@@ -2,16 +2,29 @@
 
 > **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI assistance. Please review the code, security model, and workflow assumptions before using it with private vault content, email, or Todoist data.
 
-Semantic Todoist Sync is a bring-your-own-key Obsidian plugin for turning notes and forwarded emails into Todoist tasks with semantic vault context.
+Semantic Todoist Sync is a bring-your-own-key Obsidian plugin for using AI and semantic vault context to search notes, generate tasks, and synchronize those tasks with Todoist.
 
-## What It Does
+## Primary Functions
 
-- Uses Google Gemini by default, with OpenAI also supported.
-- Builds a local semantic index for vault search and context-aware task descriptions.
-- Creates Todoist tasks from Obsidian notes, with optional two-way note/Todoist sync.
-- Processes forwarded emails through a user-owned Cloudflare Worker queue.
-- Keeps Email-To-Todoist and Notes-To-Todoist independent, so either workflow can be disabled or configured later.
-- Stores Todoist IDs in the local plugin reference table, while note tasks use short OID markers.
+1. **Semantic vault search and question-answering**
+
+   Build a local semantic index of your Obsidian vault so you can search and query across your notes. The plugin uses relevant note context to answer questions, summarize sources, and support task generation with better background information than the active note alone.
+
+2. **Notes-To-Todoist**
+
+   Generate actionable tasks from your Obsidian notes, insert them back into the note with Semantic Todoist Sync markers, and synchronize them with Todoist. Existing note tasks can be preserved, converted to local OIDs, or reconciled with Todoist through the local reference table.
+
+3. **Email-To-Todoist**
+
+   Forward emails containing tasks to a user-owned Cloudflare Worker processor. The plugin can retrieve those emails, use AI plus vault context to identify actionable tasks, log the created tasks into Obsidian, and synchronize them into Todoist.
+
+## What It Uses
+
+- Google Gemini by default, with OpenAI also supported.
+- A local semantic index for vault search and context-aware task descriptions.
+- Todoist API access for task creation, updates, and reference reconciliation.
+- Optional Cloudflare Email Routing and Workers for Email-To-Todoist.
+- Local OID markers in notes, with Todoist IDs stored in the plugin reference table.
 
 ## Quick Setup
 

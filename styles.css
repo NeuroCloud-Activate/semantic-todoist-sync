@@ -1,0 +1,484 @@
+.semantic-todoist-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 18px;
+}
+
+.semantic-todoist-tabs button {
+  border-radius: 6px;
+}
+
+.semantic-todoist-tabs button.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.semantic-todoist-settings-heading {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 18px;
+  padding-top: 14px;
+}
+
+.semantic-todoist-settings-heading h3 {
+  margin: 0 0 4px;
+}
+
+.semantic-todoist-settings-heading div {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.35;
+}
+
+.semantic-todoist-setting {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.semantic-todoist-setting .setting-item-info,
+.semantic-todoist-setting .setting-item-control,
+.semantic-todoist-setting textarea {
+  width: 100%;
+}
+
+.semantic-todoist-setting .setting-item-name {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.semantic-todoist-setting textarea {
+  min-height: 190px;
+  line-height: 1.45;
+}
+
+.semantic-todoist-setup-step {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.semantic-todoist-setup-step .setting-item-info,
+.semantic-todoist-setup-step .setting-item-control {
+  width: 100%;
+}
+
+.semantic-todoist-setup-step .setting-item-control {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.semantic-todoist-setup-step .setting-item-control button {
+  margin-inline-start: 0;
+}
+
+.semantic-todoist-project-setting {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.semantic-todoist-project-setting .setting-item-info {
+  flex: 1 1 55%;
+  min-width: 220px;
+}
+
+.semantic-todoist-project-setting .setting-item-control {
+  flex: 0 1 min(100%, 360px);
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.semantic-todoist-project-setting select {
+  max-width: 260px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-project-setting {
+    flex-direction: column;
+  }
+
+  .semantic-todoist-project-setting .setting-item-info,
+  .semantic-todoist-project-setting .setting-item-control,
+  .semantic-todoist-project-setting select {
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+.semantic-todoist-view {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 12px;
+}
+
+.semantic-todoist-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.semantic-todoist-header h3 {
+  margin: 0;
+}
+
+.semantic-todoist-header button {
+  border-radius: 6px;
+}
+
+.semantic-todoist-note-row {
+  display: grid;
+  grid-template-columns: minmax(0, 88px) minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.semantic-todoist-note-row span {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-note-picker {
+  position: relative;
+  min-width: 0;
+}
+
+.semantic-todoist-note-picker input {
+  min-width: 0;
+  width: 100%;
+}
+
+.semantic-todoist-note-results {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+}
+
+.semantic-todoist-note-results:empty {
+  display: none;
+}
+
+.semantic-todoist-note-result {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  cursor: var(--cursor-link);
+}
+
+.semantic-todoist-note-result:last-child {
+  border-bottom: 0;
+}
+
+.semantic-todoist-note-result:hover {
+  background: var(--background-modifier-hover);
+}
+
+.semantic-todoist-note-result strong {
+  display: block;
+}
+
+.semantic-todoist-note-result div {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  word-break: break-word;
+}
+
+.semantic-todoist-active-summary,
+.semantic-todoist-relevant {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: var(--background-secondary);
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-active-summary {
+  flex: 0 0 auto;
+}
+
+.semantic-todoist-active-summary div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.semantic-todoist-relevant {
+  flex: 0 0 auto;
+}
+
+.semantic-todoist-active-summary strong,
+.semantic-todoist-relevant strong {
+  display: inline-block;
+  margin: 0 6px 0 0;
+  color: var(--text-normal);
+}
+
+.semantic-todoist-source-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  vertical-align: middle;
+}
+
+.semantic-todoist-source-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 2px 7px;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: var(--cursor-link);
+}
+
+.semantic-todoist-source-card:hover {
+  background: var(--background-modifier-hover);
+}
+
+.semantic-todoist-source-card span {
+  display: block;
+  color: var(--text-accent);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.semantic-todoist-view textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.semantic-todoist-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.semantic-todoist-toolbar button {
+  border-radius: 6px;
+}
+
+.semantic-todoist-conversation {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 280px;
+  background: var(--background-primary);
+}
+
+.semantic-todoist-message {
+  margin-bottom: 10px;
+  max-width: 92%;
+}
+
+.semantic-todoist-message-user {
+  margin-left: auto;
+}
+
+.semantic-todoist-message-assistant {
+  margin-right: auto;
+}
+
+.semantic-todoist-message-role {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: 3px;
+}
+
+.semantic-todoist-message-text {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--background-secondary);
+  font-size: var(--semantic-todoist-chat-font-size, 13px);
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+.semantic-todoist-message-text p,
+.semantic-todoist-message-text ul,
+.semantic-todoist-message-text ol {
+  margin-block: 0.25em;
+}
+
+.semantic-todoist-message-text li {
+  margin-block: 0.1em;
+}
+
+.semantic-todoist-message-text li > p {
+  margin-block: 0;
+}
+
+.semantic-todoist-message-text ul,
+.semantic-todoist-message-text ol {
+  padding-inline-start: 1.3em;
+}
+
+.semantic-todoist-message-text p:first-child,
+.semantic-todoist-message-text ul:first-child,
+.semantic-todoist-message-text ol:first-child {
+  margin-top: 0;
+}
+
+.semantic-todoist-message-text p:last-child,
+.semantic-todoist-message-text ul:last-child,
+.semantic-todoist-message-text ol:last-child {
+  margin-bottom: 0;
+}
+
+.semantic-todoist-message-user .semantic-todoist-message-text {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
+.semantic-todoist-view textarea {
+  font-size: var(--semantic-todoist-chat-font-size, 13px);
+}
+
+.semantic-todoist-status {
+  flex: 0 0 auto;
+  min-height: calc(2 * 1.25em + 8px);
+  max-height: calc(2 * 1.25em + 8px);
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px 7px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.25;
+}
+
+.semantic-todoist-status-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.semantic-todoist-status-line strong {
+  color: var(--text-normal);
+  font-weight: 700;
+}
+
+.semantic-todoist-status-separator {
+  color: var(--text-faint);
+}
+
+.semantic-todoist-output {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px;
+  overflow: auto;
+  flex: 1;
+  white-space: pre-wrap;
+  background: var(--background-secondary);
+}
+
+.semantic-todoist-activity-log {
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  white-space: pre-wrap;
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-source {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 8px;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-reference-table-wrap {
+  max-height: 520px;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+
+.semantic-todoist-reference-table {
+  width: 100%;
+  min-width: 1180px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: var(--font-ui-smaller);
+}
+
+.semantic-todoist-reference-table th,
+.semantic-todoist-reference-table td {
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-reference-table th {
+  position: sticky;
+  top: 0;
+  background: var(--background-secondary);
+  z-index: 1;
+}
+
+.semantic-todoist-reference-table th:nth-child(1),
+.semantic-todoist-reference-table td:nth-child(1),
+.semantic-todoist-reference-table th:nth-child(4),
+.semantic-todoist-reference-table td:nth-child(4),
+.semantic-todoist-reference-table th:nth-child(9),
+.semantic-todoist-reference-table td:nth-child(9),
+.semantic-todoist-reference-table th:nth-child(15),
+.semantic-todoist-reference-table td:nth-child(15) {
+  width: 72px;
+}
+
+.semantic-todoist-reference-table th:nth-child(2),
+.semantic-todoist-reference-table td:nth-child(2),
+.semantic-todoist-reference-table th:nth-child(8),
+.semantic-todoist-reference-table td:nth-child(8),
+.semantic-todoist-reference-table th:nth-child(10),
+.semantic-todoist-reference-table td:nth-child(10) {
+  width: 118px;
+}
+
+.semantic-todoist-reference-table th:nth-child(5),
+.semantic-todoist-reference-table td:nth-child(5),
+.semantic-todoist-reference-table th:nth-child(6),
+.semantic-todoist-reference-table td:nth-child(6) {
+  width: 92px;
+}
+
+.semantic-todoist-reference-table th:nth-child(3),
+.semantic-todoist-reference-table td:nth-child(3),
+.semantic-todoist-reference-table th:nth-child(11),
+.semantic-todoist-reference-table td:nth-child(11),
+.semantic-todoist-reference-table th:nth-child(12),
+.semantic-todoist-reference-table td:nth-child(12),
+.semantic-todoist-reference-table th:nth-child(13),
+.semantic-todoist-reference-table td:nth-child(13),
+.semantic-todoist-reference-table th:nth-child(14),
+.semantic-todoist-reference-table td:nth-child(14) {
+  width: 190px;
+  max-height: 4.8em;
+  overflow: hidden;
+}
+
+.semantic-todoist-reference-table th:nth-child(7),
+.semantic-todoist-reference-table td:nth-child(7) {
+  width: 150px;
+}

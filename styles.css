@@ -482,3 +482,13 @@
 .semantic-todoist-reference-table td:nth-child(7) {
   width: 150px;
 }
+
+.semantic-todoist-prompt-textarea {
+  width: 100%;
+  min-height: 130px;
+}
+
+.semantic-todoist-template-preview {
+  width: 100%;
+  min-height: 180px;
+}

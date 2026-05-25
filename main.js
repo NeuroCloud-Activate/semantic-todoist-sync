@@ -415,7 +415,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   logLocal(message, data = {}) {
     const entry = { at: deviceTimestamp(), message, data: sanitizeLogData(data) };
     this.settings.localLog = [entry, ...(this.settings.localLog || [])].slice(0, 100);
-    console.log("[Semantic Todoist Sync]", message, entry.data);
     this.saveSettings().catch((error) => console.error("Semantic Todoist local log save failed", error));
   }
 
@@ -2907,7 +2906,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Semantic Todoist Sync" });
+    new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
     for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "References", "Activity"]) {
       const button = tabs.createEl("button", { text: tab });
@@ -3245,8 +3244,7 @@ class PromptModal extends Modal {
     contentEl.empty();
     contentEl.createEl("h2", { text: this.title });
     const input = contentEl.createEl("textarea", { placeholder: "Ask AI..." });
-    input.style.width = "100%";
-    input.style.minHeight = "130px";
+    input.addClass("semantic-todoist-prompt-textarea");
     new Setting(contentEl).addButton((button) => button.setButtonText("Send").setCta().onClick(async () => {
       const value = input.value.trim();
       if (!value) return;
@@ -3280,8 +3278,7 @@ class TaskTemplateModal extends Modal {
       return;
     }
     const preview = contentEl.createEl("textarea");
-    preview.style.width = "100%";
-    preview.style.minHeight = "180px";
+    preview.addClass("semantic-todoist-template-preview");
     preview.value = this.templates[0].prompt;
     new Setting(contentEl).setName("Template").addDropdown((dropdown) => {
       this.templates.forEach((template, index) => dropdown.addOption(String(index), `${template.name} (${template.source || "template"})`));

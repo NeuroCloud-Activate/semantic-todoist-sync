@@ -1,6 +1,6 @@
 # Semantic Todoist Sync
 
-> **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI using OpenAI Codex. If your concerned, please review the code, security model, and workflow assumptions before using it with your Obsidian vault content, emails, or Todoist data.
+> **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI using OpenAI Codex. If you're concerned, please review the code, security model, and workflow assumptions before using it with your Obsidian vault content, emails, or Todoist data.
 
 Semantic Todoist Sync is a bring-your-own-key Obsidian plugin for using AI and semantic vault context to search notes, generate tasks, and conduct 2-way synchronization of those tasks with Todoist. Goal here is to use your meeting notes, and identify actionable items right away and synchronize them to Todoist (saving you the hassle of manually creating all your tasks, and focusing more on getting them done!)
 
@@ -88,6 +88,17 @@ Todoist IDs are stored in the local index/reference table, but are viewable in t
 
 It is highly recommended, when writing your meeting notes, to flag tasks with some kind of tag (I used for example #todo), to help make sure that all your tasks are captured. Within the settings, plain language rompt areas are separated and available for you to customize all the Tasks creation aspects for Todoist (to help determine what works best for you). For example, Main Tasks, Subtasks, Section Titles, Dates, Deadlines, Tags, Priorities, Descriptions and any links.
 
+## Community Plugin Release
+
+This repository includes the files Obsidian expects for community plugin review:
+
+- `README.md`
+- `LICENSE`
+- `manifest.json`
+- `versions.json`
+
+Each GitHub release tag matches the version in `manifest.json` and includes `main.js`, `manifest.json`, and `styles.css` as release assets.
+
 ## Privacy And Security
 
 - API keys are stored in Obsidian plugin settings on the user's device and sync only if the user syncs Obsidian settings.
@@ -99,3 +110,7 @@ It is highly recommended, when writing your meeting notes, to flag tasks with so
 ## Mobile Notes
 
 The plugin has been tested and is functional on iPadOS/iOS mobile Obsidian apps, However, background polling and sync run only while Obsidian is open and the plugin is loaded (limitations of iPadOS/iOS).
+
+## License
+
+Semantic Todoist Sync is released under the GNU General Public License v3.0. See `LICENSE` for details.

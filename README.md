@@ -2,7 +2,7 @@
 
 > **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI using OpenAI Codex. If you're concerned, please review the code, security model, and workflow assumptions before using it with your Obsidian vault content, emails, or Todoist data.
 
-Semantic Todoist Sync is a bring-your-own-key Obsidian plugin for using AI and semantic vault context to search notes, generate tasks, and conduct 2-way synchronization of those tasks with Todoist. Goal here is to use your meeting notes, and identify actionable items right away and synchronize them to Todoist (saving you the hassle of manually creating all your tasks, and focusing more on getting them done!)
+Build a local semantic index of your vault to search, answer questions, and summarize meeting notes using AI context. Generate actionable tasks from notes or forwarded emails (that takes into account your current and past notes to fully understand the requirements to action your tasks), insert those tasks into notes to keep track, and automatically sync those tasks with Todoist. Plugin is built with full 2-way sync of tasks between Obsidian and Todoist, while keeping it fast through majority local processing. Goal here is to use your meeting notes, and identify actionable items right away and synchronize them to Todoist (saving you the hassle of manually creating all your tasks, and focusing more on getting them done!)
 
 ## Primary Functions
 

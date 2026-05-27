@@ -2,7 +2,7 @@
 
 > **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI using OpenAI Codex. If you're concerned, please review the code, security model, and workflow assumptions before using it with your Obsidian vault content, emails, or Todoist data.
 
-Build a local semantic index of your vault to search, answer questions, and identify the tasks from your meeting notes using AI and your vault for context. Generate actionable tasks from notes or forwarded emails (that takes into account your current and past notes to fully understand the requirements to action your tasks), insert those tasks into notes to keep track, and automatically sync those tasks with Todoist. Plugin is built with full 2-way sync of tasks between Obsidian and Todoist, while keeping it fast through majority local processing. Goal here is to use your meeting notes, identify actionable items right away, and synchronize them to Todoist (saving you the hassle of manually creating all your tasks, and focusing more on getting them done!)
+Build a local semantic index of your vault to search, answer questions, and identify tasks from notes using AI and vault context. Generate actionable tasks from notes or forwarded emails, insert those tasks into notes for traceability, and synchronize them with Todoist. The plugin supports 2-way task sync between Obsidian and Todoist, local OID-based reference tracking, configurable prompts, and mostly local reconciliation to reduce repeated API calls.
 
 ## Primary Functions
 
@@ -12,7 +12,7 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
 2. **Notes-To-Todoist**
 
-   Generate actionable tasks from your Obsidian notes, insert them back into the note with Semantic Todoist Sync markers, and synchronize them with Todoist. Existing note tasks can be preserved, using a local OIDs (Obsidian IDs) reference table to reduce API calls and enhance speed, with the ability to reconcile with Todoist automatically and manually.
+   Generate actionable tasks from your Obsidian notes, insert them back into the note with Semantic Todoist Sync markers, and synchronize them with Todoist. Existing note tasks can be preserved using local OIDs (Obsidian IDs) and a reference table to reduce API calls, speed up reconciliation, and recover Todoist task links when needed.
 
 3. **Email-To-Todoist**
 
@@ -20,11 +20,12 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
 ## What It Uses
 
-- Google Gemini by default (recommend the new Gemini 3.5 Flash), with OpenAI also supported (found best cost/benefit using GPT 5.4).
+- Google Gemini by default, with OpenAI also supported through the user's own API key and available model list.
 - A local semantic index for vault search and context-aware task descriptions.
 - Todoist API access for task creation, updates, and reference reconciliation.
 - Optional Cloudflare Email Routing and Workers for the Email-To-Todoist workflow.
 - Local OID markers in notes, with Todoist IDs stored in the plugin's local reference table (to keep things local and avoid having to always do external API calls - this keeps the plugin fast).
+- Markdown prompt files in the vault for reusable AI prompts, summaries, and task-generation workflows.
 
 ## Quick Setup
 
@@ -60,13 +61,42 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - This creates the local index file in the plugin folder.
    - Gemini and OpenAI indexes are stored separately so switching providers does not overwrite the other index (so you can test whichever works best for you!)
 
-## Commands Palette Options (the majority of these options are in the settings and Chat sidebar panes, so don't "need" to use the command palette")
+## Sidebar And Prompts
+
+The sidebar is the main working surface:
+
+- `Ask` queries the vault using the active note and semantic index.
+- `Tasks` runs the configured default task-generation prompt directly.
+- `Prompts` opens reusable markdown prompts from the prompt folder.
+- `New chat` clears the visible conversation.
+- `Index` rebuilds the semantic vault index.
+
+Prompt files live in the configured prompts folder, defaulting to `Semantic Todoist Sync/Prompts`. Prompt frontmatter controls behavior:
+
+```md
+---
+createTasks: true
+insertResponse: true
+syncTasks: true
+taskGenerationTemplate: false
+taskHeading: '## Semantic Todoist Sync - Summary'
+---
+```
+
+- `createTasks: false` runs a normal prompt response, such as a summary.
+- `createTasks: true` with `taskGenerationTemplate: true` marks the prompt as a dedicated Todoist task-generation prompt.
+- `createTasks: true` with `taskGenerationTemplate: false` runs the original prompt response first, then runs the configured task-generation prompt as a separate second step.
+- `insertResponse` controls whether the response is inserted into the active note.
+- `syncTasks` controls whether generated tasks sync to Todoist after insertion.
+- `taskHeading` controls the heading inserted above the response or generated task list.
+
+## Command Palette Options
 
 - `Semantic Todoist Sync: Open sidebar`
 - `Semantic Todoist Sync: Rebuild semantic vault index`
 - `Semantic Todoist Sync: Ask AI with active context`
 - `Semantic Todoist Sync: Prompt AI from command palette`
-- `Semantic Todoist Sync: Run task prompt template`
+- `Semantic Todoist Sync: Run prompts`
 - `Semantic Todoist Sync: Search vault semantically`
 - `Semantic Todoist Sync: Process pending email tasks`
 - `Semantic Todoist Sync: Create Todoist tasks from active note`
@@ -86,7 +116,18 @@ Local task marker: `%%[oid:: A1B2C]%%`
 
 Todoist IDs are stored in the local index/reference table, but are viewable in the plugin's settings, not in note text.
 
-It is highly recommended, when writing your meeting notes, to flag tasks with some kind of tag (I used for example #todo), to help make sure that all your tasks are captured. Within the settings, plain language rompt areas are separated and available for you to customize all the Tasks creation aspects for Todoist (to help determine what works best for you). For example, Main Tasks, Subtasks, Section Titles, Dates, Deadlines, Tags, Priorities, Descriptions and any links.
+It is recommended, when writing meeting notes, to flag action items with a consistent marker such as `#todo` so task extraction has a strong signal. Settings include separate plain-language instruction areas for main tasks, subtasks, section titles, dates, deadlines, tags, priorities, descriptions, and links.
+
+## What's New In v0.4
+
+- Sidebar `Tasks` button for the configured default task-generation prompt.
+- Prompt files now drive prompt responses, summary-plus-task workflows, task headings, note insertion, and Todoist sync behavior.
+- Mixed prompts can insert a summary first and then run task generation as a separate pass.
+- Prompt response citations avoid repeating the active note for every statement while preserving citations for supporting context notes.
+- Chat text is selectable, relevant notes are de-duplicated, and active-note inclusion can be toggled for sidebar search.
+- Subtask metadata criteria are configurable.
+- Gemini structured JSON handling is more robust and avoids unnecessary retry calls where possible.
+- Existing Todoist tasks can be relinked across projects without recreating them in the default project.
 
 ## Community Plugin Release
 

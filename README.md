@@ -118,6 +118,13 @@ Todoist IDs are stored in the local index/reference table, but are viewable in t
 
 It is recommended, when writing meeting notes, to flag action items with a consistent marker such as `#todo` so task extraction has a strong signal. Settings include separate plain-language instruction areas for main tasks, subtasks, section titles, dates, deadlines, tags, priorities, descriptions, and links.
 
+## What's New In v0.4.1
+
+- Email-To-Todoist notes now default to `Semantic Todoist Sync/Email-To-Todoist`.
+- Each processed email creates its own Obsidian note named `YYYY-MM-DD - Email Subject`, using the original email received date.
+- Todoist project IDs are preserved in the local OID reference table when tasks are moved between Todoist projects.
+- Todoist project-move activity is confirmed against the all-project Todoist snapshot before any note task is treated as deleted.
+
 ## What's New In v0.4
 
 - Sidebar `Tasks` button for the configured default task-generation prompt.

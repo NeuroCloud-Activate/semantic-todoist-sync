@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1
+
+- Changed the default Email-To-Todoist note folder to `Semantic Todoist Sync/Email-To-Todoist`.
+- Changed Email-To-Todoist logging so each processed email creates a separate note titled `YYYY-MM-DD - Email Subject`, using the original email received date rather than the processing date.
+- Preserved Todoist project IDs and project names in the local OID reference table for newly created note and email tasks.
+- Updated Todoist activity handling so project moves are confirmed against the all-project Todoist snapshot before a removed/deleted activity can remove a task from Obsidian.
+- Added Project and Project ID columns to the reference table view.
+
 ## 0.4.0
 
 - Added a sidebar chat option to include or exclude the active note from vault search context.

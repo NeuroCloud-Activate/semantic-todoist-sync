@@ -73,7 +73,7 @@ const DEFAULT_SETTINGS = {
   semanticIndexMaxChunksPerNote: 20,
   semanticIndexEmbeddingPrecision: 4,
   indexedFolders: "",
-  excludedFolders: "Email-To-Todoist",
+  excludedFolders: "Semantic Todoist Sync/Email-To-Todoist",
   semanticIndexMeta: {},
   autoUpdateSemanticIndex: true,
   semanticIndexDelaySeconds: 30,
@@ -116,7 +116,7 @@ const DEFAULT_SETTINGS = {
   maxGeneratedMainTasks: 10,
   maxGeneratedSubtasksPerMainTask: 4,
   todoistDescriptionMaxChars: 8000,
-  emailLogFolder: "Email-To-Todoist",
+  emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
   chatFontSizePx: 13,
@@ -266,6 +266,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (this.settings.subtaskSyncTag === "#tdsyncsub" || this.settings.subtaskSyncTag === "tdsyncsub") {
       this.settings.subtaskSyncTag = "#STSubSync";
+      changed = true;
+    }
+    if (!this.settings.emailLogFolder || this.settings.emailLogFolder === "Email-To-Todoist") {
+      this.settings.emailLogFolder = DEFAULT_SETTINGS.emailLogFolder;
+      changed = true;
+    }
+    if (!this.settings.excludedFolders || this.settings.excludedFolders === "Email-To-Todoist") {
+      this.settings.excludedFolders = DEFAULT_SETTINGS.excludedFolders;
+      changed = true;
+    } else if (splitList(this.settings.excludedFolders).includes("Email-To-Todoist")) {
+      const folders = splitList(this.settings.excludedFolders).map((folder) => folder === "Email-To-Todoist" ? DEFAULT_SETTINGS.emailLogFolder : folder);
+      this.settings.excludedFolders = Array.from(new Set(folders)).join(", ");
       changed = true;
     }
     const descriptionUpdates = {
@@ -1940,12 +1952,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async getAllTodoistReferenceTasks({ force = false } = {}) {
     const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], force);
     const projects = snapshot.projects;
-    const projectNameById = new Map(projects.map((project) => [String(project.id), project.name || ""]));
     const sectionsById = new Map(snapshot.sections.map((section) => [section.id, section]));
-    const tasks = snapshot.tasks.map((task) => Object.assign({}, task, {
-      projectName: projectNameById.get(String(task.projectId || "")) || "",
-      section: sectionsById.get(task.sectionId)?.name || ""
-    }));
+    const tasks = enrichTodoistTasksWithSnapshot(snapshot);
     return { tasks, projects, sectionsById };
   }
 
@@ -2021,7 +2029,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let remoteTasksById = new Map();
     try {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
-      remoteTasksById = new Map(snapshot.tasks.map((task) => [task.id, task]));
+      remoteTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for file sync compare", { path, error: error.message || String(error) });
     }
@@ -2109,10 +2117,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
     if (existingUpdates.length) this.setSidebarStatus(`Confirming ${existingUpdates.length} existing task${existingUpdates.length === 1 ? "" : "s"}...`);
     for (const parsed of existingUpdates) {
-      const signature = parsedTaskSignature(parsed);
       const cached = this.settings.taskCache[parsed.id];
-      if (cached?.signature === signature) continue;
       const remote = remoteTasksById.get(parsed.id) || null;
+      if (remote) {
+        applyRemoteTodoistLocation(parsed, remote);
+        const syncedLine = syncProjectMarkerOnTaskLine(lines[parsed.lineNumber], parsed, this.settings);
+        if (syncedLine !== lines[parsed.lineNumber]) {
+          lines[parsed.lineNumber] = syncedLine;
+          changed = true;
+          stats.normalized += 1;
+        }
+      }
+      const signature = parsedTaskSignature(parsed);
+      if (cached?.signature === signature && !remote) continue;
       const remoteSignature = remote ? remoteTaskComparableSignature(remote, parsed, this.settings) : "";
       if (remoteSignature && remoteSignature === signature) {
         this.cacheTask(parsed.id, parsed);
@@ -2152,9 +2169,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async createTodoistTasksFromNote(tasks, lineToTemp) {
     if (!tasks.length) return {};
     const projectId = await this.getTaskProjectId();
+    const projectName = await this.todoistProjectNameForId(projectId);
     const commands = [];
     const sectionRefs = new Map();
     for (const task of tasks) {
+      task.projectId = task.projectId || projectId;
+      task.projectName = task.projectName || projectName;
       if (task.isSubtask || !task.section) continue;
       if (sectionRefs.has(task.section)) continue;
       sectionRefs.set(task.section, task.sectionId || this.pendingSectionIdForParsedTask(task) || await this.ensureTodoistSectionId(projectId, task.section));
@@ -2229,15 +2249,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async createTodoistTaskBatch(sectionName, tasks, existingSectionId = "") {
     if (!tasks.length) return [];
     const projectId = await this.getTaskProjectId();
+    const projectName = await this.todoistProjectNameForId(projectId);
     const taskTemps = [];
     const sectionId = existingSectionId || await this.ensureTodoistSectionId(projectId, sectionName);
     assignGeneratedTaskSectionId(tasks, sectionId);
     const commands = [];
     for (const task of tasks) {
+      task.projectId = task.projectId || projectId;
+      task.projectName = task.projectName || projectName;
       const mainTempId = uuid();
       taskTemps.push({ tempId: mainTempId, task });
       commands.push({ type: "item_add", temp_id: mainTempId, uuid: uuid(), args: todoistTaskArgs(task, { section_id: sectionId }, this.settings) });
       for (const subtask of task.subtasks || []) {
+        subtask.projectId = subtask.projectId || projectId;
+        subtask.projectName = subtask.projectName || projectName;
         const subTempId = uuid();
         taskTemps.push({ tempId: subTempId, task: subtask });
         commands.push({ type: "item_add", temp_id: subTempId, uuid: uuid(), args: todoistTaskArgs(subtask, { parent_id: mainTempId }, this.settings) });
@@ -2520,9 +2545,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const savedEvents = new Set(this.settings.processedTodoistEventIds || []);
     const events = (activities.results || []).filter((event) => !savedEvents.has(event.id));
     let snapshotTasksById = null;
-    if (events.some((event) => /updated|added|uncompleted/i.test(event.event_type || event.eventType || ""))) {
+    if (events.some((event) => /updated|added|uncompleted|deleted|removed/i.test(event.event_type || event.eventType || ""))) {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false).catch(() => null);
-      if (snapshot?.tasks) snapshotTasksById = new Map(snapshot.tasks.map((task) => [task.id, task]));
+      if (snapshot?.tasks) snapshotTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
     }
     for (const event of events) {
       const taskId = event.object_id || event.objectId;
@@ -2530,6 +2555,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!taskId || !this.settings.taskCache[taskId]) continue;
       if (/deleted|removed/i.test(eventType)) {
         const cached = this.settings.taskCache[taskId];
+        const movedTask = snapshotTasksById?.get(String(taskId)) || null;
+        if (movedTask) {
+          await this.updateTaskLineFromTodoist(taskId, movedTask);
+          savedEvents.add(event.id);
+          continue;
+        }
+        const stillExists = await this.todoistTaskExists(taskId);
+        if (stillExists) {
+          this.logLocal("Todoist removal event preserved active task", { id: taskId, path: cached.path || "" });
+          savedEvents.add(event.id);
+          continue;
+        }
         await this.removeDeletedTodoistTaskFromNote(cached);
         delete this.settings.taskCache[taskId];
         savedEvents.add(event.id);
@@ -2632,8 +2669,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       parentLineNumber: Number.isFinite(task.parentLineNumber) ? task.parentLineNumber : Number.isFinite(parentReference.lineNumber) ? parentReference.lineNumber : this.settings.taskCache?.[id]?.parentLineNumber ?? null,
       section: task.section || pendingReference?.section || "",
       sectionId: task.sectionId || pendingReference?.sectionId || this.settings.taskCache?.[id]?.sectionId || "",
-      projectId: task.projectId || task.project_id || this.settings.taskCache?.[id]?.projectId || "",
-      projectName: task.projectName || this.settings.taskCache?.[id]?.projectName || "",
+      projectId: task.projectId || task.project_id || pendingReference?.projectId || this.settings.taskCache?.[id]?.projectId || "",
+      projectName: task.projectName || pendingReference?.projectName || this.settings.taskCache?.[id]?.projectName || "",
       noteRefs: mergeNoteReferences(this.settings.taskCache?.[id]?.noteRefs || [], [noteReferenceForTask(task, oid)]),
       signature: parsedTaskSignature(task),
       cachedAt: deviceTimestamp()
@@ -2668,6 +2705,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         content: task.content || "",
         section: task.section || "",
         sectionId: task.sectionId || "",
+        projectId: task.projectId || "",
+        projectName: task.projectName || "",
         isSubtask: false,
         parentId: "",
         parentOid: "",
@@ -2685,6 +2724,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           content: subtask.content || "",
           section: task.section || "",
           sectionId: task.sectionId || "",
+          projectId: subtask.projectId || task.projectId || "",
+          projectName: subtask.projectName || task.projectName || "",
           isSubtask: true,
           createdAt
         };
@@ -2768,20 +2809,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks }) {
-    const folder = trimSlashes(this.settings.emailLogFolder || "Email-To-Todoist");
-    const path = `${folder}/Email Task Log.md`;
+    const folder = trimSlashes(this.settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder);
     await ensureVaultFolder(this.app, folder);
+    const noteTitle = emailTaskNoteTitle(receivedAt, subject);
+    const path = uniqueMarkdownPath(this.app, folder, noteTitle);
     const lines = [
-      "",
-      `## ${subject}`,
+      `# ${noteTitle}`,
       "",
       `Date processed: ${deviceTimestamp()}`,
       `Original email received: ${receivedAt || ""}`,
       cloudflareReceivedAt ? `Forward received by Cloudflare: ${cloudflareReceivedAt}` : "",
       `From: ${from || ""}`,
+      `Email subject: ${subject || ""}`,
       `Todoist section: ${sectionName}`,
       "",
-      "### Synced Todoist Tasks"
+      "## Synced Todoist Tasks"
     ].filter(Boolean);
     for (const task of tasks || []) {
       lines.push(parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task), this.settings, task.id));
@@ -2791,10 +2833,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     }
     if (!tasks?.length) lines.push("- No actionable tasks were found.");
-    const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) await this.app.vault.append(existing, `${lines.join("\n")}\n`);
-    else await this.app.vault.create(path, `# Email to Todoist Log\n${lines.join("\n")}\n`);
+    await this.app.vault.create(path, `${lines.join("\n")}\n`);
     await this.cacheLoggedTasks(path, tasks || [], sectionName);
+    this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, sectionName });
   }
 };
 
@@ -3424,7 +3465,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     const table = wrapper.createEl("table", { cls: "semantic-todoist-reference-table" });
     const thead = table.createEl("thead");
     const header = thead.createEl("tr");
-    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Deadline", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) {
+    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Deadline", "Project", "Project ID", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) {
       header.createEl("th", { text: label });
     }
     const tbody = table.createEl("tbody");
@@ -3436,6 +3477,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       tr.createEl("td", { text: row.priority });
       tr.createEl("td", { text: row.date });
       tr.createEl("td", { text: row.deadline });
+      tr.createEl("td", { text: row.project });
+      tr.createEl("td", { text: row.projectId });
       tr.createEl("td", { text: row.section });
       tr.createEl("td", { text: row.sectionId });
       tr.createEl("td", { text: row.parentOid });
@@ -4020,6 +4063,8 @@ function referenceRows(settings) {
       priority: String(task.priority || ""),
       date: task.due_date || "",
       deadline: task.deadline_date || "",
+      project: task.projectName || "",
+      projectId: task.projectId || "",
       section: task.section || "",
       sectionId: task.sectionId || "",
       parentOid: task.parentOid || "",
@@ -4041,6 +4086,8 @@ function referenceRows(settings) {
       priority: "",
       date: "",
       deadline: "",
+      project: pending.projectName || "",
+      projectId: pending.projectId || "",
       section: pending.section || "",
       sectionId: pending.sectionId || "",
       parentOid: pending.parentOid || "",
@@ -4346,6 +4393,25 @@ function parsedTaskFromTodoistReference(remote, parsed, oid, path, lineNumber, p
     projectId: remote.projectId || parsed.projectId || "",
     projectName: remote.projectName || parsed.projectName || ""
   });
+}
+
+function enrichTodoistTasksWithSnapshot(snapshot = {}) {
+  const projectNameById = new Map((snapshot.projects || []).map((project) => [String(project.id), project.name || ""]));
+  const sectionsById = new Map((snapshot.sections || []).map((section) => [section.id, section]));
+  return (snapshot.tasks || []).map((task) => Object.assign({}, task, {
+    projectName: task.projectName || projectNameById.get(String(task.projectId || "")) || "",
+    section: task.section || sectionsById.get(task.sectionId)?.name || ""
+  }));
+}
+
+function applyRemoteTodoistLocation(parsed, remote) {
+  if (!parsed || !remote) return parsed;
+  parsed.projectId = remote.projectId || parsed.projectId || "";
+  parsed.projectName = remote.projectName || parsed.projectName || "";
+  parsed.sectionId = remote.sectionId || parsed.sectionId || "";
+  parsed.section = remote.section || parsed.section || "";
+  parsed.parentId = remote.parentId || parsed.parentId || "";
+  return parsed;
 }
 
 function referenceCacheEntry(id, task, settings = DEFAULT_SETTINGS, previous = null) {
@@ -5853,6 +5919,33 @@ function makeSectionName(receivedAt, subject) {
   const dd = String(date.getDate()).padStart(2, "0");
   const topic = String(subject || "No_Subject").replace(/^(re|fw|fwd):\s*/gi, "").replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").slice(0, 70) || "No_Subject";
   return `Email_${yy}_${mm}_${dd}_${topic}`;
+}
+
+function emailTaskNoteTitle(receivedAt, subject) {
+  const date = new Date(receivedAt || Date.now());
+  const datePart = Number.isFinite(date.getTime()) ? deviceDateString(date) : today();
+  const topic = safeMarkdownFileName(String(subject || "No Subject").replace(/^(re|fw|fwd):\s*/gi, ""), 110) || "No Subject";
+  return `${datePart} - ${topic}`;
+}
+
+function safeMarkdownFileName(value, maxLength = 120) {
+  return singleLine(value)
+    .replace(/[\\/#^[\]|:?*<>"]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength)
+    .replace(/[. ]+$/g, "");
+}
+
+function uniqueMarkdownPath(app, folder, title) {
+  const base = safeMarkdownFileName(title, 150) || "Untitled";
+  let path = `${folder}/${base}.md`;
+  let counter = 2;
+  while (app.vault.getAbstractFileByPath(path)) {
+    path = `${folder}/${base} ${counter}.md`;
+    counter += 1;
+  }
+  return path;
 }
 
 function makeNoteSectionName(title, text = "", path = "") {

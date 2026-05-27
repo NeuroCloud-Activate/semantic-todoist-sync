@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+- Fixed the local reference table layout so all 17 columns have explicit widths after adding Project and Project ID in v0.4.1.
+- Moved Last email poll and Process pending email tasks under the Email-To-Todoist Automation heading.
+- Audited Todoist sync paths to confirm project-move, delete, and reconcile checks continue to prefer the Todoist snapshot plus local OID reference table to minimize API calls.
+
 ## 0.4.1
 
 - Changed the default Email-To-Todoist note folder to `Semantic Todoist Sync/Email-To-Todoist`.

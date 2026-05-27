@@ -3385,6 +3385,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Automation");
     toggleSetting(containerEl, "Automatically process new emails", "Poll Cloudflare for pending email tasks while Obsidian is open.", this.plugin, "autoProcessEmails");
     numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
+    new Setting(containerEl).setName("Last email poll").setDesc(this.plugin.settings.lastEmailPollAt || "Not yet polled.");
+    new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
     settingsHeading(containerEl, "Email Content");
     numberSetting(containerEl, "Maximum email characters", this.plugin, "maxEmailChars");
     textSetting(containerEl, "Email log folder", "Plain-language processing log folder.", this.plugin, "emailLogFolder");
@@ -3392,8 +3394,6 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
     subtaskCriteriaSettings(containerEl, this.plugin);
-    new Setting(containerEl).setName("Last email poll").setDesc(this.plugin.settings.lastEmailPollAt || "Not yet polled.");
-    new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
     taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
   }
 

@@ -608,13 +608,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async rebuildSemanticIndex(showNotice) {
-    await this.ensureCompatibleEmbeddingForChatModel();
-    this.requireAiAccess();
-    this.setSidebarStatus("Indexing vault...");
-    const files = this.getIndexableFiles();
-    const chunks = [];
+    if (this.semanticIndexInProgress) {
+      if (showNotice) new Notice("Semantic indexing is already running.");
+      return false;
+    }
+    this.semanticIndexInProgress = true;
+    window.clearTimeout(this.semanticIndexTimer);
+    this.semanticIndexTimer = null;
+    this.pendingIndexPaths.clear();
+    const previousIndex = this.semanticIndex || [];
+    const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
     const startedAt = Date.now();
+    this.setSidebarStatus("Indexing vault...");
     try {
+      await this.ensureCompatibleEmbeddingForChatModel();
+      this.requireAiAccess();
+      const files = this.getIndexableFiles();
+      if (!files.length) throw new Error("No indexable Markdown notes were found. Check Indexed folders and Excluded folders in settings.");
+      const chunks = [];
       for (const file of files) {
         const text = await this.app.vault.cachedRead(file);
         const fileChunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote);
@@ -622,6 +633,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0 });
         }
       }
+      if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
 
       const indexed = [];
       for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
@@ -645,8 +657,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.saveSettings();
       this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, ms: Date.now() - startedAt });
       if (showNotice) new Notice(`Semantic index rebuilt: ${indexed.length} chunks from ${files.length} notes.`);
+      return true;
+    } catch (error) {
+      this.semanticIndex = previousIndex;
+      this.settings.semanticIndexMeta = previousMeta;
+      await this.saveSettings();
+      this.logLocal("Semantic index rebuild failed", { error: error.message || String(error) });
+      if (showNotice) new Notice(`Semantic index rebuild failed: ${error.message || error}`);
+      return false;
     } finally {
+      this.semanticIndexInProgress = false;
       this.setSidebarStatus("Ready");
+      this.refreshSidebarStatus();
     }
   }
 
@@ -656,6 +678,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return this.app.vault.getMarkdownFiles().filter((file) => {
       return this.isIndexablePath(file.path, include, exclude);
     });
+  }
+
+  hasUsableSemanticIndex() {
+    const meta = this.settings.semanticIndexMeta || {};
+    return Boolean((this.semanticIndex || []).length && Number(meta.chunks || 0) > 0 && meta.rebuiltAt);
   }
 
   getSyncableTaskFiles() {
@@ -676,9 +703,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async flushSemanticIndexUpdates() {
+    if (this.semanticIndexInProgress) {
+      window.clearTimeout(this.semanticIndexTimer);
+      this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), 10000);
+      this.refreshSidebarStatus();
+      return;
+    }
     if (!this.pendingIndexPaths.size) {
       this.semanticIndexTimer = null;
       this.refreshSidebarStatus();
+      return;
+    }
+    if (!this.hasUsableSemanticIndex()) {
+      await this.rebuildSemanticIndex(false);
       return;
     }
     const paths = Array.from(this.pendingIndexPaths);
@@ -4023,7 +4060,11 @@ function indexSummary(pluginOrSettings) {
   const settings = pluginOrSettings.settings || pluginOrSettings;
   const meta = settings.semanticIndexMeta || {};
   const bytes = pluginOrSettings.semanticIndexStats ? ` File: ${formatBytes(pluginOrSettings.semanticIndexStats.bytes || 0)}.` : "";
-  return meta.chunks ? `${meta.chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt || "unknown"}.${bytes}` : "No semantic index has been built yet.";
+  const chunks = Number(meta.chunks || pluginOrSettings.semanticIndex?.length || 0);
+  if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}`;
+  if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes} Rebuild the semantic vault index.`;
+  if (pluginOrSettings.semanticIndexStats?.bytes) return `No semantic index chunks are available. ${bytes} Rebuild the semantic vault index.`;
+  return "No semantic index has been built yet.";
 }
 
 function modelSummary(settings) {
@@ -5833,7 +5874,13 @@ async function ensureVaultFolder(app, folderPath) {
   let current = "";
   for (const part of parts) {
     current = current ? `${current}/${part}` : part;
-    if (!app.vault.getAbstractFileByPath(current)) await app.vault.createFolder(current);
+    if (!app.vault.getAbstractFileByPath(current)) {
+      try {
+        await app.vault.createFolder(current);
+      } catch (error) {
+        if (!/exist/i.test(error.message || String(error))) throw error;
+      }
+    }
   }
 }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.3
+
+- Fixed semantic index rebuilds so full rebuilds run exclusively and clear queued incremental folder-change updates before starting.
+- Prevented empty or no-text rebuild attempts from overwriting an existing usable semantic index with a tiny empty index file.
+- Changed automatic incremental indexing so it triggers a full rebuild when no complete semantic index exists, avoiding partial indexes after folder rearrangements.
+- Improved Activity index status text when an index file exists but contains no chunks.
+- Made vault folder creation tolerate already-existing folders during Obsidian Sync races.
+
 ## 0.4.2
 
 - Fixed the local reference table layout so all 17 columns have explicit widths after adding Project and Project ID in v0.4.1.

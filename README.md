@@ -103,7 +103,8 @@ taskHeading: '## Semantic Todoist Sync - Summary'
 - `Semantic Todoist Sync: Sync note tasks with Todoist`
 - `Semantic Todoist Sync: Rebuild local Todoist reference table`
 
-## Note Task Syntax (this is based directly from the amazing "Another Simple Todoist Sync" and "Ultimate Todoist Sync" plugins which work well!)
+## Note Task Syntax 
+*- This is based directly from the amazing "Another Simple Todoist Sync" and "Ultimate Todoist Sync" plugins which work well!*
 
 Main tasks use `#STsync`. Subtasks use `#STSubSync` (to not conflict with the default markers from those other 2 plugins)
 

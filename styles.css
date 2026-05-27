@@ -165,6 +165,20 @@
   display: none;
 }
 
+.semantic-todoist-context-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-context-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .semantic-todoist-note-result {
   padding: 7px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
@@ -273,11 +287,15 @@
   flex: 1 1 auto;
   min-height: 280px;
   background: var(--background-primary);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .semantic-todoist-message {
   margin-bottom: 10px;
   max-width: 92%;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .semantic-todoist-message-user {
@@ -302,6 +320,8 @@
   font-size: var(--semantic-todoist-chat-font-size, 13px);
   word-break: break-word;
   line-height: 1.35;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .semantic-todoist-message-text p,
@@ -339,6 +359,8 @@
   background: var(--interactive-accent);
   color: var(--text-on-accent);
   border-color: var(--interactive-accent);
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .semantic-todoist-view textarea {
@@ -491,4 +513,17 @@
 .semantic-todoist-template-preview {
   width: 100%;
   min-height: 180px;
+}
+
+.semantic-todoist-template-mode {
+  margin: 6px 0 10px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.semantic-todoist-template-choices {
+  margin: 0 0 10px;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
 }

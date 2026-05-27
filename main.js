@@ -17,6 +17,34 @@ const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
 const TODOIST_DESCRIPTION_LIMIT = 16000;
+const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
+const DEFAULT_PROMPT_TEMPLATE_FILES = [
+  {
+    filename: "Generate Todoist task list.md",
+    createTasks: true,
+    insertResponse: true,
+    syncTasks: true,
+    taskGenerationTemplate: true,
+    taskHeading: DEFAULT_TASK_HEADING,
+    prompt: "Scan the active note or selected text and generate a Todoist-ready task list. Use the shared task instructions. Include clear main tasks and subtasks only when they are actionable."
+  },
+  {
+    filename: "Extract follow-ups only.md",
+    createTasks: true,
+    insertResponse: true,
+    syncTasks: true,
+    taskGenerationTemplate: true,
+    taskHeading: DEFAULT_TASK_HEADING,
+    prompt: "Scan the active note or selected text and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act."
+  },
+  {
+    filename: "Summarize active note.md",
+    createTasks: false,
+    insertResponse: true,
+    syncTasks: false,
+    prompt: "Summarize the active note in concise plain language.\n\nFocus on decisions, open questions, important context, and next steps. Treat active-note details as the default source and cite the active note at most once. Link to relevant vault notes when context comes from other notes. Do not create Todoist task syntax unless createTasks is changed to true."
+  }
+];
 
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
@@ -35,6 +63,7 @@ const DEFAULT_SETTINGS = {
   geminiModelsFetchedAt: "",
   defaultOpenArea: "view",
   autoAddActiveContentToContext: true,
+  searchIncludeActiveNote: true,
   maxChatContextChunks: 12,
   maxTaskContextChunks: 10,
   maxContextChars: 12000,
@@ -71,6 +100,10 @@ const DEFAULT_SETTINGS = {
   todoistSnapshotCacheMinutes: 5,
   linksAppURI: false,
   subtaskIndentSpaces: 4,
+  subtaskIncludeLabels: true,
+  subtaskIncludePriority: true,
+  subtaskIncludeDueDate: false,
+  subtaskIncludeDeadline: false,
   taskCache: {},
   pendingTaskDescriptions: {},
   processedTodoistEventIds: [],
@@ -85,21 +118,27 @@ const DEFAULT_SETTINGS = {
   todoistDescriptionMaxChars: 8000,
   emailLogFolder: "Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
+  taskGenerationPromptTemplate: "Generate Todoist task list",
   chatFontSizePx: 13,
   insertGeneratedTasksIntoNote: true,
   syncAfterInsertingGeneratedTasks: true,
   obsidianTasksDateOrder: true,
-  taskHeadingTemplate: "## Semantic Todoist Sync - Action Items",
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
     {
       name: "Generate Todoist task list",
-      prompt: "Scan the active note or selected text and generate a Todoist-ready task list. Use the shared task instructions. Include clear main tasks and subtasks only when they are actionable."
+      prompt: "Scan the active note or selected text and generate a Todoist-ready task list. Use the shared task instructions. Include clear main tasks and subtasks only when they are actionable.",
+      mode: "tasks",
+      createTasks: true,
+      taskGenerationTemplate: true
     },
     {
       name: "Extract follow-ups only",
-      prompt: "Scan the active note or selected text and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act."
+      prompt: "Scan the active note or selected text and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act.",
+      mode: "tasks",
+      createTasks: true,
+      taskGenerationTemplate: true
     }
   ],
   mainTaskInstructions: "Review the tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
@@ -132,6 +171,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await this.migrateSettings();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.loadSemanticIndex();
+    await this.ensurePromptTemplateFolder(false);
     this.pendingIndexPaths = new Set();
     this.syncInProgress = false;
     this.emailProcessingInProgress = false;
@@ -147,7 +187,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-rebuild-index", name: "Rebuild semantic vault index", callback: () => this.rebuildSemanticIndex(true) });
     this.addCommand({ id: "semantic-todoist-ask", name: "Ask AI with active context", callback: () => this.askFromActiveContext() });
     this.addCommand({ id: "semantic-todoist-prompt-gpt", name: "Prompt AI from command palette", callback: () => this.promptGptFromCommandPalette() });
-    this.addCommand({ id: "semantic-todoist-run-task-template", name: "Run task prompt template", callback: () => this.runTaskTemplateFromCommandPalette() });
+    this.addCommand({ id: "semantic-todoist-run-task-template", name: "Run prompts", callback: () => this.runTaskTemplateFromCommandPalette() });
     this.addCommand({ id: "semantic-todoist-search", name: "Search vault semantically", callback: () => this.searchFromSelection() });
     this.addCommand({ id: "semantic-todoist-process-email", name: "Process pending email tasks", callback: () => this.processPendingEmails() });
     this.addCommand({ id: "semantic-todoist-note-to-tasks", name: "Create Todoist tasks from active note", callback: () => this.createTasksFromActiveNote() });
@@ -482,7 +522,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async runTaskTemplateFromCommandPalette() {
     const templates = await this.getPromptTemplates();
     new TaskTemplateModal(this.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
-      await this.generateTaskListFromTemplate(template, { insertIntoNote, syncAfterInsert, showNotice: true });
+      await this.runPromptTemplate(template, { insertIntoNote, syncAfterInsert, showNotice: true });
     }, {
       insertIntoNote: this.settings.insertGeneratedTasksIntoNote,
       syncAfterInsert: this.settings.syncAfterInsertingGeneratedTasks
@@ -803,7 +843,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       for (let i = 0; i < lines.length; i += 1) {
         const parsed = parseTaskLine(lines[i], i, path, lines, this.settings) || parseTaskReferenceLine(lines[i], i, path, this.settings);
         if (!parsed) continue;
-        taskLines.push(formatTaskReference(parsed));
+        taskLines.push(formatTaskReference(parsed, this.settings));
       }
     }
     const queryTerms = termCounts([query, active?.title, active?.selection].filter(Boolean).join("\n"));
@@ -812,7 +852,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((item) => item.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, 25)
-      .map((item) => formatCachedTaskReference(item.id, item.task));
+      .map((item) => formatCachedTaskReference(item.id, item.task, this.settings));
     return clamp(mergeStrings(taskLines, cachedTasks).slice(0, 40).join("\n"), 5000);
   }
 
@@ -832,9 +872,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "You are a concise Obsidian sidebar assistant.",
         "Answer in plain language, usually in 3-6 short bullets or 1-3 short paragraphs.",
         "Use the active note and vault context when useful, and say when the vault does not contain enough evidence.",
-        "Every factual claim that depends on the vault should include a direct Obsidian link from the supplied source list.",
+        "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
+        "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
         "Use markdown links exactly as supplied, and do not invent sources.",
         "Use the task context to identify whether a task already exists in the notes or Todoist-linked task cache before suggesting task creation.",
+        "If the user asks about a specific existing task or asks for a Todoist link, use the supplied Todoist task link from the local reference table task context.",
         "Avoid long preambles."
       ].join(" "),
       user: [
@@ -895,7 +937,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const generationConfig = {};
     if (jsonSchema) {
       generationConfig.responseMimeType = "application/json";
-      generationConfig.responseJsonSchema = geminiCompatibleSchema(jsonSchema);
+      generationConfig.responseSchema = geminiCompatibleSchema(jsonSchema);
     }
     let response = await requestUrl({
       url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent`,
@@ -911,7 +953,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }),
       throw: false
     });
-    if (jsonSchema && response.status === 400 && /invalid argument/i.test(response.text || "")) {
+    if (jsonSchema && response.status === 400) {
       const fallbackSystem = [
         system || "",
         "Return syntactically valid JSON only. Do not wrap it in markdown. Match the requested schema exactly."
@@ -941,7 +983,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const text = extractGeminiText(response.json);
     if (!text) throw new Error(`Gemini returned no text: ${redactSecrets(response.text)}`);
-    return text;
+    return jsonSchema ? extractJsonPayload(text) : text;
   }
 
   async openaiResponsesRequest(method, path, body) {
@@ -1062,14 +1104,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
     const instructions = [
-      source.templateInstructions ? `Selected prompt template:\n${source.templateInstructions}` : "",
+      source.templateInstructions ? `Selected prompt:\n${source.templateInstructions}` : "",
       `Generation limits:\nCreate no more than ${maxMainTasks} main tasks. Create no more than ${maxSubtasks} subtasks under any main task. It is better to create fewer high-confidence tasks than to fill the limit.`,
       `Main task instructions:\n${taskInstructions.main}`,
       `Subtask instructions:\n${taskInstructions.subtasks}`,
       `Section title instructions:\n${taskInstructions.sectionTitle}`,
       `Date and deadline instructions:\n${taskInstructions.dates}`,
       `Tag instructions:\n${taskInstructions.tags}`,
-      `Priority instructions:\n${taskInstructions.priorities}`
+      `Priority instructions:\n${taskInstructions.priorities}`,
+      `Subtask criteria:\n${subtaskCriteriaInstructions(this.settings)}`
     ].filter(Boolean).join("\n\n");
     const json = await this.openaiResponse({
       model: this.settings.chatModel,
@@ -1082,6 +1125,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
         "Use subtasks only when a main task has concrete required steps, and keep subtasks tied to the same project or program as the parent task.",
+        "For subtasks, follow the configured subtask criteria exactly. Use null dates and priority 1 for disabled subtask criteria.",
         "Do not write task descriptions in this step. Descriptions are generated in a separate pass after local OIDs are assigned.",
         "Use YYYY-MM-DD dates.",
         `Today is ${today()}. Avoid weekends unless the source explicitly requires weekend work. Respect any local holiday or time-off rules described by the user instructions.`
@@ -1105,7 +1149,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     const parsed = JSON.parse(json);
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
-    parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels)).filter((task) => task.content), maxMainTasks, maxSubtasks);
+    parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
     parsed.semanticContext = context;
@@ -1122,6 +1166,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!mainTasks.length) return;
+    this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
     const json = await this.openaiResponse({
       model: this.settings.chatModel,
       jsonSchema: taskDescriptionSchema(),
@@ -1166,8 +1211,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const weakTasks = (tasks || []).map((task, index) => ({ task, index })).filter(({ task }) => !isUsefulDescriptionSummary(task.description, task.content, this.settings));
     if (weakTasks.length) {
+      this.setSidebarStatus(`Repairing ${weakTasks.length} weak task description${weakTasks.length === 1 ? "" : "s"}...`);
       await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions);
     }
+    this.setSidebarStatus("Finalizing task descriptions...");
     for (const task of tasks || []) {
       if (!isUsefulDescriptionSummary(task.description, task.content, this.settings)) {
         task.description = fallbackActionSummary(task, sourceSummary, context, sourceTitle, this.settings);
@@ -1289,12 +1336,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const tasks = plan.tasks || [];
         enforceGeneratedTaskLimits(tasks, this.settings);
         this.setSidebarStatus("Creating local email task OIDs...");
-        ensureGeneratedTaskMetadata(tasks, sectionName);
+        ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
         assignGeneratedTaskOids(tasks, this.settings);
         this.setSidebarStatus("Preparing descriptions and Todoist section...");
         const sectionIdPromise = this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName));
         const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], subject, plan.descriptionInstructions)
-          .then(() => addContextToTaskDescriptions(tasks, plan.contextNotes || [], { title: subject, path: "", text: emailSourceText }, this.settings, plan.semanticContext || []));
+          .then(() => {
+            this.setSidebarStatus("Adding email source context...");
+            addContextToTaskDescriptions(tasks, plan.contextNotes || [], { title: subject, path: "", text: emailSourceText }, this.settings, plan.semanticContext || []);
+          });
         const [sectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
         enforceGeneratedTaskLimits(tasks, this.settings);
         this.setSidebarStatus("Syncing Todoist section...");
@@ -1500,7 +1550,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!tasks.length) return { tasks: [], markdown: "" };
       this.setSidebarStatus("Creating local task OIDs...");
       enforceGeneratedTaskLimits(tasks, this.settings);
-      ensureGeneratedTaskMetadata(tasks, sectionName);
+      ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
       assignGeneratedTaskOids(tasks, this.settings);
       let preparedSectionId = "";
       this.setSidebarStatus(shouldInsert && shouldSyncAfterInsert ? "Preparing descriptions and Todoist section..." : "Writing task descriptions...");
@@ -1508,7 +1558,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         ? this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName))
         : Promise.resolve("");
       const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], active.title, plan.descriptionInstructions)
-        .then(() => addContextToTaskDescriptions(tasks, plan.contextNotes || [], active, this.settings, plan.semanticContext || []));
+        .then(() => {
+          this.setSidebarStatus("Adding source context to descriptions...");
+          addContextToTaskDescriptions(tasks, plan.contextNotes || [], active, this.settings, plan.semanticContext || []);
+        });
       [preparedSectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
       enforceGeneratedTaskLimits(tasks, this.settings);
       this.savePendingTaskDescriptions(active.path, tasks);
@@ -1516,7 +1569,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.saveSettings();
       const noteLines = taskPlanToMarkdown(tasks, this.settings);
       const contextSummary = renderContextSummary(plan.contextNotes || []);
-      const markdown = `${renderTaskHeading(this.settings)}\n\n${noteLines.join("\n")}${contextSummary ? `\n\n${contextSummary}` : ""}`;
+      const markdown = `${renderTaskHeading(this.settings, template)}\n\n${noteLines.join("\n")}${contextSummary ? `\n\n${contextSummary}` : ""}`;
       if (shouldInsert) {
         const file = this.app.vault.getAbstractFileByPath(active.path);
         this.cancelQueuedNoteSync(active.path);
@@ -1544,16 +1597,129 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  async runPromptTemplate(template, options = {}) {
+    if (isTaskGenerationTemplate(template)) {
+      return this.generateTaskListFromTemplate(template, options);
+    }
+    if (template?.createTasks !== false) {
+      return this.runPromptTemplateWithTaskGeneration(template, options);
+    }
+    return this.runPromptResponseTemplate(template, options);
+  }
+
+  async runPromptTemplateWithTaskGeneration(template, options = {}) {
+    const active = options.active || await this.getActiveMarkdownContext();
+    if (!active.path) throw new Error("Open a markdown note first.");
+    const shouldInsert = options.insertIntoNote ?? template.insertResponse ?? true;
+    const shouldSyncAfterInsert = options.syncAfterInsert ?? template.syncAfterInsert ?? false;
+    const responseResult = await this.runPromptResponseTemplate(template, Object.assign({}, options, {
+      active,
+      insertIntoNote: shouldInsert,
+      showNotice: false
+    }));
+    const taskTemplate = await this.resolveTaskGenerationTemplate(template);
+    this.setSidebarStatus(`Creating tasks with ${taskTemplate.name || "Prompts"}...`);
+    const taskResult = await this.generateTaskListFromTemplate(taskTemplate, Object.assign({}, options, {
+      active,
+      insertIntoNote: shouldInsert,
+      syncAfterInsert: shouldSyncAfterInsert,
+      showNotice: false
+    }));
+    if (options.showNotice) {
+      const action = shouldInsert ? (shouldSyncAfterInsert ? "inserted and synced" : "inserted") : "shown in chat only";
+      new Notice(`Ran "${template.name || "Prompt"}" and generated ${taskResult.tasks.length} main task${taskResult.tasks.length === 1 ? "" : "s"} with "${taskTemplate.name || "Prompts"}"; ${action}.`);
+    }
+    return Object.assign({}, responseResult, {
+      tasks: taskResult.tasks || [],
+      taskMarkdown: taskResult.markdown || "",
+      taskContextNotes: taskResult.contextNotes || [],
+      taskSemanticContext: taskResult.semanticContext || [],
+      taskTemplate
+    });
+  }
+
+  async runPromptResponseTemplate(template, options = {}) {
+    await this.ensureCompatibleEmbeddingForChatModel();
+    this.requireAiAccess();
+    const active = options.active || await this.getActiveMarkdownContext();
+    if (!active.path) throw new Error("Open a markdown note first.");
+    const shouldInsert = options.insertIntoNote ?? template.insertResponse ?? true;
+    this.setSidebarStatus("Running prompt...");
+    try {
+      const prompt = [
+        template.prompt || "",
+        "",
+        "Use the active note and relevant vault context. Follow the prompt instructions exactly. Do not create Todoist task syntax unless the prompt explicitly asks for it."
+      ].join("\n").trim();
+      const result = await this.chat(prompt, active, []);
+      const heading = renderPromptResponseHeading(template);
+      const markdown = `${heading}\n\n${result.answer || ""}`;
+      if (shouldInsert) {
+        const file = this.app.vault.getAbstractFileByPath(active.path);
+        if (!(file instanceof TFile)) throw new Error("Active note was not found.");
+        this.cancelQueuedNoteSync(active.path);
+        this.markInternalNoteWrite(active.path);
+        await this.app.vault.append(file, `\n\n${markdown}\n`);
+      }
+      if (options.showNotice) new Notice(`Ran prompt "${template.name || "Prompt"}"${shouldInsert ? " and inserted the response" : ""}.`);
+      return { answer: result.answer, markdown, contextNotes: contextNotesForTaskPlan(result.context || [], active.path, this.settings.taskContextSummaryMaxNotes), semanticContext: result.context || [], tasks: [] };
+    } finally {
+      this.setSidebarStatus("Ready");
+    }
+  }
+
+  async resolveTaskGenerationTemplate(selectedTemplate = null) {
+    const templates = await this.getPromptTemplates();
+    const candidates = templates.filter((template) => isTaskGenerationTemplate(template));
+    const configured = singleLine(this.settings.taskGenerationPromptTemplate || DEFAULT_SETTINGS.taskGenerationPromptTemplate);
+    const byConfigured = candidates.find((template) => template.source === configured || template.name === configured);
+    if (byConfigured) return byConfigured;
+    const defaultTemplate = candidates.find((template) => template.name === DEFAULT_SETTINGS.taskGenerationPromptTemplate);
+    if (defaultTemplate) return defaultTemplate;
+    if (candidates.length) return candidates[0];
+    return {
+      name: DEFAULT_SETTINGS.taskGenerationPromptTemplate,
+      prompt: "Scan the active note or selected text and generate a Todoist-ready task list. Use the shared task instructions. Include clear main tasks and subtasks only when they are actionable.",
+      createTasks: true,
+      insertResponse: true,
+      syncAfterInsert: true,
+      taskGenerationTemplate: true,
+      taskHeading: DEFAULT_TASK_HEADING
+    };
+  }
+
   async getPromptTemplates() {
-    const templates = [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in" }, template));
+    await this.ensurePromptTemplateFolder(false);
+    const templates = [];
     const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
-    if (!folder) return templates;
+    if (!folder) return [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in", createTasks: true }, template));
     const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${folder}/`));
     for (const file of files) {
       const text = await this.app.vault.cachedRead(file);
-      templates.push({ name: file.basename, prompt: text.trim(), source: file.path });
+      templates.push(parsePromptTemplateFile(file, text));
     }
-    return templates;
+    if (templates.length) return templates;
+    return [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in", createTasks: true }, template));
+  }
+
+  async ensurePromptTemplateFolder(showNotice = false) {
+    const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
+    if (!folder) return;
+    try {
+      await ensureVaultFolder(this.app, folder);
+      let created = 0;
+      for (const template of DEFAULT_PROMPT_TEMPLATE_FILES) {
+        const path = `${folder}/${template.filename}`;
+        const existingTemplate = this.app.vault.getAbstractFileByPath(path);
+        if (existingTemplate instanceof TFile) continue;
+        await this.app.vault.create(path, promptTemplateFileText(template));
+        created += 1;
+      }
+      if (showNotice && created) new Notice(`Prompt template folder updated: ${folder}`);
+    } catch (error) {
+      this.logLocal("Prompt template folder setup failed", { error: error.message || String(error) });
+      if (showNotice) new Notice(`Prompt template folder setup failed: ${error.message || error}`);
+    }
   }
 
   async syncNoteTasks(showNotice = true, fullScan = true) {
@@ -1684,7 +1850,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           const parsed = parseTaskLine(lines[i], i, file.path, lines, oldSettings) || parseTaskReferenceLine(lines[i], i, file.path, oldSettings);
           if (!parsed?.content) continue;
           const parentId = findMatchedParentId(parsed, lines, matchedByLine);
-          const legacyId = shouldConvertLegacyTodoistIds(this.settings) ? getLegacyTodoistId(lines[i]) : "";
+          const legacyId = (shouldConvertLegacyTodoistIds(this.settings) || hasSemanticSyncMarker(lines[i], this.settings)) ? getLegacyTodoistId(lines[i]) : "";
           const oidId = parsed.oid ? todoistIdForOid(oldSettings, parsed.oid) : "";
           let match = legacyId ? remoteById.get(legacyId) : null;
           if (match) stats.directIdMatches += 1;
@@ -1889,8 +2055,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       } else {
         const cachedId = this.findCachedTaskIdForParsedTask(parsed);
         if (cachedId) {
+          const cached = this.settings.taskCache?.[cachedId] || {};
           parsed.id = cachedId;
           parsed.oid = parsed.oid || oidForTodoistId(this.settings, cachedId) || generateUniqueOid(this.settings);
+          parsed.projectId = cached.projectId || parsed.projectId || "";
+          parsed.projectName = cached.projectName || parsed.projectName || "";
+          parsed.sectionId = cached.sectionId || parsed.sectionId || "";
+          parsed.section = cached.section || parsed.section || "";
           Object.assign(parsed, this.descriptionStateForParsedTask(parsed));
           presentIds.add(cachedId);
           existingUpdates.push(parsed);
@@ -1920,7 +2091,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (creations.length) this.setSidebarStatus(`Creating ${creations.length} Todoist task${creations.length === 1 ? "" : "s"}...`);
     const tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp);
     for (const parsed of relinked) {
-      lines[parsed.lineNumber] = addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid);
+      lines[parsed.lineNumber] = syncProjectMarkerOnTaskLine(addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid), parsed, this.settings);
       changed = true;
       stats.relinked += 1;
     }
@@ -2015,14 +2186,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async relinkCreationsToExistingTodoistTasks(creations, lineToTemp) {
     if (!creations.length) return [];
-    const projectId = await this.getTaskProjectId();
     let existing = [];
     try {
-      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
-      existing = snapshot.tasks.filter((task) => String(task.projectId || "") === String(projectId));
+      const remote = await this.getAllTodoistReferenceTasks({ force: false });
+      existing = remote.tasks;
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for relink check", { error: error.message || String(error) });
-      existing = await this.getTodoistProjectTasks(projectId);
+      existing = await this.getTodoistProjectTasks(await this.getTaskProjectId());
     }
     if (!existing.length) return [];
     const relinked = [];
@@ -2034,6 +2204,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       task.id = match.id;
       task.oid = task.oid || oidForTodoistId(this.settings, match.id) || generateUniqueOid(this.settings);
       task.description = task.description || match.description || "";
+      task.sectionId = match.sectionId || task.sectionId || "";
+      task.section = match.section || task.section || "";
+      task.projectId = match.projectId || task.projectId || "";
+      task.projectName = match.projectName || task.projectName || "";
       relinked.push(task);
       creations.splice(i, 1);
     }
@@ -2630,6 +2804,7 @@ class SemanticTodoistView extends ItemView {
     this.plugin = plugin;
     this.messages = [];
     this.selectedPath = "";
+    this.includeActiveNote = plugin.settings.searchIncludeActiveNote !== false;
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -2694,11 +2869,22 @@ class SemanticTodoistView extends ItemView {
       }
     };
     this.noteResultsEl = picker.createDiv({ cls: "semantic-todoist-note-results" });
+    const includeRow = container.createDiv({ cls: "semantic-todoist-context-toggle" });
+    const includeLabel = includeRow.createEl("label");
+    const includeCheckbox = includeLabel.createEl("input", { type: "checkbox" });
+    includeCheckbox.checked = this.includeActiveNote;
+    includeLabel.createSpan({ text: "Include active note in chat search" });
+    includeCheckbox.onchange = async () => {
+      this.includeActiveNote = includeCheckbox.checked;
+      this.plugin.settings.searchIncludeActiveNote = this.includeActiveNote;
+      await this.plugin.saveSettings();
+      this.refreshActiveSummary();
+    };
     this.activeSummaryEl = container.createDiv({ cls: "semantic-todoist-active-summary" });
     this.relevantEl = container.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = container.createDiv({ cls: "semantic-todoist-conversation" });
-    this.promptEl = container.createEl("textarea", { placeholder: "Ask about your vault or draft a task prompt..." });
+    this.promptEl = container.createEl("textarea", { placeholder: "Ask about your vault or draft a prompt..." });
     this.promptEl.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       event.preventDefault();
@@ -2708,21 +2894,24 @@ class SemanticTodoistView extends ItemView {
     toolbar.createEl("button", { text: "Ask" }).onclick = async () => {
       await this.ask();
     };
+    toolbar.createEl("button", { text: "Tasks" }).onclick = async () => {
+      await this.runDefaultTaskPrompt();
+    };
     toolbar.createEl("button", { text: "New chat" }).onclick = () => {
       this.messages = [];
       this.renderMessages();
       this.renderRelevantNotes([]);
       this.setStatus("Ready");
     };
-    toolbar.createEl("button", { text: "Task Template" }).onclick = async () => {
+    toolbar.createEl("button", { text: "Prompts" }).onclick = async () => {
       const templates = await this.plugin.getPromptTemplates();
       new TaskTemplateModal(this.plugin.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
         try {
-          this.setStatus("Creating tasks...");
-          const active = await this.getSelectedActiveContext();
-          const result = await this.plugin.generateTaskListFromTemplate(template, { active, insertIntoNote, syncAfterInsert, showNotice: true });
-          this.addMessage("user", `Template: ${template.name}`);
-          this.addMessage("assistant", result.markdown || "No actionable tasks found.");
+          this.setStatus(template.createTasks === false ? "Running prompt..." : "Creating tasks...");
+          const active = await this.getSelectedActiveContext({ forceInclude: true });
+          const result = await this.plugin.runPromptTemplate(template, { active, insertIntoNote, syncAfterInsert, showNotice: true });
+          this.addMessage("user", `Prompt: ${template.name}`);
+          this.addMessage("assistant", result.markdown || result.answer || "No response generated.");
           this.setStatus("Ready");
         } catch (error) {
           console.error(error);
@@ -2760,6 +2949,25 @@ class SemanticTodoistView extends ItemView {
     }
   }
 
+  async runDefaultTaskPrompt() {
+    try {
+      this.setStatus("Creating tasks...");
+      const active = await this.getSelectedActiveContext({ forceInclude: true });
+      if (!active.path) throw new Error("Open a markdown note first.");
+      const template = await this.plugin.resolveTaskGenerationTemplate();
+      const insertIntoNote = template.insertResponse !== false;
+      const syncAfterInsert = template.syncAfterInsert === true;
+      const result = await this.plugin.runPromptTemplate(template, { active, insertIntoNote, syncAfterInsert, showNotice: true });
+      this.addMessage("user", `Tasks: ${template.name || "Default task prompt"}`);
+      this.addMessage("assistant", result.markdown || "No actionable tasks found.");
+      this.setStatus("Ready");
+    } catch (error) {
+      console.error(error);
+      this.addMessage("assistant", `Error: ${error.message || error}`);
+      this.setStatus(`Task creation failed: ${error.message || error}`);
+    }
+  }
+
   setStatus(message = "Ready") {
     this.currentStatus = message || "Ready";
     if (!this.statusEl) return;
@@ -2778,7 +2986,8 @@ class SemanticTodoistView extends ItemView {
     }
   }
 
-  async getSelectedActiveContext() {
+  async getSelectedActiveContext(options = {}) {
+    if (!options.forceInclude && !this.includeActiveNote) return { title: "", path: "", text: "", selection: "" };
     return this.plugin.getActiveMarkdownContext(this.selectedPath);
   }
 
@@ -2832,6 +3041,10 @@ class SemanticTodoistView extends ItemView {
     const active = await this.getSelectedActiveContext();
     if (!this.activeSummaryEl) return;
     this.activeSummaryEl.empty();
+    if (!this.includeActiveNote) {
+      this.activeSummaryEl.setText("Active note excluded from chat search.");
+      return;
+    }
     if (!active.path) {
       this.activeSummaryEl.setText("No active note selected.");
       if (!this.noteSearchDirty && this.noteInputEl) this.noteInputEl.value = "";
@@ -2847,12 +3060,13 @@ class SemanticTodoistView extends ItemView {
     if (!this.relevantEl) return;
     this.relevantEl.empty();
     this.relevantEl.createEl("strong", { text: "Relevant notes" });
-    if (!chunks.length) {
+    const uniqueChunks = uniqueChunksByPath(chunks);
+    if (!uniqueChunks.length) {
       this.relevantEl.createDiv({ text: "No relevant notes found." });
       return;
     }
     const tabs = this.relevantEl.createDiv({ cls: "semantic-todoist-source-tabs" });
-    for (const chunk of chunks.slice(0, 3)) {
+    for (const chunk of uniqueChunks.slice(0, 3)) {
       const card = tabs.createDiv({ cls: "semantic-todoist-source-card" });
       card.setText(shortTitle(chunk.title || chunk.path, 18));
       card.title = chunk.path;
@@ -3070,18 +3284,20 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 
   renderBasic(containerEl) {
-    settingsHeading(containerEl, "AI Model", "Choose the model used for sidebar answers, task extraction, task description writing, and prompt templates. The embedding model is automatically kept on the same provider when the selected AI model changes.");
+    settingsHeading(containerEl, "AI Model", "Choose the model used for sidebar answers, task extraction, task description writing, and prompts. The embedding model is automatically kept on the same provider when the selected AI model changes.");
     modelDropdownSetting(containerEl, "Default AI model", "Used for sidebar chat, vault question-answering, and task generation.", this.plugin, "chatModel", "availableChatModels");
-    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic vault search and active-note context for sourced answers. Chat is a lighter general conversation mode. Task Creation is for prompt templates that generate Todoist-ready tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
+    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic vault search and active-note context for sourced answers. Chat is a lighter general conversation mode. Task Creation is for prompts that generate Todoist-ready tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
     dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
     numberSetting(containerEl, "Chat font size px", this.plugin, "chatFontSizePx");
     toggleSetting(containerEl, "Auto-add active content to context", "Include active note content in sidebar chat.", this.plugin, "autoAddActiveContentToContext");
+    toggleSetting(containerEl, "Include active note in sidebar search by default", "The sidebar switch can still be changed per session.", this.plugin, "searchIncludeActiveNote");
     numberSetting(containerEl, "Max chat context chunks", this.plugin, "maxChatContextChunks");
     numberSetting(containerEl, "Max active-note context characters", this.plugin, "maxActiveNoteContextChars");
-    settingsHeading(containerEl, "Prompt Templates");
-    textSetting(containerEl, "Prompt templates folder", "Markdown files in this folder appear as command-palette task prompt templates.", this.plugin, "promptTemplatesFolder");
+    settingsHeading(containerEl, "Prompts");
+    textSetting(containerEl, "Prompts folder", "Markdown files in this folder appear as command-palette prompts.", this.plugin, "promptTemplatesFolder");
+    taskGenerationPromptTemplateSetting(containerEl, this.plugin);
     new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
-    new Setting(containerEl).setName("Run task prompt template").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
+    new Setting(containerEl).setName("Run prompts").setDesc("Runs custom prompts. Prompts can insert plain AI responses or create task lists when createTasks is true.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
   }
 
   renderApi(containerEl) {
@@ -3134,6 +3350,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
     numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
+    subtaskCriteriaSettings(containerEl, this.plugin);
     new Setting(containerEl).setName("Last email poll").setDesc(this.plugin.settings.lastEmailPollAt || "Not yet polled.");
     new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
     taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
@@ -3149,12 +3366,12 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Automatic sync interval seconds", this.plugin, "syncIntervalSeconds");
     numberSetting(containerEl, "Sync worker count", this.plugin, "syncWorkerCount");
     settingsHeading(containerEl, "Note Task Formatting");
-    toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// task links instead of web links.", this.plugin, "linksAppURI");
+    toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// task links instead of web links when the AI references tasks from the local OID table.", this.plugin, "linksAppURI");
     toggleSetting(containerEl, "Obsidian Tasks date/link order", "Place Todoist metadata before due/deadline markers to reduce parsing issues.", this.plugin, "obsidianTasksDateOrder");
     numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
     toggleSetting(containerEl, "Insert generated task list into note", "AI-generated note tasks are written into the active note.", this.plugin, "insertGeneratedTasksIntoNote");
     toggleSetting(containerEl, "Sync after inserting generated tasks", "Immediately create Todoist tasks after inserting generated note tasks.", this.plugin, "syncAfterInsertingGeneratedTasks");
-    textSetting(containerEl, "Generated task heading", "Heading inserted above generated note task lists.", this.plugin, "taskHeadingTemplate");
+    subtaskCriteriaSettings(containerEl, this.plugin);
     settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
     numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
@@ -3265,48 +3482,56 @@ class TaskTemplateModal extends Modal {
     this.templates = templates;
     this.onSubmit = onSubmit;
     this.selectedIndex = 0;
-    this.insertIntoNote = defaults.insertIntoNote ?? true;
-    this.syncAfterInsert = defaults.syncAfterInsert ?? true;
+  }
+
+  selectedTemplate() {
+    return this.templates[this.selectedIndex] || {};
+  }
+
+  selectedTemplateCreatesTasks() {
+    return this.selectedTemplate().createTasks !== false;
+  }
+
+  selectedTemplateChoices(template = this.selectedTemplate()) {
+    const createsTasks = template.createTasks !== false;
+    const insertIntoNote = template.insertResponse !== false;
+    const syncAfterInsert = createsTasks && insertIntoNote && template.syncAfterInsert === true;
+    return { createsTasks, insertIntoNote, syncAfterInsert };
   }
 
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Run Task Prompt Template" });
+    contentEl.createEl("h2", { text: "Run Prompts" });
     if (!this.templates.length) {
-      contentEl.createDiv({ text: "No prompt templates found." });
+      contentEl.createDiv({ text: "No prompts found." });
       return;
     }
     const preview = contentEl.createEl("textarea");
     preview.addClass("semantic-todoist-template-preview");
     preview.value = this.templates[0].prompt;
-    new Setting(contentEl).setName("Template").addDropdown((dropdown) => {
-      this.templates.forEach((template, index) => dropdown.addOption(String(index), `${template.name} (${template.source || "template"})`));
+    const modeEl = contentEl.createDiv({ cls: "semantic-todoist-template-mode" });
+    const choicesEl = contentEl.createDiv({ cls: "semantic-todoist-template-choices" });
+    const updateMode = () => {
+      const template = this.selectedTemplate();
+      const choices = this.selectedTemplateChoices(template);
+      modeEl.setText(choices.createsTasks ? "Prompt: generates tasks" : "Prompt: response");
+      choicesEl.setText(`Generate tasks: ${yesNo(choices.createsTasks)} | Insert: ${yesNo(choices.insertIntoNote)} | Sync to Todoist: ${yesNo(choices.syncAfterInsert)}`);
+    };
+    new Setting(contentEl).setName("Prompt").addDropdown((dropdown) => {
+      this.templates.forEach((template, index) => dropdown.addOption(String(index), `${template.name} (${template.source || "prompt"})`));
       dropdown.onChange((value) => {
         this.selectedIndex = Number(value);
         preview.value = this.templates[this.selectedIndex].prompt;
+        updateMode();
       });
     });
-    let syncToggle;
-    new Setting(contentEl).setName("Insert response into active note").setDesc("Write the generated task lines into the active note. Leave this off to preview the task list in chat only.").addToggle((toggle) => toggle.setValue(this.insertIntoNote).onChange((value) => {
-      this.insertIntoNote = value;
-      if (!value) this.syncAfterInsert = false;
-      if (syncToggle) {
-        syncToggle.setValue(this.syncAfterInsert);
-        syncToggle.setDisabled(!this.insertIntoNote);
-      }
-    }));
-    new Setting(contentEl).setName("Sync inserted tasks to Todoist").setDesc("Available only when the task list is inserted into the note first.").addToggle((toggle) => {
-      syncToggle = toggle;
-      toggle.setValue(this.insertIntoNote && this.syncAfterInsert).setDisabled(!this.insertIntoNote).onChange((value) => {
-        this.syncAfterInsert = this.insertIntoNote && value;
-        toggle.setValue(this.syncAfterInsert);
-      });
-    });
+    updateMode();
     new Setting(contentEl).addButton((button) => button.setButtonText("Run").setCta().onClick(async () => {
       this.close();
       const template = Object.assign({}, this.templates[this.selectedIndex], { prompt: preview.value });
-      await this.onSubmit({ template, insertIntoNote: this.insertIntoNote, syncAfterInsert: this.syncAfterInsert });
+      const choices = this.selectedTemplateChoices(template);
+      await this.onSubmit({ template, insertIntoNote: choices.insertIntoNote, syncAfterInsert: choices.syncAfterInsert });
     }));
   }
 
@@ -3324,7 +3549,7 @@ function settingsHeading(containerEl, name, desc = "") {
 function taskInstructionSettings(containerEl, plugin, heading, prefix) {
   const desc = prefix === "email"
     ? "Plain-language instructions used only when creating tasks from Cloudflare email content."
-    : "Plain-language instructions used only when creating tasks from notes, selected text, or note prompt templates.";
+    : "Plain-language instructions used only when creating tasks from notes, selected text, or note prompts.";
   settingsHeading(containerEl, heading, desc);
   textAreaSetting(containerEl, "Main Task", plugin, `${prefix}MainTaskInstructions`);
   textAreaSetting(containerEl, "Subtasks", plugin, `${prefix}SubtaskInstructions`);
@@ -3335,12 +3560,22 @@ function taskInstructionSettings(containerEl, plugin, heading, prefix) {
   textAreaSetting(containerEl, "Descriptions and links", plugin, `${prefix}DescriptionInstructions`);
 }
 
+function subtaskCriteriaSettings(containerEl, plugin) {
+  settingsHeading(containerEl, "Subtask Criteria", "Choose which metadata is allowed on generated or synced subtasks. Disabled criteria are omitted from note syntax and Todoist subtask payloads.");
+  toggleSetting(containerEl, "Subtask labels", "Allow configured labels on subtasks.", plugin, "subtaskIncludeLabels");
+  toggleSetting(containerEl, "Subtask priority", "Allow priority markers and Todoist priority on subtasks.", plugin, "subtaskIncludePriority");
+  toggleSetting(containerEl, "Subtask due date", "Allow due dates on subtasks.", plugin, "subtaskIncludeDueDate");
+  toggleSetting(containerEl, "Subtask deadline", "Allow deadline markers on subtasks.", plugin, "subtaskIncludeDeadline");
+}
+
 const SETTING_DESCRIPTIONS = {
   defaultOpenArea: "Choose where the sidebar opens in Obsidian.",
   chatFontSizePx: "Controls only the sidebar chat text size.",
+  searchIncludeActiveNote: "Default for whether sidebar chat queries include the active note alongside semantic vault search.",
   maxChatContextChunks: "Maximum number of semantic search results sent to the AI for vault Q&A.",
   maxActiveNoteContextChars: "Maximum active-note characters sent to the AI for normal chat. Task creation can use a separate note limit.",
-  promptTemplatesFolder: "Markdown files in this folder become reusable task-generation prompts.",
+  promptTemplatesFolder: "Markdown files in this folder become reusable AI prompts. Frontmatter can set createTasks, insertResponse, and syncTasks.",
+  taskGenerationPromptTemplate: "Prompt used as the separate Todoist task creation pass when a regular prompt also has createTasks enabled.",
   openaiApiKey: "Optional. Required only when you choose an OpenAI chat or embedding model.",
   googleApiKey: "Required for the default Gemini setup. Create this in Google AI Studio and paste it here.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
@@ -3368,12 +3603,15 @@ const SETTING_DESCRIPTIONS = {
   notesAutoSync: "When enabled, changed note task lines sync with Todoist while Obsidian is open.",
   syncIntervalSeconds: "How often automatic Notes-To-Todoist checks run while Obsidian is open.",
   syncWorkerCount: "Number of local note files processed in parallel during note sync.",
-  linksAppURI: "Use Todoist app links instead of Todoist web links for generated OID references.",
+  linksAppURI: "Use Todoist app links instead of Todoist web links when sidebar answers reference tasks from the local OID table.",
   obsidianTasksDateOrder: "Keeps metadata ordered to work better with the Obsidian Tasks plugin.",
   subtaskIndentSpaces: "Number of leading spaces used when inserting generated subtasks.",
+  subtaskIncludeLabels: "Allow Todoist labels on subtasks.",
+  subtaskIncludePriority: "Allow priority markers and Todoist priority on subtasks.",
+  subtaskIncludeDueDate: "Allow due dates on subtasks.",
+  subtaskIncludeDeadline: "Allow deadline dates on subtasks.",
   insertGeneratedTasksIntoNote: "When enabled, generated note tasks are written into the active note.",
   syncAfterInsertingGeneratedTasks: "When enabled, inserted generated tasks are immediately created or updated in Todoist.",
-  taskHeadingTemplate: "Heading inserted above generated note task lists.",
   maxNoteChars: "Maximum note text sent to the AI for task extraction.",
   todoistDescriptionMaxChars: "Maximum generated description characters before the source list is added.",
   autoRebuildReferences: "Low-frequency reconciliation of the local OID reference table against Todoist.",
@@ -3473,6 +3711,36 @@ function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
       await plugin.saveSettings();
     });
   });
+}
+
+function taskGenerationPromptTemplateSetting(containerEl, plugin) {
+  const current = plugin.settings.taskGenerationPromptTemplate || DEFAULT_SETTINGS.taskGenerationPromptTemplate;
+  new Setting(containerEl)
+    .setName("Task generation prompt")
+    .setDesc("Used as the separate Todoist task creation pass when a prompt response template also has createTasks enabled.")
+    .addDropdown((dropdown) => {
+      dropdown.addOption(current, current);
+      dropdown.setValue(current);
+      dropdown.onChange(async (value) => {
+        plugin.settings.taskGenerationPromptTemplate = value;
+        await plugin.saveSettings();
+      });
+      plugin.getPromptTemplates().then((templates) => {
+        const candidates = templates.filter((template) => isTaskGenerationTemplate(template));
+        if (dropdown.selectEl) dropdown.selectEl.empty();
+        const values = new Set();
+        for (const template of candidates) {
+          const value = template.source || template.name;
+          if (!value || values.has(value)) continue;
+          values.add(value);
+          dropdown.addOption(value, template.name || value);
+        }
+        if (!values.has(current)) dropdown.addOption(current, current);
+        dropdown.setValue(values.has(current) ? current : (candidates[0]?.source || candidates[0]?.name || current));
+      }).catch((error) => {
+        console.error("Could not load task generation templates", error);
+      });
+    });
 }
 
 function todoistProjectSetting(containerEl, plugin, refreshDisplay) {
@@ -3608,6 +3876,72 @@ function setupStatusSetting(containerEl, name, desc, buttons = []) {
   for (const [label, onClick] of buttons) {
     setting.addButton((button) => button.setButtonText(label).onClick(onClick));
   }
+}
+
+function parsePromptTemplateFile(file, text) {
+  const parsed = parseSimpleFrontmatter(text);
+    return {
+      name: parsed.meta.name || file.basename,
+      prompt: parsed.body.trim(),
+      source: file.path,
+      createTasks: parseTemplateBoolean(parsed.meta.createTasks ?? parsed.meta.create_tasks ?? parsed.meta.makeTasks ?? parsed.meta.make_tasks, false),
+      insertResponse: parseTemplateBoolean(parsed.meta.insertResponse ?? parsed.meta.insert_response, true),
+      syncAfterInsert: parseTemplateBoolean(parsed.meta.syncTasks ?? parsed.meta.sync_tasks ?? parsed.meta.syncAfterInsert ?? parsed.meta.sync_after_insert, false),
+      taskHeading: parsed.meta.taskHeading || parsed.meta.task_heading || parsed.meta.heading || "",
+      taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only)
+    };
+}
+
+function parseSimpleFrontmatter(text) {
+  const value = String(text || "");
+  if (!value.startsWith("---")) return { meta: {}, body: value };
+  const end = value.indexOf("\n---", 3);
+  if (end < 0) return { meta: {}, body: value };
+  const raw = value.slice(3, end).trim();
+  const body = value.slice(end + 4).replace(/^\s*\n/, "");
+  const meta = {};
+  for (const line of raw.split("\n")) {
+    const match = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
+    if (!match) continue;
+    meta[match[1]] = match[2].replace(/^["']|["']$/g, "").trim();
+  }
+  return { meta, body };
+}
+
+function parseTemplateBoolean(value, fallback) {
+  if (value == null || value === "") return fallback;
+  return /^(true|yes|1|on)$/i.test(String(value).trim());
+}
+
+function parseOptionalTemplateBoolean(value) {
+  if (value == null || value === "") return null;
+  return /^(true|yes|1|on)$/i.test(String(value).trim());
+}
+
+function isTaskGenerationTemplate(template = {}) {
+  if (template.taskGenerationTemplate != null) return Boolean(template.taskGenerationTemplate);
+  const text = `${template.name || ""}\n${template.prompt || ""}`;
+  if (!template.createTasks) return false;
+  return /\b(todoist-ready task list|generate(?: only)? .*tasks?|follow-up tasks|task extraction)\b/i.test(text) &&
+    !/\bsummary\b/i.test(template.name || "");
+}
+
+function promptTemplateFileText(template) {
+  return [
+    "---",
+    `createTasks: ${Boolean(template.createTasks)}`,
+    `insertResponse: ${template.insertResponse !== false}`,
+    `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
+    ...(template.taskGenerationTemplate != null ? [`taskGenerationTemplate: ${Boolean(template.taskGenerationTemplate)}`] : []),
+    ...(template.createTasks ? [`taskHeading: '${template.taskHeading || DEFAULT_TASK_HEADING}'`] : []),
+    "---",
+    "",
+    template.prompt || ""
+  ].join("\n");
+}
+
+function yesNo(value) {
+  return value ? "Yes" : "No";
 }
 
 function aiSetupSummary(settings) {
@@ -3843,32 +4177,35 @@ function taskDescriptionSchema() {
   };
 }
 
-function cleanTask(task, allowedLabels = null) {
-  return cleanTaskWithRole(task, allowedLabels, false);
+function cleanTask(task, allowedLabels = null, settings = DEFAULT_SETTINGS) {
+  return cleanTaskWithRole(task, allowedLabels, false, settings);
 }
 
-function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false) {
-  const labels = (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
+function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false, settings = DEFAULT_SETTINGS) {
+  const labels = isSubtask && !settings.subtaskIncludeLabels
+    ? []
+    : (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
   return {
     content: clamp(singleLine(task.content || ""), 250),
     description: isSubtask ? "" : cleanGeneratedDescriptionSummary(task.description || ""),
-    due_date: validDate(task.due_date) ? task.due_date : null,
-    deadline_date: validDate(task.deadline_date) ? task.deadline_date : null,
-    priority: normalizePriority(task.priority),
+    due_date: validDate(task.due_date) && (!isSubtask || settings.subtaskIncludeDueDate) ? task.due_date : null,
+    deadline_date: validDate(task.deadline_date) && (!isSubtask || settings.subtaskIncludeDeadline) ? task.deadline_date : null,
+    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority),
     labels,
-    subtasks: (task.subtasks || []).map((subtask) => cleanTaskWithRole(Object.assign({}, subtask, { due_date: null, deadline_date: null }), allowedLabels, true)).filter((subtask) => subtask.content)
+    subtasks: (task.subtasks || []).map((subtask) => cleanTaskWithRole(subtask, allowedLabels, true, settings)).filter((subtask) => subtask.content)
   };
 }
 
 function todoistTaskArgs(task, location, settings = DEFAULT_SETTINGS) {
+  const isSubtask = Boolean(location?.parent_id || task.isSubtask);
   const args = Object.assign({
     content: clamp(singleLine(task.content), 250),
-    priority: normalizePriority(task.priority),
-    labels: (task.labels || []).map(cleanLabel).filter(Boolean)
+    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority),
+    labels: isSubtask && !settings.subtaskIncludeLabels ? [] : (task.labels || []).map(cleanLabel).filter(Boolean)
   }, location || {});
   if (!location?.parent_id && isRichTodoistDescription(task.description)) args.description = formatTodoistDescription(task.description, settings);
-  if (task.due_date) args.due = { date: task.due_date };
-  if (task.deadline_date) args.deadline = { date: task.deadline_date };
+  if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate)) args.due = { date: task.due_date };
+  if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline)) args.deadline = { date: task.deadline_date };
   return args;
 }
 
@@ -4094,7 +4431,7 @@ function flattenTaskPlan(tasks) {
   return flat;
 }
 
-function ensureGeneratedTaskMetadata(tasks, sectionName) {
+function ensureGeneratedTaskMetadata(tasks, sectionName, settings = DEFAULT_SETTINGS) {
   const fallbackDate = nextBusinessDate(5);
   for (const task of tasks || []) {
     task.section = sectionName;
@@ -4102,25 +4439,32 @@ function ensureGeneratedTaskMetadata(tasks, sectionName) {
     if (!task.due_date) task.due_date = task.deadline_date;
     for (const subtask of task.subtasks || []) {
       subtask.section = "";
-      subtask.due_date = null;
-      subtask.deadline_date = null;
+      if (!settings.subtaskIncludeDueDate) subtask.due_date = null;
+      if (!settings.subtaskIncludeDeadline) subtask.deadline_date = null;
       subtask.description = "";
     }
   }
 }
 
-function renderTaskHeading(settings) {
-  const template = settings.taskHeadingTemplate || DEFAULT_SETTINGS.taskHeadingTemplate;
-  return template.replace(/\{\{date\}\}/g, today());
+function renderTaskHeading(settings, template = null) {
+  const value = template?.taskHeading || DEFAULT_TASK_HEADING;
+  const heading = singleLine(value).replace(/\{\{date\}\}/g, today()) || DEFAULT_TASK_HEADING;
+  return /^#{1,6}\s+/.test(heading) ? heading : `## ${heading}`;
+}
+
+function renderPromptResponseHeading(template = {}) {
+  const value = template.taskHeading || `## Semantic Todoist Sync - ${singleLine(template.name || "Prompt Response")}`;
+  const heading = singleLine(value).replace(/\{\{date\}\}/g, today());
+  return /^#{1,6}\s+/.test(heading) ? heading : `## ${heading}`;
 }
 
 function parsedTaskToLine(task, settings, id) {
   const oid = ensureTaskOid(settings, task, id);
   const tag = task.isSubtask ? settings.subtaskSyncTag : settings.syncTag;
-  const labels = (task.labels || []).filter(Boolean).map((label) => `#${cleanLabel(label)}`).join(" ");
-  const deadline = task.deadline_date ? ` {{${task.deadline_date}}}` : "";
-  const due = task.due_date ? ` 📅 ${task.due_date}` : "";
-  const priority = ` !!${normalizePriority(task.priority)}`;
+  const labels = (!task.isSubtask || settings.subtaskIncludeLabels) ? (task.labels || []).filter(Boolean).map((label) => `#${cleanLabel(label)}`).join(" ") : "";
+  const deadline = task.deadline_date && (!task.isSubtask || settings.subtaskIncludeDeadline) ? ` {{${task.deadline_date}}}` : "";
+  const due = task.due_date && (!task.isSubtask || settings.subtaskIncludeDueDate) ? ` 📅 ${task.due_date}` : "";
+  const priority = (!task.isSubtask || settings.subtaskIncludePriority) ? ` !!${normalizePriority(task.priority)}` : "";
   const section = task.section ? ` ///${task.section}` : "";
   const project = task.projectName ? ` ${projectMarker(task.projectName)}` : "";
   const link = oid ? ` ${oidLink(oid, id, settings)}` : "";
@@ -4246,16 +4590,18 @@ function remoteTaskComparableSignature(remote, parsed, settings = DEFAULT_SETTIN
 function todoistUpdatePayload(task, remote = null, settings = DEFAULT_SETTINGS) {
   const updates = {};
   if (!remote || singleLine(remote.content || "") !== singleLine(task.content || "")) updates.content = task.content;
-  const localLabels = (task.labels || []).map(cleanLabel).filter(Boolean).sort();
+  const isSubtask = Boolean(task.isSubtask);
+  const localLabels = (isSubtask && !settings.subtaskIncludeLabels ? [] : (task.labels || [])).map(cleanLabel).filter(Boolean).sort();
   const remoteLabels = (remote?.labels || []).map(cleanLabel).filter(Boolean).sort();
-  if (!remote || JSON.stringify(localLabels) !== JSON.stringify(remoteLabels)) updates.labels = task.labels;
-  if (!remote || normalizePriority(remote.priority) !== normalizePriority(task.priority)) updates.priority = task.priority;
+  if (!remote || JSON.stringify(localLabels) !== JSON.stringify(remoteLabels)) updates.labels = localLabels;
+  const localPriority = isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority);
+  if (!remote || normalizePriority(remote.priority) !== localPriority) updates.priority = localPriority;
   const localDescription = !task.isSubtask && task.descriptionShouldSync && isRichTodoistDescription(task.description)
     ? formatTodoistDescription(task.description, settings)
     : "";
   if (localDescription && (!remote || String(remote.description || "").trim() !== localDescription.trim())) updates.description = localDescription;
-  if (task.due_date && (!remote || (remote.dueDate || "") !== task.due_date)) updates.due_date = task.due_date;
-  if (task.deadline_date && (!remote || (remote.deadlineDate || "") !== task.deadline_date)) updates.deadline_date = task.deadline_date;
+  if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate) && (!remote || (remote.dueDate || "") !== task.due_date)) updates.due_date = task.due_date;
+  if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline) && (!remote || (remote.deadlineDate || "") !== task.deadline_date)) updates.deadline_date = task.deadline_date;
   return updates;
 }
 
@@ -4367,17 +4713,18 @@ function parseTaskReferenceLine(line, lineNumber, path, settings) {
 }
 
 function todoistArgsFromParsedTask(task, projectId, parent, sectionId, settings = DEFAULT_SETTINGS) {
+  const isSubtask = Boolean(parent || task.isSubtask);
   const args = {
     content: task.content,
-    labels: task.labels,
-    priority: task.priority
+    labels: isSubtask && !settings.subtaskIncludeLabels ? [] : task.labels,
+    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : task.priority
   };
   if (!parent && !task.isSubtask && isRichTodoistDescription(task.description)) args.description = formatTodoistDescription(task.description, settings);
   if (parent) args.parent_id = parent;
   else if (sectionId) args.section_id = sectionId;
   else args.project_id = projectId;
-  if (task.due_date) args.due = { date: task.due_date };
-  if (task.deadline_date) args.deadline = { date: task.deadline_date };
+  if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate)) args.due = { date: task.due_date };
+  if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline)) args.deadline = { date: task.deadline_date };
   return args;
 }
 
@@ -4410,7 +4757,13 @@ function oidLink(oid) {
 
 function getTodoistId(line, settings = null) {
   const oid = getTaskOid(line);
-  return (settings ? todoistIdForOid(settings, oid) : "") || (shouldConvertLegacyTodoistIds(settings) ? getLegacyTodoistId(line) : "");
+  const shouldReadLegacy = shouldConvertLegacyTodoistIds(settings) || hasSemanticSyncMarker(line, settings);
+  return (settings ? todoistIdForOid(settings, oid) : "") || (shouldReadLegacy ? getLegacyTodoistId(line) : "");
+}
+
+function hasSemanticSyncMarker(line, settings = DEFAULT_SETTINGS) {
+  const text = String(line || "");
+  return Boolean(settings && (text.includes(settings.syncTag) || text.includes(settings.subtaskSyncTag)));
 }
 
 function getLegacyTodoistId(line) {
@@ -4748,6 +5101,18 @@ function mergeChunks(...groups) {
   return merged;
 }
 
+function uniqueChunksByPath(chunks) {
+  const seen = new Set();
+  const unique = [];
+  for (const chunk of chunks || []) {
+    const key = chunk.path || chunk.id || singleLine(chunk.title || "");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(chunk);
+  }
+  return unique;
+}
+
 function mergeContextCandidates(...groups) {
   const byId = new Map();
   for (const group of groups) {
@@ -4825,6 +5190,15 @@ function recencyBoost(modifiedAt) {
 
 function labelsAllowedByInstructions(text) {
   return new Set((String(text || "").match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+}
+
+function subtaskCriteriaInstructions(settings = DEFAULT_SETTINGS) {
+  return [
+    settings.subtaskIncludeLabels ? "Labels may be used on subtasks only when allowed by tag instructions." : "Do not add labels to subtasks.",
+    settings.subtaskIncludePriority ? "Priority may be assigned to subtasks." : "Use priority 1 for all subtasks.",
+    settings.subtaskIncludeDueDate ? "Due dates may be assigned to subtasks when clearly useful." : "Use null due_date for all subtasks.",
+    settings.subtaskIncludeDeadline ? "Deadlines may be assigned to subtasks when clearly useful." : "Use null deadline_date for all subtasks."
+  ].join(" ");
 }
 
 function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
@@ -5122,21 +5496,32 @@ function renderContextSummary(contextNotes) {
   return `> Context notes used: ${links}`;
 }
 
-function formatTaskReference(task) {
+function formatTaskReference(task, settings = DEFAULT_SETTINGS) {
   const status = task.isCompleted ? "completed" : "open";
-  const todoist = task.id ? ` Todoist: ${task.id}.` : " No Todoist link.";
+  const todoist = task.id ? ` Todoist: ${todoistTaskMarkdownLink(task.id, settings)}. OID: ${task.oid || "unknown"}.` : " No Todoist link.";
   const due = task.due_date ? ` Due: ${task.due_date}.` : "";
   const labels = task.labels?.length ? ` Labels: ${task.labels.map((label) => `#${label}`).join(" ")}.` : "";
   return `- ${status}: ${task.content}.${due}${labels}${todoist} Note: [${task.path}](obsidian://open?file=${encodeURIComponent(task.path)}).`;
 }
 
-function formatCachedTaskReference(id, task) {
+function formatCachedTaskReference(id, task, settings = DEFAULT_SETTINGS) {
   const status = task.isCompleted ? "completed" : "open";
   const due = task.due_date ? ` Due: ${task.due_date}.` : "";
   const labels = task.labels?.length ? ` Labels: ${task.labels.map((label) => `#${label}`).join(" ")}.` : "";
   const path = task.path || "";
   const source = path ? ` Note: [${path}](obsidian://open?file=${encodeURIComponent(path)}).` : "";
-  return `- ${status}: ${task.content || "Untitled task"}.${due}${labels} Todoist: ${id}.${source}`;
+  return `- ${status}: ${task.content || "Untitled task"}.${due}${labels} Todoist: ${todoistTaskMarkdownLink(id, settings)}. OID: ${task.oid || "unknown"}.${source}`;
+}
+
+function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS) {
+  const url = todoistTaskUrl(id, settings);
+  return url ? `[Open task](${url})` : String(id || "");
+}
+
+function todoistTaskUrl(id, settings = DEFAULT_SETTINGS) {
+  const taskId = String(id || "").trim();
+  if (!taskId) return "";
+  return settings.linksAppURI ? `todoist://task?id=${encodeURIComponent(taskId)}` : `https://todoist.com/app/task/${encodeURIComponent(taskId)}`;
 }
 
 function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
@@ -5270,7 +5655,13 @@ function geminiCompatibleSchema(schema) {
   if (!schema || typeof schema !== "object") return schema;
   const out = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (["additionalProperties", "$schema", "strict"].includes(key)) continue;
+    if (["additionalProperties", "$schema", "strict", "pattern", "minItems", "maxItems"].includes(key)) continue;
+    if (key === "type" && Array.isArray(value)) {
+      const nonNullTypes = value.filter((type) => type !== "null");
+      out.type = nonNullTypes[0] || "null";
+      if (value.includes("null")) out.nullable = true;
+      continue;
+    }
     out[key] = geminiCompatibleSchema(value);
   }
   return out;
@@ -5423,10 +5814,12 @@ function findExistingTodoistTaskMatch(parsed, existingTasks, parentId = "") {
   if (!content) return null;
   const due = parsed.due_date || "";
   const deadline = parsed.deadline_date || "";
+  const projectName = singleLine(parsed.projectName || "").toLowerCase();
   const candidates = existingTasks.filter((task) => {
     if (singleLine(task.content).toLowerCase() !== content) return false;
     if (parentId && task.parentId && task.parentId !== parentId) return false;
     if (parsed.isSubtask && parentId && task.parentId !== parentId) return false;
+    if (projectName && task.projectName && singleLine(task.projectName).toLowerCase() !== projectName) return false;
     if (due && task.dueDate && task.dueDate !== due) return false;
     if (deadline && task.deadlineDate && task.deadlineDate !== deadline) return false;
     return true;
@@ -5438,6 +5831,8 @@ function findExistingTodoistTaskMatch(parsed, existingTasks, parentId = "") {
 function existingTodoistTaskMatchScore(task, parsed, parentId) {
   let score = 0;
   if (parsed.isSubtask && parentId && task.parentId === parentId) score += 5;
+  if (parsed.projectName && task.projectName && singleLine(parsed.projectName).toLowerCase() === singleLine(task.projectName).toLowerCase()) score += 5;
+  if (parsed.section && task.section && singleLine(parsed.section).toLowerCase() === singleLine(task.section).toLowerCase()) score += 4;
   if (!parsed.isSubtask && parsed.section && task.sectionId) score += 4;
   if (!parsed.isSubtask && !task.parentId) score += 2;
   if (parsed.due_date && task.dueDate === parsed.due_date) score += 1;
@@ -5496,6 +5891,49 @@ function extractGeminiText(response) {
     }
   }
   return parts.join("\n").trim();
+}
+
+function extractJsonPayload(text) {
+  let value = String(text || "").trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  try {
+    JSON.parse(value);
+    return value;
+  } catch {}
+  const start = value.search(/[\[{]/);
+  if (start < 0) return value;
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < value.length; i += 1) {
+    const char = value[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
+    else if (char === "}" || char === "]") {
+      if (stack.pop() !== char) break;
+      if (!stack.length) {
+        const candidate = value.slice(start, i + 1);
+        try {
+          JSON.parse(candidate);
+          return candidate;
+        } catch {
+          break;
+        }
+      }
+    }
+  }
+  return value;
 }
 
 function nextBusinessDate(daysAhead) {

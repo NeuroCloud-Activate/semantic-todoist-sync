@@ -118,35 +118,16 @@ Todoist IDs are stored in the local index/reference table, but are viewable in t
 
 It is recommended, when writing meeting notes, to flag action items with a consistent marker such as `#todo` so task extraction has a strong signal. Settings include separate plain-language instruction areas for main tasks, subtasks, section titles, dates, deadlines, tags, priorities, descriptions, and links.
 
-## What's New In v0.4.2
+## Changelog
 
-- Fixed the local reference table column widths so Project, Section, Description, Path, and Status remain readable.
-- Moved Last email poll and Process pending email tasks into the Email-To-Todoist Automation section.
-- Confirmed Todoist checks continue to use the cached all-project snapshot and local OID reference table, with per-task lookups only as a fallback when the snapshot is unavailable.
-
-## What's New In v0.4.1
-
-- Email-To-Todoist notes now default to `Semantic Todoist Sync/Email-To-Todoist`.
-- Each processed email creates its own Obsidian note named `YYYY-MM-DD - Email Subject`, using the original email received date.
-- Todoist project IDs are preserved in the local OID reference table when tasks are moved between Todoist projects.
-- Todoist project-move activity is confirmed against the all-project Todoist snapshot before any note task is treated as deleted.
-
-## What's New In v0.4
-
-- Sidebar `Tasks` button for the configured default task-generation prompt.
-- Prompt files now drive prompt responses, summary-plus-task workflows, task headings, note insertion, and Todoist sync behavior.
-- Mixed prompts can insert a summary first and then run task generation as a separate pass.
-- Prompt response citations avoid repeating the active note for every statement while preserving citations for supporting context notes.
-- Chat text is selectable, relevant notes are de-duplicated, and active-note inclusion can be toggled for sidebar search.
-- Subtask metadata criteria are configurable.
-- Gemini structured JSON handling is more robust and avoids unnecessary retry calls where possible.
-- Existing Todoist tasks can be relinked across projects without recreating them in the default project.
+Release history is maintained in [CHANGELOG.md](CHANGELOG.md).
 
 ## Community Plugin Release
 
 This repository includes the files Obsidian expects for community plugin review:
 
 - `README.md`
+- `CHANGELOG.md`
 - `LICENSE`
 - `manifest.json`
 - `versions.json`

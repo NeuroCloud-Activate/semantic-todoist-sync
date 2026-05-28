@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0
+
+- Updated Todoist-to-Obsidian sync so Todoist task title, completion state, labels, priority, dates, deadlines, section, and project changes refresh the note task line from the local reference cache/snapshot instead of only updating project markers.
+- Added section marker reconciliation so Todoist section moves update the `///Section` marker in Obsidian and the local reference table.
+- Preserved subtask indentation during Todoist-to-Obsidian sync, including re-indenting synced subtasks that would otherwise be written at the parent-task level.
+- Aligned indentation parsing with the configured subtask indent width so one-space collapsed subtasks still retain parent relationships and are repaired to the configured indentation during sync.
+- Standardized task-generation requests into separate Main task and Subtask requirement sections so the AI model consistently decides labels, priorities, dates, and deadlines from the configured settings, with validation guardrails still applied before note insertion or Todoist sync.
+- Added a built-in requirement for task and description generation to use relevant ranked vault context when available, and trimmed each context excerpt to the most relevant lines before sending it to the AI model.
+- Updated sidebar chat to consider generated/synced tasks from the local Todoist reference table alongside note context and to surface supplied Todoist task links when existing tasks are referenced.
+- Improved sidebar chat task lookup so questions about dated meetings or people can find OID-backed tasks from matching note titles/paths even when semantic vault retrieval does not select that note, while sending only a small set of the most relevant task references to reduce prompt size.
+- Added compact local Todoist reference-table task chunks to the semantic index so synced task content, labels, dates, sections, projects, descriptions, and OIDs can be retrieved through semantic search without flattening every task into one prompt line.
+- Rendered sidebar chat links as descriptive markdown links so AI responses do not display full raw Todoist, Obsidian, or web URLs.
+- Excluded the plugin's `Semantic Todoist Sync` vault folder from semantic embedding and AI sidebar context by default, including runtime filtering of older indexed chunks from that folder.
+- Updated the sidebar status line so it reflects queued and active plugin work without duplicating the detail row for a single activity; detail items now appear only when multiple distinct activities are running.
+- Normalized stored note paths for semantic index entries, local Todoist reference-table rows, pending references, and source lists so they remain vault-relative when a vault folder moves.
+- Kept Todoist description source lists plugin-generated, with separate Primary Note and Context Notes sections that show only vault-relative note paths.
+- Saved semantic embedding indexes as a small manifest plus sync-safe shard files under the Obsidian Sync Standard 5 MB file-size ceiling, while still loading and automatically converting older single-file indexes.
+- Deleted empty Todoist sections after all generated tasks from a note are removed, while keeping sections that still have local or live Todoist tasks.
+- Simplified the sidebar status line so it uses one concise local summary of all active plugin work instead of generic activity counts or duplicated detail rows.
+- Added in-memory semantic keyword scoring cache for indexed chunks to reduce repeated text parsing during chat and vault search, especially on mobile.
+- Warmed the semantic index's in-memory keyword cache in small background batches after plugin load so first searches are faster without extra AI/API calls.
+- Added explicit AI activity status during chat, task generation, and task-description writing, and renamed description quality follow-up from repair language to calmer improvement language.
+- Tightened the first-pass task-description prompt with the local quality criteria so the model is less likely to trigger an extra description-improvement call.
+- Updated task-description prompting and cleanup so descriptions begin with actionable context instead of naming the active note, source title, or filename.
+- Enforced the configured subtask indentation width during note insertion and sync normalization so subtasks do not collapse to one-space indentation.
+- Added per-workflow settings to include or omit plugin-generated source lists and matching context-note sentence citations like `(1)` in Todoist descriptions, enabled by default.
+- Removed legacy note-generation insert/sync and Obsidian Tasks ordering controls from settings because prompt templates and default plugin formatting now own that behavior.
+- Updated Activity settings to show sharded semantic index files and separate AI model summaries by provider.
+- Reworked excluded-folder settings so the add control is a searchable folder text box and the selected excluded folders appear below it.
+- Preserved AI-generated subtask metadata after task generation so subtask settings are primarily enforced through the model request instead of generation-stage field stripping.
+- Made Email-To-Todoist and Notes-To-Todoist instruction fields more compact so prompt customization stays concise and the settings pages are shorter.
+- Normalized inserted prompt and task sections so new headings are separated from existing note content by exactly one blank line.
+
 ## 0.4.3
 
 - Fixed semantic index rebuilds so full rebuilds run exclusively and clear queued incremental folder-change updates before starting.

@@ -51,6 +51,18 @@
   line-height: 1.45;
 }
 
+.semantic-todoist-setting-compact {
+  gap: 6px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+
+.semantic-todoist-setting-compact textarea {
+  min-height: 72px;
+  max-height: 140px;
+  resize: vertical;
+}
+
 .semantic-todoist-setup-step {
   align-items: flex-start;
   flex-direction: column;
@@ -93,6 +105,21 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.semantic-todoist-folder-list {
+  margin: 4px 0 12px;
+  padding-left: 0;
+}
+
+.semantic-todoist-folder-list-title {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin: 8px 0 2px;
+}
+
+.semantic-todoist-folder-list .setting-item {
+  padding: 6px 0;
 }
 
 @media (max-width: 700px) {
@@ -382,9 +409,10 @@
 }
 
 .semantic-todoist-status-line {
-  white-space: nowrap;
+  display: block;
+  white-space: normal;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .semantic-todoist-status-line strong {

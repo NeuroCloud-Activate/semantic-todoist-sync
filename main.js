@@ -16,8 +16,15 @@ const TODOIST_API = "https://api.todoist.com/api/v1";
 const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
+const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
+const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
+const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
+const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
+const TASK_CONTEXT_MAX_ROWS = 14;
+const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
+const TASK_CONTEXT_MIN_TASK_SCORE = 1;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
     filename: "Generate Todoist task list.md",
@@ -73,7 +80,7 @@ const DEFAULT_SETTINGS = {
   semanticIndexMaxChunksPerNote: 20,
   semanticIndexEmbeddingPrecision: 4,
   indexedFolders: "",
-  excludedFolders: "Semantic Todoist Sync/Email-To-Todoist",
+  excludedFolders: PLUGIN_DATA_FOLDER,
   semanticIndexMeta: {},
   autoUpdateSemanticIndex: true,
   semanticIndexDelaySeconds: 30,
@@ -116,61 +123,66 @@ const DEFAULT_SETTINGS = {
   maxGeneratedMainTasks: 10,
   maxGeneratedSubtasksPerMainTask: 4,
   todoistDescriptionMaxChars: 8000,
+  emailIncludeSourceListInDescriptions: true,
+  noteIncludeSourceListInDescriptions: true,
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
   chatFontSizePx: 13,
-  insertGeneratedTasksIntoNote: true,
-  syncAfterInsertingGeneratedTasks: true,
-  obsidianTasksDateOrder: true,
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
     {
       name: "Generate Todoist task list",
-      prompt: "Scan the active note or selected text and generate a Todoist-ready task list. Use the shared task instructions. Include clear main tasks and subtasks only when they are actionable.",
+      prompt: "Scan the active note or selected text and generate a Todoist-ready task list using relevant ranked vault context and the shared task instructions. Include clear main tasks and subtasks only when they are actionable.",
       mode: "tasks",
       createTasks: true,
       taskGenerationTemplate: true
     },
     {
       name: "Extract follow-ups only",
-      prompt: "Scan the active note or selected text and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act.",
+      prompt: "Scan the active note or selected text, use relevant ranked vault context, and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act.",
       mode: "tasks",
       createTasks: true,
       taskGenerationTemplate: true
     }
   ],
-  mainTaskInstructions: "Review the tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
-  subtaskInstructions: "Create subtasks only when they are required. Subtasks should be clear actionable items, not background information.",
+  mainTaskInstructions: "Review the source together with relevant ranked vault context and identify tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
+  subtaskInstructions: "Create subtasks only when they are required and supported by the source or relevant ranked vault context. Subtasks should be clear actionable items, not background information.",
   sectionTitleInstructions: "Create one Todoist section for all tasks from the same source. For Notes-To-Todoist, use Notes_YY_MM_DD_Subject based on the note date and note subject. For Email-To-Todoist, use Email_YY_MM_DD_Subject based on the email received date and email subject.",
   dateInstructions: "Determine a task completion deadline and a due date for each main task based on urgency, priority, and complexity. Do not add due dates to subtasks. Avoid weekends and the holidays that apply to the user's locale.",
   tagInstructions: "Only create Todoist labels that are explicitly named in these instructions. Add labels only when the source content clearly matches a configured rule.",
   priorityInstructions: "Assign priority 1 to 4 to each task and subtask, where 4 is highest priority and 1 is no priority.",
-  descriptionInstructions: "Include the source subject or note title and useful context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble.",
-  emailMainTaskInstructions: "Review the email chain and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email context to act without rereading the full thread.",
-  emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task. Do not create subtasks for background details, simple reminders, or loosely related information.",
+  descriptionInstructions: "Include concise, actionable context from the source and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the source note, source subject, or filename.",
+  emailMainTaskInstructions: "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
+  emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task and supported by the email or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   emailSectionTitleInstructions: "Create one Todoist section for all tasks from the same email using Email_YY_MM_DD_Subject based on the email received date and subject.",
   emailDateInstructions: "Determine due dates and deadlines from the email's urgency, stated dates, complexity, and sender expectations. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   emailTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   emailPriorityInstructions: "Assign priority 1 to 4 to each email-derived task and subtask, where 4 is highest priority and 1 is no priority.",
-  emailDescriptionInstructions: "Include the email subject, concise thread context, and useful vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble.",
-  noteMainTaskInstructions: "Review the active note or selected note text and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
-  noteSubtaskInstructions: "Create note subtasks only for concrete steps required to complete the parent task. Do not create subtasks for background details, simple reminders, or loosely related information.",
+  emailDescriptionInstructions: "Include concise, actionable email-thread context and relevant ranked vault context so the task can be completed without rereading the full thread. Focus on people, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the email subject or source file.",
+  noteMainTaskInstructions: "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
+  noteSubtaskInstructions: "Create note subtasks only for concrete steps required to complete the parent task and supported by the note or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   noteSectionTitleInstructions: "Create one Todoist section for all tasks from the same note using Notes_YY_MM_DD_Subject based on the note date and note subject.",
   noteDateInstructions: "Determine due dates and deadlines from the note's timing, urgency, complexity, and any explicit dates. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   noteTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   notePriorityInstructions: "Assign priority 1 to 4 to each note-derived task and subtask, where 4 is highest priority and 1 is no priority.",
-  noteDescriptionInstructions: "Include the source note title, concise note context, and useful vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
+  noteDescriptionInstructions: "Include concise, actionable note context and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the active note, source note title, or filename."
 };
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.queryEmbeddingCache = new Map();
+    this.semanticChunkTermCache = new Map();
+    this.semanticIndexPathMeta = new Map();
+    this.semanticIndexWarmupInProgress = false;
+    this.aiActivity = "";
     await this.migrateSettings();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.loadSemanticIndex();
+    this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
+    this.queueSemanticIndexWarmup();
     await this.ensurePromptTemplateFolder(false);
     this.pendingIndexPaths = new Set();
     this.syncInProgress = false;
@@ -198,11 +210,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("file-open", () => this.notifySidebarActiveNoteChanged()));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
-      this.queueSemanticIndexUpdate(file.path);
+      this.queueSemanticIndexUpdate(file.path, "modify");
       if (this.settings.notesAutoSync && this.settings.todoistToken && !this.isInternalNoteWrite(file.path)) this.queueNoteSync(file.path);
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile && file.extension === "md") this.queueSemanticIndexUpdate(file.path);
+      if (file instanceof TFile && file.extension === "md") this.queueSemanticIndexUpdate(file.path, "create");
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (file instanceof TFile && file.extension === "md") this.removePathFromSemanticIndex(file.path);
@@ -272,12 +284,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.emailLogFolder = DEFAULT_SETTINGS.emailLogFolder;
       changed = true;
     }
-    if (!this.settings.excludedFolders || this.settings.excludedFolders === "Email-To-Todoist") {
+    if (!this.settings.excludedFolders || this.settings.excludedFolders === "Email-To-Todoist" || this.settings.excludedFolders === DEFAULT_SETTINGS.emailLogFolder) {
       this.settings.excludedFolders = DEFAULT_SETTINGS.excludedFolders;
       changed = true;
     } else if (splitList(this.settings.excludedFolders).includes("Email-To-Todoist")) {
-      const folders = splitList(this.settings.excludedFolders).map((folder) => folder === "Email-To-Todoist" ? DEFAULT_SETTINGS.emailLogFolder : folder);
-      this.settings.excludedFolders = Array.from(new Set(folders)).join(", ");
+      const folders = splitList(this.settings.excludedFolders).map((folder) => folder === "Email-To-Todoist" ? PLUGIN_DATA_FOLDER : folder);
+      this.settings.excludedFolders = normalizedExcludedFolders(folders).join(", ");
+      changed = true;
+    } else if (!isFolderExcluded(PLUGIN_DATA_FOLDER, splitList(this.settings.excludedFolders).map(trimSlashes))) {
+      this.settings.excludedFolders = normalizedExcludedFolders(splitList(this.settings.excludedFolders).concat(PLUGIN_DATA_FOLDER)).join(", ");
       changed = true;
     }
     const descriptionUpdates = {
@@ -294,49 +309,110 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         DEFAULT_SETTINGS.noteDescriptionInstructions
       ]
     };
+    descriptionUpdates.descriptionInstructions.push(
+      "Include the source subject or note title, useful source context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
+    );
+    descriptionUpdates.emailDescriptionInstructions.push(
+      "Include the email subject, concise thread context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
+    );
+    descriptionUpdates.noteDescriptionInstructions.push(
+      "Include the source note title, concise note context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
+    );
     for (const [key, [oldValue, newValue]] of Object.entries(descriptionUpdates)) {
+      if (this.settings[key] === oldValue || descriptionUpdates[key].slice(2).includes(this.settings[key])) {
+        this.settings[key] = newValue;
+        changed = true;
+      }
+    }
+    const taskInstructionUpdates = {
+      mainTaskInstructions: [
+        "Review the tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
+        DEFAULT_SETTINGS.mainTaskInstructions
+      ],
+      subtaskInstructions: [
+        "Create subtasks only when they are required. Subtasks should be clear actionable items, not background information.",
+        DEFAULT_SETTINGS.subtaskInstructions
+      ],
+      emailMainTaskInstructions: [
+        "Review the email chain and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email context to act without rereading the full thread.",
+        DEFAULT_SETTINGS.emailMainTaskInstructions
+      ],
+      emailSubtaskInstructions: [
+        "Create email subtasks only for concrete steps required to complete the parent task. Do not create subtasks for background details, simple reminders, or loosely related information.",
+        DEFAULT_SETTINGS.emailSubtaskInstructions
+      ],
+      noteMainTaskInstructions: [
+        "Review the active note or selected note text and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
+        DEFAULT_SETTINGS.noteMainTaskInstructions
+      ],
+      noteSubtaskInstructions: [
+        "Create note subtasks only for concrete steps required to complete the parent task. Do not create subtasks for background details, simple reminders, or loosely related information.",
+        DEFAULT_SETTINGS.noteSubtaskInstructions
+      ]
+    };
+    for (const [key, [oldValue, newValue]] of Object.entries(taskInstructionUpdates)) {
       if (this.settings[key] === oldValue) {
         this.settings[key] = newValue;
         changed = true;
       }
     }
     const validTaskCache = {};
+    const basePath = vaultBasePath(this.app);
     for (const [todoistId, task] of Object.entries(this.settings.taskCache || {})) {
-      if (task?.oid) validTaskCache[todoistId] = task;
+      if (task?.oid) {
+        const normalized = normalizeStoredTaskReferencePaths(task, basePath);
+        validTaskCache[todoistId] = normalized;
+        if (JSON.stringify(normalized) !== JSON.stringify(task)) changed = true;
+      }
       else changed = true;
     }
     this.settings.taskCache = validTaskCache;
     const validPendingReferences = {};
     for (const [key, reference] of Object.entries(this.settings.pendingTaskReferences || {})) {
-      if (reference?.oid) validPendingReferences[key] = reference;
+      if (reference?.oid) {
+        const normalized = normalizeStoredTaskReferencePaths(reference, basePath);
+        const nextKey = pendingTaskOidKey(normalized.path || reference.path || "", normalized.oid);
+        validPendingReferences[nextKey] = normalized;
+        if (nextKey !== key || JSON.stringify(normalized) !== JSON.stringify(reference)) changed = true;
+      }
       else changed = true;
     }
     this.settings.pendingTaskReferences = validPendingReferences;
+    if (this.settings.pendingTaskDescriptions) {
+      const normalizedDescriptions = normalizePendingDescriptionKeys(this.settings.pendingTaskDescriptions, basePath);
+      if (JSON.stringify(normalizedDescriptions) !== JSON.stringify(this.settings.pendingTaskDescriptions)) changed = true;
+      this.settings.pendingTaskDescriptions = normalizedDescriptions;
+    }
     if (changed) await this.saveSettings();
   }
 
   async loadSemanticIndex() {
+    this.semanticChunkTermCache?.clear?.();
+    this.semanticIndexPathMeta?.clear?.();
     this.semanticIndex = [];
     const indexFile = this.semanticIndexFileName();
     this.semanticIndexStats = { bytes: 0, path: indexFile };
+    let shouldRewriteShardedIndex = false;
     try {
-      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
-      this.semanticIndexStats.bytes = raw.length;
-      const parsed = JSON.parse(raw);
-      this.semanticIndex = parsed.chunks || [];
+      const loaded = await this.readSemanticIndexFile(indexFile);
+      this.semanticIndexStats = loaded.stats;
+      const parsed = loaded.parsed || {};
+      this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
       this.settings.semanticIndexMeta = Object.assign({}, parsed.meta || {}, { chunks: this.semanticIndex.length, file: indexFile });
+      shouldRewriteShardedIndex = !loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && this.semanticIndex.length;
     } catch (error) {
       if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
         try {
-          const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${SEMANTIC_INDEX_FILE}`);
-          this.semanticIndexStats = { bytes: raw.length, path: SEMANTIC_INDEX_FILE };
-          const parsed = JSON.parse(raw);
-          this.semanticIndex = parsed.chunks || [];
+          const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
+          this.semanticIndexStats = loaded.stats;
+          const parsed = loaded.parsed || {};
+          this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
           this.settings.semanticIndexMeta = Object.assign({}, parsed.meta || {}, { chunks: this.semanticIndex.length, file: SEMANTIC_INDEX_FILE, legacy: true });
+          shouldRewriteShardedIndex = !loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && this.semanticIndex.length;
         } catch {}
       }
       if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
-        this.semanticIndex = this.settings.semanticIndex;
+        this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app);
         delete this.settings.semanticIndex;
         await this.saveSemanticIndex();
       }
@@ -350,21 +426,93 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
     }
     if (Array.isArray(this.settings.semanticIndex)) delete this.settings.semanticIndex;
+    if (shouldRewriteShardedIndex) await this.saveSemanticIndex();
+    this.refreshSemanticIndexPathMeta();
     await this.saveSettings();
+  }
+
+  async readSemanticIndexFile(indexFile) {
+    const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.shards) && parsed.shards.length) {
+      const chunks = [];
+      let totalBytes = utf8ByteLength(raw);
+      let largestBytes = totalBytes;
+      for (const shard of parsed.shards) {
+        const shardFile = shard.file || shard.path || "";
+        if (!shardFile) continue;
+        const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
+        const shardBytes = utf8ByteLength(shardRaw);
+        totalBytes += shardBytes;
+        largestBytes = Math.max(largestBytes, shardBytes);
+        const shardParsed = JSON.parse(shardRaw);
+        chunks.push(...(shardParsed.chunks || []));
+      }
+      return {
+        parsed,
+        chunks,
+        stats: { bytes: largestBytes, totalBytes, path: indexFile, files: parsed.shards.length + 1, shards: parsed.shards.length }
+      };
+    }
+    const bytes = utf8ByteLength(raw);
+    return {
+      parsed,
+      chunks: parsed.chunks || [],
+      stats: { bytes, totalBytes: bytes, path: indexFile, files: 1, shards: 0 }
+    };
   }
 
   async saveSemanticIndex() {
     const indexFile = this.semanticIndexFileName();
-    const body = JSON.stringify({
-      meta: Object.assign({}, this.settings.semanticIndexMeta || {}, {
+    const meta = Object.assign({}, this.settings.semanticIndexMeta || {}, {
         model: this.settings.embeddingModel,
         provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
-        file: indexFile
-      }),
-      chunks: this.semanticIndex || []
+        file: indexFile,
+        sharded: true,
+        shardMaxBytes: SEMANTIC_INDEX_SHARD_MAX_BYTES
     });
-    await this.app.vault.adapter.write(`${this.manifest.dir}/${indexFile}`, body);
-    this.semanticIndexStats = { bytes: body.length, path: indexFile };
+    const shards = semanticIndexShardBodies(indexFile, meta, this.semanticIndex || [], SEMANTIC_INDEX_SHARD_MAX_BYTES);
+    const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
+    const manifest = {
+      meta: Object.assign({}, meta, {
+        chunks: (this.semanticIndex || []).length,
+        shardCount: shards.length,
+        shardBytes
+      }),
+      shards: shards.map((shard, index) => ({
+        file: shard.file,
+        chunks: shard.chunkCount,
+        bytes: shard.bytes,
+        index
+      }))
+    };
+    const manifestBody = JSON.stringify(manifest);
+    await this.removeSemanticIndexShardFiles(indexFile, shards.map((shard) => shard.file));
+    for (const shard of shards) await this.app.vault.adapter.write(`${this.manifest.dir}/${shard.file}`, shard.body);
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${indexFile}`, manifestBody);
+    const manifestBytes = utf8ByteLength(manifestBody);
+    const totalBytes = manifestBytes + shardBytes;
+    this.semanticIndexStats = {
+      bytes: Math.max(manifestBytes, ...shards.map((shard) => shard.bytes)),
+      totalBytes,
+      path: indexFile,
+      files: shards.length + 1,
+      shards: shards.length
+    };
+    this.refreshSemanticIndexPathMeta();
+  }
+
+  refreshSemanticIndexPathMeta() {
+    this.semanticIndexPathMeta = this.semanticIndexPathMeta || new Map();
+    this.semanticIndexPathMeta.clear();
+    for (const chunk of this.semanticIndex || []) {
+      const path = chunk.path || "";
+      if (!path) continue;
+      const existing = this.semanticIndexPathMeta.get(path) || { chunks: 0, modifiedAt: 0 };
+      existing.chunks += 1;
+      existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
+      this.semanticIndexPathMeta.set(path, existing);
+    }
   }
 
   semanticIndexFileName(model = this.settings.embeddingModel) {
@@ -373,10 +521,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async purgeSemanticIndex(showNotice = true) {
     const indexFile = this.semanticIndexFileName();
-    try {
-      await this.app.vault.adapter.remove(`${this.manifest.dir}/${indexFile}`);
-    } catch {}
+    await this.removeSemanticIndexFiles(indexFile);
+    if (indexFile !== SEMANTIC_INDEX_FILE) await this.removeSemanticIndexFiles(SEMANTIC_INDEX_FILE);
     this.semanticIndex = [];
+    this.semanticChunkTermCache?.clear?.();
+    window.clearTimeout(this.semanticIndexWarmupTimer);
+    this.semanticIndexWarmupTimer = null;
+    this.semanticIndexWarmupInProgress = false;
     this.settings.semanticIndexMeta = {
       model: this.settings.embeddingModel,
       provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
@@ -388,6 +539,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.queryEmbeddingCache?.clear?.();
     await this.saveSettings();
     if (showNotice) new Notice(`Purged semantic index: ${indexFile}`);
+  }
+
+  async removeSemanticIndexFiles(indexFile) {
+    const manifestShards = [];
+    try {
+      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
+      const parsed = JSON.parse(raw);
+      manifestShards.push(...(parsed.shards || []).map((shard) => shard.file || shard.path || "").filter(Boolean));
+    } catch {}
+    await this.removeSemanticIndexShardFiles(indexFile, []);
+    for (const shardFile of manifestShards) {
+      try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${shardFile}`); } catch {}
+    }
+    try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${indexFile}`); } catch {}
+  }
+
+  async removeSemanticIndexShardFiles(indexFile, keepFiles = []) {
+    const keep = new Set(keepFiles || []);
+    try {
+      const listed = await this.app.vault.adapter.list(this.manifest.dir);
+      for (const path of listed?.files || []) {
+        const name = path.split("/").pop() || "";
+        if (!isSemanticIndexShardFile(indexFile, name) || keep.has(name)) continue;
+        try { await this.app.vault.adapter.remove(path); } catch {}
+      }
+    } catch {}
   }
 
   async ensureCompatibleEmbeddingForChatModel() {
@@ -447,6 +624,41 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
       const view = leaf.view;
       if (view instanceof SemanticTodoistView) view.setStatus(view.currentStatus || "Ready");
+    }
+  }
+
+  async withAiActivity(label, work) {
+    const previous = this.aiActivity || "";
+    this.aiActivity = singleLine(label || "Working");
+    this.refreshSidebarStatus();
+    try {
+      return await work();
+    } finally {
+      this.aiActivity = previous;
+      this.refreshSidebarStatus();
+    }
+  }
+
+  queueSemanticIndexWarmup() {
+    window.clearTimeout(this.semanticIndexWarmupTimer);
+    if (!(this.semanticIndex || []).length) return;
+    this.semanticIndexWarmupTimer = window.setTimeout(() => this.warmSemanticIndexCaches(), 1500);
+  }
+
+  async warmSemanticIndexCaches() {
+    if (this.semanticIndexWarmupInProgress || !(this.semanticIndex || []).length) return;
+    this.semanticIndexWarmupInProgress = true;
+    this.refreshSidebarStatus();
+    try {
+      const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
+      for (let i = 0; i < chunks.length; i += 25) {
+        for (const chunk of chunks.slice(i, i + 25)) this.semanticChunkTerms(chunk);
+        await delay(0);
+      }
+    } finally {
+      this.semanticIndexWarmupInProgress = false;
+      this.semanticIndexWarmupTimer = null;
+      this.refreshSidebarStatus();
     }
   }
 
@@ -535,9 +747,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const templates = await this.getPromptTemplates();
     new TaskTemplateModal(this.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
       await this.runPromptTemplate(template, { insertIntoNote, syncAfterInsert, showNotice: true });
-    }, {
-      insertIntoNote: this.settings.insertGeneratedTasksIntoNote,
-      syncAfterInsert: this.settings.syncAfterInsertingGeneratedTasks
     }).open();
   }
 
@@ -568,13 +777,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return false;
   }
 
-  queueSemanticIndexUpdate(path) {
+  queueSemanticIndexUpdate(path, reason = "change") {
     if (!this.settings.autoUpdateSemanticIndex || !this.isIndexablePath(path)) return;
     if (!aiAccessConfigured(this.settings)) return;
+    if (!this.shouldQueueSemanticIndexUpdate(path, reason)) return;
     this.pendingIndexPaths.add(path);
     window.clearTimeout(this.semanticIndexTimer);
     this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(5, this.settings.semanticIndexDelaySeconds) * 1000);
     this.refreshSidebarStatus();
+  }
+
+  shouldQueueSemanticIndexUpdate(path, reason = "change") {
+    const indexed = this.semanticIndexPathMeta?.get(path);
+    if (!indexed) return true;
+    if (reason === "task-reference") return true;
+    const now = Date.now();
+    if (now < (this.semanticIndexStartupQuietUntil || 0)) {
+      this.logLocal("Skipped startup semantic index event for indexed note", { path, reason });
+      return false;
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const fileModifiedAt = file instanceof TFile ? Number(file.stat?.mtime || 0) : 0;
+    if (fileModifiedAt && indexed.modifiedAt && fileModifiedAt <= indexed.modifiedAt + 1000) {
+      this.logLocal("Skipped unchanged semantic index event", { path, reason });
+      return false;
+    }
+    return true;
   }
 
   async searchFromSelection() {
@@ -593,6 +821,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (pathOverride) {
       const selected = this.app.vault.getAbstractFileByPath(pathOverride);
       if (selected instanceof TFile) {
+        if (this.isExcludedPath(selected.path)) return { title: "", path: "", text: "", selection: "" };
         const text = await this.app.vault.cachedRead(selected);
         return { title: selected.basename, path: selected.path, text, selection: "" };
       }
@@ -601,6 +830,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       (this.lastActiveMarkdownLeaf?.view instanceof MarkdownView ? this.lastActiveMarkdownLeaf.view : null);
     const file = view?.file;
     if (!view || !file) return { title: "", path: "", text: "", selection: "" };
+    if (this.isExcludedPath(file.path)) return { title: "", path: "", text: "", selection: "" };
     const editor = view.editor;
     const selection = editor?.getSelection?.() || "";
     const text = await this.app.vault.cachedRead(file);
@@ -633,6 +863,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0 });
         }
       }
+      chunks.push(...this.semanticTaskReferenceChunks());
       if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
 
       const indexed = [];
@@ -645,6 +876,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
 
       this.semanticIndex = indexed;
+      this.semanticChunkTermCache?.clear?.();
+      this.queueSemanticIndexWarmup();
       this.settings.semanticIndexMeta = {
         model: this.settings.embeddingModel,
         rebuiltAt: deviceTimestamp(),
@@ -688,9 +921,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   getSyncableTaskFiles() {
     const exclude = splitList(this.settings.excludedFolders).map(trimSlashes);
     return this.app.vault.getMarkdownFiles().filter((file) => {
-      if (exclude.some((folder) => file.path === folder || file.path.startsWith(`${folder}/`))) return false;
+      if (this.isExcludedPath(file.path, exclude)) return false;
       return true;
     });
+  }
+
+  isExcludedPath(path, exclude) {
+    return isFolderExcluded(path, exclude || splitList(this.settings.excludedFolders).map(trimSlashes));
   }
 
   isIndexablePath(path, include, exclude) {
@@ -698,7 +935,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
     if (path.startsWith(`${this.settings.emailLogFolder}/`)) return false;
     if (includeFolders.length && !includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
-    if (excludeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
+    if (this.isExcludedPath(path, excludeFolders)) return false;
     return true;
   }
 
@@ -754,6 +991,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const text = await this.app.vault.cachedRead(file);
     const chunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
       .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0 }));
+    chunks.push(...this.semanticTaskReferenceChunks(path));
     for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
       const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
       const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
@@ -761,11 +999,59 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.semanticIndex.push(Object.assign({}, batch[j], { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) }));
       }
     }
+    this.semanticChunkTermCache?.clear?.();
+    this.queueSemanticIndexWarmup();
+  }
+
+  queueTaskReferenceIndexUpdate(path) {
+    const notePath = vaultRelativePath(path, vaultBasePath(this.app));
+    if (!notePath || !this.settings.autoUpdateSemanticIndex || !this.hasUsableSemanticIndex()) return;
+    this.queueSemanticIndexUpdate(notePath, "task-reference");
+  }
+
+  semanticTaskReferenceChunks(pathFilter = "") {
+    const basePath = vaultBasePath(this.app);
+    const groups = new Map();
+    const childTextByParentOid = taskChildTextByParentOid(Object.entries(this.settings.taskCache || {}));
+    const addTask = (id, task, source) => {
+      const path = vaultRelativePath(task?.path || "", basePath);
+      if (!path || (pathFilter && path !== pathFilter) || !this.isIndexablePath(path)) return;
+      const row = semanticTaskReferenceText(id, task, this.settings, childTextByParentOid.get(String(task?.oid || "").toUpperCase()) || "");
+      if (!row) return;
+      const group = groups.get(path) || { path, rows: [], modifiedAt: 0 };
+      group.rows.push(row);
+      group.modifiedAt = Math.max(group.modifiedAt || 0, Date.parse(task?.cachedAt || "") || 0);
+      groups.set(path, group);
+    };
+    for (const [id, task] of Object.entries(this.settings.taskCache || {})) addTask(id, task, "cache");
+    for (const reference of Object.values(this.settings.pendingTaskReferences || {})) addTask("", reference, "pending");
+    const chunks = [];
+    for (const group of groups.values()) {
+      const file = this.app.vault.getAbstractFileByPath(group.path);
+      const title = file instanceof TFile ? `${file.basename} Todoist task references` : `${group.path.split("/").pop()?.replace(/\.md$/i, "") || group.path} Todoist task references`;
+      const textChunks = chunkTaskReferenceRows(group.path, group.rows, Math.max(1600, this.settings.semanticIndexMaxChunkChars || 1100));
+      for (let index = 0; index < textChunks.length; index += 1) {
+        chunks.push({
+          id: `${group.path}#todoist-reference-${index}`,
+          path: group.path,
+          title,
+          text: textChunks[index],
+          kind: "todoist-task-reference",
+          source: "local-reference-table",
+          modifiedAt: group.modifiedAt || (file instanceof TFile ? file.stat?.mtime || 0 : 0)
+        });
+      }
+    }
+    return chunks;
   }
 
   async removePathFromSemanticIndex(path, save = true) {
     const before = (this.semanticIndex || []).length;
     this.semanticIndex = (this.semanticIndex || []).filter((chunk) => chunk.path !== path);
+    if (before !== this.semanticIndex.length) {
+      this.semanticChunkTermCache?.clear?.();
+      this.queueSemanticIndexWarmup();
+    }
     if (save && before !== this.semanticIndex.length) {
       this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
         updatedAt: deviceTimestamp(),
@@ -832,7 +1118,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async retrieveSemanticContext(query, limit) {
-    const index = this.semanticIndex || [];
+    const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
     if (!index.length) return this.retrieveLexicalContext(query, limit);
     const cacheKey = `${this.settings.embeddingModel}:${singleLine(query).slice(0, 500)}`;
     let queryEmbedding = this.queryEmbeddingCache.get(cacheKey);
@@ -846,8 +1132,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const semanticCandidates = index
       .map((chunk) => {
         const semantic = cosine(queryEmbedding, chunk.embedding);
-        const lexical = lexicalScore(queryTerms, `${chunk.title} ${chunk.path} ${chunk.text}`);
-        const title = lexicalScore(queryTerms, `${chunk.title} ${chunk.path}`);
+        const scores = this.contextLexicalScores(chunk, queryTerms);
+        const lexical = scores.lexical;
+        const title = scores.title;
         const recency = recencyBoost(chunk.modifiedAt);
         return { chunk, semantic, lexical, title, recency };
       })
@@ -864,12 +1151,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   lexicalContextCandidates(query, limit) {
-    const chunks = this.semanticIndex || [];
+    const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
     const queryTerms = termCounts(query);
     return chunks
       .map((chunk) => {
-        const lexical = lexicalScore(queryTerms, `${chunk.title} ${chunk.path} ${chunk.text}`);
-        const title = lexicalScore(queryTerms, `${chunk.title} ${chunk.path}`);
+        const scores = this.contextLexicalScores(chunk, queryTerms);
+        const lexical = scores.lexical;
+        const title = scores.title;
         const recency = recencyBoost(chunk.modifiedAt);
         return { chunk, semantic: 0, lexical, title, recency };
       })
@@ -878,31 +1166,136 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .slice(0, Math.max(limit, 1));
   }
 
+  contextLexicalScores(chunk, queryTerms) {
+    const entry = this.semanticChunkTerms(chunk);
+    return {
+      lexical: lexicalScoreFromCounts(queryTerms, entry.allTerms),
+      title: lexicalScoreFromCounts(queryTerms, entry.titleTerms)
+    };
+  }
+
+  semanticChunkTerms(chunk) {
+    this.semanticChunkTermCache = this.semanticChunkTermCache || new Map();
+    const key = chunk.id || `${chunk.path || ""}:${shortHash(chunk.text || "")}`;
+    const fingerprint = `${chunk.path || ""}:${chunk.title || ""}:${String(chunk.text || "").length}:${shortHash(String(chunk.text || "").slice(0, 500))}`;
+    const existing = this.semanticChunkTermCache.get(key);
+    if (existing?.fingerprint === fingerprint) return existing;
+    const entry = {
+      fingerprint,
+      allTerms: termCounts(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`),
+      titleTerms: termCounts(`${chunk.title || ""} ${chunk.path || ""}`)
+    };
+    this.semanticChunkTermCache.set(key, entry);
+    if (this.semanticChunkTermCache.size > Math.max(1000, (this.semanticIndex || []).length * 2)) {
+      this.semanticChunkTermCache.clear();
+    }
+    return entry;
+  }
+
   async buildTaskContext(active, chunks, query = "") {
+    const queryText = [query, active?.title, active?.selection].filter(Boolean).join("\n");
+    const queryTerms = taskSearchTermCounts(queryText);
+    const contentQueryTerms = taskContentQueryTermCounts(queryText);
+    const chunkPaths = new Set((chunks || []).map((chunk) => chunk.path).filter(Boolean));
+    const matchedTaskFiles = this.taskFilesMatchingQuery(queryText, queryTerms, chunkPaths, 8);
+    const matchedTaskPaths = new Set(matchedTaskFiles.map((file) => file.path));
+    const taskCacheEntries = Object.entries(this.settings.taskCache || {});
+    const cachedTaskPaths = new Set(taskCacheEntries.map(([, task]) => task.path).filter(Boolean));
     const byPath = new Map();
     if (active?.path) byPath.set(active.path, active.text || "");
+    for (const file of matchedTaskFiles) {
+      if (!file.path || byPath.has(file.path)) continue;
+      byPath.set(file.path, await this.app.vault.cachedRead(file));
+    }
     for (const chunk of chunks || []) {
       if (!chunk.path || byPath.has(chunk.path)) continue;
       const file = this.app.vault.getAbstractFileByPath(chunk.path);
       if (file instanceof TFile) byPath.set(chunk.path, await this.app.vault.cachedRead(file));
     }
-    const taskLines = [];
+    const taskRows = [];
+    const matchedPathTaskCounts = {};
     for (const [path, text] of byPath.entries()) {
       const lines = String(text || "").split("\n");
       for (let i = 0; i < lines.length; i += 1) {
         const parsed = parseTaskLine(lines[i], i, path, lines, this.settings) || parseTaskReferenceLine(lines[i], i, path, this.settings);
         if (!parsed) continue;
-        taskLines.push(formatTaskReference(parsed, this.settings));
+        const exactPath = matchedTaskPaths.has(path);
+        const activePath = path === active?.path;
+        const semanticContextPath = chunkPaths.has(path);
+        if (exactPath && !activePath && cachedTaskPaths.has(path)) continue;
+        if (exactPath) matchedPathTaskCounts[path] = (matchedPathTaskCounts[path] || 0) + 1;
+        const taskScore = taskReferenceScore(parsed, contentQueryTerms, queryText);
+        const includeFromMatchedPath = exactPath && !parsed.isSubtask && taskScore >= TASK_CONTEXT_MIN_TASK_SCORE;
+        const includeFromContext = activePath || (semanticContextPath && taskScore >= TASK_CONTEXT_MIN_TASK_SCORE);
+        if (!includeFromContext && !includeFromMatchedPath) continue;
+        taskRows.push({
+          key: taskReferenceKey(parsed),
+          path,
+          priority: path === active?.path ? 3 : exactPath ? 2 : 1,
+          score: taskScore,
+          text: formatTaskReference(parsed, this.settings)
+        });
       }
     }
-    const queryTerms = termCounts([query, active?.title, active?.selection].filter(Boolean).join("\n"));
-    const cachedTasks = Object.entries(this.settings.taskCache || {})
-      .map(([id, task]) => ({ id, task, score: lexicalScore(queryTerms, `${task.content || ""} ${(task.labels || []).join(" ")} ${task.path || ""}`) + recencyBoost(Date.parse(task.cachedAt || 0)) }))
-      .filter((item) => item.score > 0)
+    const contextPaths = new Set(byPath.keys());
+    const hasMatchedTaskPath = matchedTaskPaths.size > 0;
+    const childTextByParentOid = taskChildTextByParentOid(taskCacheEntries);
+    const cachedTasks = taskCacheEntries
+      .map(([id, task]) => {
+        const notePath = task.path || "";
+        const noteRefMatch = (task.noteRefs || []).some((ref) => ref?.path && contextPaths.has(ref.path));
+        const sameContextPath = Boolean(notePath && contextPaths.has(notePath)) || noteRefMatch;
+        const matchedPath = Boolean(notePath && matchedTaskPaths.has(notePath));
+        const activeTaskPath = Boolean(active?.path && notePath === active.path);
+        if (matchedPath) matchedPathTaskCounts[notePath] = (matchedPathTaskCounts[notePath] || 0) + 1;
+        const taskScore = taskReferenceScore(task, contentQueryTerms, queryText, childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "");
+        const score = taskScore + recencyBoost(Date.parse(task.cachedAt || 0));
+        return { id, task, score, taskScore, sameContextPath, matchedPath, activeTaskPath };
+      })
+      .filter((item) => {
+        if (hasMatchedTaskPath && !item.matchedPath && !item.sameContextPath) return false;
+        if (item.matchedPath && !item.activeTaskPath && item.task.isSubtask) return false;
+        return item.score > 0 || item.activeTaskPath || (item.matchedPath && !item.task.isSubtask && item.taskScore >= TASK_CONTEXT_MIN_TASK_SCORE);
+      })
+      .sort((a, b) => Number(b.matchedPath) - Number(a.matchedPath) || Number(b.sameContextPath) - Number(a.sameContextPath) || b.score - a.score)
+      .slice(0, 30)
+      .map((item) => ({
+        key: taskReferenceKey(item.task, item.id),
+        path: item.task.path || "",
+        priority: item.matchedPath ? 2 : item.sameContextPath ? 1 : 0,
+        score: item.score,
+        text: formatCachedTaskReference(item.id, item.task, this.settings)
+      }));
+    const noteSummaries = matchedTaskFiles
+      .map((file) => matchedTaskNoteSummary(file, matchedPathTaskCounts[file.path] || 0))
+      .filter(Boolean);
+    const merged = limitTaskRowsForChat(uniqueTaskReferenceRows(taskRows.concat(cachedTasks)
+      .sort((a, b) => b.priority - a.priority || b.score - a.score)
+    ))
+      .map((item) => item.text);
+    return truncateMarkdownAtWord(noteSummaries.concat(merged).join("\n"), 4500);
+  }
+
+  taskFilesMatchingQuery(queryText, queryTerms, contextPaths = new Set(), limit = 8) {
+    if (!Object.keys(queryTerms || {}).length) return [];
+    const files = this.getSyncableTaskFiles();
+    const requiredDateTokens = specificDateTokens(queryText);
+    return files
+      .map((file) => {
+        const pathText = `${file.basename || ""} ${file.path || ""}`;
+        const lexical = taskSearchLexicalScore(queryTerms, pathText);
+        const dateScore = datePhraseOverlapScore(queryText, pathText);
+        const contextPenalty = contextPaths.has(file.path) ? -0.01 : 0;
+        return { file, score: lexical + dateScore + recencyBoost(file.stat?.mtime || 0) + contextPenalty };
+      })
+      .filter((item) => {
+        if (!requiredDateTokens.size) return true;
+        return dateTokensOverlap(requiredDateTokens, dateSearchTokens(`${item.file.basename || ""} ${item.file.path || ""}`));
+      })
+      .filter((item) => item.score >= 2)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 25)
-      .map((item) => formatCachedTaskReference(item.id, item.task, this.settings));
-    return clamp(mergeStrings(taskLines, cachedTasks).slice(0, 40).join("\n"), 5000);
+      .slice(0, Math.max(1, limit))
+      .map((item) => item.file);
   }
 
   async chat(prompt, activeOverride = null, history = []) {
@@ -911,21 +1304,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
     const context = await this.retrieveSemanticContext(query, this.settings.maxChatContextChunks);
-    const contextText = formatContext(context, this.settings.maxContextChars, this.settings);
+    const contextText = formatContext(context, this.settings.maxContextChars, this.settings, query);
     const activeText = active?.text ? (active.selection || active.text) : "";
     const sources = formatSourceLinks(active, context);
     const taskContext = await this.buildTaskContext(active, context, prompt);
-    const response = await this.openaiResponse({
+    const response = await this.withAiActivity("Answering question", () => this.openaiResponse({
       model: this.settings.chatModel,
       system: [
         "You are a concise Obsidian sidebar assistant.",
         "Answer in plain language, usually in 3-6 short bullets or 1-3 short paragraphs.",
-        "Use the active note and vault context when useful, and say when the vault does not contain enough evidence.",
+        "Use the active note, ranked vault context, and local generated/synced task context together before answering; say when the vault does not contain enough evidence.",
         "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
         "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
         "Use markdown links exactly as supplied, and do not invent sources.",
-        "Use the task context to identify whether a task already exists in the notes or Todoist-linked task cache before suggesting task creation.",
-        "If the user asks about a specific existing task or asks for a Todoist link, use the supplied Todoist task link from the local reference table task context.",
+        "When providing any link, use descriptive linked text in markdown form such as [Open task](url) or [note title](url). Do not display full raw URLs in the visible answer.",
+        "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes.",
+        "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
+        "Use the task context to identify whether a task already exists before suggesting task creation.",
+        "When referring to an existing task, include its supplied Todoist task link when available.",
         "Avoid long preambles."
       ].join(" "),
       user: [
@@ -940,16 +1336,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Allowed source links:",
         sources || "No source links available.",
         "",
-        "Existing task context from notes and local Todoist-linked cache:",
+        "Existing generated/synced task context from notes and the local Todoist reference table:",
         taskContext || "No matching local task context found.",
         "",
-        "Semantic vault context:",
+        "Ranked semantic vault context:",
         contextText || "No semantic context found.",
         "",
         "User prompt:",
         prompt
       ].join("\n")
-    });
+    }));
     return { answer: response, context };
   }
 
@@ -1142,11 +1538,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async createTaskPlan(source) {
     await this.ensureCompatibleEmbeddingForChatModel();
     const sourceSummary = compressSourceForTaskPrompt(source, this.settings);
-    const context = await this.retrieveSemanticContext(`${source.title}\n${sourceSummary}`, this.settings.maxTaskContextChunks);
+    const taskQuery = `${source.title}\n${sourceSummary}`;
+    const context = await this.retrieveSemanticContext(taskQuery, this.settings.maxTaskContextChunks);
     const taskContext = await this.buildTaskContext(
       source.type === "note" ? { path: source.path || "", text: source.text || "" } : null,
       context,
-      `${source.title}\n${sourceSummary}`
+      taskQuery
     );
     const contextNotes = contextNotesForTaskPlan(context, source.path, this.settings.taskContextSummaryMaxNotes);
     const taskInstructions = this.taskInstructionsForSource(source.type);
@@ -1155,31 +1552,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const instructions = [
       source.templateInstructions ? `Selected prompt:\n${source.templateInstructions}` : "",
       `Generation limits:\nCreate no more than ${maxMainTasks} main tasks. Create no more than ${maxSubtasks} subtasks under any main task. It is better to create fewer high-confidence tasks than to fill the limit.`,
-      `Main task instructions:\n${taskInstructions.main}`,
-      `Subtask instructions:\n${taskInstructions.subtasks}`,
-      `Section title instructions:\n${taskInstructions.sectionTitle}`,
-      `Date and deadline instructions:\n${taskInstructions.dates}`,
-      `Tag instructions:\n${taskInstructions.tags}`,
-      `Priority instructions:\n${taskInstructions.priorities}`,
-      `Subtask criteria:\n${subtaskCriteriaInstructions(this.settings)}`
+      taskGenerationRequirements(taskInstructions, this.settings)
     ].filter(Boolean).join("\n\n");
-    const json = await this.openaiResponse({
+    const json = await this.withAiActivity("Generating task list", () => this.openaiResponse({
       model: this.settings.chatModel,
       jsonSchema: taskCreationSchema(maxMainTasks, maxSubtasks),
       system: [
         "Create Todoist task structure from the supplied source.",
         "Return only JSON matching the schema.",
+        "Follow the Main task requirements for every top-level task and the Subtask requirements for every subtask.",
+        "Use the active source content, ranked vault context, and existing local Todoist reference context for every task-generation decision, including main tasks and subtasks.",
+        "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
         "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
         source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, use only explicit action, follow-up, review, waiting-on, or decision requests from the email thread.",
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
-        "Use subtasks only when a main task has concrete required steps, and keep subtasks tied to the same project or program as the parent task.",
-        "For subtasks, follow the configured subtask criteria exactly. Use null dates and priority 1 for disabled subtask criteria.",
+        "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
         "Do not write task descriptions in this step. Descriptions are generated in a separate pass after local OIDs are assigned.",
         "Use YYYY-MM-DD dates.",
         `Today is ${today()}. Avoid weekends unless the source explicitly requires weekend work. Respect any local holiday or time-off rules described by the user instructions.`
       ].join(" "),
       user: [
+        "Task generation request:",
         instructions,
         "",
         `Source type: ${source.type}`,
@@ -1189,13 +1583,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Source content:",
         sourceSummary,
         "",
-        "Relevant vault context:",
-        formatContext(context, this.settings.maxContextChars, this.settings) || "No relevant vault context found.",
+        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
+        formatContext(context, this.settings.maxContextChars, this.settings, taskQuery) || "No relevant vault context found.",
         "",
-        "Existing task context from notes and local Todoist-linked cache:",
+        "Existing generated/synced task context from notes and the local Todoist reference table:",
         taskContext || "No matching local task context found."
       ].join("\n")
-    });
+    }));
     const parsed = JSON.parse(json);
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
@@ -1206,7 +1600,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return parsed;
   }
 
-  async refineTaskDescriptions(tasks, sourceSummary, context, sourceTitle, descriptionInstructions) {
+  async refineTaskDescriptions(tasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
     const mainTasks = (tasks || []).map((task, index) => ({
       index,
       title: task.content || "",
@@ -1215,30 +1609,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!mainTasks.length) return;
+    const citationMap = contextCitationMap(options.contextNotes || [], options.basePath || "");
+    const citeContextNotes = options.citeContextNotes !== false && citationMap.size > 0;
+    const contextQuery = [sourceTitle, sourceSummary, mainTasks.map((task) => task.title).join("\n")].join("\n");
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
-    const json = await this.openaiResponse({
+    const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
       model: this.settings.chatModel,
       jsonSchema: taskDescriptionSchema(),
       system: [
         "Write Todoist main-task descriptions only.",
         "Do not change task titles, due dates, priorities, labels, or subtasks.",
-        "For each main task, write one concrete, useful paragraph between 80 and 1200 characters.",
+        "For each main task, write one concrete, useful paragraph between 120 and 900 characters, usually 2-4 sentences.",
+        "Every description must pass this local quality gate: at least 80 characters, at least 12 words, not empty, not title-only, not a generic instruction to review/use the source, and not a close paraphrase of the task title.",
         "Do not repeat or paraphrase the task title.",
-        "Do not copy raw note lines. Summarize the active note and relevant vault context into useful action context.",
-        "Prioritize active-note details. Add vault context only if it helps explain dependencies, constraints, people, documents, program status, rationale, or next information needed.",
+        "Start with the actionable context itself: name the relevant people, documents, program, meeting, decision, dependency, timing, or constraint when the source provides it.",
+        "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename.",
+        "Do not write openings like 'The note says', 'The source records', 'The email indicates', 'IRGP Reviewer Documents Overview...', or any filename-first framing.",
+        "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
+        "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
+        "Use vault context as required supporting context when it is available; prioritize the highest-ranked excerpts that explain dependencies, constraints, people, documents, program status, rationale, or next information needed.",
+        citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Explain the useful why/so-what behind the context in plain language so the task can be actioned without reopening every source.",
         "Never return an empty description. Never say only to use the source material.",
+        "Avoid vague openings such as 'This task requires', 'Review the source', 'Complete the task', or 'Use the source material'.",
         "Do not mention whether web links or linked files were found, missing, excluded, or unavailable.",
         "Do not include source lists, headings, bullets, tags, section names, date metadata, or subtask lists.",
         "Subtasks must not receive descriptions."
       ].join(" "),
       user: [
-        `Source title: ${sourceTitle || ""}`,
+        `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
         "",
         "Description instructions:",
         descriptionInstructions || "",
         "",
         `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
+        "",
+        "Local validation rule:",
+        "Descriptions that are too short, too generic, title-only, or under 12 words are rejected and require a second AI call. Make the first response specific enough to avoid that.",
+        "",
+        "Context-note citation rule:",
+        contextCitationInstructions(citeContextNotes),
         "",
         "Main tasks needing descriptions:",
         JSON.stringify(mainTasks),
@@ -1246,22 +1656,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Active source content:",
         sourceSummary || "",
         "",
-        "Relevant vault context:",
-        formatContext(context, this.settings.maxContextChars, this.settings) || "No relevant vault context found."
+        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
+        formatContext(context, this.settings.maxContextChars, this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
-    });
+    }));
     const parsed = JSON.parse(json);
     for (const item of parsed.descriptions || []) {
       const task = tasks[item.index];
       if (!task || task.isSubtask) continue;
-      const summary = removeTitleEcho(cleanGeneratedDescriptionSummary(item.description || "", this.settings), task.content);
+      const summary = cleanTaskDescriptionSummary(item.description || "", task.content, sourceTitle, this.settings);
       task.description = truncateAtWord(summary || task.description || "", 1200);
       for (const subtask of task.subtasks || []) subtask.description = "";
     }
     const weakTasks = (tasks || []).map((task, index) => ({ task, index })).filter(({ task }) => !isUsefulDescriptionSummary(task.description, task.content, this.settings));
     if (weakTasks.length) {
-      this.setSidebarStatus(`Repairing ${weakTasks.length} weak task description${weakTasks.length === 1 ? "" : "s"}...`);
-      await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions);
+      this.logLocal("Task descriptions needed improvement", {
+        count: weakTasks.length,
+        tasks: weakTasks.map(({ task }) => ({ title: task.content || "", reason: descriptionQualityReason(task.description, task.content, this.settings) }))
+      });
+      this.setSidebarStatus(`Improving ${weakTasks.length} task description${weakTasks.length === 1 ? "" : "s"}...`);
+      await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options);
     }
     this.setSidebarStatus("Finalizing task descriptions...");
     for (const task of tasks || []) {
@@ -1272,7 +1686,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
-  async repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions) {
+  async repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
     const repairItems = weakTasks.map(({ task, index }) => ({
       index,
       title: task.content || "",
@@ -1280,40 +1694,48 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!repairItems.length) return;
-    const json = await this.openaiResponse({
+    const citationMap = contextCitationMap(options.contextNotes || [], options.basePath || "");
+    const citeContextNotes = options.citeContextNotes !== false && citationMap.size > 0;
+    const contextQuery = [sourceTitle, sourceSummary, repairItems.map((task) => task.title).join("\n")].join("\n");
+    const json = await this.withAiActivity(`Improving ${repairItems.length} task description${repairItems.length === 1 ? "" : "s"}`, () => this.openaiResponse({
       model: this.settings.chatModel,
       jsonSchema: taskDescriptionSchema(),
       system: [
-        "Repair weak Todoist main-task descriptions.",
+        "Improve incomplete Todoist main-task descriptions.",
         "Return only JSON matching the schema.",
         "Each description must be 80-1200 characters and must explain the specific context, rationale, dependencies, people, documents, and next information needed to action the task.",
-        "Use active source content first, then add relevant vault context. Do not repeat the title. Do not say to use the source material.",
+        "Use active source content first, then use ranked relevant vault context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
+        "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
+        citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Do not mention whether web links or linked files were found, missing, excluded, or unavailable.",
         "Do not include source lists, headings, bullets, tags, dates, section names, metadata, or subtask lists."
       ].join(" "),
       user: [
-        `Source title: ${sourceTitle || ""}`,
+        `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
         "",
         "Description instructions:",
         descriptionInstructions || "",
         "",
         `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
         "",
-        "Tasks needing repaired descriptions:",
+        "Context-note citation rule:",
+        contextCitationInstructions(citeContextNotes),
+        "",
+        "Tasks needing improved descriptions:",
         JSON.stringify(repairItems),
         "",
         "Active source content:",
         sourceSummary || "",
         "",
-        "Relevant vault context:",
-        formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings) || "No relevant vault context found."
+        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
+        formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
-    });
+    }));
     const parsed = JSON.parse(json);
     for (const item of parsed.descriptions || []) {
       const match = weakTasks.find(({ index }) => index === item.index);
       if (!match) continue;
-      const summary = removeTitleEcho(cleanGeneratedDescriptionSummary(item.description || "", this.settings), match.task.content);
+      const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings);
       if (isUsefulDescriptionSummary(summary, match.task.content, this.settings)) match.task.description = truncateAtWord(summary, 1200);
     }
   }
@@ -1389,10 +1811,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         assignGeneratedTaskOids(tasks, this.settings);
         this.setSidebarStatus("Preparing descriptions and Todoist section...");
         const sectionIdPromise = this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName));
-        const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], subject, plan.descriptionInstructions)
+        const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], subject, plan.descriptionInstructions, {
+          contextNotes: plan.contextNotes || [],
+          basePath: vaultBasePath(this.app),
+          citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false
+        })
           .then(() => {
             this.setSidebarStatus("Adding email source context...");
-            addContextToTaskDescriptions(tasks, plan.contextNotes || [], { title: subject, path: "", text: emailSourceText }, this.settings, plan.semanticContext || []);
+            addContextToTaskDescriptions(tasks, plan.contextNotes || [], { title: subject, path: "", text: emailSourceText }, this.settings, plan.semanticContext || [], vaultBasePath(this.app), this.settings.emailIncludeSourceListInDescriptions !== false);
           });
         const [sectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
         enforceGeneratedTaskLimits(tasks, this.settings);
@@ -1559,11 +1985,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.setSidebarStatus("Creating tasks...");
       const active = await this.getActiveMarkdownContext();
       if (!active.path) throw new Error("Open a markdown note first.");
-      const template = { name: "Active note task extraction", prompt: "Scan the active note or selected text and generate a Todoist-ready task list." };
+      const template = await this.resolveTaskGenerationTemplate();
       const result = await this.generateTaskListFromTemplate(template, {
         active,
-        insertIntoNote: this.settings.insertGeneratedTasksIntoNote,
-        syncAfterInsert: this.settings.syncAfterInsertingGeneratedTasks,
         showNotice: true
       });
       if (!result.tasks.length) new Notice("No actionable tasks found in the active note.");
@@ -1582,8 +2006,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const active = options.active || await this.getActiveMarkdownContext();
     try {
       if (!active.path) throw new Error("Open a markdown note first.");
-      const shouldInsert = options.insertIntoNote ?? this.settings.insertGeneratedTasksIntoNote;
-      const shouldSyncAfterInsert = options.syncAfterInsert ?? this.settings.syncAfterInsertingGeneratedTasks;
+      const shouldInsert = options.insertIntoNote ?? template.insertResponse ?? true;
+      const shouldSyncAfterInsert = options.syncAfterInsert ?? template.syncAfterInsert ?? false;
       if (shouldInsert && shouldSyncAfterInsert) this.requireTodoistAccess();
       const sectionName = makeNoteSectionName(active.title, active.text, active.path);
       const plan = await this.createTaskPlan({
@@ -1606,10 +2030,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const sectionIdPromise = shouldInsert && shouldSyncAfterInsert
         ? this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName))
         : Promise.resolve("");
-      const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], active.title, plan.descriptionInstructions)
+      const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], active.title, plan.descriptionInstructions, {
+        contextNotes: plan.contextNotes || [],
+        basePath: vaultBasePath(this.app),
+        citeContextNotes: this.settings.noteIncludeSourceListInDescriptions !== false
+      })
         .then(() => {
           this.setSidebarStatus("Adding source context to descriptions...");
-          addContextToTaskDescriptions(tasks, plan.contextNotes || [], active, this.settings, plan.semanticContext || []);
+          addContextToTaskDescriptions(tasks, plan.contextNotes || [], active, this.settings, plan.semanticContext || [], vaultBasePath(this.app), this.settings.noteIncludeSourceListInDescriptions !== false);
         });
       [preparedSectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
       enforceGeneratedTaskLimits(tasks, this.settings);
@@ -1623,7 +2051,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const file = this.app.vault.getAbstractFileByPath(active.path);
         this.cancelQueuedNoteSync(active.path);
         this.markInternalNoteWrite(active.path);
-        await this.app.vault.append(file, `\n\n${markdown}\n`);
+        await appendMarkdownBlock(this.app, file, markdown);
         if (shouldSyncAfterInsert) {
           this.cancelQueuedNoteSync(active.path);
           this.setSidebarStatus("Syncing Todoist tasks...");
@@ -1708,7 +2136,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (!(file instanceof TFile)) throw new Error("Active note was not found.");
         this.cancelQueuedNoteSync(active.path);
         this.markInternalNoteWrite(active.path);
-        await this.app.vault.append(file, `\n\n${markdown}\n`);
+        await appendMarkdownBlock(this.app, file, markdown);
       }
       if (options.showNotice) new Notice(`Ran prompt "${template.name || "Prompt"}"${shouldInsert ? " and inserted the response" : ""}.`);
       return { answer: result.answer, markdown, contextNotes: contextNotesForTaskPlan(result.context || [], active.path, this.settings.taskContextSummaryMaxNotes), semanticContext: result.context || [], tasks: [] };
@@ -2136,7 +2564,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (creations.length) this.setSidebarStatus(`Creating ${creations.length} Todoist task${creations.length === 1 ? "" : "s"}...`);
     const tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp);
     for (const parsed of relinked) {
-      lines[parsed.lineNumber] = syncProjectMarkerOnTaskLine(addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid), parsed, this.settings);
+      lines[parsed.lineNumber] = syncLocationMarkersOnTaskLine(addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid), parsed, this.settings);
       changed = true;
       stats.relinked += 1;
     }
@@ -2158,7 +2586,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const remote = remoteTasksById.get(parsed.id) || null;
       if (remote) {
         applyRemoteTodoistLocation(parsed, remote);
-        const syncedLine = syncProjectMarkerOnTaskLine(lines[parsed.lineNumber], parsed, this.settings);
+        const syncedLine = syncLocationMarkersOnTaskLine(lines[parsed.lineNumber], parsed, this.settings);
         if (syncedLine !== lines[parsed.lineNumber]) {
           lines[parsed.lineNumber] = syncedLine;
           changed = true;
@@ -2167,15 +2595,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       const signature = parsedTaskSignature(parsed);
       if (cached?.signature === signature && !remote) continue;
-      const remoteSignature = remote ? remoteTaskComparableSignature(remote, parsed, this.settings) : "";
-      if (remoteSignature && remoteSignature === signature) {
+      const remoteParsed = remote ? todoistTaskToParsedTask(remote, parsed, this.settings) : null;
+      const remoteSignature = remoteParsed ? parsedTaskSignature(remoteParsed) : "";
+      const cachedSignature = cached?.signature || (cached ? parsedTaskSignature(cached) : "");
+      const remoteChangedSinceCache = remoteParsed && (!cachedSignature || remoteSignature !== cachedSignature);
+      if (remoteChangedSinceCache) {
+        Object.assign(parsed, remoteParsed);
+        const remoteLine = taskLineWithStableIndent(lines[parsed.lineNumber], parsed, this.settings, parsed.id);
+        if (remoteLine !== lines[parsed.lineNumber]) {
+          lines[parsed.lineNumber] = remoteLine;
+          changed = true;
+          stats.normalized += 1;
+        }
         this.cacheTask(parsed.id, parsed);
+        continue;
+      }
+      if (remoteSignature && remoteSignature === signature) {
+        this.cacheTask(parsed.id, remoteParsed || parsed);
         continue;
       }
       const conflict = await this.todoistConflictForLocalUpdate(parsed, cached, remote);
       if (conflict) {
         const todoistContent = conflict.content || parsed.content;
-        lines[parsed.lineNumber] = preserveTaskIndent(lines[parsed.lineNumber], replaceTaskLineContent(lines[parsed.lineNumber], todoistContent, this.settings));
+        lines[parsed.lineNumber] = ensureSubtaskIndent(
+          preserveTaskIndent(lines[parsed.lineNumber], replaceTaskLineContent(lines[parsed.lineNumber], todoistContent, this.settings)),
+          parsed,
+          this.settings
+        );
         parsed.content = todoistContent;
         parsed.description = conflict.description || parsed.description;
         changed = true;
@@ -2366,6 +2812,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.todoistSectionCache[projectId] = { fetchedAt: deviceTimestamp(), sections };
   }
 
+  forgetTodoistSection(projectId, sectionId, sectionName = "") {
+    if (!projectId || !this.settings.todoistSectionCache?.[projectId]) return;
+    const key = sectionKey(sectionName);
+    const cached = this.settings.todoistSectionCache[projectId];
+    const sections = (cached.sections || []).filter((section) => {
+      if (sectionId && String(section.id || "") === String(sectionId)) return false;
+      if (key && sectionKey(section.name) === key) return false;
+      return true;
+    });
+    this.settings.todoistSectionCache[projectId] = { fetchedAt: deviceTimestamp(), sections };
+  }
+
   async todoistSync(commands) {
     const body = new URLSearchParams();
     body.set("commands", JSON.stringify(commands));
@@ -2411,6 +2869,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async deleteTodoistTasksMissingFromFile(path, presentIds) {
     let deleted = 0;
+    const deletedSections = new Map();
     for (const [id, cached] of Object.entries(this.settings.taskCache || {})) {
       if (cached.path !== path || presentIds.has(id)) continue;
       const ok = await this.deleteTodoistTask(id).catch((error) => {
@@ -2418,10 +2877,61 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return false;
       });
       if (!ok) continue;
+      if (!cached.isSubtask && cached.sectionId) {
+        deletedSections.set(cached.sectionId, {
+          sectionId: cached.sectionId,
+          section: cached.section || "",
+          projectId: cached.projectId || ""
+        });
+      }
       delete this.settings.taskCache[id];
       deleted += 1;
     }
+    if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()));
     return deleted;
+  }
+
+  async cleanupEmptyTodoistSections(sections) {
+    const candidates = uniqueSectionCleanupCandidates(sections);
+    if (!candidates.length) return 0;
+    let snapshot = null;
+    try {
+      snapshot = await this.getTodoistSnapshot(["items", "sections"], true);
+    } catch (error) {
+      this.logLocal("Todoist section cleanup skipped", { error: error.message || String(error) });
+      return 0;
+    }
+    let deleted = 0;
+    for (const section of candidates) {
+      if (!section.sectionId) continue;
+      const hasLocalTasks = Object.values(this.settings.taskCache || {}).some((task) => String(task.sectionId || "") === String(section.sectionId));
+      if (hasLocalTasks) continue;
+      const hasRemoteTasks = (snapshot.tasks || []).some((task) => String(task.sectionId || "") === String(section.sectionId));
+      if (hasRemoteTasks) continue;
+      const ok = await this.deleteTodoistSection(section.sectionId).catch((error) => {
+        this.logLocal("Todoist section delete failed", { sectionId: section.sectionId, section: section.section || "", error: error.message || String(error) });
+        return false;
+      });
+      if (!ok) continue;
+      this.forgetTodoistSection(section.projectId, section.sectionId, section.section);
+      deleted += 1;
+    }
+    if (deleted) this.logLocal("Empty Todoist sections deleted", { sections: deleted });
+    return deleted;
+  }
+
+  async deleteTodoistSection(sectionId) {
+    if (!sectionId) return false;
+    const response = await requestUrl({
+      url: `${TODOIST_API}/sections/${encodeURIComponent(sectionId)}`,
+      method: "DELETE",
+      headers: { authorization: `Bearer ${this.settings.todoistToken}` },
+      throw: false
+    });
+    if (response.status === 404) return true;
+    if (response.status < 200 || response.status >= 300) throw new Error(`Todoist section delete returned ${response.status}: ${redactSecrets(response.text)}`);
+    this.todoistSnapshotCache = null;
+    return true;
   }
 
   async reconcileTodoistTaskCache() {
@@ -2582,7 +3092,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const savedEvents = new Set(this.settings.processedTodoistEventIds || []);
     const events = (activities.results || []).filter((event) => !savedEvents.has(event.id));
     let snapshotTasksById = null;
-    if (events.some((event) => /updated|added|uncompleted|deleted|removed/i.test(event.event_type || event.eventType || ""))) {
+    if (events.some((event) => /updated|added|completed|uncompleted|deleted|removed/i.test(event.event_type || event.eventType || ""))) {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false).catch(() => null);
       if (snapshot?.tasks) snapshotTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
     }
@@ -2625,6 +3135,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const cached = this.settings.taskCache[taskId];
     if (!cached) return;
     await this.updateCachedLine(taskId, (line) => line.replace(/^(\s*[-*]\s+\[)[ xX](\])/, `$1${checked ? "x" : " "}$2`));
+    cached.isCompleted = Boolean(checked);
+    cached.signature = parsedTaskSignature(cached);
+    cached.cachedAt = deviceTimestamp();
   }
 
   async updateTaskLineFromTodoist(taskId, task) {
@@ -2632,31 +3145,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!cached) return;
     const projectId = String(task.project_id || task.projectId || cached.projectId || "");
     const projectName = await this.todoistProjectNameForId(projectId);
-    const parsed = Object.assign({}, cached, {
+    const parsed = todoistTaskToParsedTask(Object.assign({}, task, { projectId, projectName }), Object.assign({}, cached, {
       oid: cached.oid || oidForTodoistId(this.settings, taskId) || generateUniqueOid(this.settings),
-      content: task.content || cached.content,
-      labels: cached.labels || [],
-      priority: normalizePriority(cached.priority),
-      due_date: cached.due_date || null,
-      deadline_date: cached.deadline_date || null,
-      description: isRichTodoistDescription(task.description) ? task.description : cached.description || "",
-      isSubtask: Boolean(cached.isSubtask),
-      parentId: task.parent_id || task.parentId || cached.parentId || "",
       parentOid: cached.parentOid || "",
       parentContent: cached.parentContent || "",
       parentLineNumber: cached.parentLineNumber ?? null,
-      section: cached.section || "",
-      sectionId: task.section_id || task.sectionId || cached.sectionId || "",
-      projectId,
-      projectName
-    });
+      id: taskId
+    }), this.settings);
     await this.updateCachedLine(taskId, (line) => {
-      const updatedContent = replaceTaskLineContent(line, parsed.content, this.settings);
-      return syncProjectMarkerOnTaskLine(updatedContent, {
-        projectId,
-        projectName,
-        isSubtask: parsed.isSubtask
-      }, this.settings);
+      return taskLineWithStableIndent(line, parsed, this.settings, taskId);
     });
     this.cacheTask(taskId, parsed);
   }
@@ -2686,11 +3183,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const incomingDescription = !task.isSubtask && isRichTodoistDescription(task.description) ? task.description : "";
     const description = task.isSubtask ? "" : sanitizeStoredTodoistDescription(incomingDescription || existingDescription || "", this.settings);
     const oid = task.oid || this.settings.taskCache?.[id]?.oid || generateUniqueOid(this.settings);
-    const pendingReference = oid ? this.settings.pendingTaskReferences?.[pendingTaskOidKey(task.path, oid)] : null;
+    const path = vaultRelativePath(task.path, vaultBasePath(this.app));
+    const pendingReference = oid ? this.settings.pendingTaskReferences?.[pendingTaskOidKey(path, oid)] : null;
     const parentReference = parentReferenceForParsedTask(task, this.settings) || {};
     this.settings.taskCache[id] = {
       oid,
-      path: task.path,
+      path,
       lineNumber: task.lineNumber,
       content: task.content,
       description,
@@ -2708,37 +3206,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       sectionId: task.sectionId || pendingReference?.sectionId || this.settings.taskCache?.[id]?.sectionId || "",
       projectId: task.projectId || task.project_id || pendingReference?.projectId || this.settings.taskCache?.[id]?.projectId || "",
       projectName: task.projectName || pendingReference?.projectName || this.settings.taskCache?.[id]?.projectName || "",
-      noteRefs: mergeNoteReferences(this.settings.taskCache?.[id]?.noteRefs || [], [noteReferenceForTask(task, oid)]),
+      noteRefs: mergeNoteReferences(this.settings.taskCache?.[id]?.noteRefs || [], [noteReferenceForTask(Object.assign({}, task, { path }), oid)]),
       signature: parsedTaskSignature(task),
       cachedAt: deviceTimestamp()
     };
     if (this.settings.pendingTaskDescriptions) {
-      delete this.settings.pendingTaskDescriptions[pendingTaskKey(task.path, task)];
-      delete this.settings.pendingTaskDescriptions[pendingTaskContentKey(task.path, task)];
-      if (oid) delete this.settings.pendingTaskDescriptions[pendingTaskOidKey(task.path, oid)];
+      delete this.settings.pendingTaskDescriptions[pendingTaskKey(path, task)];
+      delete this.settings.pendingTaskDescriptions[pendingTaskContentKey(path, task)];
+      if (oid) delete this.settings.pendingTaskDescriptions[pendingTaskOidKey(path, oid)];
     }
-    if (this.settings.pendingTaskReferences && oid) delete this.settings.pendingTaskReferences[pendingTaskOidKey(task.path, oid)];
+    if (this.settings.pendingTaskReferences && oid) delete this.settings.pendingTaskReferences[pendingTaskOidKey(path, oid)];
+    this.queueTaskReferenceIndexUpdate(path);
   }
 
   savePendingTaskDescriptions(path, tasks) {
     this.settings.pendingTaskDescriptions = this.settings.pendingTaskDescriptions || {};
+    const notePath = vaultRelativePath(path, vaultBasePath(this.app));
     for (const task of flattenTaskPlan(tasks)) {
       if (task.isSubtask) continue;
       const description = task.description || "";
       if (!description) continue;
-      this.settings.pendingTaskDescriptions[pendingTaskKey(path, task)] = description;
-      this.settings.pendingTaskDescriptions[pendingTaskContentKey(path, task)] = description;
-      if (task.oid) this.settings.pendingTaskDescriptions[pendingTaskOidKey(path, task.oid)] = description;
+      this.settings.pendingTaskDescriptions[pendingTaskKey(notePath, task)] = description;
+      this.settings.pendingTaskDescriptions[pendingTaskContentKey(notePath, task)] = description;
+      if (task.oid) this.settings.pendingTaskDescriptions[pendingTaskOidKey(notePath, task.oid)] = description;
     }
   }
 
   savePendingTaskReferences(path, tasks) {
     this.settings.pendingTaskReferences = this.settings.pendingTaskReferences || {};
     const createdAt = deviceTimestamp();
+    const notePath = vaultRelativePath(path, vaultBasePath(this.app));
     for (const task of tasks || []) {
-      if (task.oid) this.settings.pendingTaskReferences[pendingTaskOidKey(path, task.oid)] = {
+      if (task.oid) this.settings.pendingTaskReferences[pendingTaskOidKey(notePath, task.oid)] = {
         oid: task.oid,
-        path,
+        path: notePath,
         content: task.content || "",
         section: task.section || "",
         sectionId: task.sectionId || "",
@@ -2752,12 +3253,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
       for (const subtask of task.subtasks || []) {
         if (!subtask.oid) continue;
-        this.settings.pendingTaskReferences[pendingTaskOidKey(path, subtask.oid)] = {
+        this.settings.pendingTaskReferences[pendingTaskOidKey(notePath, subtask.oid)] = {
           oid: subtask.oid,
           parentOid: task.oid || "",
           parentId: task.id || "",
           parentContent: task.content || "",
-          path,
+          path: notePath,
           content: subtask.content || "",
           section: task.section || "",
           sectionId: task.sectionId || "",
@@ -2768,6 +3269,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         };
       }
     }
+    this.queueTaskReferenceIndexUpdate(notePath);
   }
 
   descriptionStateForParsedTask(task) {
@@ -2866,7 +3368,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       lines.push(parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task), this.settings, task.id));
       for (const subtask of task.subtasks || []) {
         const line = parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: true }, subtask), this.settings, subtask.id);
-        lines.push(`${" ".repeat(Math.max(2, this.settings.subtaskIndentSpaces || 4))}${line}`);
+        lines.push(`${desiredSubtaskIndent(this.settings)}${line.trimStart()}`);
       }
     }
     if (!tasks?.length) lines.push("- No actionable tasks were found.");
@@ -2883,6 +3385,8 @@ class SemanticTodoistView extends ItemView {
     this.messages = [];
     this.selectedPath = "";
     this.includeActiveNote = plugin.settings.searchIncludeActiveNote !== false;
+    this.statusDisplayEntries = new Map();
+    this.statusRefreshTimer = null;
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -2893,6 +3397,12 @@ class SemanticTodoistView extends ItemView {
     this.render();
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.handleActiveNoteChanged()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.handleActiveNoteChanged()));
+  }
+
+  async onClose() {
+    window.clearTimeout(this.statusRefreshTimer);
+    this.statusRefreshTimer = null;
+    this.statusDisplayEntries?.clear?.();
   }
 
   setPrompt(text) {
@@ -2996,9 +3506,6 @@ class SemanticTodoistView extends ItemView {
           this.addMessage("assistant", `Error: ${error.message || error}`);
           this.setStatus(`Task creation failed: ${error.message || error}`);
         }
-      }, {
-        insertIntoNote: this.plugin.settings.insertGeneratedTasksIntoNote,
-        syncAfterInsert: this.plugin.settings.syncAfterInsertingGeneratedTasks
       }).open();
     };
     this.statusEl = container.createDiv({ cls: "semantic-todoist-status" });
@@ -3049,19 +3556,62 @@ class SemanticTodoistView extends ItemView {
   setStatus(message = "Ready") {
     this.currentStatus = message || "Ready";
     if (!this.statusEl) return;
+    const { items, nextDelay } = this.statusItemsForDisplay();
+    this.renderStatusItems(items);
+    this.scheduleStatusRefresh(nextDelay);
+  }
+
+  statusItemsForDisplay(now = Date.now()) {
+    const rawItems = activeWorkflowStatusItems(this.plugin, this.currentStatus);
+    const activeItems = isReadyWorkflowStatusItems(rawItems) ? [] : rawItems;
+    const activeKeys = new Set();
+    activeItems.forEach((item, index) => {
+      const key = workflowStatusItemKey(item);
+      activeKeys.add(key);
+      const existing = this.statusDisplayEntries.get(key);
+      this.statusDisplayEntries.set(key, {
+        item,
+        firstSeen: existing?.firstSeen ?? now,
+        lastSeen: now,
+        order: existing?.order ?? now + index / 100
+      });
+    });
+    const visible = [];
+    let nextDelay = 0;
+    for (const [key, entry] of this.statusDisplayEntries.entries()) {
+      const isActive = activeKeys.has(key);
+      const remaining = STATUS_ITEM_MIN_VISIBLE_MS - (now - entry.firstSeen);
+      if (isActive || remaining > 0) {
+        visible.push(entry);
+        if (!isActive && remaining > 0) nextDelay = nextDelay ? Math.min(nextDelay, remaining) : remaining;
+      } else {
+        this.statusDisplayEntries.delete(key);
+      }
+    }
+    const items = visible
+      .sort((a, b) => a.order - b.order)
+      .map((entry) => entry.item);
+    return { items: items.length ? items : [{ label: "Status", value: "Ready" }], nextDelay };
+  }
+
+  scheduleStatusRefresh(delayMs) {
+    window.clearTimeout(this.statusRefreshTimer);
+    this.statusRefreshTimer = null;
+    if (!delayMs) return;
+    this.statusRefreshTimer = window.setTimeout(() => {
+      this.statusRefreshTimer = null;
+      this.setStatus(this.currentStatus || "Ready");
+    }, Math.max(0, Math.ceil(delayMs) + 25));
+  }
+
+  renderStatusItems(items) {
     this.statusEl.empty();
     const line1 = this.statusEl.createDiv({ cls: "semantic-todoist-status-line" });
-    line1.createEl("strong", { text: "Status:" });
-    line1.createSpan({ text: ` ${singleLine(this.currentStatus) || "Ready"}` });
-    const parts = activeWorkflowStatusParts(this.plugin, this.currentStatus);
-    if (parts.length) {
-      const line2 = this.statusEl.createDiv({ cls: "semantic-todoist-status-line semantic-todoist-status-detail" });
-      parts.forEach((part, index) => {
-        if (index) line2.createSpan({ cls: "semantic-todoist-status-separator", text: " | " });
-        line2.createEl("strong", { text: `${part.label}:` });
-        line2.createSpan({ text: ` ${part.value}` });
-      });
-    }
+    items.forEach((item, index) => {
+      if (index) line1.createSpan({ cls: "semantic-todoist-status-separator", text: " | " });
+      line1.createEl("strong", { text: `${item.label}:` });
+      line1.createSpan({ text: ` ${item.value}` });
+    });
   }
 
   async getSelectedActiveContext(options = {}) {
@@ -3156,14 +3706,14 @@ class SemanticTodoistView extends ItemView {
   }
 
   addMessage(role, text) {
-    this.messages.push({ role, text });
+    this.messages.push({ role, text: role === "assistant" ? embedBareMarkdownLinks(text) : text });
     this.renderMessages();
   }
 
   replaceLastAssistantMessage(text) {
     for (let i = this.messages.length - 1; i >= 0; i -= 1) {
       if (this.messages[i].role === "assistant") {
-        this.messages[i].text = text;
+        this.messages[i].text = embedBareMarkdownLinks(text);
         this.renderMessages();
         return;
       }
@@ -3427,6 +3977,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Email Content");
     numberSetting(containerEl, "Maximum email characters", this.plugin, "maxEmailChars");
     textSetting(containerEl, "Email log folder", "Plain-language processing log folder.", this.plugin, "emailLogFolder");
+    toggleSetting(containerEl, "Add source list and citations to Todoist descriptions", "Append source references and add context note numbers like (1) beside email description sentences primarily supported by context notes.", this.plugin, "emailIncludeSourceListInDescriptions");
     settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
     numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
@@ -3445,25 +3996,26 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Sync worker count", this.plugin, "syncWorkerCount");
     settingsHeading(containerEl, "Note Task Formatting");
     toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// task links instead of web links when the AI references tasks from the local OID table.", this.plugin, "linksAppURI");
-    toggleSetting(containerEl, "Obsidian Tasks date/link order", "Place Todoist metadata before due/deadline markers to reduce parsing issues.", this.plugin, "obsidianTasksDateOrder");
     numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
-    toggleSetting(containerEl, "Insert generated task list into note", "AI-generated note tasks are written into the active note.", this.plugin, "insertGeneratedTasksIntoNote");
-    toggleSetting(containerEl, "Sync after inserting generated tasks", "Immediately create Todoist tasks after inserting generated note tasks.", this.plugin, "syncAfterInsertingGeneratedTasks");
     subtaskCriteriaSettings(containerEl, this.plugin);
     settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
     numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
     numberSetting(containerEl, "Maximum note characters for task extraction", this.plugin, "maxNoteChars");
     numberSetting(containerEl, "Maximum Todoist description characters", this.plugin, "todoistDescriptionMaxChars");
+    toggleSetting(containerEl, "Add source list and citations to Todoist descriptions", "Append source references and add context note numbers like (1) beside note description sentences primarily supported by context notes.", this.plugin, "noteIncludeSourceListInDescriptions");
     new Setting(containerEl).setName("Sync note tasks").addButton((button) => button.setButtonText("Sync").setCta().onClick(() => this.plugin.syncNoteTasks()));
     taskInstructionSettings(containerEl, this.plugin, "Note task instructions", "note");
   }
 
   renderActivity(containerEl) {
     containerEl.createEl("h3", { text: "Plugin Activity" });
+    settingsHeading(containerEl, "AI And Semantic Index", "Current model and local semantic index status. Available model counts are shown as supporting detail.");
+    activitySetting(containerEl, "Active AI models", activeModelSummary(this.plugin.settings));
     activitySetting(containerEl, "Semantic index", indexSummary(this.plugin));
-    activitySetting(containerEl, "Index file", `${this.plugin.semanticIndexStats?.path || SEMANTIC_INDEX_FILE}. ${formatBytes(this.plugin.semanticIndexStats?.bytes || 0)}.`);
-    activitySetting(containerEl, "AI models", modelSummary(this.plugin.settings));
+    activitySetting(containerEl, "Index files", indexFilesSummary(this.plugin));
+    activitySetting(containerEl, "Available models", availableModelSummary(this.plugin.settings));
+    settingsHeading(containerEl, "Workflow Activity");
     activitySetting(containerEl, "Tracking timezone", `${deviceTimeZone()} using device-local timestamps.`);
     activitySetting(containerEl, "Todoist", `${this.plugin.settings.availableTodoistProjects?.length || 0} projects loaded. ${Object.keys(this.plugin.settings.taskCache || {}).length} synced task references.`);
     activitySetting(containerEl, "Reference rebuild", `Last rebuild: ${this.plugin.settings.lastReferenceRebuildAt || "Not yet rebuilt"}. Auto-rebuild: ${this.plugin.settings.autoRebuildReferences ? "on" : "off"}. Workers: ${referenceRebuildWorkerCount(this.plugin.settings)}. Last local candidates: ${this.plugin.settings.lastReferenceRebuildCandidateCount || 0}. OID-only tasks can recover Todoist IDs by exact task-name matching.`);
@@ -3631,13 +4183,14 @@ function taskInstructionSettings(containerEl, plugin, heading, prefix) {
     ? "Plain-language instructions used only when creating tasks from Cloudflare email content."
     : "Plain-language instructions used only when creating tasks from notes, selected text, or note prompts.";
   settingsHeading(containerEl, heading, desc);
-  textAreaSetting(containerEl, "Main Task", plugin, `${prefix}MainTaskInstructions`);
-  textAreaSetting(containerEl, "Subtasks", plugin, `${prefix}SubtaskInstructions`);
-  textAreaSetting(containerEl, "Section Titles", plugin, `${prefix}SectionTitleInstructions`);
-  textAreaSetting(containerEl, "Dates and Deadlines", plugin, `${prefix}DateInstructions`);
-  textAreaSetting(containerEl, "Tags", plugin, `${prefix}TagInstructions`);
-  textAreaSetting(containerEl, "Priorities", plugin, `${prefix}PriorityInstructions`);
-  textAreaSetting(containerEl, "Descriptions and links", plugin, `${prefix}DescriptionInstructions`);
+  const compact = { compact: true };
+  textAreaSetting(containerEl, "Main Task", plugin, `${prefix}MainTaskInstructions`, compact);
+  textAreaSetting(containerEl, "Subtasks", plugin, `${prefix}SubtaskInstructions`, compact);
+  textAreaSetting(containerEl, "Section Titles", plugin, `${prefix}SectionTitleInstructions`, compact);
+  textAreaSetting(containerEl, "Dates and Deadlines", plugin, `${prefix}DateInstructions`, compact);
+  textAreaSetting(containerEl, "Tags", plugin, `${prefix}TagInstructions`, compact);
+  textAreaSetting(containerEl, "Priorities", plugin, `${prefix}PriorityInstructions`, compact);
+  textAreaSetting(containerEl, "Descriptions and links", plugin, `${prefix}DescriptionInstructions`, compact);
 }
 
 function subtaskCriteriaSettings(containerEl, plugin) {
@@ -3684,16 +4237,15 @@ const SETTING_DESCRIPTIONS = {
   syncIntervalSeconds: "How often automatic Notes-To-Todoist checks run while Obsidian is open.",
   syncWorkerCount: "Number of local note files processed in parallel during note sync.",
   linksAppURI: "Use Todoist app links instead of Todoist web links when sidebar answers reference tasks from the local OID table.",
-  obsidianTasksDateOrder: "Keeps metadata ordered to work better with the Obsidian Tasks plugin.",
   subtaskIndentSpaces: "Number of leading spaces used when inserting generated subtasks.",
   subtaskIncludeLabels: "Allow Todoist labels on subtasks.",
   subtaskIncludePriority: "Allow priority markers and Todoist priority on subtasks.",
   subtaskIncludeDueDate: "Allow due dates on subtasks.",
   subtaskIncludeDeadline: "Allow deadline dates on subtasks.",
-  insertGeneratedTasksIntoNote: "When enabled, generated note tasks are written into the active note.",
-  syncAfterInsertingGeneratedTasks: "When enabled, inserted generated tasks are immediately created or updated in Todoist.",
   maxNoteChars: "Maximum note text sent to the AI for task extraction.",
   todoistDescriptionMaxChars: "Maximum generated description characters before the source list is added.",
+  emailIncludeSourceListInDescriptions: "When enabled, email-created Todoist descriptions include plugin-generated source references and context-note citations like (1).",
+  noteIncludeSourceListInDescriptions: "When enabled, note-created Todoist descriptions include plugin-generated source references and context-note citations like (1).",
   autoRebuildReferences: "Low-frequency reconciliation of the local OID reference table against Todoist.",
   referenceRebuildIntervalMinutes: "How often automatic reference reconciliation may run while Obsidian is open.",
   referenceRebuildWorkerCount: "Number of local note files processed in parallel during reference reconciliation.",
@@ -3909,11 +4461,15 @@ function folderListSetting(containerEl, name, desc, plugin, key) {
     .filter((path) => path && path !== "/")
     .sort((a, b) => a.localeCompare(b));
   let choice = folders.find((folder) => !selected.includes(folder)) || folders[0] || "";
-  new Setting(containerEl).setName(name).setDesc(selected.length ? `${desc} Current: ${selected.join(", ")}` : desc)
-    .addDropdown((dropdown) => {
-      if (!folders.length) dropdown.addOption("", "No folders found");
-      for (const folder of folders) dropdown.addOption(folder, folder);
-      dropdown.setValue(choice).onChange((value) => { choice = value; });
+  const listId = `semantic-todoist-folder-options-${key}`;
+  const dataList = containerEl.createEl("datalist", { attr: { id: listId } });
+  for (const folder of folders) dataList.createEl("option", { attr: { value: folder } });
+  new Setting(containerEl).setName(name).setDesc(desc)
+    .addText((text) => {
+      text.inputEl.setAttr("list", listId);
+      text.inputEl.setAttr("placeholder", folders.length ? "Type to search vault folders" : "No folders found");
+      text.setValue(choice);
+      text.onChange((value) => { choice = trimSlashes(value); });
     })
     .addButton((button) => button.setButtonText("Add").onClick(async () => {
       if (!choice) return;
@@ -3926,8 +4482,10 @@ function folderListSetting(containerEl, name, desc, plugin, key) {
       await plugin.saveSettings();
       new Notice("Folder added. Reopen this settings tab to refresh the folder list.");
     }));
+  const selectedEl = containerEl.createDiv({ cls: "semantic-todoist-folder-list" });
+  selectedEl.createDiv({ cls: "semantic-todoist-folder-list-title", text: selected.length ? "Excluded folders" : "No excluded folders selected." });
   for (const folder of selected) {
-    new Setting(containerEl).setName(folder).setDesc("Excluded folder").addButton((button) => button.setButtonText("Remove").onClick(async () => {
+    new Setting(selectedEl).setName(folder).setDesc("Excluded folder").addButton((button) => button.setButtonText("Remove").onClick(async () => {
       plugin.settings[key] = selected.filter((item) => item !== folder).join(", ");
       plugin.semanticIndex = [];
       plugin.settings.semanticIndexMeta = {};
@@ -3938,12 +4496,13 @@ function folderListSetting(containerEl, name, desc, plugin, key) {
   }
 }
 
-function textAreaSetting(containerEl, name, plugin, key) {
+function textAreaSetting(containerEl, name, plugin, key, options = {}) {
   const setting = new Setting(containerEl).setName(name).setDesc(settingDescription(name, key)).addTextArea((text) => text.setValue(plugin.settings[key] || "").onChange(async (value) => {
     plugin.settings[key] = value;
     await plugin.saveSettings();
   }));
   setting.settingEl.addClass("semantic-todoist-setting");
+  if (options.compact) setting.settingEl.addClass("semantic-todoist-setting-compact");
 }
 
 function activitySetting(containerEl, name, desc) {
@@ -4059,12 +4618,24 @@ function legacyTodoistIdModeSummary(settings) {
 function indexSummary(pluginOrSettings) {
   const settings = pluginOrSettings.settings || pluginOrSettings;
   const meta = settings.semanticIndexMeta || {};
-  const bytes = pluginOrSettings.semanticIndexStats ? ` File: ${formatBytes(pluginOrSettings.semanticIndexStats.bytes || 0)}.` : "";
+  const stats = pluginOrSettings.semanticIndexStats || {};
+  const bytes = stats.bytes ? ` Largest file: ${formatBytes(stats.bytes)}.` : "";
+  const total = stats.totalBytes && stats.totalBytes !== stats.bytes ? ` Total: ${formatBytes(stats.totalBytes)} across ${stats.files || 1} files.` : "";
   const chunks = Number(meta.chunks || pluginOrSettings.semanticIndex?.length || 0);
-  if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}`;
-  if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes} Rebuild the semantic vault index.`;
-  if (pluginOrSettings.semanticIndexStats?.bytes) return `No semantic index chunks are available. ${bytes} Rebuild the semantic vault index.`;
+  if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}${total}`;
+  if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes}${total} Rebuild the semantic vault index.`;
+  if (stats.bytes) return `No semantic index chunks are available. ${bytes}${total} Rebuild the semantic vault index.`;
   return "No semantic index has been built yet.";
+}
+
+function indexFilesSummary(pluginOrSettings) {
+  const stats = pluginOrSettings.semanticIndexStats || {};
+  const path = stats.path || pluginOrSettings.settings?.semanticIndexMeta?.file || SEMANTIC_INDEX_FILE;
+  if (!stats.bytes && !stats.totalBytes) return `${path}. No index file loaded.`;
+  if (stats.shards) {
+    return `Manifest: ${path}. Shards: ${stats.shards}. Largest file: ${formatBytes(stats.bytes || 0)}. Total: ${formatBytes(stats.totalBytes || stats.bytes || 0)} across ${stats.files || stats.shards + 1} files.`;
+  }
+  return `${path}. Single index file: ${formatBytes(stats.bytes || 0)}.`;
 }
 
 function modelSummary(settings) {
@@ -4076,6 +4647,41 @@ function modelSummary(settings) {
     ? `${settings.availableGeminiModels?.length || 0} Gemini chat and ${settings.availableGeminiEmbeddingModels?.length || 0} Gemini embedding models loaded at ${settings.geminiModelsFetchedAt}`
     : `${settings.availableGeminiModels?.length || 0} default Gemini chat model(s) available`;
   return `${active} ${openai}. ${gemini}.`;
+}
+
+function modelProviderSummaries(settings) {
+  return [
+    {
+      name: "Active AI models",
+      desc: `Chat: ${modelDisplayName(settings.chatModel)}. Embeddings: ${modelDisplayName(settings.embeddingModel)}.`
+    },
+    {
+      name: "Gemini models",
+      desc: settings.geminiModelsFetchedAt
+        ? `${settings.availableGeminiModels?.length || 0} chat and ${settings.availableGeminiEmbeddingModels?.length || 0} embedding models loaded at ${settings.geminiModelsFetchedAt}.`
+        : `${settings.availableGeminiModels?.length || 0} default chat model(s) and ${settings.availableGeminiEmbeddingModels?.length || 0} default embedding model(s) available.`
+    },
+    {
+      name: "OpenAI models",
+      desc: settings.modelsFetchedAt
+        ? `${settings.availableChatModels?.length || 0} chat and ${settings.availableEmbeddingModels?.length || 0} embedding models loaded at ${settings.modelsFetchedAt}.`
+        : "OpenAI models not loaded."
+    }
+  ];
+}
+
+function activeModelSummary(settings) {
+  return `Chat: ${modelDisplayName(settings.chatModel)}. Embeddings: ${modelDisplayName(settings.embeddingModel)}.`;
+}
+
+function availableModelSummary(settings) {
+  const gemini = settings.geminiModelsFetchedAt
+    ? `Gemini: ${settings.availableGeminiModels?.length || 0} chat, ${settings.availableGeminiEmbeddingModels?.length || 0} embedding; loaded ${settings.geminiModelsFetchedAt}.`
+    : `Gemini: ${settings.availableGeminiModels?.length || 0} default chat, ${settings.availableGeminiEmbeddingModels?.length || 0} default embedding.`;
+  const openai = settings.modelsFetchedAt
+    ? `OpenAI: ${settings.availableChatModels?.length || 0} chat, ${settings.availableEmbeddingModels?.length || 0} embedding; loaded ${settings.modelsFetchedAt}.`
+    : "OpenAI: not loaded.";
+  return `${gemini} ${openai}`;
 }
 
 function localLogSummary(settings) {
@@ -4270,15 +4876,13 @@ function cleanTask(task, allowedLabels = null, settings = DEFAULT_SETTINGS) {
 }
 
 function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false, settings = DEFAULT_SETTINGS) {
-  const labels = isSubtask && !settings.subtaskIncludeLabels
-    ? []
-    : (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
+  const labels = (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
   return {
     content: clamp(singleLine(task.content || ""), 250),
     description: isSubtask ? "" : cleanGeneratedDescriptionSummary(task.description || ""),
-    due_date: validDate(task.due_date) && (!isSubtask || settings.subtaskIncludeDueDate) ? task.due_date : null,
-    deadline_date: validDate(task.deadline_date) && (!isSubtask || settings.subtaskIncludeDeadline) ? task.deadline_date : null,
-    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority),
+    due_date: validDate(task.due_date) ? task.due_date : null,
+    deadline_date: validDate(task.deadline_date) ? task.deadline_date : null,
+    priority: normalizePriority(task.priority),
     labels,
     subtasks: (task.subtasks || []).map((subtask) => cleanTaskWithRole(subtask, allowedLabels, true, settings)).filter((subtask) => subtask.content)
   };
@@ -4303,7 +4907,7 @@ function taskPlanToMarkdown(tasks, settings) {
     lines.push(parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: false }, task), settings));
     for (const subtask of task.subtasks || []) {
       const line = parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: true, section: "" }, subtask), settings);
-      const indent = " ".repeat(Math.max(2, settings.subtaskIndentSpaces || 4));
+      const indent = desiredSubtaskIndent(settings);
       lines.push(`${indent}${line.trimStart()}`);
     }
   }
@@ -4336,6 +4940,22 @@ function mergeSyncStats(target, source) {
   return target;
 }
 
+function uniqueSectionCleanupCandidates(sections) {
+  const seen = new Set();
+  const unique = [];
+  for (const section of sections || []) {
+    const sectionId = String(section?.sectionId || "");
+    if (!sectionId || seen.has(sectionId)) continue;
+    seen.add(sectionId);
+    unique.push({
+      sectionId,
+      section: section.section || "",
+      projectId: String(section.projectId || "")
+    });
+  }
+  return unique;
+}
+
 async function asyncPool(items, workerCount, worker) {
   const list = Array.from(items || []);
   const count = Math.max(1, Math.min(list.length || 1, parseInt(workerCount, 10) || 1));
@@ -4358,20 +4978,49 @@ function referenceRebuildWorkerCount(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(8, parseInt(settings.referenceRebuildWorkerCount, 10) || DEFAULT_SETTINGS.referenceRebuildWorkerCount || 1));
 }
 
-function activeWorkflowStatusParts(plugin, currentStatus = "Ready") {
+function allActiveWorkflowStatusItems(plugin) {
   const fileSyncCount = plugin.fileSyncInProgress?.size || 0;
   const indexCount = plugin.pendingIndexPaths?.size || 0;
-  const parts = [];
-  if (plugin.emailProcessingInProgress) parts.push({ label: "Email", value: "processing" });
-  if (plugin.syncInProgress) parts.push({ label: "Notes", value: `syncing${fileSyncCount ? ` ${fileSyncCount}` : ""}` });
-  else if (plugin.noteSyncTimer) parts.push({ label: "Notes", value: "queued" });
-  if (plugin.syncInProgress || plugin.emailProcessingInProgress) parts.push({ label: "Todoist", value: "syncing" });
-  if (plugin.semanticIndexInProgress) parts.push({ label: "Index", value: "updating" });
-  else if (indexCount) parts.push({ label: "Index", value: `queued ${indexCount}` });
-  else if (plugin.semanticIndexTimer) parts.push({ label: "Index", value: "queued" });
-  if (plugin.referenceRebuildInProgress) parts.push({ label: "Refs", value: "reconciling" });
-  const maxParts = /^ready$/i.test(singleLine(currentStatus || "")) ? 3 : 2;
-  return parts.slice(0, maxParts);
+  const items = [];
+  if (plugin.aiActivity) items.push({ label: "AI", value: plugin.aiActivity });
+  if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: "Processing" });
+  if (plugin.syncInProgress || fileSyncCount) items.push({ label: "Notes", value: `Syncing${fileSyncCount ? ` (${fileSyncCount})` : ""}` });
+  else if (plugin.noteSyncTimer) items.push({ label: "Notes", value: "Sync queued" });
+  if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
+  else if (plugin.semanticIndexWarmupInProgress) items.push({ label: "Index", value: "Preparing" });
+  else if (indexCount) items.push({ label: "Index", value: `Queued (${indexCount})` });
+  else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "Queued" });
+  if (plugin.referenceRebuildInProgress) items.push({ label: "References", value: "Rebuilding" });
+  return items;
+}
+
+function activeWorkflowStatusItems(plugin, currentStatus = "Ready") {
+  const status = singleLine(currentStatus || "Ready") || "Ready";
+  const explicit = /^ready$/i.test(status) ? "" : status;
+  const items = [];
+  if (explicit) items.push({ label: "Status", value: explicit });
+  items.push(...allActiveWorkflowStatusItems(plugin));
+  return items.length ? items : [{ label: "Status", value: "Ready" }];
+}
+
+function isReadyWorkflowStatusItems(items) {
+  return (items || []).length === 1 && /^status$/i.test(items[0]?.label || "") && /^ready$/i.test(items[0]?.value || "");
+}
+
+function workflowStatusItemKey(item) {
+  return singleLine(item?.label || "Status").toLowerCase();
+}
+
+function allActiveWorkflowStatusParts(plugin) {
+  return allActiveWorkflowStatusItems(plugin).map((item) => `${item.label}: ${item.value}`);
+}
+
+function activeWorkflowStatusMessage(plugin, currentStatus = "Ready") {
+  return activeWorkflowStatusItems(plugin, currentStatus).map((item) => `${item.label}: ${item.value}`).join(" | ");
+}
+
+function activeWorkflowStatusParts(plugin, currentStatus = "Ready") {
+  return [];
 }
 
 function isReferenceRebuildCandidate(line, settings = DEFAULT_SETTINGS) {
@@ -4455,12 +5104,34 @@ function applyRemoteTodoistLocation(parsed, remote) {
   return parsed;
 }
 
+function todoistTaskToParsedTask(remote, base = {}, settings = DEFAULT_SETTINGS) {
+  const isSubtask = Boolean(base.isSubtask || remote.parentId || remote.parent_id);
+  const projectId = String(remote.projectId || remote.project_id || base.projectId || "");
+  return Object.assign({}, base, {
+    id: String(remote.id || base.id || ""),
+    content: remote.content || base.content || "",
+    labels: isSubtask && !settings.subtaskIncludeLabels ? [] : (remote.labels || base.labels || []).map(cleanLabel).filter(Boolean),
+    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(remote.priority || base.priority),
+    due_date: isSubtask && !settings.subtaskIncludeDueDate ? null : (remote.dueDate || remote.due?.date || base.due_date || null),
+    deadline_date: isSubtask && !settings.subtaskIncludeDeadline ? null : (remote.deadlineDate || remote.deadline?.date || base.deadline_date || null),
+    description: isRichTodoistDescription(remote.description) ? remote.description : base.description || "",
+    isCompleted: remote.isCompleted != null ? Boolean(remote.isCompleted) : Boolean(remote.is_completed || remote.checked || base.isCompleted),
+    isSubtask,
+    parentId: remote.parentId || remote.parent_id || base.parentId || "",
+    section: isSubtask ? "" : (remote.section || base.section || ""),
+    sectionId: remote.sectionId || remote.section_id || base.sectionId || "",
+    projectId,
+    projectName: remote.projectName || base.projectName || ""
+  });
+}
+
 function referenceCacheEntry(id, task, settings = DEFAULT_SETTINGS, previous = null) {
   const description = task.isSubtask ? "" : sanitizeStoredTodoistDescription(task.description || previous?.description || "", settings);
   const noteRefs = mergeNoteReferences(previous?.noteRefs || [], [noteReferenceForTask(task, task.oid)]);
+  const path = vaultRelativePath(task.path);
   return {
     oid: task.oid,
-    path: task.path,
+    path,
     lineNumber: task.lineNumber,
     content: task.content,
     description,
@@ -4498,7 +5169,7 @@ function mergeReferenceCacheEntry(existing, incoming) {
 function noteReferenceForTask(task, oid = "") {
   return {
     oid: oid || task?.oid || "",
-    path: task?.path || "",
+    path: vaultRelativePath(task?.path || ""),
     lineNumber: Number.isFinite(task?.lineNumber) ? task.lineNumber : null,
     isSubtask: Boolean(task?.isSubtask),
     parentOid: task?.parentOid || "",
@@ -4546,8 +5217,6 @@ function ensureGeneratedTaskMetadata(tasks, sectionName, settings = DEFAULT_SETT
     if (!task.due_date) task.due_date = task.deadline_date;
     for (const subtask of task.subtasks || []) {
       subtask.section = "";
-      if (!settings.subtaskIncludeDueDate) subtask.due_date = null;
-      if (!settings.subtaskIncludeDeadline) subtask.deadline_date = null;
       subtask.description = "";
     }
   }
@@ -4572,8 +5241,8 @@ function parsedTaskToLine(task, settings, id) {
   const deadline = task.deadline_date && (!task.isSubtask || settings.subtaskIncludeDeadline) ? ` {{${task.deadline_date}}}` : "";
   const due = task.due_date && (!task.isSubtask || settings.subtaskIncludeDueDate) ? ` 📅 ${task.due_date}` : "";
   const priority = (!task.isSubtask || settings.subtaskIncludePriority) ? ` !!${normalizePriority(task.priority)}` : "";
-  const section = task.section ? ` ///${task.section}` : "";
-  const project = task.projectName ? ` ${projectMarker(task.projectName)}` : "";
+  const section = !task.isSubtask && task.section ? ` ///${task.section}` : "";
+  const project = !task.isSubtask && task.projectName ? ` ${projectMarker(task.projectName)}` : "";
   const link = oid ? ` ${oidLink(oid, id, settings)}` : "";
   const core = `- [${task.isCompleted ? "x" : " "}] ${singleLine(task.content)} ${tag}${labels ? ` ${labels}` : ""}${priority}`;
   return `${core}${section}${project}${deadline}${due}${link}`;
@@ -4584,16 +5253,38 @@ function preserveTaskIndent(originalLine, newLine) {
   return `${indent}${String(newLine || "").trimStart()}`;
 }
 
+function taskLineWithStableIndent(originalLine, task, settings, id) {
+  return ensureSubtaskIndent(
+    preserveTaskIndent(originalLine, parsedTaskToLine(task, settings, id)),
+    task,
+    settings
+  );
+}
+
+function ensureSubtaskIndent(line, task, settings = DEFAULT_SETTINGS) {
+  if (!task?.isSubtask) return line;
+  const value = String(line || "");
+  const indent = desiredSubtaskIndent(settings);
+  const match = /^([ \t]*)([-*]\s+\[[ xX]\].*)$/.exec(value);
+  if (!match) return `${indent}${value.trimStart()}`;
+  const currentWidth = indentationLevel(match[1]);
+  return currentWidth >= indent.length ? value : `${indent}${match[2]}`;
+}
+
 function preflightTaskLine(line, settings) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return line;
   let next = normalizeLegacySyncTags(normalizeLegacyReferenceMarkers(line, settings), settings);
-  if (next.includes(settings.subtaskSyncTag) && !/^[ \t]+[-*]\s+\[[ xX]\]/.test(next)) {
-    next = `${" ".repeat(Math.max(2, settings.subtaskIndentSpaces || 4))}${next.trimStart()}`;
+  if (next.includes(settings.subtaskSyncTag)) {
+    next = ensureSubtaskIndent(next, { isSubtask: true }, settings);
   }
   if (next.includes(settings.subtaskSyncTag)) {
     next = next.replace(new RegExp(`(\\S(?:.*?\\S)?)\\s+(?:sub\\s+){1,}(${escapeRegExp(settings.subtaskSyncTag)}\\b)`, "i"), "$1 $2");
   }
   return next;
+}
+
+function desiredSubtaskIndent(settings = DEFAULT_SETTINGS) {
+  return " ".repeat(Math.max(2, parseInt(settings.subtaskIndentSpaces, 10) || DEFAULT_SETTINGS.subtaskIndentSpaces || 4));
 }
 
 function replaceTaskLineContent(line, content, settings) {
@@ -4626,6 +5317,33 @@ function syncProjectMarkerOnTaskLine(line, task, settings) {
   return setProjectMarker(line, projectName);
 }
 
+function syncLocationMarkersOnTaskLine(line, task, settings) {
+  return syncProjectMarkerOnTaskLine(syncSectionMarkerOnTaskLine(line, task, settings), task, settings);
+}
+
+function syncSectionMarkerOnTaskLine(line, task, settings) {
+  if (!line || task.isSubtask) return removeSectionMarker(line);
+  const section = singleLine(task.section || "");
+  if (!section) return removeSectionMarker(line);
+  return setSectionMarker(line, section);
+}
+
+function setSectionMarker(line, sectionName) {
+  const marker = ` ///${singleLine(sectionName).replace(/\s+/g, "_")}`;
+  const cleaned = removeSectionMarker(line).trimEnd();
+  const projectIndex = cleaned.search(/\s%%\[p::/);
+  if (projectIndex >= 0) return `${cleaned.slice(0, projectIndex)}${marker}${cleaned.slice(projectIndex)}`;
+  const oidIndex = cleaned.search(/\s%%\[oid::/);
+  if (oidIndex >= 0) return `${cleaned.slice(0, oidIndex)}${marker}${cleaned.slice(oidIndex)}`;
+  const dateIndex = cleaned.search(/\s(?:\{\{\d{4}-\d{2}-\d{2}\}\}|(?:📅|📆|🗓️|🗓|@)\s*\d{2,4}-\d{1,2}-\d{1,2})/);
+  if (dateIndex >= 0) return `${cleaned.slice(0, dateIndex)}${marker}${cleaned.slice(dateIndex)}`;
+  return `${cleaned}${marker}`;
+}
+
+function removeSectionMarker(line) {
+  return String(line || "").replace(/\s+\/\/\/[^\s%{]+/g, "").replace(/[ \t]{2,}/g, " ").trimEnd();
+}
+
 function setProjectMarker(line, projectName) {
   const marker = ` ${projectMarker(projectName)}`;
   const cleaned = removeProjectMarker(line).trimEnd();
@@ -4637,7 +5355,7 @@ function setProjectMarker(line, projectName) {
 }
 
 function removeProjectMarker(line) {
-  return String(line || "").replace(/\s*%%\[p::\s*([^\]]+?)\s*\]%%+/g, "").replace(/[ \t]{2,}/g, " ").trimEnd();
+  return String(line || "").replace(/\s*%%\[p::\s*([^\]]+?)\s*\](?:%%+)?/g, "").replace(/[ \t]{2,}/g, " ").trimEnd();
 }
 
 function projectMarker(projectName) {
@@ -4679,19 +5397,7 @@ function parsedTaskSignature(task) {
 
 function remoteTaskComparableSignature(remote, parsed, settings = DEFAULT_SETTINGS) {
   if (!remote) return "";
-  const description = !parsed?.isSubtask && parsed?.descriptionShouldSync && isRichTodoistDescription(parsed.description)
-    ? formatTodoistDescription(parsed.description, settings)
-    : parsed?.description || "";
-  return JSON.stringify({
-    content: singleLine(remote.content || ""),
-    labels: (remote.labels || []).map(cleanLabel).sort(),
-    priority: normalizePriority(remote.priority),
-    due_date: remote.dueDate || null,
-    deadline_date: remote.deadlineDate || null,
-    description: singleLine(description || ""),
-    isCompleted: Boolean(remote.isCompleted),
-    section: parsed?.section || ""
-  });
+  return parsedTaskSignature(todoistTaskToParsedTask(remote, parsed || {}, settings));
 }
 
 function todoistUpdatePayload(task, remote = null, settings = DEFAULT_SETTINGS) {
@@ -4713,15 +5419,15 @@ function todoistUpdatePayload(task, remote = null, settings = DEFAULT_SETTINGS) 
 }
 
 function pendingTaskKey(path, task) {
-  return `${path || ""}::${singleLine(task.content || "").toLowerCase()}::${task.section || ""}::${task.due_date || ""}::${task.deadline_date || ""}`;
+  return `${vaultRelativePath(path)}::${singleLine(task.content || "").toLowerCase()}::${task.section || ""}::${task.due_date || ""}::${task.deadline_date || ""}`;
 }
 
 function pendingTaskContentKey(path, task) {
-  return `${path || ""}::content::${singleLine(task.content || "").toLowerCase()}`;
+  return `${vaultRelativePath(path)}::content::${singleLine(task.content || "").toLowerCase()}`;
 }
 
 function pendingTaskOidKey(path, oid) {
-  return `${path || ""}::oid::${String(oid || "").toUpperCase()}`;
+  return `${vaultRelativePath(path)}::oid::${String(oid || "").toUpperCase()}`;
 }
 
 function parentReferenceForParsedTask(task, settings = DEFAULT_SETTINGS) {
@@ -5029,21 +5735,11 @@ function extractProjectName(line) {
 
 function indentationLevel(line) {
   const indent = (/^[ \t]*/.exec(line) || [""])[0];
-  let level = 0;
-  let spaces = 0;
+  let width = 0;
   for (const char of indent) {
-    if (char === "\t") {
-      level += 1;
-      spaces = 0;
-    } else {
-      spaces += 1;
-      if (spaces === 2) {
-        level += 1;
-        spaces = 0;
-      }
-    }
+    width += char === "\t" ? 4 : 1;
   }
-  return level;
+  return width;
 }
 
 function parseRawEmail(raw) {
@@ -5160,14 +5856,47 @@ function chunkMarkdown(text, maxChars = 900, maxChunks = 12) {
   return chunks;
 }
 
-function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS) {
-  return clamp(chunks.map((chunk, index) => [
-    `Context ${index + 1}: ${sourceReference(chunk)}`,
-    chunk.matchRationale ? `Match rationale: ${chunk.matchRationale}` : "",
-    chunk.matchScore ? `Match score: ${chunk.matchScore}` : "",
-    "Relevant excerpt:",
-    stripExcludedLinks(stripGeneratedActionItemsSection(chunk.text || ""), settings)
-  ].filter(Boolean).join("\n")).join("\n\n---\n\n"), maxChars);
+function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = "", options = {}) {
+  return clamp(chunks.map((chunk, index) => {
+    const source = sourceReference(chunk, options.basePath || "");
+    const citationNumber = source ? options.citationMap?.get(source) : null;
+    return [
+      citationNumber ? `Context Note (${citationNumber}): ${source}` : `Context ${index + 1}: ${source}`,
+      chunk.matchRationale ? `Match rationale: ${chunk.matchRationale}` : "",
+      chunk.matchScore ? `Match score: ${chunk.matchScore}` : "",
+      "Ranked relevant excerpt:",
+      rankedContextExcerpt(chunk.text || "", query, settings)
+    ].filter(Boolean).join("\n");
+  }).join("\n\n---\n\n"), maxChars);
+}
+
+function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS) {
+  const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
+  const queryTerms = termCounts(query);
+  const segments = cleaned
+    .split(/\n{2,}|\n(?=#{1,6}\s)/)
+    .flatMap((block) => {
+      const trimmed = block.trim();
+      if (!trimmed) return [];
+      if (/^#{1,6}\s/.test(trimmed) && trimmed.length <= 120) return [trimmed];
+      return splitDescriptionSentences(trimmed).length ? splitDescriptionSentences(trimmed) : [trimmed];
+    })
+    .map((segment, index) => {
+      const value = singleLine(segment.replace(/^#{1,6}\s*/, ""));
+      const actionScore = /action|todo|follow|review|send|confirm|complete|deadline|due|need|waiting|owner|lead|draft|update|share|clarify|coordinate|decision|dependency|risk|block/i.test(value) ? 0.75 : 0;
+      const lexical = lexicalScore(queryTerms, value);
+      return { value, index, lexical, score: lexical + actionScore };
+    })
+    .filter((item) => item.value && item.value.length >= 18);
+  const directMatches = segments.filter((item) => item.lexical > 0);
+  const ranked = (directMatches.length ? directMatches : segments)
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, 8)
+    .sort((a, b) => a.index - b.index)
+    .map((item) => item.value);
+  const excerpt = ranked.length ? ranked.join(" ") : cleaned;
+  return clamp(excerpt, 1400);
 }
 
 function formatSourceLinks(active, chunks) {
@@ -5192,6 +5921,68 @@ function formatChatHistory(messages) {
     .slice(-8)
     .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${clamp(singleLine(message.text), 700)}`);
   return lines.length ? lines.join("\n") : "No recent chat.";
+}
+
+function embedBareMarkdownLinks(value) {
+  const lines = String(value || "").split("\n");
+  let inFence = false;
+  return lines.map((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+    return inFence ? line : embedBareMarkdownLinksInLine(line);
+  }).join("\n");
+}
+
+function embedBareMarkdownLinksInLine(line) {
+  const withAutolinks = String(line || "").replace(/<((?:https?:\/\/|obsidian:\/\/|todoist:\/\/)[^>\s]+)>/gi, (_, rawUrl) => markdownLinkForUrl(rawUrl));
+  return withAutolinks.replace(/\b(?:https?:\/\/|obsidian:\/\/|todoist:\/\/)[^\s<>\]]+/gi, (rawUrl, offset, fullLine) => {
+    if (fullLine.slice(Math.max(0, offset - 2), offset) === "](") return rawUrl;
+    const { url, suffix } = splitLinkTrailingPunctuation(rawUrl);
+    return `${markdownLinkForUrl(url)}${suffix}`;
+  });
+}
+
+function markdownLinkForUrl(rawUrl) {
+  const url = String(rawUrl || "");
+  return `[${markdownLinkLabelForUrl(url)}](${url})`;
+}
+
+function markdownLinkLabelForUrl(rawUrl) {
+  const url = String(rawUrl || "");
+  if (/^todoist:\/\//i.test(url) || /^https?:\/\/(?:www\.)?todoist\.com\/app\/task\//i.test(url)) return "Open task";
+  if (/^obsidian:\/\/open/i.test(url)) {
+    const file = decodeUrlParam(url, "file");
+    if (file) return shortTitle(file.split("/").pop()?.replace(/\.md$/i, "") || "Open note", 48);
+    return "Open note";
+  }
+  const host = url.match(/^https?:\/\/([^/?#]+)/i)?.[1]?.replace(/^www\./i, "");
+  return host || "Open link";
+}
+
+function decodeUrlParam(url, key) {
+  const match = String(url || "").match(new RegExp(`[?&]${key}=([^&#]+)`, "i"));
+  if (!match) return "";
+  try { return decodeURIComponent(match[1]); } catch { return match[1]; }
+}
+
+function splitLinkTrailingPunctuation(rawUrl) {
+  let url = String(rawUrl || "");
+  let suffix = "";
+  while (/[.,;:!?]$/.test(url)) {
+    suffix = url.slice(-1) + suffix;
+    url = url.slice(0, -1);
+  }
+  while (url.endsWith(")") && countChar(url, "(") < countChar(url, ")")) {
+    suffix = ")" + suffix;
+    url = url.slice(0, -1);
+  }
+  return { url, suffix };
+}
+
+function countChar(value, char) {
+  return Array.from(String(value || "")).filter((item) => item === char).length;
 }
 
 function mergeChunks(...groups) {
@@ -5299,6 +6090,33 @@ function labelsAllowedByInstructions(text) {
   return new Set((String(text || "").match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
 }
 
+function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTINGS) {
+  return [
+    "Vault context requirements:",
+    "- Use the active source content together with the ranked relevant vault context for both main tasks and subtasks.",
+    "- Use the existing generated/synced task context from the local Todoist reference table to avoid duplicates and to preserve continuity with tasks already created from the vault.",
+    "- Treat vault context as required supporting context when it is available, while using only relevant ranked excerpts and not unrelated note content.",
+    "",
+    "Main task requirements:",
+    `- Actionability: ${taskInstructions.main || "Create only concrete user-owned actions."}`,
+    `- Section title: ${taskInstructions.sectionTitle || "Create one Todoist section for tasks from the same source."}`,
+    `- Labels: ${taskInstructions.tags || "Do not add labels unless explicitly instructed."}`,
+    `- Priority: ${taskInstructions.priorities || "Assign priority 1 to 4."}`,
+    `- Dates and deadlines: ${taskInstructions.dates || "Use YYYY-MM-DD dates only when supported by the source."}`,
+    "- Descriptions: leave description empty in this JSON step; descriptions are generated separately.",
+    "",
+    "Subtask requirements:",
+    `- Actionability: ${taskInstructions.subtasks || "Create subtasks only for concrete required steps under a main task."}`,
+    "- Relationship: every subtask must support its parent main task and must not duplicate the parent task title.",
+    `- Labels: ${settings.subtaskIncludeLabels ? `Allowed when useful, but only from the main label rules: ${taskInstructions.tags || "no labels configured"}` : "Disabled. Return an empty labels array for every subtask."}`,
+    `- Priority: ${settings.subtaskIncludePriority ? `Allowed. Assign priority 1 to 4 using the same priority rules: ${taskInstructions.priorities || "use task urgency and importance"}` : "Disabled. Return priority 1 for every subtask."}`,
+    `- Due date: ${settings.subtaskIncludeDueDate ? `Allowed when clearly useful and supported by the source: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return due_date null for every subtask."}`,
+    `- Deadline date: ${settings.subtaskIncludeDeadline ? `Allowed when clearly useful and supported by the source: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return deadline_date null for every subtask."}`,
+    "- Descriptions: subtasks must not have descriptions.",
+    "- Section/project: subtasks inherit the parent task location; do not create a separate section concept for subtasks."
+  ].join("\n");
+}
+
 function subtaskCriteriaInstructions(settings = DEFAULT_SETTINGS) {
   return [
     settings.subtaskIncludeLabels ? "Labels may be used on subtasks only when allowed by tag instructions." : "Do not add labels to subtasks.",
@@ -5324,23 +6142,28 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
   return notes;
 }
 
-function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = []) {
-  const sources = descriptionSourceList(active, contextNotes);
+function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
+  const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
   for (const task of tasks || []) {
     const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings) ? task.description : fallbackActionSummary(task, active?.text || "", contextChunks, active?.title || "", settings);
-    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings);
+    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "");
     for (const subtask of task.subtasks || []) {
       subtask.description = "";
     }
   }
 }
 
-function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS) {
-  const summary = removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle);
+function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "") {
+  const summary = removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle);
   const parts = [];
   if (isUsefulDescriptionSummary(summary, taskTitle, settings)) parts.push(summary);
   if (sources) parts.push(sources);
   return formatTodoistDescription(parts.join("\n\n"), settings);
+}
+
+function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS) {
+  const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
+  return removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle);
 }
 
 function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
@@ -5350,6 +6173,16 @@ function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SE
   if (/^(review|complete|action)\s+(the\s+)?(source|task|material)\b/i.test(text) && text.length < 140) return false;
   const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
   return words.length >= 12;
+}
+
+function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
+  const text = removeTitleEcho(cleanGeneratedDescriptionSummary(value || "", settings), taskTitle);
+  if (text.length < 80) return `too short (${text.length} characters)`;
+  if (/^use the source material to complete this task\.?$/i.test(text)) return "generic source-material instruction";
+  if (/^(review|complete|action)\s+(the\s+)?(source|task|material)\b/i.test(text) && text.length < 140) return "generic source/task wording";
+  const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  if (words.length < 12) return `too few words (${words.length})`;
+  return "passed";
 }
 
 function fallbackActionSummary(task, sourceText, contextChunks, sourceTitle = "", settings = DEFAULT_SETTINGS) {
@@ -5390,21 +6223,77 @@ function removeTitleEcho(summary, taskTitle) {
   return text;
 }
 
-function descriptionSourceList(active, contextNotes) {
+function removeSourceLeadIn(summary, sourceTitle = "") {
+  let text = singleLine(summary || "");
+  if (!text) return text;
+  const aliases = sourceTitleAliases(sourceTitle);
+  const titlePattern = aliases.length ? aliases.map((title) => escapeRegExp(title).replace(/\s+/g, "\\s+")).join("|") : "";
+  const genericLead = "the\\s+(?:active\\s+|primary\\s+|source\\s+)?(?:note|source|email|thread|meeting\\s+note|document)";
+  const verbs = "(?:records?|notes?|states?|says?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?)";
+  const patterns = [
+    titlePattern ? new RegExp(`^(?:${titlePattern})(?:\\.md)?\\s+(?:${verbs}\\s+(?:that\\s+)?|[-:–—]\\s*)`, "i") : null,
+    new RegExp(`^(?:${genericLead})\\s+${verbs}\\s+(?:that\\s+)?`, "i"),
+    new RegExp(`^(?:according\\s+to|based\\s+on|from)\\s+(?:${genericLead}${titlePattern ? `|${titlePattern}(?:\\.md)?` : ""})\\s*,?\\s*`, "i")
+  ].filter(Boolean);
+  for (const pattern of patterns) text = text.replace(pattern, "");
+  return capitalizeSentenceStart(text.trim().replace(/^[,;:\-–—]\s*/, ""));
+}
+
+function sourceTitleAliases(sourceTitle = "") {
+  const title = singleLine(sourceTitle || "").replace(/\.md$/i, "");
+  const aliases = [];
+  const add = (value) => {
+    const clean = singleLine(value || "").replace(/\.md$/i, "");
+    if (clean && clean.length >= 8 && !aliases.some((item) => item.toLowerCase() === clean.toLowerCase())) aliases.push(clean);
+  };
+  add(title);
+  add(title.replace(/^(?:\w+\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[-_/]\d{1,2}[-_/]\d{2,4})\s*[-:–—]\s*/i, ""));
+  return aliases;
+}
+
+function capitalizeSentenceStart(value) {
+  const text = String(value || "").trim();
+  return text.replace(/^([a-z])/, (match) => match.toUpperCase());
+}
+
+function descriptionSourceList(active, contextNotes, basePath = "") {
   const lines = ["Source List:"];
-  if (active?.path || active?.title) lines.push(`Primary Note: ${sourceReference(active)}`);
-  const seen = new Set(active?.path ? [active.path] : []);
+  const primaryPath = sourceReference(active, basePath);
+  if (primaryPath) lines.push(`Primary Note: ${primaryPath}`);
+  const seen = new Set(primaryPath ? [primaryPath] : []);
   const contextLines = [];
   for (const note of contextNotes || []) {
-    if (!note.path || seen.has(note.path)) continue;
-    seen.add(note.path);
-    contextLines.push(sourceReference(note));
+    const notePath = sourceReference(note, basePath);
+    if (!notePath || seen.has(notePath)) continue;
+    seen.add(notePath);
+    contextLines.push(notePath);
   }
   if (contextLines.length) {
+    if (primaryPath) lines.push("");
     lines.push("Context Notes:");
     contextLines.forEach((line, index) => lines.push(`${index + 1}. ${line}`));
   }
   return lines.join("\n");
+}
+
+function contextCitationMap(contextNotes, basePath = "") {
+  const map = new Map();
+  for (const note of contextNotes || []) {
+    const notePath = sourceReference(note, basePath);
+    if (!notePath || map.has(notePath)) continue;
+    map.set(notePath, map.size + 1);
+  }
+  return map;
+}
+
+function contextCitationInstructions(enabled) {
+  if (!enabled) return "Disabled. Do not add numbered context citations.";
+  return [
+    "Enabled. If a description sentence is primarily derived from a numbered context note, end that sentence with the matching note number in parentheses, for example (1).",
+    "Do not cite facts that come from the active/primary source.",
+    "Do not invent citation numbers; use only the Context Note (N) numbers shown in the ranked vault context.",
+    "Only cite the sentence that uses the context-note information."
+  ].join(" ");
 }
 
 function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {
@@ -5557,15 +6446,16 @@ function normalizeStoredSourceList(value) {
     .split("\n")
     .map((line) => singleLine(line).replace(/^[-*]\s*/, ""))
     .filter(Boolean);
-  const primary = rawLines.find((line) => /^primary note\s*:/i.test(line))?.replace(/^primary note\s*:\s*/i, "").trim();
+  const primary = vaultRelativePath(rawLines.find((line) => /^primary note\s*:/i.test(line))?.replace(/^primary note\s*:\s*/i, "").trim() || "");
   const context = rawLines
     .filter((line) => /^\d+\.\s*/.test(line))
-    .map((line) => line.replace(/^\d+\.\s*/, "").trim())
+    .map((line) => vaultRelativePath(line.replace(/^\d+\.\s*/, "").trim()))
     .filter(Boolean);
   if (!primary && !context.length) return "";
   const lines = ["Source List:"];
   if (primary) lines.push(`Primary Note: ${primary}`);
   if (context.length) {
+    if (primary) lines.push("");
     lines.push("Context Notes:");
     context.slice(0, 8).forEach((source, index) => lines.push(`${index + 1}. ${source}`));
   }
@@ -5618,6 +6508,48 @@ function formatCachedTaskReference(id, task, settings = DEFAULT_SETTINGS) {
   const path = task.path || "";
   const source = path ? ` Note: [${path}](obsidian://open?file=${encodeURIComponent(path)}).` : "";
   return `- ${status}: ${task.content || "Untitled task"}.${due}${labels} Todoist: ${todoistTaskMarkdownLink(id, settings)}. OID: ${task.oid || "unknown"}.${source}`;
+}
+
+function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childText = "") {
+  const content = singleLine(task?.content || "");
+  if (!content) return "";
+  const parts = [
+    task?.isSubtask ? "Todoist subtask" : "Todoist task",
+    task?.isCompleted ? "completed" : "open",
+    content
+  ];
+  if (task?.parentContent) parts.push(`parent: ${singleLine(task.parentContent)}`);
+  if (childText && !task?.isSubtask) parts.push(`subtasks: ${truncateAtWord(childText, 180)}`);
+  if (task?.due_date) parts.push(`due: ${task.due_date}`);
+  if (task?.deadline_date) parts.push(`deadline: ${task.deadline_date}`);
+  if (task?.priority) parts.push(`priority: ${normalizePriority(task.priority)}`);
+  if (task?.labels?.length) parts.push(`labels: ${task.labels.map((label) => `#${cleanLabel(label)}`).join(" ")}`);
+  if (task?.section) parts.push(`section: ${singleLine(task.section)}`);
+  if (task?.projectName) parts.push(`project: ${singleLine(task.projectName)}`);
+  if (task?.description && !task?.isSubtask) parts.push(`description: ${truncateAtWord(cleanGeneratedDescriptionSummary(task.description, settings), 160)}`);
+  if (task?.oid) parts.push(`oid: ${task.oid}`);
+  return `- ${parts.filter(Boolean).join(". ")}.`;
+}
+
+function chunkTaskReferenceRows(path, rows, maxChars = 1100) {
+  const header = [
+    "Local Todoist reference table task snapshot for semantic search.",
+    `Note path: ${path}.`,
+  ].join("\n");
+  const chunks = [];
+  let current = header;
+  const uniqueRows = Array.from(new Set((rows || []).filter(Boolean)));
+  for (const row of uniqueRows) {
+    const next = `${current}\n${row}`;
+    if (current !== header && next.length > Math.max(500, maxChars)) {
+      chunks.push(current);
+      current = `${header}\n${row}`;
+    } else {
+      current = next;
+    }
+  }
+  if (current !== header) chunks.push(current);
+  return chunks;
 }
 
 function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS) {
@@ -5677,15 +6609,242 @@ function termCounts(text) {
 
 function lexicalScore(queryTerms, text) {
   const terms = termCounts(text);
+  return lexicalScoreFromCounts(queryTerms, terms);
+}
+
+function lexicalScoreFromCounts(queryTerms, terms) {
   let score = 0;
   for (const [term, count] of Object.entries(queryTerms)) if (terms[term]) score += Math.min(3, terms[term]) * count;
   return score;
+}
+
+function taskSearchTermCounts(text) {
+  const counts = termCounts(text);
+  for (const term of String(text || "").toLowerCase().match(/\b\d{1,4}\b/g) || []) {
+    counts[term] = (counts[term] || 0) + 1;
+  }
+  return counts;
+}
+
+function taskContentQueryTermCounts(text) {
+  const counts = taskSearchTermCounts(text);
+  for (const token of dateSearchTokens(text)) delete counts[token];
+  for (const token of ["task", "tasks", "related", "meeting", "last", "note", "notes", "any", "from", "with"]) delete counts[token];
+  return counts;
+}
+
+function taskSearchLexicalScore(queryTerms, text) {
+  return lexicalScoreFromCounts(queryTerms, taskSearchTermCounts(text));
+}
+
+function datePhraseOverlapScore(queryText, text) {
+  const queryTokens = dateSearchTokens(queryText);
+  if (!queryTokens.size) return 0;
+  const textTokens = dateSearchTokens(text);
+  let score = 0;
+  for (const token of queryTokens) if (textTokens.has(token)) score += token.length === 4 ? 1 : 2;
+  return score;
+}
+
+function dateSearchTokens(text) {
+  const tokens = new Set();
+  const value = String(text || "").toLowerCase();
+  for (const match of value.matchAll(/\b(\d{4})[-_/](\d{1,2})[-_/](\d{1,2})\b/g)) {
+    tokens.add(match[1]);
+    tokens.add(String(parseInt(match[2], 10)));
+    tokens.add(String(parseInt(match[3], 10)));
+  }
+  for (const match of value.matchAll(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:,\s*(\d{4}))?\b/g)) {
+    tokens.add(match[0].match(/[a-z]+/)?.[0]?.slice(0, 3) || "");
+    tokens.add(String(parseInt(match[1], 10)));
+    if (match[2]) tokens.add(match[2]);
+  }
+  for (const match of value.matchAll(/\b(\d{1,2})\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?(?:\s+(\d{4}))?\b/g)) {
+    tokens.add(String(parseInt(match[1], 10)));
+    tokens.add(match[0].match(/[a-z]+/)?.[0]?.slice(0, 3) || "");
+    if (match[2]) tokens.add(match[2]);
+  }
+  tokens.delete("");
+  return tokens;
+}
+
+function specificDateTokens(text) {
+  const tokens = new Set();
+  const value = String(text || "").toLowerCase();
+  for (const match of value.matchAll(/\b\d{4}[-_/]\d{1,2}[-_/](\d{1,2})\b/g)) {
+    tokens.add(String(parseInt(match[1], 10)));
+  }
+  const monthPattern = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+  for (const match of value.matchAll(new RegExp(`\\b${monthPattern}\\.?\\s+(\\d{1,2})(?:,\\s*\\d{4})?\\b`, "g"))) {
+    tokens.add(String(parseInt(match[1], 10)));
+  }
+  for (const match of value.matchAll(new RegExp(`\\b(\\d{1,2})\\s+${monthPattern}\\.?`, "g"))) {
+    tokens.add(String(parseInt(match[1], 10)));
+  }
+  return tokens;
+}
+
+function dateTokensOverlap(requiredTokens, candidateTokens) {
+  for (const token of requiredTokens || []) if ((candidateTokens || new Set()).has(token)) return true;
+  return false;
+}
+
+function taskReferenceSearchText(task, childText = "") {
+  const refs = Array.isArray(task?.noteRefs) ? task.noteRefs.map((ref) => ref?.path || "").join(" ") : "";
+  return [
+    task?.content,
+    task?.parentContent,
+    childText,
+    task?.section,
+    task?.projectName,
+    task?.path,
+    refs,
+    task?.due_date,
+    task?.deadline_date,
+    (task?.labels || []).join(" ")
+  ].filter(Boolean).join(" ");
+}
+
+function taskReferenceScore(task, queryTerms, queryText = "", childText = "") {
+  const text = taskReferenceSearchText(task, childText);
+  return taskSearchLexicalScore(queryTerms, text);
+}
+
+function taskChildTextByParentOid(entries) {
+  const map = new Map();
+  for (const [, task] of entries || []) {
+    const parentOid = String(task?.parentOid || "").toUpperCase();
+    if (!parentOid) continue;
+    const text = [task?.content, (task?.labels || []).join(" ")].filter(Boolean).join(" ");
+    if (!text) continue;
+    map.set(parentOid, `${map.get(parentOid) || ""} ${text}`.trim());
+  }
+  return map;
+}
+
+function taskReferenceKey(task, id = "") {
+  const oid = String(task?.oid || "").toUpperCase();
+  if (oid) return `oid:${oid}`;
+  const taskId = String(id || task?.id || "");
+  if (taskId) return `id:${taskId}`;
+  return `task:${singleLine(task?.path || "")}:${singleLine(task?.content || "").toLowerCase()}:${singleLine(task?.parentContent || "").toLowerCase()}`;
+}
+
+function uniqueTaskReferenceRows(rows) {
+  const seen = new Set();
+  return (rows || []).filter((row) => {
+    const key = row?.key || row?.text || "";
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function limitTaskRowsForChat(rows, maxRows = TASK_CONTEXT_MAX_ROWS, maxPerPath = TASK_CONTEXT_MAX_ROWS_PER_PATH) {
+  const counts = new Map();
+  const selected = [];
+  for (const row of rows || []) {
+    const path = row.path || "";
+    const count = counts.get(path) || 0;
+    if (path && count >= maxPerPath) continue;
+    selected.push(row);
+    if (path) counts.set(path, count + 1);
+    if (selected.length >= maxRows) break;
+  }
+  return selected;
+}
+
+function matchedTaskNoteSummary(file, taskCount = 0) {
+  if (!file?.path) return "";
+  const countText = taskCount > 0 ? `; showing only the most relevant task references below` : "";
+  return `Matched task note: [${file.path}](obsidian://open?file=${encodeURIComponent(file.path)})${countText}.`;
 }
 
 const STOP_WORDS = new Set("the and for that with this from are you your have will would could should about into email task tasks action required completed please thanks than then them they their there here what when where who why how our out not but can has had was were been being".split(" "));
 
 function splitList(value) { return String(value || "").split(",").map((item) => item.trim()).filter(Boolean); }
 function trimSlashes(value) { return String(value || "").replace(/^\/+|\/+$/g, ""); }
+function vaultBasePath(app) {
+  try { return app?.vault?.adapter?.getBasePath?.() || ""; } catch { return ""; }
+}
+function vaultRelativePath(value, basePath = "") {
+  let path = singleLine(value || "")
+    .replace(/^file:\/\//i, "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
+  if (!path) return "";
+  try { path = decodeURIComponent(path); } catch {}
+  path = path.replace(/\[[^\]]+\]\((obsidian:\/\/open\?file=[^)]+)\)/i, "$1");
+  const obsidianFile = path.match(/obsidian:\/\/open\?file=([^&#\s)]+)/i)?.[1] || "";
+  if (obsidianFile) {
+    try { path = decodeURIComponent(obsidianFile); } catch { path = obsidianFile; }
+  }
+  const parenthesizedPath = path.match(/\(([^()]+\.md)\)$/i)?.[1] || "";
+  if (parenthesizedPath) path = parenthesizedPath;
+  path = path.replace(/\\/g, "/");
+  const normalizedBase = trimSlashes(String(basePath || "").replace(/\\/g, "/"));
+  const normalizedPath = trimSlashes(path);
+  if (normalizedBase && (normalizedPath === normalizedBase || normalizedPath.startsWith(`${normalizedBase}/`))) {
+    return trimSlashes(normalizedPath.slice(normalizedBase.length));
+  }
+  return normalizedPath;
+}
+function normalizeSemanticIndexPaths(chunks, app) {
+  const basePath = vaultBasePath(app);
+  return (chunks || []).map((chunk) => Object.assign({}, chunk, {
+    path: vaultRelativePath(chunk.path || "", basePath),
+    id: chunk.id && chunk.path ? `${vaultRelativePath(chunk.path, basePath)}${String(chunk.id).includes("#") ? `#${String(chunk.id).split("#").pop()}` : ""}` : chunk.id
+  }));
+}
+function normalizeStoredTaskReferencePaths(task, basePath = "") {
+  const normalized = Object.assign({}, task, {
+    path: vaultRelativePath(task?.path || "", basePath)
+  });
+  if (Array.isArray(task?.noteRefs)) {
+    normalized.noteRefs = task.noteRefs.map((ref) => Object.assign({}, ref, {
+      path: vaultRelativePath(ref?.path || "", basePath)
+    }));
+  }
+  return normalized;
+}
+function normalizePendingDescriptionKeys(entries, basePath = "") {
+  const normalized = {};
+  for (const [key, value] of Object.entries(entries || {})) {
+    const text = String(key || "");
+    let nextKey = text;
+    for (const marker of ["::oid::", "::content::"]) {
+      const index = text.indexOf(marker);
+      if (index >= 0) {
+        nextKey = `${vaultRelativePath(text.slice(0, index), basePath)}${text.slice(index)}`;
+        break;
+      }
+    }
+    if (nextKey === text && text.includes("::")) {
+      const [path, ...rest] = text.split("::");
+      nextKey = [vaultRelativePath(path, basePath), ...rest].join("::");
+    }
+    normalized[nextKey] = value;
+  }
+  return normalized;
+}
+function normalizedExcludedFolders(folders) {
+  const normalized = [];
+  for (const folder of folders || []) {
+    const value = trimSlashes(folder);
+    if (!value) continue;
+    if (normalized.some((existing) => value === existing || value.startsWith(`${existing}/`))) continue;
+    for (let i = normalized.length - 1; i >= 0; i -= 1) {
+      if (normalized[i].startsWith(`${value}/`)) normalized.splice(i, 1);
+    }
+    normalized.push(value);
+  }
+  return normalized;
+}
+function isFolderExcluded(path, folders) {
+  const value = trimSlashes(path);
+  if (!value) return false;
+  return (folders || []).map(trimSlashes).filter(Boolean).some((folder) => value === folder || value.startsWith(`${folder}/`));
+}
 function singleLine(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
 function shortHash(value) {
   const text = String(value || "");
@@ -5743,6 +6902,57 @@ function uniqueModelOptions(options) {
     seen.add(option.value);
     return true;
   });
+}
+function semanticIndexShardBodies(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES) {
+  const shards = [];
+  let current = [];
+  const flush = () => {
+    if (!current.length) return;
+    const file = semanticIndexShardFileName(indexFile, shards.length);
+    const body = JSON.stringify({
+      meta: Object.assign({}, meta, {
+        file,
+        parentFile: indexFile,
+        shardIndex: shards.length,
+        chunks: current.length
+      }),
+      chunks: current
+    });
+    shards.push({ file, body, bytes: utf8ByteLength(body), chunkCount: current.length });
+    current = [];
+  };
+  for (const chunk of chunks || []) {
+    const next = current.concat([chunk]);
+    const probe = JSON.stringify({
+      meta: Object.assign({}, meta, {
+        file: semanticIndexShardFileName(indexFile, shards.length),
+        parentFile: indexFile,
+        shardIndex: shards.length,
+        chunks: next.length
+      }),
+      chunks: next
+    });
+    if (current.length && utf8ByteLength(probe) > maxBytes) flush();
+    current.push(chunk);
+  }
+  flush();
+  return shards;
+}
+
+function semanticIndexShardFileName(indexFile, index) {
+  return String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, `.${String(index + 1).padStart(3, "0")}.json`);
+}
+
+function isSemanticIndexShardFile(indexFile, fileName) {
+  const prefix = String(indexFile || "").replace(/\.json$/i, "");
+  return new RegExp(`^${escapeRegExp(prefix)}\\.\\d{3}\\.json$`, "i").test(String(fileName || ""));
+}
+
+function utf8ByteLength(value) {
+  const text = String(value || "");
+  if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
+  if (typeof Buffer !== "undefined") return Buffer.byteLength(text, "utf8");
+  return text.length;
 }
 function modelDisplayName(value) {
   if (usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value)) return `Gemini: ${normalizeGeminiModelId(value)}`;
@@ -5820,6 +7030,13 @@ function truncateAtWord(value, max) {
   const boundary = sliced.lastIndexOf(" ");
   return sliced.slice(0, boundary > Math.floor(max * 0.75) ? boundary : max).trim();
 }
+function truncateMarkdownAtWord(value, max) {
+  const text = String(value || "");
+  if (text.length <= max) return text;
+  const sliced = text.slice(0, max + 1);
+  const boundary = Math.max(sliced.lastIndexOf(" "), sliced.lastIndexOf("\n"));
+  return sliced.slice(0, boundary > Math.floor(max * 0.75) ? boundary : max).trim();
+}
 function formatTodoistDescription(value, settings = DEFAULT_SETTINGS) {
   const max = Math.min(TODOIST_DESCRIPTION_LIMIT, Math.max(1, parseInt(settings.todoistDescriptionMaxChars, 10) || DEFAULT_SETTINGS.todoistDescriptionMaxChars));
   const cleaned = String(value || "")
@@ -5828,7 +7045,7 @@ function formatTodoistDescription(value, settings = DEFAULT_SETTINGS) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return cleaned.length <= max ? cleaned : truncateAtWord(cleaned, max);
+  return cleaned.length <= max ? cleaned : truncateMarkdownAtWord(cleaned, max);
 }
 function cleanLabel(label) { return String(label || "").replace(/^#/, "").replace(/\s+/g, "").trim(); }
 function shortTitle(value, max) { const text = singleLine(String(value || "").replace(/\.md$/i, "")); return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`; }
@@ -5861,13 +7078,26 @@ function deviceDateString(date = new Date()) {
 function today() { return deviceDateString(); }
 function uuid() { return globalThis.crypto?.randomUUID ? crypto.randomUUID() : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => ((c === "x" ? Math.random() * 16 : (Math.random() * 16 & 0x3 | 0x8)) | 0).toString(16)); }
 function escapeRegExp(text) { return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function obsidianDescription(path) { return `[${path}](obsidian://open?file=${encodeURIComponent(path)})`; }
-function sourceReference(source) {
-  const title = singleLine(source?.title || source?.basename || source?.path || "Untitled source");
-  const path = singleLine(source?.path || "");
-  return path && path !== title ? `${title} (${path})` : title;
+function obsidianDescription(path) {
+  const notePath = vaultRelativePath(path);
+  return notePath ? `[${notePath}](obsidian://open?file=${encodeURIComponent(notePath)})` : "";
+}
+function sourceReference(source, basePath = "") {
+  return vaultRelativePath(source?.path || "", basePath);
 }
 function sectionKey(name) { return singleLine(name).toLowerCase(); }
+
+async function appendMarkdownBlock(app, file, markdown) {
+  if (!(file instanceof TFile)) throw new Error("Active note was not found.");
+  const current = await app.vault.read(file);
+  await app.vault.modify(file, markdownWithSingleBlankLineBeforeAppend(current, markdown));
+}
+
+function markdownWithSingleBlankLineBeforeAppend(current, markdown) {
+  const before = String(current || "").replace(/\s+$/, "");
+  const block = String(markdown || "").trim();
+  return before ? `${before}\n\n${block}\n` : `${block}\n`;
+}
 
 async function ensureVaultFolder(app, folderPath) {
   const parts = trimSlashes(folderPath).split("/").filter(Boolean);

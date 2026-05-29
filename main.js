@@ -21,6 +21,7 @@ const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
 const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
+const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
@@ -105,6 +106,8 @@ const DEFAULT_SETTINGS = {
   lastReferenceRebuildAt: "",
   lastReferenceRebuildFingerprint: "",
   lastReferenceRebuildCandidateCount: 0,
+  lastSubtaskIndentRepairAt: "",
+  lastSubtaskIndentRepairFingerprint: "",
   todoistSnapshotCacheMinutes: 5,
   linksAppURI: false,
   subtaskIndentSpaces: 4,
@@ -206,13 +209,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-note-to-tasks", name: "Create Todoist tasks from active note", callback: () => this.createTasksFromActiveNote() });
     this.addCommand({ id: "semantic-todoist-sync-notes", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
     this.addCommand({ id: "semantic-todoist-rebuild-references", name: "Rebuild local Todoist reference table", callback: () => this.rebuildTodoistReferenceTable(true) });
+    this.addCommand({ id: "semantic-todoist-repair-subtask-indentation", name: "Repair synced subtask indentation", callback: () => this.repairCachedSubtaskIndentation(true, { force: true, scanAll: true }) });
 
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => this.handleActiveLeafChange(leaf)));
     this.registerEvent(this.app.workspace.on("file-open", () => this.notifySidebarActiveNoteChanged()));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      const internalWrite = this.isInternalNoteWrite(file.path);
+      if (internalWrite) return;
       this.queueSemanticIndexUpdate(file.path, "modify");
-      if (this.settings.notesAutoSync && this.settings.todoistToken && !this.isInternalNoteWrite(file.path)) this.queueNoteSync(file.path);
+      if (this.settings.notesAutoSync && this.settings.todoistToken) this.queueNoteSync(file.path);
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (file instanceof TFile && file.extension === "md") this.queueSemanticIndexUpdate(file.path, "create");
@@ -223,6 +229,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
     window.setTimeout(() => this.backgroundTick(), 5000);
+    window.setTimeout(() => this.repairCachedSubtaskIndentation(false), 9000);
   }
 
   async onunload() {
@@ -669,7 +676,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   backgroundTick() {
     const now = Date.now();
-    if (this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
+    if (!this.emailProcessingInProgress && this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
       this.processPendingEmails(false, { automatic: true });
     }
     if (this.settings.notesAutoSync && this.settings.todoistToken && elapsedMs(this.settings.lastNoteAutoSyncAt) >= Math.max(60, this.settings.syncIntervalSeconds) * 1000) {
@@ -1629,7 +1636,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not repeat or paraphrase the task title.",
         "Start with the actionable context itself: name the relevant people, documents, program, meeting, decision, dependency, timing, or constraint when the source provides it.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename.",
-        "Do not write openings like 'The note says', 'The source records', 'The email indicates', 'IRGP Reviewer Documents Overview...', or any filename-first framing.",
+        "Do not write openings like 'The note says', 'The source records', 'The email indicates', a source-title recap, or any filename-first framing.",
         "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
         "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
         "Use vault context as required supporting context when it is available; prioritize the highest-ranked excerpts that explain dependencies, constraints, people, documents, program status, rationale, or next information needed.",
@@ -1913,7 +1920,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "- After changing domains or Worker URLs, send a test email before enabling automatic processing."
     ];
     const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) await this.app.vault.modify(existing, lines.join("\n"));
+    if (existing instanceof TFile) {
+      this.markInternalNoteWrite(path);
+      await this.app.vault.modify(existing, lines.join("\n"));
+    }
     else await this.app.vault.create(path, lines.join("\n"));
     if (showNotice) new Notice(`Cloudflare setup note updated: ${path}`);
     return path;
@@ -2244,6 +2254,45 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  async repairCachedSubtaskIndentation(showNotice = true, options = {}) {
+    if (this.subtaskIndentRepairInProgress) return { scanned: 0, files: 0, repaired: 0 };
+    const fingerprint = subtaskIndentRepairFingerprint(this.settings);
+    if (!options.force && this.settings.lastSubtaskIndentRepairFingerprint === fingerprint) {
+      return { scanned: 0, files: 0, repaired: 0 };
+    }
+    this.subtaskIndentRepairInProgress = true;
+    this.setSidebarStatus("Repairing subtask indentation...");
+    const paths = options.scanAll ? this.app.vault.getMarkdownFiles().map((file) => file.path) : cachedTaskPathsForIndentRepair(this.settings);
+    const stats = { scanned: paths.length, files: 0, repaired: 0 };
+    const byOid = taskCacheByOid(this.settings);
+    try {
+      await asyncPool(paths, Math.min(2, syncWorkerCount(this.settings)), async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) return;
+        const lines = (await this.app.vault.read(file)).split("\n");
+        const repaired = repairSyncedSubtaskIndentationLines(lines, this.settings, byOid);
+        if (!repaired) return;
+        this.markInternalNoteWrite(path);
+        await this.app.vault.modify(file, lines.join("\n"));
+        stats.files += 1;
+        stats.repaired += repaired;
+      });
+      this.settings.lastSubtaskIndentRepairAt = deviceTimestamp();
+      this.settings.lastSubtaskIndentRepairFingerprint = fingerprint;
+      await this.saveSettings();
+      this.logLocal("Subtask indentation repair complete", stats);
+      if (showNotice) new Notice(`Repaired ${stats.repaired} synced subtask indentation${stats.repaired === 1 ? "" : "s"} in ${stats.files} note${stats.files === 1 ? "" : "s"}.`);
+      return stats;
+    } catch (error) {
+      this.logLocal("Subtask indentation repair failed", { error: error.message || String(error) });
+      if (showNotice) new Notice(`Subtask indentation repair failed: ${error.message || error}`);
+      return stats;
+    } finally {
+      this.subtaskIndentRepairInProgress = false;
+      this.setSidebarStatus("Ready");
+    }
+  }
+
   async rebuildTodoistReferenceTable(showNotice = true) {
     return this.rebuildTodoistReferenceTableInternal({ showNotice, force: true });
   }
@@ -2388,6 +2437,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
       this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
       await this.saveSettings();
+      await this.repairCachedSubtaskIndentation(false, { force: true });
       this.logLocal("Todoist reference table rebuilt", Object.assign({}, stats, { workers: workerCount }));
       if (showNotice) new Notice(`Rebuilt ${stats.matched} Todoist reference${stats.matched === 1 ? "" : "s"}. ${stats.unmatched} note task${stats.unmatched === 1 ? "" : "s"} not matched.`);
       return stats;
@@ -2585,7 +2635,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       parsed.id = id;
       parsed.oid = parsed.oid || generateUniqueOid(this.settings);
       presentIds.add(id);
-      lines[parsed.lineNumber] = addTodoistLink(lines[parsed.lineNumber], id, this.settings, parsed.oid);
+      lines[parsed.lineNumber] = ensureSubtaskIndent(addTodoistLink(lines[parsed.lineNumber], id, this.settings, parsed.oid), parsed, this.settings);
       this.cacheTask(id, parsed);
       changed = true;
       stats.created += 1;
@@ -2648,6 +2698,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.setSidebarStatus("Checking removed note tasks...");
     const deleted = await this.deleteTodoistTasksMissingFromFile(path, presentIds);
     stats.deleted = deleted;
+    const repairedSubtaskIndentation = repairSyncedSubtaskIndentationLines(lines, this.settings);
+    if (repairedSubtaskIndentation) {
+      changed = true;
+      stats.normalized += repairedSubtaskIndentation;
+    }
     if (changed) {
       this.markInternalNoteWrite(path);
       await this.app.vault.modify(file, lines.join("\n"));
@@ -3020,6 +3075,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (!removeIndexes.size) return false;
     const kept = lines.filter((_, index) => !removeIndexes.has(index));
+    repairSyncedSubtaskIndentationLines(kept, this.settings);
+    this.markInternalNoteWrite(cached.path);
     await this.app.vault.modify(file, kept.join("\n"));
     return true;
   }
@@ -3187,9 +3244,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (idx === -1) return;
     const originalLine = lines[idx];
     const nextLine = replacer(originalLine);
-    const hasSubtaskMarker = String(originalLine || "").includes(this.settings.subtaskSyncTag) || String(nextLine || "").includes(this.settings.subtaskSyncTag);
-    const isSubtask = Boolean(hasSubtaskMarker || cached.isSubtask || cached.parentId || cached.parentOid);
+    const hasSubtaskMarker = hasSubtaskSyncMarker(originalLine, this.settings) || hasSubtaskSyncMarker(nextLine, this.settings);
+    const isSubtask = Boolean(hasSubtaskMarker || cached.isSubtask || cached.parentId || cached.parent_id || cached.parentOid);
     lines[idx] = isSubtask ? ensureSubtaskIndent(nextLine, { isSubtask: true }, this.settings) : nextLine;
+    repairSyncedSubtaskIndentationLines(lines, this.settings);
+    this.markInternalNoteWrite(cached.path);
     await this.app.vault.modify(file, lines.join("\n"));
   }
 
@@ -5047,7 +5106,7 @@ function isReferenceRebuildCandidate(line, settings = DEFAULT_SETTINGS) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return false;
   const includeLegacy = shouldConvertLegacyTodoistIds(settings);
   return line.includes(settings.syncTag) ||
-    line.includes(settings.subtaskSyncTag) ||
+    hasSubtaskSyncMarker(line, settings) ||
     (includeLegacy && /#tdsyncsub\b/i.test(line)) ||
     (includeLegacy && /#tdsync\b/i.test(line)) ||
     Boolean(getTaskOid(line)) ||
@@ -5282,8 +5341,8 @@ function taskLineWithStableIndent(originalLine, task, settings, id) {
 }
 
 function ensureSubtaskIndent(line, task, settings = DEFAULT_SETTINGS) {
-  if (!task?.isSubtask) return line;
   const value = String(line || "");
+  if (!shouldIndentAsSubtask(value, task, settings)) return value;
   const indent = desiredSubtaskIndent(settings);
   const match = /^([ \t]*)([-*]\s+\[[ xX]\].*)$/.exec(value);
   if (!match) return `${indent}${value.trimStart()}`;
@@ -5294,13 +5353,92 @@ function ensureSubtaskIndent(line, task, settings = DEFAULT_SETTINGS) {
 function preflightTaskLine(line, settings) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return line;
   let next = normalizeLegacySyncTags(normalizeLegacyReferenceMarkers(line, settings), settings);
-  if (next.includes(settings.subtaskSyncTag)) {
+  if (hasSubtaskSyncMarker(next, settings)) {
     next = ensureSubtaskIndent(next, { isSubtask: true }, settings);
   }
-  if (next.includes(settings.subtaskSyncTag)) {
+  if (hasSubtaskSyncMarker(next, settings)) {
     next = next.replace(new RegExp(`(\\S(?:.*?\\S)?)\\s+(?:sub\\s+){1,}(${escapeRegExp(settings.subtaskSyncTag)}\\b)`, "i"), "$1 $2");
   }
   return next;
+}
+
+function shouldIndentAsSubtask(line, task, settings = DEFAULT_SETTINGS) {
+  return Boolean(
+    task?.isSubtask ||
+    task?.parentId ||
+    task?.parent_id ||
+    task?.parentOid ||
+    hasSubtaskSyncMarker(line, settings)
+  );
+}
+
+function hasSubtaskSyncMarker(line, settings = DEFAULT_SETTINGS) {
+  const value = String(line || "");
+  const configured = String(settings?.subtaskSyncTag || DEFAULT_SETTINGS.subtaskSyncTag || "#STSubSync");
+  return Boolean(
+    (configured && value.toLowerCase().includes(configured.toLowerCase())) ||
+    /#tdsyncsub\b/i.test(value)
+  );
+}
+
+function collapseInlineSpacesPreservingIndent(line) {
+  const value = String(line || "");
+  const match = /^([ \t]*)([\s\S]*)$/.exec(value) || ["", "", value];
+  return `${match[1]}${match[2].replace(/[ \t]{2,}/g, " ")}`.trimEnd();
+}
+
+function repairSyncedSubtaskIndentationLines(lines, settings = DEFAULT_SETTINGS, byOid = null) {
+  if (!Array.isArray(lines)) return 0;
+  let repaired = 0;
+  const subtaskMarker = String(settings?.subtaskSyncTag || DEFAULT_SETTINGS.subtaskSyncTag || "#STSubSync").toLowerCase();
+  const oidLookup = byOid || taskCacheByOid(settings);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!/^\s*[-*]\s+\[[ xX]\]/.test(line || "")) continue;
+    const lowered = String(line || "").toLowerCase();
+    if (!lowered.includes(subtaskMarker) && !/#tdsyncsub\b/i.test(line) && !getTaskOid(line)) continue;
+    const cached = cachedTaskForTaskLine(line, settings, oidLookup) || {};
+    if (!shouldIndentAsSubtask(line, cached, settings)) continue;
+    const next = ensureSubtaskIndent(line, cached, settings);
+    if (next === line) continue;
+    lines[i] = next;
+    repaired += 1;
+  }
+  return repaired;
+}
+
+function cachedTaskForTaskLine(line, settings = DEFAULT_SETTINGS, byOid = null) {
+  const oid = getTaskOid(line);
+  const idFromOid = oid ? byOid?.get?.(String(oid).toUpperCase()) || (!byOid ? todoistIdForOid(settings, oid) : "") : "";
+  const legacyId = (shouldConvertLegacyTodoistIds(settings) || hasSemanticSyncMarker(line, settings)) ? getLegacyTodoistId(line) : "";
+  const id = idFromOid || legacyId;
+  return id ? settings?.taskCache?.[id] || null : null;
+}
+
+function taskCacheByOid(settings = DEFAULT_SETTINGS) {
+  const byOid = new Map();
+  for (const [id, cached] of Object.entries(settings?.taskCache || {})) {
+    const oid = String(cached?.oid || "").toUpperCase();
+    if (oid) byOid.set(oid, id);
+  }
+  return byOid;
+}
+
+function cachedTaskPathsForIndentRepair(settings = DEFAULT_SETTINGS) {
+  const paths = new Set();
+  for (const cached of Object.values(settings?.taskCache || {})) {
+    if (!cached?.path) continue;
+    paths.add(vaultRelativePath(cached.path));
+  }
+  return Array.from(paths);
+}
+
+function subtaskIndentRepairFingerprint(settings = DEFAULT_SETTINGS) {
+  return [
+    SUBTASK_INDENT_REPAIR_VERSION,
+    settings?.subtaskSyncTag || DEFAULT_SETTINGS.subtaskSyncTag,
+    settings?.subtaskIndentSpaces || DEFAULT_SETTINGS.subtaskIndentSpaces
+  ].join("|");
 }
 
 function desiredSubtaskIndent(settings = DEFAULT_SETTINGS) {
@@ -5338,7 +5476,7 @@ function syncProjectMarkerOnTaskLine(line, task, settings) {
 }
 
 function syncLocationMarkersOnTaskLine(line, task, settings) {
-  return syncProjectMarkerOnTaskLine(syncSectionMarkerOnTaskLine(line, task, settings), task, settings);
+  return ensureSubtaskIndent(syncProjectMarkerOnTaskLine(syncSectionMarkerOnTaskLine(line, task, settings), task, settings), task, settings);
 }
 
 function syncSectionMarkerOnTaskLine(line, task, settings) {
@@ -5361,7 +5499,7 @@ function setSectionMarker(line, sectionName) {
 }
 
 function removeSectionMarker(line) {
-  return String(line || "").replace(/\s+\/\/\/[^\s%{]+/g, "").replace(/[ \t]{2,}/g, " ").trimEnd();
+  return collapseInlineSpacesPreservingIndent(String(line || "").replace(/\s+\/\/\/[^\s%{]+/g, ""));
 }
 
 function setProjectMarker(line, projectName) {
@@ -5375,7 +5513,7 @@ function setProjectMarker(line, projectName) {
 }
 
 function removeProjectMarker(line) {
-  return String(line || "").replace(/\s*%%\[p::\s*([^\]]+?)\s*\](?:%%+)?/g, "").replace(/[ \t]{2,}/g, " ").trimEnd();
+  return collapseInlineSpacesPreservingIndent(String(line || "").replace(/\s*%%\[p::\s*([^\]]+?)\s*\](?:%%+)?/g, ""));
 }
 
 function projectMarker(projectName) {
@@ -5477,11 +5615,11 @@ function parentReferenceForLine(lineNumber, allLines, settings = DEFAULT_SETTING
 function parseTaskLine(line, lineNumber, path, allLines, settings) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return null;
   const normalizedLine = normalizeLegacySyncTags(line, settings);
-  const isSyncTask = normalizedLine.includes(settings.syncTag) || normalizedLine.includes(settings.subtaskSyncTag);
+  const isSyncTask = normalizedLine.includes(settings.syncTag) || hasSubtaskSyncMarker(normalizedLine, settings);
   if (!isSyncTask) return null;
   const oid = getTaskOid(line);
   const id = getTodoistId(line, settings);
-  const isSubtask = normalizedLine.includes(settings.subtaskSyncTag);
+  const isSubtask = hasSubtaskSyncMarker(normalizedLine, settings);
   const parentReference = parentReferenceForLine(lineNumber, allLines, settings, isSubtask);
   const labels = (line.match(/#[\w/-]+/g) || []).map((label) => label.slice(1)).filter((label) => {
     if (!settings.excludeSyncTagsFromLabels) return true;
@@ -5596,7 +5734,7 @@ function getTodoistId(line, settings = null) {
 
 function hasSemanticSyncMarker(line, settings = DEFAULT_SETTINGS) {
   const text = String(line || "");
-  return Boolean(settings && (text.includes(settings.syncTag) || text.includes(settings.subtaskSyncTag)));
+  return Boolean(settings && (text.includes(settings.syncTag) || hasSubtaskSyncMarker(text, settings)));
 }
 
 function getLegacyTodoistId(line) {

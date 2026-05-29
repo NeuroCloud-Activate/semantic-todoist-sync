@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4
+
+- Hardened Todoist-to-Obsidian sync-back so `#STSubSync` subtasks keep the configured indentation across direct activity updates, note reconciliation, section/project marker cleanup, task creation, relinking, and deleted-task cleanup.
+- Added retroactive synced-subtask indentation repair that runs once per repair version/indent setting over cached synced-task note paths, with a manual command for an explicit full-vault repair.
+- Prevented plugin-generated note writes from queuing automatic note sync or semantic index updates, reducing sync/index churn and avoiding repair/sync loops after Todoist sync-back writes.
+- Added guards so automatic email processing cannot re-enter while already running, and optimized subtask repair lookups to avoid repeatedly scanning the local reference table.
+
 ## 0.5.2
 
 - Fixed Todoist-to-Obsidian sync-back so subtasks marked with `#STSubSync` keep or regain the configured indentation even if a prior sync flattened the note line.

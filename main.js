@@ -20,6 +20,7 @@ const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
 const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
+const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
@@ -115,7 +116,7 @@ const DEFAULT_SETTINGS = {
   pendingTaskDescriptions: {},
   processedTodoistEventIds: [],
   autoProcessEmails: false,
-  emailPollIntervalSeconds: 60,
+  emailPollIntervalSeconds: MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS,
   lastEmailPollAt: "",
   localLog: [],
   maxEmailChars: 18000,
@@ -234,6 +235,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    if ((parseInt(this.settings.emailPollIntervalSeconds, 10) || 0) < MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS) {
+      this.settings.emailPollIntervalSeconds = MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS;
+      changed = true;
+    }
     const retrievalDefaults = [
       ["maxChatContextChunks", 8, DEFAULT_SETTINGS.maxChatContextChunks],
       ["maxTaskContextChunks", 6, DEFAULT_SETTINGS.maxTaskContextChunks],
@@ -664,8 +669,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   backgroundTick() {
     const now = Date.now();
-    if (this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= Math.max(30, this.settings.emailPollIntervalSeconds) * 1000) {
-      this.processPendingEmails(false);
+    if (this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
+      this.processPendingEmails(false, { automatic: true });
     }
     if (this.settings.notesAutoSync && this.settings.todoistToken && elapsedMs(this.settings.lastNoteAutoSyncAt) >= Math.max(60, this.settings.syncIntervalSeconds) * 1000) {
       this.settings.lastNoteAutoSyncAt = deviceTimestamp(new Date(now));
@@ -1762,7 +1767,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
   }
 
-  async processPendingEmails(showNotice = true) {
+  async processPendingEmails(showNotice = true, options = {}) {
     if (this.emailProcessingInProgress) return;
     this.emailProcessingInProgress = true;
     this.setSidebarStatus("Processing email tasks...");
@@ -1771,8 +1776,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.requireAiAccess();
       this.requireTodoistAccess();
       this.requireEmailWorkerAccess();
+      if (options?.automatic) {
+        this.settings.lastEmailPollAt = deviceTimestamp();
+        await this.saveSettings();
+      }
       const pending = await this.workerJson("/pending?limit=25", "GET");
-      this.settings.lastEmailPollAt = deviceTimestamp();
+      if (!options?.automatic) this.settings.lastEmailPollAt = deviceTimestamp();
       const emails = pending.emails || [];
       if (!emails.length) {
         await this.saveSettings();
@@ -1878,7 +1887,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "1. In Cloudflare, add or select the domain that will receive forwarded task emails.",
       "2. Enable Email Routing for the domain.",
       "3. Create or confirm the destination address, such as emailtasks@your-domain.example.",
-      "4. Deploy an email queue Worker compatible with Semantic Todoist Sync.",
+      "4. Deploy an email queue Worker compatible with Semantic Todoist Sync. The recommended Worker keeps a small KV queue state key at state/pending.json so empty pending checks use KV reads instead of KV list operations.",
       "5. Set the Worker URL in this plugin to the queue endpoint.",
       "6. Generate a Worker token in this plugin and set the same value as the shared secret expected by the Worker.",
       "7. Send a test forwarded email with one clear action item.",
@@ -1889,13 +1898,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       `- Worker URL: ${workerUrl}`,
       `- Email log folder: ${folder}`,
       `- Auto-process emails: ${this.settings.autoProcessEmails ? "on" : "off"}`,
-      `- Email poll interval: ${this.settings.emailPollIntervalSeconds || DEFAULT_SETTINGS.emailPollIntervalSeconds} seconds`,
+      `- Email poll interval: ${emailAutoPollIntervalSeconds(this.settings)} seconds minimum for automatic polling`,
       `- Worker token set in plugin: ${this.settings.workerToken ? "yes" : "no"}`,
       "",
       "Notes",
       "",
       "- This note is only a setup checklist. It does not modify Cloudflare, Todoist, or the working email workflow.",
       "- Keep the Worker token private. It is not written into this note.",
+      "- Automatic polling is clamped to at least 420 seconds to leave room under Cloudflare KV Free limits.",
+      "- The current compatible Worker updates state/pending.json whenever email arrives or is completed. If that state is missing, the Worker lists pending email keys once to rebuild it, then returns to the low-list path.",
       "- If you need a Cloudflare account API token for manual Worker deployment tooling, create it from Cloudflare Profile > API Tokens. That token is separate from the plugin Worker token.",
       "- The plugin sends only email content selected for processing, retrieved vault context, and task fields needed to create Todoist tasks.",
       "- Do not reuse the Worker token anywhere else.",
@@ -3849,8 +3860,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
         }
       }]
     ]);
-    settingsHeading(containerEl, "Step 4 - Email-To-Todoist Optional", "Use this only if you want forwarded emails processed through your own Cloudflare Worker. The email workflow still requires AI and Todoist first. The Worker token below is a local shared secret generated by this plugin, not a Cloudflare account API token.");
-    setupStatusSetting(containerEl, "Open Cloudflare setup pages", `${emailSetupSummary(this.plugin.settings)} Use Email Routing for inbound email. Use Cloudflare API Tokens only for advanced deployment tooling; this plugin does not need your Cloudflare account API token during normal use.`, [
+    settingsHeading(containerEl, "Step 4 - Email-To-Todoist Optional", "Use this only if you want forwarded emails processed through your own Cloudflare Worker. The compatible Worker keeps a small KV queue state key so empty pending checks avoid KV list usage. The Worker token below is a local shared secret generated by this plugin, not a Cloudflare account API token.");
+    setupStatusSetting(containerEl, "Open Cloudflare setup pages", `${emailSetupSummary(this.plugin.settings)} Use Email Routing for inbound email. Automatic polling is clamped to at least 420 seconds to protect Cloudflare KV Free limits. Use Cloudflare API Tokens only for advanced deployment tooling; this plugin does not need your Cloudflare account API token during normal use.`, [
       ["Email Routing", () => this.plugin.openSetupUrl("https://dash.cloudflare.com/?to=/:account/:zone/email/routing")],
       ["API tokens advanced", () => this.plugin.openSetupUrl("https://dash.cloudflare.com/profile/api-tokens")],
       ["Email Routing docs", () => this.plugin.openSetupUrl("https://developers.cloudflare.com/email-routing/")],
@@ -3970,7 +3981,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderEmail(containerEl) {
     settingsHeading(containerEl, "Automation");
-    toggleSetting(containerEl, "Automatically process new emails", "Poll Cloudflare for pending email tasks while Obsidian is open.", this.plugin, "autoProcessEmails");
+    toggleSetting(containerEl, "Automatically process new emails", "Poll Cloudflare for pending email tasks while Obsidian is open. Compatible Workers use a KV queue state key so empty checks avoid KV list operations.", this.plugin, "autoProcessEmails");
     numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
     new Setting(containerEl).setName("Last email poll").setDesc(this.plugin.settings.lastEmailPollAt || "Not yet polled.");
     new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
@@ -4225,7 +4236,7 @@ const SETTING_DESCRIPTIONS = {
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
   autoProcessEmails: "When enabled, Obsidian polls your Cloudflare Worker for forwarded emails while the app is open.",
-  emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled.",
+  emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled. To protect the Cloudflare KV Free list limit, automatic polling is clamped to at least 420 seconds.",
   maxEmailChars: "Maximum email text sent to the AI for task extraction.",
   emailLogFolder: "Folder where plain-language email processing logs are stored.",
   maxGeneratedMainTasks: "Hard cap on main tasks the AI may create from one note or email.",
@@ -4420,7 +4431,8 @@ function numberSetting(containerEl, name, plugin, key) {
   new Setting(containerEl).setName(name).setDesc(settingDescription(name, key)).addText((text) => {
     text.inputEl.type = "number";
     text.setValue(String(plugin.settings[key] || DEFAULT_SETTINGS[key])).onChange(async (value) => {
-      plugin.settings[key] = Math.max(1, parseInt(value, 10) || DEFAULT_SETTINGS[key]);
+      const minimum = key === "emailPollIntervalSeconds" ? MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS : 1;
+      plugin.settings[key] = Math.max(minimum, parseInt(value, 10) || DEFAULT_SETTINGS[key]);
       await plugin.saveSettings();
     });
   });
@@ -4601,7 +4613,7 @@ function todoistSetupSummary(settings) {
 }
 
 function emailSetupSummary(settings) {
-  return `Requires AI + Todoist first. Optional Cloudflare Worker URL: ${settings.workerUrl ? "set" : "missing"}. Worker token: ${settings.workerToken ? "set" : "missing"}. Automatic processing: ${settings.autoProcessEmails ? "on" : "off"}.`;
+  return `Requires AI + Todoist first. Optional Cloudflare Worker URL: ${settings.workerUrl ? "set" : "missing"}. Worker token: ${settings.workerToken ? "set" : "missing"}. Automatic processing: ${settings.autoProcessEmails ? "on" : "off"}. Poll floor: ${MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS} seconds.`;
 }
 
 function notesSetupSummary(settings) {
@@ -4976,6 +4988,10 @@ function syncWorkerCount(settings = DEFAULT_SETTINGS) {
 
 function referenceRebuildWorkerCount(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(8, parseInt(settings.referenceRebuildWorkerCount, 10) || DEFAULT_SETTINGS.referenceRebuildWorkerCount || 1));
+}
+
+function emailAutoPollIntervalSeconds(settings = DEFAULT_SETTINGS) {
+  return Math.max(MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS, parseInt(settings.emailPollIntervalSeconds, 10) || DEFAULT_SETTINGS.emailPollIntervalSeconds);
 }
 
 function allActiveWorkflowStatusItems(plugin) {

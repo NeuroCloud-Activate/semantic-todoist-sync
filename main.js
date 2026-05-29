@@ -3185,7 +3185,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const lines = (await this.app.vault.read(file)).split("\n");
     const idx = lines.findIndex((line) => getTodoistId(line, this.settings) === taskId || (cached.oid && getTaskOid(line) === cached.oid));
     if (idx === -1) return;
-    lines[idx] = preserveTaskIndent(lines[idx], replacer(lines[idx]));
+    const originalLine = lines[idx];
+    const nextLine = replacer(originalLine);
+    const hasSubtaskMarker = String(originalLine || "").includes(this.settings.subtaskSyncTag) || String(nextLine || "").includes(this.settings.subtaskSyncTag);
+    const isSubtask = Boolean(hasSubtaskMarker || cached.isSubtask || cached.parentId || cached.parentOid);
+    lines[idx] = isSubtask ? ensureSubtaskIndent(nextLine, { isSubtask: true }, this.settings) : nextLine;
     await this.app.vault.modify(file, lines.join("\n"));
   }
 

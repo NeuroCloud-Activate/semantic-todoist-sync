@@ -3,7 +3,6 @@
 ## 0.5.2
 
 - Fixed Todoist-to-Obsidian sync-back so subtasks marked with `#STSubSync` keep or regain the configured indentation even if a prior sync flattened the note line.
-- Audited the May 20 IRGP testing note against the local Todoist reference table to confirm all `#STSubSync` subtasks resolve as cached subtasks and re-indent correctly during sync-back.
 
 ## 0.5.1
 

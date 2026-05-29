@@ -18,8 +18,9 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
    Forward emails containing tasks to a user-owned Cloudflare Domain and Worker process. The plugin can retrieve those emails, use AI plus ranked vault context to identify actionable main tasks and subtasks, log the created tasks into Obsidian (to keep a record), and synchronize them into Todoist.
 
-## What's New In 0.5.2
+## What's New In 0.5.4
 
+- **0.5.4 update:** Sync-back now repairs synced subtask indentation retroactively, keeps `#STSubSync` lines stable across Todoist updates, and skips auto-sync/index queues for plugin-generated note writes.
 - **0.5.2 update:** Todoist-to-Obsidian sync-back now treats `#STSubSync` subtasks as authoritative and reapplies the configured indentation when updating note lines.
 - **0.5.1 update:** Email-To-Todoist automatic polling now uses a 420-second minimum and compatible Cloudflare Workers use a small `state/pending.json` queue-state key so empty checks avoid repeated KV list operations.
 - Todoist-to-Obsidian sync now refreshes task titles, completion state, labels, priorities, dates, deadlines, sections, projects, and subtask indentation from the local Todoist snapshot.

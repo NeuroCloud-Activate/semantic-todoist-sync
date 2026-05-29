@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+- Changed automatic Email-To-Todoist polling to a 420-second minimum so open Obsidian sessions stay well below Cloudflare KV Free tier list-operation limits.
+- Updated automatic email polling so failed background checks record the attempted poll time before contacting Cloudflare, preventing rapid retry loops.
+- Updated Email-To-Todoist setup language, generated Cloudflare setup notes, and settings descriptions to explain the 420-second poll floor and the compatible Worker's `state/pending.json` queue-state behavior.
+- Deployed and audited the Cloudflare Worker queue optimization so empty `/pending` checks use a lightweight KV read path instead of repeatedly using `KV.list()`.
+
 ## 0.5.0
 
 - Updated Todoist-to-Obsidian sync so Todoist task title, completion state, labels, priority, dates, deadlines, section, and project changes refresh the note task line from the local reference cache/snapshot instead of only updating project markers.

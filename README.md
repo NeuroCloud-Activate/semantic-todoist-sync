@@ -20,6 +20,7 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
 ## What's New In 0.5.0
 
+- **0.5.1 update:** Email-To-Todoist automatic polling now uses a 420-second minimum and compatible Cloudflare Workers use a small `state/pending.json` queue-state key so empty checks avoid repeated KV list operations.
 - Todoist-to-Obsidian sync now refreshes task titles, completion state, labels, priorities, dates, deadlines, sections, projects, and subtask indentation from the local Todoist snapshot.
 - Sidebar chat can use synced task references alongside note context, with descriptive task links instead of raw URLs.
 - The semantic index now stores vault-relative paths, excludes the plugin data folder by default, and writes sync-safe shard files under the Obsidian Sync 5 MB file-size ceiling.

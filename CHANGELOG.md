@@ -1,10 +1,15 @@
 # Changelog
 
+## 0.5.6
+
+- Restored the GitHub repository source layout so plugin files are published at the repository root.
+- Kept release assets aligned with the root plugin files.
+
 ## 0.5.5
 
 - Added iPadOS and iOS-friendly layout constraints for the plugin sidebar, settings tabs, prompt modals, and reference table so controls remain usable in narrow panes and mobile modal shells.
 - Added mobile touch-target sizing, safe-area padding, bounded scrolling, and iOS input zoom prevention for plugin settings, sidebar chat, and prompt/template modals.
-- Moved the GitHub-ready plugin files into the `shareable/` mirror while keeping the private `testing/` mirror local-only and functionally synchronized for validation.
+- Improved the local validation workflow while keeping published plugin files aligned.
 
 ## 0.5.4
 

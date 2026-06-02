@@ -3546,7 +3546,7 @@ class SemanticTodoistView extends ItemView {
     this.relevantEl = container.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = container.createDiv({ cls: "semantic-todoist-conversation" });
-    this.promptEl = container.createEl("textarea", { placeholder: "Ask about your vault or draft a prompt..." });
+    this.promptEl = container.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt..." });
     this.promptEl.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       event.preventDefault();
@@ -3822,6 +3822,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
     for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "References", "Activity"]) {
@@ -4164,6 +4165,9 @@ class PromptModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-prompt-modal");
+    contentEl.addClass("semantic-todoist-modal-content");
     contentEl.empty();
     contentEl.createEl("h2", { text: this.title });
     const input = contentEl.createEl("textarea", { placeholder: "Ask AI..." });
@@ -4207,6 +4211,9 @@ class TaskTemplateModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-template-modal");
+    contentEl.addClass("semantic-todoist-modal-content");
     contentEl.empty();
     contentEl.createEl("h2", { text: "Run Prompts" });
     if (!this.templates.length) {

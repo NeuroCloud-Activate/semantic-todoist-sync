@@ -1,12 +1,33 @@
+.semantic-todoist-view,
+.semantic-todoist-settings,
+.semantic-todoist-modal {
+  box-sizing: border-box;
+}
+
+.semantic-todoist-view *,
+.semantic-todoist-settings *,
+.semantic-todoist-modal * {
+  box-sizing: border-box;
+}
+
 .semantic-todoist-tabs {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
   margin: 12px 0 18px;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
 }
 
 .semantic-todoist-tabs button {
+  flex: 0 0 auto;
   border-radius: 6px;
+  min-height: 36px;
+  white-space: nowrap;
 }
 
 .semantic-todoist-tabs button.is-active {
@@ -39,6 +60,16 @@
 .semantic-todoist-setting .setting-item-control,
 .semantic-todoist-setting textarea {
   width: 100%;
+}
+
+.semantic-todoist-settings .setting-item-control {
+  min-width: 0;
+}
+
+.semantic-todoist-settings input,
+.semantic-todoist-settings select,
+.semantic-todoist-settings textarea {
+  max-width: 100%;
 }
 
 .semantic-todoist-setting .setting-item-name {
@@ -140,6 +171,8 @@
   flex-direction: column;
   gap: 8px;
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
   padding: 12px;
 }
 
@@ -292,6 +325,7 @@
 
 .semantic-todoist-view textarea {
   min-height: 76px;
+  max-height: 34vh;
   resize: vertical;
 }
 
@@ -312,10 +346,12 @@
   padding: 10px;
   overflow: auto;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 280px;
   background: var(--background-primary);
   user-select: text;
   -webkit-user-select: text;
+  -webkit-overflow-scrolling: touch;
 }
 
 .semantic-todoist-message {
@@ -430,6 +466,7 @@
   padding: 10px;
   overflow: auto;
   flex: 1;
+  min-height: 0;
   white-space: pre-wrap;
   background: var(--background-secondary);
 }
@@ -455,10 +492,12 @@
 
 .semantic-todoist-reference-table-wrap {
   max-height: 520px;
+  max-width: 100%;
   overflow: auto;
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   background: var(--background-primary);
+  -webkit-overflow-scrolling: touch;
 }
 
 .semantic-todoist-reference-table {
@@ -537,11 +576,176 @@
 .semantic-todoist-prompt-textarea {
   width: 100%;
   min-height: 130px;
+  max-height: min(48vh, 420px);
 }
 
 .semantic-todoist-template-preview {
   width: 100%;
   min-height: 180px;
+  max-height: min(52vh, 460px);
+}
+
+.semantic-todoist-modal {
+  width: min(720px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+  max-height: min(86vh, 760px);
+}
+
+.semantic-todoist-modal .modal-content,
+.semantic-todoist-modal-content {
+  max-height: calc(min(86vh, 760px) - 48px);
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.semantic-todoist-modal textarea {
+  resize: vertical;
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-settings .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .semantic-todoist-settings .setting-item-info,
+  .semantic-todoist-settings .setting-item-control {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .semantic-todoist-settings .setting-item-control {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .semantic-todoist-settings .setting-item-control input,
+  .semantic-todoist-settings .setting-item-control select,
+  .semantic-todoist-settings .setting-item-control textarea {
+    width: 100%;
+  }
+
+  .semantic-todoist-settings .setting-item-control button {
+    min-height: 40px;
+    margin-inline-start: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .semantic-todoist-view {
+    gap: 7px;
+    padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  }
+
+  .semantic-todoist-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .semantic-todoist-header button,
+  .semantic-todoist-toolbar button {
+    min-height: 40px;
+  }
+
+  .semantic-todoist-note-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .semantic-todoist-context-toggle label {
+    align-items: flex-start;
+  }
+
+  .semantic-todoist-active-summary,
+  .semantic-todoist-relevant,
+  .semantic-todoist-conversation,
+  .semantic-todoist-message-text {
+    border-radius: 6px;
+  }
+
+  .semantic-todoist-active-summary div {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .semantic-todoist-conversation {
+    min-height: 0;
+    flex-basis: 0;
+  }
+
+  .semantic-todoist-message {
+    max-width: 100%;
+  }
+
+  .semantic-todoist-toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .semantic-todoist-toolbar button {
+    width: 100%;
+  }
+
+  .semantic-todoist-chat-prompt {
+    min-height: 68px;
+    max-height: 30vh;
+    max-height: 30dvh;
+  }
+
+  .semantic-todoist-status {
+    min-height: calc(2 * 1.25em + 10px);
+    max-height: calc(2 * 1.25em + 10px);
+  }
+
+  .semantic-todoist-reference-table-wrap {
+    max-height: 48vh;
+    max-height: 48dvh;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .semantic-todoist-tabs button,
+  .semantic-todoist-toolbar button,
+  .semantic-todoist-header button,
+  .semantic-todoist-settings button,
+  .semantic-todoist-modal button {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  .semantic-todoist-view input,
+  .semantic-todoist-view select,
+  .semantic-todoist-view textarea,
+  .semantic-todoist-settings input,
+  .semantic-todoist-settings select,
+  .semantic-todoist-settings textarea,
+  .semantic-todoist-modal input,
+  .semantic-todoist-modal select,
+  .semantic-todoist-modal textarea {
+    font-size: max(16px, var(--font-ui-small));
+  }
+}
+
+.is-mobile .semantic-todoist-view {
+  height: 100%;
+  min-height: 0;
+}
+
+.is-mobile .semantic-todoist-modal {
+  width: 100vw;
+  max-width: 100vw;
+  max-height: 100vh;
+  max-height: 100dvh;
+  margin: 0;
+  border-radius: 0;
+}
+
+.is-mobile .semantic-todoist-modal .modal-content,
+.is-mobile .semantic-todoist-modal-content {
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  padding-bottom: calc(16px + env(safe-area-inset-bottom));
 }
 
 .semantic-todoist-template-mode {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.5
+
+- Added iPadOS and iOS-friendly layout constraints for the plugin sidebar, settings tabs, prompt modals, and reference table so controls remain usable in narrow panes and mobile modal shells.
+- Added mobile touch-target sizing, safe-area padding, bounded scrolling, and iOS input zoom prevention for plugin settings, sidebar chat, and prompt/template modals.
+- Moved the GitHub-ready plugin files into the `shareable/` mirror while keeping the private `testing/` mirror local-only and functionally synchronized for validation.
+
 ## 0.5.4
 
 - Hardened Todoist-to-Obsidian sync-back so `#STSubSync` subtasks keep the configured indentation across direct activity updates, note reconciliation, section/project marker cleanup, task creation, relinking, and deleted-task cleanup.

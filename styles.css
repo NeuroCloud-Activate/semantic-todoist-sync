@@ -634,22 +634,30 @@
 
 @media (max-width: 520px) {
   .semantic-todoist-view {
-    gap: 7px;
-    padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+    gap: 5px;
+    padding: max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
   }
 
   .semantic-todoist-header {
-    align-items: stretch;
-    flex-direction: column;
+    align-items: center;
+    flex-direction: row;
+  }
+
+  .semantic-todoist-header h3 {
+    font-size: 1.15em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .semantic-todoist-header button,
   .semantic-todoist-toolbar button {
-    min-height: 40px;
+    min-height: 34px;
   }
 
   .semantic-todoist-note-row {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 72px) minmax(0, 1fr);
     gap: 4px;
   }
 
@@ -665,13 +673,15 @@
   }
 
   .semantic-todoist-active-summary div {
-    white-space: normal;
-    overflow-wrap: anywhere;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .semantic-todoist-conversation {
-    min-height: 0;
+    min-height: 160px;
     flex-basis: 0;
+    padding: 7px;
   }
 
   .semantic-todoist-message {
@@ -680,17 +690,19 @@
 
   .semantic-todoist-toolbar {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
   }
 
   .semantic-todoist-toolbar button {
+    padding-inline: 4px;
     width: 100%;
   }
 
   .semantic-todoist-chat-prompt {
-    min-height: 68px;
-    max-height: 30vh;
-    max-height: 30dvh;
+    min-height: 48px;
+    max-height: 18vh;
+    max-height: 18dvh;
   }
 
   .semantic-todoist-status {
@@ -730,6 +742,70 @@
 .is-mobile .semantic-todoist-view {
   height: 100%;
   min-height: 0;
+}
+
+.is-mobile .semantic-todoist-header button,
+.is-mobile .semantic-todoist-toolbar button {
+  min-height: 34px;
+  padding-block: 4px;
+}
+
+.is-mobile .semantic-todoist-note-picker input {
+  height: 34px;
+  min-height: 34px;
+}
+
+.is-mobile .semantic-todoist-context-toggle {
+  font-size: var(--font-ui-smaller);
+  line-height: 1.1;
+}
+
+.is-mobile .semantic-todoist-context-toggle label {
+  gap: 4px;
+}
+
+.is-mobile .semantic-todoist-active-summary,
+.is-mobile .semantic-todoist-relevant {
+  padding: 5px 7px;
+  max-height: 42px;
+  overflow: hidden;
+}
+
+.is-mobile .semantic-todoist-active-summary strong {
+  display: inline;
+}
+
+.is-mobile .semantic-todoist-active-summary div:nth-of-type(n+2) {
+  display: none;
+}
+
+.is-mobile .semantic-todoist-relevant {
+  white-space: nowrap;
+}
+
+.is-mobile .semantic-todoist-source-tabs {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  max-width: 100%;
+  width: calc(100% - 92px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 1px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.is-mobile .semantic-todoist-source-card {
+  flex: 0 0 auto;
+  max-width: 15ch;
+}
+
+.is-mobile .semantic-todoist-message {
+  margin-bottom: 7px;
+}
+
+.is-mobile .semantic-todoist-message-text {
+  padding: 6px 8px;
+  line-height: 1.3;
 }
 
 .is-mobile .semantic-todoist-modal {

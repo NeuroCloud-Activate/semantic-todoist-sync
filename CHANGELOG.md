@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.7
+
+- Reworked the iPhone/iOS sidebar layout so the chat transcript keeps usable vertical space by compacting the header, active-note controls, relevant-note chips, prompt field, and action buttons.
+
 ## 0.5.6
 
 - Restored the GitHub repository source layout so plugin files are published at the repository root.

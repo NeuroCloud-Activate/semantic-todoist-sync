@@ -3535,7 +3535,7 @@ class SemanticTodoistView extends ItemView {
     const includeLabel = includeRow.createEl("label");
     const includeCheckbox = includeLabel.createEl("input", { type: "checkbox" });
     includeCheckbox.checked = this.includeActiveNote;
-    includeLabel.createSpan({ text: "Include active note in chat search" });
+    includeLabel.createSpan({ text: "Use active note in chat" });
     includeCheckbox.onchange = async () => {
       this.includeActiveNote = includeCheckbox.checked;
       this.plugin.settings.searchIncludeActiveNote = this.includeActiveNote;

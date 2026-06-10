@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.15
+
+- Fixed Email-To-Todoist task notes so the Email-To-Todoist log folder remains eligible for note sync and local reference rebuilds even when the plugin data folder is excluded from semantic indexing.
+- Kept Email-To-Todoist log notes excluded from AI indexing/search while allowing Todoist sync-back updates to reach the generated note.
+- Added clearer local logging for generated email task notes, including cached task count and sync eligibility.
+
 ## 0.5.14
 
 - Updated the artifact attestation workflow to use `actions/checkout@v6` to avoid the GitHub Actions Node 20 deprecation warning.

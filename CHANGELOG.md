@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.9
+
+- Added same-provider AI model fallback for transient overload, rate-limit, and temporary 5xx model errors.
+- Added settings to enable or disable fallback and choose the fallback model, with Automatic using the next available model from the same provider.
+
 ## 0.5.8
 
 - Replaced the always-visible active-note search field with a compact selector so desktop sidebar chat has only one persistent text-entry box.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.8
+
+- Replaced the always-visible active-note search field with a compact selector so desktop sidebar chat has only one persistent text-entry box.
+- Hid the included active-note summary card on mobile to keep the chat transcript prioritized while preserving excluded/unavailable active-note status messages.
+- Cleaned up Obsidian CSS lint warnings for partially supported scrollbar styling and duplicate mobile `max-height` declarations.
+
 ## 0.5.7
 
 - Reworked the iPhone/iOS sidebar layout so the chat transcript keeps usable vertical space by compacting the header, active-note controls, relevant-note chips, prompt field, and action buttons.

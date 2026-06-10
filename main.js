@@ -3509,7 +3509,10 @@ class SemanticTodoistView extends ItemView {
     const noteRow = container.createDiv({ cls: "semantic-todoist-note-row" });
     noteRow.createSpan({ text: "Active note" });
     const picker = noteRow.createDiv({ cls: "semantic-todoist-note-picker" });
-    this.noteInputEl = picker.createEl("input", { type: "search", placeholder: "Current active note" });
+    this.noteButtonEl = picker.createEl("button", { cls: "semantic-todoist-note-select", text: "Current active note" });
+    this.noteButtonEl.onclick = () => this.showNoteSearch();
+    this.noteInputEl = picker.createEl("input", { type: "search", cls: "semantic-todoist-note-search", placeholder: "Search notes..." });
+    this.noteInputEl.hidden = true;
     this.noteInputEl.oninput = () => {
       if (!this.noteInputEl.value.trim()) {
         this.selectedPath = "";
@@ -3523,6 +3526,11 @@ class SemanticTodoistView extends ItemView {
     };
     this.noteInputEl.onfocus = () => this.renderNoteSearchResults();
     this.noteInputEl.onkeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.hideNoteSearch();
+        return;
+      }
       if (event.key !== "Enter") return;
       const first = this.getNoteSearchMatches(this.noteInputEl.value)[0];
       if (first) {
@@ -3701,7 +3709,7 @@ class SemanticTodoistView extends ItemView {
     this.selectedPath = path;
     this.noteSearchDirty = false;
     if (this.noteInputEl) this.noteInputEl.value = path;
-    if (this.noteResultsEl) this.noteResultsEl.empty();
+    this.hideNoteSearch();
     this.refreshActiveSummary();
   }
 
@@ -3744,18 +3752,49 @@ class SemanticTodoistView extends ItemView {
     if (!this.activeSummaryEl) return;
     this.activeSummaryEl.empty();
     if (!this.includeActiveNote) {
+      this.activeSummaryEl.removeClass("is-active-note-included");
+      this.activeSummaryEl.removeClass("is-active-note-unavailable");
+      this.activeSummaryEl.addClass("is-active-note-excluded");
       this.activeSummaryEl.setText("Active note excluded from chat search.");
       return;
     }
     if (!active.path) {
       this.activeSummaryEl.setText("No active note selected.");
+      this.activeSummaryEl.removeClass("is-active-note-included");
+      this.activeSummaryEl.removeClass("is-active-note-excluded");
+      this.activeSummaryEl.addClass("is-active-note-unavailable");
+      this.updateNotePickerLabel("");
       if (!this.noteSearchDirty && this.noteInputEl) this.noteInputEl.value = "";
       return;
     }
     if (!this.noteSearchDirty && this.noteInputEl) this.noteInputEl.value = active.path;
+    this.activeSummaryEl.removeClass("is-active-note-unavailable");
+    this.activeSummaryEl.removeClass("is-active-note-excluded");
+    this.activeSummaryEl.addClass("is-active-note-included");
+    this.updateNotePickerLabel(active.title || active.path);
     this.activeSummaryEl.createEl("strong", { text: active.title });
     this.activeSummaryEl.createDiv({ text: active.path });
     this.activeSummaryEl.createDiv({ text: active.selection ? "Selected text will be included." : "Full note will be included." });
+  }
+
+  showNoteSearch() {
+    if (!this.noteInputEl) return;
+    this.noteInputEl.hidden = false;
+    this.noteInputEl.focus();
+    this.noteInputEl.select();
+    this.renderNoteSearchResults();
+  }
+
+  hideNoteSearch() {
+    if (this.noteInputEl) this.noteInputEl.hidden = true;
+    if (this.noteResultsEl) this.noteResultsEl.empty();
+    this.noteSearchDirty = false;
+  }
+
+  updateNotePickerLabel(label) {
+    if (!this.noteButtonEl) return;
+    this.noteButtonEl.setText(label ? shortTitle(label, 42) : "Current active note");
+    this.noteButtonEl.title = label || "Current active note";
   }
 
   renderRelevantNotes(chunks) {

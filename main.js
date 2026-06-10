@@ -16,6 +16,8 @@ const TODOIST_API = "https://api.todoist.com/api/v1";
 const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
+const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
+const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
@@ -116,6 +118,7 @@ const DEFAULT_SETTINGS = {
   lastSubtaskIndentRepairAt: "",
   lastSubtaskIndentRepairFingerprint: "",
   todoistSnapshotCacheMinutes: 5,
+  taskReferenceSnapshotMeta: {},
   linksAppURI: false,
   subtaskIndentSpaces: 4,
   subtaskIncludeLabels: true,
@@ -188,8 +191,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticChunkTermCache = new Map();
     this.semanticIndexPathMeta = new Map();
     this.semanticIndexWarmupInProgress = false;
+    this.taskReferenceIndex = emptyTaskReferenceIndex();
+    this.taskReferenceStateRevision = 0;
+    this.taskReferenceIndexRevision = -1;
+    this.taskReferenceSnapshotFingerprint = "";
+    this.taskReferenceSnapshotDirty = true;
     this.aiActivity = "";
+    await this.loadTaskReferenceSnapshot();
+    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     await this.migrateSettings();
+    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.loadSemanticIndex();
     this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
@@ -240,11 +251,116 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    window.clearTimeout(this.taskReferenceSnapshotTimer);
+    this.taskReferenceSnapshotTimer = null;
+    await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.flushTaskReferenceSnapshotIfDirty();
+    await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
+  }
+
+  async loadTaskReferenceSnapshot() {
+    let persistedIndex = null;
+    try {
+      const rawIndex = await this.app.vault.adapter.read(`${this.manifest.dir}/${TASK_REFERENCE_INDEX_FILE}`);
+      const parsedIndex = JSON.parse(rawIndex || "{}");
+      persistedIndex = parsedIndex.index || parsedIndex;
+    } catch {
+      persistedIndex = null;
+    }
+    try {
+      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${TASK_REFERENCE_SNAPSHOT_FILE}`);
+      const snapshot = JSON.parse(raw || "{}");
+      const currentCount = Object.keys(this.settings.taskCache || {}).length;
+      const snapshotCount = Object.keys(snapshot.taskCache || {}).length;
+      if (snapshotCount && snapshotCount >= currentCount) {
+        this.settings.taskCache = snapshot.taskCache || {};
+        this.settings.pendingTaskReferences = snapshot.pendingTaskReferences || {};
+        this.settings.pendingTaskDescriptions = snapshot.pendingTaskDescriptions || {};
+        this.settings.taskReferenceSnapshotMeta = snapshot.meta || {};
+      }
+      const compactIndex = persistedIndex || snapshot.index || null;
+      if (compactIndex) {
+        this.taskReferenceIndex = hydrateTaskReferenceIndex(compactIndex, this.settings);
+        this.taskReferenceIndexRevision = this.taskReferenceStateRevision;
+      }
+      this.taskReferenceSnapshotFingerprint = snapshot.meta?.fingerprint || compactIndex?.fingerprint || taskReferencePayloadFingerprint(this.settings);
+      this.taskReferenceSnapshotDirty = false;
+    } catch {
+      if (persistedIndex) {
+        this.taskReferenceIndex = hydrateTaskReferenceIndex(persistedIndex, this.settings);
+        this.taskReferenceIndexRevision = this.taskReferenceStateRevision;
+      }
+      this.taskReferenceSnapshotFingerprint = taskReferencePayloadFingerprint(this.settings);
+      this.taskReferenceSnapshotDirty = Object.keys(this.settings.taskCache || {}).length > 0 || Object.keys(this.settings.pendingTaskReferences || {}).length > 0;
+    }
+  }
+
+  refreshTaskReferenceIndex() {
+    const deduped = dedupeTaskReferenceState(this.settings);
+    this.taskReferenceIndex = buildTaskReferenceIndex(this.settings);
+    Object.defineProperty(this.settings, "__taskReferenceUsedOids", {
+      value: new Set(this.taskReferenceIndex.usedOids),
+      writable: true,
+      configurable: true,
+      enumerable: false
+    });
+    if (deduped) this.taskReferenceSnapshotDirty = true;
+    this.taskReferenceIndexRevision = this.taskReferenceStateRevision;
+    return this.taskReferenceIndex;
+  }
+
+  getTaskReferenceIndex() {
+    if (!this.taskReferenceIndex || this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) {
+      return this.refreshTaskReferenceIndex();
+    }
+    return this.taskReferenceIndex;
+  }
+
+  markTaskReferenceStateDirty() {
+    this.taskReferenceStateRevision += 1;
+    this.taskReferenceSnapshotDirty = true;
+    this.queueTaskReferenceSnapshotWrite();
+  }
+
+  queueTaskReferenceSnapshotWrite(delayMs = 2500) {
+    window.clearTimeout(this.taskReferenceSnapshotTimer);
+    this.taskReferenceSnapshotTimer = window.setTimeout(() => {
+      this.taskReferenceSnapshotTimer = null;
+      this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot save failed", error));
+    }, delayMs);
+  }
+
+  async flushTaskReferenceSnapshotIfDirty() {
+    if (!this.taskReferenceSnapshotDirty && this.taskReferenceIndexRevision === this.taskReferenceStateRevision && this.taskReferenceSnapshotFingerprint) return false;
+    this.refreshTaskReferenceIndex();
+    const fingerprint = this.taskReferenceIndex.fingerprint || taskReferencePayloadFingerprint(this.settings);
+    if (!this.taskReferenceSnapshotDirty && fingerprint === this.taskReferenceSnapshotFingerprint) return false;
+    const meta = {
+      version: 1,
+      updatedAt: deviceTimestamp(),
+      fingerprint,
+      taskCount: Object.keys(this.settings.taskCache || {}).length,
+      pendingReferenceCount: Object.keys(this.settings.pendingTaskReferences || {}).length,
+      pendingDescriptionCount: Object.keys(this.settings.pendingTaskDescriptions || {}).length
+    };
+    const persistentIndex = persistentTaskReferenceIndex(this.taskReferenceIndex);
+    const body = JSON.stringify({
+      meta,
+      index: persistentIndex,
+      taskCache: this.settings.taskCache || {},
+      pendingTaskReferences: this.settings.pendingTaskReferences || {},
+      pendingTaskDescriptions: this.settings.pendingTaskDescriptions || {}
+    });
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${TASK_REFERENCE_SNAPSHOT_FILE}`, body);
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${TASK_REFERENCE_INDEX_FILE}`, JSON.stringify({ meta, index: persistentIndex }));
+    this.settings.taskReferenceSnapshotMeta = meta;
+    this.taskReferenceSnapshotFingerprint = fingerprint;
+    this.taskReferenceSnapshotDirty = false;
+    return true;
   }
 
   async migrateSettings() {
@@ -402,6 +518,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (JSON.stringify(normalizedDescriptions) !== JSON.stringify(this.settings.pendingTaskDescriptions)) changed = true;
       this.settings.pendingTaskDescriptions = normalizedDescriptions;
     }
+    if (changed || this.taskReferenceSnapshotDirty) this.markTaskReferenceStateDirty();
     if (changed) await this.saveSettings();
   }
 
@@ -1036,7 +1153,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   semanticTaskReferenceChunks(pathFilter = "") {
     const basePath = vaultBasePath(this.app);
     const groups = new Map();
-    const childTextByParentOid = taskChildTextByParentOid(Object.entries(this.settings.taskCache || {}));
+    const referenceIndex = this.getTaskReferenceIndex();
+    const childTextByParentOid = referenceIndex.childTextByParentOid;
     const addTask = (id, task, source) => {
       const path = vaultRelativePath(task?.path || "", basePath);
       if (!path || (pathFilter && path !== pathFilter) || !this.isIndexablePath(path)) return;
@@ -1047,8 +1165,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       group.modifiedAt = Math.max(group.modifiedAt || 0, Date.parse(task?.cachedAt || "") || 0);
       groups.set(path, group);
     };
-    for (const [id, task] of Object.entries(this.settings.taskCache || {})) addTask(id, task, "cache");
-    for (const reference of Object.values(this.settings.pendingTaskReferences || {})) addTask("", reference, "pending");
+    for (const [id, task] of referenceIndex.entries) addTask(id, task, "cache");
+    for (const reference of referenceIndex.pendingReferences) addTask("", reference, "pending");
     const chunks = [];
     for (const group of groups.values()) {
       const file = this.app.vault.getAbstractFileByPath(group.path);
@@ -1223,8 +1341,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const chunkPaths = new Set((chunks || []).map((chunk) => chunk.path).filter(Boolean));
     const matchedTaskFiles = this.taskFilesMatchingQuery(queryText, queryTerms, chunkPaths, 8);
     const matchedTaskPaths = new Set(matchedTaskFiles.map((file) => file.path));
-    const taskCacheEntries = Object.entries(this.settings.taskCache || {});
-    const cachedTaskPaths = new Set(taskCacheEntries.map(([, task]) => task.path).filter(Boolean));
+    const referenceIndex = this.getTaskReferenceIndex();
+    const taskCacheEntries = referenceIndex.entries;
+    const cachedTaskPaths = referenceIndex.cachedTaskPaths;
     const byPath = new Map();
     if (active?.path) byPath.set(active.path, active.text || "");
     for (const file of matchedTaskFiles) {
@@ -1263,7 +1382,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const contextPaths = new Set(byPath.keys());
     const hasMatchedTaskPath = matchedTaskPaths.size > 0;
-    const childTextByParentOid = taskChildTextByParentOid(taskCacheEntries);
+    const childTextByParentOid = referenceIndex.childTextByParentOid;
     const cachedTasks = taskCacheEntries
       .map(([id, task]) => {
         const notePath = task.path || "";
@@ -2293,9 +2412,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     this.subtaskIndentRepairInProgress = true;
     this.setSidebarStatus("Repairing subtask indentation...");
-    const paths = options.scanAll ? this.app.vault.getMarkdownFiles().map((file) => file.path) : cachedTaskPathsForIndentRepair(this.settings);
+    const referenceIndex = this.getTaskReferenceIndex();
+    const paths = options.scanAll ? this.app.vault.getMarkdownFiles().map((file) => file.path) : Array.from(referenceIndex.pathsForIndentRepair);
     const stats = { scanned: paths.length, files: 0, repaired: 0 };
-    const byOid = taskCacheByOid(this.settings);
+    const byOid = referenceIndex.byOid;
     try {
       await asyncPool(paths, Math.min(2, syncWorkerCount(this.settings)), async (path) => {
         const file = this.app.vault.getAbstractFileByPath(path);
@@ -2369,6 +2489,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!localState.candidateCount) {
         this.settings.taskCache = {};
         this.settings.pendingTaskReferences = {};
+        this.markTaskReferenceStateDirty();
         this.settings.lastReferenceRebuildAt = deviceTimestamp();
         this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
         this.settings.lastReferenceRebuildCandidateCount = 0;
@@ -2464,6 +2585,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       this.settings.taskCache = nextCache;
       this.settings.pendingTaskReferences = {};
+      this.markTaskReferenceStateDirty();
       this.settings.lastReferenceRebuildAt = deviceTimestamp();
       this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
       this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
@@ -2967,8 +3089,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async deleteTodoistTasksMissingFromFile(path, presentIds) {
     let deleted = 0;
     const deletedSections = new Map();
-    for (const [id, cached] of Object.entries(this.settings.taskCache || {})) {
-      if (cached.path !== path || presentIds.has(id)) continue;
+    const cachedEntries = this.getTaskReferenceIndex().byPath.get(vaultRelativePath(path, vaultBasePath(this.app))) || [];
+    for (const [id, cached] of cachedEntries) {
+      if (presentIds.has(id)) continue;
       const ok = await this.deleteTodoistTask(id).catch((error) => {
         this.logLocal("Todoist delete failed", { id, path, error: error.message || String(error) });
         return false;
@@ -2984,6 +3107,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       delete this.settings.taskCache[id];
       deleted += 1;
     }
+    if (deleted) this.markTaskReferenceStateDirty();
     if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()));
     return deleted;
   }
@@ -2999,9 +3123,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return 0;
     }
     let deleted = 0;
+    const referenceIndex = this.getTaskReferenceIndex();
     for (const section of candidates) {
       if (!section.sectionId) continue;
-      const hasLocalTasks = Object.values(this.settings.taskCache || {}).some((task) => String(task.sectionId || "") === String(section.sectionId));
+      const hasLocalTasks = (referenceIndex.bySectionId.get(String(section.sectionId)) || []).length > 0;
       if (hasLocalTasks) continue;
       const hasRemoteTasks = (snapshot.tasks || []).some((task) => String(task.sectionId || "") === String(section.sectionId));
       if (hasRemoteTasks) continue;
@@ -3032,7 +3157,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async reconcileTodoistTaskCache() {
-    const entries = Object.entries(this.settings.taskCache || {});
+    const referenceIndex = this.getTaskReferenceIndex();
+    const entries = referenceIndex.entries;
     const removed = [];
     let checked = 0;
     const removedIds = new Set();
@@ -3050,20 +3176,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (exists) continue;
       const noteTouched = await this.removeDeletedTodoistTaskFromNote(cached);
       delete this.settings.taskCache[id];
+      this.taskReferenceSnapshotDirty = true;
       removedIds.add(id);
       if (!cached.isSubtask) {
-        for (const [otherId, otherCached] of Object.entries(this.settings.taskCache || {})) {
-          if (otherCached.path !== cached.path || !otherCached.isSubtask) continue;
+        for (const [otherId, otherCached] of referenceIndex.byPath.get(cached.path || "") || []) {
+          if (!otherCached.isSubtask) continue;
           if (Math.abs((otherCached.lineNumber || 0) - (cached.lineNumber || 0)) > 25) continue;
           const otherExists = activeTodoistIds ? activeTodoistIds.has(otherId) : await this.todoistTaskExists(otherId);
           if (otherExists) continue;
           delete this.settings.taskCache[otherId];
+          this.taskReferenceSnapshotDirty = true;
           removedIds.add(otherId);
         }
       }
       removed.push({ id, oid: cached.oid || "", path: cached.path || "", noteTouched });
     }
     if (removed.length) {
+      this.markTaskReferenceStateDirty();
       await this.saveSettings();
       this.logLocal("Todoist cache reconciled", { checked, removed: removed.length });
     }
@@ -3215,6 +3344,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         await this.removeDeletedTodoistTaskFromNote(cached);
         delete this.settings.taskCache[taskId];
+        this.markTaskReferenceStateDirty();
         savedEvents.add(event.id);
         continue;
       }
@@ -3237,6 +3367,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     cached.isCompleted = Boolean(checked);
     cached.signature = parsedTaskSignature(cached);
     cached.cachedAt = deviceTimestamp();
+    this.markTaskReferenceStateDirty();
   }
 
   async updateTaskLineFromTodoist(taskId, task) {
@@ -3321,6 +3452,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (oid) delete this.settings.pendingTaskDescriptions[pendingTaskOidKey(path, oid)];
     }
     if (this.settings.pendingTaskReferences && oid) delete this.settings.pendingTaskReferences[pendingTaskOidKey(path, oid)];
+    this.markTaskReferenceStateDirty();
     this.queueTaskReferenceIndexUpdate(path);
   }
 
@@ -3335,6 +3467,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.pendingTaskDescriptions[pendingTaskContentKey(notePath, task)] = description;
       if (task.oid) this.settings.pendingTaskDescriptions[pendingTaskOidKey(notePath, task.oid)] = description;
     }
+    this.markTaskReferenceStateDirty();
   }
 
   savePendingTaskReferences(path, tasks) {
@@ -3374,6 +3507,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         };
       }
     }
+    this.markTaskReferenceStateDirty();
     this.queueTaskReferenceIndexUpdate(notePath);
   }
 
@@ -3406,16 +3540,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   findCachedTaskIdForParsedTask(task) {
+    const referenceIndex = this.getTaskReferenceIndex();
     if (task.oid) {
-      const oidId = todoistIdForOid(this.settings, task.oid);
+      const oidId = referenceIndex.byOid.get(String(task.oid || "").toUpperCase()) || "";
       if (oidId) return oidId;
     }
     const signature = parsedTaskSignature(task);
     const key = pendingTaskKey(task.path, task);
-    for (const [id, cached] of Object.entries(this.settings.taskCache || {})) {
-      if (cached.path !== task.path) continue;
-      if (cached.signature === signature || pendingTaskKey(cached.path, cached) === key || pendingTaskContentKey(cached.path, cached) === pendingTaskContentKey(task.path, task)) return id;
-    }
+    const contentKey = pendingTaskContentKey(task.path, task);
+    const pathEntries = referenceIndex.byPath.get(task.path) || [];
+    for (const [id, cached] of pathEntries) if (cached.signature === signature || pendingTaskKey(cached.path, cached) === key || pendingTaskContentKey(cached.path, cached) === contentKey) return id;
     return "";
   }
 
@@ -4882,6 +5016,275 @@ function activityLogText(settings) {
   return entries.slice(0, 12).map((entry) => `${entry.at}  ${entry.message}  ${JSON.stringify(entry.data || {})}`).join("\n");
 }
 
+function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS) {
+  const data = Object.assign({}, settings);
+  delete data.taskCache;
+  delete data.pendingTaskReferences;
+  delete data.pendingTaskDescriptions;
+  return data;
+}
+
+function taskReferencePayloadFingerprint(settings = DEFAULT_SETTINGS) {
+  return shortHash(JSON.stringify({
+    taskCache: settings.taskCache || {},
+    pendingTaskReferences: settings.pendingTaskReferences || {},
+    pendingTaskDescriptions: settings.pendingTaskDescriptions || {}
+  }));
+}
+
+function emptyTaskReferenceIndex() {
+  return {
+    fingerprint: "",
+    entries: [],
+    pendingReferences: [],
+    byId: new Map(),
+    byOid: new Map(),
+    byPath: new Map(),
+    bySectionId: new Map(),
+    cachedTaskPaths: new Set(),
+    pathsForIndentRepair: new Set(),
+    usedOids: new Set(),
+    childTextByParentOid: new Map(),
+    taskCount: 0,
+    pendingReferenceCount: 0
+  };
+}
+
+function buildTaskReferenceIndex(settings = DEFAULT_SETTINGS) {
+  const index = emptyTaskReferenceIndex();
+  index.entries = Object.entries(settings.taskCache || {});
+  index.pendingReferences = Object.values(settings.pendingTaskReferences || {});
+  index.taskCount = index.entries.length;
+  index.pendingReferenceCount = index.pendingReferences.length;
+  for (const [id, task] of index.entries) {
+    index.byId.set(String(id), task);
+    const oid = String(task?.oid || "").toUpperCase();
+    if (oid) {
+      index.usedOids.add(oid);
+      if (!index.byOid.has(oid)) index.byOid.set(oid, String(id));
+    }
+    const path = vaultRelativePath(task?.path || "");
+    if (path) {
+      index.cachedTaskPaths.add(path);
+      if (task?.oid || task?.isSubtask || task?.parentOid || task?.parentId) index.pathsForIndentRepair.add(path);
+      const pathEntries = index.byPath.get(path) || [];
+      pathEntries.push([String(id), task]);
+      index.byPath.set(path, pathEntries);
+    }
+    const sectionId = String(task?.sectionId || "");
+    if (sectionId) {
+      const sectionEntries = index.bySectionId.get(sectionId) || [];
+      sectionEntries.push([String(id), task]);
+      index.bySectionId.set(sectionId, sectionEntries);
+    }
+  }
+  index.childTextByParentOid = taskChildTextByParentOid(index.entries);
+  for (const reference of index.pendingReferences) {
+    const oid = String(reference?.oid || "").toUpperCase();
+    if (oid) index.usedOids.add(oid);
+  }
+  index.fingerprint = taskReferencePayloadFingerprint(settings);
+  return index;
+}
+
+function persistentTaskReferenceIndex(index = emptyTaskReferenceIndex()) {
+  return {
+    fingerprint: index.fingerprint || "",
+    taskCount: index.taskCount || 0,
+    pendingReferenceCount: index.pendingReferenceCount || 0,
+    oidCount: index.usedOids?.size || 0,
+    usedOids: Array.from(index.usedOids || []).sort(),
+    byOid: Array.from(index.byOid.entries()),
+    bySectionId: Array.from(index.bySectionId.entries()).map(([sectionId, entries]) => [sectionId, entries.map(([id, task]) => ({
+      id,
+      oid: task?.oid || "",
+      path: vaultRelativePath(task?.path || ""),
+      content: task?.content || "",
+      isSubtask: Boolean(task?.isSubtask),
+      parentOid: task?.parentOid || "",
+      section: task?.section || "",
+      cachedAt: task?.cachedAt || ""
+    }))]),
+    paths: Array.from(index.cachedTaskPaths.values()).sort(),
+    pathsForIndentRepair: Array.from(index.pathsForIndentRepair.values()).sort(),
+    byPath: Array.from(index.byPath.entries()).map(([path, entries]) => [path, entries.map(([id, task]) => ({
+      id,
+      oid: task?.oid || "",
+      path,
+      content: task?.content || "",
+      isSubtask: Boolean(task?.isSubtask),
+      parentOid: task?.parentOid || "",
+      section: task?.section || "",
+      sectionId: task?.sectionId || "",
+      projectId: task?.projectId || "",
+      projectName: task?.projectName || "",
+      cachedAt: task?.cachedAt || ""
+    }))])
+  };
+}
+
+function hydrateTaskReferenceIndex(payload = {}, settings = DEFAULT_SETTINGS) {
+  const index = emptyTaskReferenceIndex();
+  index.fingerprint = payload.fingerprint || "";
+  index.taskCount = payload.taskCount || 0;
+  index.pendingReferenceCount = payload.pendingReferenceCount || 0;
+  const compactById = compactTaskReferencesById(payload, settings);
+  index.entries = taskReferenceEntriesForHydration(settings, compactById);
+  index.pendingReferences = Object.values(settings.pendingTaskReferences || {});
+  index.byId = new Map(index.entries.map(([id, task]) => [String(id), task]));
+  index.byOid = compactOidMap(payload);
+  index.cachedTaskPaths = new Set((payload.paths || []).map((path) => vaultRelativePath(path)).filter(Boolean));
+  index.pathsForIndentRepair = new Set((payload.pathsForIndentRepair || []).map((path) => vaultRelativePath(path)).filter(Boolean));
+  index.usedOids = compactUsedOidSet(payload, index.pendingReferences);
+  index.byPath = compactGroupedReferenceMap(payload.byPath, settings);
+  if (!index.byPath.size && index.entries.length) populatePathReferenceIndexes(index);
+  index.bySectionId = compactGroupedReferenceMap(payload.bySectionId, settings, { useGroupPath: false });
+  if (!index.bySectionId.size && index.entries.length) populateSectionReferenceIndex(index);
+  for (const oid of index.byOid.keys()) index.usedOids.add(oid);
+  index.childTextByParentOid = taskChildTextByParentOid(index.entries);
+  return index;
+}
+
+function compactTaskReferencesById(payload = {}, settings = DEFAULT_SETTINGS) {
+  const compactById = new Map();
+  for (const group of [payload.byPath || [], payload.bySectionId || []]) {
+    for (const [, entries] of group) {
+      for (const entry of entries || []) {
+        const id = String(entry?.id || "");
+        if (id && !compactById.has(id)) compactById.set(id, hydrateCompactTaskReference(entry, settings));
+      }
+    }
+  }
+  return compactById;
+}
+
+function taskReferenceEntriesForHydration(settings = DEFAULT_SETTINGS, compactById = new Map()) {
+  const entries = Object.entries(settings.taskCache || {});
+  return entries.length ? entries : Array.from(compactById.entries());
+}
+
+function compactOidMap(payload = {}) {
+  return new Map((payload.byOid || [])
+    .map(([oid, id]) => [String(oid || "").toUpperCase(), String(id || "")])
+    .filter(([oid, id]) => oid && id));
+}
+
+function compactUsedOidSet(payload = {}, pendingReferences = []) {
+  const used = new Set((payload.usedOids || []).map((oid) => String(oid || "").toUpperCase()).filter(Boolean));
+  for (const reference of pendingReferences) {
+    const oid = String(reference?.oid || "").toUpperCase();
+    if (oid) used.add(oid);
+  }
+  return used;
+}
+
+function compactGroupedReferenceMap(groups = [], settings = DEFAULT_SETTINGS, options = {}) {
+  const useGroupPath = options.useGroupPath !== false;
+  return new Map((groups || []).map(([groupKey, entries]) => {
+    const key = useGroupPath ? vaultRelativePath(groupKey) : String(groupKey || "");
+    return [key, (entries || [])
+      .map((entry) => [String(entry.id || ""), hydrateCompactTaskReference(entry, settings)])
+      .filter(([id]) => id)];
+  }).filter(([key]) => key));
+}
+
+function populatePathReferenceIndexes(index) {
+  for (const [id, task] of index.entries) {
+    const path = vaultRelativePath(task?.path || "");
+    if (!path) continue;
+    const pathEntries = index.byPath.get(path) || [];
+    pathEntries.push([String(id), task]);
+    index.byPath.set(path, pathEntries);
+    index.cachedTaskPaths.add(path);
+    if (task?.oid || task?.isSubtask || task?.parentOid || task?.parentId) index.pathsForIndentRepair.add(path);
+  }
+}
+
+function populateSectionReferenceIndex(index) {
+  for (const [id, task] of index.entries) {
+    const sectionId = String(task?.sectionId || "");
+    if (!sectionId) continue;
+    const sectionEntries = index.bySectionId.get(sectionId) || [];
+    sectionEntries.push([String(id), task]);
+    index.bySectionId.set(sectionId, sectionEntries);
+  }
+}
+
+function hydrateCompactTaskReference(entry = {}, settings = DEFAULT_SETTINGS) {
+  const cached = settings.taskCache?.[String(entry.id || "")];
+  if (cached) return cached;
+  return {
+    oid: entry.oid || "",
+    path: vaultRelativePath(entry.path || ""),
+    content: entry.content || "",
+    isSubtask: Boolean(entry.isSubtask),
+    parentOid: entry.parentOid || "",
+    section: entry.section || "",
+    sectionId: entry.sectionId || "",
+    projectId: entry.projectId || "",
+    projectName: entry.projectName || "",
+    cachedAt: entry.cachedAt || ""
+  };
+}
+
+function dedupeTaskReferenceState(settings = DEFAULT_SETTINGS) {
+  let changed = false;
+  const nextCache = {};
+  const seenDuplicateOids = new Map();
+  for (const [id, task] of Object.entries(settings.taskCache || {})) {
+    if (!task || typeof task !== "object") {
+      changed = true;
+      continue;
+    }
+    const normalized = Object.assign({}, task, {
+      labels: uniqueValues((task.labels || []).map(cleanLabel).filter(Boolean)),
+      noteRefs: mergeNoteReferences([], task.noteRefs || [])
+    });
+    const oid = String(normalized.oid || "").toUpperCase();
+    const duplicateId = oid ? seenDuplicateOids.get(oid) : "";
+    if (duplicateId) {
+      const existing = nextCache[duplicateId];
+      if (existing && taskReferenceDuplicateKey(existing) === taskReferenceDuplicateKey(normalized)) {
+        nextCache[duplicateId] = mergeReferenceCacheEntry(existing, normalized);
+        changed = true;
+        continue;
+      }
+    }
+    if (oid) seenDuplicateOids.set(oid, id);
+    if (JSON.stringify(normalized) !== JSON.stringify(task)) changed = true;
+    nextCache[id] = normalized;
+  }
+  const nextPending = {};
+  for (const reference of Object.values(settings.pendingTaskReferences || {})) {
+    if (!reference?.oid) {
+      changed = true;
+      continue;
+    }
+    const normalized = Object.assign({}, reference, {
+      labels: reference.labels ? uniqueValues((reference.labels || []).map(cleanLabel).filter(Boolean)) : reference.labels
+    });
+    const key = pendingTaskOidKey(normalized.path || reference.path || "", normalized.oid);
+    if (nextPending[key]) {
+      nextPending[key] = Object.assign({}, nextPending[key], normalized);
+      changed = true;
+    } else nextPending[key] = normalized;
+  }
+  if (JSON.stringify(nextCache) !== JSON.stringify(settings.taskCache || {})) changed = true;
+  if (JSON.stringify(nextPending) !== JSON.stringify(settings.pendingTaskReferences || {})) changed = true;
+  settings.taskCache = nextCache;
+  settings.pendingTaskReferences = nextPending;
+  settings.pendingTaskDescriptions = settings.pendingTaskDescriptions || {};
+  return changed;
+}
+
+function taskReferenceDuplicateKey(task) {
+  return [
+    vaultRelativePath(task?.path || ""),
+    String(task?.lineNumber ?? ""),
+    singleLine(task?.content || "").toLowerCase()
+  ].join("::");
+}
+
 function referenceRows(settings) {
   const rows = [];
   const seenOids = new Set();
@@ -5897,12 +6300,20 @@ function oidForTodoistId(settings, todoistId) {
 }
 
 function generateUniqueOid(settings) {
-  const used = new Set(Object.values(settings?.taskCache || {}).map((task) => String(task.oid || "").toUpperCase()).filter(Boolean));
+  const runtimeUsed = settings?.__taskReferenceUsedOids;
+  const used = runtimeUsed && typeof runtimeUsed.has === "function" && typeof runtimeUsed.add === "function"
+    ? settings.__taskReferenceUsedOids
+    : new Set(Object.values(settings?.taskCache || {}).map((task) => String(task.oid || "").toUpperCase()).filter(Boolean));
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const oid = Math.random().toString(36).replace(/[^a-z0-9]/gi, "").slice(2, 7).toUpperCase().padEnd(5, "0");
-    if (!used.has(oid)) return oid;
+    if (!used.has(oid)) {
+      used.add(oid);
+      return oid;
+    }
   }
-  return uuid().replace(/[^a-z0-9]/gi, "").slice(0, 5).toUpperCase();
+  const fallback = uuid().replace(/[^a-z0-9]/gi, "").slice(0, 5).toUpperCase();
+  used.add(fallback);
+  return fallback;
 }
 
 function stripBrokenTodoistLink(line) {

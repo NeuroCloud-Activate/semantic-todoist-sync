@@ -22,10 +22,11 @@ const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
 const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
-const SEMANTIC_INDEX_WARMUP_DELAY_MS = 10000;
-const SEMANTIC_INDEX_WARMUP_BATCH_SIZE = 8;
-const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 50;
+const SEMANTIC_INDEX_WARMUP_DELAY_MS = 30000;
+const SEMANTIC_INDEX_WARMUP_BATCH_SIZE = 4;
+const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
+const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
@@ -190,27 +191,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.queryEmbeddingCache = new Map();
     this.semanticChunkTermCache = new Map();
     this.semanticIndexPathMeta = new Map();
+    this.semanticIndexKnownShardFiles = [];
+    this.semanticIndexStorageFingerprint = "";
     this.semanticIndexWarmupInProgress = false;
+    this.semanticIndexWarmupFingerprint = "";
+    this.semanticIndexWarmupPendingFingerprint = "";
     this.taskReferenceIndex = emptyTaskReferenceIndex();
     this.taskReferenceStateRevision = 0;
     this.taskReferenceIndexRevision = -1;
     this.taskReferenceSnapshotFingerprint = "";
     this.taskReferenceSnapshotDirty = true;
     this.aiActivity = "";
-    await this.loadTaskReferenceSnapshot();
-    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
-    await this.migrateSettings();
-    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
-    await this.ensureCompatibleEmbeddingForChatModel();
-    await this.loadSemanticIndex();
-    this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
-    this.queueSemanticIndexWarmup();
-    await this.ensurePromptTemplateFolder(false);
     this.pendingIndexPaths = new Set();
     this.syncInProgress = false;
     this.emailProcessingInProgress = false;
     this.semanticIndexInProgress = false;
     this.internalNoteWriteUntil = new Map();
+    await this.loadTaskReferenceSnapshot();
+    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
+    await this.migrateSettings();
+    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
+    const compatibleIndexLoaded = await this.ensureCompatibleEmbeddingForChatModel();
+    if (!compatibleIndexLoaded) await this.loadSemanticIndex();
+    this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
+    this.queueSemanticIndexWarmup();
     const activeMarkdown = this.app.workspace.getActiveViewOfType(MarkdownView);
     this.lastActiveMarkdownLeaf = activeMarkdown?.leaf || null;
     this.addSettingTab(new SemanticTodoistSettingTab(this.app, this));
@@ -246,6 +250,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
 
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
+    this.registerInterval(window.setTimeout(() => this.ensurePromptTemplateFolder(false), STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.repairCachedSubtaskIndentation(false), STARTUP_SUBTASK_REPAIR_DELAY_MS));
   }
@@ -285,17 +290,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async loadTaskReferenceSnapshot() {
-    let persistedIndex = null;
-    try {
-      const rawIndex = await this.app.vault.adapter.read(`${this.manifest.dir}/${TASK_REFERENCE_INDEX_FILE}`);
-      const parsedIndex = JSON.parse(rawIndex || "{}");
-      persistedIndex = parsedIndex.index || parsedIndex;
-    } catch {
-      persistedIndex = null;
-    }
-    try {
-      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${TASK_REFERENCE_SNAPSHOT_FILE}`);
-      const snapshot = JSON.parse(raw || "{}");
+    const readJsonFile = async (fileName) => {
+      try {
+        const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${fileName}`);
+        return JSON.parse(raw || "{}");
+      } catch {
+        return null;
+      }
+    };
+    const [parsedIndex, snapshot] = await Promise.all([
+      readJsonFile(TASK_REFERENCE_INDEX_FILE),
+      readJsonFile(TASK_REFERENCE_SNAPSHOT_FILE)
+    ]);
+    const persistedIndex = parsedIndex ? parsedIndex.index || parsedIndex : null;
+    if (snapshot) {
       const currentCount = Object.keys(this.settings.taskCache || {}).length;
       const snapshotCount = Object.keys(snapshot.taskCache || {}).length;
       if (snapshotCount && snapshotCount >= currentCount) {
@@ -311,14 +319,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       this.taskReferenceSnapshotFingerprint = snapshot.meta?.fingerprint || compactIndex?.fingerprint || taskReferencePayloadFingerprint(this.settings);
       this.taskReferenceSnapshotDirty = false;
-    } catch {
-      if (persistedIndex) {
-        this.taskReferenceIndex = hydrateTaskReferenceIndex(persistedIndex, this.settings);
-        this.taskReferenceIndexRevision = this.taskReferenceStateRevision;
-      }
-      this.taskReferenceSnapshotFingerprint = taskReferencePayloadFingerprint(this.settings);
-      this.taskReferenceSnapshotDirty = Object.keys(this.settings.taskCache || {}).length > 0 || Object.keys(this.settings.pendingTaskReferences || {}).length > 0;
+      return;
     }
+    if (persistedIndex) {
+      this.taskReferenceIndex = hydrateTaskReferenceIndex(persistedIndex, this.settings);
+      this.taskReferenceIndexRevision = this.taskReferenceStateRevision;
+    }
+    this.taskReferenceSnapshotFingerprint = taskReferencePayloadFingerprint(this.settings);
+    this.taskReferenceSnapshotDirty = Object.keys(this.settings.taskCache || {}).length > 0 || Object.keys(this.settings.pendingTaskReferences || {}).length > 0;
   }
 
   refreshTaskReferenceIndex() {
@@ -551,42 +559,52 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const indexFile = this.semanticIndexFileName();
     this.semanticIndexStats = { bytes: 0, path: indexFile };
     let shouldRewriteShardedIndex = false;
-    try {
-      const loaded = await this.readSemanticIndexFile(indexFile);
+    let settingsChanged = false;
+    const applyLoaded = (loaded, file, extraMeta = {}) => {
       this.semanticIndexStats = loaded.stats;
+      this.semanticIndexKnownShardFiles = loaded.shardFiles || [];
+      this.semanticIndexStorageFingerprint = loaded.storageFingerprint || "";
       const parsed = loaded.parsed || {};
       this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
-      this.settings.semanticIndexMeta = Object.assign({}, parsed.meta || {}, { chunks: this.semanticIndex.length, file: indexFile });
+      const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, { chunks: this.semanticIndex.length, file });
+      if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
+      this.settings.semanticIndexMeta = nextMeta;
       shouldRewriteShardedIndex = !loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && this.semanticIndex.length;
+    };
+    try {
+      const loaded = await this.readSemanticIndexFile(indexFile);
+      applyLoaded(loaded, indexFile);
     } catch (error) {
       if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
         try {
           const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
-          this.semanticIndexStats = loaded.stats;
-          const parsed = loaded.parsed || {};
-          this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
-          this.settings.semanticIndexMeta = Object.assign({}, parsed.meta || {}, { chunks: this.semanticIndex.length, file: SEMANTIC_INDEX_FILE, legacy: true });
-          shouldRewriteShardedIndex = !loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && this.semanticIndex.length;
+          applyLoaded(loaded, SEMANTIC_INDEX_FILE, { legacy: true });
         } catch {}
       }
       if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
         this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app);
         delete this.settings.semanticIndex;
+        settingsChanged = true;
         await this.saveSemanticIndex();
       }
     }
     if (!this.semanticIndex.length) {
-      this.settings.semanticIndexMeta = {
+      const nextMeta = {
         model: this.settings.embeddingModel,
         provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
         file: indexFile,
         chunks: 0
       };
+      if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
+      this.settings.semanticIndexMeta = nextMeta;
     }
-    if (Array.isArray(this.settings.semanticIndex)) delete this.settings.semanticIndex;
+    if (Array.isArray(this.settings.semanticIndex)) {
+      delete this.settings.semanticIndex;
+      settingsChanged = true;
+    }
     if (shouldRewriteShardedIndex) await this.saveSemanticIndex();
     this.refreshSemanticIndexPathMeta();
-    await this.saveSettings();
+    if (settingsChanged || shouldRewriteShardedIndex) await this.saveSettings();
   }
 
   async readSemanticIndexFile(indexFile) {
@@ -596,26 +614,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const chunks = [];
       let totalBytes = utf8ByteLength(raw);
       let largestBytes = totalBytes;
-      for (const shard of parsed.shards) {
-        const shardFile = shard.file || shard.path || "";
-        if (!shardFile) continue;
+      const shardFiles = (parsed.shards || []).map((shard) => shard.file || shard.path || "").filter(Boolean);
+      const shardReads = [];
+      await asyncPool(shardFiles, 3, async (shardFile, index) => {
         const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
         const shardBytes = utf8ByteLength(shardRaw);
+        shardReads[index] = { file: shardFile, hash: shortHash(shardRaw), bytes: shardBytes, parsed: JSON.parse(shardRaw) };
+      });
+      for (const shard of shardReads) {
+        const shardFile = shard.file || shard.path || "";
+        if (!shardFile) continue;
+        const shardBytes = shard.bytes || 0;
         totalBytes += shardBytes;
         largestBytes = Math.max(largestBytes, shardBytes);
-        const shardParsed = JSON.parse(shardRaw);
-        chunks.push(...(shardParsed.chunks || []));
+        chunks.push(...(shard.parsed?.chunks || []));
       }
       return {
         parsed,
         chunks,
-        stats: { bytes: largestBytes, totalBytes, path: indexFile, files: parsed.shards.length + 1, shards: parsed.shards.length }
+        shardFiles,
+        storageFingerprint: semanticIndexStorageFingerprint(raw, shardReads),
+        stats: { bytes: largestBytes, totalBytes, path: indexFile, files: shardFiles.length + 1, shards: shardFiles.length }
       };
     }
     const bytes = utf8ByteLength(raw);
     return {
       parsed,
       chunks: parsed.chunks || [],
+      shardFiles: [],
+      storageFingerprint: semanticIndexStorageFingerprint(raw, []),
       stats: { bytes, totalBytes: bytes, path: indexFile, files: 1, shards: 0 }
     };
   }
@@ -645,18 +672,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }))
     };
     const manifestBody = JSON.stringify(manifest);
-    await this.removeSemanticIndexShardFiles(indexFile, shards.map((shard) => shard.file));
-    for (const shard of shards) await this.app.vault.adapter.write(`${this.manifest.dir}/${shard.file}`, shard.body);
-    await this.app.vault.adapter.write(`${this.manifest.dir}/${indexFile}`, manifestBody);
+    const shardFiles = shards.map((shard) => shard.file);
+    const storageFingerprint = semanticIndexStorageFingerprint(manifestBody, shards);
     const manifestBytes = utf8ByteLength(manifestBody);
     const totalBytes = manifestBytes + shardBytes;
-    this.semanticIndexStats = {
+    const stats = {
       bytes: Math.max(manifestBytes, ...shards.map((shard) => shard.bytes)),
       totalBytes,
       path: indexFile,
       files: shards.length + 1,
       shards: shards.length
     };
+    if (storageFingerprint === this.semanticIndexStorageFingerprint) {
+      this.semanticIndexStats = stats;
+      this.semanticIndexKnownShardFiles = shardFiles;
+      if (!this.semanticIndexPathMeta?.size && (this.semanticIndex || []).some((chunk) => chunk.path)) this.refreshSemanticIndexPathMeta();
+      return;
+    }
+    await this.removeSemanticIndexShardFiles(indexFile, shardFiles, this.semanticIndexKnownShardFiles);
+    await asyncPool(shards, 3, async (shard) => {
+      await this.app.vault.adapter.write(`${this.manifest.dir}/${shard.file}`, shard.body);
+    });
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${indexFile}`, manifestBody);
+    this.semanticIndexStats = stats;
+    this.semanticIndexKnownShardFiles = shardFiles;
+    this.semanticIndexStorageFingerprint = storageFingerprint;
     this.refreshSemanticIndexPathMeta();
   }
 
@@ -675,6 +715,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   semanticIndexFileName(model = this.settings.embeddingModel) {
     return usesGeminiEmbeddingModel(model) ? GEMINI_SEMANTIC_INDEX_FILE : OPENAI_SEMANTIC_INDEX_FILE;
+  }
+
+  semanticIndexWarmupKey() {
+    return this.semanticIndexStorageFingerprint || shortHash(JSON.stringify({
+      meta: this.settings.semanticIndexMeta || {},
+      chunks: (this.semanticIndex || []).length
+    }));
   }
 
   async purgeSemanticIndex(showNotice = true) {
@@ -706,15 +753,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const parsed = JSON.parse(raw);
       manifestShards.push(...(parsed.shards || []).map((shard) => shard.file || shard.path || "").filter(Boolean));
     } catch {}
+    if (manifestShards.length) await this.removeSemanticIndexShardFiles(indexFile, [], manifestShards);
     await this.removeSemanticIndexShardFiles(indexFile, []);
-    for (const shardFile of manifestShards) {
-      try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${shardFile}`); } catch {}
-    }
     try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${indexFile}`); } catch {}
   }
 
-  async removeSemanticIndexShardFiles(indexFile, keepFiles = []) {
+  async removeSemanticIndexShardFiles(indexFile, keepFiles = [], candidateFiles = null) {
     const keep = new Set(keepFiles || []);
+    const removeCandidates = Array.isArray(candidateFiles) ? uniqueValues(candidateFiles) : null;
+    if (removeCandidates) {
+      await asyncPool(removeCandidates, 4, async (candidate) => {
+        const name = String(candidate || "").split("/").pop() || "";
+        if (!isSemanticIndexShardFile(indexFile, name) || keep.has(name)) return;
+        const path = String(candidate || "").includes("/") ? candidate : `${this.manifest.dir}/${name}`;
+        try { await this.app.vault.adapter.remove(path); } catch {}
+      });
+      return;
+    }
     try {
       const listed = await this.app.vault.adapter.list(this.manifest.dir);
       for (const path of listed?.files || []) {
@@ -738,7 +793,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.queryEmbeddingCache?.clear?.();
       await this.loadSemanticIndex();
       await this.saveSettings();
+      return true;
     }
+    return false;
   }
 
   async setChatModel(value) {
@@ -800,12 +857,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   queueSemanticIndexWarmup() {
     window.clearTimeout(this.semanticIndexWarmupTimer);
     if (!(this.semanticIndex || []).length) return;
+    const warmupKey = this.semanticIndexWarmupKey();
+    if (warmupKey && this.semanticIndexWarmupFingerprint === warmupKey) return;
+    this.semanticIndexWarmupPendingFingerprint = warmupKey;
     this.semanticIndexWarmupTimer = window.setTimeout(() => this.warmSemanticIndexCaches(), SEMANTIC_INDEX_WARMUP_DELAY_MS);
   }
 
   async warmSemanticIndexCaches() {
     if (this.semanticIndexWarmupInProgress || !(this.semanticIndex || []).length) return;
     this.semanticIndexWarmupInProgress = true;
+    const warmupKey = this.semanticIndexWarmupPendingFingerprint || this.semanticIndexWarmupKey();
     this.refreshSidebarStatus();
     try {
       const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
@@ -819,6 +880,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await idlePause(SEMANTIC_INDEX_WARMUP_PAUSE_MS);
       }
     } finally {
+      if (warmupKey && warmupKey === this.semanticIndexWarmupKey()) this.semanticIndexWarmupFingerprint = warmupKey;
+      this.semanticIndexWarmupPendingFingerprint = "";
       this.semanticIndexWarmupInProgress = false;
       this.semanticIndexWarmupTimer = null;
       this.refreshSidebarStatus();
@@ -2011,13 +2074,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.requireEmailWorkerAccess();
       if (options?.automatic) {
         this.settings.lastEmailPollAt = deviceTimestamp();
-        await this.saveSettings();
+        this.queueSettingsSave();
       }
       const pending = await this.workerJson("/pending?limit=25", "GET");
       if (!options?.automatic) this.settings.lastEmailPollAt = deviceTimestamp();
       const emails = pending.emails || [];
       if (!emails.length) {
-        await this.saveSettings();
+        if (options?.automatic) this.queueSettingsSave();
+        else await this.saveSettings();
         this.logLocal("Email poll complete", { pending: 0 });
         if (showNotice) new Notice("No pending email tasks.");
         return;
@@ -7763,6 +7827,25 @@ function uniqueValues(values) {
     seen.add(value);
     return true;
   });
+}
+function shallowObjectEqual(a = {}, b = {}) {
+  const aKeys = Object.keys(a || {});
+  const bKeys = Object.keys(b || {});
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+}
+function semanticIndexStorageFingerprint(manifestBody, shards = []) {
+  const parts = [`manifest:${utf8ByteLength(manifestBody)}:${shortHash(manifestBody)}`];
+  for (const shard of shards || []) {
+    const body = shard.body || "";
+    const bytes = shard.bytes || utf8ByteLength(body);
+    const hash = shard.hash || shortHash(body);
+    parts.push(`${shard.file || ""}:${bytes}:${hash}`);
+  }
+  return shortHash(parts.join("|"));
 }
 function semanticIndexShardBodies(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES) {
   const shards = [];

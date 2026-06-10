@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.17
+
+- Reduced semantic-index startup and save overhead by tracking loaded shard files and cleaning stale shards from the known manifest instead of listing the plugin directory on each save.
+- Loaded semantic index shards with bounded concurrency and skipped redundant semantic-index writes when the generated manifest and shard contents have not changed.
+- Reduced automatic Email-To-Todoist poll IO by queueing the poll timestamp save instead of forcing an immediate settings write for empty background checks.
+- Reduced startup blocking IO by loading task-reference snapshot files in parallel and deferring prompt-template folder seeding until after plugin startup.
+- Reduced semantic-index warmup CPU and memory pressure by delaying lighter cache warmups, avoiding duplicate warmups for unchanged index files, avoiding duplicate startup index loads after embedding migrations, and dropping raw shard bodies after parsing.
+
 ## 0.5.16
 
 - Reduced sync/index IO by debouncing local activity-log settings writes instead of saving plugin data on every log event.

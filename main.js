@@ -20,6 +20,11 @@ const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
 const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
+const SEMANTIC_INDEX_WARMUP_DELAY_MS = 10000;
+const SEMANTIC_INDEX_WARMUP_BATCH_SIZE = 8;
+const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 50;
+const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
+const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
@@ -230,8 +235,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
 
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
-    window.setTimeout(() => this.backgroundTick(), 5000);
-    window.setTimeout(() => this.repairCachedSubtaskIndentation(false), 9000);
+    this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
+    this.registerInterval(window.setTimeout(() => this.repairCachedSubtaskIndentation(false), STARTUP_SUBTASK_REPAIR_DELAY_MS));
   }
 
   async onunload() {
@@ -656,7 +661,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   queueSemanticIndexWarmup() {
     window.clearTimeout(this.semanticIndexWarmupTimer);
     if (!(this.semanticIndex || []).length) return;
-    this.semanticIndexWarmupTimer = window.setTimeout(() => this.warmSemanticIndexCaches(), 1500);
+    this.semanticIndexWarmupTimer = window.setTimeout(() => this.warmSemanticIndexCaches(), SEMANTIC_INDEX_WARMUP_DELAY_MS);
   }
 
   async warmSemanticIndexCaches() {
@@ -665,9 +670,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.refreshSidebarStatus();
     try {
       const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
-      for (let i = 0; i < chunks.length; i += 25) {
-        for (const chunk of chunks.slice(i, i + 25)) this.semanticChunkTerms(chunk);
-        await delay(0);
+      for (let i = 0; i < chunks.length; i += SEMANTIC_INDEX_WARMUP_BATCH_SIZE) {
+        if (this.aiActivity || this.semanticIndexInProgress || this.syncInProgress || this.emailProcessingInProgress) {
+          await delay(250);
+          i -= SEMANTIC_INDEX_WARMUP_BATCH_SIZE;
+          continue;
+        }
+        for (const chunk of chunks.slice(i, i + SEMANTIC_INDEX_WARMUP_BATCH_SIZE)) this.semanticChunkTerms(chunk);
+        await idlePause(SEMANTIC_INDEX_WARMUP_PAUSE_MS);
       }
     } finally {
       this.semanticIndexWarmupInProgress = false;
@@ -1619,14 +1629,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Follow the Main task requirements for every top-level task and the Subtask requirements for every subtask.",
         "Use the active source content, ranked vault context, and existing local Todoist reference context for every task-generation decision, including main tasks and subtasks.",
         "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
+        "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
         "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
         source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, use only explicit action, follow-up, review, waiting-on, or decision requests from the email thread.",
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
         "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
         "Do not write task descriptions in this step. Descriptions are generated in a separate pass after local OIDs are assigned.",
-        "Use YYYY-MM-DD dates.",
-        `Today is ${today()}. Avoid weekends unless the source explicitly requires weekend work. Respect any local holiday or time-off rules described by the user instructions.`
+        "For date fields, follow the Dates and Deadlines instructions exactly. Use null for due_date or deadline_date when the source and settings do not support that field.",
+        "due_date and deadline_date are separate fields. Do not copy one into the other unless the Dates and Deadlines instructions explicitly say to do that.",
+        `Today is ${today()}. Use this only to interpret relative dates when the Dates and Deadlines instructions allow a date.`
       ].join(" "),
       user: [
         "Task generation request:",
@@ -1634,7 +1646,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "",
         `Source type: ${source.type}`,
         `Source title: ${source.title}`,
-        `Required section name: ${source.sectionName || ""}`,
+        `Fallback section name if the Section title instructions cannot be applied: ${source.sectionName || ""}`,
         "",
         "Source content:",
         sourceSummary,
@@ -1649,6 +1661,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const parsed = JSON.parse(json);
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
+    parsed.sectionName = cleanGeneratedSectionName(parsed.section_name || parsed.sectionName || source.sectionName);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
     parsed.semanticContext = context;
@@ -1849,7 +1862,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const subject = decodeHeader(email.subject || parsed.subject || "(no subject)");
         const cloudflareReceivedAt = email.receivedAt || "";
         const receivedAt = originalEmailReceivedAt(parsed, cloudflareReceivedAt);
-        const sectionName = makeSectionName(receivedAt, subject);
+        const fallbackSectionName = makeSectionName(receivedAt, subject);
         const emailSourceText = [
           `From: ${email.from || parsed.from || ""}`,
           `To: ${email.to || parsed.to || ""}`,
@@ -1863,9 +1876,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           type: "email",
           title: subject,
           text: emailSourceText,
-          sectionName,
+          sectionName: fallbackSectionName,
           maxChars: this.settings.maxEmailChars
         });
+        const sectionName = plan.sectionName || fallbackSectionName;
         const tasks = plan.tasks || [];
         enforceGeneratedTaskLimits(tasks, this.settings);
         this.setSidebarStatus("Creating local email task OIDs...");
@@ -2076,16 +2090,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const shouldInsert = options.insertIntoNote ?? template.insertResponse ?? true;
       const shouldSyncAfterInsert = options.syncAfterInsert ?? template.syncAfterInsert ?? false;
       if (shouldInsert && shouldSyncAfterInsert) this.requireTodoistAccess();
-      const sectionName = makeNoteSectionName(active.title, active.text, active.path);
+      const fallbackSectionName = makeNoteSectionName(active.title, active.text, active.path);
       const plan = await this.createTaskPlan({
         type: "note",
         title: active.title,
         path: active.path,
         text: active.selection || active.text,
-        sectionName,
+        sectionName: fallbackSectionName,
         maxChars: this.settings.maxNoteChars,
         templateInstructions: template.prompt
       });
+      const sectionName = plan.sectionName || fallbackSectionName;
       const tasks = plan.tasks || [];
       if (!tasks.length) return { tasks: [], markdown: "" };
       this.setSidebarStatus("Creating local task OIDs...");
@@ -2142,44 +2157,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async runPromptTemplate(template, options = {}) {
-    if (isTaskGenerationTemplate(template)) {
-      return this.generateTaskListFromTemplate(template, options);
-    }
     if (template?.createTasks !== false) {
-      return this.runPromptTemplateWithTaskGeneration(template, options);
+      return this.generateTaskListFromTemplate(template, options);
     }
     return this.runPromptResponseTemplate(template, options);
   }
 
   async runPromptTemplateWithTaskGeneration(template, options = {}) {
-    const active = options.active || await this.getActiveMarkdownContext();
-    if (!active.path) throw new Error("Open a markdown note first.");
-    const shouldInsert = options.insertIntoNote ?? template.insertResponse ?? true;
-    const shouldSyncAfterInsert = options.syncAfterInsert ?? template.syncAfterInsert ?? false;
-    const responseResult = await this.runPromptResponseTemplate(template, Object.assign({}, options, {
-      active,
-      insertIntoNote: shouldInsert,
-      showNotice: false
-    }));
-    const taskTemplate = await this.resolveTaskGenerationTemplate(template);
-    this.setSidebarStatus(`Creating tasks with ${taskTemplate.name || "Prompts"}...`);
-    const taskResult = await this.generateTaskListFromTemplate(taskTemplate, Object.assign({}, options, {
-      active,
-      insertIntoNote: shouldInsert,
-      syncAfterInsert: shouldSyncAfterInsert,
-      showNotice: false
-    }));
-    if (options.showNotice) {
-      const action = shouldInsert ? (shouldSyncAfterInsert ? "inserted and synced" : "inserted") : "shown in chat only";
-      new Notice(`Ran "${template.name || "Prompt"}" and generated ${taskResult.tasks.length} main task${taskResult.tasks.length === 1 ? "" : "s"} with "${taskTemplate.name || "Prompts"}"; ${action}.`);
-    }
-    return Object.assign({}, responseResult, {
-      tasks: taskResult.tasks || [],
-      taskMarkdown: taskResult.markdown || "",
-      taskContextNotes: taskResult.contextNotes || [],
-      taskSemanticContext: taskResult.semanticContext || [],
-      taskTemplate
-    });
+    return this.generateTaskListFromTemplate(template, options);
   }
 
   async runPromptResponseTemplate(template, options = {}) {
@@ -4376,7 +4361,7 @@ const SETTING_DESCRIPTIONS = {
   maxChatContextChunks: "Maximum number of semantic search results sent to the AI for vault Q&A.",
   maxActiveNoteContextChars: "Maximum active-note characters sent to the AI for normal chat. Task creation can use a separate note limit.",
   promptTemplatesFolder: "Markdown files in this folder become reusable AI prompts. Frontmatter can set createTasks, insertResponse, and syncTasks.",
-  taskGenerationPromptTemplate: "Prompt used as the separate Todoist task creation pass when a regular prompt also has createTasks enabled.",
+  taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
   openaiApiKey: "Optional. Required only when you choose an OpenAI chat or embedding model.",
   googleApiKey: "Required for the default Gemini setup. Create this in Google AI Studio and paste it here.",
   chatFallbackModel: "Optional. Choose a same-provider fallback model for temporary overload or rate-limit errors. Leave Automatic to use the next available model from the selected provider.",
@@ -4549,7 +4534,7 @@ function taskGenerationPromptTemplateSetting(containerEl, plugin) {
   const current = plugin.settings.taskGenerationPromptTemplate || DEFAULT_SETTINGS.taskGenerationPromptTemplate;
   new Setting(containerEl)
     .setName("Task generation prompt")
-    .setDesc("Used as the separate Todoist task creation pass when a prompt response template also has createTasks enabled.")
+    .setDesc("Default task-generation prompt used by the Create Todoist tasks command. Prompt templates with createTasks enabled use their own prompt text directly.")
     .addDropdown((dropdown) => {
       dropdown.addOption(current, current);
       dropdown.setValue(current);
@@ -5009,6 +4994,7 @@ function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTask
     type: "object",
     additionalProperties: false,
     properties: {
+      section_name: { type: "string" },
       tasks: {
         type: "array",
         maxItems: mainLimit,
@@ -5020,7 +5006,7 @@ function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTask
         })
       }
     },
-    required: ["tasks"]
+    required: ["section_name", "tasks"]
   };
 }
 
@@ -5415,14 +5401,15 @@ function flattenTaskPlan(tasks) {
 }
 
 function ensureGeneratedTaskMetadata(tasks, sectionName, settings = DEFAULT_SETTINGS) {
-  const fallbackDate = nextBusinessDate(5);
   for (const task of tasks || []) {
     task.section = sectionName;
-    if (!task.deadline_date) task.deadline_date = task.due_date || fallbackDate;
-    if (!task.due_date) task.due_date = task.deadline_date;
     for (const subtask of task.subtasks || []) {
       subtask.section = "";
       subtask.description = "";
+      if (!settings.subtaskIncludeLabels) subtask.labels = [];
+      if (!settings.subtaskIncludePriority) subtask.priority = 1;
+      if (!settings.subtaskIncludeDueDate) subtask.due_date = null;
+      if (!settings.subtaskIncludeDeadline) subtask.deadline_date = null;
     }
   }
 }
@@ -6377,7 +6364,10 @@ function recencyBoost(modifiedAt) {
 }
 
 function labelsAllowedByInstructions(text) {
-  return new Set((String(text || "").match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+  const value = String(text || "");
+  if (/\b(?:do\s+not|don't|never)\s+(?:add|create|use)\s+(?:any\s+)?labels?\b|\bno\s+labels?\b/i.test(value)) return new Set();
+  const labels = new Set((value.match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+  return labels.size ? labels : null;
 }
 
 function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTINGS) {
@@ -6389,10 +6379,13 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "",
     "Main task requirements:",
     `- Actionability: ${taskInstructions.main || "Create only concrete user-owned actions."}`,
-    `- Section title: ${taskInstructions.sectionTitle || "Create one Todoist section for tasks from the same source."}`,
+    `- Section title: Return one section_name for the full generated task group. Follow this setting exactly: ${taskInstructions.sectionTitle || "Create one Todoist section for tasks from the same source."}`,
     `- Labels: ${taskInstructions.tags || "Do not add labels unless explicitly instructed."}`,
     `- Priority: ${taskInstructions.priorities || "Assign priority 1 to 4."}`,
-    `- Dates and deadlines: ${taskInstructions.dates || "Use YYYY-MM-DD dates only when supported by the source."}`,
+    "Dates and deadlines:",
+    `- Follow this setting exactly: ${taskInstructions.dates || "Use YYYY-MM-DD dates only when supported by the source."}`,
+    "- due_date and deadline_date are independent. Do not copy due_date into deadline_date or deadline_date into due_date unless the setting explicitly says to mirror them.",
+    "- Use null for any due_date or deadline_date that is not supported by the source and the setting. If the setting says deadlines require explicit source language, deadline_date must be null unless the source explicitly indicates a deadline.",
     "- Descriptions: leave description empty in this JSON step; descriptions are generated separately.",
     "",
     "Subtask requirements:",
@@ -6400,8 +6393,8 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "- Relationship: every subtask must support its parent main task and must not duplicate the parent task title.",
     `- Labels: ${settings.subtaskIncludeLabels ? `Allowed when useful, but only from the main label rules: ${taskInstructions.tags || "no labels configured"}` : "Disabled. Return an empty labels array for every subtask."}`,
     `- Priority: ${settings.subtaskIncludePriority ? `Allowed. Assign priority 1 to 4 using the same priority rules: ${taskInstructions.priorities || "use task urgency and importance"}` : "Disabled. Return priority 1 for every subtask."}`,
-    `- Due date: ${settings.subtaskIncludeDueDate ? `Allowed when clearly useful and supported by the source: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return due_date null for every subtask."}`,
-    `- Deadline date: ${settings.subtaskIncludeDeadline ? `Allowed when clearly useful and supported by the source: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return deadline_date null for every subtask."}`,
+    `- Due date: ${settings.subtaskIncludeDueDate ? `Allowed only when supported by the source and the Dates and Deadlines setting: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return due_date null for every subtask."}`,
+    `- Deadline date: ${settings.subtaskIncludeDeadline ? `Allowed only when supported by explicit source/deadline context and the Dates and Deadlines setting: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return deadline_date null for every subtask."}`,
     "- Descriptions: subtasks must not have descriptions.",
     "- Section/project: subtasks inherit the parent task location; do not create a separate section concept for subtasks."
   ].join("\n");
@@ -7564,6 +7557,17 @@ function makeNoteSectionName(title, text = "", path = "") {
   return `Notes${datePart}_${topic}`;
 }
 
+function cleanGeneratedSectionName(value) {
+  const text = singleLine(value || "")
+    .replace(/^section(?:\s+name|\s+title)?\s*:\s*/i, "")
+    .replace(/^#+\s*/, "")
+    .replace(/[\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return truncateAtWord(text || "Tasks", 120).replace(/\s+/g, "_");
+}
+
 function extractNoteDate(title, text, path) {
   const source = `${title || ""}\n${path || ""}\n${String(text || "").slice(0, 500)}`;
   const iso = /(?:created:\s*\[?"?|^|\D)(\d{4})-(\d{2})-(\d{2})/im.exec(source);
@@ -7656,4 +7660,14 @@ function elapsedMs(iso) {
 
 function delay(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function idlePause(timeoutMs = 50) {
+  return new Promise((resolve) => {
+    if (typeof window?.requestIdleCallback === "function") {
+      window.requestIdleCallback(() => resolve(), { timeout: Math.max(50, timeoutMs) });
+      return;
+    }
+    window.setTimeout(resolve, timeoutMs);
+  });
 }

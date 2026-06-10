@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.13
+
+- Added a GitHub Actions artifact attestation workflow for the Obsidian release assets `main.js`, `manifest.json`, and `styles.css` on pushes, releases, and manual runs.
+- Added workflow validation that rejects leading-`v` manifest versions and confirms the manifest version is present in `versions.json` before generating attestations.
+
 ## 0.5.12
 
 - Added a separate Todoist task reference snapshot file so normal plugin settings saves no longer rewrite the full local task reference table.

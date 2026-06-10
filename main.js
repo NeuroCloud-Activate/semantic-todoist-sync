@@ -892,6 +892,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   queueNoteSync(path) {
+    if (!this.isSyncableTaskPath(path)) return;
     window.clearTimeout(this.noteSyncTimer);
     this.noteSyncPath = path;
     this.noteSyncTimer = window.setTimeout(() => this.syncFileNotes(path, false), 1200);
@@ -1062,9 +1063,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   getSyncableTaskFiles() {
     const exclude = splitList(this.settings.excludedFolders).map(trimSlashes);
     return this.app.vault.getMarkdownFiles().filter((file) => {
-      if (this.isExcludedPath(file.path, exclude)) return false;
-      return true;
+      return this.isSyncableTaskPath(file.path, exclude);
     });
+  }
+
+  isSyncableTaskPath(path, exclude) {
+    if (isEmailLogPath(path, this.settings)) return true;
+    if (this.isExcludedPath(path, exclude)) return false;
+    return true;
   }
 
   isExcludedPath(path, exclude) {
@@ -1074,7 +1080,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   isIndexablePath(path, include, exclude) {
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
-    if (path.startsWith(`${this.settings.emailLogFolder}/`)) return false;
+    if (isEmailLogPath(path, this.settings)) return false;
     if (includeFolders.length && !includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
     if (this.isExcludedPath(path, excludeFolders)) return false;
     return true;
@@ -3555,10 +3561,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async cacheLoggedTasks(path, tasks, sectionName) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
+    if (!(file instanceof TFile)) return 0;
     const lines = (await this.app.vault.read(file)).split("\n");
     const byId = new Map();
     const byOid = new Map();
+    let cached = 0;
     for (const task of tasks || []) {
       if (task.id) byId.set(task.id, Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task));
       if (task.oid) byOid.set(task.oid, Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task));
@@ -3582,8 +3589,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         due_date: task.due_date || null,
         deadline_date: task.deadline_date || null
       }));
+      cached += 1;
     }
     await this.saveSettings();
+    return cached;
   }
 
   async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks }) {
@@ -3611,9 +3620,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     }
     if (!tasks?.length) lines.push("- No actionable tasks were found.");
+    this.markInternalNoteWrite(path);
     await this.app.vault.create(path, `${lines.join("\n")}\n`);
-    await this.cacheLoggedTasks(path, tasks || [], sectionName);
-    this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, sectionName });
+    const cached = await this.cacheLoggedTasks(path, tasks || [], sectionName);
+    this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, cached, syncable: isEmailLogPath(path, this.settings), sectionName });
   }
 };
 
@@ -4236,7 +4246,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     }));
     settingsHeading(containerEl, "Semantic Index");
     textSetting(containerEl, "Indexed folders", "Comma-separated. Leave blank for whole vault.", this.plugin, "indexedFolders");
-    folderListSetting(containerEl, "Excluded folders", "Folders ignored by search, semantic indexing, and note sync.", this.plugin, "excludedFolders");
+    folderListSetting(containerEl, "Excluded folders", "Folders ignored by search and semantic indexing. Note sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist.", this.plugin, "excludedFolders");
     textSetting(containerEl, "Excluded link domains", "Comma-separated domains omitted from AI task prompts and Todoist descriptions. Subdomains are included. Example: internal.example.com.", this.plugin, "excludedLinkDomains");
     numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
     numberSetting(containerEl, "Index chunk size characters", this.plugin, "semanticIndexMaxChunkChars");
@@ -4505,7 +4515,7 @@ const SETTING_DESCRIPTIONS = {
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
   workerToken: "Required only for Email-To-Todoist. This shared secret authorizes Obsidian to read queued emails from your Worker.",
   indexedFolders: "Optional comma-separated folder list. Leave blank to index the whole vault except excluded folders.",
-  excludedFolders: "Folders ignored by semantic indexing, vault search, and note task sync.",
+  excludedFolders: "Folders ignored by semantic indexing and vault search. Note task sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist.",
   excludedLinkDomains: "Comma-separated web domains omitted from AI prompts and Todoist descriptions.",
   embeddingBatchSize: "How many note chunks are embedded per API batch. Larger values can be faster but heavier.",
   semanticIndexMaxChunkChars: "Approximate size of each note chunk before embedding.",
@@ -7817,6 +7827,11 @@ function obsidianDescription(path) {
 }
 function sourceReference(source, basePath = "") {
   return vaultRelativePath(source?.path || "", basePath);
+}
+function isEmailLogPath(path, settings = DEFAULT_SETTINGS) {
+  const folder = trimSlashes(settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder || "");
+  const notePath = trimSlashes(path || "");
+  return Boolean(folder && (notePath === folder || notePath.startsWith(`${folder}/`)));
 }
 function sectionKey(name) { return singleLine(name).toLowerCase(); }
 

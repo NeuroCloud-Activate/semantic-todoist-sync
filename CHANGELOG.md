@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.14
+
+- Updated the artifact attestation workflow to use `actions/checkout@v6` to avoid the GitHub Actions Node 20 deprecation warning.
+
 ## 0.5.13
 
 - Added a GitHub Actions artifact attestation workflow for the Obsidian release assets `main.js`, `manifest.json`, and `styles.css` on pushes, releases, and manual runs.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.16
+
+- Reduced sync/index IO by debouncing local activity-log settings writes instead of saving plugin data on every log event.
+- Skipped semantic re-embedding when queued file chunks and local Todoist reference chunks are unchanged.
+- Prevented automatic background polling, sync, and reference rebuild from starting while another plugin workflow is already active.
+- Centralized Todoist task field selection so task creation and update payloads follow the same subtask include/exclude settings with less repeated work.
+
 ## 0.5.15
 
 - Fixed Email-To-Todoist task notes so the Email-To-Todoist log folder remains eligible for note sync and local reference rebuilds even when the plugin data folder is excluded from semantic indexing.

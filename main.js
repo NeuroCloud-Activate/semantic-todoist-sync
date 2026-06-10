@@ -251,6 +251,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    await this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings flush failed", error));
     window.clearTimeout(this.taskReferenceSnapshotTimer);
     this.taskReferenceSnapshotTimer = null;
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
@@ -258,8 +259,29 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async saveSettings() {
+    window.clearTimeout(this.settingsSaveTimer);
+    this.settingsSaveTimer = null;
+    this.settingsSaveQueued = false;
     await this.flushTaskReferenceSnapshotIfDirty();
     await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
+  }
+
+  queueSettingsSave(delayMs = 4000) {
+    this.settingsSaveQueued = true;
+    window.clearTimeout(this.settingsSaveTimer);
+    this.settingsSaveTimer = window.setTimeout(() => {
+      this.settingsSaveTimer = null;
+      this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings save failed", error));
+    }, delayMs);
+  }
+
+  async flushQueuedSettingsSave() {
+    if (!this.settingsSaveQueued) return false;
+    window.clearTimeout(this.settingsSaveTimer);
+    this.settingsSaveTimer = null;
+    this.settingsSaveQueued = false;
+    await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
+    return true;
   }
 
   async loadTaskReferenceSnapshot() {
@@ -803,9 +825,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  canStartBackgroundWork() {
+    return !this.aiActivity &&
+      !this.semanticIndexInProgress &&
+      !this.syncInProgress &&
+      !this.emailProcessingInProgress &&
+      !this.referenceRebuildInProgress;
+  }
+
   backgroundTick() {
     const now = Date.now();
-    if (!this.emailProcessingInProgress && this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
+    if (!this.canStartBackgroundWork()) return;
+    if (this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
       this.processPendingEmails(false, { automatic: true });
     }
     if (this.settings.notesAutoSync && this.settings.todoistToken && elapsedMs(this.settings.lastNoteAutoSyncAt) >= Math.max(60, this.settings.syncIntervalSeconds) * 1000) {
@@ -820,7 +851,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   logLocal(message, data = {}) {
     const entry = { at: deviceTimestamp(), message, data: sanitizeLogData(data) };
     this.settings.localLog = [entry, ...(this.settings.localLog || [])].slice(0, 100);
-    this.saveSettings().catch((error) => console.error("Semantic Todoist local log save failed", error));
+    this.queueSettingsSave();
   }
 
   requireApiAccess(requireWorker = false) {
@@ -1108,7 +1139,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexInProgress = true;
     this.setSidebarStatus("Indexing vault changes...");
     try {
-      for (const path of paths) await this.reindexFile(path);
+      let changedFiles = 0;
+      for (const path of paths) {
+        if (await this.reindexFile(path)) changedFiles += 1;
+      }
+      if (!changedFiles) {
+        this.logLocal("Semantic index unchanged", { files: paths.length });
+        return;
+      }
       this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
         rebuiltAt: this.settings.semanticIndexMeta?.rebuiltAt || "",
         updatedAt: deviceTimestamp(),
@@ -1120,7 +1158,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       await this.saveSemanticIndex();
       await this.saveSettings();
-      this.logLocal("Semantic index updated", { files: paths.length, chunks: this.settings.semanticIndexMeta.chunks });
+      this.logLocal("Semantic index updated", { files: changedFiles, checked: paths.length, chunks: this.settings.semanticIndexMeta.chunks });
     } catch (error) {
       console.error(error);
       this.logLocal("Semantic index update failed", { error: error.message || String(error) });
@@ -1131,14 +1169,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async reindexFile(path) {
-    this.removePathFromSemanticIndex(path, false);
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile) || !this.isIndexablePath(path)) return;
+    if (!(file instanceof TFile) || !this.isIndexablePath(path)) return this.removePathFromSemanticIndex(path, false);
     this.requireAiAccess();
     const text = await this.app.vault.cachedRead(file);
     const chunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
       .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0 }));
     chunks.push(...this.semanticTaskReferenceChunks(path));
+    if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return false;
+    await this.removePathFromSemanticIndex(path, false);
     for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
       const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
       const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
@@ -1148,6 +1187,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     this.semanticChunkTermCache?.clear?.();
     this.queueSemanticIndexWarmup();
+    return true;
   }
 
   queueTaskReferenceIndexUpdate(path) {
@@ -1196,11 +1236,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async removePathFromSemanticIndex(path, save = true) {
     const before = (this.semanticIndex || []).length;
     this.semanticIndex = (this.semanticIndex || []).filter((chunk) => chunk.path !== path);
-    if (before !== this.semanticIndex.length) {
+    const changed = before !== this.semanticIndex.length;
+    if (changed) {
       this.semanticChunkTermCache?.clear?.();
       this.queueSemanticIndexWarmup();
     }
-    if (save && before !== this.semanticIndex.length) {
+    if (save && changed) {
       this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
         updatedAt: deviceTimestamp(),
         chunks: this.semanticIndex.length
@@ -1208,6 +1249,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.saveSemanticIndex();
       await this.saveSettings();
     }
+    return changed;
   }
 
   async embedTexts(texts, role = "document") {
@@ -5708,18 +5750,83 @@ function applyRemoteTodoistLocation(parsed, remote) {
   return parsed;
 }
 
+function todoistRemoteIsSubtask(remote = {}, base = {}) {
+  return Boolean(base.isSubtask || remote.parentId || remote.parent_id);
+}
+
+function cleanTodoistLabels(labels = []) {
+  return (labels || []).map(cleanLabel).filter(Boolean);
+}
+
+function sortedTodoistLabels(labels = []) {
+  return cleanTodoistLabels(labels).sort();
+}
+
+function sameStringArray(left = [], right = []) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) if (left[i] !== right[i]) return false;
+  return true;
+}
+
+function subtaskFieldEnabled(task, settings, key) {
+  return !task?.isSubtask || Boolean(settings?.[key]);
+}
+
+function taskLabelsForTodoist(task, settings = DEFAULT_SETTINGS) {
+  if (!subtaskFieldEnabled(task, settings, "subtaskIncludeLabels")) return [];
+  return sortedTodoistLabels(task?.labels || []);
+}
+
+function taskPriorityForTodoist(task, settings = DEFAULT_SETTINGS) {
+  if (!subtaskFieldEnabled(task, settings, "subtaskIncludePriority")) return 1;
+  return normalizePriority(task?.priority);
+}
+
+function taskDueDateForTodoist(task, settings = DEFAULT_SETTINGS) {
+  if (!subtaskFieldEnabled(task, settings, "subtaskIncludeDueDate")) return null;
+  return task?.due_date || null;
+}
+
+function taskDeadlineForTodoist(task, settings = DEFAULT_SETTINGS) {
+  if (!subtaskFieldEnabled(task, settings, "subtaskIncludeDeadline")) return null;
+  return task?.deadline_date || null;
+}
+
+function taskDescriptionForTodoist(task, settings = DEFAULT_SETTINGS) {
+  if (task?.isSubtask || !task?.descriptionShouldSync || !isRichTodoistDescription(task.description)) return "";
+  return formatTodoistDescription(task.description, settings);
+}
+
+function todoistRemoteDueDate(remote = {}, base = {}) {
+  return remote.dueDate || remote.due?.date || base.due_date || null;
+}
+
+function todoistRemoteDeadlineDate(remote = {}, base = {}) {
+  return remote.deadlineDate || remote.deadline?.date || base.deadline_date || null;
+}
+
+function todoistRemoteDescription(remote = {}, base = {}) {
+  return isRichTodoistDescription(remote.description) ? remote.description : base.description || "";
+}
+
+function todoistRemoteCompletion(remote = {}, base = {}) {
+  if (remote.isCompleted != null) return Boolean(remote.isCompleted);
+  return Boolean(remote.is_completed || remote.checked || base.isCompleted);
+}
+
 function todoistTaskToParsedTask(remote, base = {}, settings = DEFAULT_SETTINGS) {
-  const isSubtask = Boolean(base.isSubtask || remote.parentId || remote.parent_id);
+  const isSubtask = todoistRemoteIsSubtask(remote, base);
+  const remoteTask = Object.assign({}, remote, { isSubtask });
   const projectId = String(remote.projectId || remote.project_id || base.projectId || "");
   return Object.assign({}, base, {
     id: String(remote.id || base.id || ""),
     content: remote.content || base.content || "",
-    labels: isSubtask && !settings.subtaskIncludeLabels ? [] : (remote.labels || base.labels || []).map(cleanLabel).filter(Boolean),
-    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(remote.priority || base.priority),
-    due_date: isSubtask && !settings.subtaskIncludeDueDate ? null : (remote.dueDate || remote.due?.date || base.due_date || null),
-    deadline_date: isSubtask && !settings.subtaskIncludeDeadline ? null : (remote.deadlineDate || remote.deadline?.date || base.deadline_date || null),
-    description: isRichTodoistDescription(remote.description) ? remote.description : base.description || "",
-    isCompleted: remote.isCompleted != null ? Boolean(remote.isCompleted) : Boolean(remote.is_completed || remote.checked || base.isCompleted),
+    labels: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeLabels") ? cleanTodoistLabels(remote.labels || base.labels || []) : [],
+    priority: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludePriority") ? normalizePriority(remote.priority || base.priority) : 1,
+    due_date: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeDueDate") ? todoistRemoteDueDate(remote, base) : null,
+    deadline_date: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeDeadline") ? todoistRemoteDeadlineDate(remote, base) : null,
+    description: todoistRemoteDescription(remote, base),
+    isCompleted: todoistRemoteCompletion(remote, base),
     isSubtask,
     parentId: remote.parentId || remote.parent_id || base.parentId || "",
     section: isSubtask ? "" : (remote.section || base.section || ""),
@@ -6087,18 +6194,17 @@ function remoteTaskComparableSignature(remote, parsed, settings = DEFAULT_SETTIN
 function todoistUpdatePayload(task, remote = null, settings = DEFAULT_SETTINGS) {
   const updates = {};
   if (!remote || singleLine(remote.content || "") !== singleLine(task.content || "")) updates.content = task.content;
-  const isSubtask = Boolean(task.isSubtask);
-  const localLabels = (isSubtask && !settings.subtaskIncludeLabels ? [] : (task.labels || [])).map(cleanLabel).filter(Boolean).sort();
-  const remoteLabels = (remote?.labels || []).map(cleanLabel).filter(Boolean).sort();
-  if (!remote || JSON.stringify(localLabels) !== JSON.stringify(remoteLabels)) updates.labels = localLabels;
-  const localPriority = isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority);
+  const localLabels = taskLabelsForTodoist(task, settings);
+  const remoteLabels = sortedTodoistLabels(remote?.labels || []);
+  if (!remote || !sameStringArray(localLabels, remoteLabels)) updates.labels = localLabels;
+  const localPriority = taskPriorityForTodoist(task, settings);
   if (!remote || normalizePriority(remote.priority) !== localPriority) updates.priority = localPriority;
-  const localDescription = !task.isSubtask && task.descriptionShouldSync && isRichTodoistDescription(task.description)
-    ? formatTodoistDescription(task.description, settings)
-    : "";
+  const localDescription = taskDescriptionForTodoist(task, settings);
   if (localDescription && (!remote || String(remote.description || "").trim() !== localDescription.trim())) updates.description = localDescription;
-  if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate) && (!remote || (remote.dueDate || "") !== task.due_date)) updates.due_date = task.due_date;
-  if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline) && (!remote || (remote.deadlineDate || "") !== task.deadline_date)) updates.deadline_date = task.deadline_date;
+  const dueDate = taskDueDateForTodoist(task, settings);
+  if (dueDate && (!remote || (remote.dueDate || remote.due?.date || "") !== dueDate)) updates.due_date = dueDate;
+  const deadlineDate = taskDeadlineForTodoist(task, settings);
+  if (deadlineDate && (!remote || (remote.deadlineDate || remote.deadline?.date || "") !== deadlineDate)) updates.deadline_date = deadlineDate;
   return updates;
 }
 
@@ -6210,18 +6316,20 @@ function parseTaskReferenceLine(line, lineNumber, path, settings) {
 }
 
 function todoistArgsFromParsedTask(task, projectId, parent, sectionId, settings = DEFAULT_SETTINGS) {
-  const isSubtask = Boolean(parent || task.isSubtask);
+  const effectiveTask = Object.assign({}, task, { isSubtask: Boolean(parent || task.isSubtask) });
   const args = {
     content: task.content,
-    labels: isSubtask && !settings.subtaskIncludeLabels ? [] : task.labels,
-    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : task.priority
+    labels: taskLabelsForTodoist(effectiveTask, settings),
+    priority: taskPriorityForTodoist(effectiveTask, settings)
   };
   if (!parent && !task.isSubtask && isRichTodoistDescription(task.description)) args.description = formatTodoistDescription(task.description, settings);
   if (parent) args.parent_id = parent;
   else if (sectionId) args.section_id = sectionId;
   else args.project_id = projectId;
-  if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate)) args.due = { date: task.due_date };
-  if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline)) args.deadline = { date: task.deadline_date };
+  const dueDate = taskDueDateForTodoist(effectiveTask, settings);
+  if (dueDate) args.due = { date: dueDate };
+  const deadlineDate = taskDeadlineForTodoist(effectiveTask, settings);
+  if (deadlineDate) args.deadline = { date: deadlineDate };
   return args;
 }
 
@@ -7279,6 +7387,21 @@ function chunkTaskReferenceRows(path, rows, maxChars = 1100) {
   }
   if (current !== header) chunks.push(current);
   return chunks;
+}
+
+function semanticPathChunksMatch(index, path, nextChunks) {
+  const currentChunks = (index || []).filter((chunk) => chunk.path === path);
+  if (currentChunks.length !== nextChunks.length) return false;
+  const currentById = new Map(currentChunks.map((chunk) => [chunk.id, chunk]));
+  for (const next of nextChunks) {
+    const current = currentById.get(next.id);
+    if (!current) return false;
+    if (String(current.text || "") !== String(next.text || "")) return false;
+    if (String(current.title || "") !== String(next.title || "")) return false;
+    if (String(current.kind || "") !== String(next.kind || "")) return false;
+    if (String(current.source || "") !== String(next.source || "")) return false;
+  }
+  return true;
 }
 
 function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS) {

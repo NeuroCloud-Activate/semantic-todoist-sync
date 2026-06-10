@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.10
+
+- Kept Todoist description context-note citations aligned with the plugin-generated context source list.
+- Stopped numbering extra vault context chunks during description generation so the AI cannot cite a context number that is not present in the final source list.
+- Added local cleanup for out-of-range context-note citations before source lists are appended to Todoist descriptions.
+
 ## 0.5.9
 
 - Added same-provider AI model fallback for transient overload, rate-limit, and temporary 5xx model errors.

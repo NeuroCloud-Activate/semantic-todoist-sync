@@ -1665,8 +1665,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!mainTasks.length) return;
-    const citationMap = contextCitationMap(options.contextNotes || [], options.basePath || "");
-    const citeContextNotes = options.citeContextNotes !== false && citationMap.size > 0;
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
+    const citationMap = citationState.citationMap;
+    const citeContextNotes = citationState.citeContextNotes;
     const contextQuery = [sourceTitle, sourceSummary, mainTasks.map((task) => task.title).join("\n")].join("\n");
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
     const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
@@ -1720,7 +1721,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const item of parsed.descriptions || []) {
       const task = tasks[item.index];
       if (!task || task.isSubtask) continue;
-      const summary = cleanTaskDescriptionSummary(item.description || "", task.content, sourceTitle, this.settings);
+      const summary = cleanTaskDescriptionSummary(item.description || "", task.content, sourceTitle, this.settings, citationState);
       task.description = truncateAtWord(summary || task.description || "", 1200);
       for (const subtask of task.subtasks || []) subtask.description = "";
     }
@@ -1750,8 +1751,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!repairItems.length) return;
-    const citationMap = contextCitationMap(options.contextNotes || [], options.basePath || "");
-    const citeContextNotes = options.citeContextNotes !== false && citationMap.size > 0;
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
+    const citationMap = citationState.citationMap;
+    const citeContextNotes = citationState.citeContextNotes;
     const contextQuery = [sourceTitle, sourceSummary, repairItems.map((task) => task.title).join("\n")].join("\n");
     const json = await this.withAiActivity(`Improving ${repairItems.length} task description${repairItems.length === 1 ? "" : "s"}`, () => this.openaiResponse({
       model: this.settings.chatModel,
@@ -1791,7 +1793,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const item of parsed.descriptions || []) {
       const match = weakTasks.find(({ index }) => index === item.index);
       if (!match) continue;
-      const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings);
+      const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings, citationState);
       if (isUsefulDescriptionSummary(summary, match.task.content, this.settings)) match.task.description = truncateAtWord(summary, 1200);
     }
   }
@@ -6139,11 +6141,17 @@ function chunkMarkdown(text, maxChars = 900, maxChunks = 12) {
 }
 
 function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = "", options = {}) {
+  const hasCitationMap = options.citationMap instanceof Map;
   return clamp(chunks.map((chunk, index) => {
     const source = sourceReference(chunk, options.basePath || "");
     const citationNumber = source ? options.citationMap?.get(source) : null;
+    const heading = citationNumber
+      ? `Context Note (${citationNumber}): ${source}`
+      : hasCitationMap
+        ? `Additional Vault Context: ${source}`
+        : `Context ${index + 1}: ${source}`;
     return [
-      citationNumber ? `Context Note (${citationNumber}): ${source}` : `Context ${index + 1}: ${source}`,
+      heading,
       chunk.matchRationale ? `Match rationale: ${chunk.matchRationale}` : "",
       chunk.matchScore ? `Match score: ${chunk.matchScore}` : "",
       "Ranked relevant excerpt:",
@@ -6425,27 +6433,28 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
 }
 
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
+  const citationState = contextCitationState(contextNotes, basePath, includeSourceList);
   const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
   for (const task of tasks || []) {
     const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings) ? task.description : fallbackActionSummary(task, active?.text || "", contextChunks, active?.title || "", settings);
-    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "");
+    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "", citationState);
     for (const subtask of task.subtasks || []) {
       subtask.description = "";
     }
   }
 }
 
-function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "") {
-  const summary = removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle);
+function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}) {
+  const summary = sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle), citationState);
   const parts = [];
   if (isUsefulDescriptionSummary(summary, taskTitle, settings)) parts.push(summary);
   if (sources) parts.push(sources);
   return formatTodoistDescription(parts.join("\n\n"), settings);
 }
 
-function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS) {
+function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
   const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
-  return removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle);
+  return sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle), citationState);
 }
 
 function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
@@ -6568,6 +6577,15 @@ function contextCitationMap(contextNotes, basePath = "") {
   return map;
 }
 
+function contextCitationState(contextNotes, basePath = "", enabled = true) {
+  const citationMap = contextCitationMap(contextNotes, basePath);
+  return {
+    citationMap,
+    citeContextNotes: enabled !== false && citationMap.size > 0,
+    allowedContextCitations: new Set(citationMap.values())
+  };
+}
+
 function contextCitationInstructions(enabled) {
   if (!enabled) return "Disabled. Do not add numbered context citations.";
   return [
@@ -6576,6 +6594,21 @@ function contextCitationInstructions(enabled) {
     "Do not invent citation numbers; use only the Context Note (N) numbers shown in the ranked vault context.",
     "Only cite the sentence that uses the context-note information."
   ].join(" ");
+}
+
+function sanitizeContextCitations(value, citationState = {}) {
+  const text = String(value || "");
+  if (!text) return "";
+  const allowed = citationState.allowedContextCitations instanceof Set ? citationState.allowedContextCitations : null;
+  const citationsEnabled = citationState.citeContextNotes !== false && allowed && allowed.size > 0;
+  return text
+    .replace(/\s*\((\d{1,3})\)(?=([.!?;,)]|$))/g, (match, rawNumber) => {
+      const number = Number(rawNumber);
+      return citationsEnabled && allowed.has(number) ? match : "";
+    })
+    .replace(/\s+([.!?,;:])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {

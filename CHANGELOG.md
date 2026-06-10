@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.12
+
+- Added a separate Todoist task reference snapshot file so normal plugin settings saves no longer rewrite the full local task reference table.
+- Added an in-memory task reference index and compact persistent OID/index cache for OID, path, section, child-task, and pending-reference lookups used by sync, chat task context, subtask indentation repair, and semantic task-reference chunks.
+- Added lightweight task-reference de-duplication for duplicate note references, labels, pending OID references, and same-note duplicate OIDs before snapshotting.
+- Reduced sync overhead by using the RAM index for per-file deleted-task checks and empty-section cleanup instead of scanning the full local reference table.
+
 ## 0.5.11
 
 - Reduced startup and task-generation lag by deferring background maintenance, warming semantic-index caches in smaller idle batches, and avoiding the extra prompt-response pass for task-generating prompts.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.11
+
+- Reduced startup and task-generation lag by deferring background maintenance, warming semantic-index caches in smaller idle batches, and avoiding the extra prompt-response pass for task-generating prompts.
+- Prevented duplicate inserted task lists by routing prompts with `createTasks: true` directly through the structured task-generation workflow.
+- Removed local due-date/deadline autofill so customizable Dates and Deadlines instructions control whether due dates and deadlines are created.
+- Made section names model-generated from the Section Title settings, with the previous plugin-derived name used only as a fallback.
+- Stopped stripping model-generated labels when label settings are written in plain language without `#Label` syntax.
+
 ## 0.5.10
 
 - Kept Todoist description context-note citations aligned with the plugin-generated context source list.

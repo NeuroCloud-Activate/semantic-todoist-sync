@@ -25,6 +25,9 @@ const SEMANTIC_INDEX_STARTUP_QUIET_MS = 15000;
 const SEMANTIC_INDEX_WARMUP_DELAY_MS = 30000;
 const SEMANTIC_INDEX_WARMUP_BATCH_SIZE = 4;
 const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
+const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
+const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
+const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
@@ -1092,23 +1095,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const files = this.getIndexableFiles();
       if (!files.length) throw new Error("No indexable Markdown notes were found. Check Indexed folders and Excluded folders in settings.");
       const chunks = [];
-      for (const file of files) {
+      await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+        const file = files[fileIndex];
+        if (fileIndex % SEMANTIC_INDEX_FILE_YIELD_INTERVAL === 0) {
+          this.setSidebarStatus(`Reading vault notes ${fileIndex + 1}/${files.length}...`);
+          await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+        }
         const text = await this.app.vault.cachedRead(file);
         const fileChunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote);
         for (let index = 0; index < fileChunks.length; index += 1) {
           chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0 });
         }
       }
+      this.setSidebarStatus("Preparing task reference chunks...");
+      await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       chunks.push(...this.semanticTaskReferenceChunks());
       if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
 
       const indexed = [];
       for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
         const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
+        this.setSidebarStatus(`Embedding vault chunks ${Math.min(i + batch.length, chunks.length)}/${chunks.length}...`);
         const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
         for (let j = 0; j < batch.length; j += 1) {
           indexed.push(Object.assign({}, batch[j], { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) }));
         }
+        await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
       }
 
       this.semanticIndex = indexed;
@@ -1203,8 +1216,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.setSidebarStatus("Indexing vault changes...");
     try {
       let changedFiles = 0;
-      for (const path of paths) {
+      for (let index = 0; index < paths.length; index += 1) {
+        const path = paths[index];
+        this.setSidebarStatus(`Indexing changed note ${index + 1}/${paths.length}...`);
+        await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         if (await this.reindexFile(path)) changedFiles += 1;
+        await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       }
       if (!changedFiles) {
         this.logLocal("Semantic index unchanged", { files: paths.length });
@@ -1241,12 +1258,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     chunks.push(...this.semanticTaskReferenceChunks(path));
     if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return false;
     await this.removePathFromSemanticIndex(path, false);
+    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
     for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
       const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
       const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
       for (let j = 0; j < batch.length; j += 1) {
         this.semanticIndex.push(Object.assign({}, batch[j], { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) }));
       }
+      await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
     }
     this.semanticChunkTermCache?.clear?.();
     this.queueSemanticIndexWarmup();
@@ -7038,7 +7057,7 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
 }
 
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
-  const citationState = contextCitationState(contextNotes, basePath, includeSourceList);
+  const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
   const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
   for (const task of tasks || []) {
     const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings) ? task.description : fallbackActionSummary(task, active?.text || "", contextChunks, active?.title || "", settings);
@@ -7050,7 +7069,11 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
 }
 
 function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}) {
-  const summary = sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle), citationState);
+  const summary = ensureContextCitation(
+    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle), citationState),
+    taskTitle,
+    citationState
+  );
   const parts = [];
   if (isUsefulDescriptionSummary(summary, taskTitle, settings)) parts.push(summary);
   if (sources) parts.push(sources);
@@ -7059,7 +7082,11 @@ function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = 
 
 function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
   const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
-  return sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle), citationState);
+  return ensureContextCitation(
+    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle), citationState),
+    taskTitle,
+    citationState
+  );
 }
 
 function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
@@ -7172,20 +7199,36 @@ function descriptionSourceList(active, contextNotes, basePath = "") {
   return lines.join("\n");
 }
 
-function contextCitationMap(contextNotes, basePath = "") {
+function contextCitationMap(contextNotes, basePath = "", primary = null) {
   const map = new Map();
+  const primaryPath = sourceReference(primary, basePath);
+  const seen = new Set(primaryPath ? [primaryPath] : []);
   for (const note of contextNotes || []) {
     const notePath = sourceReference(note, basePath);
-    if (!notePath || map.has(notePath)) continue;
+    if (!notePath || seen.has(notePath)) continue;
+    seen.add(notePath);
     map.set(notePath, map.size + 1);
   }
   return map;
 }
 
-function contextCitationState(contextNotes, basePath = "", enabled = true) {
-  const citationMap = contextCitationMap(contextNotes, basePath);
+function contextCitationState(contextNotes, basePath = "", enabled = true, primary = null) {
+  const citationMap = contextCitationMap(contextNotes, basePath, primary);
+  const contextCitationNotes = [];
+  for (const note of contextNotes || []) {
+    const notePath = sourceReference(note, basePath);
+    const number = notePath ? citationMap.get(notePath) : null;
+    if (!number || contextCitationNotes.some((item) => item.number === number)) continue;
+    contextCitationNotes.push({
+      number,
+      source: notePath,
+      title: note.title || note.basename || notePath,
+      text: note.text || note.excerpt || ""
+    });
+  }
   return {
     citationMap,
+    contextCitationNotes,
     citeContextNotes: enabled !== false && citationMap.size > 0,
     allowedContextCitations: new Set(citationMap.values())
   };
@@ -7214,6 +7257,35 @@ function sanitizeContextCitations(value, citationState = {}) {
     .replace(/\s+([.!?,;:])/g, "$1")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function hasValidContextCitation(value, citationState = {}) {
+  const allowed = citationState.allowedContextCitations instanceof Set ? citationState.allowedContextCitations : null;
+  if (!citationState.citeContextNotes || !allowed?.size) return false;
+  const matches = String(value || "").match(/\((\d{1,3})\)/g) || [];
+  return matches.some((match) => allowed.has(Number(match.replace(/\D/g, ""))));
+}
+
+function ensureContextCitation(value, taskTitle = "", citationState = {}) {
+  const text = String(value || "").trim();
+  if (!text || !citationState.citeContextNotes || hasValidContextCitation(text, citationState)) return text;
+  const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
+  if (!notes.length) return text;
+  const queryTerms = termCounts([text, taskTitle].filter(Boolean).join(" "));
+  let bestNumber = 0;
+  let bestScore = 0;
+  for (const note of notes) {
+    const candidate = [note.title, note.source, note.text].filter(Boolean).join("\n");
+    const score = lexicalScore(queryTerms, candidate);
+    if (score > bestScore) {
+      bestScore = score;
+      bestNumber = note.number;
+    }
+  }
+  if (!bestNumber || bestScore < 1.5) return text;
+  const punctuation = /[.!?]$/.test(text) ? text.slice(-1) : "";
+  const body = punctuation ? text.slice(0, -1).trim() : text;
+  return `${body} (${bestNumber})${punctuation}`;
 }
 
 function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.18
+
+- Harmonized Email-To-Todoist log notes with the standard note sync workflow by caching full Todoist reference metadata for email-created tasks and immediately reconciling the generated note through note sync.
+- Preserved email-created task project, section, label, parent, description, and completion metadata so later Todoist API updates can update the generated note task lines like normal note-created tasks.
+
 ## 0.5.17
 
 - Reduced semantic-index startup and save overhead by tracking loaded shard files and cleaning stale shards from the known manifest instead of listing the plugin directory on each save.

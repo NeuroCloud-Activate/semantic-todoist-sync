@@ -3681,19 +3681,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     }
     for (let i = 0; i < lines.length; i += 1) {
-      const oid = getTaskOid(lines[i]);
-      const id = getTodoistId(lines[i], this.settings) || byOid.get(oid)?.id;
+      const parsed = parseTaskLine(lines[i], i, path, lines, this.settings) || {};
+      const oid = parsed.oid || getTaskOid(lines[i]);
+      const id = parsed.id || getTodoistId(lines[i], this.settings) || byOid.get(oid)?.id;
       const task = byId.get(id) || byOid.get(oid);
       if (!task) continue;
       if (!id) continue;
-      this.cacheTask(id, Object.assign({}, task, {
+      this.cacheTask(id, Object.assign({}, parsed, task, {
         oid: oid || task.oid,
         path,
         lineNumber: i,
+        allLines: lines,
+        description: task.description || parsed.description || "",
         labels: (task.labels || []).map(cleanLabel).filter(Boolean),
         priority: normalizePriority(task.priority),
         due_date: task.due_date || null,
-        deadline_date: task.deadline_date || null
+        deadline_date: task.deadline_date || null,
+        isCompleted: Boolean(task.isCompleted || parsed.isCompleted),
+        isSubtask: Boolean(task.isSubtask || parsed.isSubtask),
+        parentId: task.parentId || task.parent_id || parsed.parentId || "",
+        parentOid: task.parentOid || parsed.parentOid || "",
+        parentContent: task.parentContent || parsed.parentContent || "",
+        parentLineNumber: Number.isFinite(task.parentLineNumber) ? task.parentLineNumber : parsed.parentLineNumber ?? null,
+        section: task.section || parsed.section || (task.isSubtask || parsed.isSubtask ? "" : sectionName),
+        sectionId: task.sectionId || parsed.sectionId || "",
+        projectId: task.projectId || parsed.projectId || this.settings.todoistTaskProjectId || this.settings.todoistInboxProjectId || "",
+        projectName: task.projectName || parsed.projectName || this.settings.todoistTaskProjectName || ""
       }));
       cached += 1;
     }
@@ -3729,7 +3742,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.markInternalNoteWrite(path);
     await this.app.vault.create(path, `${lines.join("\n")}\n`);
     const cached = await this.cacheLoggedTasks(path, tasks || [], sectionName);
-    this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, cached, syncable: isEmailLogPath(path, this.settings), sectionName });
+    let syncStats = emptySyncStats();
+    try {
+      syncStats = await this.syncFileNotes(path, false);
+    } catch (error) {
+      this.logLocal("Email task note sync initialization failed", { path, error: error.message || String(error) });
+    }
+    this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, cached, syncStats, syncable: isEmailLogPath(path, this.settings), sectionName });
   }
 };
 

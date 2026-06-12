@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.20
+
+- Deferred full semantic-index RAM hydration until idle or first use, while loading a small path-metadata snapshot at startup so Obsidian can open without parsing every shard.
+- Rebuilt semantic index shard bodies from pre-serialized chunk strings, reducing repeated index-save serialization from multi-second CPU work to short yielded batches.
+- Restored the semantic index shard ceiling to 4.5 MB while keeping sync-safe sharding and idle legacy-shard optimization.
+- Improved context-result diversity so chat and task-description context prefer relevant unique notes before adding multiple chunks from the same note.
+- Added distinct status reporting for semantic index loading and shard optimization instead of labeling all background index work as vault indexing.
+
 ## 0.5.19
 
 - Reduced vault-indexing UI freezes by yielding during full semantic-index reads, queued note re-indexing, and embedding batches while showing indexing progress.

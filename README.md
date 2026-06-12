@@ -25,7 +25,8 @@ Build a local semantic index of your vault to search, answer questions, and iden
 - **0.5.1 update:** Email-To-Todoist automatic polling now uses a 420-second minimum and compatible Cloudflare Workers use a small `state/pending.json` queue-state key so empty checks avoid repeated KV list operations.
 - Todoist-to-Obsidian sync now refreshes task titles, completion state, labels, priorities, dates, deadlines, sections, projects, and subtask indentation from the local Todoist snapshot.
 - Sidebar chat can use synced task references alongside note context, with descriptive task links instead of raw URLs.
-- The semantic index now stores vault-relative paths, excludes the plugin data folder by default, and writes sync-safe shard files under the Obsidian Sync 5 MB file-size ceiling.
+- The semantic index stores vault-relative paths, excludes the plugin data folder by default, and writes sync-safe shard files under the Obsidian Sync 5 MB file-size ceiling.
+- Semantic index startup uses a small path-metadata snapshot and hydrates the full index into RAM later when idle or when search/chat/index updates need it.
 - Notes-To-Todoist and Email-To-Todoist prompts now use separate main-task and subtask requirements, ranked vault context, and optional plugin-generated source lists with context-note citations.
 - The status bar now uses concise local activity text for indexing, syncing, AI calls, and other plugin work. It does not call the AI API.
 - Settings were simplified by removing legacy insert/sync and date/link order toggles now handled by prompt templates and default plugin formatting.
@@ -73,6 +74,8 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - This creates the local semantic index manifest and shard files in the plugin folder.
    - Gemini and OpenAI indexes are stored separately so switching providers does not overwrite the other index (so you can test whichever works best for you!)
    - Index shards are kept under Obsidian Sync's 5 MB file-size ceiling so the index can sync across devices instead of rebuilding separately on each device.
+   - A small path-metadata snapshot helps startup and note-change checks avoid loading full shard files until the in-memory index is needed.
+   - Existing larger legacy shards are loaded with idle yields, then optimized later when the plugin is idle.
    - The plugin folder is excluded from indexing and AI chat context by default.
 
 ## Sidebar And Prompts

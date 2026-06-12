@@ -16,6 +16,7 @@ const TODOIST_API = "https://api.todoist.com/api/v1";
 const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
+const SEMANTIC_INDEX_PATH_META_FILE = "semantic-index-path-meta.json";
 const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
 const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
@@ -30,6 +31,8 @@ const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
+const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
+const STARTUP_SEMANTIC_INDEX_RESHARD_DELAY_MS = 120000;
 const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
@@ -196,6 +199,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexPathMeta = new Map();
     this.semanticIndexKnownShardFiles = [];
     this.semanticIndexStorageFingerprint = "";
+    this.semanticIndexLoaded = false;
+    this.semanticIndexLoadInProgress = false;
+    this.semanticIndexLoadPromise = null;
+    this.semanticIndexLoadTimer = null;
+    this.semanticIndexPathMetaSnapshotFingerprint = "";
+    this.semanticIndexReshardTimer = null;
     this.semanticIndexWarmupInProgress = false;
     this.semanticIndexWarmupFingerprint = "";
     this.semanticIndexWarmupPendingFingerprint = "";
@@ -209,14 +218,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.syncInProgress = false;
     this.emailProcessingInProgress = false;
     this.semanticIndexInProgress = false;
+    this.semanticIndexOptimizeInProgress = false;
     this.internalNoteWriteUntil = new Map();
     await this.loadTaskReferenceSnapshot();
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     await this.migrateSettings();
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
-    const compatibleIndexLoaded = await this.ensureCompatibleEmbeddingForChatModel();
-    if (!compatibleIndexLoaded) await this.loadSemanticIndex();
     this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
+    await this.loadSemanticIndexPathMetaSnapshot();
+    const compatibleIndexLoaded = await this.ensureCompatibleEmbeddingForChatModel({ loadIndex: false });
+    if (!compatibleIndexLoaded) this.queueSemanticIndexLoad();
     this.queueSemanticIndexWarmup();
     const activeMarkdown = this.app.workspace.getActiveViewOfType(MarkdownView);
     this.lastActiveMarkdownLeaf = activeMarkdown?.leaf || null;
@@ -260,6 +271,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async onunload() {
     await this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings flush failed", error));
+    window.clearTimeout(this.semanticIndexLoadTimer);
+    this.semanticIndexLoadTimer = null;
+    window.clearTimeout(this.semanticIndexReshardTimer);
+    this.semanticIndexReshardTimer = null;
     window.clearTimeout(this.taskReferenceSnapshotTimer);
     this.taskReferenceSnapshotTimer = null;
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
@@ -556,61 +571,177 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async loadSemanticIndex() {
-    this.semanticChunkTermCache?.clear?.();
-    this.semanticIndexPathMeta?.clear?.();
-    this.semanticIndex = [];
-    const indexFile = this.semanticIndexFileName();
-    this.semanticIndexStats = { bytes: 0, path: indexFile };
-    let shouldRewriteShardedIndex = false;
-    let settingsChanged = false;
-    const applyLoaded = (loaded, file, extraMeta = {}) => {
-      this.semanticIndexStats = loaded.stats;
-      this.semanticIndexKnownShardFiles = loaded.shardFiles || [];
-      this.semanticIndexStorageFingerprint = loaded.storageFingerprint || "";
-      const parsed = loaded.parsed || {};
-      this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
-      const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, { chunks: this.semanticIndex.length, file });
-      if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
-      this.settings.semanticIndexMeta = nextMeta;
-      shouldRewriteShardedIndex = !loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && this.semanticIndex.length;
-    };
+    window.clearTimeout(this.semanticIndexLoadTimer);
+    this.semanticIndexLoadTimer = null;
+    if (this.semanticIndexLoadPromise) return this.semanticIndexLoadPromise;
+    this.semanticIndexLoadPromise = this.loadSemanticIndexInternal();
     try {
-      const loaded = await this.readSemanticIndexFile(indexFile);
-      applyLoaded(loaded, indexFile);
-    } catch (error) {
-      if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
-        try {
-          const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
-          applyLoaded(loaded, SEMANTIC_INDEX_FILE, { legacy: true });
-        } catch {}
+      return await this.semanticIndexLoadPromise;
+    } finally {
+      this.semanticIndexLoadPromise = null;
+    }
+  }
+
+  async loadSemanticIndexInternal() {
+    this.semanticIndexLoadInProgress = true;
+    this.refreshSidebarStatus();
+    try {
+      this.semanticChunkTermCache?.clear?.();
+      this.semanticIndexPathMeta?.clear?.();
+      this.semanticIndex = [];
+      this.semanticIndexLoaded = false;
+      const indexFile = this.semanticIndexFileName();
+      this.semanticIndexStats = { bytes: 0, path: indexFile };
+      let shouldRewriteShardedIndex = false;
+      let settingsChanged = false;
+      const applyLoaded = async (loaded, file, extraMeta = {}) => {
+        this.semanticIndexStats = loaded.stats;
+        this.semanticIndexKnownShardFiles = loaded.shardFiles || [];
+        this.semanticIndexStorageFingerprint = loaded.storageFingerprint || "";
+        const parsed = loaded.parsed || {};
+        this.setSidebarStatus("Preparing semantic index...");
+        await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+        this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
+        const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, { chunks: this.semanticIndex.length, file });
+        if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
+        this.settings.semanticIndexMeta = nextMeta;
+        const loadedShardMaxBytes = Number(parsed.meta?.shardMaxBytes || 0);
+        const oversizedLegacyShards = loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && (!loadedShardMaxBytes || loadedShardMaxBytes > SEMANTIC_INDEX_SHARD_MAX_BYTES);
+        shouldRewriteShardedIndex = this.semanticIndex.length && ((!loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES) || oversizedLegacyShards);
+      };
+      try {
+        const loaded = await this.readSemanticIndexFile(indexFile);
+        await applyLoaded(loaded, indexFile);
+      } catch (error) {
+        if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
+          try {
+            const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
+            await applyLoaded(loaded, SEMANTIC_INDEX_FILE, { legacy: true });
+          } catch {}
+        }
+        if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
+          this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app);
+          delete this.settings.semanticIndex;
+          settingsChanged = true;
+          await this.saveSemanticIndex();
+        }
       }
-      if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
-        this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app);
+      if (!this.semanticIndex.length) {
+        const nextMeta = {
+          model: this.settings.embeddingModel,
+          provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
+          file: indexFile,
+          chunks: 0
+        };
+        if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
+        this.settings.semanticIndexMeta = nextMeta;
+      }
+      if (Array.isArray(this.settings.semanticIndex)) {
         delete this.settings.semanticIndex;
         settingsChanged = true;
-        await this.saveSemanticIndex();
       }
+      if (shouldRewriteShardedIndex) this.queueSemanticIndexReshard();
+      await this.refreshSemanticIndexPathMetaAsync();
+      await this.saveSemanticIndexPathMetaSnapshot();
+      if (settingsChanged) await this.saveSettings();
+    } finally {
+      this.semanticIndexLoaded = true;
+      this.semanticIndexLoadInProgress = false;
+      this.refreshSidebarStatus();
     }
-    if (!this.semanticIndex.length) {
-      const nextMeta = {
-        model: this.settings.embeddingModel,
-        provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
-        file: indexFile,
-        chunks: 0
-      };
-      if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
-      this.settings.semanticIndexMeta = nextMeta;
+  }
+
+  queueSemanticIndexLoad(delayMs = STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS) {
+    if (this.semanticIndexLoaded || this.semanticIndexLoadInProgress || this.semanticIndexLoadPromise) return;
+    window.clearTimeout(this.semanticIndexLoadTimer);
+    this.semanticIndexLoadTimer = window.setTimeout(() => {
+      this.semanticIndexLoadTimer = null;
+      this.loadSemanticIndexWhenIdle().catch((error) => this.logLocal("Semantic index cache load failed", { error: error.message || String(error) }));
+    }, Math.max(1000, delayMs || 0));
+    this.refreshSidebarStatus();
+  }
+
+  async loadSemanticIndexWhenIdle() {
+    if (this.semanticIndexLoaded || this.semanticIndexLoadInProgress) return true;
+    if (!this.canStartBackgroundWork()) {
+      this.queueSemanticIndexLoad(30000);
+      return false;
     }
-    if (Array.isArray(this.settings.semanticIndex)) {
-      delete this.settings.semanticIndex;
-      settingsChanged = true;
+    await this.loadSemanticIndex();
+    this.queueSemanticIndexWarmup();
+    return true;
+  }
+
+  async ensureSemanticIndexLoaded(reason = "semantic index") {
+    if (this.semanticIndexLoaded && (this.semanticIndex || []).length) return true;
+    window.clearTimeout(this.semanticIndexLoadTimer);
+    this.semanticIndexLoadTimer = null;
+    if (!this.semanticIndexLoaded) this.setSidebarStatus(`Loading ${reason}...`);
+    await this.loadSemanticIndex();
+    this.queueSemanticIndexWarmup();
+    return Boolean((this.semanticIndex || []).length);
+  }
+
+  semanticIndexPathMetaFingerprint(meta = this.settings.semanticIndexMeta || {}) {
+    return shortHash(JSON.stringify({
+      model: meta.model || this.settings.embeddingModel || "",
+      file: meta.file || this.semanticIndexFileName(),
+      chunks: Number(meta.chunks || 0),
+      rebuiltAt: meta.rebuiltAt || "",
+      updatedAt: meta.updatedAt || "",
+      shardCount: Number(meta.shardCount || 0),
+      shardBytes: Number(meta.shardBytes || 0)
+    }));
+  }
+
+  async loadSemanticIndexPathMetaSnapshot() {
+    try {
+      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${SEMANTIC_INDEX_PATH_META_FILE}`);
+      const parsed = JSON.parse(raw);
+      const expected = this.semanticIndexPathMetaFingerprint();
+      if (!parsed || parsed.metaFingerprint !== expected || !Array.isArray(parsed.entries)) return false;
+      this.semanticIndexPathMeta = this.semanticIndexPathMeta || new Map();
+      this.semanticIndexPathMeta.clear();
+      for (const entry of parsed.entries) {
+        const path = vaultRelativePath(entry?.path || "", vaultBasePath(this.app));
+        if (!path) continue;
+        this.semanticIndexPathMeta.set(path, {
+          chunks: Number(entry.chunks || 0),
+          modifiedAt: Number(entry.modifiedAt || 0)
+        });
+      }
+      this.semanticIndexPathMetaSnapshotFingerprint = expected;
+      return this.semanticIndexPathMeta.size > 0;
+    } catch {
+      return false;
     }
-    if (shouldRewriteShardedIndex) await this.saveSemanticIndex();
-    this.refreshSemanticIndexPathMeta();
-    if (settingsChanged || shouldRewriteShardedIndex) await this.saveSettings();
+  }
+
+  async saveSemanticIndexPathMetaSnapshot() {
+    const entries = Array.from(this.semanticIndexPathMeta || [])
+      .filter(([path]) => path)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([path, meta]) => ({
+        path,
+        chunks: Number(meta?.chunks || 0),
+        modifiedAt: Number(meta?.modifiedAt || 0)
+      }));
+    const metaFingerprint = this.semanticIndexPathMetaFingerprint();
+    const body = JSON.stringify({
+      metaFingerprint,
+      model: this.settings.embeddingModel,
+      indexFile: this.semanticIndexFileName(),
+      savedAt: deviceTimestamp(),
+      entries
+    });
+    if (this.semanticIndexPathMetaSnapshotFingerprint === metaFingerprint) return;
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${SEMANTIC_INDEX_PATH_META_FILE}`, body);
+    this.semanticIndexPathMetaSnapshotFingerprint = metaFingerprint;
   }
 
   async readSemanticIndexFile(indexFile) {
+    this.setSidebarStatus("Loading semantic index manifest...");
+    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
     const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.shards) && parsed.shards.length) {
@@ -619,11 +750,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let largestBytes = totalBytes;
       const shardFiles = (parsed.shards || []).map((shard) => shard.file || shard.path || "").filter(Boolean);
       const shardReads = [];
-      await asyncPool(shardFiles, 3, async (shardFile, index) => {
+      for (let index = 0; index < shardFiles.length; index += 1) {
+        const shardFile = shardFiles[index];
+        this.setSidebarStatus(`Loading semantic index shard ${index + 1}/${shardFiles.length}...`);
+        await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
         const shardBytes = utf8ByteLength(shardRaw);
         shardReads[index] = { file: shardFile, hash: shortHash(shardRaw), bytes: shardBytes, parsed: JSON.parse(shardRaw) };
-      });
+        await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      }
       for (const shard of shardReads) {
         const shardFile = shard.file || shard.path || "";
         if (!shardFile) continue;
@@ -659,7 +794,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         sharded: true,
         shardMaxBytes: SEMANTIC_INDEX_SHARD_MAX_BYTES
     });
-    const shards = semanticIndexShardBodies(indexFile, meta, this.semanticIndex || [], SEMANTIC_INDEX_SHARD_MAX_BYTES);
+    const shards = await semanticIndexShardBodiesAsync(indexFile, meta, this.semanticIndex || [], SEMANTIC_INDEX_SHARD_MAX_BYTES);
     const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
     const manifest = {
       meta: Object.assign({}, meta, {
@@ -689,7 +824,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (storageFingerprint === this.semanticIndexStorageFingerprint) {
       this.semanticIndexStats = stats;
       this.semanticIndexKnownShardFiles = shardFiles;
-      if (!this.semanticIndexPathMeta?.size && (this.semanticIndex || []).some((chunk) => chunk.path)) this.refreshSemanticIndexPathMeta();
+      if (!this.semanticIndexPathMeta?.size && (this.semanticIndex || []).some((chunk) => chunk.path)) await this.refreshSemanticIndexPathMetaAsync();
+      await this.saveSemanticIndexPathMetaSnapshot();
       return;
     }
     await this.removeSemanticIndexShardFiles(indexFile, shardFiles, this.semanticIndexKnownShardFiles);
@@ -700,13 +836,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexStats = stats;
     this.semanticIndexKnownShardFiles = shardFiles;
     this.semanticIndexStorageFingerprint = storageFingerprint;
-    this.refreshSemanticIndexPathMeta();
+    await this.refreshSemanticIndexPathMetaAsync();
+    await this.saveSemanticIndexPathMetaSnapshot();
   }
 
   refreshSemanticIndexPathMeta() {
     this.semanticIndexPathMeta = this.semanticIndexPathMeta || new Map();
     this.semanticIndexPathMeta.clear();
     for (const chunk of this.semanticIndex || []) {
+      const path = chunk.path || "";
+      if (!path) continue;
+      const existing = this.semanticIndexPathMeta.get(path) || { chunks: 0, modifiedAt: 0 };
+      existing.chunks += 1;
+      existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
+      this.semanticIndexPathMeta.set(path, existing);
+    }
+  }
+
+  async refreshSemanticIndexPathMetaAsync() {
+    this.semanticIndexPathMeta = this.semanticIndexPathMeta || new Map();
+    this.semanticIndexPathMeta.clear();
+    const chunks = this.semanticIndex || [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      if (index && index % 100 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      const chunk = chunks[index];
       const path = chunk.path || "";
       if (!path) continue;
       const existing = this.semanticIndexPathMeta.get(path) || { chunks: 0, modifiedAt: 0 };
@@ -725,6 +878,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       meta: this.settings.semanticIndexMeta || {},
       chunks: (this.semanticIndex || []).length
     }));
+  }
+
+  queueSemanticIndexReshard(delayMs = STARTUP_SEMANTIC_INDEX_RESHARD_DELAY_MS) {
+    window.clearTimeout(this.semanticIndexReshardTimer);
+    if (!(this.semanticIndex || []).length) return;
+    this.semanticIndexReshardTimer = window.setTimeout(() => {
+      this.semanticIndexReshardTimer = null;
+      this.reshardSemanticIndexWhenIdle().catch((error) => this.logLocal("Semantic index shard optimization failed", { error: error.message || String(error) }));
+    }, delayMs);
+  }
+
+  async reshardSemanticIndexWhenIdle() {
+    if (!(this.semanticIndex || []).length) return false;
+    if (!this.canStartBackgroundWork() || this.semanticIndexLoadInProgress) {
+      this.queueSemanticIndexReshard(30000);
+      return false;
+    }
+    this.semanticIndexInProgress = true;
+    this.semanticIndexOptimizeInProgress = true;
+    this.setSidebarStatus("Optimizing semantic index shards...");
+    try {
+      await this.saveSemanticIndex();
+      await this.saveSettings();
+      this.logLocal("Semantic index shards optimized", {
+        files: this.semanticIndexStats?.files || 0,
+        shards: this.semanticIndexStats?.shards || 0,
+        bytes: this.semanticIndexStats?.totalBytes || this.semanticIndexStats?.bytes || 0
+      });
+      return true;
+    } finally {
+      this.semanticIndexInProgress = false;
+      this.semanticIndexOptimizeInProgress = false;
+      this.setSidebarStatus("Ready");
+    }
   }
 
   async purgeSemanticIndex(showNotice = true) {
@@ -783,7 +970,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     } catch {}
   }
 
-  async ensureCompatibleEmbeddingForChatModel() {
+  async ensureCompatibleEmbeddingForChatModel(options = {}) {
+    const loadIndex = options.loadIndex !== false;
     const before = this.settings.embeddingModel;
     if (usesGeminiChatModel(this.settings.chatModel) && !usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
       this.settings.embeddingModel = "gemini/gemini-embedding-2";
@@ -794,9 +982,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (this.settings.embeddingModel !== before) {
       this.queryEmbeddingCache?.clear?.();
-      await this.loadSemanticIndex();
+      this.semanticIndexLoaded = false;
+      this.semanticIndex = [];
+      this.semanticIndexPathMeta?.clear?.();
+      this.semanticIndexPathMetaSnapshotFingerprint = "";
+      if (loadIndex) await this.loadSemanticIndex();
+      else this.queueSemanticIndexLoad();
       await this.saveSettings();
-      return true;
+      return loadIndex;
     }
     return false;
   }
@@ -1028,9 +1221,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   shouldQueueSemanticIndexUpdate(path, reason = "change") {
     const indexed = this.semanticIndexPathMeta?.get(path);
+    const now = Date.now();
+    if (!indexed && !this.semanticIndexLoaded && now < (this.semanticIndexStartupQuietUntil || 0)) {
+      this.logLocal("Skipped startup semantic index event before cache hydration", { path, reason });
+      return false;
+    }
     if (!indexed) return true;
     if (reason === "task-reference") return true;
-    const now = Date.now();
     if (now < (this.semanticIndexStartupQuietUntil || 0)) {
       this.logLocal("Skipped startup semantic index event for indexed note", { path, reason });
       return false;
@@ -1205,6 +1402,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.refreshSidebarStatus();
       return;
     }
+    if (!this.hasUsableSemanticIndex() && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+      await this.ensureSemanticIndexLoaded("semantic index cache");
+    }
     if (!this.hasUsableSemanticIndex()) {
       await this.rebuildSemanticIndex(false);
       return;
@@ -1274,7 +1474,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   queueTaskReferenceIndexUpdate(path) {
     const notePath = vaultRelativePath(path, vaultBasePath(this.app));
-    if (!notePath || !this.settings.autoUpdateSemanticIndex || !this.hasUsableSemanticIndex()) return;
+    const hasPersistedIndex = this.hasUsableSemanticIndex() || Number(this.settings.semanticIndexMeta?.chunks || 0) > 0;
+    if (!notePath || !this.settings.autoUpdateSemanticIndex || !hasPersistedIndex) return;
     this.queueSemanticIndexUpdate(notePath, "task-reference");
   }
 
@@ -1390,6 +1591,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async retrieveSemanticContext(query, limit) {
+    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+      await this.ensureSemanticIndexLoaded("semantic search index");
+    }
     const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
     if (!index.length) return this.retrieveLexicalContext(query, limit);
     const cacheKey = `${this.settings.embeddingModel}:${singleLine(query).slice(0, 500)}`;
@@ -5734,7 +5938,10 @@ function allActiveWorkflowStatusItems(plugin) {
   if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: "Processing" });
   if (plugin.syncInProgress || fileSyncCount) items.push({ label: "Notes", value: `Syncing${fileSyncCount ? ` (${fileSyncCount})` : ""}` });
   else if (plugin.noteSyncTimer) items.push({ label: "Notes", value: "Sync queued" });
-  if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
+  if (plugin.semanticIndexLoadInProgress) items.push({ label: "Index", value: "Loading" });
+  else if (plugin.semanticIndexLoadTimer) items.push({ label: "Index", value: "Cache queued" });
+  else if (plugin.semanticIndexOptimizeInProgress) items.push({ label: "Index", value: "Optimizing" });
+  else if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
   else if (plugin.semanticIndexWarmupInProgress) items.push({ label: "Index", value: "Preparing" });
   else if (indexCount) items.push({ label: "Index", value: `Queued (${indexCount})` });
   else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "Queued" });
@@ -6949,13 +7156,22 @@ function contextCandidateScore(item) {
 function diversifyContextCandidates(candidates, limit) {
   const selected = [];
   const perPath = new Map();
-  for (const item of candidates || []) {
-    const path = item.chunk?.path || "";
-    const count = perPath.get(path) || 0;
-    if (count >= 3 && selected.length < Math.max(1, Math.floor(limit * 0.75))) continue;
-    selected.push(item);
-    perPath.set(path, count + 1);
-    if (selected.length >= limit) break;
+  const selectedKeys = new Set();
+  const maxItems = Math.max(1, limit || 1);
+  const passes = [1, 2, 3, Number.POSITIVE_INFINITY];
+  for (const maxPerPath of passes) {
+    for (const item of candidates || []) {
+      const chunk = item.chunk || item;
+      const key = chunk.id || `${chunk.path || ""}:${String(chunk.text || "").slice(0, 80)}`;
+      if (selectedKeys.has(key)) continue;
+      const path = chunk.path || "";
+      const count = perPath.get(path) || 0;
+      if (count >= maxPerPath) continue;
+      selected.push(item);
+      selectedKeys.add(key);
+      perPath.set(path, count + 1);
+      if (selected.length >= maxItems) return selected;
+    }
   }
   return selected;
 }
@@ -7940,38 +8156,79 @@ function semanticIndexStorageFingerprint(manifestBody, shards = []) {
 }
 function semanticIndexShardBodies(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES) {
   const shards = [];
-  let current = [];
+  let currentBodies = [];
+  let currentBytes = 0;
   const flush = () => {
-    if (!current.length) return;
-    const file = semanticIndexShardFileName(indexFile, shards.length);
-    const body = JSON.stringify({
-      meta: Object.assign({}, meta, {
-        file,
-        parentFile: indexFile,
-        shardIndex: shards.length,
-        chunks: current.length
-      }),
-      chunks: current
-    });
-    shards.push({ file, body, bytes: utf8ByteLength(body), chunkCount: current.length });
-    current = [];
+    if (!currentBodies.length) return;
+    const shard = semanticIndexShardFromBodies(indexFile, meta, shards.length, currentBodies, currentBytes);
+    shards.push(shard);
+    currentBodies = [];
+    currentBytes = 0;
   };
   for (const chunk of chunks || []) {
-    const next = current.concat([chunk]);
-    const probe = JSON.stringify({
-      meta: Object.assign({}, meta, {
-        file: semanticIndexShardFileName(indexFile, shards.length),
-        parentFile: indexFile,
-        shardIndex: shards.length,
-        chunks: next.length
-      }),
-      chunks: next
-    });
-    if (current.length && utf8ByteLength(probe) > maxBytes) flush();
-    current.push(chunk);
+    const chunkBody = JSON.stringify(chunk);
+    const chunkBytes = utf8ByteLength(chunkBody);
+    const nextBytes = currentBytes + chunkBytes;
+    const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shards.length, currentBodies.length + 1, nextBytes);
+    if (currentBodies.length && projectedBytes > maxBytes) flush();
+    currentBodies.push(chunkBody);
+    currentBytes += chunkBytes;
   }
   flush();
   return shards;
+}
+
+async function semanticIndexShardBodiesAsync(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES) {
+  const shards = [];
+  let currentBodies = [];
+  let currentBytes = 0;
+  const flush = async () => {
+    if (!currentBodies.length) return;
+    const shard = semanticIndexShardFromBodies(indexFile, meta, shards.length, currentBodies, currentBytes);
+    shards.push(shard);
+    currentBodies = [];
+    currentBytes = 0;
+    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+  };
+  for (let index = 0; index < (chunks || []).length; index += 1) {
+    const chunk = chunks[index];
+    const chunkBody = JSON.stringify(chunk);
+    const chunkBytes = utf8ByteLength(chunkBody);
+    const nextBytes = currentBytes + chunkBytes;
+    const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shards.length, currentBodies.length + 1, nextBytes);
+    if (currentBodies.length && projectedBytes > maxBytes) await flush();
+    currentBodies.push(chunkBody);
+    currentBytes += chunkBytes;
+    if (index && index % 50 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+  }
+  await flush();
+  return shards;
+}
+
+function semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount) {
+  const file = semanticIndexShardFileName(indexFile, shardIndex);
+  return Object.assign({}, meta, {
+    file,
+    parentFile: indexFile,
+    shardIndex,
+    chunks: chunkCount
+  });
+}
+
+function semanticIndexShardHeader(indexFile, meta, shardIndex, chunkCount) {
+  return `{"meta":${JSON.stringify(semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount))},"chunks":[`;
+}
+
+function semanticIndexShardProjectedBytes(indexFile, meta, shardIndex, chunkCount, chunkBytes) {
+  return utf8ByteLength(semanticIndexShardHeader(indexFile, meta, shardIndex, chunkCount)) + chunkBytes + Math.max(0, chunkCount - 1) + 2;
+}
+
+function semanticIndexShardFromBodies(indexFile, meta, shardIndex, chunkBodies, chunkBytes) {
+  const file = semanticIndexShardFileName(indexFile, shardIndex);
+  const header = semanticIndexShardHeader(indexFile, meta, shardIndex, chunkBodies.length);
+  const body = `${header}${chunkBodies.join(",")}]}`;
+  const bytes = utf8ByteLength(body);
+  return { file, body, bytes, chunkCount: chunkBodies.length };
 }
 
 function semanticIndexShardFileName(indexFile, index) {

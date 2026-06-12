@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.22
+
+- Removed the duplicate Recent log summary from Activity settings and replaced it with one selectable Activity Log Console.
+- Expanded the Activity Log Console to show the full retained local log instead of only the latest 12 entries.
+- Added local workflow-start entries for AI work, semantic index rebuild/update, email processing, note sync, reference rebuilds, and semantic index purges so the console better matches plugin activity without logging every progress tick.
+
 ## 0.5.21
 
 - Reused unchanged semantic-index chunk embeddings during full rebuilds and changed-note updates so ordinary edits only embed new or changed chunks.

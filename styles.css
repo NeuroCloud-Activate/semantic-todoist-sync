@@ -494,6 +494,14 @@
   background: var(--background-secondary);
   white-space: pre-wrap;
   font-size: var(--font-ui-small);
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.semantic-todoist-activity-log:focus {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .semantic-todoist-source {

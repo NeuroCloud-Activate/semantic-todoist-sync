@@ -29,6 +29,7 @@ const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
+const GEMINI_EMBEDDING_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
@@ -1282,14 +1283,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.semanticIndexTimer);
     this.semanticIndexTimer = null;
     this.pendingIndexPaths.clear();
-    const previousIndex = this.semanticIndex || [];
-    const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
+    let previousIndex = this.semanticIndex || [];
+    let previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
     const startedAt = Date.now();
     this.setSidebarStatus("Indexing vault...");
     try {
       await this.ensureCompatibleEmbeddingForChatModel();
+      if (!this.semanticIndexLoaded && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+        this.setSidebarStatus("Loading existing semantic index cache...");
+        await this.ensureSemanticIndexLoaded("semantic index cache");
+      }
+      previousIndex = this.semanticIndex || previousIndex;
+      previousMeta = Object.assign({}, this.settings.semanticIndexMeta || previousMeta);
       this.requireAiAccess();
-      const files = this.getIndexableFiles();
+      const files = this.orderSemanticIndexFiles(this.getIndexableFiles());
       if (!files.length) throw new Error("No indexable Markdown notes were found. Check Indexed folders and Excluded folders in settings.");
       const chunks = [];
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
@@ -1310,16 +1317,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       chunks.push(...this.semanticTaskReferenceChunks());
       if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
 
-      const indexed = [];
-      for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
-        const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
-        this.setSidebarStatus(`Embedding vault chunks ${Math.min(i + batch.length, chunks.length)}/${chunks.length}...`);
-        const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
-        for (let j = 0; j < batch.length; j += 1) {
-          indexed.push(Object.assign({}, batch[j], { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) }));
-        }
-        await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
-      }
+      const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
+      const embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks");
+      const indexed = embedded.indexed;
 
       this.semanticIndex = indexed;
       this.semanticChunkTermCache?.clear?.();
@@ -1334,7 +1334,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
       await this.saveSemanticIndex();
       await this.saveSettings();
-      this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, ms: Date.now() - startedAt });
+      this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, embedded: embedded.embedded, reused: embedded.reused, ms: Date.now() - startedAt });
       if (showNotice) new Notice(`Semantic index rebuilt: ${indexed.length} chunks from ${files.length} notes.`);
       return true;
     } catch (error) {
@@ -1356,6 +1356,36 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const exclude = splitList(this.settings.excludedFolders).map(trimSlashes);
     return this.app.vault.getMarkdownFiles().filter((file) => {
       return this.isIndexablePath(file.path, include, exclude);
+    });
+  }
+
+  semanticIndexPriorityRanks() {
+    const ranks = new Map();
+    const addFile = (file, rank) => {
+      if (!(file instanceof TFile) || file.extension !== "md" || !this.isIndexablePath(file.path)) return;
+      const existing = ranks.get(file.path);
+      if (existing === undefined || rank < existing) ranks.set(file.path, rank);
+    };
+    addFile(this.app.workspace.getActiveViewOfType(MarkdownView)?.file, 0);
+    addFile(this.lastActiveMarkdownLeaf?.view instanceof MarkdownView ? this.lastActiveMarkdownLeaf.view.file : null, 0);
+    const leaves = typeof this.app.workspace.getLeavesOfType === "function" ? this.app.workspace.getLeavesOfType("markdown") : [];
+    for (const leaf of leaves || []) addFile(leaf?.view instanceof MarkdownView ? leaf.view.file : null, 1);
+    if (typeof this.app.workspace.iterateAllLeaves === "function") {
+      this.app.workspace.iterateAllLeaves((leaf) => addFile(leaf?.view instanceof MarkdownView ? leaf.view.file : null, 1));
+    }
+    return ranks;
+  }
+
+  orderSemanticIndexFiles(files) {
+    const priorityRanks = this.semanticIndexPriorityRanks();
+    return Array.from(files || []).sort((a, b) => {
+      const aPriority = priorityRanks.has(a.path) ? priorityRanks.get(a.path) : 2;
+      const bPriority = priorityRanks.has(b.path) ? priorityRanks.get(b.path) : 2;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      const aModified = Number(a.stat?.mtime || 0);
+      const bModified = Number(b.stat?.mtime || 0);
+      if (aModified !== bModified) return bModified - aModified;
+      return String(a.path || "").localeCompare(String(b.path || ""));
     });
   }
 
@@ -1456,20 +1486,65 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const chunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
       .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0 }));
     chunks.push(...this.semanticTaskReferenceChunks(path));
-    if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return false;
-    await this.removePathFromSemanticIndex(path, false);
+    if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return this.refreshSemanticPathChunkMetadata(path, chunks);
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-    for (let i = 0; i < chunks.length; i += this.settings.embeddingBatchSize) {
-      const batch = chunks.slice(i, i + this.settings.embeddingBatchSize);
-      const embeddings = await this.embedTexts(batch.map((chunk) => `${chunk.title}\n${chunk.text}`), "document");
-      for (let j = 0; j < batch.length; j += 1) {
-        this.semanticIndex.push(Object.assign({}, batch[j], { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) }));
-      }
-      await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
-    }
+    const previousIndex = this.semanticIndex || [];
+    const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, this.settings.semanticIndexMeta || {});
+    const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`);
+    this.semanticIndex = previousIndex.filter((chunk) => chunk.path !== path).concat(embedded.indexed);
     this.semanticChunkTermCache?.clear?.();
     this.queueSemanticIndexWarmup();
+    this.logLocal("Semantic note index refreshed", { path, chunks: chunks.length, embedded: embedded.embedded, reused: embedded.reused });
     return true;
+  }
+
+  async embedSemanticChunks(chunks, reuseMap = new Map(), label = "semantic chunks") {
+    const indexed = new Array(chunks.length);
+    const pending = [];
+    let reused = 0;
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      const reusedChunk = reusedSemanticChunk(chunk, reuseMap);
+      if (reusedChunk) {
+        indexed[index] = reusedChunk;
+        reused += 1;
+      } else {
+        pending.push({ chunk, index });
+      }
+    }
+    const batchSize = semanticEmbeddingBatchSize(this.settings);
+    let embedded = 0;
+    if (!pending.length) this.setSidebarStatus(`Reusing ${reused} unchanged ${label}...`);
+    for (let i = 0; i < pending.length; i += batchSize) {
+      const batch = pending.slice(i, i + batchSize);
+      this.setSidebarStatus(`Embedding ${label} ${Math.min(embedded + batch.length, pending.length)}/${pending.length}${reused ? `; reused ${reused}` : ""}...`);
+      const embeddings = await this.embedTexts(batch.map((item) => semanticChunkEmbeddingInput(item.chunk)), "document");
+      for (let j = 0; j < batch.length; j += 1) {
+        const item = batch[j];
+        indexed[item.index] = Object.assign({}, item.chunk, { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) });
+      }
+      embedded += batch.length;
+      await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
+    }
+    return { indexed, embedded, reused };
+  }
+
+  refreshSemanticPathChunkMetadata(path, nextChunks) {
+    const currentById = new Map((this.semanticIndex || [])
+      .filter((chunk) => chunk.path === path)
+      .map((chunk) => [chunk.id, chunk]));
+    let changed = false;
+    for (const next of nextChunks || []) {
+      const current = currentById.get(next.id);
+      if (!current) continue;
+      const nextModifiedAt = Number(next.modifiedAt || 0);
+      if (nextModifiedAt && Number(current.modifiedAt || 0) !== nextModifiedAt) {
+        current.modifiedAt = nextModifiedAt;
+        changed = true;
+      }
+    }
+    if (changed) this.refreshSemanticIndexPathMeta();
+    return changed;
   }
 
   queueTaskReferenceIndexUpdate(path) {
@@ -1558,17 +1633,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async geminiEmbedTexts(texts, role = "document") {
     const model = normalizeGeminiModelId(this.settings.embeddingModel || DEFAULT_SETTINGS.availableGeminiEmbeddingModels[0]);
-    const embeddings = [];
-    for (const text of texts) {
-      const body = { content: { parts: [{ text: geminiEmbeddingInput(text, role, model) }] } };
-      if (model === "gemini-embedding-001") body.taskType = role === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT";
+    if (!texts.length) return [];
+    const embeddings = new Array(texts.length);
+    await asyncPool(texts, geminiEmbeddingConcurrency(this.settings), async (text, index) => {
+      const body = this.geminiEmbeddingRequestBody(model, text, role);
       const response = await this.geminiEmbeddingRequest(model, body);
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`Gemini embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
       }
-      embeddings.push(response.json?.embedding?.values || []);
-    }
+      embeddings[index] = response.json?.embedding?.values || [];
+    });
     return embeddings;
+  }
+
+  geminiEmbeddingRequestBody(model, text, role = "document") {
+    const body = {
+      content: { parts: [{ text: geminiEmbeddingInput(text, role, model) }] }
+    };
+    if (model === "gemini-embedding-001") body.taskType = role === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT";
+    return body;
   }
 
   async geminiEmbeddingRequest(model, body) {
@@ -5922,6 +6005,14 @@ function syncWorkerCount(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(4, parseInt(settings.syncWorkerCount, 10) || DEFAULT_SETTINGS.syncWorkerCount || 1));
 }
 
+function semanticEmbeddingBatchSize(settings = DEFAULT_SETTINGS) {
+  return Math.max(1, Math.min(96, parseInt(settings.embeddingBatchSize, 10) || DEFAULT_SETTINGS.embeddingBatchSize || 16));
+}
+
+function geminiEmbeddingConcurrency(settings = DEFAULT_SETTINGS) {
+  return Math.max(1, Math.min(GEMINI_EMBEDDING_CONCURRENCY, semanticEmbeddingBatchSize(settings)));
+}
+
 function referenceRebuildWorkerCount(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(8, parseInt(settings.referenceRebuildWorkerCount, 10) || DEFAULT_SETTINGS.referenceRebuildWorkerCount || 1));
 }
@@ -7773,6 +7864,45 @@ function semanticPathChunksMatch(index, path, nextChunks) {
     if (String(current.source || "") !== String(next.source || "")) return false;
   }
   return true;
+}
+
+function semanticChunkEmbeddingInput(chunk) {
+  return `${chunk?.title || ""}\n${chunk?.text || ""}`;
+}
+
+function semanticChunkReuseKey(chunk) {
+  return [
+    String(chunk?.title || ""),
+    String(chunk?.kind || ""),
+    String(chunk?.source || ""),
+    shortHash(String(chunk?.text || ""))
+  ].join("\u0000");
+}
+
+function semanticChunkEmbeddingsReusable(settings = DEFAULT_SETTINGS, meta = {}) {
+  const currentModel = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  const indexedModel = meta?.model || currentModel;
+  if (indexedModel && indexedModel !== currentModel) return false;
+  const currentPrecision = Number(settings.semanticIndexEmbeddingPrecision || DEFAULT_SETTINGS.semanticIndexEmbeddingPrecision);
+  const indexedPrecision = Number(meta?.embeddingPrecision || currentPrecision);
+  return indexedPrecision === currentPrecision;
+}
+
+function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {}) {
+  const reuseMap = new Map();
+  if (!semanticChunkEmbeddingsReusable(settings, meta)) return reuseMap;
+  for (const chunk of index || []) {
+    if (!Array.isArray(chunk?.embedding) || !chunk.embedding.length) continue;
+    const key = semanticChunkReuseKey(chunk);
+    if (key && !reuseMap.has(key)) reuseMap.set(key, chunk.embedding);
+  }
+  return reuseMap;
+}
+
+function reusedSemanticChunk(chunk, reuseMap) {
+  const embedding = reuseMap?.get(semanticChunkReuseKey(chunk));
+  if (!Array.isArray(embedding) || !embedding.length) return null;
+  return Object.assign({}, chunk, { embedding });
 }
 
 function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS) {

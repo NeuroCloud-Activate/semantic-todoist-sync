@@ -18,8 +18,10 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
    Forward emails containing tasks to a user-owned Cloudflare Domain and Worker process. The plugin can retrieve those emails, use AI plus ranked vault context to identify actionable main tasks and subtasks, log the created tasks into Obsidian (to keep a record), and synchronize them into Todoist.
 
-## What's New In 0.5.4
+## What's New In 0.5.21
 
+- **0.5.21 update:** Semantic indexing now reuses unchanged chunk embeddings during full rebuilds and changed-note updates, prioritizes the active/open/recent notes first, and keeps the working rebuild in RAM before swapping it into the live index.
+- **0.5.20 update:** Semantic index startup now loads a small path-metadata snapshot first, hydrates full shards later when needed, and writes shard files with less CPU-heavy serialization.
 - **0.5.4 update:** Sync-back now repairs synced subtask indentation retroactively, keeps `#STSubSync` lines stable across Todoist updates, and skips auto-sync/index queues for plugin-generated note writes.
 - **0.5.2 update:** Todoist-to-Obsidian sync-back now treats `#STSubSync` subtasks as authoritative and reapplies the configured indentation when updating note lines.
 - **0.5.1 update:** Email-To-Todoist automatic polling now uses a 420-second minimum and compatible Cloudflare Workers use a small `state/pending.json` queue-state key so empty checks avoid repeated KV list operations.
@@ -27,6 +29,8 @@ Build a local semantic index of your vault to search, answer questions, and iden
 - Sidebar chat can use synced task references alongside note context, with descriptive task links instead of raw URLs.
 - The semantic index stores vault-relative paths, excludes the plugin data folder by default, and writes sync-safe shard files under the Obsidian Sync 5 MB file-size ceiling.
 - Semantic index startup uses a small path-metadata snapshot and hydrates the full index into RAM later when idle or when search/chat/index updates need it.
+- Full rebuilds and changed-note updates reuse unchanged chunk embeddings from the persistent local index, reducing embedding API calls and avoiding unnecessary CPU and network work.
+- Rebuilds process the active note first, then other open notes, then recently modified notes, so useful context becomes available earlier while the rest of the vault continues indexing.
 - Notes-To-Todoist and Email-To-Todoist prompts now use separate main-task and subtask requirements, ranked vault context, and optional plugin-generated source lists with context-note citations.
 - The status bar now uses concise local activity text for indexing, syncing, AI calls, and other plugin work. It does not call the AI API.
 - Settings were simplified by removing legacy insert/sync and date/link order toggles now handled by prompt templates and default plugin formatting.
@@ -75,6 +79,8 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Gemini and OpenAI indexes are stored separately so switching providers does not overwrite the other index (so you can test whichever works best for you!)
    - Index shards are kept under Obsidian Sync's 5 MB file-size ceiling so the index can sync across devices instead of rebuilding separately on each device.
    - A small path-metadata snapshot helps startup and note-change checks avoid loading full shard files until the in-memory index is needed.
+   - Existing unchanged chunks are reused from the persistent index during rebuilds and changed-note updates, so ordinary edits should only embed new or changed chunks.
+   - During rebuilds, the active note, open notes, and recently modified notes are indexed first before older background content.
    - Existing larger legacy shards are loaded with idle yields, then optimized later when the plugin is idle.
    - The plugin folder is excluded from indexing and AI chat context by default.
 

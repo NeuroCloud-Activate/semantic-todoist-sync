@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.21
+
+- Reused unchanged semantic-index chunk embeddings during full rebuilds and changed-note updates so ordinary edits only embed new or changed chunks.
+- Prioritized the active note, other open notes, and recently modified notes during full rebuilds so high-value context is refreshed before older background content.
+- Kept full rebuilds on a working RAM copy until the rebuilt index is ready, preserving the active index for search/chat while background indexing continues.
+- Added bounded concurrent Gemini embedding requests for document batches to reduce rebuild and incremental-update wall time without increasing UI blocking.
+- Refreshed cached chunk modified times when file timestamps change but chunk text does not, reducing repeated stale-note indexing.
+
 ## 0.5.20
 
 - Deferred full semantic-index RAM hydration until idle or first use, while loading a small path-metadata snapshot at startup so Obsidian can open without parsing every shard.

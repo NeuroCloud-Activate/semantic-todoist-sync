@@ -18,8 +18,9 @@ Build a local semantic index of your vault to search, answer questions, and iden
 
    Forward emails containing tasks to a user-owned Cloudflare Domain and Worker process. The plugin can retrieve those emails, use AI plus ranked vault context to identify actionable main tasks and subtasks, log the created tasks into Obsidian (to keep a record), and synchronize them into Todoist.
 
-## What's New In 0.5.21
+## What's New In 0.5.22
 
+- **0.5.22 update:** Activity settings now use one selectable Activity Log Console, show the full retained local log, and capture workflow starts as well as completions, failures, and notable skips.
 - **0.5.21 update:** Semantic indexing now reuses unchanged chunk embeddings during full rebuilds and changed-note updates, prioritizes the active/open/recent notes first, and keeps the working rebuild in RAM before swapping it into the live index.
 - **0.5.20 update:** Semantic index startup now loads a small path-metadata snapshot first, hydrates full shards later when needed, and writes shard files with less CPU-heavy serialization.
 - **0.5.4 update:** Sync-back now repairs synced subtask indentation retroactively, keeps `#STSubSync` lines stable across Todoist updates, and skips auto-sync/index queues for plugin-generated note writes.

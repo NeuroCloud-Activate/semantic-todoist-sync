@@ -934,6 +934,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexStats = { bytes: 0, path: indexFile };
     this.queryEmbeddingCache?.clear?.();
     await this.saveSettings();
+    this.logLocal("Semantic index purged", { file: indexFile });
     if (showNotice) new Notice(`Purged semantic index: ${indexFile}`);
   }
 
@@ -1041,10 +1042,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async withAiActivity(label, work) {
     const previous = this.aiActivity || "";
-    this.aiActivity = singleLine(label || "Working");
+    const activity = singleLine(label || "Working");
+    this.aiActivity = activity;
+    this.logLocal("AI activity started", { activity });
     this.refreshSidebarStatus();
     try {
-      return await work();
+      const result = await work();
+      this.logLocal("AI activity complete", { activity });
+      return result;
+    } catch (error) {
+      this.logLocal("AI activity failed", { activity, error: error.message || String(error) });
+      throw error;
     } finally {
       this.aiActivity = previous;
       this.refreshSidebarStatus();
@@ -1288,6 +1296,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const startedAt = Date.now();
     this.setSidebarStatus("Indexing vault...");
     try {
+      this.logLocal("Semantic index rebuild started", { existingChunks: (previousIndex || []).length });
       await this.ensureCompatibleEmbeddingForChatModel();
       if (!this.semanticIndexLoaded && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
         this.setSidebarStatus("Loading existing semantic index cache...");
@@ -1445,6 +1454,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexInProgress = true;
     this.setSidebarStatus("Indexing vault changes...");
     try {
+      this.logLocal("Semantic index update started", { files: paths.length });
       let changedFiles = 0;
       for (let index = 0; index < paths.length; index += 1) {
         const path = paths[index];
@@ -2374,6 +2384,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.emailProcessingInProgress = true;
     this.setSidebarStatus("Processing email tasks...");
     try {
+      this.logLocal("Email processing started", { automatic: Boolean(options?.automatic) });
       await this.ensureCompatibleEmbeddingForChatModel();
       this.requireAiAccess();
       this.requireTodoistAccess();
@@ -2793,6 +2804,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.syncInProgress = true;
     this.setSidebarStatus("Syncing note tasks...");
     try {
+      this.logLocal("Note sync started", { fullScan });
       this.settings.lastNoteAutoSyncAt = deviceTimestamp();
       this.requireTodoistAccess();
       this.setSidebarStatus("Syncing Todoist changes...");
@@ -2899,6 +2911,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
     this.setSidebarStatus("Rebuilding Todoist references...");
     try {
+      this.logLocal("Todoist reference rebuild started", { force });
       if (!this.settings.todoistToken) throw new Error("Add a Todoist API token first.");
       const files = this.getSyncableTaskFiles();
       const localState = await this.referenceRebuildLocalState(files);
@@ -4744,8 +4757,10 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     activitySetting(containerEl, "Cloudflare email", `Last poll: ${this.plugin.settings.lastEmailPollAt || "Not yet polled"}. Auto-processing: ${this.plugin.settings.autoProcessEmails ? "on" : "off"}.`);
     activitySetting(containerEl, "Notes sync", `Last sync: ${this.plugin.settings.lastNoteAutoSyncAt || "Not yet synced"}. Auto-sync: ${this.plugin.settings.notesAutoSync ? "on" : "off"}. Workers: ${syncWorkerCount(this.plugin.settings)}.`);
     new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
-    new Setting(containerEl).setName("Recent log").setDesc(localLogSummary(this.plugin.settings));
+    settingsHeading(containerEl, "Activity Log Console", "Selectable local workflow log. Progress ticks stay in the status bar; starts, completions, failures, and notable skips are kept here.");
     const log = containerEl.createEl("pre", { cls: "semantic-todoist-activity-log" });
+    log.setAttribute("tabindex", "0");
+    log.setAttribute("aria-label", "Semantic Todoist Sync activity log");
     log.setText(activityLogText(this.plugin.settings));
   }
 
@@ -5445,16 +5460,10 @@ function availableModelSummary(settings) {
   return `${gemini} ${openai}`;
 }
 
-function localLogSummary(settings) {
-  const entries = settings.localLog || [];
-  if (!entries.length) return "No local activity logged yet.";
-  return entries.slice(0, 5).map((entry) => `${entry.at}: ${entry.message}`).join(" | ");
-}
-
 function activityLogText(settings) {
   const entries = settings.localLog || [];
   if (!entries.length) return "No local activity logged yet.";
-  return entries.slice(0, 12).map((entry) => `${entry.at}  ${entry.message}  ${JSON.stringify(entry.data || {})}`).join("\n");
+  return entries.map((entry) => `${entry.at}  ${entry.message}  ${JSON.stringify(entry.data || {})}`).join("\n");
 }
 
 function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.23
+
+- Updated the README to use a more casual, plain-language overview and focus the What's New section on the three biggest functional changes.
+- Added note-created-time semantic ranking so frontmatter such as `created: ["2026-05-20 13:43"]` can help newer same-topic notes win when context conflicts.
+- Added a setting to disable note-created-time parsing and rely only on file metadata for semantic freshness when users want fewer note-header checks.
+- Updated sidebar task references so Todoist links use the task title as linked text, and added an optional chat footer when an AI fallback model answers.
+
 ## 0.5.22
 
 - Removed the duplicate Recent log summary from Activity settings and replaced it with one selectable Activity Log Console.

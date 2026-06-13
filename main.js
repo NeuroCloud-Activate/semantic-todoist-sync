@@ -79,6 +79,7 @@ const DEFAULT_SETTINGS = {
   chatModel: "gemini/gemini-3.5-flash",
   chatFallbackModel: "",
   enableAiModelFallback: true,
+  showAiFallbackNotice: true,
   chatMode: "Vault QA",
   embeddingModel: "gemini/gemini-embedding-2",
   availableChatModels: [],
@@ -98,6 +99,7 @@ const DEFAULT_SETTINGS = {
   semanticIndexMaxChunkChars: 1100,
   semanticIndexMaxChunksPerNote: 20,
   semanticIndexEmbeddingPrecision: 4,
+  useNoteCreatedTimeForSemanticIndex: true,
   indexedFolders: "",
   excludedFolders: PLUGIN_DATA_FOLDER,
   semanticIndexMeta: {},
@@ -1316,9 +1318,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         }
         const text = await this.app.vault.cachedRead(file);
+        const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
         const fileChunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote);
         for (let index = 0; index < fileChunks.length; index += 1) {
-          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0 });
+          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource });
         }
       }
       this.setSidebarStatus("Preparing task reference chunks...");
@@ -1493,8 +1496,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!(file instanceof TFile) || !this.isIndexablePath(path)) return this.removePathFromSemanticIndex(path, false);
     this.requireAiAccess();
     const text = await this.app.vault.cachedRead(file);
+    const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
     const chunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
-      .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0 }));
+      .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource }));
     chunks.push(...this.semanticTaskReferenceChunks(path));
     if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return this.refreshSemanticPathChunkMetadata(path, chunks);
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
@@ -1550,6 +1554,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const nextModifiedAt = Number(next.modifiedAt || 0);
       if (nextModifiedAt && Number(current.modifiedAt || 0) !== nextModifiedAt) {
         current.modifiedAt = nextModifiedAt;
+        changed = true;
+      }
+      const nextCreatedAt = Number(next.createdAt || 0);
+      if (nextCreatedAt && Number(current.createdAt || 0) !== nextCreatedAt) {
+        current.createdAt = nextCreatedAt;
+        changed = true;
+      }
+      const nextCreatedAtSource = String(next.createdAtSource || "");
+      if (nextCreatedAtSource && String(current.createdAtSource || "") !== nextCreatedAtSource) {
+        current.createdAtSource = nextCreatedAtSource;
         changed = true;
       }
     }
@@ -1698,20 +1712,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const queryTerms = termCounts(query);
     const poolSize = Math.max(limit * 6, 40);
-    const semanticCandidates = index
+    const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
+    const semanticRawCandidates = index
       .map((chunk) => {
         const semantic = cosine(queryEmbedding, chunk.embedding);
         const scores = this.contextLexicalScores(chunk, queryTerms);
         const lexical = scores.lexical;
         const title = scores.title;
-        const recency = recencyBoost(chunk.modifiedAt);
-        return { chunk, semantic, lexical, title, recency };
-      })
-      .sort((a, b) => contextCandidateScore(b) - contextCandidateScore(a))
+        return { chunk, semantic, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) };
+      });
+    await this.hydrateCandidateCreatedTimes(semanticRawCandidates, Math.max(poolSize * 2, 60));
+    const semanticCandidates = rankContextCandidates(semanticRawCandidates)
       .slice(0, poolSize);
     const lexicalCandidates = this.lexicalContextCandidates(query, poolSize);
-    const candidates = mergeContextCandidates(semanticCandidates, lexicalCandidates)
-      .sort((a, b) => contextCandidateScore(b) - contextCandidateScore(a));
+    const candidates = rankContextCandidates(mergeContextCandidates(semanticCandidates, lexicalCandidates));
     return diversifyContextCandidates(candidates, limit).map((item) => annotateContextChunk(item));
   }
 
@@ -1722,16 +1736,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   lexicalContextCandidates(query, limit) {
     const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
     const queryTerms = termCounts(query);
-    return chunks
+    const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
+    return rankContextCandidates(chunks
       .map((chunk) => {
         const scores = this.contextLexicalScores(chunk, queryTerms);
         const lexical = scores.lexical;
         const title = scores.title;
-        const recency = recencyBoost(chunk.modifiedAt);
-        return { chunk, semantic: 0, lexical, title, recency };
+        return { chunk, semantic: 0, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) };
       })
-      .filter((item) => item.lexical > 0 || item.title > 0)
-      .sort((a, b) => contextCandidateScore(b) - contextCandidateScore(a))
+      .filter((item) => item.lexical > 0 || item.title > 0))
       .slice(0, Math.max(limit, 1));
   }
 
@@ -1741,6 +1754,67 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       lexical: lexicalScoreFromCounts(queryTerms, entry.allTerms),
       title: lexicalScoreFromCounts(queryTerms, entry.titleTerms)
     };
+  }
+
+  async hydrateCandidateCreatedTimes(candidates, maxPaths = 80) {
+    const ranked = rankContextCandidates(candidates || []);
+    const paths = [];
+    const seen = new Set();
+    const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
+    for (const item of ranked) {
+      const chunk = item.chunk || item;
+      const path = chunk.path || "";
+      const hasUsableCreatedAt = Number(chunk.createdAt || 0) && (useNoteCreatedTime || chunk.createdAtSource === "file");
+      if (!path || hasUsableCreatedAt || seen.has(path)) continue;
+      if (chunk.kind === "todoist-task-reference" || chunk.source === "local-reference-table") continue;
+      const relevance = contextCandidateRelevanceScore(item);
+      if (relevance < 0.08 && !(item.lexical || item.title)) continue;
+      seen.add(path);
+      paths.push(path);
+      if (paths.length >= Math.max(1, maxPaths || 1)) break;
+    }
+    if (!paths.length) return 0;
+    let hydrated = 0;
+    this.semanticCreatedAtPathCache = this.semanticCreatedAtPathCache || new Map();
+    for (let index = 0; index < paths.length; index += 1) {
+      const notePath = paths[index];
+      let createdMeta = this.semanticCreatedAtPathCache.get(notePath);
+      if (createdMeta === undefined) {
+        createdMeta = { createdAt: 0, createdAtSource: "" };
+        try {
+          const file = this.app.vault.getAbstractFileByPath(notePath);
+          if (file instanceof TFile) {
+            createdMeta = useNoteCreatedTime
+              ? semanticCreatedMetadataForFile(file, await this.app.vault.cachedRead(file), this.settings)
+              : semanticCreatedMetadataForFile(file, "", this.settings);
+          }
+        } catch {}
+        this.semanticCreatedAtPathCache.set(notePath, createdMeta);
+      }
+      const createdAt = Number(createdMeta?.createdAt || 0);
+      const createdAtSource = String(createdMeta?.createdAtSource || "");
+      if (createdAt) {
+        for (const chunk of this.semanticIndex || []) {
+          const shouldApply = chunk.path === notePath && (!chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file"));
+          if (shouldApply) {
+            chunk.createdAt = createdAt;
+            if (createdAtSource) chunk.createdAtSource = createdAtSource;
+            hydrated += 1;
+          }
+        }
+        for (const item of candidates || []) {
+          const chunk = item.chunk || item;
+          const shouldApply = chunk.path === notePath && (!chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file"));
+          if (shouldApply) {
+            chunk.createdAt = createdAt;
+            if (createdAtSource) chunk.createdAtSource = createdAtSource;
+          }
+          if (chunk.path === notePath) item.recency = recencyBoost(contextCandidateFreshnessAt(item));
+        }
+      }
+      if (index % 12 === 11) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+    }
+    return hydrated;
   }
 
   semanticChunkTerms(chunk) {
@@ -1887,7 +1961,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
         "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
         "Use markdown links exactly as supplied, and do not invent sources.",
-        "When providing any link, use descriptive linked text in markdown form such as [Open task](url) or [note title](url). Do not display full raw URLs in the visible answer.",
+        "When providing any link, use descriptive linked text in markdown form such as [task title](url) or [note title](url). Do not display full raw URLs in the visible answer.",
+        "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
         "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes.",
         "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
         "Use the task context to identify whether a task already exists before suggesting task creation.",
@@ -1914,12 +1989,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "",
         "User prompt:",
         prompt
-      ].join("\n")
+      ].join("\n"),
+      appendFallbackNotice: this.settings.showAiFallbackNotice !== false
     }));
     return { answer: response, context };
   }
 
-  async openaiResponse({ model, system, user, jsonSchema }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -1927,9 +2003,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const candidateModel = candidates[index];
       try {
         if (index > 0) this.setSidebarStatus(`Retrying AI with ${modelDisplayName(candidateModel)}...`);
-        return usesGeminiChatModel(candidateModel)
+        const response = usesGeminiChatModel(candidateModel)
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema })
           : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema });
+        if (index > 0 && appendFallbackNotice && !jsonSchema) {
+          return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
+        }
+        return response;
       } catch (error) {
         lastError = error;
         if (!this.settings.enableAiModelFallback || index >= candidates.length - 1 || !isTransientAiModelError(error)) throw error;
@@ -2175,6 +2255,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Follow the Main task requirements for every top-level task and the Subtask requirements for every subtask.",
         "Use the active source content, ranked vault context, and existing local Todoist reference context for every task-generation decision, including main tasks and subtasks.",
         "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
+        "When ranked vault context conflicts on the same topic, prefer the newest matching note as the current guidance while preserving older notes only as background.",
         "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
         "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
         source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, use only explicit action, follow-up, review, waiting-on, or decision requests from the email thread.",
@@ -2244,6 +2325,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
         "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
         "Use vault context as required supporting context when it is available; prioritize the highest-ranked excerpts that explain dependencies, constraints, people, documents, program status, rationale, or next information needed.",
+        "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Explain the useful why/so-what behind the context in plain language so the task can be actioned without reopening every source.",
         "Never return an empty description. Never say only to use the source material.",
@@ -2322,6 +2404,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Return only JSON matching the schema.",
         "Each description must be 80-1200 characters and must explain the specific context, rationale, dependencies, people, documents, and next information needed to action the task.",
         "Use active source content first, then use ranked relevant vault context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
+        "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Do not mention whether web links or linked files were found, missing, excluded, or unavailable.",
@@ -4649,6 +4732,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     modelDropdownSetting(containerEl, "Default AI model", "Used for sidebar chat, vault question-answering, and task generation.", this.plugin, "chatModel", "availableChatModels");
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin);
+    toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
     dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic vault search and active-note context for sourced answers. Chat is a lighter general conversation mode. Task Creation is for prompts that generate Todoist-ready tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
     dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
     numberSetting(containerEl, "Chat font size px", this.plugin, "chatFontSizePx");
@@ -4696,6 +4780,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Index chunk size characters", this.plugin, "semanticIndexMaxChunkChars");
     numberSetting(containerEl, "Max index chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
     numberSetting(containerEl, "Index embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
+    toggleSetting(containerEl, "Use note created time in semantic ranking", "Recommended. Add frontmatter such as created: [\"2026-05-20 13:43\"] to each Markdown note so semantic search can prefer the most current meeting guidance. This value is stored in the semantic index and used for context ranking. If this is off, or if the note has no created value, the plugin uses file metadata instead: created time for freshness and modified time for note updates.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
     toggleSetting(containerEl, "Automatically update semantic index", "Re-index created or modified notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
     numberSetting(containerEl, "Semantic index delay seconds", this.plugin, "semanticIndexDelaySeconds");
     new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin))
@@ -4956,6 +5041,7 @@ const SETTING_DESCRIPTIONS = {
   googleApiKey: "Required for the default Gemini setup. Create this in Google AI Studio and paste it here.",
   chatFallbackModel: "Optional. Choose a same-provider fallback model for temporary overload or rate-limit errors. Leave Automatic to use the next available model from the selected provider.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
+  showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
@@ -4967,6 +5053,7 @@ const SETTING_DESCRIPTIONS = {
   semanticIndexMaxChunkChars: "Approximate size of each note chunk before embedding.",
   semanticIndexMaxChunksPerNote: "Caps how much of a single note can enter the semantic index.",
   semanticIndexEmbeddingPrecision: "Number of decimal places retained in stored embeddings. Lower is smaller; higher is more precise.",
+  useNoteCreatedTimeForSemanticIndex: "Uses a note frontmatter created value, for example created: [\"2026-05-20 13:43\"], as the meeting/date signal in semantic ranking. When disabled, only file metadata is used.",
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
   autoProcessEmails: "When enabled, Obsidian polls your Cloudflare Worker for forwarded emails while the app is open.",
@@ -7246,11 +7333,60 @@ function mergeContextCandidates(...groups) {
   return Array.from(byId.values());
 }
 
-function contextCandidateScore(item) {
+function rankContextCandidates(candidates = []) {
+  const list = (candidates || []).map((item) => Object.assign({}, item));
+  if (!list.length) return list;
+  const topRelevance = Math.max(0, ...list.map((item) => contextCandidateRelevanceScore(item)));
+  const freshnessTimes = list
+    .filter((item) => contextCandidateFreshnessEligible(item, topRelevance))
+    .map((item) => contextCandidateFreshnessAt(item))
+    .filter(Boolean);
+  const oldest = freshnessTimes.length ? Math.min(...freshnessTimes) : 0;
+  const newest = freshnessTimes.length ? Math.max(...freshnessTimes) : 0;
+  for (const item of list) item.relativeRecency = contextRelativeRecencyBoost(item, topRelevance, oldest, newest);
+  return list.sort((a, b) => contextCandidateScore(b) - contextCandidateScore(a) ||
+    contextCandidateFreshnessAt(b) - contextCandidateFreshnessAt(a) ||
+    (b.semantic || 0) - (a.semantic || 0) ||
+    (b.lexical || 0) - (a.lexical || 0));
+}
+
+function contextCandidateRelevanceScore(item) {
   return (item.semantic || 0) * 0.72 +
     Math.min(0.22, (item.lexical || 0) * 0.018) +
-    Math.min(0.08, (item.title || 0) * 0.025) +
-    (item.recency || 0);
+    Math.min(0.08, (item.title || 0) * 0.025);
+}
+
+function contextCandidateScore(item) {
+  return contextCandidateRelevanceScore(item) +
+    (item.recency || 0) +
+    (item.relativeRecency || 0);
+}
+
+function contextCandidateFreshnessEligible(item, topRelevance = 0) {
+  const relevance = contextCandidateRelevanceScore(item);
+  if (relevance <= 0) return false;
+  if ((item.lexical || 0) > 0 || (item.title || 0) > 0) return relevance >= Math.max(0.08, topRelevance * 0.45);
+  return relevance >= Math.max(0.18, topRelevance * 0.7);
+}
+
+function contextRelativeRecencyBoost(item, topRelevance = 0, oldest = 0, newest = 0) {
+  const freshnessAt = contextCandidateFreshnessAt(item);
+  if (!freshnessAt || !oldest || !newest || newest <= oldest) return 0;
+  if (!contextCandidateFreshnessEligible(item, topRelevance)) return 0;
+  const closeness = topRelevance > 0 ? Math.min(1, contextCandidateRelevanceScore(item) / topRelevance) : 0;
+  if (closeness < 0.45) return 0;
+  const relative = Math.max(0, Math.min(1, (freshnessAt - oldest) / (newest - oldest)));
+  return Math.min(0.16, relative * 0.16 * closeness);
+}
+
+function contextCandidateFreshnessAt(item) {
+  const chunk = item?.chunk || item || {};
+  const useNoteCreatedTime = item?.useNoteCreatedTime !== false;
+  const storedCreatedAt = Number(chunk.createdAt || 0);
+  return (storedCreatedAt && (useNoteCreatedTime || chunk.createdAtSource === "file") ? storedCreatedAt : 0) ||
+    (useNoteCreatedTime ? noteCreatedTimestamp(chunk.text || "") : 0) ||
+    (useNoteCreatedTime ? noteDateTimestamp(chunk.title, chunk.path) : 0) ||
+    Number(chunk.modifiedAt || 0);
 }
 
 function diversifyContextCandidates(candidates, limit) {
@@ -7283,6 +7419,7 @@ function annotateContextChunk(item) {
   if ((item.semantic || 0) > 0.2) reasons.push(`semantic ${item.semantic.toFixed(3)}`);
   if (item.lexical) reasons.push(`keyword ${item.lexical.toFixed(1)}`);
   if (item.title) reasons.push("title/path match");
+  if (item.relativeRecency) reasons.push("newer matching note");
   if (item.recency) reasons.push("recent note");
   return Object.assign({}, chunk, {
     matchScore: Math.round(score * 1000) / 1000,
@@ -7803,7 +7940,7 @@ function renderContextSummary(contextNotes) {
 
 function formatTaskReference(task, settings = DEFAULT_SETTINGS) {
   const status = task.isCompleted ? "completed" : "open";
-  const todoist = task.id ? ` Todoist: ${todoistTaskMarkdownLink(task.id, settings)}. OID: ${task.oid || "unknown"}.` : " No Todoist link.";
+  const todoist = task.id ? ` Todoist: ${todoistTaskMarkdownLink(task.id, settings, task.content)}. OID: ${task.oid || "unknown"}.` : " No Todoist link.";
   const due = task.due_date ? ` Due: ${task.due_date}.` : "";
   const labels = task.labels?.length ? ` Labels: ${task.labels.map((label) => `#${label}`).join(" ")}.` : "";
   return `- ${status}: ${task.content}.${due}${labels}${todoist} Note: [${task.path}](obsidian://open?file=${encodeURIComponent(task.path)}).`;
@@ -7815,7 +7952,8 @@ function formatCachedTaskReference(id, task, settings = DEFAULT_SETTINGS) {
   const labels = task.labels?.length ? ` Labels: ${task.labels.map((label) => `#${label}`).join(" ")}.` : "";
   const path = task.path || "";
   const source = path ? ` Note: [${path}](obsidian://open?file=${encodeURIComponent(path)}).` : "";
-  return `- ${status}: ${task.content || "Untitled task"}.${due}${labels} Todoist: ${todoistTaskMarkdownLink(id, settings)}. OID: ${task.oid || "unknown"}.${source}`;
+  const title = task.content || "Untitled task";
+  return `- ${status}: ${title}.${due}${labels} Todoist: ${todoistTaskMarkdownLink(id, settings, title)}. OID: ${task.oid || "unknown"}.${source}`;
 }
 
 function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childText = "") {
@@ -7871,6 +8009,8 @@ function semanticPathChunksMatch(index, path, nextChunks) {
     if (String(current.title || "") !== String(next.title || "")) return false;
     if (String(current.kind || "") !== String(next.kind || "")) return false;
     if (String(current.source || "") !== String(next.source || "")) return false;
+    if (Number(current.createdAt || 0) !== Number(next.createdAt || 0)) return false;
+    if (String(current.createdAtSource || "") !== String(next.createdAtSource || "")) return false;
   }
   return true;
 }
@@ -7914,15 +8054,21 @@ function reusedSemanticChunk(chunk, reuseMap) {
   return Object.assign({}, chunk, { embedding });
 }
 
-function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS) {
+function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS, label = "") {
   const url = todoistTaskUrl(id, settings);
-  return url ? `[Open task](${url})` : String(id || "");
+  const title = markdownLinkText(label || "Open task");
+  return url ? `[${title}](${url})` : String(id || "");
 }
 
 function todoistTaskUrl(id, settings = DEFAULT_SETTINGS) {
   const taskId = String(id || "").trim();
   if (!taskId) return "";
   return settings.linksAppURI ? `todoist://task?id=${encodeURIComponent(taskId)}` : `https://todoist.com/app/task/${encodeURIComponent(taskId)}`;
+}
+
+function markdownLinkText(value) {
+  const text = singleLine(value || "Open task") || "Open task";
+  return text.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
 }
 
 function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
@@ -8049,6 +8195,69 @@ function specificDateTokens(text) {
 function dateTokensOverlap(requiredTokens, candidateTokens) {
   for (const token of requiredTokens || []) if ((candidateTokens || new Set()).has(token)) return true;
   return false;
+}
+
+function noteCreatedTimestamp(text) {
+  const head = String(text || "").slice(0, 2400);
+  const frontmatter = head.match(/^\s*---\s*\n([\s\S]*?)\n---/);
+  const scope = frontmatter ? frontmatter[1] : head.split("\n").slice(0, 30).join("\n");
+  const line = scope.match(/^\s*(?:created|created[_\s-]*at|date[_\s-]*created|meeting[_\s-]*date)\s*:\s*(.+)$/im);
+  return line ? parseLooseDateTimestamp(line[1]) : 0;
+}
+
+function semanticNoteCreatedTimeEnabled(settings = DEFAULT_SETTINGS) {
+  return settings?.useNoteCreatedTimeForSemanticIndex !== false;
+}
+
+function semanticCreatedAtForFile(file, text = "", settings = DEFAULT_SETTINGS) {
+  return semanticCreatedMetadataForFile(file, text, settings).createdAt;
+}
+
+function semanticCreatedMetadataForFile(file, text = "", settings = DEFAULT_SETTINGS) {
+  const fileCreatedAt = Number(file?.stat?.ctime || 0);
+  const fileModifiedAt = Number(file?.stat?.mtime || 0);
+  if (semanticNoteCreatedTimeEnabled(settings)) {
+    const noteCreatedAt = noteCreatedTimestamp(text);
+    if (noteCreatedAt) return { createdAt: noteCreatedAt, createdAtSource: "note" };
+  }
+  if (fileCreatedAt) return { createdAt: fileCreatedAt, createdAtSource: "file" };
+  if (fileModifiedAt) return { createdAt: fileModifiedAt, createdAtSource: "file" };
+  return { createdAt: 0, createdAtSource: "" };
+}
+
+function noteDateTimestamp(...values) {
+  return parseLooseDateTimestamp(values.filter(Boolean).join(" "));
+}
+
+function parseLooseDateTimestamp(value) {
+  const text = String(value || "")
+    .replace(/[\[\]"']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return 0;
+  let match = text.match(/\b(\d{4})[-_/](\d{1,2})[-_/](\d{1,2})(?:[ T]+(\d{1,2}):(\d{2}))?/);
+  if (match) return timestampFromDateParts(match[1], match[2], match[3], match[4], match[5]);
+  const monthPattern = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+  match = text.match(new RegExp(`\\b${monthPattern}\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,)?\\s+(\\d{4})(?:\\s+(\\d{1,2}):(\\d{2}))?`, "i"));
+  if (match) return timestampFromDateParts(match[3], monthNumber(match[1]), match[2], match[4], match[5]);
+  match = text.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+${monthPattern}\\.?\\s+(\\d{4})(?:\\s+(\\d{1,2}):(\\d{2}))?`, "i"));
+  if (match) return timestampFromDateParts(match[3], monthNumber(match[2]), match[1], match[4], match[5]);
+  return 0;
+}
+
+function timestampFromDateParts(year, month, day, hour = 0, minute = 0) {
+  const y = Number(year);
+  const m = Number(month);
+  const d = Number(day);
+  const h = Number(hour || 0);
+  const min = Number(minute || 0);
+  if (!y || !m || !d || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+  return new Date(y, m - 1, d, h, min, 0, 0).getTime();
+}
+
+function monthNumber(value) {
+  const key = String(value || "").slice(0, 3).toLowerCase();
+  return { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 }[key] || 0;
 }
 
 function taskReferenceSearchText(task, childText = "") {

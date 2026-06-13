@@ -1,40 +1,38 @@
 # Semantic Todoist Sync
 
-> **AI vibecoded project:** Semantic Todoist Sync was built collaboratively with AI using OpenAI Codex. If you're concerned, please review the code, security model, and workflow assumptions before using it with your Obsidian vault content, emails, or Todoist data.
+Semantic Todoist Sync is for people who live in Obsidian, but still need their actual action items to land in Todoist.
 
-Build a local semantic index of your vault to search, answer questions, and identify tasks from notes using AI and vault context. Generate actionable tasks from notes or forwarded emails, insert those tasks into notes for traceability, and synchronize them with Todoist. The plugin supports 2-way task sync between Obsidian and Todoist, local OID-based reference tracking, task-aware chat, configurable prompts, and mostly local reconciliation to reduce repeated API calls.
+It builds a local semantic index of your vault, uses your own AI API key to understand note context, turns notes or forwarded emails into Todoist-ready tasks, writes those tasks back into Obsidian for traceability, and keeps the two sides synced. The plugin also keeps a local Todoist reference table so it can answer questions about existing tasks and avoid pestering external APIs more than it needs to.
 
-## Primary Functions
+> **AI vibecoded project:** This plugin was built collaboratively with AI using OpenAI Codex. Please review the code, security model, and workflow assumptions before using it with vault content, emails, or Todoist data you care about.
+
+## What It Does
 
 1. **Semantic vault search and question-answering**
 
-   Build a local semantic index of your Obsidian vault so you can search and query across your notes (similar to the Copilot plugin). The plugin ranks relevant note context, uses recent matching notes when useful, and can include compact synced-task references from the local Todoist table so task-aware questions can find existing OID-backed tasks.
+   Ask questions across your vault using ranked note context. The plugin can also pull in compact task references from its local Todoist table, so answers can point to tasks you already created instead of pretending they do not exist.
 
 2. **Notes-To-Todoist**
 
-   Generate actionable tasks from your Obsidian notes, insert them back into the note with Semantic Todoist Sync markers, and synchronize them with Todoist. Existing note tasks can be preserved using local OIDs (Obsidian IDs) and a local Todoist snapshot/reference table to reduce API calls, speed up reconciliation, update changed Todoist fields back into notes, and recover Todoist task links when needed.
+   Turn meeting notes, project notes, or selected text into main tasks and subtasks. The tasks are inserted back into the note with Semantic Todoist Sync markers, then synced to Todoist with local OIDs so later updates can be reconciled.
 
 3. **Email-To-Todoist**
 
-   Forward emails containing tasks to a user-owned Cloudflare Domain and Worker process. The plugin can retrieve those emails, use AI plus ranked vault context to identify actionable main tasks and subtasks, log the created tasks into Obsidian (to keep a record), and synchronize them into Todoist.
+   Forward task-heavy emails into a user-owned Cloudflare Worker queue. The plugin can pull them into Obsidian, use AI plus vault context to identify the real tasks, write a note log, and sync the tasks into Todoist.
 
-## What's New In 0.5.22
+## What's New In 0.5.23
 
-- **0.5.22 update:** Activity settings now use one selectable Activity Log Console, show the full retained local log, and capture workflow starts as well as completions, failures, and notable skips.
-- **0.5.21 update:** Semantic indexing now reuses unchanged chunk embeddings during full rebuilds and changed-note updates, prioritizes the active/open/recent notes first, and keeps the working rebuild in RAM before swapping it into the live index.
-- **0.5.20 update:** Semantic index startup now loads a small path-metadata snapshot first, hydrates full shards later when needed, and writes shard files with less CPU-heavy serialization.
-- **0.5.4 update:** Sync-back now repairs synced subtask indentation retroactively, keeps `#STSubSync` lines stable across Todoist updates, and skips auto-sync/index queues for plugin-generated note writes.
-- **0.5.2 update:** Todoist-to-Obsidian sync-back now treats `#STSubSync` subtasks as authoritative and reapplies the configured indentation when updating note lines.
-- **0.5.1 update:** Email-To-Todoist automatic polling now uses a 420-second minimum and compatible Cloudflare Workers use a small `state/pending.json` queue-state key so empty checks avoid repeated KV list operations.
-- Todoist-to-Obsidian sync now refreshes task titles, completion state, labels, priorities, dates, deadlines, sections, projects, and subtask indentation from the local Todoist snapshot.
-- Sidebar chat can use synced task references alongside note context, with descriptive task links instead of raw URLs.
-- The semantic index stores vault-relative paths, excludes the plugin data folder by default, and writes sync-safe shard files under the Obsidian Sync 5 MB file-size ceiling.
-- Semantic index startup uses a small path-metadata snapshot and hydrates the full index into RAM later when idle or when search/chat/index updates need it.
-- Full rebuilds and changed-note updates reuse unchanged chunk embeddings from the persistent local index, reducing embedding API calls and avoiding unnecessary CPU and network work.
-- Rebuilds process the active note first, then other open notes, then recently modified notes, so useful context becomes available earlier while the rest of the vault continues indexing.
-- Notes-To-Todoist and Email-To-Todoist prompts now use separate main-task and subtask requirements, ranked vault context, and optional plugin-generated source lists with context-note citations.
-- The status bar now uses concise local activity text for indexing, syncing, AI calls, and other plugin work. It does not call the AI API.
-- Settings were simplified by removing legacy insert/sync and date/link order toggles now handled by prompt templates and default plugin formatting.
+1. **Smarter answers when your notes disagree**
+
+   Semantic context now pays attention to meeting/note dates, including frontmatter like `created: ["2026-05-20 13:43"]`. When older notes and newer notes talk about the same thing, the plugin is better at treating the newer matching note as the current guidance while still keeping older notes available as background.
+
+2. **A lighter, faster semantic index**
+
+   The index now uses sync-safe shard files, path metadata, RAM hydration, chunk-level embedding reuse, and active/recent-note prioritization. In plain English: Obsidian should spend less time freezing, fewer unchanged chunks need to be embedded again, and useful recent context becomes available sooner.
+
+3. **Better Todoist continuity**
+
+   The local Todoist reference table is doing more work now: chat can link to existing tasks by title, sync-back refreshes Todoist changes into notes, subtasks keep their indentation, and Email-To-Todoist/Notes-To-Todoist both use the same stronger task context and prompt rules.
 
 ## What It Uses
 

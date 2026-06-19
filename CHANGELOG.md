@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.2
+
+- Expanded Schedule Today's Tasks preview suggestions from five to the top ten swap candidates so more high-priority unscheduled work can be reviewed before applying a plan.
+- Integrated semantic-index context into scheduler priority selection as well as duration estimation, so Todoist priority, deadlines, recency, scheduler memory, and relevant vault context all inform the proposed day.
+- Added 15-minute duration stepping while still respecting the configured minimum task block, and scaled the preview timeline to the same minimum block setting.
+- Added scheduler memory policy support for quick follow-up, discussion, meeting-planning, coordination, and collaboration tasks so those items stay capped to the configured minimum block by default.
+- Kept Todoist as the scheduling source of truth by applying approved due datetimes and duration fields immediately, then relying on normal note sync to update Obsidian.
+- Refreshed README and scheduler documentation for the integrated scheduler workflow, preview behavior, semantic context use, Todoist writeback, and mobile-friendly controls.
+
+## 0.6.1
+
+- Added Schedule Today's Tasks, a Todoist-first daily scheduler that previews today's highest-priority overdue and soon-due work in compact time blocks before writing anything back to Todoist.
+- Added local scheduler memory outside plugin settings so accepted durations, manual preview order changes, promoted suggestions, bumped tasks, Todoist priority, and compact vault context can improve future planning without triggering automatic rescheduling.
+- Added mobile-friendly scheduler preview controls, suggested swaps for up to five unscheduled tasks, moved-out task tracking, lunch/workday constraints, undo support, and next-workday continuation subtasks for oversized work.
+- Added `Schedule today's tasks` as a seeded vault prompt action using `action: schedule-today`; scheduler settings remain authoritative while the prompt coordinates duration-estimation guidance.
+- Hardened same-provider AI fallback so automatic Gemini fallback chooses one usable text model, prefers Gemini 3.1 Flash Lite behind Gemini 3.5 Flash, skips known unavailable/non-text models, shows the primary plus automatic/manual fallback choice in settings, and lets Schedule Today continue with local duration estimates if AI duration estimation is unavailable.
+- Clarified the sidebar toolbar so `Ask` is only for chat, `Tasks` directly generates note tasks, the compact `Run:` dropdown plus `Run` handles scheduler and prompt actions, and the active-note chat state lives in the note picker instead of a separate sidebar block.
+- Updated README documentation to describe the scheduler workflow, local scheduler memory, semantic-index performance work, and current Todoist continuity features.
+
 ## 0.5.23
 
 - Updated the README to use a more casual, plain-language overview and focus the What's New section on the three biggest functional changes.

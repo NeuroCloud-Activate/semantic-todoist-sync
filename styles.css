@@ -177,33 +177,52 @@
 
 .semantic-todoist-header {
   display: flex;
-  justify-content: space-between;
   gap: 8px;
   align-items: center;
 }
 
 .semantic-todoist-header h3 {
+  flex: 1 1 auto;
   margin: 0;
+  min-width: 0;
 }
 
 .semantic-todoist-header button {
   border-radius: 6px;
+  flex: 0 0 auto;
+}
+
+.semantic-todoist-header-icon {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  min-width: 34px;
+  padding-inline: 6px;
 }
 
 .semantic-todoist-note-row {
-  display: grid;
-  grid-template-columns: minmax(0, 88px) minmax(0, 1fr);
-  gap: 8px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
 }
 
-.semantic-todoist-note-row span {
+.semantic-todoist-note-label {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
+  font-weight: 600;
+  line-height: 1.15;
 }
 
 .semantic-todoist-note-picker {
   position: relative;
+  min-width: 0;
+}
+
+.semantic-todoist-note-picker-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 5px;
   min-width: 0;
 }
 
@@ -223,8 +242,45 @@
   width: 100%;
 }
 
+.semantic-todoist-note-chat-toggle {
+  align-items: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: var(--font-ui-smaller);
+  font-weight: 700;
+  justify-content: center;
+  line-height: 1;
+  min-height: 32px;
+  min-width: 34px;
+  padding: 0;
+  position: relative;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.semantic-todoist-note-chat-toggle input {
+  height: 1px;
+  opacity: 0;
+  position: absolute;
+  width: 1px;
+}
+
+.semantic-todoist-note-chat-toggle.is-chat-included {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.semantic-todoist-note-chat-toggle.is-chat-excluded {
+  background: var(--background-modifier-border);
+  border-color: var(--background-modifier-border-hover);
+  color: var(--text-muted);
+}
+
 .semantic-todoist-note-search {
-  margin-top: 6px;
+  margin-top: 0;
 }
 
 .semantic-todoist-note-results {
@@ -237,20 +293,6 @@
 
 .semantic-todoist-note-results:empty {
   display: none;
-}
-
-.semantic-todoist-context-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-muted);
-  font-size: var(--font-ui-small);
-}
-
-.semantic-todoist-context-toggle label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .semantic-todoist-note-result {
@@ -277,7 +319,6 @@
   word-break: break-word;
 }
 
-.semantic-todoist-active-summary,
 .semantic-todoist-relevant {
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
@@ -286,21 +327,10 @@
   font-size: var(--font-ui-small);
 }
 
-.semantic-todoist-active-summary {
-  flex: 0 0 auto;
-}
-
-.semantic-todoist-active-summary div {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .semantic-todoist-relevant {
   flex: 0 0 auto;
 }
 
-.semantic-todoist-active-summary strong,
 .semantic-todoist-relevant strong {
   display: inline-block;
   margin: 0 6px 0 0;
@@ -344,14 +374,47 @@
 }
 
 .semantic-todoist-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
   align-items: center;
 }
 
 .semantic-todoist-toolbar button {
   border-radius: 6px;
+  min-width: 0;
+}
+
+.semantic-todoist-toolbar button {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  line-height: 1;
+  min-height: 34px;
+  padding-block: 0;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.semantic-todoist-action-row {
+  align-items: center;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.semantic-todoist-action-label {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.semantic-todoist-action-row select {
+  border-radius: 6px;
+  min-height: 34px;
+  width: 100%;
 }
 
 .semantic-todoist-conversation {
@@ -624,6 +687,300 @@
   resize: vertical;
 }
 
+.semantic-todoist-weight-setting .setting-item-control {
+  min-width: min(220px, 100%);
+}
+
+.semantic-todoist-weight-control {
+  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) 72px;
+  gap: 8px;
+  width: min(240px, 100%);
+}
+
+.semantic-todoist-weight-control input[type="range"] {
+  width: 100%;
+}
+
+.semantic-todoist-weight-label {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: right;
+}
+
+.semantic-todoist-schedule-modal {
+  width: min(520px, calc(100vw - 24px));
+}
+
+.semantic-todoist-schedule-modal .semantic-todoist-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.semantic-todoist-schedule-header h2 {
+  margin: 0 0 2px;
+  font-size: 1.15em;
+}
+
+.semantic-todoist-schedule-header div {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.semantic-todoist-schedule-summary {
+  display: flex;
+  gap: 5px;
+  overflow-x: auto;
+  padding-bottom: 1px;
+  white-space: nowrap;
+}
+
+.semantic-todoist-schedule-summary span {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  padding: 2px 7px;
+}
+
+.semantic-todoist-schedule-timeline {
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  max-height: min(42vh, 360px);
+  min-height: 120px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  position: relative;
+}
+
+.semantic-todoist-schedule-slot {
+  border-top: 1px solid var(--background-modifier-border);
+  height: var(--schedule-slot-height);
+  left: 0;
+  position: absolute;
+  right: 0;
+}
+
+.semantic-todoist-schedule-slot:first-child {
+  border-top: 0;
+}
+
+.semantic-todoist-schedule-slot.is-lunch {
+  background: var(--background-secondary);
+}
+
+.semantic-todoist-schedule-time {
+  color: var(--text-faint);
+  display: inline-block;
+  font-size: 10px;
+  line-height: var(--schedule-slot-height);
+  padding-left: 5px;
+  width: 46px;
+}
+
+.semantic-todoist-schedule-block {
+  align-items: stretch;
+  background: var(--background-secondary);
+  border: 1px solid var(--interactive-accent);
+  border-left-width: 3px;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  display: grid;
+  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  left: 48px;
+  min-height: 24px;
+  overflow: hidden;
+  padding: 3px 4px;
+  position: absolute;
+  right: 6px;
+  touch-action: none;
+}
+
+.semantic-todoist-schedule-block.is-short {
+  grid-template-columns: minmax(0, 1fr) 63px;
+  padding-bottom: 2px;
+  padding-top: 2px;
+}
+
+.semantic-todoist-schedule-block.is-fixed {
+  border-color: var(--background-modifier-border);
+  opacity: 0.84;
+}
+
+.semantic-todoist-schedule-block.has-lunch-overlap {
+  outline: 1px dashed var(--text-warning);
+  outline-offset: -3px;
+}
+
+.semantic-todoist-schedule-block-main {
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-main {
+  justify-content: center;
+}
+
+.semantic-todoist-schedule-block-title {
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  line-height: 1.08;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.semantic-todoist-schedule-block:not(.is-short) .semantic-todoist-schedule-block-main {
+  justify-content: center;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-title {
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.semantic-todoist-schedule-block-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-meta {
+  display: none;
+}
+
+.semantic-todoist-schedule-block-controls {
+  align-self: center;
+  display: grid;
+  gap: 2px;
+  grid-template-columns: repeat(2, 19px);
+}
+
+.semantic-todoist-schedule-block-controls button {
+  align-items: center;
+  display: inline-flex;
+  font-size: 10px;
+  height: 13px;
+  justify-content: center;
+  line-height: 1;
+  min-height: 13px;
+  padding: 0;
+  width: 19px;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls {
+  gap: 1px;
+  grid-template-columns: repeat(4, 15px);
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls button {
+  font-size: 9px;
+  height: 13px;
+  min-height: 13px;
+  width: 15px;
+}
+
+.semantic-todoist-schedule-resize {
+  bottom: 0;
+  color: transparent;
+  cursor: ns-resize;
+  height: 8px;
+  left: 0;
+  position: absolute;
+  right: 0;
+}
+
+.semantic-todoist-schedule-list {
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  max-height: 92px;
+  overflow: auto;
+  padding-top: 6px;
+}
+
+.semantic-todoist-schedule-list h3 {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  margin: 0 0 4px;
+}
+
+.semantic-todoist-schedule-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 132px;
+}
+
+.semantic-todoist-schedule-suggestion {
+  align-items: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  cursor: grab;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 5px;
+}
+
+.semantic-todoist-schedule-suggestion.is-bumped {
+  background: var(--background-secondary);
+}
+
+.semantic-todoist-schedule-suggestion-title {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.semantic-todoist-schedule-suggestion-reason,
+.semantic-todoist-schedule-list-empty,
+.semantic-todoist-schedule-bumped {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.semantic-todoist-schedule-suggestion button {
+  font-size: var(--font-ui-smaller);
+  min-height: 26px;
+  padding: 2px 8px;
+}
+
+.semantic-todoist-schedule-bumped {
+  border-top: 1px solid var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 2px;
+  padding-top: 5px;
+}
+
+.semantic-todoist-schedule-bumped h3 {
+  margin-bottom: 1px;
+}
+
+.semantic-todoist-schedule-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 @media (max-width: 700px) {
   .semantic-todoist-settings .setting-item {
     align-items: stretch;
@@ -679,25 +1036,24 @@
   }
 
   .semantic-todoist-note-row {
-    grid-template-columns: minmax(0, 72px) minmax(0, 1fr);
+    gap: 3px;
+  }
+
+  .semantic-todoist-note-picker-line {
     gap: 4px;
+    grid-template-columns: minmax(0, 1fr) 32px;
   }
 
-  .semantic-todoist-context-toggle label {
-    align-items: flex-start;
+  .semantic-todoist-note-chat-toggle {
+    font-size: 0.68em;
+    min-height: 34px;
+    min-width: 32px;
   }
 
-  .semantic-todoist-active-summary,
   .semantic-todoist-relevant,
   .semantic-todoist-conversation,
   .semantic-todoist-message-text {
     border-radius: 6px;
-  }
-
-  .semantic-todoist-active-summary div {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .semantic-todoist-conversation {
@@ -712,13 +1068,17 @@
 
   .semantic-todoist-toolbar {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 5px;
   }
 
   .semantic-todoist-toolbar button {
     padding-inline: 4px;
     width: 100%;
+  }
+
+  .semantic-todoist-action-row select {
+    min-height: 34px;
   }
 
   .semantic-todoist-chat-prompt {
@@ -734,6 +1094,69 @@
   .semantic-todoist-reference-table-wrap {
     max-height: 48vh;
   }
+
+  .semantic-todoist-schedule-modal {
+    width: 100vw;
+    max-width: 100vw;
+  }
+
+  .semantic-todoist-schedule-header h2 {
+    font-size: 1.05em;
+  }
+
+  .semantic-todoist-schedule-timeline {
+    border-radius: 6px;
+    max-height: 38vh;
+  }
+
+  .semantic-todoist-schedule-time {
+    width: 40px;
+  }
+
+  .semantic-todoist-schedule-block {
+    border-radius: 7px;
+    left: 42px;
+    padding: 3px 4px;
+    right: 4px;
+  }
+
+  .semantic-todoist-schedule-block.is-short {
+    grid-template-columns: minmax(0, 1fr) 55px;
+  }
+
+  .semantic-todoist-schedule-block-controls {
+    grid-template-columns: repeat(2, 17px);
+  }
+
+  .semantic-todoist-schedule-block-controls button {
+    height: 13px;
+    min-height: 13px;
+    padding-inline: 0;
+    width: 17px;
+  }
+
+  .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls {
+    grid-template-columns: repeat(4, 13px);
+  }
+
+  .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls button {
+    font-size: 8px;
+    width: 13px;
+  }
+
+  .semantic-todoist-schedule-suggestions {
+    max-height: 116px;
+  }
+
+  .semantic-todoist-schedule-suggestion {
+    gap: 4px;
+    padding: 4px;
+  }
+
+  .semantic-todoist-schedule-suggestion button {
+    min-height: 30px;
+    padding-inline: 6px;
+  }
 }
 
 @media (hover: none), (pointer: coarse) {
@@ -744,6 +1167,14 @@
   .semantic-todoist-modal button {
     min-height: 44px;
     touch-action: manipulation;
+  }
+
+  .semantic-todoist-schedule-block-controls button {
+    min-height: 28px;
+  }
+
+  .semantic-todoist-schedule-suggestion button {
+    min-height: 32px;
   }
 
   .semantic-todoist-view input,
@@ -775,32 +1206,10 @@
   min-height: 34px;
 }
 
-.is-mobile .semantic-todoist-context-toggle {
-  font-size: var(--font-ui-smaller);
-  line-height: 1.1;
-}
-
-.is-mobile .semantic-todoist-context-toggle label {
-  gap: 4px;
-}
-
-.is-mobile .semantic-todoist-active-summary,
 .is-mobile .semantic-todoist-relevant {
   padding: 5px 7px;
   max-height: 42px;
   overflow: hidden;
-}
-
-.is-mobile .semantic-todoist-active-summary.is-active-note-included {
-  display: none;
-}
-
-.is-mobile .semantic-todoist-active-summary strong {
-  display: inline;
-}
-
-.is-mobile .semantic-todoist-active-summary div:nth-of-type(n+2) {
-  display: none;
 }
 
 .is-mobile .semantic-todoist-relevant {

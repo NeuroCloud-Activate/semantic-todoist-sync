@@ -2,7 +2,7 @@
 
 Semantic Todoist Sync is for people who live in Obsidian, but still need their actual action items to land in Todoist.
 
-It builds a local semantic index of your vault, uses your own AI API key to understand note context, turns notes or forwarded emails into Todoist-ready tasks, writes those tasks back into Obsidian for traceability, and keeps the two sides synced. The plugin also keeps a local Todoist reference table so it can answer questions about existing tasks and avoid pestering external APIs more than it needs to.
+It builds a local semantic index of your vault, uses your own AI API key to understand note context, turns notes or forwarded emails into Todoist-ready tasks, writes those tasks back into Obsidian for traceability, and keeps the two sides synced. It can also preview a practical workday schedule from your Todoist tasks. The plugin keeps local Todoist and scheduler memory files so it can answer questions about existing tasks, plan from prior scheduling choices, and avoid pestering external APIs more than it needs to.
 
 > **AI vibecoded project:** This plugin was built collaboratively with AI using OpenAI Codex. Please review the code, security model, and workflow assumptions before using it with vault content, emails, or Todoist data you care about.
 
@@ -20,19 +20,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Forward task-heavy emails into a user-owned Cloudflare Worker queue. The plugin can pull them into Obsidian, use AI plus vault context to identify the real tasks, write a note log, and sync the tasks into Todoist.
 
-## What's New In 0.5.23
+4. **Schedule Today's Tasks**
 
-1. **Smarter answers when your notes disagree**
+   Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-   Semantic context now pays attention to meeting/note dates, including frontmatter like `created: ["2026-05-20 13:43"]`. When older notes and newer notes talk about the same thing, the plugin is better at treating the newer matching note as the current guidance while still keeping older notes available as background.
+## What's New In 0.6.2
 
-2. **A lighter, faster semantic index**
+1. **Schedule Today now uses the same context brain as the rest of the plugin**
 
-   The index now uses sync-safe shard files, path metadata, RAM hydration, chunk-level embedding reuse, and active/recent-note prioritization. In plain English: Obsidian should spend less time freezing, fewer unchanged chunks need to be embedded again, and useful recent context becomes available sooner.
+   The scheduler now ranks and estimates work using Todoist task snapshots, local scheduler memory, linked note context, and the semantic vault index. That keeps the daily plan tied to both Todoist urgency and the most relevant Obsidian context instead of relying on task titles alone.
 
-3. **Better Todoist continuity**
+2. **A more useful preview before anything touches Todoist**
 
-   The local Todoist reference table is doing more work now: chat can link to existing tasks by title, sync-back refreshes Todoist changes into notes, subtasks keep their indentation, and Email-To-Todoist/Notes-To-Todoist both use the same stronger task context and prompt rules.
+   The preview can show the top ten suggested swaps, keeps moved-out tasks visible so they can be restored, and uses compact controls that work better on mobile and desktop. The timeline scales to your configured minimum task block, while task durations can still move in 15-minute steps when that fits your settings.
+
+3. **Todoist-first scheduling with cleaner duration rules**
+
+   Applying a schedule writes approved due times and Todoist durations immediately, then lets the normal note sync flow update Obsidian. Quick follow-up, discussion, coordination, and meeting-planning tasks are capped to the configured minimum block so they do not crowd out deeper work.
 
 ## What It Uses
 
@@ -41,6 +45,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 - Todoist API access for task creation, updates, and reference reconciliation.
 - Optional Cloudflare Email Routing and Workers for the Email-To-Todoist workflow.
 - Local OID markers in notes, with Todoist IDs and Todoist task snapshots stored in the plugin's local reference table (to keep things local and avoid having to always do external API calls - this keeps the plugin fast).
+- A small local scheduler memory file for accepted task durations, preview edits, schedule order signals, and compact vault context used by Schedule Today's Tasks.
 - Markdown prompt files in the vault for reusable AI prompts, summaries, and task-generation workflows.
 
 ## Quick Setup
@@ -83,14 +88,23 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Existing larger legacy shards are loaded with idle yields, then optimized later when the plugin is idle.
    - The plugin folder is excluded from indexing and AI chat context by default.
 
+5. Optional: configure Schedule Today's Tasks.
+   - Open `Settings > Semantic Todoist Sync > Schedule Today`.
+   - Set your workday, lunch window, minimum block, maximum block, due window, excluded labels, and simple scheduling weights.
+   - Run the scheduler from the sidebar prompt chooser or command palette. It opens a preview first and does not write Todoist changes until you choose `Apply`.
+   - The preview shows scheduled tasks, unscheduled work, moved-out tasks, and up to ten suggested swaps.
+   - The default `Schedule today's tasks` prompt is created in the prompts folder and can be edited there. Settings still control the scheduler rules; the prompt coordinates the duration-estimation request.
+
 ## Sidebar And Prompts
 
 The sidebar is the main working surface:
 
+- The active-note picker shows whether the selected note is included in chat search, without taking a separate sidebar row.
 - `Ask` queries the vault using the active note and semantic index.
-- `Tasks` runs the configured default task-generation prompt directly.
-- `Prompts` opens reusable markdown prompts from the prompt folder.
-- `New chat` clears the visible conversation.
+- `Tasks` runs the configured default task-generation prompt directly and creates Todoist-ready tasks from the selected or active note.
+- The one-line `Run:` dropdown sits below the chat box. Choose `Schedule today's tasks` or another prompt template, then press `Run`.
+- `Run` executes only the selected dropdown action. It does not send a chat question or run the default task generator unless that is the selected prompt template.
+- The header icon starts a new chat.
 - `Index` rebuilds the semantic vault index.
 
 When task context is relevant, chat can also use the local Todoist reference table and semantic task chunks. Task links are shown as descriptive linked text rather than full raw URLs.
@@ -110,6 +124,7 @@ taskHeading: '## Semantic Todoist Sync - Summary'
 - `createTasks: false` runs a normal prompt response, such as a summary.
 - `createTasks: true` with `taskGenerationTemplate: true` marks the prompt as a dedicated Todoist task-generation prompt.
 - `createTasks: true` with `taskGenerationTemplate: false` runs the original prompt response first, then runs the configured task-generation prompt as a separate second step.
+- `action: schedule-today` marks a prompt as the scheduler action. Scheduler settings remain authoritative, while the prompt coordinates duration estimates, split suggestions, and practical sequencing guidance.
 - `insertResponse` controls whether the response is inserted into the active note.
 - `syncTasks` controls whether generated tasks sync to Todoist after insertion.
 - `taskHeading` controls the heading inserted above the response or generated task list.
@@ -124,6 +139,8 @@ taskHeading: '## Semantic Todoist Sync - Summary'
 - `Semantic Todoist Sync: Search vault semantically`
 - `Semantic Todoist Sync: Process pending email tasks`
 - `Semantic Todoist Sync: Create Todoist tasks from active note`
+- `Semantic Todoist Sync: Schedule today's tasks`
+- `Semantic Todoist Sync: Undo last schedule today apply`
 - `Semantic Todoist Sync: Sync note tasks with Todoist`
 - `Semantic Todoist Sync: Rebuild local Todoist reference table`
 
@@ -168,13 +185,14 @@ Each GitHub release tag matches the version in `manifest.json` and includes `mai
 - The local status bar and sync reconciliation logic do not use AI API calls.
 - Todoist receives task content, descriptions, labels, due dates, priorities, project IDs, and section IDs needed for sync.
 - The local Todoist reference table stores Todoist task snapshots on device and is used to reduce repeated Todoist API reads.
+- The local scheduler memory stores compact scheduling signals on device, including accepted durations, preview edits, task order signals, labels, relative note paths, and lightweight context terms.
 - Semantic index shards can include compact task-reference chunks derived from the local reference table.
 - Email-To-Todoist uses the user's own Cloudflare Worker. The plugin reads queued email content only when that workflow is configured and run.
 - No personal accounts, domains, API keys, Worker URLs, or vault paths are included in this public BYOK version.
 
 ## Mobile Notes
 
-The plugin has been tested and is functional on iPadOS/iOS mobile Obsidian apps, However, background polling and sync run only while Obsidian is open and the plugin is loaded (limitations of iPadOS/iOS).
+The plugin has been tested and is functional on iPadOS/iOS mobile Obsidian apps. Background polling and sync run only while Obsidian is open and the plugin is loaded because of iPadOS/iOS limits. The scheduler preview uses compact controls on narrow screens, so you can adjust blocks without relying on desktop drag-and-drop.
 
 ## License
 

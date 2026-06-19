@@ -802,7 +802,7 @@
 }
 
 .semantic-todoist-schedule-block.is-short {
-  grid-template-columns: minmax(0, 1fr) 79px;
+  grid-template-columns: minmax(0, 1fr) auto;
   padding-bottom: 2px;
   padding-top: 2px;
 }
@@ -864,9 +864,9 @@
 
 .semantic-todoist-schedule-block-controls {
   align-self: center;
-  display: grid;
-  gap: 2px;
-  grid-template-columns: repeat(3, 19px);
+  align-items: center;
+  display: flex;
+  gap: 5px;
 }
 
 .semantic-todoist-schedule-block-controls button {
@@ -881,9 +881,35 @@
   width: 19px;
 }
 
+.semantic-todoist-schedule-control-group {
+  display: grid;
+  gap: 2px;
+  grid-template-columns: repeat(2, 19px);
+}
+
+.semantic-todoist-schedule-remove-controls {
+  align-items: center;
+  border-left: 1px solid var(--background-modifier-border);
+  display: inline-flex;
+  margin-left: 1px;
+  padding-left: 5px;
+}
+
+.semantic-todoist-schedule-block-controls .semantic-todoist-schedule-remove-button {
+  border-radius: 999px;
+  font-size: 12px;
+  height: 18px;
+  min-height: 18px;
+  width: 18px;
+}
+
+.semantic-todoist-schedule-block-controls .semantic-todoist-schedule-remove-button:hover {
+  border-color: var(--text-error);
+  color: var(--text-error);
+}
+
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls {
-  gap: 1px;
-  grid-template-columns: repeat(5, 15px);
+  gap: 3px;
 }
 
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls button {
@@ -891,6 +917,21 @@
   height: 13px;
   min-height: 13px;
   width: 15px;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-control-group {
+  gap: 1px;
+  grid-template-columns: repeat(2, 15px);
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-remove-controls {
+  padding-left: 3px;
+}
+
+.semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls .semantic-todoist-schedule-remove-button {
+  height: 16px;
+  min-height: 16px;
+  width: 16px;
 }
 
 .semantic-todoist-schedule-resize {
@@ -1129,11 +1170,11 @@
   }
 
   .semantic-todoist-schedule-block.is-short {
-    grid-template-columns: minmax(0, 1fr) 55px;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .semantic-todoist-schedule-block-controls {
-    grid-template-columns: repeat(2, 17px);
+    gap: 3px;
   }
 
   .semantic-todoist-schedule-block-controls button {
@@ -1143,13 +1184,28 @@
     width: 17px;
   }
 
-  .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls {
-    grid-template-columns: repeat(4, 13px);
+  .semantic-todoist-schedule-control-group {
+    gap: 1px;
+    grid-template-columns: repeat(2, 17px);
   }
 
   .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls button {
     font-size: 8px;
     width: 13px;
+  }
+
+  .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-control-group {
+    grid-template-columns: repeat(2, 13px);
+  }
+
+  .semantic-todoist-schedule-remove-controls {
+    padding-left: 3px;
+  }
+
+  .semantic-todoist-schedule-block-controls .semantic-todoist-schedule-remove-button {
+    height: 17px;
+    min-height: 17px;
+    width: 17px;
   }
 
   .semantic-todoist-schedule-suggestions {
@@ -1179,6 +1235,11 @@
 
   .semantic-todoist-schedule-block-controls button {
     min-height: 28px;
+  }
+
+  .semantic-todoist-schedule-block-controls .semantic-todoist-schedule-remove-button {
+    min-height: 28px;
+    width: 28px;
   }
 
   .semantic-todoist-schedule-suggestion button {

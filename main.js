@@ -6114,24 +6114,27 @@ class ScheduleTodayModal extends Modal {
     title.title = `${item.content} | ${metaText}`;
     main.createDiv({ cls: "semantic-todoist-schedule-block-meta", text: metaText });
     const controls = block.createDiv({ cls: "semantic-todoist-schedule-block-controls" });
-    controls.createEl("button", { text: "↑", attr: { "aria-label": "Move earlier", title: "Move earlier" } }).onclick = (event) => {
+    const moveControls = controls.createDiv({ cls: "semantic-todoist-schedule-control-group semantic-todoist-schedule-move-controls" });
+    moveControls.createEl("button", { text: "↑", attr: { "aria-label": "Move earlier", title: "Move earlier" } }).onclick = (event) => {
       event.preventDefault();
       this.moveItem(item.id, -config.chunkMinutes);
     };
-    controls.createEl("button", { text: "↓", attr: { "aria-label": "Move later", title: "Move later" } }).onclick = (event) => {
+    moveControls.createEl("button", { text: "↓", attr: { "aria-label": "Move later", title: "Move later" } }).onclick = (event) => {
       event.preventDefault();
       this.moveItem(item.id, config.chunkMinutes);
     };
-    controls.createEl("button", { text: "-", attr: { "aria-label": "Shorten task", title: "Shorten task" } }).onclick = (event) => {
+    const durationControls = controls.createDiv({ cls: "semantic-todoist-schedule-control-group semantic-todoist-schedule-duration-controls" });
+    durationControls.createEl("button", { text: "-", attr: { "aria-label": "Shorten task", title: "Shorten task" } }).onclick = (event) => {
       event.preventDefault();
       this.adjustDuration(item.id, -scheduleDurationStepMinutes(config));
     };
-    controls.createEl("button", { text: "+", attr: { "aria-label": "Lengthen task", title: "Lengthen task" } }).onclick = (event) => {
+    durationControls.createEl("button", { text: "+", attr: { "aria-label": "Lengthen task", title: "Lengthen task" } }).onclick = (event) => {
       event.preventDefault();
       this.adjustDuration(item.id, scheduleDurationStepMinutes(config));
     };
     if (!item.fixed) {
-      controls.createEl("button", { text: "×", attr: { "aria-label": "Remove from today", title: "Remove from today" } }).onclick = (event) => {
+      const removeControls = controls.createDiv({ cls: "semantic-todoist-schedule-remove-controls" });
+      removeControls.createEl("button", { cls: "semantic-todoist-schedule-remove-button", text: "×", attr: { "aria-label": "Remove from today", title: "Remove from today" } }).onclick = (event) => {
         event.preventDefault();
         this.removeScheduledItem(item.id);
       };

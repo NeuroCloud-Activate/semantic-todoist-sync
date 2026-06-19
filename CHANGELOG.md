@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3
+
+- Preserved completed Todoist tasks in their original Obsidian notes by syncing completion back as checked markdown tasks instead of treating them as deleted.
+- Kept completed Todoist tasks out of Schedule Today's Tasks planning and fuzzy relinking so finished work stays as a record without reappearing as active work.
+- Added a conservative cache cleanup guard so previously completed note tasks are not removed if a full Todoist snapshot is temporarily unavailable.
+
 ## 0.6.2
 
 - Expanded Schedule Today's Tasks preview suggestions from five to the top ten swap candidates so more high-priority unscheduled work can be reviewed before applying a plan.

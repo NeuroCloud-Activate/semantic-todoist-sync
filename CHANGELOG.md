@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.6
+
+- Updated Schedule Today's Tasks suggestions so eligible tasks can show Add in when they fit an open preview window, while Swap in remains available when another scheduled task needs to move out.
+- Added a scheduler setting for the Add-in flexible time window and made swap rationale name the scheduled task that would be moved out.
+
 ## 0.6.5
 
 - Tightened Schedule Today's Tasks preview controls by stacking move and duration button groups vertically while keeping the remove button separated.

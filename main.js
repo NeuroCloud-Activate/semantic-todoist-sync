@@ -160,6 +160,7 @@ const DEFAULT_SETTINGS = {
   scheduleTodayLunchMinutes: 30,
   scheduleTodayMinBlockMinutes: 30,
   scheduleTodayMaxBlockMinutes: 180,
+  scheduleTodayAddWindowMinutes: 30,
   scheduleTodayChunkMinutes: 30,
   scheduleTodayDueWindowDays: 2,
   scheduleTodayIncludeOverdue: true,
@@ -5669,6 +5670,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Lunch length minutes", this.plugin, "scheduleTodayLunchMinutes");
     numberSetting(containerEl, "Minimum task block minutes", this.plugin, "scheduleTodayMinBlockMinutes");
     numberSetting(containerEl, "Maximum task block minutes", this.plugin, "scheduleTodayMaxBlockMinutes");
+    numberSetting(containerEl, "Add-in flex minutes", this.plugin, "scheduleTodayAddWindowMinutes");
 
     settingsHeading(containerEl, "Task Selection", "Chooses which open Todoist tasks are considered before the deterministic scheduler picks what fits today.");
     toggleSetting(containerEl, "Include overdue tasks", "Include open tasks due before today.", this.plugin, "scheduleTodayIncludeOverdue");
@@ -5856,7 +5858,7 @@ class ScheduleTodayModal extends Modal {
     const text = row.createDiv({ cls: "semantic-todoist-schedule-suggestion-text" });
     text.createDiv({ cls: "semantic-todoist-schedule-suggestion-title", text: shortTitle(item.content || "Task", 82) });
     text.createDiv({ cls: "semantic-todoist-schedule-suggestion-reason", text: item.rationale || item.reason || "Could fit by moving another scheduled block." });
-    const button = row.createEl("button", { text: "Swap in" });
+    const button = row.createEl("button", { text: item.suggestionAction === "add" ? "Add in" : "Swap in" });
     button.onclick = (event) => {
       event.preventDefault();
       this.swapInSuggestion(item.id);
@@ -5967,6 +5969,13 @@ class ScheduleTodayModal extends Modal {
       new Notice("Fixed tasks cannot be swapped out from this preview.");
       return;
     }
+    if (!targetId) {
+      const addPlan = bestScheduleAddSlot(suggestion, this.preview, config, preferredStartMinutes);
+      if (addPlan) {
+        this.addSuggestionToSchedule(suggestion, addPlan);
+        return;
+      }
+    }
     const bumped = target || bestScheduleSwapCandidate(suggestion, this.preview, config);
     if (!bumped) {
       new Notice("That task no longer fits by swapping one scheduled block.");
@@ -6013,6 +6022,28 @@ class ScheduleTodayModal extends Modal {
     });
     this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(bumped.id));
     this.preview.bumped.push(bumpedItem);
+    refreshScheduleSuggestions(this.preview);
+    this.render();
+  }
+
+  addSuggestionToSchedule(suggestion, addPlan) {
+    const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    const blockDuration = addPlan.durationMinutes || suggestionScheduleBlockMinutes(suggestion, config);
+    this.preview.unscheduled = (this.preview.unscheduled || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.removed = (this.preview.removed || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((item) => String(item.sourceTaskId || "") !== String(suggestion.id));
+    const scheduledSuggestion = schedulePreviewItem(suggestion, addPlan.startMinutes, blockDuration, config, {
+      promotedFromSuggestion: true,
+      previewOrderChanged: true,
+      addedFromOpenWindow: true,
+      scheduleBlockMinutes: blockDuration,
+      totalDurationMinutes: suggestion.totalDurationMinutes || suggestion.durationMinutes || blockDuration
+    });
+    this.preview.scheduled.push(scheduledSuggestion);
+    this.preview.scheduled.sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    const remainder = Math.max(0, Number(suggestion.totalDurationMinutes || suggestion.durationMinutes || 0) - blockDuration);
+    if (remainder > 0) this.preview.splitSubtasks.push(scheduleContinuationSubtask(suggestion, remainder, config, this.plugin.settings));
     refreshScheduleSuggestions(this.preview);
     this.render();
   }
@@ -6543,6 +6574,7 @@ const SETTING_DESCRIPTIONS = {
   scheduleTodayLunchMinutes: "Length of the lunch block avoided by automatic scheduling. Use 0 to disable lunch blocking.",
   scheduleTodayMinBlockMinutes: "Smallest duration block a task can receive. The preview timeline also uses this interval.",
   scheduleTodayMaxBlockMinutes: "Largest same-day block a task can receive before overflow is split to the next workday.",
+  scheduleTodayAddWindowMinutes: "How much shorter an open preview window may be than a suggested task block when showing Add in instead of Swap in.",
   scheduleTodayChunkMinutes: "Legacy setting kept for older saved data. The scheduler now uses Minimum task block minutes as its timeline interval.",
   scheduleTodayDueWindowDays: "Include tasks due today through this many days ahead.",
   scheduleTodayIncludeOverdue: "Include open overdue tasks in today's candidate list.",
@@ -6757,7 +6789,7 @@ function numberSetting(containerEl, name, plugin, key) {
   new Setting(containerEl).setName(name).setDesc(settingDescription(name, key)).addText((text) => {
     text.inputEl.type = "number";
     text.setValue(String(plugin.settings[key] ?? DEFAULT_SETTINGS[key])).onChange(async (value) => {
-      const minimum = key === "emailPollIntervalSeconds" ? MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS : key === "scheduleTodayLunchMinutes" ? 0 : 1;
+      const minimum = key === "emailPollIntervalSeconds" ? MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS : ["scheduleTodayLunchMinutes", "scheduleTodayAddWindowMinutes"].includes(key) ? 0 : 1;
       const parsed = parseInt(value, 10);
       plugin.settings[key] = Math.max(minimum, Number.isFinite(parsed) ? parsed : DEFAULT_SETTINGS[key]);
       await plugin.saveSettings();
@@ -8063,6 +8095,7 @@ function scheduleTodayConfig(settings = DEFAULT_SETTINGS) {
   const lunchMinutes = roundToScheduleChunk(clampNumber(settings.scheduleTodayLunchMinutes, 0, 0, 240), { chunkMinutes }) || 0;
   const minBlockMinutes = chunkMinutes;
   const maxBlockMinutes = roundToScheduleChunk(clampNumber(settings.scheduleTodayMaxBlockMinutes, 180, minBlockMinutes, 8 * 60), { durationStepMinutes, chunkMinutes: durationStepMinutes }) || 180;
+  const addWindowMinutes = roundToScheduleChunk(clampNumber(settings.scheduleTodayAddWindowMinutes, DEFAULT_SETTINGS.scheduleTodayAddWindowMinutes || 30, 0, 240), { durationStepMinutes, chunkMinutes: durationStepMinutes }) || 0;
   const todayDate = today();
   return {
     today: todayDate,
@@ -8074,6 +8107,7 @@ function scheduleTodayConfig(settings = DEFAULT_SETTINGS) {
     lunchMinutes,
     minBlockMinutes,
     maxBlockMinutes,
+    addWindowMinutes,
     chunkMinutes,
     durationStepMinutes,
     dueWindowDays: Math.max(0, parseInt(settings.scheduleTodayDueWindowDays, 10) || DEFAULT_SETTINGS.scheduleTodayDueWindowDays || 2),
@@ -8406,12 +8440,20 @@ function refreshScheduleSuggestions(preview) {
   const suggestions = (preview.unscheduled || [])
     .filter((item) => item?.id && !item.wasBumped && !scheduledIds.has(String(item.id)))
     .map((item) => {
+      const addPlan = bestScheduleAddSlot(item, preview, config);
       const swap = bestScheduleSwapCandidate(item, preview, config);
-      if (!swap) return null;
+      if (!addPlan && !swap) return null;
       return Object.assign({}, item, {
-        swapCandidateId: swap.id,
-        swapCandidateTitle: swap.content || "",
-        rationale: suggestionRationale(item, swap, config)
+        suggestionAction: addPlan ? "add" : "swap",
+        addStartMinutes: addPlan?.startMinutes ?? null,
+        addEndMinutes: addPlan ? addPlan.startMinutes + addPlan.durationMinutes : null,
+        addDurationMinutes: addPlan?.durationMinutes ?? null,
+        addWindowStartMinutes: addPlan?.windowStartMinutes ?? null,
+        addWindowEndMinutes: addPlan?.windowEndMinutes ?? null,
+        addRemainderMinutes: addPlan?.remainderMinutes ?? 0,
+        swapCandidateId: swap?.id || "",
+        swapCandidateTitle: swap?.content || "",
+        rationale: addPlan ? suggestionAddRationale(item, addPlan, config) : suggestionSwapRationale(item, swap, config)
       });
     })
     .filter(Boolean)
@@ -8419,6 +8461,18 @@ function refreshScheduleSuggestions(preview) {
     .slice(0, SCHEDULE_PREVIEW_SUGGESTION_LIMIT);
   preview.suggestions = suggestions;
   return suggestions;
+}
+
+function bestScheduleAddSlot(suggestion, preview, config = {}, preferredStartMinutes = null) {
+  const desiredDuration = suggestionScheduleBlockMinutes(suggestion, config);
+  if (!desiredDuration) return null;
+  const blocked = scheduleBlocksForPreview(preview, config);
+  const flexible = findFlexibleOpenScheduleSlot(blocked, desiredDuration, config, preferredStartMinutes);
+  if (!flexible) return null;
+  const totalDuration = Number(suggestion?.totalDurationMinutes || suggestion?.durationMinutes || desiredDuration);
+  return Object.assign({}, flexible, {
+    remainderMinutes: Math.max(0, totalDuration - flexible.durationMinutes)
+  });
 }
 
 function bestScheduleSwapCandidate(suggestion, preview, config = {}) {
@@ -8439,6 +8493,56 @@ function bestScheduleSwapCandidate(suggestion, preview, config = {}) {
     return (a.item.score || 0) - (b.item.score || 0) || (b.item.startMinutes || 0) - (a.item.startMinutes || 0);
   });
   return scored[0]?.item || null;
+}
+
+function openScheduleWindows(blocked, config = {}) {
+  const startDay = Number(config.startMinutes || 0);
+  const endDay = Number(config.endMinutes || startDay);
+  if (!Number.isFinite(startDay) || !Number.isFinite(endDay) || endDay <= startDay) return [];
+  const blocks = (blocked || [])
+    .filter((block) => Number.isFinite(block?.startMinutes) && Number.isFinite(block?.endMinutes))
+    .map((block) => ({
+      startMinutes: Math.max(startDay, Number(block.startMinutes)),
+      endMinutes: Math.min(endDay, Number(block.endMinutes))
+    }))
+    .filter((block) => block.endMinutes > block.startMinutes)
+    .sort((a, b) => a.startMinutes - b.startMinutes || a.endMinutes - b.endMinutes);
+  const windows = [];
+  let cursor = startDay;
+  for (const block of blocks) {
+    if (block.startMinutes > cursor) windows.push({ startMinutes: cursor, endMinutes: block.startMinutes });
+    cursor = Math.max(cursor, block.endMinutes);
+  }
+  if (cursor < endDay) windows.push({ startMinutes: cursor, endMinutes: endDay });
+  return windows;
+}
+
+function findFlexibleOpenScheduleSlot(blocked, desiredDurationValue, config = {}, preferredStartMinutes = null) {
+  const desiredDuration = roundToScheduleChunk(desiredDurationValue, config);
+  if (!desiredDuration) return null;
+  const flex = Math.max(0, Number(config.addWindowMinutes || 0));
+  const minDuration = Math.max(config.minBlockMinutes || 0, desiredDuration - flex);
+  const windows = openScheduleWindows(blocked, config)
+    .map((window) => {
+      const available = window.endMinutes - window.startMinutes;
+      const duration = Math.min(desiredDuration, floorToScheduleStep(available, config));
+      if (duration < minDuration) return null;
+      const maxStart = window.endMinutes - duration;
+      const preferred = Number.isFinite(Number(preferredStartMinutes))
+        ? Math.max(window.startMinutes, Math.min(maxStart, Number(preferredStartMinutes)))
+        : window.startMinutes;
+      return {
+        startMinutes: preferred,
+        durationMinutes: duration,
+        windowStartMinutes: window.startMinutes,
+        windowEndMinutes: window.endMinutes,
+        distance: Number.isFinite(Number(preferredStartMinutes)) ? Math.abs(preferred - Number(preferredStartMinutes)) : window.startMinutes - (config.startMinutes || 0),
+        shortfall: Math.max(0, desiredDuration - duration)
+      };
+    })
+    .filter(Boolean);
+  windows.sort((a, b) => a.distance - b.distance || a.shortfall - b.shortfall || a.startMinutes - b.startMinutes);
+  return windows[0] || null;
 }
 
 function scheduleBlocksForPreview(preview, config = {}, options = {}) {
@@ -8467,11 +8571,17 @@ function unscheduledRationale(candidate, reason, duration, config) {
   return parts.slice(0, 3).join("; ");
 }
 
-function suggestionRationale(item, swap, config) {
+function suggestionAddRationale(item, addPlan, config) {
+  const base = unscheduledRationale(item, item.reason || "Open time available", item.durationMinutes, config);
+  const continuation = addPlan.remainderMinutes > 0 ? ` ${addPlan.remainderMinutes} min continues next workday.` : "";
+  return `${base}. Add at ${minutesToClock(addPlan.startMinutes)}-${minutesToClock(addPlan.startMinutes + addPlan.durationMinutes)}.${continuation}`;
+}
+
+function suggestionSwapRationale(item, swap, config) {
   const base = unscheduledRationale(item, item.reason || "Not enough open time", item.durationMinutes, config);
   const block = suggestionScheduleBlockMinutes(item, config);
   const continuation = item.durationMinutes > block ? ` ${item.durationMinutes - block} min continues next workday.` : "";
-  return `${base}. Swap would move out ${shortTitle(swap.content || "scheduled task", 28)}.${continuation}`;
+  return `${base}. Swap would move out ${shortTitle(swap?.content || "scheduled task", 28)} based on scheduler priority.${continuation}`;
 }
 
 function suggestionScheduleBlockMinutes(item, config = {}, target = null) {
@@ -8660,6 +8770,13 @@ function roundToScheduleChunk(minutes, config = {}) {
   const value = Number(minutes || 0);
   if (!value) return 0;
   return Math.max(chunk, Math.ceil(value / chunk) * chunk);
+}
+
+function floorToScheduleStep(minutes, config = {}) {
+  const chunk = scheduleDurationStepMinutes(config);
+  const value = Number(minutes || 0);
+  if (!value) return 0;
+  return Math.max(0, Math.floor(value / chunk) * chunk);
 }
 
 function scheduleDurationStepMinutes(config = {}) {

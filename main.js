@@ -5774,8 +5774,9 @@ class ScheduleTodayModal extends Modal {
       .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
   }
 
-  render() {
+  render(options = {}) {
     const { contentEl } = this;
+    const scrollState = options.preserveScroll === false ? null : this.captureScrollState(options.anchorItemId || "");
     contentEl.empty();
     const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
     refreshScheduleSuggestions(this.preview);
@@ -5843,6 +5844,54 @@ class ScheduleTodayModal extends Modal {
       this.close();
     };
     actions.createEl("button", { text: "Close" }).onclick = () => this.close();
+    this.restoreScrollState(scrollState);
+  }
+
+  captureScrollState(anchorItemId = "") {
+    if (!this.contentEl?.hasChildNodes?.()) return null;
+    const timeline = this.contentEl.querySelector?.(".semantic-todoist-schedule-timeline") || null;
+    const anchor = anchorItemId && timeline ? this.findRenderedScheduleBlock(timeline, anchorItemId) : null;
+    return {
+      contentScrollTop: Number(this.contentEl.scrollTop || 0),
+      contentScrollLeft: Number(this.contentEl.scrollLeft || 0),
+      timelineScrollTop: Number(timeline?.scrollTop || 0),
+      timelineScrollLeft: Number(timeline?.scrollLeft || 0),
+      anchorItemId: String(anchorItemId || ""),
+      anchorOffsetTop: anchor && timeline ? anchor.getBoundingClientRect().top - timeline.getBoundingClientRect().top : null
+    };
+  }
+
+  restoreScrollState(state) {
+    if (!state) return;
+    const restore = () => {
+      if (!this.contentEl) return;
+      const timeline = this.contentEl.querySelector?.(".semantic-todoist-schedule-timeline") || null;
+      this.contentEl.scrollTop = state.contentScrollTop;
+      this.contentEl.scrollLeft = state.contentScrollLeft;
+      if (timeline) {
+        timeline.scrollTop = state.timelineScrollTop;
+        timeline.scrollLeft = state.timelineScrollLeft;
+        const anchor = state.anchorItemId ? this.findRenderedScheduleBlock(timeline, state.anchorItemId) : null;
+        if (anchor && Number.isFinite(state.anchorOffsetTop)) {
+          const nextOffset = anchor.getBoundingClientRect().top - timeline.getBoundingClientRect().top;
+          timeline.scrollTop += nextOffset - state.anchorOffsetTop;
+        }
+      }
+    };
+    restore();
+    const schedule = typeof window !== "undefined" && window.requestAnimationFrame
+      ? (callback) => window.requestAnimationFrame(callback)
+      : typeof window !== "undefined" && window.setTimeout
+        ? (callback) => window.setTimeout(callback, 0)
+        : (callback) => setTimeout(callback, 0);
+    schedule(restore);
+  }
+
+  findRenderedScheduleBlock(timeline, id) {
+    const target = String(id || "");
+    if (!target || !timeline?.querySelectorAll) return null;
+    return Array.from(timeline.querySelectorAll(".semantic-todoist-schedule-block"))
+      .find((block) => String(block.dataset?.id || "") === target) || null;
   }
 
   renderSuggestionRow(container, item) {
@@ -6340,7 +6389,7 @@ class ScheduleTodayModal extends Modal {
     item.scheduledDateTime = localDateTimeString(config.today, item.startMinutes);
     item.overlapsLunch = rangesOverlap(item.startMinutes, item.endMinutes, config.lunchStartMinutes, config.lunchEndMinutes);
     item.previewDurationChanged = item.durationMinutes !== item.originalDurationMinutes;
-    this.render();
+    this.render({ anchorItemId: item.id });
   }
 
   startResize(event, id) {
@@ -6368,7 +6417,7 @@ class ScheduleTodayModal extends Modal {
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
-      if (changed) this.render();
+      if (changed) this.render({ anchorItemId: item.id });
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);

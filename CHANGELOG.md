@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.8
+
+- Kept the Schedule Today's Tasks preview from jumping while shortening, lengthening, or resizing a task by preserving the modal and timeline scroll position around the edited task.
+
 ## 0.6.7
 
 - Hardened Schedule Today's Tasks drag-and-drop so moved tasks snap to the configured time grid and only displace nearby blocking tasks instead of repacking the day from the top.

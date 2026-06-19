@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.4
+
+- Polished the Schedule Today's Tasks preview controls by grouping move arrows, grouping duration adjustments, and separating the remove action as a round button.
+
 ## 0.6.3
 
 - Preserved completed Todoist tasks in their original Obsidian notes by syncing completion back as checked markdown tasks instead of treating them as deleted.

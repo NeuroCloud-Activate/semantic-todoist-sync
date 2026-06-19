@@ -25,6 +25,7 @@ const SCHEDULER_MEMORY_MAX_ENTRIES = 500;
 const SCHEDULER_MEMORY_MAX_CONTEXT_TERMS = 24;
 const SCHEDULER_MEMORY_MAX_CONTEXT_PATHS = 12;
 const SCHEDULE_PREVIEW_SUGGESTION_LIMIT = 10;
+const SCHEDULE_AI_DURATION_MAX_TASKS = 18;
 const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID = "people-followup-minimum-duration";
 const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
 const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
@@ -2824,7 +2825,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const scheduleConfig = scheduleTodayConfig(this.settings);
       scheduleConfig.durationPolicies = schedulerMemoryDurationPolicies(this.schedulerMemory);
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
-      const tasks = enrichTodoistTasksWithSnapshot(snapshot);
+      const tasks = enrichTodoistTasksWithSnapshot(snapshot).filter((task) => !task.isCompleted);
       const candidates = scheduleTodayCandidates(tasks, this.settings, scheduleConfig, this.schedulerMemory);
       const memoryMatches = this.applySchedulerMemoryToCandidates(candidates);
       if (!candidates.length) {
@@ -2834,8 +2835,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const context = query ? await this.retrieveSemanticContext(query, Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6))) : [];
       const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, context, scheduleConfig);
       const taskContext = await this.buildTaskContext(null, context, query);
-      await this.estimateScheduleTodayDurations(candidates, context, taskContext, scheduleConfig, template);
+      const durationTriage = prepareScheduleDurationTriage(candidates, scheduleConfig, this.settings);
+      const durationEstimateModel = schedulerDurationEstimateModel(this.settings);
+      await this.estimateScheduleTodayDurations(durationTriage.aiCandidates, context, taskContext, scheduleConfig, template, {
+        force: true,
+        totalMissing: durationTriage.totalMissing,
+        model: durationEstimateModel
+      });
       const preview = planScheduleToday(candidates, scheduleConfig, this.settings);
+      preview.durationTriage = durationTriage.summary;
       preview.context = context.map((chunk) => ({
         title: chunk.title || "",
         path: chunk.path || "",
@@ -2848,7 +2856,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         unscheduled: preview.unscheduled.length,
         split: preview.splitSubtasks.length,
         memoryMatches,
-        semanticPriorityMatches
+        semanticPriorityMatches,
+        durationAiCandidates: durationTriage.aiCandidates.length,
+        durationLocalOnly: durationTriage.localOnlyCount,
+        durationAiModel: modelDisplayName(durationEstimateModel)
       });
       this.recordSchedulerPreviewMemory(candidates, context);
       return preview;
@@ -2858,15 +2869,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
-  async estimateScheduleTodayDurations(candidates, context, taskContext, scheduleConfig, template = null) {
-    const missing = candidates.filter((candidate) => !candidate.durationMinutes);
+  async estimateScheduleTodayDurations(candidates, context, taskContext, scheduleConfig, template = null, options = {}) {
+    const missing = options.force ? (candidates || []).filter(Boolean) : (candidates || []).filter((candidate) => !candidate.durationMinutes);
     if (!missing.length) return;
-    this.setSidebarStatus(`Estimating ${missing.length} task duration${missing.length === 1 ? "" : "s"}...`);
+    const totalMissing = Math.max(missing.length, Number(options.totalMissing || 0));
+    const skipped = Math.max(0, totalMissing - missing.length);
+    const durationModel = options.model || schedulerDurationEstimateModel(this.settings);
+    this.setSidebarStatus(`Estimating ${missing.length} triaged duration${missing.length === 1 ? "" : "s"}...`);
     const schedulerPrompt = String(template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT).trim();
     const schedulerPromptName = singleLine(template?.name || template?.source || "Schedule today's tasks");
     const durationPolicies = schedulerMemoryDurationPolicies(this.schedulerMemory);
     const durationPolicyText = formatSchedulerDurationPolicies(durationPolicies, scheduleConfig);
-    const compactTasks = missing.slice(0, 30).map((candidate) => ({
+    const compactTasks = missing.map((candidate) => ({
       id: candidate.id,
       title: candidate.content,
       description: truncateAtWord(singleLine(candidate.description || ""), 420),
@@ -2880,8 +2894,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     let parsed = { estimates: [] };
     try {
-      const json = await this.withAiActivity(`Estimating ${missing.length} task duration${missing.length === 1 ? "" : "s"}`, () => this.openaiResponse({
-        model: this.settings.chatModel,
+      const json = await this.withAiActivity(`Estimating ${missing.length} triaged task duration${missing.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+        model: durationModel,
         jsonSchema: scheduleDurationSchema(),
         system: [
           "Estimate practical work durations for Todoist scheduling.",
@@ -2919,11 +2933,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }));
       parsed = JSON.parse(json);
     } catch (error) {
-      this.logLocal("Schedule duration AI estimate failed; using local estimates", { tasks: missing.length, error: error.message || String(error) });
+      this.logLocal("Schedule duration AI estimate failed; using local estimates", { tasks: missing.length, skipped, error: error.message || String(error) });
       for (const candidate of missing) {
-        candidate.durationMinutes = scheduleDurationWithLocalPolicy(candidate, fallbackScheduleDuration(candidate, scheduleConfig), scheduleConfig, durationPolicies);
-        candidate.durationSource = "local estimate";
-        candidate.durationConfidence = "low";
+        candidate.durationMinutes = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes || fallbackScheduleDuration(candidate, scheduleConfig), scheduleConfig, durationPolicies);
+        candidate.durationSource = candidate.durationSource || "local estimate";
+        candidate.durationConfidence = candidate.durationConfidence || "low";
         candidate.splitTitle = scheduleContinuationTitle(candidate);
       }
       return;
@@ -2932,14 +2946,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const candidate of missing) {
       const estimate = byId.get(candidate.id);
       const minutes = roundToScheduleChunk(Number(estimate?.minutes || 0), scheduleConfig);
-      const source = estimate ? "AI estimate" : "local estimate";
-      const rawMinutes = minutes || fallbackScheduleDuration(candidate, scheduleConfig);
+      const source = estimate ? "AI estimate" : candidate.durationSource || "local estimate";
+      const rawMinutes = minutes || candidate.durationMinutes || fallbackScheduleDuration(candidate, scheduleConfig);
       const adjustedMinutes = scheduleDurationWithLocalPolicy(candidate, rawMinutes, scheduleConfig, durationPolicies);
       candidate.durationMinutes = adjustedMinutes;
       candidate.durationSource = adjustedMinutes < roundToScheduleChunk(rawMinutes, scheduleConfig) ? `${source}; capped for follow-up` : source;
-      candidate.durationConfidence = estimate?.confidence || "medium";
+      candidate.durationConfidence = estimate?.confidence || candidate.durationConfidence || "medium";
       candidate.independentSubtask = this.settings.scheduleTodayAllowIndependentSubtasks === false ? false : estimate?.independent_subtask != null ? Boolean(estimate.independent_subtask) : candidate.independentSubtask;
-      candidate.splitTitle = singleLine(estimate?.split_title || "") || scheduleContinuationTitle(candidate);
+      candidate.splitTitle = singleLine(estimate?.split_title || "") || candidate.splitTitle || scheduleContinuationTitle(candidate);
     }
   }
 
@@ -3764,7 +3778,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             if (match) stats.directIdMatches += 1;
           }
           if (!match) {
-            match = findExistingTodoistTaskMatch(parsed, remote.tasks, parentId);
+            const matchCandidates = parsed.isCompleted ? remote.tasks : remote.tasks.filter((task) => !task.isCompleted);
+            match = findExistingTodoistTaskMatch(parsed, matchCandidates, parentId);
             if (match) {
               stats.contentMatches += 1;
               if (parsed.oid && !oidId && !legacyId && !parsed.id) stats.recoveredMissingTodoistIds += 1;
@@ -3869,7 +3884,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const projects = normalizeTodoistProjects(json.projects || []);
     const sections = normalizeTodoistSections(json.sections || [], "");
     const tasks = (json.items || [])
-      .filter((task) => !task.is_deleted && !task.checked)
+      .filter((task) => !task.is_deleted)
       .map(normalizeTodoistTask)
       .filter((task) => task.id && task.content);
     const snapshot = { tasks, projects, sections, fetchedAt: deviceTimestamp() };
@@ -4123,10 +4138,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let existing = [];
     try {
       const remote = await this.getAllTodoistReferenceTasks({ force: false });
-      existing = remote.tasks;
+      existing = remote.tasks.filter((task) => !task.isCompleted);
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for relink check", { error: error.message || String(error) });
-      existing = await this.getTodoistProjectTasks(await this.getTaskProjectId());
+      existing = (await this.getTodoistProjectTasks(await this.getTaskProjectId())).filter((task) => !task.isCompleted);
     }
     if (!existing.length) return [];
     const relinked = [];
@@ -4384,6 +4399,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const [id, cached] of entries) {
       if (removedIds.has(id)) continue;
       checked += 1;
+      if (!activeTodoistIds && cached.isCompleted) continue;
       const exists = activeTodoistIds ? activeTodoistIds.has(id) : await this.todoistTaskExists(id);
       if (exists) continue;
       const noteTouched = await this.removeDeletedTodoistTaskFromNote(cached);
@@ -5766,7 +5782,7 @@ class ScheduleTodayModal extends Modal {
     header.createDiv({ text: `${config.today} | ${minutesToClock(config.startMinutes)}-${minutesToClock(config.endMinutes)} | ${config.chunkMinutes} min chunks` });
     if (this.preview.message) contentEl.createDiv({ cls: "semantic-todoist-schedule-empty", text: this.preview.message });
     const summary = contentEl.createDiv({ cls: "semantic-todoist-schedule-summary" });
-    const notScheduledCount = (this.preview.unscheduled?.length || 0) + (this.preview.bumped?.length || 0);
+    const notScheduledCount = (this.preview.unscheduled?.length || 0) + (this.preview.bumped?.length || 0) + (this.preview.removed?.length || 0);
     summary.createSpan({ text: `${this.preview.scheduled.length} scheduled` });
     summary.createSpan({ text: `${this.preview.fixed.length} fixed` });
     summary.createSpan({ text: `${notScheduledCount} not scheduled` });
@@ -5793,7 +5809,7 @@ class ScheduleTodayModal extends Modal {
     }
     for (const item of this.scheduleItems()) this.renderScheduleBlock(timeline, item, config);
 
-    if (this.preview.suggestions?.length || this.preview.unscheduled?.length || this.preview.bumped?.length) {
+    if (this.preview.suggestions?.length || this.preview.unscheduled?.length) {
       const unscheduled = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-suggestions" });
       unscheduled.createEl("h3", { text: "Suggested swaps" });
       if (this.preview.suggestions?.length) {
@@ -5801,11 +5817,16 @@ class ScheduleTodayModal extends Modal {
       } else if (this.preview.unscheduled?.length) {
         unscheduled.createDiv({ cls: "semantic-todoist-schedule-list-empty", text: "No unscheduled task currently fits by swapping one scheduled block." });
       }
-      if (this.preview.bumped?.length) {
-        const bumped = unscheduled.createDiv({ cls: "semantic-todoist-schedule-bumped" });
-        bumped.createEl("h3", { text: "Moved out" });
-        for (const item of this.preview.bumped.slice(-5)) this.renderBumpedRow(bumped, item);
-      }
+    }
+    if (this.preview.removed?.length) {
+      const removed = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-removed" });
+      removed.createEl("h3", { text: "Removed from today" });
+      for (const item of this.preview.removed.slice(-8)) this.renderRemovedRow(removed, item);
+    }
+    if (this.preview.bumped?.length) {
+      const bumped = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-bumped" });
+      bumped.createEl("h3", { text: "Moved out" });
+      for (const item of this.preview.bumped.slice(-8)) this.renderBumpedRow(bumped, item);
     }
     if (this.preview.splitSubtasks.length) {
       const split = contentEl.createDiv({ cls: "semantic-todoist-schedule-list" });
@@ -5855,6 +5876,19 @@ class ScheduleTodayModal extends Modal {
     button.onclick = (event) => {
       event.preventDefault();
       this.restoreBumpedItem(item.id);
+    };
+  }
+
+  renderRemovedRow(container, item) {
+    const row = container.createDiv({ cls: "semantic-todoist-schedule-suggestion is-removed" });
+    row.dataset.id = item.id;
+    const text = row.createDiv({ cls: "semantic-todoist-schedule-suggestion-text" });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-title", text: shortTitle(item.content || "Task", 82) });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-reason", text: item.rationale || item.reason || "Removed manually from today's preview." });
+    const button = row.createEl("button", { text: "Restore" });
+    button.onclick = (event) => {
+      event.preventDefault();
+      this.restoreRemovedItem(item.id);
     };
   }
 
@@ -5938,13 +5972,15 @@ class ScheduleTodayModal extends Modal {
       new Notice("That task no longer fits by swapping one scheduled block.");
       return;
     }
-    const blockDuration = suggestionScheduleBlockMinutes(suggestion, config);
+    const blockDuration = suggestionScheduleBlockMinutes(suggestion, config, target);
     const desiredStart = Number.isFinite(Number(preferredStartMinutes)) ? Number(preferredStartMinutes) : bumped.startMinutes;
     const boundedStart = this.boundedStart(desiredStart, blockDuration);
     const blocksWithoutBumped = scheduleBlocksForPreview(this.preview, config, { excludeId: bumped.id });
-    const start = this.canPlaceScheduleBlock(bumped.id, boundedStart, blockDuration)
+    const start = target
       ? boundedStart
-      : findNearestOpenScheduleSlot(blocksWithoutBumped, blockDuration, config, boundedStart);
+      : this.canPlaceScheduleBlock(bumped.id, boundedStart, blockDuration)
+        ? boundedStart
+        : findNearestOpenScheduleSlot(blocksWithoutBumped, blockDuration, config, boundedStart);
     if (start == null) {
       new Notice("That task no longer fits in today's open slots.");
       return;
@@ -5952,6 +5988,7 @@ class ScheduleTodayModal extends Modal {
     this.preview.scheduled = (this.preview.scheduled || []).filter((item) => String(item.id) !== String(bumped.id));
     this.preview.unscheduled = (this.preview.unscheduled || []).filter((item) => String(item.id) !== String(suggestion.id));
     this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.removed = (this.preview.removed || []).filter((item) => String(item.id) !== String(suggestion.id));
     this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((item) => {
       const sourceId = String(item.sourceTaskId || "");
       return sourceId !== String(bumped.id) && sourceId !== String(suggestion.id);
@@ -5959,11 +5996,12 @@ class ScheduleTodayModal extends Modal {
     const scheduledSuggestion = schedulePreviewItem(suggestion, start, blockDuration, config, {
       promotedFromSuggestion: true,
       previewOrderChanged: true,
-      scheduleBlockMinutes: blockDuration
+      scheduleBlockMinutes: blockDuration,
+      totalDurationMinutes: suggestion.totalDurationMinutes || suggestion.durationMinutes || blockDuration
     });
     this.preview.scheduled.push(scheduledSuggestion);
     this.preview.scheduled.sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
-    const remainder = Math.max(0, Number(suggestion.durationMinutes || 0) - blockDuration);
+    const remainder = Math.max(0, Number(suggestion.totalDurationMinutes || suggestion.durationMinutes || 0) - blockDuration);
     if (remainder > 0) this.preview.splitSubtasks.push(scheduleContinuationSubtask(suggestion, remainder, config, this.plugin.settings));
     const bumpedItem = scheduleUnscheduledItem(bumped, bumped.durationMinutes, `Swapped out for ${shortTitle(suggestion.content || "task", 32)}`, config, {
       wasBumped: true,
@@ -5983,6 +6021,66 @@ class ScheduleTodayModal extends Modal {
     const item = this.findSuggestion(id);
     if (!item) return;
     this.swapInSuggestion(item.id, item.bumpedById || "");
+  }
+
+  removeScheduledItem(id) {
+    const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    this.preview.config = config;
+    const item = this.movableItem(id);
+    if (!item) return;
+    this.preview.scheduled = (this.preview.scheduled || []).filter((scheduled) => String(scheduled.id) !== String(item.id));
+    this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((split) => String(split.sourceTaskId || "") !== String(item.id));
+    const totalDuration = Number(item.totalDurationMinutes || item.durationMinutes || 0);
+    const removedItem = scheduleUnscheduledItem(item, totalDuration, "Removed from today's preview", config, {
+      wasRemoved: true,
+      removedByUser: true,
+      removedAtMinutes: item.startMinutes,
+      originalStartMinutes: item.originalStartMinutes ?? item.startMinutes,
+      scheduleBlockMinutes: item.durationMinutes,
+      totalDurationMinutes: totalDuration,
+      startMinutes: null,
+      endMinutes: null,
+      scheduledDateTime: "",
+      rationale: `Removed from ${minutesToClock(item.startMinutes)}-${minutesToClock(item.endMinutes)}. This leaves that time open unless you restore or move another task there.`
+    });
+    this.preview.removed = (this.preview.removed || []).filter((removed) => String(removed.id) !== String(item.id));
+    this.preview.removed.push(removedItem);
+    refreshScheduleSuggestions(this.preview);
+    this.render();
+  }
+
+  restoreRemovedItem(id) {
+    const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    this.preview.config = config;
+    const target = String(id || "");
+    const item = (this.preview.removed || []).find((removed) => String(removed.id) === target);
+    if (!item) return;
+    const duration = suggestionScheduleBlockMinutes(item, config);
+    const preferredStart = Number.isFinite(Number(item.removedAtMinutes)) ? Number(item.removedAtMinutes) : Number(item.originalStartMinutes);
+    const boundedStart = this.boundedStart(Number.isFinite(preferredStart) ? preferredStart : config.startMinutes, duration);
+    const start = this.canPlaceScheduleBlock(item.id, boundedStart, duration)
+      ? boundedStart
+      : findNearestOpenScheduleSlot(scheduleBlocksForPreview(this.preview, config, { excludeId: item.id }), duration, config, boundedStart);
+    if (start == null) {
+      new Notice("No open slot fits that removed task.");
+      return;
+    }
+    this.preview.removed = (this.preview.removed || []).filter((removed) => String(removed.id) !== target);
+    const restored = schedulePreviewItem(item, start, duration, config, {
+      restoredFromRemoved: true,
+      previewOrderChanged: true,
+      scheduleBlockMinutes: duration,
+      totalDurationMinutes: item.totalDurationMinutes || item.durationMinutes || duration
+    });
+    this.preview.scheduled.push(restored);
+    const remainder = Math.max(0, Number(restored.totalDurationMinutes || restored.durationMinutes || 0) - restored.durationMinutes);
+    if (remainder > 0) {
+      this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((split) => String(split.sourceTaskId || "") !== String(restored.id));
+      this.preview.splitSubtasks.push(scheduleContinuationSubtask(restored, remainder, config, this.plugin.settings));
+    }
+    this.preview.scheduled.sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    refreshScheduleSuggestions(this.preview);
+    this.render();
   }
 
   renderScheduleBlock(timeline, item, config) {
@@ -6032,6 +6130,12 @@ class ScheduleTodayModal extends Modal {
       event.preventDefault();
       this.adjustDuration(item.id, scheduleDurationStepMinutes(config));
     };
+    if (!item.fixed) {
+      controls.createEl("button", { text: "×", attr: { "aria-label": "Remove from today", title: "Remove from today" } }).onclick = (event) => {
+        event.preventDefault();
+        this.removeScheduledItem(item.id);
+      };
+    }
     if (!item.fixed) {
       const resize = block.createDiv({ cls: "semantic-todoist-schedule-resize", text: "resize" });
       resize.addEventListener("pointerdown", (event) => this.startResize(event, item.id));
@@ -8032,6 +8136,7 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
         path,
         lineNumber: cached.lineNumber,
         oid: cached.oid || "",
+        isCompleted: Boolean(task.isCompleted || cached.isCompleted),
         remoteDueDate: task.dueDate || "",
         remoteDuration: duration,
         durationMinutes: durationMinutes(duration),
@@ -8056,6 +8161,7 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
     })
     .filter(({ candidate, lowerLabels, dueDays }) => {
       if (!candidate.id || !candidate.content) return false;
+      if (candidate.isCompleted) return false;
       if (!settings.scheduleTodayIncludeSubtasks && candidate.isSubtask) return false;
       for (const label of lowerLabels) if (config.excludedLabels.has(label)) return false;
       if (candidate.scheduledTimeFixed) return datePart(candidate.dueDate) === config.today;
@@ -8217,7 +8323,9 @@ function planScheduleToday(candidates, config, settings = DEFAULT_SETTINGS) {
       unscheduled.push(scheduleUnscheduledItem(candidate, duration + remainder, "No open block today", config));
       continue;
     }
-    const item = schedulePreviewItem(candidate, start, duration, config);
+    const item = schedulePreviewItem(candidate, start, duration, config, {
+      totalDurationMinutes: duration + remainder
+    });
     scheduled.push(item);
     blocked.push({ startMinutes: start, endMinutes: start + duration, type: "scheduled", id: candidate.id });
     if (remainder > 0) splitSubtasks.push(scheduleContinuationSubtask(candidate, remainder, config, settings));
@@ -8229,6 +8337,7 @@ function planScheduleToday(candidates, config, settings = DEFAULT_SETTINGS) {
     unscheduled,
     suggestions: [],
     bumped: [],
+    removed: [],
     splitSubtasks,
     message: ""
   };
@@ -8362,10 +8471,11 @@ function suggestionRationale(item, swap, config) {
   return `${base}. Swap would move out ${shortTitle(swap.content || "scheduled task", 28)}.${continuation}`;
 }
 
-function suggestionScheduleBlockMinutes(item, config = {}) {
+function suggestionScheduleBlockMinutes(item, config = {}, target = null) {
   const duration = roundToScheduleChunk(item?.scheduleBlockMinutes || item?.durationMinutes || 0, config);
   if (!duration) return 0;
-  return Math.max(config.minBlockMinutes || duration, Math.min(duration, config.maxBlockMinutes || duration));
+  const maxBlock = target?.durationMinutes ? Math.max(config.minBlockMinutes || 0, Number(target.durationMinutes || 0)) : config.maxBlockMinutes || duration;
+  return Math.max(config.minBlockMinutes || duration, Math.min(duration, maxBlock));
 }
 
 function scheduleContinuationSubtask(candidate, remainderMinutes, config, settings = DEFAULT_SETTINGS) {
@@ -8425,7 +8535,71 @@ function findNearestOpenScheduleSlot(blocked, durationMinutesValue, config, pref
 }
 
 function emptyScheduleTodayPreview(config, message = "") {
-  return { config, fixed: [], scheduled: [], unscheduled: [], suggestions: [], bumped: [], splitSubtasks: [], message };
+  return { config, fixed: [], scheduled: [], unscheduled: [], suggestions: [], bumped: [], removed: [], splitSubtasks: [], message };
+}
+
+function prepareScheduleDurationTriage(candidates, config, settings = DEFAULT_SETTINGS) {
+  const missing = (candidates || []).filter((candidate) => !candidate.durationMinutes);
+  const totalMissing = missing.length;
+  for (const candidate of missing) {
+    const minutes = scheduleDurationWithLocalPolicy(candidate, fallbackScheduleDuration(candidate, config), config, config.durationPolicies);
+    candidate.durationMinutes = minutes;
+    candidate.durationSource = "local triage estimate";
+    candidate.durationConfidence = "low";
+    candidate.splitTitle = candidate.splitTitle || scheduleContinuationTitle(candidate);
+  }
+  const firstPassPreview = planScheduleToday(candidates, config, settings);
+  const aiCandidates = selectScheduleDurationAiCandidates(missing, firstPassPreview, config);
+  return {
+    totalMissing,
+    aiCandidates,
+    localOnlyCount: Math.max(0, totalMissing - aiCandidates.length),
+    summary: {
+      totalMissing,
+      aiEstimated: aiCandidates.length,
+      localOnly: Math.max(0, totalMissing - aiCandidates.length),
+      firstPassScheduled: (firstPassPreview.fixed || []).length + (firstPassPreview.scheduled || []).length,
+      firstPassSuggestions: (firstPassPreview.suggestions || []).length
+    }
+  };
+}
+
+function selectScheduleDurationAiCandidates(missingCandidates, preview, config = {}) {
+  const missingById = new Map((missingCandidates || []).map((candidate) => [String(candidate.id || ""), candidate]).filter(([id]) => id));
+  const selected = [];
+  const seen = new Set();
+  const add = (item) => {
+    const id = String(item?.id || "");
+    const candidate = missingById.get(id);
+    if (!candidate || seen.has(id)) return;
+    selected.push(candidate);
+    seen.add(id);
+  };
+  for (const item of preview?.fixed || []) add(item);
+  for (const item of preview?.scheduled || []) add(item);
+  for (const item of preview?.suggestions || []) add(item);
+  const cap = scheduleAiDurationCandidateLimit(preview, config);
+  if (selected.length < cap) {
+    const selectedIds = new Set(selected.map((item) => String(item.id || "")));
+    const remaining = (missingCandidates || [])
+      .filter((candidate) => candidate?.id && !selectedIds.has(String(candidate.id)))
+      .sort((a, b) => Number(b.score || 0) - Number(a.score || 0) ||
+        normalizePriority(b.priority) - normalizePriority(a.priority) ||
+        String(a.content || "").localeCompare(String(b.content || "")));
+    for (const candidate of remaining) {
+      add(candidate);
+      if (selected.length >= cap) break;
+    }
+  }
+  return selected.slice(0, cap);
+}
+
+function scheduleAiDurationCandidateLimit(preview, config = {}) {
+  const planned = (preview?.fixed || []).length + (preview?.scheduled || []).length;
+  const suggestions = Math.min(SCHEDULE_PREVIEW_SUGGESTION_LIMIT, (preview?.suggestions || []).length);
+  const minimum = Math.max(4, planned + Math.min(4, suggestions));
+  const workdaySlots = Math.ceil(Math.max(0, Number(config.endMinutes || 0) - Number(config.startMinutes || 0) - Math.max(0, Number(config.lunchMinutes || 0))) / Math.max(15, Number(config.minBlockMinutes || 30)));
+  return Math.max(1, Math.min(SCHEDULE_AI_DURATION_MAX_TASKS, Math.max(minimum, Math.ceil(workdaySlots * 0.75))));
 }
 
 function fallbackScheduleDuration(candidate, config, policies = null) {
@@ -11088,6 +11262,27 @@ function rankGeminiPrimaryModels(models = []) {
     return 8;
   };
   return list.sort((a, b) => score(a) - score(b) || a.localeCompare(b));
+}
+function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
+  const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
+  if (usesGeminiChatModel(primary)) {
+    const primaryId = normalizeGeminiModelId(primary);
+    const manualFallback = settings.chatFallbackModel && usesGeminiChatModel(settings.chatFallbackModel)
+      ? normalizeGeminiModelId(settings.chatFallbackModel)
+      : "";
+    const preferredId = manualFallback || "gemini-3.1-flash-lite";
+    const available = new Set((settings.availableGeminiModels?.length ? settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels)
+      .map(normalizeGeminiModelId)
+      .filter(isUsableGeminiChatModel));
+    if (isUsableGeminiChatModel(preferredId) && preferredId !== primaryId && (available.has(preferredId) || preferredId === "gemini-3.1-flash-lite")) {
+      return `gemini/${preferredId}`;
+    }
+  }
+  if (usesOpenAIChatModel(primary) && settings.chatFallbackModel && usesOpenAIChatModel(settings.chatFallbackModel)) {
+    const fallback = normalizeOpenAIModelId(settings.chatFallbackModel);
+    if (fallback && fallback !== normalizeOpenAIModelId(primary)) return fallback;
+  }
+  return primary;
 }
 function aiModelOptions(settings, key, listKey) {
   const options = [];

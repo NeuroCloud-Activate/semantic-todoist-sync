@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.9
+
+- Hardened Todoist sync reconciliation so completed tasks are preserved as checked tasks in Obsidian instead of being removed when they disappear from Todoist's active-task snapshot.
+- Split completed-task preservation, active-task deletion, note-side removal, and Todoist metadata updates into separate sync outcomes so the activity log can report them more clearly.
+
 ## 0.6.8
 
 - Kept the Schedule Today's Tasks preview from jumping while shortening, lengthening, or resizing a task by preserving the modal and timeline scroll position around the edited task.

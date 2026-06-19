@@ -3608,7 +3608,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.setSidebarStatus("Reconciling Todoist references...");
       const reconciled = await this.reconcileTodoistTaskCache();
       const files = fullScan ? this.getSyncableTaskFiles() : [];
-      const totals = { files: files.length, created: 0, updated: 0, relinked: 0, deleted: 0, normalized: 0, conflicts: 0, staleReferences: reconciled.removed };
+      const totals = { files: files.length, created: 0, updated: 0, relinked: 0, deleted: 0, completedForgotten: 0, normalized: 0, conflicts: 0, staleReferences: reconciled.removed, preservedCompleted: reconciled.preservedCompleted || 0 };
       const workerCount = syncWorkerCount(this.settings);
       await asyncPool(files, workerCount, async (file) => {
         this.setSidebarStatus(`Syncing notes: ${file.basename}`);
@@ -4071,14 +4071,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.cacheTask(parsed.id, parsed);
         continue;
       }
-      await this.updateTodoistFromParsedTask(parsed, remote);
+      const todoistUpdated = await this.updateTodoistFromParsedTask(parsed, remote);
+      if (todoistUpdated === false) continue;
       this.cacheTask(parsed.id, parsed);
       stats.updated += 1;
     }
 
     this.setSidebarStatus("Checking removed note tasks...");
-    const deleted = await this.deleteTodoistTasksMissingFromFile(path, presentIds);
-    stats.deleted = deleted;
+    const removalStats = await this.deleteTodoistTasksMissingFromFile(path, presentIds);
+    stats.deleted = removalStats.deleted;
+    stats.completedForgotten = removalStats.completedForgotten;
     const repairedSubtaskIndentation = repairSyncedSubtaskIndentationLines(lines, this.settings);
     if (repairedSubtaskIndentation) {
       changed = true;
@@ -4089,7 +4091,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.app.vault.modify(file, lines.join("\n"));
     }
     await this.saveSettings();
-    if (showNotice) new Notice(`Synced ${creations.length + existingUpdates.length} task line${creations.length + existingUpdates.length === 1 ? "" : "s"}${deleted ? ` and deleted ${deleted} removed Todoist task${deleted === 1 ? "" : "s"}` : ""}.`);
+    if (showNotice) new Notice(`Synced ${creations.length + existingUpdates.length} task line${creations.length + existingUpdates.length === 1 ? "" : "s"}${stats.deleted ? ` and deleted ${stats.deleted} removed Todoist task${stats.deleted === 1 ? "" : "s"}` : ""}.`);
     return stats;
     } finally {
       this.fileSyncInProgress.delete(path);
@@ -4316,10 +4318,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async deleteTodoistTasksMissingFromFile(path, presentIds) {
     let deleted = 0;
+    let forgotCompleted = 0;
     const deletedSections = new Map();
     const cachedEntries = this.getTaskReferenceIndex().byPath.get(vaultRelativePath(path, vaultBasePath(this.app))) || [];
     for (const [id, cached] of cachedEntries) {
       if (presentIds.has(id)) continue;
+      if (cached.isCompleted) {
+        delete this.settings.taskCache[id];
+        forgotCompleted += 1;
+        continue;
+      }
       const ok = await this.deleteTodoistTask(id).catch((error) => {
         this.logLocal("Todoist delete failed", { id, path, error: error.message || String(error) });
         return false;
@@ -4335,9 +4343,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       delete this.settings.taskCache[id];
       deleted += 1;
     }
-    if (deleted) this.markTaskReferenceStateDirty();
+    if (deleted || forgotCompleted) this.markTaskReferenceStateDirty();
+    if (forgotCompleted) this.logLocal("Completed note task references forgotten after local line removal", { path, tasks: forgotCompleted });
     if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()));
-    return deleted;
+    return { deleted, completedForgotten: forgotCompleted };
   }
 
   async cleanupEmptyTodoistSections(sections) {
@@ -4387,9 +4396,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async reconcileTodoistTaskCache() {
     const referenceIndex = this.getTaskReferenceIndex();
     const entries = referenceIndex.entries;
-    const removed = [];
+    const preservedCompleted = [];
     let checked = 0;
-    const removedIds = new Set();
     let activeTodoistIds = null;
     try {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
@@ -4398,34 +4406,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.logLocal("Todoist snapshot unavailable for cache reconcile", { error: error.message || String(error) });
     }
     for (const [id, cached] of entries) {
-      if (removedIds.has(id)) continue;
       checked += 1;
       if (!activeTodoistIds && cached.isCompleted) continue;
       const exists = activeTodoistIds ? activeTodoistIds.has(id) : await this.todoistTaskExists(id);
       if (exists) continue;
-      const noteTouched = await this.removeDeletedTodoistTaskFromNote(cached);
-      delete this.settings.taskCache[id];
-      this.taskReferenceSnapshotDirty = true;
-      removedIds.add(id);
-      if (!cached.isSubtask) {
-        for (const [otherId, otherCached] of referenceIndex.byPath.get(cached.path || "") || []) {
-          if (!otherCached.isSubtask) continue;
-          if (Math.abs((otherCached.lineNumber || 0) - (cached.lineNumber || 0)) > 25) continue;
-          const otherExists = activeTodoistIds ? activeTodoistIds.has(otherId) : await this.todoistTaskExists(otherId);
-          if (otherExists) continue;
-          delete this.settings.taskCache[otherId];
-          this.taskReferenceSnapshotDirty = true;
-          removedIds.add(otherId);
-        }
-      }
-      removed.push({ id, oid: cached.oid || "", path: cached.path || "", noteTouched });
+      const noteTouched = await this.preserveMissingTodoistTaskInNote(id, cached, "missing from active Todoist snapshot");
+      preservedCompleted.push({ id, oid: cached.oid || "", path: cached.path || "", noteTouched });
     }
-    if (removed.length) {
+    if (preservedCompleted.length) {
       this.markTaskReferenceStateDirty();
       await this.saveSettings();
-      this.logLocal("Todoist cache reconciled", { checked, removed: removed.length });
+      this.logLocal("Todoist cache reconciled", { checked, removed: 0, preservedCompleted: preservedCompleted.length });
     }
-    return { checked, removed: removed.length };
+    return { checked, removed: 0, preservedCompleted: preservedCompleted.length };
   }
 
   async todoistTaskExists(taskId) {
@@ -4468,6 +4461,37 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.markInternalNoteWrite(cached.path);
     await this.app.vault.modify(file, kept.join("\n"));
     return true;
+  }
+
+  async cachedTaskLineIsChecked(taskId, cached) {
+    if (!cached?.path) return false;
+    const file = this.app.vault.getAbstractFileByPath(cached.path);
+    if (!(file instanceof TFile)) return false;
+    const lines = (await this.app.vault.read(file)).split("\n");
+    return lines.some((line) => {
+      if (taskId && getTodoistId(line, this.settings) === String(taskId)) return /^\s*[-*]\s+\[[xX]\]/.test(line);
+      if (cached.oid && getTaskOid(line) === cached.oid) return /^\s*[-*]\s+\[[xX]\]/.test(line);
+      return false;
+    });
+  }
+
+  async preserveMissingTodoistTaskInNote(taskId, cached, reason = "") {
+    if (!cached) return false;
+    let noteTouched = false;
+    if (cached.path) {
+      await this.updateCachedLine(String(taskId || ""), (line) => {
+        const next = line.replace(/^(\s*[-*]\s+\[)[ xX](\])/, "$1x$2");
+        if (next !== line) noteTouched = true;
+        return next;
+      });
+    }
+    cached.isCompleted = true;
+    cached.signature = parsedTaskSignature(cached);
+    cached.cachedAt = deviceTimestamp();
+    cached.completedPreservedAt = deviceTimestamp();
+    if (reason) cached.completedPreservedReason = reason;
+    this.taskReferenceSnapshotDirty = true;
+    return noteTouched;
   }
 
   async getInboxProjectId() {
@@ -4521,11 +4545,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async updateTodoistFromParsedTask(task, remote = null) {
+    const cached = this.settings.taskCache?.[task.id] || null;
+    const cachedCompleted = Boolean(cached?.isCompleted);
+    const remoteCompleted = remote ? Boolean(remote.isCompleted) : cachedCompleted;
+    if (task.isCompleted) {
+      if (!remoteCompleted) {
+        await this.setTodoistTaskCompletionState(task.id, true);
+      }
+      return true;
+    }
+    if (remoteCompleted) {
+      const reopened = await this.setTodoistTaskCompletionState(task.id, false);
+      if (!reopened) return false;
+      remote = null;
+    }
     const updates = todoistUpdatePayload(task, remote, this.settings);
     if (Object.keys(updates).length) await this.todoistRequest(`/tasks/${task.id}`, "POST", updates);
-    if (remote && Boolean(remote.isCompleted) === Boolean(task.isCompleted)) return;
-    if (task.isCompleted) await this.todoistRequest(`/tasks/${task.id}/close`, "POST");
-    else if (!remote || remote.isCompleted) await this.todoistRequest(`/tasks/${task.id}/reopen`, "POST").catch(() => null);
+    return true;
+  }
+
+  async setTodoistTaskCompletionState(taskId, completed) {
+    const endpoint = completed ? "close" : "reopen";
+    const response = await requestUrl({
+      url: `${TODOIST_API}/tasks/${encodeURIComponent(taskId)}/${endpoint}`,
+      method: "POST",
+      headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/json" },
+      throw: false
+    });
+    if (response.status === 404) {
+      this.logLocal("Todoist completion update skipped because task was not found", { id: taskId, completed });
+      return false;
+    }
+    if (response.status < 200 || response.status >= 300) throw new Error(`Todoist completion returned ${response.status}: ${redactSecrets(response.text)}`);
+    this.todoistSnapshotCache = null;
+    return true;
   }
 
   async todoistConflictForLocalUpdate(parsed, cached, remoteOverride = null) {
@@ -4568,6 +4621,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const stillExists = await this.todoistTaskExists(taskId);
         if (stillExists) {
           this.logLocal("Todoist removal event preserved active task", { id: taskId, path: cached.path || "" });
+          savedEvents.add(event.id);
+          continue;
+        }
+        if (cached.isCompleted || await this.cachedTaskLineIsChecked(taskId, cached)) {
+          await this.preserveMissingTodoistTaskInNote(taskId, cached, "Todoist removal event for completed local task");
+          this.logLocal("Todoist removal event preserved completed task in note", { id: taskId, path: cached.path || "" });
           savedEvents.add(event.id);
           continue;
         }
@@ -9049,7 +9108,7 @@ function assignGeneratedTaskSectionId(tasks, sectionId) {
 }
 
 function emptySyncStats() {
-  return { created: 0, updated: 0, relinked: 0, deleted: 0, normalized: 0, conflicts: 0 };
+  return { created: 0, updated: 0, relinked: 0, deleted: 0, completedForgotten: 0, normalized: 0, conflicts: 0, preservedCompleted: 0 };
 }
 
 function mergeSyncStats(target, source) {

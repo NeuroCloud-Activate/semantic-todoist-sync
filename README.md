@@ -24,7 +24,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.2
+## What's New In 0.6.0
 
 1. **Schedule Today now uses the same context brain as the rest of the plugin**
 
@@ -32,7 +32,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 2. **A more useful preview before anything touches Todoist**
 
-   The preview can show the top ten suggested swaps, keeps moved-out tasks visible so they can be restored, and uses compact controls that work better on mobile and desktop. The timeline scales to your configured minimum task block, while task durations can still move in 15-minute steps when that fits your settings.
+   The preview can show the top ten suggested task swaps, keeps moved-out tasks visible so they can be restored, and uses compact controls that work better on mobile and desktop. The timeline scales to your configured minimum task block, while task durations can still move in 15-minute steps when that fits your settings.
 
 3. **Todoist-first scheduling with cleaner duration rules**
 

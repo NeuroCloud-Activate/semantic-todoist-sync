@@ -884,7 +884,8 @@
 .semantic-todoist-schedule-control-group {
   display: grid;
   gap: 2px;
-  grid-template-columns: repeat(2, 19px);
+  grid-template-columns: 19px;
+  grid-template-rows: repeat(2, 13px);
 }
 
 .semantic-todoist-schedule-remove-controls {
@@ -921,7 +922,8 @@
 
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-control-group {
   gap: 1px;
-  grid-template-columns: repeat(2, 15px);
+  grid-template-columns: 15px;
+  grid-template-rows: repeat(2, 13px);
 }
 
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-remove-controls {
@@ -1186,7 +1188,8 @@
 
   .semantic-todoist-schedule-control-group {
     gap: 1px;
-    grid-template-columns: repeat(2, 17px);
+    grid-template-columns: 17px;
+    grid-template-rows: repeat(2, 13px);
   }
 
   .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-controls button {
@@ -1195,7 +1198,7 @@
   }
 
   .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-control-group {
-    grid-template-columns: repeat(2, 13px);
+    grid-template-columns: 13px;
   }
 
   .semantic-todoist-schedule-remove-controls {

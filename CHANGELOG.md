@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.5
+
+- Tightened Schedule Today's Tasks preview controls by stacking move and duration button groups vertically while keeping the remove button separated.
+
 ## 0.6.4
 
 - Polished the Schedule Today's Tasks preview controls by grouping move arrows, grouping duration adjustments, and separating the remove action as a round button.

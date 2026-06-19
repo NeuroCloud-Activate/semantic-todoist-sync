@@ -5784,7 +5784,8 @@ class ScheduleTodayModal extends Modal {
     header.createDiv({ text: `${config.today} | ${minutesToClock(config.startMinutes)}-${minutesToClock(config.endMinutes)} | ${config.chunkMinutes} min chunks` });
     if (this.preview.message) contentEl.createDiv({ cls: "semantic-todoist-schedule-empty", text: this.preview.message });
     const summary = contentEl.createDiv({ cls: "semantic-todoist-schedule-summary" });
-    const notScheduledCount = (this.preview.unscheduled?.length || 0) + (this.preview.bumped?.length || 0) + (this.preview.removed?.length || 0);
+    const removedItems = removedScheduleItems(this.preview);
+    const notScheduledCount = (this.preview.unscheduled?.length || 0) + removedItems.length;
     summary.createSpan({ text: `${this.preview.scheduled.length} scheduled` });
     summary.createSpan({ text: `${this.preview.fixed.length} fixed` });
     summary.createSpan({ text: `${notScheduledCount} not scheduled` });
@@ -5820,15 +5821,10 @@ class ScheduleTodayModal extends Modal {
         unscheduled.createDiv({ cls: "semantic-todoist-schedule-list-empty", text: "No unscheduled task currently fits by swapping one scheduled block." });
       }
     }
-    if (this.preview.removed?.length) {
+    if (removedItems.length) {
       const removed = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-removed" });
       removed.createEl("h3", { text: "Removed from today" });
-      for (const item of this.preview.removed.slice(-8)) this.renderRemovedRow(removed, item);
-    }
-    if (this.preview.bumped?.length) {
-      const bumped = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-bumped" });
-      bumped.createEl("h3", { text: "Moved out" });
-      for (const item of this.preview.bumped.slice(-8)) this.renderBumpedRow(bumped, item);
+      for (const item of removedItems.slice(-8)) this.renderRemovedRow(removed, item);
     }
     if (this.preview.splitSubtasks.length) {
       const split = contentEl.createDiv({ cls: "semantic-todoist-schedule-list" });
@@ -5862,22 +5858,6 @@ class ScheduleTodayModal extends Modal {
     button.onclick = (event) => {
       event.preventDefault();
       this.swapInSuggestion(item.id);
-    };
-  }
-
-  renderBumpedRow(container, item) {
-    const row = container.createDiv({ cls: "semantic-todoist-schedule-suggestion is-bumped" });
-    row.draggable = true;
-    row.dataset.id = item.id;
-    row.addEventListener("dragstart", (event) => this.startDrag(event, "suggestion", item.id));
-    row.addEventListener("dragend", () => this.clearDrag());
-    const text = row.createDiv({ cls: "semantic-todoist-schedule-suggestion-text" });
-    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-title", text: shortTitle(item.content || "Task", 82) });
-    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-reason", text: item.rationale || item.reason || "Moved out by a swap." });
-    const button = row.createEl("button", { text: "Put back" });
-    button.onclick = (event) => {
-      event.preventDefault();
-      this.restoreBumpedItem(item.id);
     };
   }
 
@@ -5946,7 +5926,7 @@ class ScheduleTodayModal extends Modal {
       return;
     }
     if (String(payload.id) === String(target.id)) return;
-    if (!this.reorderScheduledAround(payload.id, target.id)) this.dropScheduledAt(payload.id, target.startMinutes);
+    this.dropScheduledAt(payload.id, target.startMinutes);
   }
 
   findSuggestion(id) {
@@ -6015,13 +5995,18 @@ class ScheduleTodayModal extends Modal {
     const bumpedItem = scheduleUnscheduledItem(bumped, bumped.durationMinutes, `Swapped out for ${shortTitle(suggestion.content || "task", 32)}`, config, {
       wasBumped: true,
       bumpedById: suggestion.id,
+      removedAtMinutes: bumped.startMinutes,
+      originalStartMinutes: bumped.originalStartMinutes ?? bumped.startMinutes,
+      scheduleBlockMinutes: bumped.durationMinutes,
+      totalDurationMinutes: bumped.totalDurationMinutes || bumped.durationMinutes,
       startMinutes: null,
       endMinutes: null,
       scheduledDateTime: "",
-      rationale: `Moved out for ${shortTitle(suggestion.content || "task", 42)}.`
+      rationale: `Swapped out from ${minutesToClock(bumped.startMinutes)}-${minutesToClock(bumped.endMinutes)} for ${shortTitle(suggestion.content || "task", 42)}.`
     });
     this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(bumped.id));
-    this.preview.bumped.push(bumpedItem);
+    this.preview.removed = (this.preview.removed || []).filter((item) => String(item.id) !== String(bumped.id));
+    this.preview.removed.push(bumpedItem);
     refreshScheduleSuggestions(this.preview);
     this.render();
   }
@@ -6049,9 +6034,7 @@ class ScheduleTodayModal extends Modal {
   }
 
   restoreBumpedItem(id) {
-    const item = this.findSuggestion(id);
-    if (!item) return;
-    this.swapInSuggestion(item.id, item.bumpedById || "");
+    this.restoreRemovedItem(id);
   }
 
   removeScheduledItem(id) {
@@ -6084,7 +6067,7 @@ class ScheduleTodayModal extends Modal {
     const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
     this.preview.config = config;
     const target = String(id || "");
-    const item = (this.preview.removed || []).find((removed) => String(removed.id) === target);
+    const item = removedScheduleItems(this.preview).find((removed) => String(removed.id) === target);
     if (!item) return;
     const duration = suggestionScheduleBlockMinutes(item, config);
     const preferredStart = Number.isFinite(Number(item.removedAtMinutes)) ? Number(item.removedAtMinutes) : Number(item.originalStartMinutes);
@@ -6097,6 +6080,7 @@ class ScheduleTodayModal extends Modal {
       return;
     }
     this.preview.removed = (this.preview.removed || []).filter((removed) => String(removed.id) !== target);
+    this.preview.bumped = (this.preview.bumped || []).filter((removed) => String(removed.id) !== target);
     const restored = schedulePreviewItem(item, start, duration, config, {
       restoredFromRemoved: true,
       previewOrderChanged: true,
@@ -6190,7 +6174,7 @@ class ScheduleTodayModal extends Modal {
     const config = this.preview.config;
     const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
     const raw = Number(startMinutes);
-    const start = Number.isFinite(raw) ? raw : config.startMinutes;
+    const start = snapScheduleStart(Number.isFinite(raw) ? raw : config.startMinutes, config);
     return Math.max(config.startMinutes, Math.min(config.endMinutes - duration, start));
   }
 
@@ -6212,13 +6196,6 @@ class ScheduleTodayModal extends Modal {
     return item.durationMinutes;
   }
 
-  firstScheduleConflict(excludeId, startMinutes, durationMinutesValue) {
-    const config = this.preview.config;
-    const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
-    return scheduleBlocksForPreview(this.preview, config, { excludeId })
-      .find((block) => rangesOverlap(startMinutes, startMinutes + duration, block.startMinutes, block.endMinutes)) || null;
-  }
-
   placeScheduleItem(item, startMinutes) {
     const config = this.preview.config;
     const bounded = this.boundedStart(startMinutes, item.durationMinutes);
@@ -6230,25 +6207,88 @@ class ScheduleTodayModal extends Modal {
   }
 
   dropScheduledAt(id, startMinutes) {
-    const config = this.preview.config;
     const item = this.movableItem(id);
     if (!item) return false;
     const bounded = this.boundedStart(startMinutes, item.durationMinutes);
-    const conflict = this.firstScheduleConflict(item.id, bounded, item.durationMinutes);
-    if (conflict?.type === "scheduled" && conflict.id && this.reorderScheduledAround(item.id, conflict.id)) return true;
-    if (this.canPlaceScheduleBlock(item.id, bounded, item.durationMinutes)) {
-      this.placeScheduleItem(item, bounded);
-      this.render();
-      return true;
-    }
-    const start = findNearestOpenScheduleSlot(scheduleBlocksForPreview(this.preview, config, { excludeId: item.id }), item.durationMinutes, config, bounded);
-    if (start != null) {
-      this.placeScheduleItem(item, start);
-      this.render();
+    const direction = bounded >= item.startMinutes ? 1 : -1;
+    if (this.placeScheduledWithDisplacement(item.id, bounded, direction)) {
       return true;
     }
     new Notice("No open slot fits that task block.");
     return false;
+  }
+
+  placeScheduledWithDisplacement(id, startMinutes, direction = 1) {
+    const config = this.preview.config;
+    const item = this.movableItem(id);
+    if (!item) return false;
+    const snapshot = this.snapshotScheduledItems();
+    const anchorStart = this.boundedStart(startMinutes, item.durationMinutes);
+    const anchorDuration = roundToScheduleChunk(item.durationMinutes, config) || config.minBlockMinutes;
+    const anchorEnd = anchorStart + anchorDuration;
+    const immovableBlocks = scheduleImmovableBlocks(this.preview, config);
+    if (immovableBlocks.some((block) => rangesOverlap(anchorStart, anchorEnd, block.startMinutes, block.endMinutes))) return false;
+    const ordered = (this.preview.scheduled || []).slice()
+      .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    const source = ordered.find((scheduled) => String(scheduled.id) === String(item.id));
+    if (!source) return false;
+    const withoutSource = ordered.filter((scheduled) => String(scheduled.id) !== String(item.id));
+    const sign = direction >= 0 ? 1 : -1;
+    let insertIndex;
+    if (sign >= 0) {
+      insertIndex = withoutSource.findIndex((scheduled) => scheduled.startMinutes > anchorStart);
+    } else {
+      insertIndex = withoutSource.findIndex((scheduled) => scheduled.startMinutes >= anchorStart);
+    }
+    if (insertIndex < 0) insertIndex = withoutSource.length;
+    const sequence = withoutSource.slice();
+    sequence.splice(insertIndex, 0, source);
+    const anchorIndex = sequence.findIndex((scheduled) => String(scheduled.id) === String(source.id));
+    this.placeScheduleItem(source, anchorStart);
+    const ok = this.packScheduledSequenceAroundAnchor(sequence, anchorIndex);
+    if (!ok) {
+      this.restoreScheduledSnapshot(snapshot);
+      return false;
+    }
+    this.preview.scheduled = sequence
+      .slice()
+      .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    this.render();
+    return true;
+  }
+
+  packScheduledSequenceAroundAnchor(sequence, anchorIndex) {
+    const config = this.preview.config;
+    const anchor = sequence?.[anchorIndex];
+    if (!anchor) return false;
+    const immovableBlocks = scheduleImmovableBlocks(this.preview, config);
+    const anchorBlock = { startMinutes: anchor.startMinutes, endMinutes: anchor.endMinutes, id: anchor.id, type: "scheduled" };
+    if (immovableBlocks.some((block) => rangesOverlap(anchorBlock.startMinutes, anchorBlock.endMinutes, block.startMinutes, block.endMinutes))) return false;
+    const beforeBlocks = immovableBlocks.concat(anchorBlock);
+    let beforeCursor = anchor.startMinutes;
+    for (let index = anchorIndex - 1; index >= 0; index -= 1) {
+      const item = sequence[index];
+      const duration = roundToScheduleChunk(item.durationMinutes, config) || config.minBlockMinutes;
+      const desired = Math.min(Number(item.startMinutes || config.startMinutes), beforeCursor - duration);
+      const start = latestOpenScheduleStartBefore(beforeBlocks, duration, config, desired, beforeCursor);
+      if (start == null) return false;
+      this.placeScheduleItem(item, start);
+      beforeBlocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
+      beforeCursor = item.startMinutes;
+    }
+    const afterBlocks = immovableBlocks.concat(anchorBlock);
+    let afterCursor = anchor.endMinutes;
+    for (let index = anchorIndex + 1; index < sequence.length; index += 1) {
+      const item = sequence[index];
+      const duration = roundToScheduleChunk(item.durationMinutes, config) || config.minBlockMinutes;
+      const desired = Math.max(Number(item.startMinutes || config.startMinutes), afterCursor);
+      const start = earliestOpenScheduleStartAfter(afterBlocks, duration, config, desired, afterCursor);
+      if (start == null) return false;
+      this.placeScheduleItem(item, start);
+      afterBlocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
+      afterCursor = item.endMinutes;
+    }
+    return true;
   }
 
   snapshotScheduledItems() {
@@ -6272,42 +6312,6 @@ class ScheduleTodayModal extends Modal {
     }
   }
 
-  repackScheduledItems(orderedItems) {
-    const config = this.preview.config;
-    const snapshot = this.snapshotScheduledItems();
-    const blocked = [];
-    if (config.lunchMinutes > 0) blocked.push({ startMinutes: config.lunchStartMinutes, endMinutes: config.lunchEndMinutes, type: "lunch" });
-    for (const fixed of this.preview.fixed || []) {
-      blocked.push({ startMinutes: fixed.startMinutes, endMinutes: fixed.endMinutes, id: fixed.id, type: "fixed" });
-    }
-    for (const item of orderedItems) {
-      const start = findOpenScheduleSlot(blocked, item.durationMinutes, config);
-      if (start == null) {
-        this.restoreScheduledSnapshot(snapshot);
-        new Notice("That order no longer fits in today's open blocks.");
-        return false;
-      }
-      this.placeScheduleItem(item, start);
-      blocked.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
-    }
-    this.preview.scheduled = orderedItems;
-    this.render();
-    return true;
-  }
-
-  reorderScheduledAround(sourceId, targetId) {
-    const ordered = (this.preview.scheduled || []).slice()
-      .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
-    const fromIndex = ordered.findIndex((item) => String(item.id) === String(sourceId));
-    const targetIndex = ordered.findIndex((item) => String(item.id) === String(targetId));
-    if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return false;
-    const [moved] = ordered.splice(fromIndex, 1);
-    const adjustedTargetIndex = ordered.findIndex((item) => String(item.id) === String(targetId));
-    const insertIndex = fromIndex < targetIndex ? adjustedTargetIndex + 1 : adjustedTargetIndex;
-    ordered.splice(Math.max(0, insertIndex), 0, moved);
-    return this.repackScheduledItems(ordered);
-  }
-
   moveItem(id, deltaMinutes) {
     const item = this.movableItem(id);
     if (!item) return;
@@ -6316,16 +6320,7 @@ class ScheduleTodayModal extends Modal {
     const minStart = config.startMinutes;
     const maxStart = config.endMinutes - item.durationMinutes;
     for (let start = item.startMinutes + step; step > 0 ? start <= maxStart : start >= minStart; start += step) {
-      const conflict = this.firstScheduleConflict(item.id, start, item.durationMinutes);
-      if (conflict?.type === "scheduled" && conflict.id) {
-        if (this.reorderScheduledAround(item.id, conflict.id)) return;
-        continue;
-      }
-      if (this.canPlaceScheduleBlock(item.id, start, item.durationMinutes)) {
-        this.placeScheduleItem(item, start);
-        this.render();
-        return;
-      }
+      if (this.placeScheduledWithDisplacement(item.id, start, step >= 0 ? 1 : -1)) return;
     }
     new Notice(step > 0 ? "No later open slot fits that task block." : "No earlier open slot fits that task block.");
   }
@@ -8433,6 +8428,19 @@ function scheduleUnscheduledItem(candidate, durationMinutesValue, reason, config
   });
 }
 
+function removedScheduleItems(preview = {}) {
+  const combined = [];
+  const seen = new Set();
+  for (const item of [...(preview.removed || []), ...(preview.bumped || [])]) {
+    if (!item?.id) continue;
+    const key = String(item.id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    combined.push(item);
+  }
+  return combined;
+}
+
 function refreshScheduleSuggestions(preview) {
   if (!preview) return [];
   const config = preview.config || {};
@@ -8555,6 +8563,79 @@ function scheduleBlocksForPreview(preview, config = {}, options = {}) {
     blocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: item.fixed ? "fixed" : "scheduled" });
   }
   return blocks;
+}
+
+function scheduleImmovableBlocks(preview, config = {}) {
+  const blocks = [];
+  if (config.lunchMinutes > 0) blocks.push({ startMinutes: config.lunchStartMinutes, endMinutes: config.lunchEndMinutes, type: "lunch" });
+  for (const fixed of preview?.fixed || []) {
+    if (!Number.isFinite(fixed.startMinutes) || !Number.isFinite(fixed.endMinutes)) continue;
+    blocks.push({ startMinutes: fixed.startMinutes, endMinutes: fixed.endMinutes, id: fixed.id, type: "fixed" });
+  }
+  return blocks.sort((a, b) => a.startMinutes - b.startMinutes || a.endMinutes - b.endMinutes);
+}
+
+function scheduleGridMinutes(config = {}) {
+  return Math.max(1, Math.round(Number(config.chunkMinutes || config.minBlockMinutes || scheduleDurationStepMinutes(config))));
+}
+
+function snapScheduleStart(startMinutes, config = {}) {
+  const grid = scheduleGridMinutes(config);
+  const origin = Number(config.startMinutes || 0);
+  const value = Number(startMinutes);
+  if (!Number.isFinite(value)) return origin;
+  return origin + Math.round((value - origin) / grid) * grid;
+}
+
+function snapScheduleStartAtOrBefore(startMinutes, config = {}) {
+  const grid = scheduleGridMinutes(config);
+  const origin = Number(config.startMinutes || 0);
+  const value = Number(startMinutes);
+  if (!Number.isFinite(value)) return origin;
+  return origin + Math.floor((value - origin) / grid) * grid;
+}
+
+function snapScheduleStartAtOrAfter(startMinutes, config = {}) {
+  const grid = scheduleGridMinutes(config);
+  const origin = Number(config.startMinutes || 0);
+  const value = Number(startMinutes);
+  if (!Number.isFinite(value)) return origin;
+  return origin + Math.ceil((value - origin) / grid) * grid;
+}
+
+function latestOpenScheduleStartBefore(blocked, durationMinutesValue, config = {}, preferredStartMinutes, latestEndMinutes) {
+  const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
+  const latestEnd = Number.isFinite(Number(latestEndMinutes)) ? Number(latestEndMinutes) : config.endMinutes;
+  let start = snapScheduleStartAtOrBefore(Math.min(Number(preferredStartMinutes), latestEnd - duration), config);
+  let guard = 0;
+  while (start >= config.startMinutes && guard < 500) {
+    const end = start + duration;
+    const conflict = (blocked || [])
+      .filter((block) => Number.isFinite(block?.startMinutes) && Number.isFinite(block?.endMinutes))
+      .find((block) => rangesOverlap(start, end, block.startMinutes, block.endMinutes));
+    if (!conflict && end <= latestEnd) return start;
+    const next = conflict ? Math.min(start - scheduleGridMinutes(config), conflict.startMinutes - duration) : start - scheduleGridMinutes(config);
+    start = snapScheduleStartAtOrBefore(next, config);
+    guard += 1;
+  }
+  return null;
+}
+
+function earliestOpenScheduleStartAfter(blocked, durationMinutesValue, config = {}, preferredStartMinutes, earliestStartMinutes) {
+  const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
+  const earliestStart = Number.isFinite(Number(earliestStartMinutes)) ? Number(earliestStartMinutes) : config.startMinutes;
+  let start = snapScheduleStartAtOrAfter(Math.max(Number(preferredStartMinutes), earliestStart), config);
+  let guard = 0;
+  while (start + duration <= config.endMinutes && guard < 500) {
+    const end = start + duration;
+    const conflict = (blocked || [])
+      .filter((block) => Number.isFinite(block?.startMinutes) && Number.isFinite(block?.endMinutes))
+      .find((block) => rangesOverlap(start, end, block.startMinutes, block.endMinutes));
+    if (!conflict) return start;
+    start = snapScheduleStartAtOrAfter(conflict.endMinutes, config);
+    guard += 1;
+  }
+  return null;
 }
 
 function unscheduledRationale(candidate, reason, duration, config) {

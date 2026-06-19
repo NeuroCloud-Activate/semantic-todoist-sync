@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.7
+
+- Hardened Schedule Today's Tasks drag-and-drop so moved tasks snap to the configured time grid and only displace nearby blocking tasks instead of repacking the day from the top.
+- Folded swapped-out tasks into the existing Removed from today section so displaced and manually removed tasks can be restored from one place.
+
 ## 0.6.6
 
 - Updated Schedule Today's Tasks suggestions so eligible tasks can show Add in when they fit an open preview window, while Swap in remains available when another scheduled task needs to move out.

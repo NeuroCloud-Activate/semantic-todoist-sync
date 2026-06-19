@@ -8,6 +8,7 @@ const {
   PluginSettingTab,
   Setting,
   TFile,
+  setIcon,
   requestUrl
 } = require("obsidian");
 
@@ -19,6 +20,15 @@ const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
 const SEMANTIC_INDEX_PATH_META_FILE = "semantic-index-path-meta.json";
 const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
 const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
+const SCHEDULER_MEMORY_FILE = "scheduler-memory.json";
+const SCHEDULER_MEMORY_MAX_ENTRIES = 500;
+const SCHEDULER_MEMORY_MAX_CONTEXT_TERMS = 24;
+const SCHEDULER_MEMORY_MAX_CONTEXT_PATHS = 12;
+const SCHEDULE_PREVIEW_SUGGESTION_LIMIT = 10;
+const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID = "people-followup-minimum-duration";
+const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
+const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
+const SCHEDULER_RELATED_GROUPING_POLICY_ID = "related-task-grouping";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const TODOIST_DESCRIPTION_LIMIT = 16000;
 const STATUS_ITEM_MIN_VISIBLE_MS = 1000;
@@ -38,6 +48,12 @@ const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
+const DEFAULT_SCHEDULE_TODAY_PROMPT = "Plan today's Todoist tasks into a realistic workday. Prioritize urgent, high-value, and time-sensitive work that can fit today. Use vault and task context to estimate focused work duration, prefer about one hour for ordinary focused-work blocks, keep follow-up/check-in/discussion tasks short when appropriate, split oversized tasks into clear continuation work, and leave due dates, deadlines, priorities, labels, and task titles unchanged.";
+const DEFAULT_SCHEDULER_POLICY_TEXT = {
+  peopleFollowupRationale: "These blocks represent quick action or outreach by the user, not the actual meeting or conversation time. Cap them at the scheduler minimum duration configured in settings.",
+  defaultFocusRationale: "Ordinary focused-work tasks without clear heavy-complexity signals should start near this duration before context, priority, deadlines, and memory adjust them.",
+  relatedGroupingRationale: "Related tasks should stay near each other when practical, while Todoist priority, deadline proximity, urgency, recency, and learned memory still drive the main order."
+};
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
@@ -62,6 +78,14 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     prompt: "Scan the active note or selected text and generate only follow-up tasks. Apply the FollowUp tag rules and include enough context to act."
   },
   {
+    filename: "Schedule today's tasks.md",
+    action: "schedule-today",
+    createTasks: false,
+    insertResponse: false,
+    syncTasks: false,
+    prompt: DEFAULT_SCHEDULE_TODAY_PROMPT
+  },
+  {
     filename: "Summarize active note.md",
     createTasks: false,
     insertResponse: true,
@@ -84,7 +108,7 @@ const DEFAULT_SETTINGS = {
   embeddingModel: "gemini/gemini-embedding-2",
   availableChatModels: [],
   availableEmbeddingModels: [],
-  availableGeminiModels: ["gemini-3.5-flash", "gemini-2.5-flash"],
+  availableGeminiModels: ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
   availableGeminiEmbeddingModels: ["gemini-embedding-2", "gemini-embedding-001"],
   modelsFetchedAt: "",
   geminiModelsFetchedAt: "",
@@ -128,6 +152,27 @@ const DEFAULT_SETTINGS = {
   lastSubtaskIndentRepairAt: "",
   lastSubtaskIndentRepairFingerprint: "",
   todoistSnapshotCacheMinutes: 5,
+  scheduleTodayEnabled: true,
+  scheduleTodayStartTime: "08:00",
+  scheduleTodayEndTime: "16:00",
+  scheduleTodayLunchStartTime: "12:00",
+  scheduleTodayLunchMinutes: 30,
+  scheduleTodayMinBlockMinutes: 30,
+  scheduleTodayMaxBlockMinutes: 180,
+  scheduleTodayChunkMinutes: 30,
+  scheduleTodayDueWindowDays: 2,
+  scheduleTodayIncludeOverdue: true,
+  scheduleTodayIncludeSubtasks: true,
+  scheduleTodayAllowIndependentSubtasks: true,
+  scheduleTodayExcludedLabels: "waiting, blocked, someday",
+  scheduleTodayWeightTodoistPriority: "more",
+  scheduleTodayWeightDeadlineProximity: "more",
+  scheduleTodayWeightOverdue: "more",
+  scheduleTodayWeightDueDateProximity: "moderate",
+  scheduleTodayWeightSemanticUrgency: "moderate",
+  scheduleTodayWeightNoteRecency: "moderate",
+  scheduleTodayWeightParentDependency: "moderate",
+  scheduleTodayLastUndo: null,
   taskReferenceSnapshotMeta: {},
   linksAppURI: false,
   subtaskIndentSpaces: 4,
@@ -169,6 +214,14 @@ const DEFAULT_SETTINGS = {
       mode: "tasks",
       createTasks: true,
       taskGenerationTemplate: true
+    },
+    {
+      name: "Schedule today's tasks",
+      prompt: DEFAULT_SCHEDULE_TODAY_PROMPT,
+      action: "schedule-today",
+      createTasks: false,
+      insertResponse: false,
+      syncAfterInsert: false
     }
   ],
   mainTaskInstructions: "Review the source together with relevant ranked vault context and identify tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
@@ -216,13 +269,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceIndexRevision = -1;
     this.taskReferenceSnapshotFingerprint = "";
     this.taskReferenceSnapshotDirty = true;
+    this.schedulerMemory = emptySchedulerMemory();
+    this.schedulerMemoryDirty = false;
+    this.schedulerMemorySaveTimer = null;
     this.aiActivity = "";
     this.pendingIndexPaths = new Set();
     this.syncInProgress = false;
+    this.schedulerInProgress = false;
     this.emailProcessingInProgress = false;
     this.semanticIndexInProgress = false;
     this.semanticIndexOptimizeInProgress = false;
     this.internalNoteWriteUntil = new Map();
+    await this.loadSchedulerMemory();
     await this.loadTaskReferenceSnapshot();
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     await this.migrateSettings();
@@ -246,6 +304,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-search", name: "Search vault semantically", callback: () => this.searchFromSelection() });
     this.addCommand({ id: "semantic-todoist-process-email", name: "Process pending email tasks", callback: () => this.processPendingEmails() });
     this.addCommand({ id: "semantic-todoist-note-to-tasks", name: "Create Todoist tasks from active note", callback: () => this.createTasksFromActiveNote() });
+    this.addCommand({ id: "semantic-todoist-schedule-today", name: "Schedule today's tasks", callback: () => this.openScheduleTodayPreview() });
+    this.addCommand({ id: "semantic-todoist-undo-schedule-today", name: "Undo last schedule today apply", callback: () => this.undoLastScheduleToday(true) });
     this.addCommand({ id: "semantic-todoist-sync-notes", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
     this.addCommand({ id: "semantic-todoist-rebuild-references", name: "Rebuild local Todoist reference table", callback: () => this.rebuildTodoistReferenceTable(true) });
     this.addCommand({ id: "semantic-todoist-repair-subtask-indentation", name: "Repair synced subtask indentation", callback: () => this.repairCachedSubtaskIndentation(true, { force: true, scanAll: true }) });
@@ -280,7 +340,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexReshardTimer = null;
     window.clearTimeout(this.taskReferenceSnapshotTimer);
     this.taskReferenceSnapshotTimer = null;
+    window.clearTimeout(this.schedulerMemorySaveTimer);
+    this.schedulerMemorySaveTimer = null;
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
+    await this.flushSchedulerMemoryIfDirty().catch((error) => console.error("Scheduler memory flush failed", error));
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
@@ -308,6 +371,169 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settingsSaveQueued = false;
     await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
     return true;
+  }
+
+  async loadSchedulerMemory() {
+    try {
+      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${SCHEDULER_MEMORY_FILE}`);
+      const parsed = JSON.parse(raw || "{}");
+      this.schedulerMemory = normalizeSchedulerMemory(parsed);
+      this.schedulerMemoryDirty = false;
+      const policies = Array.isArray(parsed?.durationPolicies) ? parsed.durationPolicies : [];
+      const hasCanonicalPolicy = policies.some((policy) => policy?.id === SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID);
+      const hasLegacyPolicy = policies.some((policy) => SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES.includes(policy?.id));
+      if (!hasCanonicalPolicy || hasLegacyPolicy) this.markSchedulerMemoryDirty(1000);
+    } catch {
+      this.schedulerMemory = emptySchedulerMemory();
+      this.schedulerMemoryDirty = false;
+      this.markSchedulerMemoryDirty(1000);
+    }
+  }
+
+  markSchedulerMemoryDirty(delayMs = 2500) {
+    this.schedulerMemoryDirty = true;
+    window.clearTimeout(this.schedulerMemorySaveTimer);
+    this.schedulerMemorySaveTimer = window.setTimeout(() => {
+      this.schedulerMemorySaveTimer = null;
+      this.flushSchedulerMemoryIfDirty().catch((error) => console.error("Scheduler memory save failed", error));
+    }, delayMs);
+  }
+
+  async flushSchedulerMemoryIfDirty() {
+    if (!this.schedulerMemoryDirty) return false;
+    window.clearTimeout(this.schedulerMemorySaveTimer);
+    this.schedulerMemorySaveTimer = null;
+    const compact = compactSchedulerMemory(this.schedulerMemory);
+    compact.updatedAt = deviceTimestamp();
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${SCHEDULER_MEMORY_FILE}`, JSON.stringify(compact));
+    this.schedulerMemory = compact;
+    this.schedulerMemoryDirty = false;
+    return true;
+  }
+
+  applySchedulerMemoryToCandidates(candidates) {
+    let matched = 0;
+    const durationPolicies = schedulerMemoryDurationPolicies(this.schedulerMemory);
+    for (const candidate of candidates || []) {
+      const memory = schedulerMemoryForCandidate(this.schedulerMemory, candidate);
+      if (!memory) continue;
+      matched += 1;
+      candidate.schedulerMemory = memory;
+      const learnedMinutes = learnedSchedulerDurationMinutes(memory);
+      if (!candidate.durationMinutes && learnedMinutes) {
+        const config = scheduleTodayConfig(this.settings);
+        const rounded = roundToScheduleChunk(learnedMinutes, config);
+        const adjusted = scheduleDurationWithLocalPolicy(candidate, rounded, config, durationPolicies);
+        candidate.durationMinutes = adjusted;
+        candidate.durationSource = `${memory.exact ? "scheduler memory" : "similar scheduler memory"}${adjusted < rounded ? "; capped for follow-up" : ""}`;
+      }
+      candidate.score += schedulerMemoryScoreAdjustment(memory);
+      candidate.searchText = [candidate.searchText, schedulerMemoryContextText(memory)].filter(Boolean).join("\n");
+    }
+    return matched;
+  }
+
+  observeSchedulerMemoryForTask(id, task, source = "cache") {
+    if (!task || !task.content) return false;
+    const entry = schedulerMemoryEntry(this.schedulerMemory, Object.assign({}, task, { id }));
+    if (!entry) return false;
+    const before = JSON.stringify(entry);
+    updateSchedulerMemoryEntry(entry, task, {
+      source,
+      observedAt: deviceTimestamp(),
+      durationMinutes: durationMinutes(task.duration),
+      scheduledDateTime: task.scheduledDueDateTime || "",
+      scheduledDate: task.scheduledDueDateTime ? datePart(task.scheduledDueDateTime) : task.due_date || "",
+      contextPaths: [task.path].filter(Boolean),
+      outcome: "observed"
+    });
+    if (JSON.stringify(entry) !== before) {
+      this.markSchedulerMemoryDirty();
+      return true;
+    }
+    return false;
+  }
+
+  recordSchedulerPreviewMemory(candidates, context = []) {
+    let changed = false;
+    const contextPaths = (context || []).map((chunk) => chunk.path).filter(Boolean).slice(0, 8);
+    for (const candidate of candidates || []) {
+      const entry = schedulerMemoryEntry(this.schedulerMemory, candidate);
+      if (!entry) continue;
+      const before = JSON.stringify(entry);
+      updateSchedulerMemoryEntry(entry, candidate, {
+        source: "preview",
+        observedAt: deviceTimestamp(),
+        durationMinutes: candidate.durationMinutes,
+        scheduledDateTime: candidate.scheduledDueDateTime || candidate.dueDate || "",
+        scheduledDate: candidate.dueDay || datePart(candidate.dueDate),
+        contextPaths,
+        outcome: "candidate"
+      });
+      if (JSON.stringify(entry) !== before) changed = true;
+    }
+    if (changed) this.markSchedulerMemoryDirty();
+    return changed;
+  }
+
+  recordSchedulerApplyMemory(preview, scheduled, created = []) {
+    const config = preview?.config || scheduleTodayConfig(this.settings);
+    const ordered = (scheduled || []).slice().sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    const contextPaths = (preview?.context || []).map((chunk) => chunk.path).filter(Boolean).slice(0, 8);
+    let changed = false;
+    ordered.forEach((item, index) => {
+      const entry = schedulerMemoryEntry(this.schedulerMemory, item);
+      if (!entry) return;
+      const before = JSON.stringify(entry);
+      updateSchedulerMemoryEntry(entry, item, {
+        source: "apply",
+        observedAt: deviceTimestamp(),
+        durationMinutes: item.durationMinutes,
+        scheduledDateTime: item.scheduledDateTime,
+        scheduledDate: config.today,
+        contextPaths,
+        orderIndex: index,
+        orderTotal: ordered.length,
+        startMinutes: item.startMinutes,
+        score: item.score,
+        outcome: item.promotedFromSuggestion ? "promoted" : "scheduled",
+        manualDurationChange: Boolean(item.previewDurationChanged),
+        manualOrderChange: Boolean(item.previewOrderChanged)
+      });
+      if (JSON.stringify(entry) !== before) changed = true;
+    });
+    for (const item of preview?.bumped || []) {
+      const entry = schedulerMemoryEntry(this.schedulerMemory, item);
+      if (!entry) continue;
+      const before = JSON.stringify(entry);
+      updateSchedulerMemoryEntry(entry, item, {
+        source: "preview",
+        observedAt: deviceTimestamp(),
+        durationMinutes: item.durationMinutes,
+        scheduledDate: config.today,
+        contextPaths,
+        outcome: "bumped",
+        score: item.score
+      });
+      if (JSON.stringify(entry) !== before) changed = true;
+    }
+    for (const item of created || []) {
+      const entry = schedulerMemoryEntry(this.schedulerMemory, item);
+      if (!entry) continue;
+      const before = JSON.stringify(entry);
+      updateSchedulerMemoryEntry(entry, item, {
+        source: "apply",
+        observedAt: deviceTimestamp(),
+        durationMinutes: item.durationMinutes,
+        scheduledDateTime: item.scheduledDateTime,
+        scheduledDate: datePart(item.scheduledDateTime),
+        contextPaths,
+        outcome: "created-continuation"
+      });
+      if (JSON.stringify(entry) !== before) changed = true;
+    }
+    if (changed) this.markSchedulerMemoryDirty();
+    return changed;
   }
 
   async loadTaskReferenceSnapshot() {
@@ -1099,6 +1325,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return !this.aiActivity &&
       !this.semanticIndexInProgress &&
       !this.syncInProgress &&
+      !this.schedulerInProgress &&
       !this.emailProcessingInProgress &&
       !this.referenceRebuildInProgress;
   }
@@ -1943,6 +2170,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async chat(prompt, activeOverride = null, history = []) {
+    const schedulerMemoryUpdate = await this.tryUpdateSchedulerMemoryFromChat(prompt);
+    if (schedulerMemoryUpdate) return { answer: schedulerMemoryUpdate, context: [] };
     await this.ensureCompatibleEmbeddingForChatModel();
     this.requireAiAccess();
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
@@ -1995,6 +2224,94 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return { answer: response, context };
   }
 
+  async tryUpdateSchedulerMemoryFromChat(prompt) {
+    let command = parseSchedulerMemoryChatCommand(prompt, this.settings);
+    if (!command) return "";
+    const config = scheduleTodayConfig(this.settings);
+    const policies = normalizeSchedulerDurationPolicies(this.schedulerMemory?.durationPolicies);
+    if (command.showOnly) return schedulerMemoryPolicySummary(policies, config);
+    try {
+      this.requireAiAccess();
+      const aiCommand = await this.interpretSchedulerMemoryPolicyCommand(prompt, policies, config);
+      command = mergeSchedulerMemoryChatCommands(command, aiCommand);
+    } catch (error) {
+      this.logLocal("Scheduler memory AI policy interpretation skipped", { error: error.message || String(error) });
+    }
+    let changed = false;
+    const updatePolicy = (id, updater) => {
+      const index = policies.findIndex((policy) => policy.id === id);
+      const current = index >= 0 ? policies[index] : normalizeSchedulerDurationPolicies([{ id }]).find((policy) => policy.id === id);
+      if (!current) return;
+      const next = updater(Object.assign({}, current));
+      if (!next) return;
+      if (index >= 0) policies[index] = next;
+      else policies.push(next);
+      changed = true;
+    };
+    if (command.peopleFollowupMinimum) {
+      updatePolicy(SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID, (policy) => Object.assign(policy, {
+        enabled: true,
+        maxMinutesSetting: "scheduleTodayMinBlockMinutes",
+        rationale: DEFAULT_SCHEDULER_POLICY_TEXT.peopleFollowupRationale
+      }));
+    } else if (command.peopleFollowupMaxMinutes) {
+      updatePolicy(SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID, (policy) => Object.assign(policy, {
+        enabled: true,
+        maxMinutes: command.peopleFollowupMaxMinutes,
+        maxMinutesSetting: "",
+        rationale: "These blocks represent quick action or outreach by the user, not the actual meeting or conversation time."
+      }));
+    }
+    if (command.defaultFocusMinutes) {
+      updatePolicy(SCHEDULER_DEFAULT_FOCUS_POLICY_ID, (policy) => Object.assign(policy, {
+        enabled: true,
+        targetMinutes: command.defaultFocusMinutes
+      }));
+    }
+    if (command.relatedGrouping != null) {
+      updatePolicy(SCHEDULER_RELATED_GROUPING_POLICY_ID, (policy) => Object.assign(policy, {
+        enabled: command.relatedGrouping !== false,
+        boost: command.relatedGroupingBoost || policy.boost || 0.45
+      }));
+    }
+    if (!changed) return schedulerMemoryPolicySummary(policies, config);
+    this.schedulerMemory = normalizeSchedulerMemory(Object.assign({}, this.schedulerMemory || {}, {
+      version: 2,
+      updatedAt: deviceTimestamp(),
+      durationPolicies: policies
+    }));
+    this.markSchedulerMemoryDirty(0);
+    await this.flushSchedulerMemoryIfDirty();
+    return `Updated scheduler memory.\n\n${schedulerMemoryPolicySummary(this.schedulerMemory.durationPolicies, config)}`;
+  }
+
+  async interpretSchedulerMemoryPolicyCommand(prompt, policies, config) {
+    const json = await this.withAiActivity("Reading scheduler memory instruction", () => this.openaiResponse({
+      model: this.settings.chatModel,
+      jsonSchema: schedulerMemoryPolicyCommandSchema(),
+      system: [
+        "Interpret a user's instruction about local scheduler memory policies.",
+        "Return only JSON matching the schema.",
+        "The plugin will apply only validated policy fields locally; do not invent unrelated settings.",
+        "Use null or unchanged values when the user did not clearly request a change.",
+        "People follow-up/discussion policies should usually use the configured minimum duration when the user mentions quick follow-up, discussion, coordination, collaboration, or outreach tasks."
+      ].join(" "),
+      user: [
+        "Current scheduler memory policies:",
+        formatSchedulerDurationPolicies(policies, config),
+        "",
+        "Current scheduler settings:",
+        `Minimum task block minutes: ${config.minBlockMinutes}`,
+        `Maximum task block minutes: ${config.maxBlockMinutes}`,
+        "",
+        "User instruction:",
+        prompt
+      ].join("\n")
+    }));
+    const parsed = JSON.parse(json);
+    return schedulerMemoryPolicyCommandFromAi(parsed);
+  }
+
   async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
@@ -2031,9 +2348,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const preferred = this.settings.chatFallbackModel && usesGeminiChatModel(this.settings.chatFallbackModel)
         ? `gemini/${normalizeGeminiModelId(this.settings.chatFallbackModel)}`
         : "";
-      return uniqueValues([preferred].concat(models
+      return uniqueValues([preferred].concat(rankGeminiFallbackModels(models)
         .map((model) => `gemini/${normalizeGeminiModelId(model)}`)
-        .filter((model) => normalizeGeminiModelId(model) && normalizeGeminiModelId(model) !== primary))).slice(0, 1);
+        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary))).slice(0, 1);
     }
     const primary = normalizeOpenAIModelId(primaryModel);
     const preferred = this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatFallbackModel)
@@ -2220,7 +2537,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (methods.includes("generateContent") && /^gemini-/i.test(id)) chat.push(id);
       if (methods.includes("embedContent") && /embedding/i.test(id)) embeddings.push(id);
     }
-    if (!chat.includes("gemini-3.5-flash")) chat.unshift("gemini-3.5-flash");
+    for (const preferred of ["gemini-3.1-flash-lite", "gemini-3.5-flash"]) {
+      if (!chat.includes(preferred)) chat.unshift(preferred);
+    }
     return {
       chat: Array.from(new Set(chat)).sort((a, b) => a.localeCompare(b)),
       embeddings: Array.from(new Set(embeddings)).sort((a, b) => a.localeCompare(b))
@@ -2460,6 +2779,381 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       priorities: this.settings[`${prefix}PriorityInstructions`] || fallback.priorities,
       descriptions: this.settings[`${prefix}DescriptionInstructions`] || fallback.descriptions
     };
+  }
+
+  async openScheduleTodayPreview(template = null) {
+    try {
+      const scheduleTemplate = template || await this.resolveScheduleTodayTemplate();
+      const preview = await this.buildScheduleTodayPreview(scheduleTemplate);
+      new ScheduleTodayModal(this.app, this, preview).open();
+    } catch (error) {
+      console.error(error);
+      this.logLocal("Schedule today preview failed", { error: error.message || String(error) });
+      new Notice(`Schedule today failed: ${error.message || error}`);
+      this.setSidebarStatus("Ready");
+    }
+  }
+
+  async resolveScheduleTodayTemplate() {
+    try {
+      const templates = await this.getPromptTemplates();
+      const selected = templates.find((template) => isScheduleTodayTemplate(template));
+      if (selected) return selected;
+    } catch (error) {
+      console.error(error);
+    }
+    return {
+      name: "Schedule today's tasks",
+      prompt: DEFAULT_SCHEDULE_TODAY_PROMPT,
+      action: "schedule-today",
+      createTasks: false,
+      insertResponse: false,
+      syncAfterInsert: false
+    };
+  }
+
+  async buildScheduleTodayPreview(template = null) {
+    if (this.schedulerInProgress) throw new Error("Schedule Today is already planning tasks.");
+    this.schedulerInProgress = true;
+    this.setSidebarStatus("Planning today's tasks...");
+    try {
+      if (!this.settings.scheduleTodayEnabled) throw new Error("Enable Schedule Today's Tasks in settings first.");
+      this.requireAiAccess();
+      this.requireTodoistAccess();
+      await this.ensureCompatibleEmbeddingForChatModel();
+      const scheduleConfig = scheduleTodayConfig(this.settings);
+      scheduleConfig.durationPolicies = schedulerMemoryDurationPolicies(this.schedulerMemory);
+      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
+      const tasks = enrichTodoistTasksWithSnapshot(snapshot);
+      const candidates = scheduleTodayCandidates(tasks, this.settings, scheduleConfig, this.schedulerMemory);
+      const memoryMatches = this.applySchedulerMemoryToCandidates(candidates);
+      if (!candidates.length) {
+        return emptyScheduleTodayPreview(scheduleConfig, "No overdue tasks or tasks due within the configured window were found.");
+      }
+      const query = candidates.slice(0, 24).map((item) => item.searchText).join("\n");
+      const context = query ? await this.retrieveSemanticContext(query, Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6))) : [];
+      const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, context, scheduleConfig);
+      const taskContext = await this.buildTaskContext(null, context, query);
+      await this.estimateScheduleTodayDurations(candidates, context, taskContext, scheduleConfig, template);
+      const preview = planScheduleToday(candidates, scheduleConfig, this.settings);
+      preview.context = context.map((chunk) => ({
+        title: chunk.title || "",
+        path: chunk.path || "",
+        score: chunk.matchScore || 0
+      })).slice(0, 6);
+      this.logLocal("Schedule today preview prepared", {
+        candidates: candidates.length,
+        scheduled: preview.scheduled.length,
+        fixed: preview.fixed.length,
+        unscheduled: preview.unscheduled.length,
+        split: preview.splitSubtasks.length,
+        memoryMatches,
+        semanticPriorityMatches
+      });
+      this.recordSchedulerPreviewMemory(candidates, context);
+      return preview;
+    } finally {
+      this.schedulerInProgress = false;
+      this.setSidebarStatus("Ready");
+    }
+  }
+
+  async estimateScheduleTodayDurations(candidates, context, taskContext, scheduleConfig, template = null) {
+    const missing = candidates.filter((candidate) => !candidate.durationMinutes);
+    if (!missing.length) return;
+    this.setSidebarStatus(`Estimating ${missing.length} task duration${missing.length === 1 ? "" : "s"}...`);
+    const schedulerPrompt = String(template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT).trim();
+    const schedulerPromptName = singleLine(template?.name || template?.source || "Schedule today's tasks");
+    const durationPolicies = schedulerMemoryDurationPolicies(this.schedulerMemory);
+    const durationPolicyText = formatSchedulerDurationPolicies(durationPolicies, scheduleConfig);
+    const compactTasks = missing.slice(0, 30).map((candidate) => ({
+      id: candidate.id,
+      title: candidate.content,
+      description: truncateAtWord(singleLine(candidate.description || ""), 420),
+      labels: candidate.labels || [],
+      priority: candidate.priority,
+      due: candidate.dueDate || "",
+      deadline: candidate.deadlineDate || "",
+      parent: candidate.parentContent || "",
+      note: candidate.path || "",
+      isSubtask: Boolean(candidate.isSubtask)
+    }));
+    let parsed = { estimates: [] };
+    try {
+      const json = await this.withAiActivity(`Estimating ${missing.length} task duration${missing.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+        model: this.settings.chatModel,
+        jsonSchema: scheduleDurationSchema(),
+        system: [
+          "Estimate practical work durations for Todoist scheduling.",
+          "Return only JSON matching the schema.",
+          "Use current general knowledge, task title, task description, parent/subtask context, existing Todoist task context, and relevant vault snippets.",
+          "The scheduler settings remain authoritative for candidate selection, due window, workday boundaries, lunch, block sizes, weights, excluded labels, and whether subtasks can be scheduled independently.",
+          "Use the selected scheduler prompt only to coordinate duration-estimation assumptions, split-title style, subtask independence reasoning, and practical sequencing preferences that are compatible with those settings.",
+          "Estimate the time required for focused work by the user, not elapsed waiting time.",
+          `Use ${scheduleConfig.durationStepMinutes}-minute duration increments only, and never return less than the ${scheduleConfig.minBlockMinutes}-minute minimum duration.`,
+          "Follow the scheduler memory duration policies exactly when estimating duration.",
+          `Maximum same-day work block is ${scheduleConfig.maxBlockMinutes} minutes. If a task is larger, return the total estimate and a clear continuation title for the remaining work.`,
+          "Set independent_subtask to true only for subtasks that should be scheduled separately, such as document review, follow-up, waiting-on-information check-ins, replies, approvals, or dependency work. Otherwise subtasks should stay with the parent task.",
+          "For follow-up tasks, estimate the time to complete the follow-up action.",
+          "For waiting-on tasks, estimate a short check-in or follow-up if action is still needed.",
+          "Do not change due dates, deadlines, priorities, labels, or task titles."
+        ].join(" "),
+        user: [
+          `Today: ${scheduleConfig.today}`,
+          `Workday: ${minutesToClock(scheduleConfig.startMinutes)}-${minutesToClock(scheduleConfig.endMinutes)}. Timeline chunk size: ${scheduleConfig.chunkMinutes} minutes. Duration step: ${scheduleConfig.durationStepMinutes} minutes.`,
+          `Scheduler prompt: ${schedulerPromptName}`,
+          schedulerPrompt,
+          "",
+          "Scheduler memory duration policies:",
+          durationPolicyText || "No scheduler memory duration policies found.",
+          "",
+          "Tasks needing duration estimates:",
+          JSON.stringify(compactTasks),
+          "",
+          "Relevant vault context:",
+          formatContext(context, Math.min(6000, this.settings.maxContextChars || 6000), this.settings, compactTasks.map((task) => task.title).join("\n")) || "No relevant vault context found.",
+          "",
+          "Existing generated/synced task context from notes and the local Todoist reference table:",
+          taskContext || "No matching local task context found."
+        ].join("\n")
+      }));
+      parsed = JSON.parse(json);
+    } catch (error) {
+      this.logLocal("Schedule duration AI estimate failed; using local estimates", { tasks: missing.length, error: error.message || String(error) });
+      for (const candidate of missing) {
+        candidate.durationMinutes = scheduleDurationWithLocalPolicy(candidate, fallbackScheduleDuration(candidate, scheduleConfig), scheduleConfig, durationPolicies);
+        candidate.durationSource = "local estimate";
+        candidate.durationConfidence = "low";
+        candidate.splitTitle = scheduleContinuationTitle(candidate);
+      }
+      return;
+    }
+    const byId = new Map((parsed.estimates || []).map((item) => [String(item.id || ""), item]));
+    for (const candidate of missing) {
+      const estimate = byId.get(candidate.id);
+      const minutes = roundToScheduleChunk(Number(estimate?.minutes || 0), scheduleConfig);
+      const source = estimate ? "AI estimate" : "local estimate";
+      const rawMinutes = minutes || fallbackScheduleDuration(candidate, scheduleConfig);
+      const adjustedMinutes = scheduleDurationWithLocalPolicy(candidate, rawMinutes, scheduleConfig, durationPolicies);
+      candidate.durationMinutes = adjustedMinutes;
+      candidate.durationSource = adjustedMinutes < roundToScheduleChunk(rawMinutes, scheduleConfig) ? `${source}; capped for follow-up` : source;
+      candidate.durationConfidence = estimate?.confidence || "medium";
+      candidate.independentSubtask = this.settings.scheduleTodayAllowIndependentSubtasks === false ? false : estimate?.independent_subtask != null ? Boolean(estimate.independent_subtask) : candidate.independentSubtask;
+      candidate.splitTitle = singleLine(estimate?.split_title || "") || scheduleContinuationTitle(candidate);
+    }
+  }
+
+  async applyScheduleToday(preview) {
+    const scheduled = (preview?.scheduled || []).filter((item) => item.id && !item.fixed);
+    const splitSubtasks = preview?.splitSubtasks || [];
+    if (!scheduled.length && !splitSubtasks.length) {
+      new Notice("No schedule changes to apply.");
+      return { updated: 0, created: 0 };
+    }
+    this.schedulerInProgress = true;
+    this.setSidebarStatus("Applying today's schedule...");
+    try {
+      this.requireTodoistAccess();
+      const previousById = new Map();
+      const commands = [];
+      for (const item of scheduled) {
+        const cached = this.settings.taskCache?.[item.id] || {};
+        previousById.set(item.id, {
+          id: item.id,
+          dueDate: item.remoteDueDate || cached.scheduledDueDateTime || cached.due_date || "",
+          duration: normalizeTodoistDuration(item.remoteDuration || cached.duration || null)
+        });
+        commands.push({
+          type: "item_update",
+          uuid: uuid(),
+          args: {
+            id: item.id,
+            due: { date: item.scheduledDateTime },
+            duration: { amount: item.durationMinutes, unit: "minute" }
+          }
+        });
+      }
+      const tempMap = new Map();
+      for (const item of splitSubtasks) {
+        const tempId = uuid();
+        tempMap.set(tempId, item);
+        commands.push({
+          type: "item_add",
+          temp_id: tempId,
+          uuid: uuid(),
+          args: {
+            content: item.content,
+            parent_id: item.parentId,
+            priority: normalizePriority(item.priority),
+            labels: (item.labels || []).map(cleanLabel).filter(Boolean),
+            due: { date: item.scheduledDateTime },
+            duration: { amount: item.durationMinutes, unit: "minute" }
+          }
+        });
+      }
+      const response = await this.todoistSync(commands);
+      const created = [];
+      for (const [tempId, item] of tempMap.entries()) {
+        const id = response.temp_id_mapping?.[tempId] || "";
+        if (!id) continue;
+        item.id = id;
+        item.oid = item.oid || generateUniqueOid(this.settings);
+        created.push({ id, oid: item.oid, path: item.path || "", parentId: item.parentId || "" });
+        this.cacheTask(id, Object.assign({}, item, {
+          isSubtask: true,
+          due_date: datePart(item.scheduledDateTime),
+          scheduledDueDateTime: item.scheduledDateTime,
+          duration: { amount: item.durationMinutes, unit: "minute" },
+          parentOid: item.parentOid || "",
+          parentContent: item.parentContent || "",
+          parentLineNumber: item.parentLineNumber ?? null,
+          description: ""
+        }));
+        await this.insertScheduledSubtaskIntoNote(item);
+      }
+      for (const item of scheduled) {
+        const cached = this.settings.taskCache?.[item.id] || {};
+        this.settings.taskCache[item.id] = Object.assign({}, cached, {
+          due_date: datePart(item.scheduledDateTime),
+          scheduledDueDateTime: item.scheduledDateTime,
+          duration: { amount: item.durationMinutes, unit: "minute" },
+          cachedAt: deviceTimestamp()
+        });
+        await this.updateScheduleMarkersInNote(item.id, item.scheduledDateTime, item.durationMinutes);
+      }
+      this.recordSchedulerApplyMemory(preview, scheduled, splitSubtasks);
+      this.settings.scheduleTodayLastUndo = {
+        at: deviceTimestamp(),
+        previous: Array.from(previousById.values()),
+        created
+      };
+      this.markTaskReferenceStateDirty();
+      await this.saveSettings();
+      this.logLocal("Schedule today applied", { updated: scheduled.length, created: created.length, date: preview?.config?.today || today() });
+      new Notice(`Scheduled ${scheduled.length} task${scheduled.length === 1 ? "" : "s"}${created.length ? ` and created ${created.length} continuation subtask${created.length === 1 ? "" : "s"}` : ""}.`);
+      return { updated: scheduled.length, created: created.length };
+    } finally {
+      this.schedulerInProgress = false;
+      this.setSidebarStatus("Ready");
+    }
+  }
+
+  async undoLastScheduleToday(showNotice = true) {
+    const undo = this.settings.scheduleTodayLastUndo;
+    if (!undo?.previous?.length && !undo?.created?.length) {
+      if (showNotice) new Notice("No Schedule Today changes to undo.");
+      return { restored: 0, removed: 0 };
+    }
+    this.schedulerInProgress = true;
+    this.setSidebarStatus("Undoing schedule...");
+    try {
+      this.requireTodoistAccess();
+      const commands = [];
+      for (const item of undo.previous || []) {
+        const args = { id: item.id };
+        if (item.dueDate) args.due = { date: item.dueDate };
+        else args.due = null;
+        args.duration = item.duration?.amount ? item.duration : null;
+        commands.push({ type: "item_update", uuid: uuid(), args });
+      }
+      if (commands.length) await this.todoistSync(commands);
+      let removed = 0;
+      for (const item of undo.created || []) {
+        if (!item.id) continue;
+        const ok = await this.deleteTodoistTask(item.id).catch((error) => {
+          this.logLocal("Schedule undo delete failed", { id: item.id, error: error.message || String(error) });
+          return false;
+        });
+        if (!ok) continue;
+        await this.removeScheduledSubtaskFromNote(item);
+        delete this.settings.taskCache[item.id];
+        removed += 1;
+      }
+      for (const item of undo.previous || []) {
+        const cached = this.settings.taskCache?.[item.id];
+        if (!cached) continue;
+        cached.scheduledDueDateTime = isDateTimeString(item.dueDate) ? item.dueDate : "";
+        cached.due_date = item.dueDate ? datePart(item.dueDate) : null;
+        cached.duration = normalizeTodoistDuration(item.duration);
+        cached.cachedAt = deviceTimestamp();
+        await this.updateScheduleMarkersInNote(item.id, cached.scheduledDueDateTime, durationMinutes(cached.duration), { removeIfEmpty: true });
+      }
+      this.settings.scheduleTodayLastUndo = null;
+      this.markTaskReferenceStateDirty();
+      await this.saveSettings();
+      this.logLocal("Schedule today undone", { restored: undo.previous?.length || 0, removed });
+      if (showNotice) new Notice(`Undid schedule changes for ${undo.previous?.length || 0} task${undo.previous?.length === 1 ? "" : "s"}.`);
+      return { restored: undo.previous?.length || 0, removed };
+    } finally {
+      this.schedulerInProgress = false;
+      this.setSidebarStatus("Ready");
+    }
+  }
+
+  async updateScheduleMarkersInNote(taskId, scheduledDateTime, minutes, options = {}) {
+    const cached = this.settings.taskCache?.[taskId];
+    if (!cached?.path) return false;
+    const file = this.app.vault.getAbstractFileByPath(cached.path);
+    if (!(file instanceof TFile)) return false;
+    const lines = (await this.app.vault.read(file)).split("\n");
+    const idx = lines.findIndex((line) => getTodoistId(line, this.settings) === taskId || (cached.oid && getTaskOid(line) === cached.oid));
+    if (idx === -1) return false;
+    const next = setScheduleMarker(lines[idx], scheduledDateTime, minutes, options);
+    if (next === lines[idx]) return false;
+    lines[idx] = cached.isSubtask ? ensureSubtaskIndent(next, { isSubtask: true }, this.settings) : next;
+    repairSyncedSubtaskIndentationLines(lines, this.settings);
+    this.markInternalNoteWrite(cached.path);
+    await this.app.vault.modify(file, lines.join("\n"));
+    return true;
+  }
+
+  async insertScheduledSubtaskIntoNote(item) {
+    if (!item?.path || !item?.parentOid) return false;
+    const file = this.app.vault.getAbstractFileByPath(item.path);
+    if (!(file instanceof TFile)) return false;
+    const lines = (await this.app.vault.read(file)).split("\n");
+    const parentIndex = lines.findIndex((line) => getTaskOid(line) === item.parentOid || getTodoistId(line, this.settings) === item.parentId);
+    if (parentIndex < 0) return false;
+    let insertAt = parentIndex + 1;
+    const parentIndent = indentationLevel(lines[parentIndex]);
+    while (insertAt < lines.length) {
+      const line = lines[insertAt] || "";
+      if (!line.trim()) {
+        insertAt += 1;
+        continue;
+      }
+      if (/^\s*[-*]\s+\[[ xX]\]/.test(line) && indentationLevel(line) > parentIndent) {
+        insertAt += 1;
+        continue;
+      }
+      break;
+    }
+    const taskLine = parsedTaskToLine(Object.assign({}, item, {
+      isSubtask: true,
+      due_date: datePart(item.scheduledDateTime),
+      deadline_date: null,
+      description: "",
+      isCompleted: false
+    }), this.settings, item.id);
+    const line = setScheduleMarker(`${desiredSubtaskIndent(this.settings)}${taskLine.trimStart()}`, item.scheduledDateTime, item.durationMinutes);
+    lines.splice(insertAt, 0, line);
+    repairSyncedSubtaskIndentationLines(lines, this.settings);
+    this.markInternalNoteWrite(item.path);
+    await this.app.vault.modify(file, lines.join("\n"));
+    return true;
+  }
+
+  async removeScheduledSubtaskFromNote(item) {
+    if (!item?.path) return false;
+    const file = this.app.vault.getAbstractFileByPath(item.path);
+    if (!(file instanceof TFile)) return false;
+    const lines = (await this.app.vault.read(file)).split("\n");
+    const idx = lines.findIndex((line) => (item.oid && getTaskOid(line) === item.oid) || (item.id && getTodoistId(line, this.settings) === item.id));
+    if (idx < 0) return false;
+    lines.splice(idx, 1);
+    this.markInternalNoteWrite(item.path);
+    await this.app.vault.modify(file, lines.join("\n"));
+    return true;
   }
 
   async processPendingEmails(showNotice = true, options = {}) {
@@ -2788,6 +3482,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async runPromptTemplate(template, options = {}) {
+    if (isScheduleTodayTemplate(template)) {
+      await this.openScheduleTodayPreview(template);
+      return { action: "schedule-today", tasks: [], markdown: "", contextNotes: [], semanticContext: [] };
+    }
     if (template?.createTasks !== false) {
       return this.generateTaskListFromTemplate(template, options);
     }
@@ -3946,6 +4644,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       priority: task.priority,
       due_date: task.due_date || null,
       deadline_date: task.deadline_date || null,
+      duration: normalizeTodoistDuration(task.duration),
+      scheduledDueDateTime: task.scheduledDueDateTime || task.due_datetime || (task.due_date && isDateTimeString(task.due_date) ? task.due_date : ""),
       isCompleted: task.isCompleted,
       isSubtask: Boolean(task.isSubtask),
       parentId: task.parentId || task.parent_id || parentReference.id || pendingReference?.parentId || this.settings.taskCache?.[id]?.parentId || "",
@@ -3968,6 +4668,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (this.settings.pendingTaskReferences && oid) delete this.settings.pendingTaskReferences[pendingTaskOidKey(path, oid)];
     this.markTaskReferenceStateDirty();
     this.queueTaskReferenceIndexUpdate(path);
+    this.observeSchedulerMemoryForTask(id, this.settings.taskCache[id], "task-cache");
   }
 
   savePendingTaskDescriptions(path, tasks) {
@@ -4198,7 +4899,8 @@ class SemanticTodoistView extends ItemView {
     container.style.setProperty("--semantic-todoist-chat-font-size", `${this.plugin.settings.chatFontSizePx || DEFAULT_SETTINGS.chatFontSizePx}px`);
     const header = container.createDiv({ cls: "semantic-todoist-header" });
     header.createEl("h3", { text: "Semantic Todoist Sync" });
-    header.createEl("button", { text: "Index" }).onclick = async () => {
+    const indexButton = header.createEl("button", { text: "Index" });
+    indexButton.onclick = async () => {
       this.setStatus("Indexing vault...");
       try {
         await this.plugin.rebuildSemanticIndex(true);
@@ -4208,29 +4910,51 @@ class SemanticTodoistView extends ItemView {
         new Notice(`Index failed: ${error.message || error}`);
       }
     };
+    const headerNewChatButton = header.createEl("button", { cls: "semantic-todoist-header-icon", attr: { "aria-label": "New chat", title: "New chat" } });
+    setIcon(headerNewChatButton, "message-square-plus");
+    headerNewChatButton.onclick = () => this.newChat();
     const noteRow = container.createDiv({ cls: "semantic-todoist-note-row" });
-    noteRow.createSpan({ text: "Active note" });
+    noteRow.createSpan({ cls: "semantic-todoist-note-label", text: "Active note" });
     const picker = noteRow.createDiv({ cls: "semantic-todoist-note-picker" });
-    this.noteButtonEl = picker.createEl("button", { cls: "semantic-todoist-note-select", text: "Current active note" });
-    this.noteButtonEl.onclick = () => this.showNoteSearch();
-    this.noteInputEl = picker.createEl("input", { type: "search", cls: "semantic-todoist-note-search", placeholder: "Search notes..." });
-    this.noteInputEl.hidden = true;
+    const pickerLine = picker.createDiv({ cls: "semantic-todoist-note-picker-line" });
+    this.noteInputEl = pickerLine.createEl("input", { type: "search", cls: "semantic-todoist-note-select semantic-todoist-note-search", placeholder: "Search or select note..." });
+    this.noteChatToggleEl = pickerLine.createEl("label", { cls: "semantic-todoist-note-chat-toggle", attr: { title: "Include active note in chat search", "aria-label": "Include active note in chat search" } });
+    const includeCheckbox = this.noteChatToggleEl.createEl("input", { type: "checkbox", attr: { "aria-label": "Include active note in chat search" } });
+    this.noteChatCheckboxEl = includeCheckbox;
+    includeCheckbox.checked = this.includeActiveNote;
+    this.noteChatToggleTextEl = this.noteChatToggleEl.createSpan({ text: this.includeActiveNote ? "On" : "Off" });
+    includeCheckbox.onchange = async () => {
+      this.includeActiveNote = includeCheckbox.checked;
+      this.plugin.settings.searchIncludeActiveNote = this.includeActiveNote;
+      await this.plugin.saveSettings();
+      this.refreshActiveSummary();
+    };
     this.noteInputEl.oninput = () => {
       if (!this.noteInputEl.value.trim()) {
         this.selectedPath = "";
-        this.noteSearchDirty = false;
+        this.noteSearchDirty = true;
         if (this.noteResultsEl) this.noteResultsEl.empty();
-        this.refreshActiveSummary();
         return;
       }
       this.noteSearchDirty = true;
       this.renderNoteSearchResults();
     };
-    this.noteInputEl.onfocus = () => this.renderNoteSearchResults();
+    this.noteInputEl.onfocus = () => {
+      this.noteSearchDirty = true;
+      this.noteInputEl.select();
+      if (this.noteResultsEl) this.noteResultsEl.empty();
+    };
+    this.noteInputEl.onblur = () => {
+      window.setTimeout(() => {
+        this.hideNoteSearch();
+        this.refreshActiveSummary();
+      }, 150);
+    };
     this.noteInputEl.onkeydown = (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
         this.hideNoteSearch();
+        this.refreshActiveSummary();
         return;
       }
       if (event.key !== "Enter") return;
@@ -4241,18 +4965,6 @@ class SemanticTodoistView extends ItemView {
       }
     };
     this.noteResultsEl = picker.createDiv({ cls: "semantic-todoist-note-results" });
-    const includeRow = container.createDiv({ cls: "semantic-todoist-context-toggle" });
-    const includeLabel = includeRow.createEl("label");
-    const includeCheckbox = includeLabel.createEl("input", { type: "checkbox" });
-    includeCheckbox.checked = this.includeActiveNote;
-    includeLabel.createSpan({ text: "Use active note in chat" });
-    includeCheckbox.onchange = async () => {
-      this.includeActiveNote = includeCheckbox.checked;
-      this.plugin.settings.searchIncludeActiveNote = this.includeActiveNote;
-      await this.plugin.saveSettings();
-      this.refreshActiveSummary();
-    };
-    this.activeSummaryEl = container.createDiv({ cls: "semantic-todoist-active-summary" });
     this.relevantEl = container.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = container.createDiv({ cls: "semantic-todoist-conversation" });
@@ -4262,35 +4974,23 @@ class SemanticTodoistView extends ItemView {
       event.preventDefault();
       this.ask();
     });
+    const actionRow = container.createDiv({ cls: "semantic-todoist-action-row" });
+    actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Run:" });
+    this.actionSelectEl = actionRow.createEl("select", { cls: "semantic-todoist-action-select", attr: { "aria-label": "Action prompt to run", title: "Choose a scheduler action or prompt template" } });
+    this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
+    this.populateSidebarActionOptions();
     const toolbar = container.createDiv({ cls: "semantic-todoist-toolbar" });
-    toolbar.createEl("button", { text: "Ask" }).onclick = async () => {
+    const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: "Ask a chat question using vault context" }, text: "Ask" });
+    askButton.onclick = async () => {
       await this.ask();
     };
-    toolbar.createEl("button", { text: "Tasks" }).onclick = async () => {
+    const tasksButton = toolbar.createEl("button", { cls: "semantic-todoist-tasks-button", attr: { title: "Generate Todoist tasks from the selected or active note" }, text: "Tasks" });
+    tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
     };
-    toolbar.createEl("button", { text: "New chat" }).onclick = () => {
-      this.messages = [];
-      this.renderMessages();
-      this.renderRelevantNotes([]);
-      this.setStatus("Ready");
-    };
-    toolbar.createEl("button", { text: "Prompts" }).onclick = async () => {
-      const templates = await this.plugin.getPromptTemplates();
-      new TaskTemplateModal(this.plugin.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
-        try {
-          this.setStatus(template.createTasks === false ? "Running prompt..." : "Creating tasks...");
-          const active = await this.getSelectedActiveContext({ forceInclude: true });
-          const result = await this.plugin.runPromptTemplate(template, { active, insertIntoNote, syncAfterInsert, showNotice: true });
-          this.addMessage("user", `Prompt: ${template.name}`);
-          this.addMessage("assistant", result.markdown || result.answer || "No response generated.");
-          this.setStatus("Ready");
-        } catch (error) {
-          console.error(error);
-          this.addMessage("assistant", `Error: ${error.message || error}`);
-          this.setStatus(`Task creation failed: ${error.message || error}`);
-        }
-      }).open();
+    const runButton = toolbar.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
+    runButton.onclick = async () => {
+      await this.runSelectedSidebarAction();
     };
     this.statusEl = container.createDiv({ cls: "semantic-todoist-status" });
     this.setStatus("Ready");
@@ -4335,6 +5035,108 @@ class SemanticTodoistView extends ItemView {
       this.addMessage("assistant", `Error: ${error.message || error}`);
       this.setStatus(`Task creation failed: ${error.message || error}`);
     }
+  }
+
+  async populateSidebarActionOptions() {
+    if (!this.actionSelectEl) return;
+    const previous = this.actionSelectEl.value || "";
+    this.sidebarActionTemplates = [];
+    while (this.actionSelectEl.firstChild) this.actionSelectEl.removeChild(this.actionSelectEl.firstChild);
+    const options = [];
+    let scheduleOption = null;
+    const promptOptions = [];
+    try {
+      const templates = await this.plugin.getPromptTemplates();
+      this.sidebarActionTemplates = templates || [];
+      this.sidebarActionTemplates.forEach((template, index) => {
+        const name = singleLine(template.name || template.path || `Prompt ${index + 1}`);
+        const option = { value: `prompt:${index}`, label: shortTitle(name, 56) };
+        if (isScheduleTodayTemplate(template)) {
+          if (!scheduleOption) scheduleOption = option;
+          return;
+        }
+        promptOptions.push(option);
+      });
+    } catch (error) {
+      console.error(error);
+      options.push({ value: "prompts", label: "Prompts..." });
+    }
+    if (this.plugin.settings.scheduleTodayEnabled !== false) options.unshift(scheduleOption || { value: "schedule", label: "Schedule today" });
+    options.push(...promptOptions);
+    if (!options.length) options.push({ value: "", label: "No actions available" });
+    for (const option of options) this.actionSelectEl.createEl("option", { text: option.label, value: option.value });
+    const values = new Set(options.map((option) => option.value));
+    this.actionSelectEl.value = values.has(previous) ? previous : options[0].value;
+  }
+
+  sidebarTemplateChoices(template = {}) {
+    const createsTasks = template.createTasks !== false;
+    const insertIntoNote = template.insertResponse === true || createsTasks;
+    const syncAfterInsert = createsTasks && insertIntoNote && template.syncAfterInsert === true;
+    return { insertIntoNote, syncAfterInsert };
+  }
+
+  async runSelectedSidebarAction() {
+    const action = this.actionSelectEl?.value || (this.plugin.settings.scheduleTodayEnabled !== false ? "schedule" : "prompts");
+    if (action === "schedule") {
+      await this.plugin.openScheduleTodayPreview();
+      return;
+    }
+    if (action === "prompts") {
+      await this.openPromptTemplates();
+      return;
+    }
+    if (action.startsWith("prompt:")) {
+      const index = Number(action.split(":")[1]);
+      const template = this.sidebarActionTemplates?.[index];
+      if (!template) {
+        await this.populateSidebarActionOptions();
+        throw new Error("Select a prompt and try again.");
+      }
+      if (isScheduleTodayTemplate(template)) {
+        await this.plugin.openScheduleTodayPreview(template);
+        return;
+      }
+      try {
+        this.setStatus(template.createTasks === false ? "Running prompt..." : "Creating tasks...");
+        const active = await this.getSelectedActiveContext({ forceInclude: true });
+        const choices = this.sidebarTemplateChoices(template);
+        const result = await this.plugin.runPromptTemplate(template, Object.assign({ active, showNotice: true }, choices));
+        this.addMessage("user", `Prompt: ${template.name || "Selected prompt"}`);
+        this.addMessage("assistant", result.markdown || result.answer || "No response generated.");
+        this.setStatus("Ready");
+      } catch (error) {
+        console.error(error);
+        this.addMessage("assistant", `Error: ${error.message || error}`);
+        this.setStatus(`Prompt failed: ${error.message || error}`);
+      }
+      return;
+    }
+  }
+
+  async openPromptTemplates() {
+    const templates = await this.plugin.getPromptTemplates();
+    new TaskTemplateModal(this.plugin.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
+      try {
+        this.setStatus(template.createTasks === false ? "Running prompt..." : "Creating tasks...");
+        const active = await this.getSelectedActiveContext({ forceInclude: true });
+        const result = await this.plugin.runPromptTemplate(template, { active, insertIntoNote, syncAfterInsert, showNotice: true });
+        this.addMessage("user", `Prompt: ${template.name}`);
+        this.addMessage("assistant", result.markdown || result.answer || "No response generated.");
+        this.setStatus("Ready");
+      } catch (error) {
+        console.error(error);
+        this.addMessage("assistant", `Error: ${error.message || error}`);
+        this.setStatus(`Task creation failed: ${error.message || error}`);
+      }
+    }).open();
+  }
+
+  newChat() {
+    this.messages = [];
+    this.renderMessages();
+    this.renderRelevantNotes([]);
+    this.setStatus("Ready");
   }
 
   setStatus(message = "Ready") {
@@ -4410,7 +5212,6 @@ class SemanticTodoistView extends ItemView {
   selectNote(path) {
     this.selectedPath = path;
     this.noteSearchDirty = false;
-    if (this.noteInputEl) this.noteInputEl.value = path;
     this.hideNoteSearch();
     this.refreshActiveSummary();
   }
@@ -4450,53 +5251,42 @@ class SemanticTodoistView extends ItemView {
   }
 
   async refreshActiveSummary() {
-    const active = await this.getSelectedActiveContext();
-    if (!this.activeSummaryEl) return;
-    this.activeSummaryEl.empty();
+    const active = await this.plugin.getActiveMarkdownContext(this.selectedPath);
+    if (this.noteChatCheckboxEl) this.noteChatCheckboxEl.checked = this.includeActiveNote;
+    this.updateNoteChatToggleState();
+    if (this.noteInputEl) this.noteInputEl.placeholder = this.includeActiveNote ? "Search notes..." : "Search notes... (chat off)";
     if (!this.includeActiveNote) {
-      this.activeSummaryEl.removeClass("is-active-note-included");
-      this.activeSummaryEl.removeClass("is-active-note-unavailable");
-      this.activeSummaryEl.addClass("is-active-note-excluded");
-      this.activeSummaryEl.setText("Active note excluded from chat search.");
+      this.updateNotePickerLabel(active.title || active.path || "");
       return;
     }
     if (!active.path) {
-      this.activeSummaryEl.setText("No active note selected.");
-      this.activeSummaryEl.removeClass("is-active-note-included");
-      this.activeSummaryEl.removeClass("is-active-note-excluded");
-      this.activeSummaryEl.addClass("is-active-note-unavailable");
       this.updateNotePickerLabel("");
-      if (!this.noteSearchDirty && this.noteInputEl) this.noteInputEl.value = "";
       return;
     }
-    if (!this.noteSearchDirty && this.noteInputEl) this.noteInputEl.value = active.path;
-    this.activeSummaryEl.removeClass("is-active-note-unavailable");
-    this.activeSummaryEl.removeClass("is-active-note-excluded");
-    this.activeSummaryEl.addClass("is-active-note-included");
-    this.updateNotePickerLabel(active.title || active.path);
-    this.activeSummaryEl.createEl("strong", { text: active.title });
-    this.activeSummaryEl.createDiv({ text: active.path });
-    this.activeSummaryEl.createDiv({ text: active.selection ? "Selected text will be included." : "Full note will be included." });
-  }
-
-  showNoteSearch() {
-    if (!this.noteInputEl) return;
-    this.noteInputEl.hidden = false;
-    this.noteInputEl.focus();
-    this.noteInputEl.select();
-    this.renderNoteSearchResults();
+    this.updateNotePickerLabel(active.title || active.path, active.selection ? "Selection" : "");
   }
 
   hideNoteSearch() {
-    if (this.noteInputEl) this.noteInputEl.hidden = true;
     if (this.noteResultsEl) this.noteResultsEl.empty();
     this.noteSearchDirty = false;
   }
 
-  updateNotePickerLabel(label) {
-    if (!this.noteButtonEl) return;
-    this.noteButtonEl.setText(label ? shortTitle(label, 42) : "Current active note");
-    this.noteButtonEl.title = label || "Current active note";
+  updateNotePickerLabel(label, state = "") {
+    const noteText = label ? shortTitle(label, 34) : "No active note";
+    const stateText = state ? ` | ${state}` : "";
+    if (!this.noteInputEl) return;
+    if (!this.noteSearchDirty) this.noteInputEl.value = `${noteText}${stateText}`;
+    this.noteInputEl.title = label ? `${label}${stateText}` : `No active note${stateText}`;
+  }
+
+  updateNoteChatToggleState() {
+    if (!this.noteChatToggleEl) return;
+    const included = Boolean(this.includeActiveNote);
+    this.noteChatToggleEl.classList.toggle("is-chat-included", included);
+    this.noteChatToggleEl.classList.toggle("is-chat-excluded", !included);
+    this.noteChatToggleEl.title = included ? "Active note included in chat search" : "Active note excluded from chat search";
+    this.noteChatToggleEl.setAttribute("aria-label", this.noteChatToggleEl.title);
+    if (this.noteChatToggleTextEl) this.noteChatToggleTextEl.setText(included ? "On" : "Off");
   }
 
   renderRelevantNotes(chunks) {
@@ -4566,7 +5356,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
-    for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "References", "Activity"]) {
+    for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "Daily Scheduler", "References", "Activity"]) {
       const button = tabs.createEl("button", { text: tab });
       if (this.activeTab === tab) button.addClass("is-active");
       button.onclick = () => {
@@ -4579,6 +5369,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     if (this.activeTab === "API Access") this.renderApi(containerEl);
     if (this.activeTab === "Email-To-Todoist") this.renderEmail(containerEl);
     if (this.activeTab === "Notes-To-Todoist") this.renderNotes(containerEl);
+    if (this.activeTab === "Daily Scheduler") this.renderScheduleToday(containerEl);
     if (this.activeTab === "References") this.renderReferences(containerEl);
     if (this.activeTab === "Activity") this.renderActivity(containerEl);
   }
@@ -4729,7 +5520,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderBasic(containerEl) {
     settingsHeading(containerEl, "AI Model", "Choose the model used for sidebar answers, task extraction, task description writing, and prompts. The embedding model is automatically kept on the same provider when the selected AI model changes.");
-    modelDropdownSetting(containerEl, "Default AI model", "Used for sidebar chat, vault question-answering, and task generation.", this.plugin, "chatModel", "availableChatModels");
+    new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
+    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels");
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
@@ -4741,7 +5533,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Max chat context chunks", this.plugin, "maxChatContextChunks");
     numberSetting(containerEl, "Max active-note context characters", this.plugin, "maxActiveNoteContextChars");
     settingsHeading(containerEl, "Prompts");
-    textSetting(containerEl, "Prompts folder", "Markdown files in this folder appear as command-palette prompts.", this.plugin, "promptTemplatesFolder");
+    textSetting(containerEl, "Prompts folder", "Markdown files in this folder appear as prompt actions. Use action: schedule-today for the scheduler prompt; scheduler settings still control the actual rules.", this.plugin, "promptTemplatesFolder");
     taskGenerationPromptTemplateSetting(containerEl, this.plugin);
     new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
     new Setting(containerEl).setName("Run prompts").setDesc("Runs custom prompts. Prompts can insert plain AI responses or create task lists when createTasks is true.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
@@ -4849,6 +5641,39 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     log.setText(activityLogText(this.plugin.settings));
   }
 
+  renderScheduleToday(containerEl) {
+    settingsHeading(containerEl, "Schedule Today's Tasks", "Plan today's highest-priority Todoist work into compact time blocks. Todoist remains the source of scheduled task times and durations.");
+    toggleSetting(containerEl, "Enable scheduler", "Shows the Schedule Today's Tasks prompt action in the sidebar chooser and command palette.", this.plugin, "scheduleTodayEnabled");
+    new Setting(containerEl).setName("Run scheduler preview").setDesc("Builds a preview only. Todoist is not updated until Apply is selected.").addButton((button) => button.setButtonText("Preview").setCta().onClick(() => this.plugin.openScheduleTodayPreview()));
+
+    settingsHeading(containerEl, "Workday", "Controls the default time window and protected lunch block used for today's schedule.");
+    timeSetting(containerEl, "Start time", "Start of the schedulable workday.", this.plugin, "scheduleTodayStartTime");
+    timeSetting(containerEl, "End time", "End of the schedulable workday.", this.plugin, "scheduleTodayEndTime");
+    timeSetting(containerEl, "Lunch starts", "Default lunch block start. The preview can manually override it.", this.plugin, "scheduleTodayLunchStartTime");
+    numberSetting(containerEl, "Lunch length minutes", this.plugin, "scheduleTodayLunchMinutes");
+    numberSetting(containerEl, "Minimum task block minutes", this.plugin, "scheduleTodayMinBlockMinutes");
+    numberSetting(containerEl, "Maximum task block minutes", this.plugin, "scheduleTodayMaxBlockMinutes");
+
+    settingsHeading(containerEl, "Task Selection", "Chooses which open Todoist tasks are considered before the deterministic scheduler picks what fits today.");
+    toggleSetting(containerEl, "Include overdue tasks", "Include open tasks due before today.", this.plugin, "scheduleTodayIncludeOverdue");
+    numberSetting(containerEl, "Due window days", this.plugin, "scheduleTodayDueWindowDays");
+    toggleSetting(containerEl, "Include subtasks", "Allow subtasks to be scheduled directly.", this.plugin, "scheduleTodayIncludeSubtasks");
+    toggleSetting(containerEl, "Independent subtasks", "Allow subtasks such as reviews and follow-ups to move independently from the parent.", this.plugin, "scheduleTodayAllowIndependentSubtasks");
+    textSetting(containerEl, "Excluded labels", "Comma-separated Todoist labels skipped by the scheduler.", this.plugin, "scheduleTodayExcludedLabels");
+
+    settingsHeading(containerEl, "Scheduling Weights", "Simple importance controls for how the deterministic scheduler ranks eligible tasks.");
+    scheduleWeightSetting(containerEl, "Todoist priority", this.plugin, "scheduleTodayWeightTodoistPriority");
+    scheduleWeightSetting(containerEl, "Deadline proximity", this.plugin, "scheduleTodayWeightDeadlineProximity");
+    scheduleWeightSetting(containerEl, "Overdue status", this.plugin, "scheduleTodayWeightOverdue");
+    scheduleWeightSetting(containerEl, "Due date proximity", this.plugin, "scheduleTodayWeightDueDateProximity");
+    scheduleWeightSetting(containerEl, "Semantic urgency", this.plugin, "scheduleTodayWeightSemanticUrgency");
+    scheduleWeightSetting(containerEl, "Note recency", this.plugin, "scheduleTodayWeightNoteRecency");
+    scheduleWeightSetting(containerEl, "Parent/subtask dependency", this.plugin, "scheduleTodayWeightParentDependency");
+
+    settingsHeading(containerEl, "Safety", "Existing timed tasks stay fixed by default. Deadlines are preserved. The last applied schedule can be undone.");
+    new Setting(containerEl).setName("Undo last applied schedule").setDesc(this.plugin.settings.scheduleTodayLastUndo?.at ? `Last applied: ${this.plugin.settings.scheduleTodayLastUndo.at}` : "No applied schedule to undo.").addButton((button) => button.setButtonText("Undo").onClick(() => this.plugin.undoLastScheduleToday(true)));
+  }
+
   renderReferences(containerEl) {
     containerEl.createEl("h3", { text: "Todoist References" });
     containerEl.createDiv({ text: "Local OID table used to connect Obsidian task lines to Todoist tasks. Todoist IDs are stored here only, not in note text." });
@@ -4876,7 +5701,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     const table = wrapper.createEl("table", { cls: "semantic-todoist-reference-table" });
     const thead = table.createEl("thead");
     const header = thead.createEl("tr");
-    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Deadline", "Project", "Project ID", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) {
+    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Scheduled", "Duration", "Deadline", "Project", "Project ID", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) {
       header.createEl("th", { text: label });
     }
     const tbody = table.createEl("tbody");
@@ -4887,6 +5712,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       tr.createEl("td", { text: row.task });
       tr.createEl("td", { text: row.priority });
       tr.createEl("td", { text: row.date });
+      tr.createEl("td", { text: row.scheduled });
+      tr.createEl("td", { text: row.duration });
       tr.createEl("td", { text: row.deadline });
       tr.createEl("td", { text: row.project });
       tr.createEl("td", { text: row.projectId });
@@ -4900,6 +5727,518 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       tr.createEl("td", { text: row.path });
       tr.createEl("td", { text: row.status });
     }
+  }
+}
+
+class ScheduleTodayModal extends Modal {
+  constructor(app, plugin, preview) {
+    super(app);
+    this.plugin = plugin;
+    this.preview = preview || emptyScheduleTodayPreview(scheduleTodayConfig(plugin.settings));
+    this.draggedId = "";
+    this.draggedPayload = null;
+    this.slotHeight = 28;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-schedule-modal");
+    this.contentEl.addClass("semantic-todoist-modal-content");
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  scheduleItems() {
+    return (this.preview.fixed || []).concat(this.preview.scheduled || [])
+      .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    refreshScheduleSuggestions(this.preview);
+    const header = contentEl.createDiv({ cls: "semantic-todoist-schedule-header" });
+    header.createEl("h2", { text: "Schedule Today's Tasks" });
+    header.createDiv({ text: `${config.today} | ${minutesToClock(config.startMinutes)}-${minutesToClock(config.endMinutes)} | ${config.chunkMinutes} min chunks` });
+    if (this.preview.message) contentEl.createDiv({ cls: "semantic-todoist-schedule-empty", text: this.preview.message });
+    const summary = contentEl.createDiv({ cls: "semantic-todoist-schedule-summary" });
+    const notScheduledCount = (this.preview.unscheduled?.length || 0) + (this.preview.bumped?.length || 0);
+    summary.createSpan({ text: `${this.preview.scheduled.length} scheduled` });
+    summary.createSpan({ text: `${this.preview.fixed.length} fixed` });
+    summary.createSpan({ text: `${notScheduledCount} not scheduled` });
+    summary.createSpan({ text: `${this.preview.splitSubtasks.length} continuation${this.preview.splitSubtasks.length === 1 ? "" : "s"}` });
+
+    const timeline = contentEl.createDiv({ cls: "semantic-todoist-schedule-timeline" });
+    timeline.style.setProperty("--schedule-slot-height", `${this.slotHeight}px`);
+    const totalSlots = Math.max(1, Math.ceil((config.endMinutes - config.startMinutes) / config.chunkMinutes));
+    timeline.style.height = `${totalSlots * this.slotHeight}px`;
+    for (let slot = 0; slot < totalSlots; slot += 1) {
+      const slotStart = config.startMinutes + slot * config.chunkMinutes;
+      const row = timeline.createDiv({ cls: "semantic-todoist-schedule-slot" });
+      row.style.top = `${slot * this.slotHeight}px`;
+      row.dataset.minutes = String(slotStart);
+      row.createSpan({ cls: "semantic-todoist-schedule-time", text: minutesToClock(slotStart) });
+      if (rangesOverlap(slotStart, slotStart + config.chunkMinutes, config.lunchStartMinutes, config.lunchEndMinutes)) row.addClass("is-lunch");
+      row.addEventListener("dragover", (event) => {
+        if (this.readDragPayload(event).id) event.preventDefault();
+      });
+      row.addEventListener("drop", (event) => {
+        event.preventDefault();
+        this.dropOnTimeline(slotStart, event);
+      });
+    }
+    for (const item of this.scheduleItems()) this.renderScheduleBlock(timeline, item, config);
+
+    if (this.preview.suggestions?.length || this.preview.unscheduled?.length || this.preview.bumped?.length) {
+      const unscheduled = contentEl.createDiv({ cls: "semantic-todoist-schedule-list semantic-todoist-schedule-suggestions" });
+      unscheduled.createEl("h3", { text: "Suggested swaps" });
+      if (this.preview.suggestions?.length) {
+        for (const item of this.preview.suggestions) this.renderSuggestionRow(unscheduled, item);
+      } else if (this.preview.unscheduled?.length) {
+        unscheduled.createDiv({ cls: "semantic-todoist-schedule-list-empty", text: "No unscheduled task currently fits by swapping one scheduled block." });
+      }
+      if (this.preview.bumped?.length) {
+        const bumped = unscheduled.createDiv({ cls: "semantic-todoist-schedule-bumped" });
+        bumped.createEl("h3", { text: "Moved out" });
+        for (const item of this.preview.bumped.slice(-5)) this.renderBumpedRow(bumped, item);
+      }
+    }
+    if (this.preview.splitSubtasks.length) {
+      const split = contentEl.createDiv({ cls: "semantic-todoist-schedule-list" });
+      split.createEl("h3", { text: "Next-workday continuations" });
+      for (const item of this.preview.splitSubtasks) {
+        split.createDiv({ text: `${item.content} - ${item.durationMinutes} min on ${datePart(item.scheduledDateTime)}` });
+      }
+    }
+    const actions = contentEl.createDiv({ cls: "semantic-todoist-schedule-actions" });
+    actions.createEl("button", { text: "Apply" }).onclick = async () => {
+      await this.plugin.applyScheduleToday(this.preview);
+      this.close();
+    };
+    actions.createEl("button", { text: "Undo last" }).onclick = async () => {
+      await this.plugin.undoLastScheduleToday(true);
+      this.close();
+    };
+    actions.createEl("button", { text: "Close" }).onclick = () => this.close();
+  }
+
+  renderSuggestionRow(container, item) {
+    const row = container.createDiv({ cls: "semantic-todoist-schedule-suggestion" });
+    row.draggable = true;
+    row.dataset.id = item.id;
+    row.addEventListener("dragstart", (event) => this.startDrag(event, "suggestion", item.id));
+    row.addEventListener("dragend", () => this.clearDrag());
+    const text = row.createDiv({ cls: "semantic-todoist-schedule-suggestion-text" });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-title", text: shortTitle(item.content || "Task", 82) });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-reason", text: item.rationale || item.reason || "Could fit by moving another scheduled block." });
+    const button = row.createEl("button", { text: "Swap in" });
+    button.onclick = (event) => {
+      event.preventDefault();
+      this.swapInSuggestion(item.id);
+    };
+  }
+
+  renderBumpedRow(container, item) {
+    const row = container.createDiv({ cls: "semantic-todoist-schedule-suggestion is-bumped" });
+    row.draggable = true;
+    row.dataset.id = item.id;
+    row.addEventListener("dragstart", (event) => this.startDrag(event, "suggestion", item.id));
+    row.addEventListener("dragend", () => this.clearDrag());
+    const text = row.createDiv({ cls: "semantic-todoist-schedule-suggestion-text" });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-title", text: shortTitle(item.content || "Task", 82) });
+    text.createDiv({ cls: "semantic-todoist-schedule-suggestion-reason", text: item.rationale || item.reason || "Moved out by a swap." });
+    const button = row.createEl("button", { text: "Put back" });
+    button.onclick = (event) => {
+      event.preventDefault();
+      this.restoreBumpedItem(item.id);
+    };
+  }
+
+  startDrag(event, type, id) {
+    const payload = { type, id: String(id || "") };
+    this.draggedPayload = payload;
+    this.draggedId = payload.id;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("application/x-semantic-todoist-schedule", JSON.stringify(payload));
+      event.dataTransfer.setData("text/plain", `${type}:${payload.id}`);
+    }
+  }
+
+  clearDrag() {
+    this.draggedId = "";
+    this.draggedPayload = null;
+  }
+
+  readDragPayload(event) {
+    if (this.draggedPayload?.id) return this.draggedPayload;
+    const fallback = { type: "scheduled", id: "" };
+    const transfer = event?.dataTransfer;
+    if (!transfer) return fallback;
+    const typed = transfer.getData("application/x-semantic-todoist-schedule");
+    if (typed) {
+      try {
+        const parsed = JSON.parse(typed);
+        if (parsed?.id) return { type: parsed.type || "scheduled", id: String(parsed.id) };
+      } catch (error) {
+        console.debug("Schedule drag payload parse failed", error);
+      }
+    }
+    const text = transfer.getData("text/plain") || "";
+    const match = /^(suggestion|scheduled):(.+)$/.exec(text);
+    if (match) return { type: match[1], id: match[2] };
+    if (text) return { type: "scheduled", id: text };
+    return fallback;
+  }
+
+  dropOnTimeline(startMinutes, event) {
+    const payload = this.readDragPayload(event);
+    if (!payload.id) return;
+    if (payload.type === "suggestion") this.swapInSuggestion(payload.id, "", startMinutes);
+    else this.dropScheduledAt(payload.id, startMinutes);
+  }
+
+  dropOnScheduleItem(target, event) {
+    const payload = this.readDragPayload(event);
+    if (!payload.id) return;
+    if (payload.type === "suggestion") {
+      this.swapInSuggestion(payload.id, target.id, target.startMinutes);
+      return;
+    }
+    if (String(payload.id) === String(target.id)) return;
+    if (!this.reorderScheduledAround(payload.id, target.id)) this.dropScheduledAt(payload.id, target.startMinutes);
+  }
+
+  findSuggestion(id) {
+    const target = String(id || "");
+    return [
+      ...(this.preview.suggestions || []),
+      ...(this.preview.unscheduled || []),
+      ...(this.preview.bumped || [])
+    ].find((item) => String(item.id) === target);
+  }
+
+  swapInSuggestion(id, targetId = "", preferredStartMinutes = null) {
+    const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    this.preview.config = config;
+    refreshScheduleSuggestions(this.preview);
+    const suggestion = this.findSuggestion(id);
+    if (!suggestion) return;
+    const target = targetId ? this.movableItem(targetId) : null;
+    if (targetId && !target) {
+      new Notice("Fixed tasks cannot be swapped out from this preview.");
+      return;
+    }
+    const bumped = target || bestScheduleSwapCandidate(suggestion, this.preview, config);
+    if (!bumped) {
+      new Notice("That task no longer fits by swapping one scheduled block.");
+      return;
+    }
+    const blockDuration = suggestionScheduleBlockMinutes(suggestion, config);
+    const desiredStart = Number.isFinite(Number(preferredStartMinutes)) ? Number(preferredStartMinutes) : bumped.startMinutes;
+    const boundedStart = this.boundedStart(desiredStart, blockDuration);
+    const blocksWithoutBumped = scheduleBlocksForPreview(this.preview, config, { excludeId: bumped.id });
+    const start = this.canPlaceScheduleBlock(bumped.id, boundedStart, blockDuration)
+      ? boundedStart
+      : findNearestOpenScheduleSlot(blocksWithoutBumped, blockDuration, config, boundedStart);
+    if (start == null) {
+      new Notice("That task no longer fits in today's open slots.");
+      return;
+    }
+    this.preview.scheduled = (this.preview.scheduled || []).filter((item) => String(item.id) !== String(bumped.id));
+    this.preview.unscheduled = (this.preview.unscheduled || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(suggestion.id));
+    this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((item) => {
+      const sourceId = String(item.sourceTaskId || "");
+      return sourceId !== String(bumped.id) && sourceId !== String(suggestion.id);
+    });
+    const scheduledSuggestion = schedulePreviewItem(suggestion, start, blockDuration, config, {
+      promotedFromSuggestion: true,
+      previewOrderChanged: true,
+      scheduleBlockMinutes: blockDuration
+    });
+    this.preview.scheduled.push(scheduledSuggestion);
+    this.preview.scheduled.sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    const remainder = Math.max(0, Number(suggestion.durationMinutes || 0) - blockDuration);
+    if (remainder > 0) this.preview.splitSubtasks.push(scheduleContinuationSubtask(suggestion, remainder, config, this.plugin.settings));
+    const bumpedItem = scheduleUnscheduledItem(bumped, bumped.durationMinutes, `Swapped out for ${shortTitle(suggestion.content || "task", 32)}`, config, {
+      wasBumped: true,
+      bumpedById: suggestion.id,
+      startMinutes: null,
+      endMinutes: null,
+      scheduledDateTime: "",
+      rationale: `Moved out for ${shortTitle(suggestion.content || "task", 42)}.`
+    });
+    this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(bumped.id));
+    this.preview.bumped.push(bumpedItem);
+    refreshScheduleSuggestions(this.preview);
+    this.render();
+  }
+
+  restoreBumpedItem(id) {
+    const item = this.findSuggestion(id);
+    if (!item) return;
+    this.swapInSuggestion(item.id, item.bumpedById || "");
+  }
+
+  renderScheduleBlock(timeline, item, config) {
+    const block = timeline.createDiv({ cls: "semantic-todoist-schedule-block" });
+    if (item.fixed) block.addClass("is-fixed");
+    if (item.overlapsLunch) block.addClass("has-lunch-overlap");
+    if (item.durationMinutes <= config.chunkMinutes) block.addClass("is-short");
+    block.style.top = `${((item.startMinutes - config.startMinutes) / config.chunkMinutes) * this.slotHeight}px`;
+    block.style.height = `${Math.max(this.slotHeight, (item.durationMinutes / config.chunkMinutes) * this.slotHeight)}px`;
+    block.draggable = !item.fixed;
+    block.dataset.id = item.id;
+    block.addEventListener("dragstart", (event) => {
+      if (item.fixed) return;
+      this.startDrag(event, "scheduled", item.id);
+    });
+    block.addEventListener("dragend", () => this.clearDrag());
+    block.addEventListener("dragover", (event) => {
+      const payload = this.readDragPayload(event);
+      if (!payload.id || (payload.type === "scheduled" && String(payload.id) === String(item.id))) return;
+      event.preventDefault();
+    });
+    block.addEventListener("drop", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.dropOnScheduleItem(item, event);
+    });
+    const main = block.createDiv({ cls: "semantic-todoist-schedule-block-main" });
+    const dependentText = item.dependentSubtasks?.length ? ` | +${item.dependentSubtasks.length} subtask${item.dependentSubtasks.length === 1 ? "" : "s"}` : "";
+    const metaText = `${minutesToClock(item.startMinutes)}-${minutesToClock(item.endMinutes)} | ${item.durationMinutes} min${item.fixed ? " | fixed" : ""}${dependentText}`;
+    const title = main.createDiv({ cls: "semantic-todoist-schedule-block-title", text: item.content });
+    title.title = `${item.content} | ${metaText}`;
+    main.createDiv({ cls: "semantic-todoist-schedule-block-meta", text: metaText });
+    const controls = block.createDiv({ cls: "semantic-todoist-schedule-block-controls" });
+    controls.createEl("button", { text: "↑", attr: { "aria-label": "Move earlier", title: "Move earlier" } }).onclick = (event) => {
+      event.preventDefault();
+      this.moveItem(item.id, -config.chunkMinutes);
+    };
+    controls.createEl("button", { text: "↓", attr: { "aria-label": "Move later", title: "Move later" } }).onclick = (event) => {
+      event.preventDefault();
+      this.moveItem(item.id, config.chunkMinutes);
+    };
+    controls.createEl("button", { text: "-", attr: { "aria-label": "Shorten task", title: "Shorten task" } }).onclick = (event) => {
+      event.preventDefault();
+      this.adjustDuration(item.id, -scheduleDurationStepMinutes(config));
+    };
+    controls.createEl("button", { text: "+", attr: { "aria-label": "Lengthen task", title: "Lengthen task" } }).onclick = (event) => {
+      event.preventDefault();
+      this.adjustDuration(item.id, scheduleDurationStepMinutes(config));
+    };
+    if (!item.fixed) {
+      const resize = block.createDiv({ cls: "semantic-todoist-schedule-resize", text: "resize" });
+      resize.addEventListener("pointerdown", (event) => this.startResize(event, item.id));
+    }
+  }
+
+  movableItem(id) {
+    return (this.preview.scheduled || []).find((item) => String(item.id) === String(id) && !item.fixed);
+  }
+
+  setItemStart(id, startMinutes) {
+    const item = this.movableItem(id);
+    if (!item) return;
+    this.dropScheduledAt(item.id, startMinutes);
+  }
+
+  boundedStart(startMinutes, durationMinutesValue) {
+    const config = this.preview.config;
+    const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
+    const raw = Number(startMinutes);
+    const start = Number.isFinite(raw) ? raw : config.startMinutes;
+    return Math.max(config.startMinutes, Math.min(config.endMinutes - duration, start));
+  }
+
+  canPlaceScheduleBlock(excludeId, startMinutes, durationMinutesValue) {
+    const config = this.preview.config;
+    const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
+    if (!Number.isFinite(startMinutes) || startMinutes < config.startMinutes || startMinutes + duration > config.endMinutes) return false;
+    return !scheduleBlocksForPreview(this.preview, config, { excludeId }).some((block) => rangesOverlap(startMinutes, startMinutes + duration, block.startMinutes, block.endMinutes));
+  }
+
+  fitDurationAtStart(item, desiredMinutes) {
+    const config = this.preview.config;
+    const step = scheduleDurationStepMinutes(config);
+    let duration = Math.max(config.minBlockMinutes, Math.min(config.maxBlockMinutes, roundToScheduleChunk(desiredMinutes, config)));
+    while (duration >= config.minBlockMinutes) {
+      if (this.canPlaceScheduleBlock(item.id, item.startMinutes, duration)) return duration;
+      duration -= step;
+    }
+    return item.durationMinutes;
+  }
+
+  firstScheduleConflict(excludeId, startMinutes, durationMinutesValue) {
+    const config = this.preview.config;
+    const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
+    return scheduleBlocksForPreview(this.preview, config, { excludeId })
+      .find((block) => rangesOverlap(startMinutes, startMinutes + duration, block.startMinutes, block.endMinutes)) || null;
+  }
+
+  placeScheduleItem(item, startMinutes) {
+    const config = this.preview.config;
+    const bounded = this.boundedStart(startMinutes, item.durationMinutes);
+    item.startMinutes = bounded;
+    item.endMinutes = bounded + item.durationMinutes;
+    item.scheduledDateTime = localDateTimeString(config.today, bounded);
+    item.overlapsLunch = rangesOverlap(item.startMinutes, item.endMinutes, config.lunchStartMinutes, config.lunchEndMinutes);
+    item.previewOrderChanged = item.startMinutes !== item.originalStartMinutes;
+  }
+
+  dropScheduledAt(id, startMinutes) {
+    const config = this.preview.config;
+    const item = this.movableItem(id);
+    if (!item) return false;
+    const bounded = this.boundedStart(startMinutes, item.durationMinutes);
+    const conflict = this.firstScheduleConflict(item.id, bounded, item.durationMinutes);
+    if (conflict?.type === "scheduled" && conflict.id && this.reorderScheduledAround(item.id, conflict.id)) return true;
+    if (this.canPlaceScheduleBlock(item.id, bounded, item.durationMinutes)) {
+      this.placeScheduleItem(item, bounded);
+      this.render();
+      return true;
+    }
+    const start = findNearestOpenScheduleSlot(scheduleBlocksForPreview(this.preview, config, { excludeId: item.id }), item.durationMinutes, config, bounded);
+    if (start != null) {
+      this.placeScheduleItem(item, start);
+      this.render();
+      return true;
+    }
+    new Notice("No open slot fits that task block.");
+    return false;
+  }
+
+  snapshotScheduledItems() {
+    return (this.preview.scheduled || []).map((item) => ({
+      item,
+      startMinutes: item.startMinutes,
+      endMinutes: item.endMinutes,
+      scheduledDateTime: item.scheduledDateTime,
+      overlapsLunch: item.overlapsLunch,
+      previewOrderChanged: item.previewOrderChanged
+    }));
+  }
+
+  restoreScheduledSnapshot(snapshot) {
+    for (const state of snapshot || []) {
+      state.item.startMinutes = state.startMinutes;
+      state.item.endMinutes = state.endMinutes;
+      state.item.scheduledDateTime = state.scheduledDateTime;
+      state.item.overlapsLunch = state.overlapsLunch;
+      state.item.previewOrderChanged = state.previewOrderChanged;
+    }
+  }
+
+  repackScheduledItems(orderedItems) {
+    const config = this.preview.config;
+    const snapshot = this.snapshotScheduledItems();
+    const blocked = [];
+    if (config.lunchMinutes > 0) blocked.push({ startMinutes: config.lunchStartMinutes, endMinutes: config.lunchEndMinutes, type: "lunch" });
+    for (const fixed of this.preview.fixed || []) {
+      blocked.push({ startMinutes: fixed.startMinutes, endMinutes: fixed.endMinutes, id: fixed.id, type: "fixed" });
+    }
+    for (const item of orderedItems) {
+      const start = findOpenScheduleSlot(blocked, item.durationMinutes, config);
+      if (start == null) {
+        this.restoreScheduledSnapshot(snapshot);
+        new Notice("That order no longer fits in today's open blocks.");
+        return false;
+      }
+      this.placeScheduleItem(item, start);
+      blocked.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
+    }
+    this.preview.scheduled = orderedItems;
+    this.render();
+    return true;
+  }
+
+  reorderScheduledAround(sourceId, targetId) {
+    const ordered = (this.preview.scheduled || []).slice()
+      .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    const fromIndex = ordered.findIndex((item) => String(item.id) === String(sourceId));
+    const targetIndex = ordered.findIndex((item) => String(item.id) === String(targetId));
+    if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return false;
+    const [moved] = ordered.splice(fromIndex, 1);
+    const adjustedTargetIndex = ordered.findIndex((item) => String(item.id) === String(targetId));
+    const insertIndex = fromIndex < targetIndex ? adjustedTargetIndex + 1 : adjustedTargetIndex;
+    ordered.splice(Math.max(0, insertIndex), 0, moved);
+    return this.repackScheduledItems(ordered);
+  }
+
+  moveItem(id, deltaMinutes) {
+    const item = this.movableItem(id);
+    if (!item) return;
+    const config = this.preview.config;
+    const step = deltaMinutes >= 0 ? config.chunkMinutes : -config.chunkMinutes;
+    const minStart = config.startMinutes;
+    const maxStart = config.endMinutes - item.durationMinutes;
+    for (let start = item.startMinutes + step; step > 0 ? start <= maxStart : start >= minStart; start += step) {
+      const conflict = this.firstScheduleConflict(item.id, start, item.durationMinutes);
+      if (conflict?.type === "scheduled" && conflict.id) {
+        if (this.reorderScheduledAround(item.id, conflict.id)) return;
+        continue;
+      }
+      if (this.canPlaceScheduleBlock(item.id, start, item.durationMinutes)) {
+        this.placeScheduleItem(item, start);
+        this.render();
+        return;
+      }
+    }
+    new Notice(step > 0 ? "No later open slot fits that task block." : "No earlier open slot fits that task block.");
+  }
+
+  adjustDuration(id, deltaMinutes) {
+    const config = this.preview.config;
+    const item = this.movableItem(id);
+    if (!item) return;
+    const requested = Math.max(config.minBlockMinutes, Math.min(config.maxBlockMinutes, roundToScheduleChunk(item.durationMinutes + deltaMinutes, config)));
+    const next = this.fitDurationAtStart(item, requested);
+    if (next === item.durationMinutes && requested !== next) {
+      new Notice("No open room to extend that task block.");
+      return;
+    }
+    item.durationMinutes = next;
+    item.endMinutes = item.startMinutes + next;
+    item.scheduledDateTime = localDateTimeString(config.today, item.startMinutes);
+    item.overlapsLunch = rangesOverlap(item.startMinutes, item.endMinutes, config.lunchStartMinutes, config.lunchEndMinutes);
+    item.previewDurationChanged = item.durationMinutes !== item.originalDurationMinutes;
+    this.render();
+  }
+
+  startResize(event, id) {
+    event.preventDefault();
+    const item = this.movableItem(id);
+    if (!item) return;
+    const startY = event.clientY;
+    const startDuration = item.durationMinutes;
+    const config = this.preview.config;
+    let changed = false;
+    const move = (moveEvent) => {
+      const step = scheduleDurationStepMinutes(config);
+      const pixelsPerStep = this.slotHeight * (step / Math.max(1, config.chunkMinutes || step));
+      const deltaSteps = Math.round((moveEvent.clientY - startY) / Math.max(1, pixelsPerStep));
+      const next = startDuration + deltaSteps * step;
+      const requested = Math.max(config.minBlockMinutes, Math.min(config.maxBlockMinutes, roundToScheduleChunk(next, config)));
+      const bounded = this.fitDurationAtStart(item, requested);
+      if (bounded === item.durationMinutes) return;
+      item.durationMinutes = bounded;
+      item.endMinutes = item.startMinutes + bounded;
+      item.overlapsLunch = rangesOverlap(item.startMinutes, item.endMinutes, config.lunchStartMinutes, config.lunchEndMinutes);
+      item.previewDurationChanged = item.durationMinutes !== item.originalDurationMinutes;
+      changed = true;
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      if (changed) this.render();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
   }
 }
 
@@ -4950,6 +6289,9 @@ class TaskTemplateModal extends Modal {
   }
 
   selectedTemplateChoices(template = this.selectedTemplate()) {
+    if (isScheduleTodayTemplate(template)) {
+      return { action: "schedule-today", createsTasks: false, insertIntoNote: false, syncAfterInsert: false };
+    }
     const createsTasks = template.createTasks !== false;
     const insertIntoNote = template.insertResponse !== false;
     const syncAfterInsert = createsTasks && insertIntoNote && template.syncAfterInsert === true;
@@ -4975,6 +6317,11 @@ class TaskTemplateModal extends Modal {
     const updateMode = () => {
       const template = this.selectedTemplate();
       const choices = this.selectedTemplateChoices(template);
+      if (choices.action === "schedule-today") {
+        modeEl.setText("Prompt: schedule today");
+        choicesEl.setText("Opens scheduler preview. Settings stay authoritative; this prompt coordinates duration estimates and split suggestions.");
+        return;
+      }
       modeEl.setText(choices.createsTasks ? "Prompt: generates tasks" : "Prompt: response");
       choicesEl.setText(`Generate tasks: ${yesNo(choices.createsTasks)} | Insert: ${yesNo(choices.insertIntoNote)} | Sync to Todoist: ${yesNo(choices.syncAfterInsert)}`);
     };
@@ -5035,11 +6382,11 @@ const SETTING_DESCRIPTIONS = {
   searchIncludeActiveNote: "Default for whether sidebar chat queries include the active note alongside semantic vault search.",
   maxChatContextChunks: "Maximum number of semantic search results sent to the AI for vault Q&A.",
   maxActiveNoteContextChars: "Maximum active-note characters sent to the AI for normal chat. Task creation can use a separate note limit.",
-  promptTemplatesFolder: "Markdown files in this folder become reusable AI prompts. Frontmatter can set createTasks, insertResponse, and syncTasks.",
+  promptTemplatesFolder: "Markdown files in this folder become reusable prompt actions. Frontmatter can set createTasks, insertResponse, syncTasks, and action: schedule-today.",
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
   openaiApiKey: "Optional. Required only when you choose an OpenAI chat or embedding model.",
   googleApiKey: "Required for the default Gemini setup. Create this in Google AI Studio and paste it here.",
-  chatFallbackModel: "Optional. Choose a same-provider fallback model for temporary overload or rate-limit errors. Leave Automatic to use the next available model from the selected provider.",
+  chatFallbackModel: "Optional. Choose one same-provider fallback model for temporary overload or rate-limit errors. Leave Automatic to use the model shown in the dropdown.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
@@ -5082,6 +6429,26 @@ const SETTING_DESCRIPTIONS = {
   referenceRebuildIntervalMinutes: "How often automatic reference reconciliation may run while Obsidian is open.",
   referenceRebuildWorkerCount: "Number of local note files processed in parallel during reference reconciliation.",
   todoistSnapshotCacheMinutes: "How long Todoist snapshots can be reused to reduce API calls.",
+  scheduleTodayEnabled: "Adds the Schedule Today's Tasks prompt action to the sidebar chooser and command palette.",
+  scheduleTodayStartTime: "Start of the schedulable workday.",
+  scheduleTodayEndTime: "End of the schedulable workday.",
+  scheduleTodayLunchStartTime: "Start of the protected lunch block.",
+  scheduleTodayLunchMinutes: "Length of the lunch block avoided by automatic scheduling. Use 0 to disable lunch blocking.",
+  scheduleTodayMinBlockMinutes: "Smallest duration block a task can receive. The preview timeline also uses this interval.",
+  scheduleTodayMaxBlockMinutes: "Largest same-day block a task can receive before overflow is split to the next workday.",
+  scheduleTodayChunkMinutes: "Legacy setting kept for older saved data. The scheduler now uses Minimum task block minutes as its timeline interval.",
+  scheduleTodayDueWindowDays: "Include tasks due today through this many days ahead.",
+  scheduleTodayIncludeOverdue: "Include open overdue tasks in today's candidate list.",
+  scheduleTodayIncludeSubtasks: "Allow open subtasks to be scheduled directly.",
+  scheduleTodayAllowIndependentSubtasks: "Allow follow-up, review, waiting, or dependency subtasks to move independently from their parent task.",
+  scheduleTodayExcludedLabels: "Comma-separated Todoist labels skipped by the scheduler.",
+  scheduleTodayWeightTodoistPriority: "How much Todoist priority affects the schedule order.",
+  scheduleTodayWeightDeadlineProximity: "How much deadline proximity affects the schedule order. Deadlines are read only and are not changed.",
+  scheduleTodayWeightOverdue: "How much overdue status affects the schedule order.",
+  scheduleTodayWeightDueDateProximity: "How much due-date proximity affects the schedule order.",
+  scheduleTodayWeightSemanticUrgency: "How much urgent wording in the task and local context affects the schedule order.",
+  scheduleTodayWeightNoteRecency: "How much recent note/task context affects the schedule order.",
+  scheduleTodayWeightParentDependency: "How much parent/subtask dependency context affects the schedule order.",
   emailMainTaskInstructions: "Plain-language rules for deciding which email items become main tasks.",
   emailSubtaskInstructions: "Plain-language rules for creating email-derived subtasks.",
   emailSectionTitleInstructions: "Plain-language rules for naming Todoist sections for email tasks.",
@@ -5179,19 +6546,20 @@ function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
 
 function aiFallbackModelSetting(containerEl, plugin) {
   const primary = plugin.settings.chatModel || DEFAULT_SETTINGS.chatModel;
-  const options = [{ value: "", label: "Automatic same provider" }];
+  const automaticFallback = plugin.sameProviderFallbackModels(primary)[0] || "";
+  const options = [{ value: "", label: automaticFallback ? `Automatic: ${modelDisplayName(automaticFallback)}` : "Automatic same provider" }];
   if (usesGeminiChatModel(primary)) {
     const primaryId = normalizeGeminiModelId(primary);
     const models = plugin.settings.availableGeminiModels?.length ? plugin.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
-    for (const model of models) {
+    for (const model of rankGeminiFallbackModels(models)) {
       const id = normalizeGeminiModelId(model);
-      if (id && id !== primaryId) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
+      if (id && id !== primaryId && isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Manual: Gemini: ${id}` });
     }
   } else {
     const primaryId = normalizeOpenAIModelId(primary);
     for (const model of plugin.settings.availableChatModels || []) {
       const id = normalizeOpenAIModelId(model);
-      if (id && id !== primaryId) options.push({ value: id, label: `OpenAI: ${id}` });
+      if (id && id !== primaryId) options.push({ value: id, label: `Manual: OpenAI: ${id}` });
     }
   }
   const selected = options.some((option) => option.value === plugin.settings.chatFallbackModel) ? plugin.settings.chatFallbackModel : "";
@@ -5281,12 +6649,42 @@ function secretSetting(containerEl, name, plugin, key) {
 function numberSetting(containerEl, name, plugin, key) {
   new Setting(containerEl).setName(name).setDesc(settingDescription(name, key)).addText((text) => {
     text.inputEl.type = "number";
-    text.setValue(String(plugin.settings[key] || DEFAULT_SETTINGS[key])).onChange(async (value) => {
-      const minimum = key === "emailPollIntervalSeconds" ? MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS : 1;
-      plugin.settings[key] = Math.max(minimum, parseInt(value, 10) || DEFAULT_SETTINGS[key]);
+    text.setValue(String(plugin.settings[key] ?? DEFAULT_SETTINGS[key])).onChange(async (value) => {
+      const minimum = key === "emailPollIntervalSeconds" ? MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS : key === "scheduleTodayLunchMinutes" ? 0 : 1;
+      const parsed = parseInt(value, 10);
+      plugin.settings[key] = Math.max(minimum, Number.isFinite(parsed) ? parsed : DEFAULT_SETTINGS[key]);
       await plugin.saveSettings();
     });
   });
+}
+
+function timeSetting(containerEl, name, desc, plugin, key) {
+  const setting = new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc));
+  const input = setting.controlEl.createEl("input", { type: "time" });
+  input.value = String(plugin.settings[key] || DEFAULT_SETTINGS[key] || "");
+  input.onchange = async () => {
+    plugin.settings[key] = input.value || DEFAULT_SETTINGS[key];
+    await plugin.saveSettings();
+  };
+}
+
+function scheduleWeightSetting(containerEl, name, plugin, key) {
+  const options = ["less", "moderate", "more"];
+  const labels = { less: "Less", moderate: "Moderate", more: "More" };
+  const current = options.includes(plugin.settings[key]) ? plugin.settings[key] : "moderate";
+  const setting = new Setting(containerEl).setName(name).setDesc(settingDescription(name, key));
+  setting.settingEl.addClass("semantic-todoist-weight-setting");
+  const wrapper = setting.controlEl.createDiv({ cls: "semantic-todoist-weight-control" });
+  const range = wrapper.createEl("input", { type: "range", attr: { min: "0", max: "2", step: "1", "aria-label": name } });
+  const label = wrapper.createSpan({ cls: "semantic-todoist-weight-label", text: labels[current] });
+  range.value = String(Math.max(0, options.indexOf(current)));
+  range.oninput = () => {
+    label.setText(labels[options[Number(range.value)] || "moderate"]);
+  };
+  range.onchange = async () => {
+    plugin.settings[key] = options[Number(range.value)] || "moderate";
+    await plugin.saveSettings();
+  };
 }
 
 function toggleSetting(containerEl, name, desc, plugin, key) {
@@ -5386,6 +6784,7 @@ function parsePromptTemplateFile(file, text) {
       name: parsed.meta.name || file.basename,
       prompt: parsed.body.trim(),
       source: file.path,
+      action: normalizePromptTemplateAction(parsed.meta.action ?? parsed.meta.actionType ?? parsed.meta.action_type ?? parsed.meta.templateAction ?? parsed.meta.template_action),
       createTasks: parseTemplateBoolean(parsed.meta.createTasks ?? parsed.meta.create_tasks ?? parsed.meta.makeTasks ?? parsed.meta.make_tasks, false),
       insertResponse: parseTemplateBoolean(parsed.meta.insertResponse ?? parsed.meta.insert_response, true),
       syncAfterInsert: parseTemplateBoolean(parsed.meta.syncTasks ?? parsed.meta.sync_tasks ?? parsed.meta.syncAfterInsert ?? parsed.meta.sync_after_insert, false),
@@ -5428,9 +6827,20 @@ function isTaskGenerationTemplate(template = {}) {
     !/\bsummary\b/i.test(template.name || "");
 }
 
+function normalizePromptTemplateAction(value) {
+  const action = String(value || "").trim().toLowerCase().replace(/['’]/g, "").replace(/[\s_]+/g, "-");
+  if (/^(schedule|schedule-today|schedule-todays-tasks|schedule-today-tasks|schedule-day|plan-today)$/.test(action)) return "schedule-today";
+  return action;
+}
+
+function isScheduleTodayTemplate(template = {}) {
+  return normalizePromptTemplateAction(template.action) === "schedule-today";
+}
+
 function promptTemplateFileText(template) {
   return [
     "---",
+    ...(template.action ? [`action: ${normalizePromptTemplateAction(template.action)}`] : []),
     `createTasks: ${Boolean(template.createTasks)}`,
     `insertResponse: ${template.insertResponse !== false}`,
     `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
@@ -5510,6 +6920,18 @@ function modelSummary(settings) {
     ? `${settings.availableGeminiModels?.length || 0} Gemini chat and ${settings.availableGeminiEmbeddingModels?.length || 0} Gemini embedding models loaded at ${settings.geminiModelsFetchedAt}`
     : `${settings.availableGeminiModels?.length || 0} default Gemini chat model(s) available`;
   return `${active} ${openai}. ${gemini}.`;
+}
+
+function configuredAiModelSummary(plugin) {
+  const settings = plugin.settings || DEFAULT_SETTINGS;
+  const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
+  const primaryText = `Primary: ${modelDisplayName(primary)}`;
+  if (!settings.enableAiModelFallback) return `${primaryText}. Fallback: off.`;
+  const fallback = plugin.sameProviderFallbackModels(primary)[0] || "";
+  const mode = settings.chatFallbackModel ? "Manual" : "Automatic";
+  return fallback
+    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.`
+    : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.`;
 }
 
 function modelProviderSummaries(settings) {
@@ -5640,6 +7062,8 @@ function persistentTaskReferenceIndex(index = emptyTaskReferenceIndex()) {
       isSubtask: Boolean(task?.isSubtask),
       parentOid: task?.parentOid || "",
       section: task?.section || "",
+      scheduledDueDateTime: task?.scheduledDueDateTime || "",
+      duration: normalizeTodoistDuration(task?.duration),
       cachedAt: task?.cachedAt || ""
     }))]),
     paths: Array.from(index.cachedTaskPaths.values()).sort(),
@@ -5655,6 +7079,8 @@ function persistentTaskReferenceIndex(index = emptyTaskReferenceIndex()) {
       sectionId: task?.sectionId || "",
       projectId: task?.projectId || "",
       projectName: task?.projectName || "",
+      scheduledDueDateTime: task?.scheduledDueDateTime || "",
+      duration: normalizeTodoistDuration(task?.duration),
       cachedAt: task?.cachedAt || ""
     }))])
   };
@@ -5760,6 +7186,8 @@ function hydrateCompactTaskReference(entry = {}, settings = DEFAULT_SETTINGS) {
     sectionId: entry.sectionId || "",
     projectId: entry.projectId || "",
     projectName: entry.projectName || "",
+    scheduledDueDateTime: entry.scheduledDueDateTime || "",
+    duration: normalizeTodoistDuration(entry.duration),
     cachedAt: entry.cachedAt || ""
   };
 }
@@ -5835,6 +7263,8 @@ function referenceRows(settings) {
       task: task.content || "",
       priority: String(task.priority || ""),
       date: task.due_date || "",
+      scheduled: task.scheduledDueDateTime || "",
+      duration: durationMinutes(task.duration) ? `${durationMinutes(task.duration)} min` : "",
       deadline: task.deadline_date || "",
       project: task.projectName || "",
       projectId: task.projectId || "",
@@ -5858,6 +7288,8 @@ function referenceRows(settings) {
       task: pending.content || "",
       priority: "",
       date: "",
+      scheduled: "",
+      duration: "",
       deadline: "",
       project: pending.projectName || "",
       projectId: pending.projectId || "",
@@ -5998,6 +7430,1141 @@ function taskDescriptionSchema() {
   };
 }
 
+function scheduleDurationSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      estimates: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: { type: "string" },
+            minutes: { type: "integer", minimum: 1, maximum: 1440 },
+            confidence: { type: "string", enum: ["low", "medium", "high"] },
+            independent_subtask: { type: "boolean" },
+            split_title: { type: "string" }
+          },
+          required: ["id", "minutes", "confidence", "independent_subtask", "split_title"]
+        }
+      }
+    },
+    required: ["estimates"]
+  };
+}
+
+function emptySchedulerMemory() {
+  return { version: 2, updatedAt: "", durationPolicies: defaultSchedulerDurationPolicies(), entries: {} };
+}
+
+function normalizeSchedulerMemory(payload) {
+  const normalized = emptySchedulerMemory();
+  normalized.updatedAt = String(payload?.updatedAt || "");
+  normalized.durationPolicies = normalizeSchedulerDurationPolicies(payload?.durationPolicies);
+  const entries = payload?.entries && typeof payload.entries === "object" ? payload.entries : {};
+  for (const [key, value] of Object.entries(entries)) {
+    const entry = normalizeSchedulerMemoryEntry(value, key);
+    if (entry?.key) normalized.entries[entry.key] = entry;
+  }
+  return compactSchedulerMemory(normalized);
+}
+
+function normalizeSchedulerMemoryEntry(value, fallbackKey = "") {
+  if (!value || typeof value !== "object") return null;
+  const key = String(value.key || fallbackKey || "").trim();
+  if (!key) return null;
+  const entry = {
+    key,
+    title: singleLine(value.title || ""),
+    contentHash: String(value.contentHash || ""),
+    parentContent: singleLine(value.parentContent || ""),
+    isSubtask: Boolean(value.isSubtask),
+    ids: uniqueValues(value.ids || []).slice(0, 8),
+    oids: uniqueValues(value.oids || []).slice(0, 8),
+    paths: uniqueValues(value.paths || []).slice(-SCHEDULER_MEMORY_MAX_CONTEXT_PATHS),
+    projectIds: uniqueValues(value.projectIds || []).slice(0, 8),
+    projectNames: uniqueValues(value.projectNames || []).slice(0, 8),
+    sections: uniqueValues(value.sections || []).slice(0, 8),
+    labels: uniqueValues(value.labels || []).slice(0, 16),
+    contextPaths: uniqueValues(value.contextPaths || []).slice(-SCHEDULER_MEMORY_MAX_CONTEXT_PATHS),
+    contextTerms: uniqueValues(value.contextTerms || []).slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS),
+    priority: Object.assign({ last: 1, max: 1, samples: 0 }, value.priority || {}),
+    duration: Object.assign({ last: 0, average: 0, samples: 0, source: "" }, value.duration || {}),
+    order: Object.assign({
+      samples: 0,
+      avgPosition: 0,
+      lastStartMinutes: null,
+      lastOrderIndex: null,
+      lastOrderTotal: null,
+      scheduledCount: 0,
+      promotedCount: 0,
+      bumpedCount: 0,
+      manualDurationCount: 0,
+      manualOrderCount: 0
+    }, value.order || {}),
+    outcomes: Object.assign({}, value.outcomes || {}),
+    lastScheduledDate: String(value.lastScheduledDate || ""),
+    lastScheduledDateTime: String(value.lastScheduledDateTime || ""),
+    lastObservedAt: String(value.lastObservedAt || ""),
+    lastAppliedAt: String(value.lastAppliedAt || ""),
+    updatedAt: String(value.updatedAt || "")
+  };
+  entry.priority.last = normalizePriority(entry.priority.last);
+  entry.priority.max = normalizePriority(entry.priority.max);
+  entry.priority.samples = Math.max(0, Number(entry.priority.samples || 0));
+  entry.duration.last = Math.max(0, Math.round(Number(entry.duration.last || 0)));
+  entry.duration.average = Math.max(0, Math.round(Number(entry.duration.average || 0)));
+  entry.duration.samples = Math.max(0, Number(entry.duration.samples || 0));
+  entry.order.samples = Math.max(0, Number(entry.order.samples || 0));
+  entry.order.avgPosition = Math.max(0, Math.min(1, Number(entry.order.avgPosition || 0)));
+  return entry;
+}
+
+function compactSchedulerMemory(memory) {
+  const compact = emptySchedulerMemory();
+  compact.updatedAt = String(memory?.updatedAt || "");
+  compact.durationPolicies = normalizeSchedulerDurationPolicies(memory?.durationPolicies);
+  const entries = Object.values(memory?.entries || {})
+    .map((entry) => normalizeSchedulerMemoryEntry(entry))
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(b.updatedAt || b.lastAppliedAt || b.lastObservedAt || "") - Date.parse(a.updatedAt || a.lastAppliedAt || a.lastObservedAt || ""));
+  for (const entry of entries.slice(0, SCHEDULER_MEMORY_MAX_ENTRIES)) compact.entries[entry.key] = entry;
+  return compact;
+}
+
+function defaultSchedulerDurationPolicies() {
+  return [
+    {
+      id: SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID,
+      enabled: true,
+      maxMinutes: 30,
+      maxMinutesSetting: "scheduleTodayMinBlockMinutes",
+      appliesTo: "Tasks whose main action is to follow up, discuss, check in, call, email, ask, confirm, coordinate, collaborate, or schedule with another person.",
+      rationale: DEFAULT_SCHEDULER_POLICY_TEXT.peopleFollowupRationale,
+      excludeWhen: "Do not apply when the task clearly requires preparing, reviewing, writing, analyzing, creating, or finalizing material during the block."
+    },
+    {
+      id: SCHEDULER_DEFAULT_FOCUS_POLICY_ID,
+      enabled: true,
+      targetMinutes: 60,
+      appliesTo: "Ordinary focused-work tasks without clear complexity or quick-outreach signals.",
+      rationale: DEFAULT_SCHEDULER_POLICY_TEXT.defaultFocusRationale,
+      excludeWhen: "Do not apply to people-follow-up tasks, explicitly short tasks, or clearly complex document/review/strategy work."
+    },
+    {
+      id: SCHEDULER_RELATED_GROUPING_POLICY_ID,
+      enabled: true,
+      boost: 0.45,
+      appliesTo: "Tasks sharing the same parent, project, section, note path, or meaningful labels/context terms.",
+      rationale: DEFAULT_SCHEDULER_POLICY_TEXT.relatedGroupingRationale,
+      excludeWhen: "Do not group tasks when priority, deadline proximity, fixed schedule blocks, lunch, or available time make grouping impractical."
+    }
+  ];
+}
+
+function normalizeSchedulerDurationPolicies(policies) {
+  const byId = new Map();
+  for (const policy of defaultSchedulerDurationPolicies()) byId.set(policy.id, policy);
+  const list = Array.isArray(policies) ? policies : [];
+  for (const value of list) {
+    if (!value || typeof value !== "object") continue;
+    const rawId = singleLine(value.id || "");
+    const id = isSchedulerPeopleFollowupPolicyId(rawId) ? SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID : rawId;
+    if (!id) continue;
+    const base = byId.get(id) || {};
+    byId.set(id, {
+      id,
+      enabled: value.enabled !== false,
+      maxMinutes: Math.max(30, Math.min(8 * 60, Math.round(Number(value.maxMinutes || base.maxMinutes || 30)))),
+      maxMinutesSetting: singleLine(value.maxMinutesSetting || base.maxMinutesSetting || ""),
+      targetMinutes: Math.max(0, Math.min(8 * 60, Math.round(Number(value.targetMinutes || base.targetMinutes || 0)))),
+      boost: Math.max(0, Math.min(2, Number(value.boost ?? base.boost ?? 0))),
+      appliesTo: singleLine(value.appliesTo || base.appliesTo || ""),
+      rationale: singleLine(value.rationale || base.rationale || ""),
+      excludeWhen: singleLine(value.excludeWhen || base.excludeWhen || "")
+    });
+  }
+  return Array.from(byId.values()).filter((policy) => policy.id);
+}
+
+function schedulerMemoryDurationPolicies(memory) {
+  return normalizeSchedulerDurationPolicies(memory?.durationPolicies);
+}
+
+function schedulerPeopleFollowupPolicy(policies = null) {
+  return normalizeSchedulerDurationPolicies(policies).find((policy) => isSchedulerPeopleFollowupPolicyId(policy.id) && policy.enabled !== false) || null;
+}
+
+function schedulerDefaultFocusPolicy(policies = null) {
+  return normalizeSchedulerDurationPolicies(policies).find((policy) => policy.id === SCHEDULER_DEFAULT_FOCUS_POLICY_ID && policy.enabled !== false) || null;
+}
+
+function schedulerRelatedGroupingPolicy(policies = null) {
+  return normalizeSchedulerDurationPolicies(policies).find((policy) => policy.id === SCHEDULER_RELATED_GROUPING_POLICY_ID && policy.enabled !== false) || null;
+}
+
+function isSchedulerPeopleFollowupPolicyId(id) {
+  const value = singleLine(id || "");
+  return value === SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID || SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES.includes(value);
+}
+
+function schedulerDurationPolicyMaxMinutes(policy, config = {}) {
+  if (policy?.maxMinutesSetting === "scheduleTodayMinBlockMinutes") {
+    return Math.max(1, Math.round(Number(config.minBlockMinutes || policy.maxMinutes || 30)));
+  }
+  return Math.max(30, Math.round(Number(policy?.maxMinutes || 30)));
+}
+
+function schedulerDefaultFocusMinutes(config = {}, policies = null) {
+  const policy = schedulerDefaultFocusPolicy(policies);
+  const target = policy?.targetMinutes || 60;
+  return Math.max(config.minBlockMinutes || 30, roundToScheduleChunk(target, config) || target);
+}
+
+function formatSchedulerDurationPolicies(policies = null, config = {}) {
+  return normalizeSchedulerDurationPolicies(policies)
+    .filter((policy) => policy.enabled !== false)
+    .map((policy) => {
+      const source = policy.maxMinutesSetting === "scheduleTodayMinBlockMinutes" ? " (current scheduler minimum duration setting)" : "";
+      const duration = policy.id === SCHEDULER_DEFAULT_FOCUS_POLICY_ID
+        ? `target ${schedulerDefaultFocusMinutes(config, [policy])} min`
+        : policy.id === SCHEDULER_RELATED_GROUPING_POLICY_ID
+          ? `grouping boost ${Number(policy.boost || 0).toFixed(2)}`
+          : `max ${schedulerDurationPolicyMaxMinutes(policy, config)} min${source}`;
+      return `- ${policy.id}: ${duration}. Applies to: ${policy.appliesTo} Rationale: ${policy.rationale} Exclude when: ${policy.excludeWhen}`;
+    })
+    .join("\n");
+}
+
+function schedulerMemoryPolicySummary(policies = null, config = {}) {
+  return `Scheduler memory policies:\n${formatSchedulerDurationPolicies(policies, config) || "- No active scheduler memory policies."}`;
+}
+
+function parseSchedulerMemoryChatCommand(prompt, settings = DEFAULT_SETTINGS) {
+  const text = String(prompt || "").trim();
+  const lower = text.toLowerCase();
+  if (!/(scheduler|scheduling).{0,30}memory|memory.{0,30}(scheduler|scheduling)|duration polic|scheduling logic|schedule logic/.test(lower)) return null;
+  const wantsUpdate = /\b(update|set|change|make|remember|prefer|cap|use|enable|disable|adjust|tune|teach|learn|policy|policies)\b/.test(lower);
+  const wantsShow = /\b(show|list|what|current|view|display)\b/.test(lower) && !wantsUpdate;
+  const command = { showOnly: wantsShow };
+  const minuteMatch = /(\d{1,3})\s*(?:min|mins|minute|minutes)\b/.exec(lower);
+  const minutes = minuteMatch ? Math.max(1, Math.min(8 * 60, Number(minuteMatch[1]))) : 0;
+  if (/\b(follow[- ]?up|discuss|discussion|check[- ]?in|call|email|ask|confirm|coordinate|collaborate|person|individual)\b/.test(lower)) {
+    if (/\b(minimum|min block|smallest|setting|settings)\b/.test(lower) || !minutes) command.peopleFollowupMinimum = true;
+    else command.peopleFollowupMaxMinutes = minutes;
+  }
+  if (/\b(default|ordinary|normal|general|focused[- ]?work|focus work|about an hour|one hour|1 hour)\b/.test(lower)) {
+    command.defaultFocusMinutes = minutes || (/about an hour|one hour|1 hour/.test(lower) ? 60 : 0);
+  }
+  if (/\b(group|cluster|together|related|same project|same note|same parent|build off|builds off)\b/.test(lower)) {
+    command.relatedGrouping = !/\b(disable|turn off|stop|do not|don't)\b/.test(lower);
+    if (/\b(more|stronger|increase|high)\b/.test(lower)) command.relatedGroupingBoost = 0.65;
+    else if (/\b(less|weaker|decrease|low)\b/.test(lower)) command.relatedGroupingBoost = 0.25;
+    else command.relatedGroupingBoost = 0.45;
+  }
+  if (command.showOnly || command.peopleFollowupMinimum || command.peopleFollowupMaxMinutes || command.defaultFocusMinutes || command.relatedGrouping != null || wantsUpdate) return command;
+  return null;
+}
+
+function schedulerMemoryPolicyCommandSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      show_only: { type: "boolean" },
+      people_followup_mode: { type: ["string", "null"], enum: ["minimum", "fixed", "unchanged", null] },
+      people_followup_max_minutes: { type: ["integer", "null"], minimum: 1, maximum: 480 },
+      default_focus_minutes: { type: ["integer", "null"], minimum: 1, maximum: 480 },
+      related_grouping: { type: ["string", "null"], enum: ["enable", "disable", "unchanged", null] },
+      related_grouping_strength: { type: ["string", "null"], enum: ["less", "moderate", "more", "unchanged", null] },
+      rationale: { type: "string" }
+    },
+    required: [
+      "show_only",
+      "people_followup_mode",
+      "people_followup_max_minutes",
+      "default_focus_minutes",
+      "related_grouping",
+      "related_grouping_strength",
+      "rationale"
+    ]
+  };
+}
+
+function schedulerMemoryPolicyCommandFromAi(value = {}) {
+  const command = {};
+  if (value.show_only === true) command.showOnly = true;
+  const peopleMode = String(value.people_followup_mode || "unchanged").toLowerCase();
+  const peopleMinutes = Math.max(1, Math.min(8 * 60, Math.round(Number(value.people_followup_max_minutes || 0))));
+  if (peopleMode === "minimum") command.peopleFollowupMinimum = true;
+  else if (peopleMode === "fixed" && peopleMinutes) command.peopleFollowupMaxMinutes = peopleMinutes;
+  const focusMinutes = Math.max(1, Math.min(8 * 60, Math.round(Number(value.default_focus_minutes || 0))));
+  if (focusMinutes) command.defaultFocusMinutes = focusMinutes;
+  const grouping = String(value.related_grouping || "unchanged").toLowerCase();
+  if (grouping === "enable") command.relatedGrouping = true;
+  else if (grouping === "disable") command.relatedGrouping = false;
+  const strength = String(value.related_grouping_strength || "unchanged").toLowerCase();
+  if (strength === "less") command.relatedGroupingBoost = 0.25;
+  else if (strength === "moderate") command.relatedGroupingBoost = 0.45;
+  else if (strength === "more") command.relatedGroupingBoost = 0.65;
+  return command;
+}
+
+function mergeSchedulerMemoryChatCommands(local = {}, ai = {}) {
+  const merged = Object.assign({}, local || {});
+  for (const [key, value] of Object.entries(ai || {})) {
+    if (value !== undefined && value !== null && value !== "") merged[key] = value;
+  }
+  return merged;
+}
+
+function schedulerMemoryEntry(memory, task) {
+  if (!memory || !task) return null;
+  memory.entries = memory.entries || {};
+  const match = schedulerMemoryExactMatch(memory, task);
+  if (match?.entry) return match.entry;
+  const key = schedulerMemoryKey(task);
+  if (!key) return null;
+  const entry = normalizeSchedulerMemoryEntry({ key }) || { key };
+  memory.entries[key] = entry;
+  return entry;
+}
+
+function schedulerMemoryForCandidate(memory, candidate) {
+  if (!memory?.entries || !candidate) return null;
+  const exact = schedulerMemoryExactMatch(memory, candidate);
+  if (exact?.entry) return Object.assign({}, exact.entry, { exact: true });
+  const candidateTerms = new Set(schedulerContextTokens(candidate));
+  const candidatePaths = new Set(schedulerTaskPaths(candidate));
+  const candidateLabels = new Set(cleanTodoistLabels(candidate.labels || []).map((label) => label.toLowerCase()));
+  let best = null;
+  for (const entry of Object.values(memory.entries || {})) {
+    const score = schedulerMemorySimilarity(entry, candidate, candidateTerms, candidatePaths, candidateLabels);
+    if (!best || score > best.score) best = { entry, score };
+  }
+  if (!best || best.score < 0.55) return null;
+  return Object.assign({}, best.entry, { exact: false, similarity: best.score });
+}
+
+function schedulerMemoryExactMatch(memory, task) {
+  const key = schedulerMemoryKey(task);
+  if (key && memory.entries?.[key]) return { entry: memory.entries[key], key };
+  const id = String(task?.id || "").trim();
+  const oid = String(task?.oid || "").trim();
+  const contentHash = schedulerTaskContentHash(task);
+  for (const entry of Object.values(memory.entries || {})) {
+    if (id && (entry.ids || []).includes(id)) return { entry, key: entry.key };
+    if (oid && (entry.oids || []).includes(oid)) return { entry, key: entry.key };
+    if (contentHash && entry.contentHash === contentHash && schedulerTaskPaths(task).some((path) => (entry.paths || []).includes(path))) return { entry, key: entry.key };
+  }
+  return null;
+}
+
+function schedulerMemoryKey(task) {
+  const oid = String(task?.oid || "").trim();
+  if (oid) return `oid:${oid}`;
+  const id = String(task?.id || "").trim();
+  if (id) return `todoist:${id}`;
+  const contentHash = schedulerTaskContentHash(task);
+  return contentHash ? `sig:${contentHash}` : "";
+}
+
+function schedulerTaskContentHash(task) {
+  const text = [
+    singleLine(task?.content || task?.title || ""),
+    singleLine(task?.parentContent || ""),
+    singleLine(task?.projectName || ""),
+    singleLine(task?.section || ""),
+    schedulerTaskPaths(task)[0] || ""
+  ].join("|");
+  return text.trim() ? shortHash(text.toLowerCase()) : "";
+}
+
+function schedulerTaskPaths(task, observation = {}) {
+  const paths = [];
+  if (task?.path) paths.push(task.path);
+  if (Array.isArray(task?.noteRefs)) {
+    for (const ref of task.noteRefs) {
+      if (typeof ref === "string") paths.push(ref);
+      else if (ref?.path) paths.push(ref.path);
+    }
+  }
+  if (Array.isArray(observation.contextPaths)) paths.push(...observation.contextPaths);
+  return uniqueValues(paths.map((path) => String(path || "").trim()).filter(Boolean));
+}
+
+function schedulerContextTokens(task) {
+  const text = [
+    task?.content,
+    task?.description,
+    task?.parentContent,
+    task?.projectName,
+    task?.section,
+    task?.path,
+    ...(task?.labels || [])
+  ].filter(Boolean).join(" ");
+  return Object.entries(termCounts(text))
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS)
+    .map(([term]) => term);
+}
+
+function schedulerMemorySimilarity(entry, candidate, candidateTerms, candidatePaths, candidateLabels) {
+  let score = 0;
+  const entryTerms = new Set(entry.contextTerms || []);
+  const entryPaths = new Set([...(entry.paths || []), ...(entry.contextPaths || [])]);
+  const entryLabels = new Set((entry.labels || []).map((label) => label.toLowerCase()));
+  const termOverlap = [...candidateTerms].filter((term) => entryTerms.has(term)).length;
+  const pathOverlap = [...candidatePaths].filter((path) => entryPaths.has(path)).length;
+  const labelOverlap = [...candidateLabels].filter((label) => entryLabels.has(label)).length;
+  if (entry.contentHash && entry.contentHash === schedulerTaskContentHash(candidate)) score += 0.35;
+  if (pathOverlap) score += Math.min(0.35, 0.2 + pathOverlap * 0.08);
+  if (String(candidate.projectId || "") && (entry.projectIds || []).includes(String(candidate.projectId))) score += 0.12;
+  if (String(candidate.projectName || "") && (entry.projectNames || []).includes(String(candidate.projectName))) score += 0.08;
+  if (labelOverlap) score += Math.min(0.15, labelOverlap * 0.05);
+  if (termOverlap) score += Math.min(0.35, termOverlap / Math.max(8, candidateTerms.size || 1));
+  return score;
+}
+
+function learnedSchedulerDurationMinutes(entry) {
+  const duration = entry?.duration || {};
+  if (duration.samples && duration.average) return Math.round(duration.average);
+  return Math.round(Number(duration.last || 0));
+}
+
+function schedulerMemoryScoreAdjustment(entry) {
+  if (!entry) return 0;
+  const order = entry.order || {};
+  const outcomes = entry.outcomes || {};
+  let adjustment = 0;
+  if (order.samples && order.avgPosition) {
+    if (order.avgPosition <= 0.35) adjustment += 0.35;
+    else if (order.avgPosition >= 0.75) adjustment -= 0.2;
+  }
+  adjustment += Math.min(0.5, (order.promotedCount || outcomes.promoted || 0) * 0.14);
+  adjustment -= Math.min(0.5, (order.bumpedCount || outcomes.bumped || 0) * 0.14);
+  if (order.manualOrderCount) adjustment += 0.1;
+  if (entry.exact === false) adjustment *= 0.5;
+  return Math.max(-0.75, Math.min(0.75, adjustment));
+}
+
+function schedulerMemoryContextText(entry) {
+  if (!entry) return "";
+  return [
+    entry.title,
+    entry.parentContent,
+    ...(entry.labels || []),
+    ...(entry.contextTerms || []).slice(0, 12),
+    ...(entry.paths || []).slice(-3),
+    ...(entry.contextPaths || []).slice(-3)
+  ].filter(Boolean).join(" ");
+}
+
+function updateSchedulerMemoryEntry(entry, task, observation = {}) {
+  if (!entry || !task) return entry;
+  const timestamp = observation.observedAt || deviceTimestamp();
+  const paths = schedulerTaskPaths(task, observation);
+  const contextTerms = schedulerContextTokens(task);
+  const labels = cleanTodoistLabels(task.labels || []);
+  const priority = normalizePriority(task.priority);
+  entry.title = singleLine(task.content || task.title || entry.title || "");
+  entry.contentHash = schedulerTaskContentHash(task) || entry.contentHash || "";
+  entry.parentContent = singleLine(task.parentContent || entry.parentContent || "");
+  entry.isSubtask = Boolean(task.isSubtask || entry.isSubtask);
+  entry.ids = schedulerAppendUnique(entry.ids, [task.id], 8);
+  entry.oids = schedulerAppendUnique(entry.oids, [task.oid], 8);
+  entry.paths = schedulerAppendUnique(entry.paths, paths, SCHEDULER_MEMORY_MAX_CONTEXT_PATHS);
+  entry.projectIds = schedulerAppendUnique(entry.projectIds, [task.projectId], 8);
+  entry.projectNames = schedulerAppendUnique(entry.projectNames, [task.projectName], 8);
+  entry.sections = schedulerAppendUnique(entry.sections, [task.section], 8);
+  entry.labels = schedulerAppendUnique(entry.labels, labels, 16);
+  entry.contextPaths = schedulerAppendUnique(entry.contextPaths, observation.contextPaths || [], SCHEDULER_MEMORY_MAX_CONTEXT_PATHS);
+  entry.contextTerms = schedulerAppendUnique(entry.contextTerms, contextTerms, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS);
+  entry.priority = entry.priority || { last: 1, max: 1, samples: 0 };
+  entry.priority.last = priority;
+  entry.priority.max = Math.max(normalizePriority(entry.priority.max), priority);
+  entry.priority.samples = Math.min(1000, Number(entry.priority.samples || 0) + 1);
+  updateSchedulerDurationMemory(entry, observation);
+  updateSchedulerOrderMemory(entry, observation);
+  const outcome = singleLine(observation.outcome || "observed");
+  entry.outcomes = entry.outcomes || {};
+  entry.outcomes[outcome] = Math.min(1000, Number(entry.outcomes[outcome] || 0) + 1);
+  if (outcome === "scheduled") entry.order.scheduledCount = Math.min(1000, Number(entry.order.scheduledCount || 0) + 1);
+  if (outcome === "promoted") entry.order.promotedCount = Math.min(1000, Number(entry.order.promotedCount || 0) + 1);
+  if (outcome === "bumped") entry.order.bumpedCount = Math.min(1000, Number(entry.order.bumpedCount || 0) + 1);
+  entry.lastScheduledDate = observation.scheduledDate || entry.lastScheduledDate || "";
+  entry.lastScheduledDateTime = observation.scheduledDateTime || entry.lastScheduledDateTime || "";
+  entry.lastObservedAt = timestamp;
+  if (observation.source === "apply") entry.lastAppliedAt = timestamp;
+  entry.updatedAt = timestamp;
+  return entry;
+}
+
+function updateSchedulerDurationMemory(entry, observation = {}) {
+  const minutes = Math.round(Number(observation.durationMinutes || 0));
+  if (!minutes) return;
+  entry.duration = entry.duration || { last: 0, average: 0, samples: 0, source: "" };
+  const samples = Math.min(1000, Number(entry.duration.samples || 0) + 1);
+  const priorWeight = Math.min(9, Math.max(0, samples - 1));
+  entry.duration.average = Math.round(((Number(entry.duration.average || minutes) * priorWeight) + minutes) / (priorWeight + 1));
+  entry.duration.last = minutes;
+  entry.duration.samples = samples;
+  entry.duration.source = observation.source || entry.duration.source || "";
+  if (observation.manualDurationChange) {
+    entry.order = entry.order || {};
+    entry.order.manualDurationCount = Math.min(1000, Number(entry.order.manualDurationCount || 0) + 1);
+  }
+}
+
+function updateSchedulerOrderMemory(entry, observation = {}) {
+  const hasOrder = Number.isFinite(observation.orderIndex) && Number.isFinite(observation.orderTotal) && observation.orderTotal > 0;
+  entry.order = entry.order || {};
+  if (hasOrder) {
+    const position = Math.max(0, Math.min(1, (Number(observation.orderIndex) + 1) / Number(observation.orderTotal)));
+    const samples = Math.min(1000, Number(entry.order.samples || 0) + 1);
+    const priorWeight = Math.min(9, Math.max(0, samples - 1));
+    entry.order.avgPosition = ((Number(entry.order.avgPosition || position) * priorWeight) + position) / (priorWeight + 1);
+    entry.order.samples = samples;
+    entry.order.lastOrderIndex = Number(observation.orderIndex);
+    entry.order.lastOrderTotal = Number(observation.orderTotal);
+  }
+  if (Number.isFinite(observation.startMinutes)) entry.order.lastStartMinutes = Number(observation.startMinutes);
+  if (observation.manualOrderChange) entry.order.manualOrderCount = Math.min(1000, Number(entry.order.manualOrderCount || 0) + 1);
+}
+
+function schedulerAppendUnique(existing, incoming, limit) {
+  const values = [];
+  for (const value of [...(existing || []), ...(incoming || [])]) {
+    const text = String(value || "").trim();
+    if (!text) continue;
+    const existingIndex = values.indexOf(text);
+    if (existingIndex >= 0) values.splice(existingIndex, 1);
+    values.push(text);
+  }
+  return values.slice(-limit);
+}
+
+function scheduleTodayConfig(settings = DEFAULT_SETTINGS) {
+  const chunkMinutes = Math.round(clampNumber(settings.scheduleTodayMinBlockMinutes, DEFAULT_SETTINGS.scheduleTodayMinBlockMinutes || 30, 15, 480));
+  const durationStepMinutes = 15;
+  const startMinutes = parseClockMinutes(settings.scheduleTodayStartTime, 8 * 60);
+  const endMinutes = parseClockMinutes(settings.scheduleTodayEndTime, 16 * 60);
+  const safeEnd = endMinutes > startMinutes ? endMinutes : startMinutes + 8 * 60;
+  const lunchStartMinutes = parseClockMinutes(settings.scheduleTodayLunchStartTime, 12 * 60);
+  const lunchMinutes = roundToScheduleChunk(clampNumber(settings.scheduleTodayLunchMinutes, 0, 0, 240), { chunkMinutes }) || 0;
+  const minBlockMinutes = chunkMinutes;
+  const maxBlockMinutes = roundToScheduleChunk(clampNumber(settings.scheduleTodayMaxBlockMinutes, 180, minBlockMinutes, 8 * 60), { durationStepMinutes, chunkMinutes: durationStepMinutes }) || 180;
+  const todayDate = today();
+  return {
+    today: todayDate,
+    nextWorkday: nextWorkdayDate(todayDate),
+    startMinutes,
+    endMinutes: safeEnd,
+    lunchStartMinutes,
+    lunchEndMinutes: lunchStartMinutes + lunchMinutes,
+    lunchMinutes,
+    minBlockMinutes,
+    maxBlockMinutes,
+    chunkMinutes,
+    durationStepMinutes,
+    dueWindowDays: Math.max(0, parseInt(settings.scheduleTodayDueWindowDays, 10) || DEFAULT_SETTINGS.scheduleTodayDueWindowDays || 2),
+    excludedLabels: new Set(splitList(settings.scheduleTodayExcludedLabels).map(cleanLabel).map((label) => label.toLowerCase()).filter(Boolean)),
+    weights: scheduleTodayWeights(settings)
+  };
+}
+
+function scheduleTodayWeights(settings = DEFAULT_SETTINGS) {
+  return {
+    todoistPriority: scheduleWeightValue(settings.scheduleTodayWeightTodoistPriority),
+    deadlineProximity: scheduleWeightValue(settings.scheduleTodayWeightDeadlineProximity),
+    overdue: scheduleWeightValue(settings.scheduleTodayWeightOverdue),
+    dueDateProximity: scheduleWeightValue(settings.scheduleTodayWeightDueDateProximity),
+    semanticUrgency: scheduleWeightValue(settings.scheduleTodayWeightSemanticUrgency),
+    noteRecency: scheduleWeightValue(settings.scheduleTodayWeightNoteRecency),
+    parentDependency: scheduleWeightValue(settings.scheduleTodayWeightParentDependency)
+  };
+}
+
+function scheduleWeightValue(value) {
+  const text = String(value || "moderate").toLowerCase();
+  if (text === "less") return 0.65;
+  if (text === "more") return 1.35;
+  return 1;
+}
+
+function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = scheduleTodayConfig(settings), schedulerMemory = null) {
+  const cache = settings.taskCache || {};
+  const byId = new Map((tasks || []).map((task) => [task.id, task]));
+  const durationPolicies = schedulerMemoryDurationPolicies(schedulerMemory);
+  return (tasks || [])
+    .map((task) => {
+      const cached = cache[task.id] || {};
+      const labels = cleanTodoistLabels(task.labels || cached.labels || []);
+      const lowerLabels = new Set(labels.map((label) => label.toLowerCase()));
+      const dueDate = task.dueDate || cached.scheduledDueDateTime || cached.due_date || "";
+      const deadlineDate = task.deadlineDate || cached.deadline_date || "";
+      const dueDay = datePart(dueDate);
+      const dueDays = dueDay ? daysBetweenLocalDates(config.today, dueDay) : Number.POSITIVE_INFINITY;
+      const parent = task.parentId ? byId.get(task.parentId) || cache[task.parentId] || {} : {};
+      const path = cached.path || "";
+      const duration = normalizeTodoistDuration(task.duration || cached.duration);
+      const candidate = {
+        id: task.id,
+        content: task.content || cached.content || "",
+        description: task.description || cached.description || "",
+        labels,
+        priority: normalizePriority(task.priority || cached.priority),
+        dueDate,
+        dueDay,
+        deadlineDate,
+        deadlineDay: datePart(deadlineDate),
+        isSubtask: Boolean(task.parentId || cached.isSubtask),
+        parentId: task.parentId || cached.parentId || "",
+        parentOid: cached.parentOid || "",
+        parentContent: parent.content || cached.parentContent || "",
+        parentLineNumber: cached.parentLineNumber ?? null,
+        section: task.section || cached.section || "",
+        sectionId: task.sectionId || cached.sectionId || "",
+        projectId: task.projectId || cached.projectId || "",
+        projectName: task.projectName || cached.projectName || "",
+        path,
+        lineNumber: cached.lineNumber,
+        oid: cached.oid || "",
+        remoteDueDate: task.dueDate || "",
+        remoteDuration: duration,
+        durationMinutes: durationMinutes(duration),
+        durationSource: duration ? "Todoist duration" : "",
+        scheduledTimeFixed: isDateTimeString(dueDate),
+        independentSubtask: false,
+        searchText: [task.content, task.description, cached.description, parent.content || cached.parentContent, path].filter(Boolean).join("\n")
+      };
+      if (candidate.durationMinutes) {
+        const adjustedDuration = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes, config, durationPolicies);
+        if (adjustedDuration < candidate.durationMinutes) {
+          candidate.durationMinutes = adjustedDuration;
+          candidate.durationSource = `${candidate.durationSource || "Todoist duration"}; capped for follow-up`;
+        }
+      }
+      candidate.independentSubtask = scheduleIndependentSubtask(candidate, settings);
+      candidate.semanticUrgency = scheduleSemanticUrgency(candidate);
+      candidate.noteRecency = scheduleNoteRecency(cached);
+      candidate.parentDependency = candidate.isSubtask || candidate.parentId ? 1 : 0.4;
+      candidate.score = scheduleCandidateScore(candidate, config);
+      return { candidate, lowerLabels, dueDays };
+    })
+    .filter(({ candidate, lowerLabels, dueDays }) => {
+      if (!candidate.id || !candidate.content) return false;
+      if (!settings.scheduleTodayIncludeSubtasks && candidate.isSubtask) return false;
+      for (const label of lowerLabels) if (config.excludedLabels.has(label)) return false;
+      if (candidate.scheduledTimeFixed) return datePart(candidate.dueDate) === config.today;
+      if (!candidate.dueDay) return false;
+      if (dueDays < 0) return settings.scheduleTodayIncludeOverdue !== false;
+      return dueDays <= config.dueWindowDays;
+    })
+    .map(({ candidate }) => candidate);
+}
+
+function applySemanticContextToScheduleCandidates(candidates, context = [], config = scheduleTodayConfig(DEFAULT_SETTINGS)) {
+  let matches = 0;
+  for (const candidate of candidates || []) {
+    const semanticScore = scheduleSemanticContextScore(candidate, context);
+    candidate.semanticContextScore = semanticScore;
+    if (semanticScore > 0) {
+      matches += 1;
+      candidate.semanticUrgency = Math.max(Number(candidate.semanticUrgency || 0), semanticScore);
+    }
+    candidate.score = scheduleCandidateScore(candidate, config);
+  }
+  return matches;
+}
+
+function scheduleSemanticContextScore(candidate, context = []) {
+  if (!candidate || !Array.isArray(context) || !context.length) return 0;
+  const candidateTerms = termCounts([
+    candidate.content,
+    candidate.description,
+    candidate.parentContent,
+    candidate.projectName,
+    candidate.section,
+    candidate.path,
+    ...(candidate.labels || [])
+  ].filter(Boolean).join(" "));
+  const genericTerms = new Set(["project", "projects", "task", "tasks", "todoist", "note", "notes", "meeting", "meetings"]);
+  const terms = Object.keys(candidateTerms).filter((term) => term.length > 2 && !genericTerms.has(term));
+  if (!terms.length && !candidate.path) return 0;
+  let best = 0;
+  for (const chunk of context) {
+    const chunkText = `${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`;
+    const chunkCounts = termCounts(chunkText);
+    const overlap = terms.filter((term) => chunkCounts[term]).length;
+    const lexical = terms.length ? Math.min(1, overlap / Math.max(5, Math.min(terms.length, 18))) : 0;
+    const pathBoost = candidate.path && chunk.path && candidate.path === chunk.path ? 0.55 : 0;
+    const titleBoost = singleLine(candidate.content || "").toLowerCase() &&
+      singleLine(chunkText).toLowerCase().includes(singleLine(candidate.content || "").toLowerCase().slice(0, 48)) ? 0.25 : 0;
+    if (!pathBoost && !titleBoost && lexical <= 0.2) continue;
+    const matchScore = Math.max(0, Math.min(1, Number(chunk.matchScore || 0)));
+    const contextStrength = Math.max(pathBoost, Math.min(1, (matchScore * 0.45) + (lexical * 0.45) + titleBoost));
+    best = Math.max(best, contextStrength);
+  }
+  return Math.max(0, Math.min(1, Math.round(best * 1000) / 1000));
+}
+
+function scheduleCandidateScore(candidate, config) {
+  const weights = config.weights || {};
+  const dueDays = candidate.dueDay ? daysBetweenLocalDates(config.today, candidate.dueDay) : 99;
+  const deadlineDays = candidate.deadlineDay ? daysBetweenLocalDates(config.today, candidate.deadlineDay) : 99;
+  const priorityScore = (normalizePriority(candidate.priority) - 1) / 3;
+  const overdueScore = dueDays < 0 ? Math.min(1, Math.abs(dueDays) / 5 + 0.35) : 0;
+  const dueScore = dueDays <= 0 ? 1 : dueDays === 1 ? 0.75 : dueDays === 2 ? 0.5 : 0;
+  const deadlineScore = deadlineDays <= 0 ? 1 : deadlineDays === 1 ? 0.85 : deadlineDays === 2 ? 0.65 : deadlineDays <= 7 ? 0.35 : 0;
+  return (priorityScore * (weights.todoistPriority || 1) * 3) +
+    (deadlineScore * (weights.deadlineProximity || 1) * 3) +
+    (overdueScore * (weights.overdue || 1) * 3) +
+    (dueScore * (weights.dueDateProximity || 1) * 2.5) +
+    ((candidate.semanticUrgency || 0) * (weights.semanticUrgency || 1) * 1.6) +
+    ((candidate.noteRecency || 0) * (weights.noteRecency || 1) * 1.2) +
+    ((candidate.parentDependency || 0) * (weights.parentDependency || 1));
+}
+
+function sortScheduleCandidatesForPlanning(candidates, config = {}) {
+  const remaining = (candidates || []).slice();
+  const ordered = [];
+  while (remaining.length) {
+    const previous = ordered[ordered.length - 1] || null;
+    remaining.sort((a, b) => scheduleCandidatePlanningScore(b, previous, config) - scheduleCandidatePlanningScore(a, previous, config) ||
+      normalizePriority(b.priority) - normalizePriority(a.priority) ||
+      String(a.content || "").localeCompare(String(b.content || "")));
+    ordered.push(remaining.shift());
+  }
+  return ordered;
+}
+
+function scheduleCandidatePlanningScore(candidate, previous, config = {}) {
+  return Number(candidate?.score || 0) + scheduleRelatedGroupingBoost(previous, candidate, config);
+}
+
+function scheduleRelatedGroupingBoost(previous, candidate, config = {}) {
+  if (!previous || !candidate) return 0;
+  const policy = schedulerRelatedGroupingPolicy(config.durationPolicies);
+  if (!policy) return 0;
+  let score = 0;
+  if (String(previous.parentId || previous.id || "") && String(previous.parentId || previous.id || "") === String(candidate.parentId || candidate.id || "")) score += 1.2;
+  if (String(previous.parentContent || "") && String(previous.parentContent || "") === String(candidate.parentContent || "")) score += 0.8;
+  if (String(previous.projectId || "") && String(previous.projectId || "") === String(candidate.projectId || "")) score += 0.9;
+  if (String(previous.projectName || "") && String(previous.projectName || "") === String(candidate.projectName || "")) score += 0.7;
+  if (String(previous.sectionId || "") && String(previous.sectionId || "") === String(candidate.sectionId || "")) score += 0.45;
+  if (String(previous.path || "") && String(previous.path || "") === String(candidate.path || "")) score += 0.75;
+  const previousLabels = new Set(cleanTodoistLabels(previous.labels || []).map((label) => label.toLowerCase()));
+  const sharedLabels = cleanTodoistLabels(candidate.labels || []).filter((label) => previousLabels.has(label.toLowerCase()));
+  if (sharedLabels.length) score += Math.min(0.55, sharedLabels.length * 0.18);
+  const previousTerms = new Set(schedulerContextTokens(previous));
+  const sharedTerms = schedulerContextTokens(candidate).filter((term) => previousTerms.has(term));
+  if (sharedTerms.length) score += Math.min(0.5, sharedTerms.length * 0.08);
+  const maxBoost = Math.max(0, Number(policy.boost || 0.45));
+  return Math.min(maxBoost, score * 0.2);
+}
+
+function scheduleIndependentSubtask(candidate, settings = DEFAULT_SETTINGS) {
+  if (!candidate?.isSubtask) return false;
+  if (settings.scheduleTodayAllowIndependentSubtasks === false) return false;
+  const text = `${candidate.content || ""} ${candidate.description || ""} ${(candidate.labels || []).join(" ")}`.toLowerCase();
+  return /\b(review|follow[- ]?up|waiting|await|blocked|send|email|confirm|check|call|reply|feedback|approval)\b/.test(text);
+}
+
+function scheduleSemanticUrgency(candidate) {
+  const text = `${candidate.content || ""} ${candidate.description || ""} ${(candidate.labels || []).join(" ")}`.toLowerCase();
+  let score = 0;
+  if (/\burgent|asap|critical|important|priority|deadline|due|overdue\b/.test(text)) score += 0.55;
+  if (/\bfollow[- ]?up|send|review|complete|submit|prepare|schedule|confirm|decide|update\b/.test(text)) score += 0.35;
+  if (/\bwaiting|blocked|depend|risk|approval|feedback\b/.test(text)) score += 0.2;
+  return Math.min(1, score);
+}
+
+function scheduleNoteRecency(cached = {}) {
+  const time = Date.parse(cached.cachedAt || cached.rebuiltAt || "") || 0;
+  if (!time) return 0;
+  return Math.min(1, recencyBoost(time) / 0.12);
+}
+
+function planScheduleToday(candidates, config, settings = DEFAULT_SETTINGS) {
+  const scheduleCandidates = mergeDependentSubtasksForSchedule(candidates, config);
+  const fixed = [];
+  const scheduled = [];
+  const unscheduled = [];
+  const splitSubtasks = [];
+  const blocked = [];
+  if (config.lunchMinutes > 0) blocked.push({ startMinutes: config.lunchStartMinutes, endMinutes: config.lunchEndMinutes, type: "lunch" });
+  for (const candidate of scheduleCandidates) {
+    if (!candidate.scheduledTimeFixed || datePart(candidate.dueDate) !== config.today) continue;
+    const start = minutesFromDateTime(candidate.dueDate);
+    const duration = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes || fallbackScheduleDuration(candidate, config), config);
+    const item = schedulePreviewItem(candidate, start, duration, config, { fixed: true });
+    fixed.push(item);
+    blocked.push({ startMinutes: start, endMinutes: start + duration, type: "fixed", id: candidate.id });
+  }
+  const movable = sortScheduleCandidatesForPlanning(scheduleCandidates.filter((candidate) => !candidate.scheduledTimeFixed), config);
+  for (const candidate of movable) {
+    let duration = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes || fallbackScheduleDuration(candidate, config), config);
+    let remainder = 0;
+    if (duration > config.maxBlockMinutes) {
+      remainder = duration - config.maxBlockMinutes;
+      duration = config.maxBlockMinutes;
+    }
+    const start = findOpenScheduleSlot(blocked, duration, config);
+    if (start == null) {
+      unscheduled.push(scheduleUnscheduledItem(candidate, duration + remainder, "No open block today", config));
+      continue;
+    }
+    const item = schedulePreviewItem(candidate, start, duration, config);
+    scheduled.push(item);
+    blocked.push({ startMinutes: start, endMinutes: start + duration, type: "scheduled", id: candidate.id });
+    if (remainder > 0) splitSubtasks.push(scheduleContinuationSubtask(candidate, remainder, config, settings));
+  }
+  const preview = {
+    config,
+    fixed: fixed.sort((a, b) => a.startMinutes - b.startMinutes),
+    scheduled: scheduled.sort((a, b) => a.startMinutes - b.startMinutes),
+    unscheduled,
+    suggestions: [],
+    bumped: [],
+    splitSubtasks,
+    message: ""
+  };
+  refreshScheduleSuggestions(preview);
+  return preview;
+}
+
+function mergeDependentSubtasksForSchedule(candidates, config) {
+  const byId = new Map((candidates || []).map((candidate) => [String(candidate.id || ""), candidate]));
+  const dependentMinutes = new Map();
+  const dependentTitles = new Map();
+  const filtered = [];
+  for (const candidate of candidates || []) {
+    const parentId = String(candidate.parentId || "");
+    if (candidate.isSubtask && parentId && !candidate.independentSubtask && byId.has(parentId)) {
+      const minutes = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes || fallbackScheduleDuration(candidate, config), config);
+      dependentMinutes.set(parentId, (dependentMinutes.get(parentId) || 0) + minutes);
+      const titles = dependentTitles.get(parentId) || [];
+      titles.push(candidate.content || "subtask");
+      dependentTitles.set(parentId, titles);
+      continue;
+    }
+    filtered.push(candidate);
+  }
+  return filtered.map((candidate) => {
+    const extra = dependentMinutes.get(candidate.id) || 0;
+    if (!extra) return candidate;
+    return Object.assign({}, candidate, {
+      durationMinutes: scheduleDurationWithLocalPolicy(candidate, (candidate.durationMinutes || fallbackScheduleDuration(candidate, config)) + extra, config),
+      dependentSubtasks: dependentTitles.get(candidate.id) || []
+    });
+  });
+}
+
+function schedulePreviewItem(candidate, startMinutes, durationMinutesValue, config, extra = {}) {
+  const duration = scheduleDurationWithLocalPolicy(candidate, durationMinutesValue, config) || config.minBlockMinutes;
+  return Object.assign({}, candidate, extra, {
+    startMinutes,
+    originalStartMinutes: candidate.originalStartMinutes ?? startMinutes,
+    durationMinutes: duration,
+    originalDurationMinutes: candidate.originalDurationMinutes || duration,
+    scheduledDateTime: localDateTimeString(config.today, startMinutes),
+    endMinutes: startMinutes + duration,
+    overlapsLunch: rangesOverlap(startMinutes, startMinutes + duration, config.lunchStartMinutes, config.lunchEndMinutes)
+  });
+}
+
+function scheduleUnscheduledItem(candidate, durationMinutesValue, reason, config, extra = {}) {
+  const duration = scheduleDurationWithLocalPolicy(candidate, durationMinutesValue, config) || config.minBlockMinutes;
+  const scheduleBlockMinutes = Math.min(duration, config.maxBlockMinutes || duration);
+  return Object.assign({}, candidate, extra, {
+    durationMinutes: duration,
+    scheduleBlockMinutes,
+    reason,
+    rationale: unscheduledRationale(candidate, reason, duration, config)
+  });
+}
+
+function refreshScheduleSuggestions(preview) {
+  if (!preview) return [];
+  const config = preview.config || {};
+  const scheduledIds = new Set([...(preview.fixed || []), ...(preview.scheduled || [])].map((item) => String(item.id || "")).filter(Boolean));
+  const suggestions = (preview.unscheduled || [])
+    .filter((item) => item?.id && !item.wasBumped && !scheduledIds.has(String(item.id)))
+    .map((item) => {
+      const swap = bestScheduleSwapCandidate(item, preview, config);
+      if (!swap) return null;
+      return Object.assign({}, item, {
+        swapCandidateId: swap.id,
+        swapCandidateTitle: swap.content || "",
+        rationale: suggestionRationale(item, swap, config)
+      });
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score || normalizePriority(b.priority) - normalizePriority(a.priority) || String(a.content).localeCompare(String(b.content)))
+    .slice(0, SCHEDULE_PREVIEW_SUGGESTION_LIMIT);
+  preview.suggestions = suggestions;
+  return suggestions;
+}
+
+function bestScheduleSwapCandidate(suggestion, preview, config = {}) {
+  const scheduled = (preview?.scheduled || []).filter((item) => item?.id && !item.fixed);
+  const swapDuration = suggestionScheduleBlockMinutes(suggestion, config);
+  if (!scheduled.length || !swapDuration) return null;
+  const blocksWithout = (candidateId) => scheduleBlocksForPreview(preview, config, { excludeId: candidateId });
+  const scored = scheduled.map((item) => {
+    const canFit = findOpenScheduleSlot(blocksWithout(item.id), swapDuration, config) != null;
+    const durationFit = Number(item.durationMinutes || 0) >= swapDuration;
+    const scoreDelta = Number(suggestion.score || 0) - Number(item.score || 0);
+    return { item, canFit, durationFit, scoreDelta };
+  }).filter((entry) => entry.canFit);
+  if (!scored.length) return null;
+  scored.sort((a, b) => {
+    if (a.scoreDelta >= 0 !== b.scoreDelta >= 0) return a.scoreDelta >= 0 ? -1 : 1;
+    if (a.durationFit !== b.durationFit) return a.durationFit ? -1 : 1;
+    return (a.item.score || 0) - (b.item.score || 0) || (b.item.startMinutes || 0) - (a.item.startMinutes || 0);
+  });
+  return scored[0]?.item || null;
+}
+
+function scheduleBlocksForPreview(preview, config = {}, options = {}) {
+  const excludeId = String(options.excludeId || "");
+  const blocks = [];
+  if (config.lunchMinutes > 0) blocks.push({ startMinutes: config.lunchStartMinutes, endMinutes: config.lunchEndMinutes, type: "lunch" });
+  for (const item of [...(preview?.fixed || []), ...(preview?.scheduled || [])]) {
+    if (!item?.id || String(item.id) === excludeId) continue;
+    if (!Number.isFinite(item.startMinutes) || !Number.isFinite(item.endMinutes)) continue;
+    blocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: item.fixed ? "fixed" : "scheduled" });
+  }
+  return blocks;
+}
+
+function unscheduledRationale(candidate, reason, duration, config) {
+  const parts = [];
+  if (reason) parts.push(reason);
+  if (duration) parts.push(`needs ${duration} min`);
+  if (candidate?.dueDay) {
+    const dueDays = daysBetweenLocalDates(config.today, candidate.dueDay);
+    if (dueDays < 0) parts.push(`${Math.abs(dueDays)}d overdue`);
+    else if (dueDays === 0) parts.push("due today");
+    else parts.push(`due in ${dueDays}d`);
+  }
+  if (normalizePriority(candidate?.priority) >= 4) parts.push("P4");
+  return parts.slice(0, 3).join("; ");
+}
+
+function suggestionRationale(item, swap, config) {
+  const base = unscheduledRationale(item, item.reason || "Not enough open time", item.durationMinutes, config);
+  const block = suggestionScheduleBlockMinutes(item, config);
+  const continuation = item.durationMinutes > block ? ` ${item.durationMinutes - block} min continues next workday.` : "";
+  return `${base}. Swap would move out ${shortTitle(swap.content || "scheduled task", 28)}.${continuation}`;
+}
+
+function suggestionScheduleBlockMinutes(item, config = {}) {
+  const duration = roundToScheduleChunk(item?.scheduleBlockMinutes || item?.durationMinutes || 0, config);
+  if (!duration) return 0;
+  return Math.max(config.minBlockMinutes || duration, Math.min(duration, config.maxBlockMinutes || duration));
+}
+
+function scheduleContinuationSubtask(candidate, remainderMinutes, config, settings = DEFAULT_SETTINGS) {
+  const duration = Math.max(config.minBlockMinutes || 0, Math.min(roundToScheduleChunk(remainderMinutes, config) || config.minBlockMinutes, config.maxBlockMinutes));
+  const parentId = candidate.isSubtask ? candidate.parentId || candidate.id : candidate.id;
+  const parentOid = candidate.isSubtask ? candidate.parentOid || "" : candidate.oid || "";
+  const title = singleLine(candidate.splitTitle || scheduleContinuationTitle(candidate));
+  return {
+    content: truncateAtWord(title, 220),
+    parentId,
+    parentOid,
+    parentContent: candidate.isSubtask ? candidate.parentContent : candidate.content,
+    parentLineNumber: candidate.isSubtask ? candidate.parentLineNumber : candidate.lineNumber,
+    path: candidate.path || "",
+    labels: settings.subtaskIncludeLabels ? candidate.labels || [] : [],
+    priority: settings.subtaskIncludePriority ? normalizePriority(candidate.priority) : 1,
+    durationMinutes: duration,
+    scheduledDateTime: localDateTimeString(config.nextWorkday, config.startMinutes),
+    sourceTaskId: candidate.id || "",
+    due_date: config.nextWorkday,
+    deadline_date: null,
+    projectId: candidate.projectId || "",
+    projectName: candidate.projectName || "",
+    section: "",
+    sectionId: "",
+    isSubtask: true
+  };
+}
+
+function findOpenScheduleSlot(blocked, durationMinutesValue, config) {
+  const duration = roundToScheduleChunk(durationMinutesValue, config);
+  for (let start = config.startMinutes; start + duration <= config.endMinutes; start += config.chunkMinutes) {
+    const end = start + duration;
+    if (rangesOverlap(start, end, config.lunchStartMinutes, config.lunchEndMinutes)) continue;
+    if ((blocked || []).some((block) => rangesOverlap(start, end, block.startMinutes, block.endMinutes))) continue;
+    return start;
+  }
+  return null;
+}
+
+function findNearestOpenScheduleSlot(blocked, durationMinutesValue, config, preferredStartMinutes = config.startMinutes) {
+  const duration = roundToScheduleChunk(durationMinutesValue, config);
+  if (!duration) return null;
+  const minStart = config.startMinutes;
+  const maxStart = config.endMinutes - duration;
+  const preferred = Math.max(minStart, Math.min(maxStart, Number(preferredStartMinutes) || minStart));
+  const candidates = [];
+  for (let start = minStart; start <= maxStart; start += config.chunkMinutes) candidates.push(start);
+  candidates.sort((a, b) => Math.abs(a - preferred) - Math.abs(b - preferred) || a - b);
+  for (const start of candidates) {
+    const end = start + duration;
+    if (rangesOverlap(start, end, config.lunchStartMinutes, config.lunchEndMinutes)) continue;
+    if ((blocked || []).some((block) => rangesOverlap(start, end, block.startMinutes, block.endMinutes))) continue;
+    return start;
+  }
+  return null;
+}
+
+function emptyScheduleTodayPreview(config, message = "") {
+  return { config, fixed: [], scheduled: [], unscheduled: [], suggestions: [], bumped: [], splitSubtasks: [], message };
+}
+
+function fallbackScheduleDuration(candidate, config, policies = null) {
+  const durationPolicies = policies || config.durationPolicies;
+  const text = `${candidate.content || ""} ${candidate.description || ""}`.toLowerCase();
+  let minutes = schedulerDefaultFocusMinutes(config, durationPolicies);
+  if (isPeopleCoordinationScheduleTask(candidate, durationPolicies)) {
+    minutes = schedulerDurationPolicyMaxMinutes(schedulerPeopleFollowupPolicy(durationPolicies), config);
+    return scheduleDurationWithLocalPolicy(candidate, minutes, config, durationPolicies);
+  }
+  if (/\breview|draft|prepare|analy[sz]e|write|document|proposal|report|presentation\b/.test(text)) minutes = Math.max(minutes, 90);
+  if (/\bmeeting|call|follow[- ]?up|email|send|confirm|check\b/.test(text)) minutes = Math.max(minutes, 30);
+  if (/\bcomplex|strategy|plan|protocol|grant|manuscript|reviewer|committee\b/.test(text)) minutes = Math.max(minutes, 120);
+  return scheduleDurationWithLocalPolicy(candidate, minutes, config, durationPolicies);
+}
+
+function scheduleDurationWithLocalPolicy(candidate, minutes, config, policies = null) {
+  const durationPolicies = policies || config.durationPolicies;
+  const rounded = Math.max(config.minBlockMinutes || 0, roundToScheduleChunk(minutes, config) || config.minBlockMinutes || 0);
+  const policy = schedulerPeopleFollowupPolicy(durationPolicies);
+  if (!policy || !isPeopleCoordinationScheduleTask(candidate, durationPolicies)) return rounded;
+  return Math.min(rounded, roundToScheduleChunk(schedulerDurationPolicyMaxMinutes(policy, config), config) || config.minBlockMinutes || 30);
+}
+
+function isPeopleCoordinationScheduleTask(candidate, policies = null) {
+  if (!schedulerPeopleFollowupPolicy(policies)) return false;
+  const text = `${candidate?.content || ""} ${candidate?.description || ""}`.toLowerCase();
+  if (!text.trim()) return false;
+  const action = /\b(discuss(?:ing|ion)?(?:\b|.*?\bwith\b)|meet with|meeting with|touch base(?: with)?|check[- ]?in(?: with)?|follow[- ]?up(?: with)?|call|email|ask|confirm with|coordinate with|schedule (?:a |the )?(?:meeting|call)|book (?:a |the )?(?:meeting|call)|arrange (?:a |the )?(?:meeting|call))\b/.test(text);
+  if (!action) return false;
+  const work = /^(?:review|draft|prepare|analy[sz]e|write|document|finali[sz]e|build|create)\b|\b(?:to|and)\s+(?:review|draft|prepare|analy[sz]e|write|document|finali[sz]e|build|create)\b/.test(text);
+  return !work;
+}
+
+function scheduleContinuationTitle(candidate) {
+  return `Continue: ${singleLine(candidate.content || "task")}`;
+}
+
+function normalizeTodoistDuration(duration) {
+  if (!duration) return null;
+  const amount = Number(duration.amount || duration.duration || 0);
+  const unit = String(duration.unit || duration.duration_unit || "minute");
+  if (!amount || amount < 1) return null;
+  return { amount: Math.round(amount), unit: unit === "day" ? "day" : "minute" };
+}
+
+function durationMinutes(duration) {
+  const normalized = normalizeTodoistDuration(duration);
+  if (!normalized) return 0;
+  return normalized.unit === "day" ? normalized.amount * 8 * 60 : normalized.amount;
+}
+
+function roundToScheduleChunk(minutes, config = {}) {
+  const chunk = scheduleDurationStepMinutes(config);
+  const value = Number(minutes || 0);
+  if (!value) return 0;
+  return Math.max(chunk, Math.ceil(value / chunk) * chunk);
+}
+
+function scheduleDurationStepMinutes(config = {}) {
+  return Math.max(1, Math.round(Number(config.durationStepMinutes || config.chunkMinutes || 15)));
+}
+
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value);
+  return Math.max(min, Math.min(max, Number.isFinite(number) ? number : fallback));
+}
+
+function parseClockMinutes(value, fallback) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(value || "").trim());
+  if (!match) return fallback;
+  const hours = Math.max(0, Math.min(23, Number(match[1])));
+  const minutes = Math.max(0, Math.min(59, Number(match[2])));
+  return hours * 60 + minutes;
+}
+
+function minutesToClock(minutes) {
+  const safe = Math.max(0, Math.min(24 * 60 - 1, Math.round(Number(minutes || 0))));
+  return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+}
+
+function localDateTimeString(date, minutes) {
+  return `${date}T${minutesToClock(minutes)}:00`;
+}
+
+function isDateTimeString(value) {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(String(value || ""));
+}
+
+function datePart(value) {
+  return (/^\d{4}-\d{2}-\d{2}/.exec(String(value || "")) || [])[0] || "";
+}
+
+function minutesFromDateTime(value) {
+  const match = /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/.exec(String(value || ""));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
+}
+
+function daysBetweenLocalDates(startDate, endDate) {
+  const start = parseLocalDate(startDate);
+  const end = parseLocalDate(endDate);
+  if (!start || !end) return 0;
+  return Math.round((end - start) / 86400000);
+}
+
+function parseLocalDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return null;
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function formatLocalDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function nextWorkdayDate(dateText) {
+  const date = parseLocalDate(dateText) || new Date();
+  do {
+    date.setDate(date.getDate() + 1);
+  } while (date.getDay() === 0 || date.getDay() === 6);
+  return formatLocalDate(date);
+}
+
+function rangesOverlap(start, end, otherStart, otherEnd) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(otherStart) || !Number.isFinite(otherEnd)) return false;
+  if (otherEnd <= otherStart) return false;
+  return start < otherEnd && end > otherStart;
+}
+
+function setScheduleMarker(line, scheduledDateTime, minutes, options = {}) {
+  const cleaned = String(line || "").replace(/\s*%%\[sched::\s*[^\]]*?\]%%/g, "").trimEnd();
+  if ((!scheduledDateTime || !minutes) && options.removeIfEmpty) return cleaned;
+  if (!scheduledDateTime || !minutes) return cleaned;
+  const marker = ` %%[sched:: ${scheduledDateTime}; dur:: ${Math.max(0, Math.round(minutes))}]%%`;
+  const oidIndex = cleaned.search(/\s%%\[oid::/);
+  if (oidIndex >= 0) return `${cleaned.slice(0, oidIndex)}${marker}${cleaned.slice(oidIndex)}`;
+  return `${cleaned}${marker}`;
+}
+
 function cleanTask(task, allowedLabels = null, settings = DEFAULT_SETTINGS) {
   return cleanTaskWithRole(task, allowedLabels, false, settings);
 }
@@ -6122,6 +8689,7 @@ function allActiveWorkflowStatusItems(plugin) {
   const indexCount = plugin.pendingIndexPaths?.size || 0;
   const items = [];
   if (plugin.aiActivity) items.push({ label: "AI", value: plugin.aiActivity });
+  if (plugin.schedulerInProgress) items.push({ label: "Scheduler", value: "Planning" });
   if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: "Processing" });
   if (plugin.syncInProgress || fileSyncCount) items.push({ label: "Notes", value: `Syncing${fileSyncCount ? ` (${fileSyncCount})` : ""}` });
   else if (plugin.noteSyncTimer) items.push({ label: "Notes", value: "Sync queued" });
@@ -6280,6 +8848,7 @@ function taskPriorityForTodoist(task, settings = DEFAULT_SETTINGS) {
 
 function taskDueDateForTodoist(task, settings = DEFAULT_SETTINGS) {
   if (!subtaskFieldEnabled(task, settings, "subtaskIncludeDueDate")) return null;
+  if (task?.scheduledDueDateTime && (!task?.due_date || datePart(task.scheduledDueDateTime) === task.due_date)) return task.scheduledDueDateTime;
   return task?.due_date || null;
 }
 
@@ -6314,13 +8883,16 @@ function todoistTaskToParsedTask(remote, base = {}, settings = DEFAULT_SETTINGS)
   const isSubtask = todoistRemoteIsSubtask(remote, base);
   const remoteTask = Object.assign({}, remote, { isSubtask });
   const projectId = String(remote.projectId || remote.project_id || base.projectId || "");
+  const remoteDue = todoistRemoteDueDate(remote, base);
   return Object.assign({}, base, {
     id: String(remote.id || base.id || ""),
     content: remote.content || base.content || "",
     labels: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeLabels") ? cleanTodoistLabels(remote.labels || base.labels || []) : [],
     priority: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludePriority") ? normalizePriority(remote.priority || base.priority) : 1,
-    due_date: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeDueDate") ? todoistRemoteDueDate(remote, base) : null,
+    due_date: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeDueDate") ? (remoteDue ? datePart(remoteDue) : null) : null,
     deadline_date: subtaskFieldEnabled(remoteTask, settings, "subtaskIncludeDeadline") ? todoistRemoteDeadlineDate(remote, base) : null,
+    scheduledDueDateTime: isDateTimeString(remoteDue) ? remoteDue : base.scheduledDueDateTime || "",
+    duration: normalizeTodoistDuration(remote.duration || base.duration),
     description: todoistRemoteDescription(remote, base),
     isCompleted: todoistRemoteCompletion(remote, base),
     isSubtask,
@@ -6346,6 +8918,8 @@ function referenceCacheEntry(id, task, settings = DEFAULT_SETTINGS, previous = n
     priority: normalizePriority(task.priority),
     due_date: task.due_date || null,
     deadline_date: task.deadline_date || null,
+    scheduledDueDateTime: task.scheduledDueDateTime || "",
+    duration: normalizeTodoistDuration(task.duration),
     isCompleted: Boolean(task.isCompleted),
     isSubtask: Boolean(task.isSubtask),
     parentId: task.parentId || previous?.parentId || "",
@@ -6453,7 +9027,7 @@ function parsedTaskToLine(task, settings, id) {
   const project = !task.isSubtask && task.projectName ? ` ${projectMarker(task.projectName)}` : "";
   const link = oid ? ` ${oidLink(oid, id, settings)}` : "";
   const core = `- [${task.isCompleted ? "x" : " "}] ${singleLine(task.content)} ${tag}${labels ? ` ${labels}` : ""}${priority}`;
-  return `${core}${section}${project}${deadline}${due}${link}`;
+  return setScheduleMarker(`${core}${section}${project}${deadline}${due}${link}`, task.scheduledDueDateTime, durationMinutes(task.duration), { removeIfEmpty: true });
 }
 
 function preserveTaskIndent(originalLine, newLine) {
@@ -6663,6 +9237,7 @@ function taskSyntaxMarkerIndexes(body, settings) {
     body.search(/\s!![1-4]\b/),
     body.search(/\s\/\/\/[\w/-]+/),
     body.search(/\s%%\[p::/),
+    body.search(/\s%%\[sched::/),
     body.search(/\s\{\{\d{4}-\d{2}-\d{2}\}\}/),
     body.search(/\s(?:📅|📆|🗓️|🗓|@)\s*\d{2,4}-\d{1,2}-\d{1,2}/),
     body.search(/\s%%\[oid::/)
@@ -6675,6 +9250,8 @@ function parsedTaskSignature(task) {
     labels: (task.labels || []).map(cleanLabel).sort(),
     priority: normalizePriority(task.priority),
     due_date: task.due_date || null,
+    scheduledDueDateTime: task.scheduledDueDateTime || "",
+    durationMinutes: durationMinutes(task.duration),
     deadline_date: task.deadline_date || null,
     description: singleLine(task.description || ""),
     isCompleted: Boolean(task.isCompleted),
@@ -6699,6 +9276,9 @@ function todoistUpdatePayload(task, remote = null, settings = DEFAULT_SETTINGS) 
   if (localDescription && (!remote || String(remote.description || "").trim() !== localDescription.trim())) updates.description = localDescription;
   const dueDate = taskDueDateForTodoist(task, settings);
   if (dueDate && (!remote || (remote.dueDate || remote.due?.date || "") !== dueDate)) updates.due_date = dueDate;
+  const localDuration = normalizeTodoistDuration(task.duration);
+  const remoteDuration = normalizeTodoistDuration(remote?.duration);
+  if (localDuration?.amount && (!remoteDuration || remoteDuration.amount !== localDuration.amount || remoteDuration.unit !== localDuration.unit)) updates.duration = localDuration;
   const deadlineDate = taskDeadlineForTodoist(task, settings);
   if (deadlineDate && (!remote || (remote.deadlineDate || remote.deadline?.date || "") !== deadlineDate)) updates.deadline_date = deadlineDate;
   return updates;
@@ -6749,6 +9329,7 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
   const id = getTodoistId(line, settings);
   const isSubtask = hasSubtaskSyncMarker(normalizedLine, settings);
   const parentReference = parentReferenceForLine(lineNumber, allLines, settings, isSubtask);
+  const scheduleMarker = extractScheduleMarker(line);
   const labels = (line.match(/#[\w/-]+/g) || []).map((label) => label.slice(1)).filter((label) => {
     if (!settings.excludeSyncTagsFromLabels) return true;
     return !isSyncMarkerLabel(label, settings);
@@ -6773,6 +9354,8 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
     priority: extractPriority(line),
     due_date: extractDueDate(line),
     deadline_date: extractDeadline(line),
+    scheduledDueDateTime: scheduleMarker.scheduledDueDateTime,
+    duration: scheduleMarker.duration,
     section: extractSection(line),
     projectName: extractProjectName(line),
     description: obsidianDescription(path)
@@ -6781,6 +9364,7 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
 
 function parseTaskReferenceLine(line, lineNumber, path, settings) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return null;
+  const scheduleMarker = extractScheduleMarker(line);
   const labels = (line.match(/#[\w/-]+/g) || []).map((label) => label.slice(1)).filter((label) => {
     if (!settings.excludeSyncTagsFromLabels) return true;
     return !isSyncMarkerLabel(label, settings);
@@ -6805,6 +9389,8 @@ function parseTaskReferenceLine(line, lineNumber, path, settings) {
     priority: extractPriority(line),
     due_date: extractDueDate(line),
     deadline_date: extractDeadline(line),
+    scheduledDueDateTime: scheduleMarker.scheduledDueDateTime,
+    duration: scheduleMarker.duration,
     section: extractSection(line),
     projectName: extractProjectName(line),
     description: obsidianDescription(path)
@@ -7019,6 +9605,17 @@ function extractDueDate(line) {
 function extractDeadline(line) {
   const match = /\{\{(\d{2,4}-\d{1,2}-\d{1,2})\}\}?/.exec(line);
   return match ? normalizeDate(match[1]) : null;
+}
+
+function extractScheduleMarker(line) {
+  const match = /%%\[sched::\s*([^;\]]+?)(?:\s*;\s*dur::\s*(\d+))?\s*\]%%/.exec(String(line || ""));
+  if (!match) return { scheduledDueDateTime: "", duration: null };
+  const scheduledDueDateTime = isDateTimeString(match[1]) ? match[1].trim() : "";
+  const minutes = Number(match[2] || 0);
+  return {
+    scheduledDueDateTime,
+    duration: minutes > 0 ? { amount: Math.round(minutes), unit: "minute" } : null
+  };
 }
 
 function extractSection(line) {
@@ -7967,6 +10564,8 @@ function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childT
   if (task?.parentContent) parts.push(`parent: ${singleLine(task.parentContent)}`);
   if (childText && !task?.isSubtask) parts.push(`subtasks: ${truncateAtWord(childText, 180)}`);
   if (task?.due_date) parts.push(`due: ${task.due_date}`);
+  if (task?.scheduledDueDateTime) parts.push(`scheduled: ${task.scheduledDueDateTime}`);
+  if (durationMinutes(task?.duration)) parts.push(`duration: ${durationMinutes(task.duration)} minutes`);
   if (task?.deadline_date) parts.push(`deadline: ${task.deadline_date}`);
   if (task?.priority) parts.push(`priority: ${normalizePriority(task.priority)}`);
   if (task?.labels?.length) parts.push(`labels: ${task.labels.map((label) => `#${cleanLabel(label)}`).join(" ")}`);
@@ -8450,12 +11049,55 @@ function usesGeminiEmbeddingModel(value) {
 function usesOpenAIEmbeddingModel(value) {
   return !usesGeminiEmbeddingModel(value);
 }
+function isDeprecatedGeminiChatModel(value) {
+  const model = normalizeGeminiModelId(value).toLowerCase();
+  return model === "gemini-2.0-flash";
+}
+function isUsableGeminiChatModel(value) {
+  const model = normalizeGeminiModelId(value);
+  return /^gemini-/i.test(model) && !/embedding|image|tts|computer-use/i.test(model) && !isDeprecatedGeminiChatModel(model);
+}
+function rankGeminiFallbackModels(models = []) {
+  const list = uniqueValues((models || []).map(normalizeGeminiModelId).filter(isUsableGeminiChatModel));
+  const score = (model) => {
+    const value = normalizeGeminiModelId(model).toLowerCase();
+    if (value === "gemini-3.1-flash-lite") return 0;
+    if (/^gemini-3\.\d+-flash-lite$/.test(value)) return 1;
+    if (/^gemini-3\.\d+-flash$/.test(value)) return 2;
+    if (/^gemini-2\.5-flash$/.test(value)) return 3;
+    if (/^gemini-2\.5-flash-lite$/.test(value)) return 3;
+    if (/^gemini-3-flash/.test(value)) return 4;
+    if (/flash/.test(value)) return 5;
+    if (/pro/.test(value)) return 6;
+    return 7;
+  };
+  return list.sort((a, b) => score(a) - score(b) || a.localeCompare(b));
+}
+function rankGeminiPrimaryModels(models = []) {
+  const list = uniqueValues((models || []).map(normalizeGeminiModelId).filter(isUsableGeminiChatModel));
+  const score = (model) => {
+    const value = normalizeGeminiModelId(model).toLowerCase();
+    if (value === "gemini-3.5-flash") return 0;
+    if (/^gemini-3\.\d+-flash$/.test(value)) return 1;
+    if (value === "gemini-3.1-flash-lite") return 2;
+    if (/^gemini-3\.\d+-flash-lite$/.test(value)) return 3;
+    if (/^gemini-2\.5-flash$/.test(value)) return 4;
+    if (/^gemini-2\.5-flash-lite$/.test(value)) return 5;
+    if (/flash/.test(value)) return 6;
+    if (/pro/.test(value)) return 7;
+    return 8;
+  };
+  return list.sort((a, b) => score(a) - score(b) || a.localeCompare(b));
+}
 function aiModelOptions(settings, key, listKey) {
   const options = [];
   if (key === "chatModel") {
     for (const model of settings.availableChatModels || []) options.push({ value: model, label: `OpenAI: ${model}` });
     const geminiModels = settings.availableGeminiModels?.length ? settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
-    for (const model of geminiModels) options.push({ value: `gemini/${normalizeGeminiModelId(model)}`, label: `Gemini: ${normalizeGeminiModelId(model)}` });
+    for (const model of rankGeminiPrimaryModels(geminiModels)) {
+      const id = normalizeGeminiModelId(model);
+      if (isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
+    }
     return uniqueModelOptions(options);
   }
   if (key === "embeddingModel") {
@@ -8600,8 +11242,8 @@ function modelDisplayName(value) {
 }
 function isTransientAiModelError(error) {
   const message = String(error?.message || error || "");
-  return /\b(429|500|502|503|504)\b/.test(message) ||
-    /overload|too much demand|temporarily unavailable|unavailable|rate limit|rate-limit|capacity|try again|deadline exceeded/i.test(message);
+  return /\b(404|429|500|502|503|504)\b/.test(message) ||
+    /overload|too much demand|temporarily unavailable|unavailable|not found|no longer available|rate limit|rate-limit|capacity|try again|deadline exceeded/i.test(message);
 }
 function geminiEmbeddingInput(text, role = "document", model = "") {
   const value = String(text || "").trim();
@@ -8798,6 +11440,7 @@ function normalizeTodoistTask(task) {
     priority: normalizePriority(task.priority),
     dueDate: task.due?.date || task.due_date || "",
     deadlineDate: task.deadline?.date || task.deadline_date || "",
+    duration: normalizeTodoistDuration(task.duration),
     isCompleted: Boolean(task.is_completed || task.checked || task.completed)
   };
 }
@@ -8813,7 +11456,7 @@ function findExistingTodoistTaskMatch(parsed, existingTasks, parentId = "") {
     if (parentId && task.parentId && task.parentId !== parentId) return false;
     if (parsed.isSubtask && parentId && task.parentId !== parentId) return false;
     if (projectName && task.projectName && singleLine(task.projectName).toLowerCase() !== projectName) return false;
-    if (due && task.dueDate && task.dueDate !== due) return false;
+    if (due && task.dueDate && datePart(task.dueDate) !== due) return false;
     if (deadline && task.deadlineDate && task.deadlineDate !== deadline) return false;
     return true;
   });
@@ -8828,7 +11471,7 @@ function existingTodoistTaskMatchScore(task, parsed, parentId) {
   if (parsed.section && task.section && singleLine(parsed.section).toLowerCase() === singleLine(task.section).toLowerCase()) score += 4;
   if (!parsed.isSubtask && parsed.section && task.sectionId) score += 4;
   if (!parsed.isSubtask && !task.parentId) score += 2;
-  if (parsed.due_date && task.dueDate === parsed.due_date) score += 1;
+  if (parsed.due_date && datePart(task.dueDate) === parsed.due_date) score += 1;
   if (parsed.deadline_date && task.deadlineDate === parsed.deadline_date) score += 1;
   return score;
 }

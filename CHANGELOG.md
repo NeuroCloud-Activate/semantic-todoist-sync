@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.10
+
+- Improved dark-mode sidebar chat links so embedded note and task links are easier to read while still standing apart from normal response text.
+- Updated relevant-note chips to show up to four notes in a compact two-column layout that adapts to the sidebar width.
+- Cleaned up settings tabs so the selected tab stays visible while scrolling and AI model controls live in one Setup section instead of being duplicated across Basic and API Access.
+- Tightened the Todoist References table so all columns have stable widths, long cells use ellipsis, and Path/Status no longer collapse into vertical text.
+
 ## 0.6.9
 
 - Hardened Todoist sync reconciliation so completed tasks are preserved as checked tasks in Obsidian instead of being removed when they disappear from Todoist's active-task snapshot.

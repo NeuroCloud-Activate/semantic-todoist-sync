@@ -5375,9 +5375,9 @@ class SemanticTodoistView extends ItemView {
       return;
     }
     const tabs = this.relevantEl.createDiv({ cls: "semantic-todoist-source-tabs" });
-    for (const chunk of uniqueChunks.slice(0, 3)) {
+    for (const chunk of uniqueChunks.slice(0, 4)) {
       const card = tabs.createDiv({ cls: "semantic-todoist-source-card" });
-      card.setText(shortTitle(chunk.title || chunk.path, 18));
+      card.setText(chunk.title || chunk.path);
       card.title = chunk.path;
       card.onclick = () => {
         const file = this.plugin.app.vault.getAbstractFileByPath(chunk.path);
@@ -5432,10 +5432,15 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
+    let activeButton = null;
     for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "Daily Scheduler", "References", "Activity"]) {
       const button = tabs.createEl("button", { text: tab });
-      if (this.activeTab === tab) button.addClass("is-active");
+      if (this.activeTab === tab) {
+        button.addClass("is-active");
+        activeButton = button;
+      }
       button.onclick = () => {
+        this.tabScrollLeft = tabs.scrollLeft;
         this.activeTab = tab;
         this.display();
       };
@@ -5448,6 +5453,12 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     if (this.activeTab === "Daily Scheduler") this.renderScheduleToday(containerEl);
     if (this.activeTab === "References") this.renderReferences(containerEl);
     if (this.activeTab === "Activity") this.renderActivity(containerEl);
+    tabs.scrollLeft = Number(this.tabScrollLeft || 0);
+    if (activeButton) {
+      const alignActiveTab = () => activeButton.scrollIntoView({ block: "nearest", inline: "center" });
+      if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(alignActiveTab);
+      else alignActiveTab();
+    }
   }
 
   renderSetup(containerEl) {
@@ -5460,8 +5471,21 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     ]);
     secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
     secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
-    modelDropdownSetting(containerEl, "Default AI model", "Used for sidebar chat, vault question-answering, task extraction, and task description generation. Refresh models after adding a key.", this.plugin, "chatModel", "availableChatModels");
+    settingsHeading(containerEl, "AI Models", "Choose the primary chat model, one same-provider fallback, and the embedding model used for semantic vault indexing.");
+    new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
+    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels");
     modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
+    toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
+    aiFallbackModelSetting(containerEl, this.plugin);
+    toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
+    new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
+      try {
+        await this.plugin.refreshOpenAIModels(true);
+        this.display();
+      } catch (error) {
+        new Notice(`Could not load AI models: ${error.message || error}`);
+      }
+    }));
     new Setting(containerEl).setName("Validate AI access").setDesc("Tests the saved provider key by loading available chat and embedding models.").addButton((button) => button.setButtonText("Test AI").setCta().onClick(async () => {
       try {
         await this.plugin.validateAiSetup(true);
@@ -5595,12 +5619,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 
   renderBasic(containerEl) {
-    settingsHeading(containerEl, "AI Model", "Choose the model used for sidebar answers, task extraction, task description writing, and prompts. The embedding model is automatically kept on the same provider when the selected AI model changes.");
-    new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
-    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels");
-    toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
-    aiFallbackModelSetting(containerEl, this.plugin);
-    toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
+    settingsHeading(containerEl, "Sidebar And Prompts", "Controls how the sidebar behaves and where prompt templates are loaded from. AI model selection now lives in Setup.");
     dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic vault search and active-note context for sourced answers. Chat is a lighter general conversation mode. Task Creation is for prompts that generate Todoist-ready tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
     dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
     numberSetting(containerEl, "Chat font size px", this.plugin, "chatFontSizePx");
@@ -5619,15 +5638,6 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "API Keys");
     secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
     secretSetting(containerEl, "Google API key", this.plugin, "googleApiKey");
-    modelDropdownSetting(containerEl, "Embedding model", "Used for semantic RAG indexing and search. Default follows the selected AI provider; Gemini uses gemini-embedding-2.", this.plugin, "embeddingModel", "availableEmbeddingModels");
-    new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
-      try {
-        await this.plugin.refreshOpenAIModels(true);
-        this.display();
-      } catch (error) {
-        new Notice(`Could not load AI models: ${error.message || error}`);
-      }
-    }));
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "Cloudflare");

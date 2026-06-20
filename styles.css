@@ -616,7 +616,7 @@
 
 .semantic-todoist-reference-table {
   width: 3460px;
-  min-width: 100%;
+  min-width: 3460px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: var(--font-ui-smaller);
@@ -642,59 +642,59 @@
 }
 
 .semantic-todoist-reference-table th:nth-child(1),
-.semantic-todoist-reference-table td:nth-child(1) { width: 72px; }
+.semantic-todoist-reference-table td:nth-child(1) { width: 72px; min-width: 72px; }
 
 .semantic-todoist-reference-table th:nth-child(2),
-.semantic-todoist-reference-table td:nth-child(2) { width: 126px; }
+.semantic-todoist-reference-table td:nth-child(2) { width: 126px; min-width: 126px; }
 
 .semantic-todoist-reference-table th:nth-child(3),
-.semantic-todoist-reference-table td:nth-child(3) { width: 320px; }
+.semantic-todoist-reference-table td:nth-child(3) { width: 320px; min-width: 320px; }
 
 .semantic-todoist-reference-table th:nth-child(4),
-.semantic-todoist-reference-table td:nth-child(4) { width: 74px; }
+.semantic-todoist-reference-table td:nth-child(4) { width: 74px; min-width: 74px; }
 
 .semantic-todoist-reference-table th:nth-child(5),
 .semantic-todoist-reference-table td:nth-child(5),
 .semantic-todoist-reference-table th:nth-child(6),
-.semantic-todoist-reference-table td:nth-child(6) { width: 104px; }
+.semantic-todoist-reference-table td:nth-child(6) { width: 104px; min-width: 104px; }
 
 .semantic-todoist-reference-table th:nth-child(7),
-.semantic-todoist-reference-table td:nth-child(7) { width: 92px; }
+.semantic-todoist-reference-table td:nth-child(7) { width: 92px; min-width: 92px; }
 
 .semantic-todoist-reference-table th:nth-child(8),
 .semantic-todoist-reference-table td:nth-child(8),
 .semantic-todoist-reference-table th:nth-child(10),
-.semantic-todoist-reference-table td:nth-child(10) { width: 128px; }
+.semantic-todoist-reference-table td:nth-child(10) { width: 128px; min-width: 128px; }
 
 .semantic-todoist-reference-table th:nth-child(9),
-.semantic-todoist-reference-table td:nth-child(9) { width: 190px; }
+.semantic-todoist-reference-table td:nth-child(9) { width: 190px; min-width: 190px; }
 
 .semantic-todoist-reference-table th:nth-child(11),
-.semantic-todoist-reference-table td:nth-child(11) { width: 160px; }
+.semantic-todoist-reference-table td:nth-child(11) { width: 160px; min-width: 160px; }
 
 .semantic-todoist-reference-table th:nth-child(12),
-.semantic-todoist-reference-table td:nth-child(12) { width: 140px; }
+.semantic-todoist-reference-table td:nth-child(12) { width: 140px; min-width: 140px; }
 
 .semantic-todoist-reference-table th:nth-child(13),
-.semantic-todoist-reference-table td:nth-child(13) { width: 112px; }
+.semantic-todoist-reference-table td:nth-child(13) { width: 112px; min-width: 112px; }
 
 .semantic-todoist-reference-table th:nth-child(14),
-.semantic-todoist-reference-table td:nth-child(14) { width: 142px; }
+.semantic-todoist-reference-table td:nth-child(14) { width: 142px; min-width: 142px; }
 
 .semantic-todoist-reference-table th:nth-child(15),
-.semantic-todoist-reference-table td:nth-child(15) { width: 320px; }
+.semantic-todoist-reference-table td:nth-child(15) { width: 320px; min-width: 320px; }
 
 .semantic-todoist-reference-table th:nth-child(16),
-.semantic-todoist-reference-table td:nth-child(16) { width: 360px; }
+.semantic-todoist-reference-table td:nth-child(16) { width: 360px; min-width: 360px; }
 
 .semantic-todoist-reference-table th:nth-child(17),
-.semantic-todoist-reference-table td:nth-child(17) { width: 420px; }
+.semantic-todoist-reference-table td:nth-child(17) { width: 420px; min-width: 420px; }
 
 .semantic-todoist-reference-table th:nth-child(18),
-.semantic-todoist-reference-table td:nth-child(18) { width: 320px; }
+.semantic-todoist-reference-table td:nth-child(18) { width: 320px; min-width: 320px; }
 
 .semantic-todoist-reference-table th:nth-child(19),
-.semantic-todoist-reference-table td:nth-child(19) { width: 100px; }
+.semantic-todoist-reference-table td:nth-child(19) { width: 100px; min-width: 100px; }
 
 .semantic-todoist-prompt-textarea {
   width: 100%;

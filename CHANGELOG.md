@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.12
+
+- Rebalanced sidebar chat answers so vault note content is treated as the primary evidence, with existing Todoist tasks shown as supporting action links instead of driving every response.
+- Tightened the mobile sidebar so relevant notes can show four compact chips across two rows without clipping and the main controls take up less vertical space.
+
 ## 0.6.11
 
 - Changed the default AI setup to OpenAI, using GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback/strong model, and `text-embedding-3-large` for semantic vault indexing.

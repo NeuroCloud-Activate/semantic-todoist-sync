@@ -2326,16 +2326,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       system: [
         "You are a concise Obsidian sidebar assistant.",
         "Answer in plain language, usually in 3-6 short bullets or 1-3 short paragraphs.",
-        "Use the active note, adaptive task/meeting/project context pack, ranked vault context, and local generated/synced task context together before answering; say when the vault does not contain enough evidence.",
+        "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
+        "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
         "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
         "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
         "Use markdown links exactly as supplied, and do not invent sources.",
         "When providing any link, use descriptive linked text in markdown form such as [task title](url) or [note title](url). Do not display full raw URLs in the visible answer.",
         "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
-        "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes.",
+        "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes; task references should confirm or point to actions, not replace the note evidence.",
         "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
         "Use the task context to identify whether a task already exists before suggesting task creation.",
-        "When referring to an existing task, include its supplied Todoist task link when available.",
+        "When referring to an existing task, include its supplied Todoist task link when available after explaining the relevant note-based evidence.",
         "Avoid long preambles."
       ].join(" "),
       user: [
@@ -2350,7 +2351,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Allowed source links:",
         sources || "No source links available.",
         "",
-        "Adaptive task, meeting, project, and portfolio context:",
+        "Note-first vault context with secondary task pointers:",
         adaptivePack.text || taskContext || "No adaptive context found.",
         "",
         "User prompt:",
@@ -11069,25 +11070,41 @@ function deriveTaskRationale(task = {}, signals = {}, intent = "") {
 
 function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
   const depth = Math.max(1, Math.min(7, Number(pack.depth || 4)));
+  const chatMode = pack.mode === "chat";
   const sections = [];
   sections.push(`Adaptive context depth: ${depth}/7 (${ADAPTIVE_CONTEXT_TIERS.slice(0, depth).join(" -> ")}).`);
   sections.push("Use this local-first context to understand why tasks exist, what they are trying to resolve or put in place, and which recent source notes should guide the answer.");
+  if (chatMode) sections.push("Chat evidence hierarchy: answer from vault note content first; use existing Todoist tasks only as secondary links to related actions unless the user explicitly asks about tasks.");
   if (pack.active?.path || pack.sourceTitle) {
     sections.push([
       "Tier 1 - Active/source note:",
       `- ${pack.sourceTitle || pack.active?.title || "Active source"}${pack.active?.path ? ` (${pack.active.path})` : ""}.`
     ].join("\n"));
   }
-  if (depth >= 6 && pack.projectCards?.length) {
-    sections.push(["Tier 6-7 - Project and portfolio context:"].concat(pack.projectCards.map(formatAdaptiveProjectCard)).join("\n"));
-  }
-  if (depth >= 2 && pack.taskCards?.length) {
-    sections.push(["Tier 2-3 - Task snapshots, intent, and rationale:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
-  } else if (depth >= 2 && pack.taskContext) {
-    sections.push(["Tier 2 - Existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
-  }
-  if (depth >= 4 && pack.noteCards?.length) {
-    sections.push(["Tier 4-5 - Origin meeting/outcome and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
+  if (chatMode) {
+    if (depth >= 4 && pack.noteCards?.length) {
+      sections.push(["Primary vault evidence - origin meetings, outcomes, and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
+    }
+    if (depth >= 6 && pack.projectCards?.length) {
+      sections.push(["Supporting project and portfolio context:"].concat(pack.projectCards.map(formatAdaptiveProjectCard)).join("\n"));
+    }
+    if (depth >= 2 && pack.taskCards?.length) {
+      sections.push(["Secondary Todoist task references - related existing actions only:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
+    } else if (depth >= 2 && pack.taskContext) {
+      sections.push(["Secondary existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
+    }
+  } else {
+    if (depth >= 6 && pack.projectCards?.length) {
+      sections.push(["Tier 6-7 - Project and portfolio context:"].concat(pack.projectCards.map(formatAdaptiveProjectCard)).join("\n"));
+    }
+    if (depth >= 2 && pack.taskCards?.length) {
+      sections.push(["Tier 2-3 - Task snapshots, intent, and rationale:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
+    } else if (depth >= 2 && pack.taskContext) {
+      sections.push(["Tier 2 - Existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
+    }
+    if (depth >= 4 && pack.noteCards?.length) {
+      sections.push(["Tier 4-5 - Origin meeting/outcome and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
+    }
   }
   return truncateMarkdownAtWord(sections.filter(Boolean).join("\n\n"), maxChars);
 }

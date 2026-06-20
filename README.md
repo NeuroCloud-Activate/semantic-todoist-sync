@@ -24,23 +24,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.0
+## What's New In 0.6.11
 
-1. **Schedule Today now uses the same context brain as the rest of the plugin**
+1. **OpenAI is now the default AI setup**
 
-   The scheduler now ranks and estimates work using Todoist task snapshots, local scheduler memory, linked note context, and the semantic vault index. That keeps the daily plan tied to both Todoist urgency and the most relevant Obsidian context instead of relying on task titles alone.
+   New installs default to OpenAI with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback, and `text-embedding-3-large` for the semantic vault index. Gemini is still supported if you prefer it.
 
-2. **A more useful preview before anything touches Todoist**
+2. **Optional strong-model routing**
 
-   The preview can show the top ten suggested task swaps, keeps moved-out tasks visible so they can be restored, and uses compact controls that work better on mobile and desktop. The timeline scales to your configured minimum task block, while task durations can still move in 15-minute steps when that fits your settings.
+   There is a new Setup option, off by default, that lets the plugin use the stronger fallback model only when local context signals strongly justify it. It looks for things like broad project questions, recent-vs-older guidance, multi-project context, and action-heavy requests, and it does that locally without a separate AI routing call.
 
-3. **Todoist-first scheduling with cleaner duration rules**
+3. **Better wide settings tables**
 
-   Applying a schedule writes approved due times and Todoist durations immediately, then lets the normal note sync flow update Obsidian. Quick follow-up, discussion, coordination, and meeting-planning tasks are capped to the configured minimum block so they do not crowd out deeper work.
+   The Todoist References table keeps stable column widths and scrolls horizontally, so long paths, descriptions, and status fields should stay readable instead of being squeezed into one-character columns.
 
 ## What It Uses
 
-- Google Gemini by default, with OpenAI also supported through the user's own API key and available model list.
+- OpenAI by default through the user's own API key, with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback/optional strong model, and Gemini still supported through Google AI Studio.
 - A local semantic index for vault search, context-aware task descriptions, and compact task-reference retrieval.
 - Todoist API access for task creation, updates, and reference reconciliation.
 - Optional Cloudflare Email Routing and Workers for the Email-To-Todoist workflow.
@@ -55,11 +55,11 @@ Open `Settings > Semantic Todoist Sync > Setup` (all the details are in there - 
 The setup tab is step-wise with links to open each provider pages in the browser, gives you the field to paste each key or token directly beside the step, and includes validation buttons so you can confirm each connection before moving on. 
 
 1. Add an AI provider key.
-   - Default: Google Gemini.
-   - Use `Gemini API keys` to open Google AI Studio's key page.
-   - Paste the Gemini key into `Google Gemini API key`.
+   - Default: OpenAI.
+   - Use `OpenAI API keys` to open OpenAI Platform's key page.
+   - Paste the OpenAI key into `OpenAI API key`.
    - Click `Test AI`.
-   - Optional: use OpenAI instead by adding an OpenAI API key and choosing OpenAI models.
+   - Optional: use Gemini instead by adding a Gemini key and choosing Gemini models.
 
 2. Add Todoist access.
    - Use `Token instructions` if Todoist does not open directly to the token page.
@@ -94,6 +94,11 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Run the scheduler from the sidebar prompt chooser or command palette. It opens a preview first and does not write Todoist changes until you choose `Apply`.
    - The preview shows scheduled tasks, unscheduled work, moved-out tasks, and up to ten suggested swaps.
    - The default `Schedule today's tasks` prompt is created in the prompts folder and can be edited there. Settings still control the scheduler rules; the prompt coordinates the duration-estimation request.
+
+6. Optional: enable stronger-model routing.
+   - Open `Settings > Semantic Todoist Sync > Setup`.
+   - Leave `Use stronger model when locally justified` off for the fastest and cheapest default behavior.
+   - Turn it on when you want broad portfolio questions, recency/conflict-heavy answers, complex task generation, or richer task descriptions to use the configured stronger model only when the local score is high enough.
 
 ## Sidebar And Prompts
 
@@ -182,6 +187,7 @@ Each GitHub release tag matches the version in `manifest.json` and includes `mai
 
 - API keys are stored in Obsidian plugin settings on the user's device and sync only if the user syncs Obsidian settings.
 - Vault content is sent to the selected AI provider when using chat, semantic indexing, task extraction, or task description generation.
+- The optional strong-model gate is decided locally from already-retrieved context and does not make an extra AI call just to choose a model.
 - The local status bar and sync reconciliation logic do not use AI API calls.
 - Todoist receives task content, descriptions, labels, due dates, priorities, project IDs, and section IDs needed for sync.
 - The local Todoist reference table stores Todoist task snapshots on device and is used to reduce repeated Todoist API reads.

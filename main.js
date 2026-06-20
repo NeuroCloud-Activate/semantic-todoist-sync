@@ -59,6 +59,26 @@ const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
 const TASK_CONTEXT_MIN_TASK_SCORE = 1;
+const ADAPTIVE_CONTEXT_TIERS = [
+  "Active/source note",
+  "Todoist task snapshot",
+  "Task intent and rationale",
+  "Origin meeting or email outcome",
+  "Related note thread",
+  "Project context",
+  "Portfolio context"
+];
+const ADAPTIVE_CONTEXT_MODE_BUDGETS = {
+  chat: { defaultDepth: 4, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 24, maxChars: 10000, maxNotes: 7, maxTasks: 12, maxProjects: 5 },
+  "task-generation": { defaultDepth: 6, maxDepth: 6, retrievalMultiplier: 2, maxRetrieval: 20, maxChars: 11000, maxNotes: 7, maxTasks: 10, maxProjects: 4 },
+  description: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 3, maxRetrieval: 28, maxChars: 14000, maxNotes: 8, maxTasks: 14, maxProjects: 6 },
+  schedule: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 18, maxChars: 8000, maxNotes: 6, maxTasks: 16, maxProjects: 6 }
+};
+const BROAD_CONTEXT_QUERY_RE = /\b(across|all|overall|portfolio|project|projects|priorit(?:y|ies|ize)|important|most important|top|rank|compare|status|where things stand|everything|whole vault|all notes)\b/i;
+const TASK_ACTION_CONTEXT_RE = /\b(tasks?|todo|actions?|next steps?|what should i do|complete|finish|work on|how do i|schedule|plan|deadline|due|follow[-\s]?up)\b/i;
+const RECENCY_OR_CONFLICT_QUERY_RE = /\b(recent|current|latest|newest|older|past|changed?|updated?|guidance|conflict|conflicting|discrepanc(?:y|ies)|instead|now|history|previous(?:ly)?)\b/i;
+const STRONG_MODEL_ESCALATION_THRESHOLD = 95;
+const STRONG_MODEL_HARD_ESCALATION_THRESHOLD = 99;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
     filename: "Generate Todoist task list.md",
@@ -101,14 +121,15 @@ const DEFAULT_SETTINGS = {
   todoistToken: "",
   workerUrl: "",
   workerToken: "",
-  chatModel: "gemini/gemini-3.5-flash",
-  chatFallbackModel: "",
+  chatModel: "gpt-5.4-mini",
+  chatFallbackModel: "gpt-5.4",
   enableAiModelFallback: true,
+  enableStrongModelEscalation: false,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
-  embeddingModel: "gemini/gemini-embedding-2",
-  availableChatModels: [],
-  availableEmbeddingModels: [],
+  embeddingModel: "text-embedding-3-large",
+  availableChatModels: ["gpt-5.4-mini", "gpt-5.4"],
+  availableEmbeddingModels: ["text-embedding-3-large"],
   availableGeminiModels: ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
   availableGeminiEmbeddingModels: ["gemini-embedding-2", "gemini-embedding-001"],
   modelsFetchedAt: "",
@@ -662,8 +683,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         changed = true;
       }
     }
-    if (!this.settings.chatModel || this.settings.chatModel === "gpt-5.4-mini") {
+    if (!this.settings.chatModel) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
+      changed = true;
+    }
+    if (!this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatModel)) {
+      this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
+      changed = true;
+    }
+    if (typeof this.settings.enableStrongModelEscalation !== "boolean") {
+      this.settings.enableStrongModelEscalation = DEFAULT_SETTINGS.enableStrongModelEscalation;
       changed = true;
     }
     if (!this.settings.googleApiKey) {
@@ -1958,6 +1987,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return diversifyContextCandidates(candidates, limit).map((item) => annotateContextChunk(item));
   }
 
+  async retrieveAdaptiveSemanticContext(query, mode = "chat", baseLimit = 8, prompt = "") {
+    return this.retrieveSemanticContext(query, adaptiveSemanticRetrievalLimit(this.settings, mode, baseLimit, prompt || query));
+  }
+
   retrieveLexicalContext(query, limit) {
     return this.lexicalContextCandidates(query, limit).slice(0, limit).map((item) => annotateContextChunk(item));
   }
@@ -2149,6 +2182,102 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return truncateMarkdownAtWord(noteSummaries.concat(merged).join("\n"), 4500);
   }
 
+  buildAdaptiveContextPack(options = {}) {
+    const mode = options.mode || "chat";
+    const prompt = [options.prompt, options.sourceTitle, options.sourceSummary].filter(Boolean).join("\n");
+    const depth = adaptiveContextDepth(mode, prompt);
+    const budget = adaptiveContextBudget(mode);
+    const basePath = vaultBasePath(this.app);
+    const citationMap = options.citationMap instanceof Map ? options.citationMap : null;
+    const query = [
+      prompt,
+      options.active?.title,
+      options.active?.selection,
+      (options.tasks || []).map((task) => task.content || task.title || "").join("\n")
+    ].filter(Boolean).join("\n");
+    const noteCards = adaptiveNoteCardsFromChunks(options.context || [], query, this.settings, {
+      depth,
+      maxCards: budget.maxNotes,
+      basePath,
+      citationMap
+    });
+    const taskCards = this.adaptiveTaskCards({
+      depth,
+      mode,
+      query,
+      active: options.active || null,
+      tasks: options.tasks || [],
+      context: options.context || [],
+      maxCards: budget.maxTasks
+    });
+    const projectCards = adaptiveProjectCards(noteCards, taskCards, {
+      depth,
+      maxCards: budget.maxProjects
+    });
+    const text = formatAdaptiveContextPack({
+      depth,
+      mode,
+      prompt: query,
+      sourceTitle: options.sourceTitle || options.active?.title || "",
+      active: options.active || null,
+      noteCards,
+      taskCards,
+      projectCards,
+      taskContext: options.taskContext || "",
+      settings: this.settings
+    }, Math.min(budget.maxChars, this.settings.maxContextChars ? Math.max(5000, this.settings.maxContextChars) : budget.maxChars));
+    return { depth, mode, noteCards, taskCards, projectCards, text };
+  }
+
+  adaptiveTaskCards(options = {}) {
+    const depth = Number(options.depth || 4);
+    const query = options.query || "";
+    const queryTerms = taskSearchTermCounts(query);
+    const contextPaths = new Set((options.context || []).map((chunk) => chunk.path).filter(Boolean));
+    const activePath = options.active?.path || "";
+    const explicitTasks = flattenTaskPlan(options.tasks || []);
+    const referenceIndex = this.getTaskReferenceIndex();
+    const childTextByParentOid = referenceIndex.childTextByParentOid || new Map();
+    const candidates = [];
+    const addCard = (id, task, source, sourcePriority = 0) => {
+      if (!task?.content) return;
+      const notePath = vaultRelativePath(task.path || activePath || "", vaultBasePath(this.app));
+      const childText = childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "";
+      const score = taskReferenceScore(task, queryTerms, query, childText);
+      const pathMatch = Boolean(notePath && (notePath === activePath || contextPaths.has(notePath)));
+      const broad = depth >= 7;
+      const taskKnowledge = taskKnowledgeSnapshot(task, this.settings, childText, task.knowledge || task.taskKnowledge || null);
+      if (!broad && !pathMatch && score <= 0 && source !== "current task") return;
+      const dueScore = task.due_date || task.deadline_date || task.scheduledDueDateTime ? 0.35 : 0;
+      const priorityScore = (normalizePriority(task.priority) - 1) * 0.25;
+      const recency = recencyBoost(Date.parse(task.cachedAt || task.createdAt || 0));
+      candidates.push({
+        id: id || task.id || task.oid || "",
+        title: task.content || "",
+        path: notePath,
+        source,
+        score: sourcePriority + score + priorityScore + dueScore + recency + (pathMatch ? 1.25 : 0),
+        status: task.isCompleted ? "completed" : task.isSubtask ? "subtask" : "open",
+        priority: normalizePriority(task.priority),
+        due: task.due_date || task.scheduledDueDateTime || "",
+        deadline: task.deadline_date || "",
+        labels: (task.labels || []).map(cleanLabel).filter(Boolean),
+        project: task.projectName || "",
+        section: task.section || "",
+        parent: task.parentContent || "",
+        todoistLink: id ? todoistTaskMarkdownLink(id, this.settings, task.content || "Open task") : "",
+        knowledge: taskKnowledge,
+        evidence: truncateAtWord(taskKnowledge.evidence || task.description || childText || "", 420)
+      });
+    };
+    for (const task of explicitTasks) addCard(task.id || "", Object.assign({}, task, { path: task.path || activePath }), "current task", 3);
+    for (const [id, task] of referenceIndex.entries || []) addCard(id, task, "local reference table", 0);
+    for (const task of referenceIndex.pendingReferences || []) addCard("", task, "pending local reference", 0.4);
+    return uniqueAdaptiveTaskCards(candidates)
+      .sort((a, b) => b.score - a.score || b.priority - a.priority || String(a.title).localeCompare(String(b.title)))
+      .slice(0, Math.max(1, options.maxCards || adaptiveContextBudget(options.mode || "chat").maxTasks));
+  }
+
   taskFilesMatchingQuery(queryText, queryTerms, contextPaths = new Set(), limit = 8) {
     if (!Object.keys(queryTerms || {}).length) return [];
     const files = this.getSyncableTaskFiles();
@@ -2178,17 +2307,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.requireAiAccess();
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
-    const context = await this.retrieveSemanticContext(query, this.settings.maxChatContextChunks);
-    const contextText = formatContext(context, this.settings.maxContextChars, this.settings, query);
+    const context = await this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt);
     const activeText = active?.text ? (active.selection || active.text) : "";
     const sources = formatSourceLinks(active, context);
     const taskContext = await this.buildTaskContext(active, context, prompt);
-    const response = await this.withAiActivity("Answering question", () => this.openaiResponse({
-      model: this.settings.chatModel,
+    const adaptivePack = this.buildAdaptiveContextPack({
+      mode: "chat",
+      prompt,
+      active,
+      sourceTitle: active?.title || "",
+      sourceSummary: activeText,
+      context,
+      taskContext
+    });
+    const modelChoice = this.aiModelForRequest("chat", { prompt, context, adaptivePack, taskContext });
+    let response = await this.withAiActivity("Answering question", () => this.openaiResponse({
+      model: modelChoice.model,
       system: [
         "You are a concise Obsidian sidebar assistant.",
         "Answer in plain language, usually in 3-6 short bullets or 1-3 short paragraphs.",
-        "Use the active note, ranked vault context, and local generated/synced task context together before answering; say when the vault does not contain enough evidence.",
+        "Use the active note, adaptive task/meeting/project context pack, ranked vault context, and local generated/synced task context together before answering; say when the vault does not contain enough evidence.",
         "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
         "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
         "Use markdown links exactly as supplied, and do not invent sources.",
@@ -2212,17 +2350,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Allowed source links:",
         sources || "No source links available.",
         "",
-        "Existing generated/synced task context from notes and the local Todoist reference table:",
-        taskContext || "No matching local task context found.",
-        "",
-        "Ranked semantic vault context:",
-        contextText || "No semantic context found.",
+        "Adaptive task, meeting, project, and portfolio context:",
+        adaptivePack.text || taskContext || "No adaptive context found.",
         "",
         "User prompt:",
         prompt
       ].join("\n"),
       appendFallbackNotice: this.settings.showAiFallbackNotice !== false
     }));
+    if (modelChoice.useStrong && this.settings.showAiFallbackNotice !== false && modelIdentity(this.lastAiResponseModel) === modelIdentity(modelChoice.model)) {
+      response = `${String(response || "").trimEnd()}\n\nStronger AI model used: ${modelDisplayName(modelChoice.model)}`;
+    }
     return { answer: response, context };
   }
 
@@ -2314,6 +2452,70 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return schedulerMemoryPolicyCommandFromAi(parsed);
   }
 
+  aiModelForRequest(mode, options = {}) {
+    const primary = options.primaryModel || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
+    const decision = this.strongModelEscalationDecision(mode, Object.assign({}, options, { primaryModel: primary }));
+    if (decision.useStrong) {
+      this.logLocal("Strong AI model selected", {
+        mode,
+        from: modelDisplayName(primary),
+        to: modelDisplayName(decision.model),
+        score: decision.score,
+        reasons: decision.reasons
+      });
+      return decision;
+    }
+    return decision;
+  }
+
+  strongModelEscalationDecision(mode, options = {}) {
+    const primary = options.primaryModel || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
+    const strongModel = this.strongModelForPrimary(primary);
+    const signals = modelEscalationSignals(mode, options);
+    const score = modelEscalationScore(mode, signals);
+    const sameModel = !strongModel || modelIdentity(strongModel) === modelIdentity(primary);
+    const enabled = this.settings.enableStrongModelEscalation === true;
+    const synthesisPattern = signals.broadPrompt && signals.recencyPrompt && signals.actionPrompt;
+    const highValuePattern = synthesisPattern
+      || signals.validationRepair
+      || mode === "description"
+      || (mode === "task-generation" && (signals.broadPrompt || signals.recencyPrompt));
+    const scheduleNeedsSynthesis = mode !== "schedule" || (signals.recencyPrompt && (signals.broadPrompt || signals.actionPrompt));
+    const useStrong = enabled && !sameModel && scheduleNeedsSynthesis && highValuePattern && score >= STRONG_MODEL_ESCALATION_THRESHOLD;
+    return {
+      model: useStrong ? strongModel : primary,
+      primaryModel: primary,
+      strongModel,
+      useStrong,
+      score,
+      signals,
+      reasons: modelEscalationReasons(mode, signals, score)
+    };
+  }
+
+  strongModelForPrimary(primaryModel) {
+    if (usesGeminiChatModel(primaryModel)) {
+      const primary = normalizeGeminiModelId(primaryModel);
+      const preferred = this.settings.chatFallbackModel && usesGeminiChatModel(this.settings.chatFallbackModel)
+        ? `gemini/${normalizeGeminiModelId(this.settings.chatFallbackModel)}`
+        : "";
+      const models = this.settings.availableGeminiModels?.length ? this.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
+      return uniqueValues([preferred].concat(rankGeminiFallbackModels(models)
+        .map((model) => `gemini/${normalizeGeminiModelId(model)}`)
+        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary))).slice(0, 1)[0] || "";
+    }
+    if (usesOpenAIChatModel(primaryModel)) {
+      const primary = normalizeOpenAIModelId(primaryModel);
+      const preferred = this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatFallbackModel)
+        ? normalizeOpenAIModelId(this.settings.chatFallbackModel)
+        : DEFAULT_SETTINGS.chatFallbackModel;
+      return uniqueValues([preferred].concat(this.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels || [])
+        .map((model) => normalizeOpenAIModelId(model))
+        .filter((model) => model && model !== primary)).slice(0, 1)[0] || "";
+    }
+    return "";
+  }
+
   async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
@@ -2325,6 +2527,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const response = usesGeminiChatModel(candidateModel)
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema })
           : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema });
+        this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
         }
@@ -2552,13 +2755,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await this.ensureCompatibleEmbeddingForChatModel();
     const sourceSummary = compressSourceForTaskPrompt(source, this.settings);
     const taskQuery = `${source.title}\n${sourceSummary}`;
-    const context = await this.retrieveSemanticContext(taskQuery, this.settings.maxTaskContextChunks);
+    const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, source.templateInstructions || "");
     const taskContext = await this.buildTaskContext(
       source.type === "note" ? { path: source.path || "", text: source.text || "" } : null,
       context,
       taskQuery
     );
-    const contextNotes = contextNotesForTaskPlan(context, source.path, this.settings.taskContextSummaryMaxNotes);
+    const contextNotes = contextNotesForTaskPlan(context, source.path, Math.max(this.settings.taskContextSummaryMaxNotes || 0, adaptiveContextBudget("task-generation").maxNotes));
     const taskInstructions = this.taskInstructionsForSource(source.type);
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
@@ -2567,14 +2770,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       `Generation limits:\nCreate no more than ${maxMainTasks} main tasks. Create no more than ${maxSubtasks} subtasks under any main task. It is better to create fewer high-confidence tasks than to fill the limit.`,
       taskGenerationRequirements(taskInstructions, this.settings)
     ].filter(Boolean).join("\n\n");
+    const adaptivePack = this.buildAdaptiveContextPack({
+      mode: "task-generation",
+      prompt: [taskQuery, instructions].join("\n"),
+      active: source.type === "note" ? { title: source.title, path: source.path || "", text: source.text || "" } : null,
+      sourceTitle: source.title,
+      sourceSummary,
+      context,
+      taskContext
+    });
+    const modelChoice = this.aiModelForRequest("task-generation", {
+      prompt: [taskQuery, instructions].join("\n"),
+      context,
+      adaptivePack,
+      taskContext,
+      taskCount: maxMainTasks + maxSubtasks
+    });
     const json = await this.withAiActivity("Generating task list", () => this.openaiResponse({
-      model: this.settings.chatModel,
+      model: modelChoice.model,
       jsonSchema: taskCreationSchema(maxMainTasks, maxSubtasks),
       system: [
         "Create Todoist task structure from the supplied source.",
         "Return only JSON matching the schema.",
         "Follow the Main task requirements for every top-level task and the Subtask requirements for every subtask.",
-        "Use the active source content, ranked vault context, and existing local Todoist reference context for every task-generation decision, including main tasks and subtasks.",
+        "Use the active source content and adaptive task/meeting/project context for every task-generation decision, including main tasks and subtasks.",
         "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
         "When ranked vault context conflicts on the same topic, prefer the newest matching note as the current guidance while preserving older notes only as background.",
         "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
@@ -2599,11 +2818,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Source content:",
         sourceSummary,
         "",
-        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
-        formatContext(context, this.settings.maxContextChars, this.settings, taskQuery) || "No relevant vault context found.",
-        "",
-        "Existing generated/synced task context from notes and the local Todoist reference table:",
-        taskContext || "No matching local task context found."
+        "Adaptive task, meeting, project, and portfolio context (required supporting context when available; locally ranked and compacted):",
+        adaptivePack.text || taskContext || "No adaptive context found."
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
@@ -2613,6 +2829,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
     parsed.semanticContext = context;
+    parsed.adaptiveContextDepth = adaptivePack.depth;
     parsed.descriptionInstructions = taskInstructions.descriptions;
     return parsed;
   }
@@ -2630,9 +2847,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
     const contextQuery = [sourceTitle, sourceSummary, mainTasks.map((task) => task.title).join("\n")].join("\n");
+    const adaptivePack = this.buildAdaptiveContextPack({
+      mode: "description",
+      prompt: contextQuery,
+      sourceTitle,
+      sourceSummary,
+      tasks,
+      context,
+      citationMap,
+      active: { title: sourceTitle || "", path: "", text: sourceSummary || "" }
+    });
+    const modelChoice = this.aiModelForRequest("description", {
+      prompt: contextQuery,
+      context,
+      adaptivePack,
+      taskContext: adaptivePack.text || "",
+      taskCount: mainTasks.length
+    });
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
     const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
-      model: this.settings.chatModel,
+      model: modelChoice.model,
       jsonSchema: taskDescriptionSchema(),
       system: [
         "Write Todoist main-task descriptions only.",
@@ -2645,7 +2879,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not write openings like 'The note says', 'The source records', 'The email indicates', a source-title recap, or any filename-first framing.",
         "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
         "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
-        "Use vault context as required supporting context when it is available; prioritize the highest-ranked excerpts that explain dependencies, constraints, people, documents, program status, rationale, or next information needed.",
+        "Use the adaptive context pack as required supporting context when it is available; prioritize the highest-ranked excerpts that explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Explain the useful why/so-what behind the context in plain language so the task can be actioned without reopening every source.",
@@ -2675,8 +2909,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Active source content:",
         sourceSummary || "",
         "",
-        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
-        formatContext(context, this.settings.maxContextChars, this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
+        "Adaptive portfolio-level context for writing task descriptions:",
+        adaptivePack.text || formatContext(context, this.settings.maxContextChars, this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
@@ -2717,14 +2951,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
     const contextQuery = [sourceTitle, sourceSummary, repairItems.map((task) => task.title).join("\n")].join("\n");
+    const adaptivePack = this.buildAdaptiveContextPack({
+      mode: "description",
+      prompt: contextQuery,
+      sourceTitle,
+      sourceSummary,
+      tasks: repairItems.map((item) => Object.assign({}, weakTasks.find(({ index }) => index === item.index)?.task || {}, { content: item.title })),
+      context,
+      citationMap,
+      active: { title: sourceTitle || "", path: "", text: sourceSummary || "" }
+    });
+    const modelChoice = this.aiModelForRequest("description", {
+      prompt: contextQuery,
+      context,
+      adaptivePack,
+      taskContext: adaptivePack.text || "",
+      taskCount: repairItems.length,
+      validationRepair: true
+    });
     const json = await this.withAiActivity(`Improving ${repairItems.length} task description${repairItems.length === 1 ? "" : "s"}`, () => this.openaiResponse({
-      model: this.settings.chatModel,
+      model: modelChoice.model,
       jsonSchema: taskDescriptionSchema(),
       system: [
         "Improve incomplete Todoist main-task descriptions.",
         "Return only JSON matching the schema.",
         "Each description must be 80-1200 characters and must explain the specific context, rationale, dependencies, people, documents, and next information needed to action the task.",
-        "Use active source content first, then use ranked relevant vault context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
+        "Use active source content first, then use the adaptive portfolio-level context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
@@ -2748,8 +3000,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Active source content:",
         sourceSummary || "",
         "",
-        "Ranked relevant vault context (required supporting context when available; excerpts are ordered and trimmed by relevance):",
-        formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
+        "Adaptive portfolio-level context for repairing task descriptions:",
+        adaptivePack.text || formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
@@ -2833,12 +3085,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return emptyScheduleTodayPreview(scheduleConfig, "No overdue tasks or tasks due within the configured window were found.");
       }
       const query = candidates.slice(0, 24).map((item) => item.searchText).join("\n");
-      const context = query ? await this.retrieveSemanticContext(query, Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6))) : [];
+      const context = query ? await this.retrieveAdaptiveSemanticContext(query, "schedule", Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6)), template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT) : [];
       const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, context, scheduleConfig);
       const taskContext = await this.buildTaskContext(null, context, query);
+      const adaptivePack = this.buildAdaptiveContextPack({
+        mode: "schedule",
+        prompt: [query, template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT].join("\n"),
+        sourceTitle: "Schedule today's tasks",
+        tasks: candidates,
+        context,
+        taskContext
+      });
+      const adaptiveSignalMatches = applyAdaptiveContextPackToScheduleCandidates(candidates, adaptivePack, scheduleConfig);
       const durationTriage = prepareScheduleDurationTriage(candidates, scheduleConfig, this.settings);
-      const durationEstimateModel = schedulerDurationEstimateModel(this.settings);
-      await this.estimateScheduleTodayDurations(durationTriage.aiCandidates, context, taskContext, scheduleConfig, template, {
+      const durationModelChoice = this.aiModelForRequest("schedule", {
+        prompt: [query, template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT].join("\n"),
+        context,
+        adaptivePack,
+        taskContext,
+        taskCount: durationTriage.aiCandidates.length
+      });
+      const durationEstimateModel = durationModelChoice.model || schedulerDurationEstimateModel(this.settings);
+      await this.estimateScheduleTodayDurations(durationTriage.aiCandidates, context, adaptivePack.text || taskContext, scheduleConfig, template, {
         force: true,
         totalMissing: durationTriage.totalMissing,
         model: durationEstimateModel
@@ -2858,6 +3126,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         split: preview.splitSubtasks.length,
         memoryMatches,
         semanticPriorityMatches,
+        adaptiveSignalMatches,
         durationAiCandidates: durationTriage.aiCandidates.length,
         durationLocalOnly: durationTriage.localOnlyCount,
         durationAiModel: modelDisplayName(durationEstimateModel)
@@ -2891,7 +3160,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       deadline: candidate.deadlineDate || "",
       parent: candidate.parentContent || "",
       note: candidate.path || "",
-      isSubtask: Boolean(candidate.isSubtask)
+      isSubtask: Boolean(candidate.isSubtask),
+      intent: candidate.intent || candidate.knowledge?.intent || "",
+      rationale: candidate.rationale || candidate.knowledge?.rationale || "",
+      outcomeType: candidate.outcomeType || candidate.knowledge?.outcomeType || ""
     }));
     let parsed = { estimates: [] };
     try {
@@ -2928,7 +3200,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Relevant vault context:",
           formatContext(context, Math.min(6000, this.settings.maxContextChars || 6000), this.settings, compactTasks.map((task) => task.title).join("\n")) || "No relevant vault context found.",
           "",
-          "Existing generated/synced task context from notes and the local Todoist reference table:",
+          "Adaptive task, meeting, project, and local reference context:",
           taskContext || "No matching local task context found."
         ].join("\n")
       }));
@@ -4710,6 +4982,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const path = vaultRelativePath(task.path, vaultBasePath(this.app));
     const pendingReference = oid ? this.settings.pendingTaskReferences?.[pendingTaskOidKey(path, oid)] : null;
     const parentReference = parentReferenceForParsedTask(task, this.settings) || {};
+    const knowledgeTask = Object.assign({}, task, {
+      oid,
+      path,
+      description,
+      parentId: task.parentId || task.parent_id || parentReference.id || pendingReference?.parentId || this.settings.taskCache?.[id]?.parentId || "",
+      parentOid: task.parentOid || parentReference.oid || pendingReference?.parentOid || this.settings.taskCache?.[id]?.parentOid || "",
+      parentContent: task.parentContent || parentReference.content || pendingReference?.parentContent || this.settings.taskCache?.[id]?.parentContent || "",
+      section: task.section || pendingReference?.section || "",
+      projectName: task.projectName || pendingReference?.projectName || this.settings.taskCache?.[id]?.projectName || ""
+    });
+    const knowledge = taskKnowledgeSnapshot(knowledgeTask, this.settings, "", this.settings.taskCache?.[id]?.knowledge || pendingReference?.knowledge || null);
     this.settings.taskCache[id] = {
       oid,
       path,
@@ -4733,6 +5016,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       projectId: task.projectId || task.project_id || pendingReference?.projectId || this.settings.taskCache?.[id]?.projectId || "",
       projectName: task.projectName || pendingReference?.projectName || this.settings.taskCache?.[id]?.projectName || "",
       noteRefs: mergeNoteReferences(this.settings.taskCache?.[id]?.noteRefs || [], [noteReferenceForTask(Object.assign({}, task, { path }), oid)]),
+      knowledge,
       signature: parsedTaskSignature(task),
       cachedAt: deviceTimestamp()
     };
@@ -4770,6 +5054,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         oid: task.oid,
         path: notePath,
         content: task.content || "",
+        description: task.description || "",
         section: task.section || "",
         sectionId: task.sectionId || "",
         projectId: task.projectId || "",
@@ -4778,6 +5063,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         parentId: "",
         parentOid: "",
         parentContent: "",
+        knowledge: taskKnowledgeSnapshot(Object.assign({}, task, { path: notePath }), this.settings, "", task.knowledge || null),
         createdAt
       };
       for (const subtask of task.subtasks || []) {
@@ -4789,11 +5075,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           parentContent: task.content || "",
           path: notePath,
           content: subtask.content || "",
+          description: "",
           section: task.section || "",
           sectionId: task.sectionId || "",
           projectId: subtask.projectId || task.projectId || "",
           projectName: subtask.projectName || task.projectName || "",
           isSubtask: true,
+          knowledge: taskKnowledgeSnapshot(Object.assign({}, subtask, {
+            path: notePath,
+            parentOid: task.oid || "",
+            parentId: task.id || "",
+            parentContent: task.content || "",
+            section: task.section || "",
+            projectName: subtask.projectName || task.projectName || ""
+          }), this.settings, "", subtask.knowledge || null),
           createdAt
         };
       }
@@ -5463,7 +5758,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderSetup(containerEl) {
     settingsHeading(containerEl, "Quick Setup", "Follow these steps in order. AI credentials and Todoist access are required for both workflows. Cloudflare is optional and only needed for Email-To-Todoist.");
-    settingsHeading(containerEl, "Step 1 - AI Provider", "Create a provider key in your browser, paste it below, then validate. Gemini is the default provider; OpenAI is optional.");
+    settingsHeading(containerEl, "Step 1 - AI Provider", "Create a provider key in your browser, paste it below, then validate. OpenAI is the default provider; Gemini remains optional.");
     setupStatusSetting(containerEl, "Open provider key pages", aiSetupSummary(this.plugin.settings), [
       ["Gemini API keys", () => this.plugin.openSetupUrl("https://aistudio.google.com/app/apikey")],
       ["Gemini instructions", () => this.plugin.openSetupUrl("https://ai.google.dev/gemini-api/docs/api-key")],
@@ -5477,6 +5772,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin);
+    toggleSetting(containerEl, "Use stronger model when locally justified", "Off by default. When enabled, broad portfolio questions, recency/conflict checks, complex task generation, and task descriptions can use the configured fallback model only when local context signals strongly justify it.", this.plugin, "enableStrongModelEscalation");
     toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
     new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
       try {
@@ -6635,11 +6931,12 @@ const SETTING_DESCRIPTIONS = {
   maxActiveNoteContextChars: "Maximum active-note characters sent to the AI for normal chat. Task creation can use a separate note limit.",
   promptTemplatesFolder: "Markdown files in this folder become reusable prompt actions. Frontmatter can set createTasks, insertResponse, syncTasks, and action: schedule-today.",
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
-  openaiApiKey: "Optional. Required only when you choose an OpenAI chat or embedding model.",
-  googleApiKey: "Required for the default Gemini setup. Create this in Google AI Studio and paste it here.",
-  chatFallbackModel: "Optional. Choose one same-provider fallback model for temporary overload or rate-limit errors. Leave Automatic to use the model shown in the dropdown.",
+  openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
+  googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
+  chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries. The same model can be used as the stronger model when local escalation is enabled.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
-  showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
+  enableStrongModelEscalation: "Off by default. Locally scores broad, recent/conflicting, multi-project, and action-heavy requests; high-scoring requests use the configured fallback/strong model without an extra routing AI call.",
+  showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback or stronger model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
@@ -6809,7 +7106,8 @@ function aiFallbackModelSetting(containerEl, plugin) {
     }
   } else {
     const primaryId = normalizeOpenAIModelId(primary);
-    for (const model of plugin.settings.availableChatModels || []) {
+    const openAiFallbackOptions = uniqueValues([plugin.settings.chatFallbackModel, DEFAULT_SETTINGS.chatFallbackModel].concat(plugin.settings.availableChatModels || []));
+    for (const model of openAiFallbackOptions) {
       const id = normalizeOpenAIModelId(model);
       if (id && id !== primaryId) options.push({ value: id, label: `Manual: OpenAI: ${id}` });
     }
@@ -7181,9 +7479,10 @@ function configuredAiModelSummary(plugin) {
   if (!settings.enableAiModelFallback) return `${primaryText}. Fallback: off.`;
   const fallback = plugin.sameProviderFallbackModels(primary)[0] || "";
   const mode = settings.chatFallbackModel ? "Manual" : "Automatic";
+  const escalation = settings.enableStrongModelEscalation ? " Strong-model gate: on." : " Strong-model gate: off.";
   return fallback
-    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.`
-    : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.`;
+    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.${escalation}`
+    : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.${escalation}`;
 }
 
 function modelProviderSummaries(settings) {
@@ -7268,6 +7567,7 @@ function buildTaskReferenceIndex(settings = DEFAULT_SETTINGS) {
   index.taskCount = index.entries.length;
   index.pendingReferenceCount = index.pendingReferences.length;
   for (const [id, task] of index.entries) {
+    if (task && typeof task === "object" && !task.knowledge?.intent) task.knowledge = taskKnowledgeSnapshot(task, settings, "", task.knowledge || null);
     index.byId.set(String(id), task);
     const oid = String(task?.oid || "").toUpperCase();
     if (oid) {
@@ -7291,6 +7591,7 @@ function buildTaskReferenceIndex(settings = DEFAULT_SETTINGS) {
   }
   index.childTextByParentOid = taskChildTextByParentOid(index.entries);
   for (const reference of index.pendingReferences) {
+    if (reference && typeof reference === "object" && !reference.knowledge?.intent) reference.knowledge = taskKnowledgeSnapshot(reference, settings, "", reference.knowledge || null);
     const oid = String(reference?.oid || "").toUpperCase();
     if (oid) index.usedOids.add(oid);
   }
@@ -7316,6 +7617,7 @@ function persistentTaskReferenceIndex(index = emptyTaskReferenceIndex()) {
       section: task?.section || "",
       scheduledDueDateTime: task?.scheduledDueDateTime || "",
       duration: normalizeTodoistDuration(task?.duration),
+      knowledge: compactTaskKnowledge(task?.knowledge),
       cachedAt: task?.cachedAt || ""
     }))]),
     paths: Array.from(index.cachedTaskPaths.values()).sort(),
@@ -7333,6 +7635,7 @@ function persistentTaskReferenceIndex(index = emptyTaskReferenceIndex()) {
       projectName: task?.projectName || "",
       scheduledDueDateTime: task?.scheduledDueDateTime || "",
       duration: normalizeTodoistDuration(task?.duration),
+      knowledge: compactTaskKnowledge(task?.knowledge),
       cachedAt: task?.cachedAt || ""
     }))])
   };
@@ -7440,6 +7743,7 @@ function hydrateCompactTaskReference(entry = {}, settings = DEFAULT_SETTINGS) {
     projectName: entry.projectName || "",
     scheduledDueDateTime: entry.scheduledDueDateTime || "",
     duration: normalizeTodoistDuration(entry.duration),
+    knowledge: compactTaskKnowledge(entry.knowledge),
     cachedAt: entry.cachedAt || ""
   };
 }
@@ -7457,6 +7761,7 @@ function dedupeTaskReferenceState(settings = DEFAULT_SETTINGS) {
       labels: uniqueValues((task.labels || []).map(cleanLabel).filter(Boolean)),
       noteRefs: mergeNoteReferences([], task.noteRefs || [])
     });
+    normalized.knowledge = taskKnowledgeSnapshot(normalized, settings, "", task.knowledge || null);
     const oid = String(normalized.oid || "").toUpperCase();
     const duplicateId = oid ? seenDuplicateOids.get(oid) : "";
     if (duplicateId) {
@@ -7480,6 +7785,7 @@ function dedupeTaskReferenceState(settings = DEFAULT_SETTINGS) {
     const normalized = Object.assign({}, reference, {
       labels: reference.labels ? uniqueValues((reference.labels || []).map(cleanLabel).filter(Boolean)) : reference.labels
     });
+    normalized.knowledge = taskKnowledgeSnapshot(normalized, settings, "", reference.knowledge || null);
     const key = pendingTaskOidKey(normalized.path || reference.path || "", normalized.oid);
     if (nextPending[key]) {
       nextPending[key] = Object.assign({}, nextPending[key], normalized);
@@ -8264,6 +8570,7 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
       const parent = task.parentId ? byId.get(task.parentId) || cache[task.parentId] || {} : {};
       const path = cached.path || "";
       const duration = normalizeTodoistDuration(task.duration || cached.duration);
+      const knowledge = compactTaskKnowledge(cached.knowledge || task.knowledge);
       const candidate = {
         id: task.id,
         content: task.content || cached.content || "",
@@ -8286,6 +8593,10 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
         path,
         lineNumber: cached.lineNumber,
         oid: cached.oid || "",
+        knowledge,
+        intent: knowledge?.intent || "",
+        rationale: knowledge?.rationale || "",
+        outcomeType: knowledge?.outcomeType || "",
         isCompleted: Boolean(task.isCompleted || cached.isCompleted),
         remoteDueDate: task.dueDate || "",
         remoteDuration: duration,
@@ -8293,7 +8604,7 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
         durationSource: duration ? "Todoist duration" : "",
         scheduledTimeFixed: isDateTimeString(dueDate),
         independentSubtask: false,
-        searchText: [task.content, task.description, cached.description, parent.content || cached.parentContent, path].filter(Boolean).join("\n")
+        searchText: [task.content, task.description, cached.description, knowledge?.intent, knowledge?.rationale, knowledge?.problem, knowledge?.outcome, knowledge?.dependency, parent.content || cached.parentContent, path].filter(Boolean).join("\n")
       };
       if (candidate.durationMinutes) {
         const adjustedDuration = scheduleDurationWithLocalPolicy(candidate, candidate.durationMinutes, config, durationPolicies);
@@ -8331,6 +8642,48 @@ function applySemanticContextToScheduleCandidates(candidates, context = [], conf
       matches += 1;
       candidate.semanticUrgency = Math.max(Number(candidate.semanticUrgency || 0), semanticScore);
     }
+    candidate.score = scheduleCandidateScore(candidate, config);
+  }
+  return matches;
+}
+
+function applyAdaptiveContextPackToScheduleCandidates(candidates, pack = {}, config = scheduleTodayConfig(DEFAULT_SETTINGS)) {
+  let matches = 0;
+  const taskCards = pack.taskCards || [];
+  const projectCards = pack.projectCards || [];
+  const noteCards = pack.noteCards || [];
+  for (const candidate of candidates || []) {
+    if (!candidate) continue;
+    const candidateText = singleLine([
+      candidate.id,
+      candidate.oid,
+      candidate.content,
+      candidate.description,
+      candidate.parentContent,
+      candidate.projectName,
+      candidate.section,
+      candidate.path,
+      ...(candidate.labels || [])
+    ].filter(Boolean).join(" ")).toLowerCase();
+    const taskMatch = taskCards.find((card) => {
+      if (card.id && String(card.id) === String(candidate.id)) return true;
+      if (card.path && candidate.path && card.path === candidate.path && card.title && candidate.content && singleLine(card.title).toLowerCase() === singleLine(candidate.content).toLowerCase()) return true;
+      return false;
+    });
+    const projectMatch = projectCards.find((card) => {
+      const name = singleLine(card.name || "").toLowerCase();
+      return name && candidateText.includes(name.toLowerCase());
+    });
+    const noteMatch = noteCards.find((card) => card.path && candidate.path && card.path === candidate.path);
+    const signal = (taskMatch ? 0.35 : 0) + (projectMatch ? 0.18 : 0) + (noteMatch ? 0.22 : 0);
+    if (signal <= 0) continue;
+    matches += 1;
+    const knowledge = taskMatch?.knowledge || candidate.knowledge || {};
+    candidate.semanticUrgency = Math.max(Number(candidate.semanticUrgency || 0), Math.min(1, Number(candidate.semanticUrgency || 0) + signal));
+    if (knowledge.intent && !candidate.intent) candidate.intent = knowledge.intent;
+    if (knowledge.rationale && !candidate.rationale) candidate.rationale = knowledge.rationale;
+    if (knowledge.outcomeType && !candidate.outcomeType) candidate.outcomeType = knowledge.outcomeType;
+    if (noteMatch?.recency) candidate.noteRecency = Math.max(Number(candidate.noteRecency || 0), recencyBoost(noteMatch.recency));
     candidate.score = scheduleCandidateScore(candidate, config);
   }
   return matches;
@@ -9401,6 +9754,8 @@ function referenceCacheEntry(id, task, settings = DEFAULT_SETTINGS, previous = n
   const description = task.isSubtask ? "" : sanitizeStoredTodoistDescription(task.description || previous?.description || "", settings);
   const noteRefs = mergeNoteReferences(previous?.noteRefs || [], [noteReferenceForTask(task, task.oid)]);
   const path = vaultRelativePath(task.path);
+  const knowledgeTask = Object.assign({}, task, { path, description });
+  const knowledge = taskKnowledgeSnapshot(knowledgeTask, settings, "", previous?.knowledge || null);
   return {
     oid: task.oid,
     path,
@@ -9424,6 +9779,7 @@ function referenceCacheEntry(id, task, settings = DEFAULT_SETTINGS, previous = n
     projectId: task.projectId || "",
     projectName: task.projectName || "",
     noteRefs,
+    knowledge,
     signature: parsedTaskSignature(task),
     cachedAt: deviceTimestamp(),
     rebuiltAt: deviceTimestamp()
@@ -10315,6 +10671,478 @@ function formatChatHistory(messages) {
   return lines.length ? lines.join("\n") : "No recent chat.";
 }
 
+function adaptiveContextBudget(mode = "chat") {
+  return ADAPTIVE_CONTEXT_MODE_BUDGETS[mode] || ADAPTIVE_CONTEXT_MODE_BUDGETS.chat;
+}
+
+function adaptiveContextDepth(mode = "chat", prompt = "") {
+  const budget = adaptiveContextBudget(mode);
+  if (mode === "description" || mode === "schedule") return budget.maxDepth;
+  const text = String(prompt || "");
+  if (BROAD_CONTEXT_QUERY_RE.test(text)) return budget.maxDepth;
+  if (TASK_ACTION_CONTEXT_RE.test(text)) return Math.min(budget.maxDepth, Math.max(budget.defaultDepth, 5));
+  return budget.defaultDepth;
+}
+
+function adaptiveSemanticRetrievalLimit(settings = DEFAULT_SETTINGS, mode = "chat", baseLimit = 8, prompt = "") {
+  const depth = adaptiveContextDepth(mode, prompt);
+  const budget = adaptiveContextBudget(mode);
+  const base = Math.max(1, Number(baseLimit || settings.maxChatContextChunks || 8));
+  const expanded = depth >= 7 ? Math.max(base * budget.retrievalMultiplier, budget.maxNotes * 2) : depth >= 5 ? Math.max(base, Math.ceil(base * 1.5)) : base;
+  return Math.max(base, Math.min(budget.maxRetrieval, expanded));
+}
+
+function modelEscalationSignals(mode = "chat", options = {}) {
+  const prompt = String(options.prompt || "");
+  const context = Array.isArray(options.context) ? options.context : [];
+  const pack = options.adaptivePack || {};
+  const taskCards = Array.isArray(pack.taskCards) ? pack.taskCards : [];
+  const projectCards = Array.isArray(pack.projectCards) ? pack.projectCards : [];
+  const paths = uniqueValues(context.map((chunk) => chunk?.path || "").filter(Boolean));
+  const projects = uniqueValues(paths.map(projectKeyFromPath).filter(Boolean));
+  const scores = context
+    .map((chunk) => Number(chunk?.matchScore ?? chunk?.score ?? 0))
+    .filter(Number.isFinite)
+    .sort((a, b) => b - a);
+  const topScore = scores[0] || 0;
+  const nearTopChunks = topScore ? scores.filter((score) => score >= topScore * 0.82).length : 0;
+  const dates = uniqueValues(context.map(contextDatePart).filter(Boolean)).sort();
+  const recencySpreadDays = dates.length > 1 ? Math.abs(daysBetweenLocalDates(dates[0], dates[dates.length - 1])) : 0;
+  const taskCount = Math.max(taskCards.length, Number(options.taskCount || 0));
+  return {
+    mode,
+    retrievedChunks: context.length,
+    uniqueNotes: paths.length,
+    projectDiversity: Math.max(projects.length, projectCards.length),
+    nearTopChunks,
+    taskCards: taskCount,
+    projectCards: projectCards.length,
+    dateMentions: dates.length,
+    recencySpreadDays,
+    broadPrompt: BROAD_CONTEXT_QUERY_RE.test(prompt),
+    recencyPrompt: RECENCY_OR_CONFLICT_QUERY_RE.test(prompt),
+    actionPrompt: TASK_ACTION_CONTEXT_RE.test(prompt),
+    validationRepair: options.validationRepair === true
+  };
+}
+
+function modelEscalationScore(mode = "chat", signals = {}) {
+  let score = 0;
+  if (mode === "description") score += 25;
+  else if (mode === "schedule") score += 18;
+  else if (mode === "task-generation") score += 16;
+  if (signals.validationRepair) score += 10;
+  if (signals.broadPrompt) score += 20;
+  if (signals.recencyPrompt) score += 14;
+  if (signals.actionPrompt) score += 8;
+  if (signals.projectDiversity >= 5) score += 16;
+  else if (signals.projectDiversity >= 3) score += 10;
+  if (signals.uniqueNotes >= 10) score += 12;
+  else if (signals.uniqueNotes >= 6) score += 8;
+  if (signals.nearTopChunks >= 8) score += 10;
+  else if (signals.nearTopChunks >= 4) score += 6;
+  if (signals.taskCards >= 12) score += 10;
+  else if (signals.taskCards >= 6) score += 6;
+  if (signals.projectCards >= 4) score += 8;
+  if (signals.recencySpreadDays >= 45 && signals.recencyPrompt) score += 12;
+  else if (signals.recencySpreadDays >= 14 && signals.recencyPrompt) score += 7;
+  return Math.min(100, score);
+}
+
+function modelEscalationReasons(mode = "chat", signals = {}, score = 0) {
+  const reasons = [];
+  if (mode === "description") reasons.push("portfolio-level task description");
+  if (mode === "task-generation") reasons.push("task-generation reasoning");
+  if (mode === "schedule") reasons.push("scheduler reasoning");
+  if (signals.broadPrompt) reasons.push("broad project or priority request");
+  if (signals.recencyPrompt) reasons.push("recency or conflicting-guidance request");
+  if (signals.actionPrompt) reasons.push("action or next-step selection");
+  if (signals.projectDiversity >= 3) reasons.push(`${signals.projectDiversity} project areas`);
+  if (signals.uniqueNotes >= 6) reasons.push(`${signals.uniqueNotes} relevant notes`);
+  if (signals.nearTopChunks >= 4) reasons.push("several similarly relevant context matches");
+  if (signals.recencySpreadDays >= 14 && signals.recencyPrompt) reasons.push(`${signals.recencySpreadDays} days of recency spread`);
+  if (score >= STRONG_MODEL_HARD_ESCALATION_THRESHOLD) reasons.push("near-maximum local complexity score");
+  return reasons.slice(0, 6);
+}
+
+function projectKeyFromPath(filePath = "") {
+  return String(filePath || "").split("/").filter(Boolean).slice(0, 3).join("/");
+}
+
+function contextDatePart(chunk = {}) {
+  const timestamp = Number(chunk.createdAt || chunk.modifiedAt || 0);
+  if (timestamp) return formatLocalDate(new Date(timestamp));
+  return datePartFromText(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`);
+}
+
+function datePartFromText(value = "") {
+  const text = String(value || "");
+  const iso = /\b(20\d{2})-(\d{2})-(\d{2})\b/.exec(text);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const long = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(20\d{2})\b/i.exec(text);
+  if (!long) return "";
+  const month = {
+    january: "01",
+    february: "02",
+    march: "03",
+    april: "04",
+    may: "05",
+    june: "06",
+    july: "07",
+    august: "08",
+    september: "09",
+    october: "10",
+    november: "11",
+    december: "12"
+  }[long[1].toLowerCase()];
+  return `${long[3]}-${month}-${String(long[2]).padStart(2, "0")}`;
+}
+
+function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT_SETTINGS, options = {}) {
+  const grouped = new Map();
+  for (const chunk of chunks || []) {
+    if (!chunk?.path) continue;
+    if (chunk.kind === "todoist-task-reference" || chunk.source === "local-reference-table") continue;
+    const source = sourceReference(chunk, options.basePath || "");
+    const existing = grouped.get(chunk.path) || {
+      path: chunk.path,
+      source,
+      title: chunk.title || chunk.path,
+      createdAt: Number(chunk.createdAt || 0),
+      modifiedAt: Number(chunk.modifiedAt || 0),
+      score: 0,
+      chunks: []
+    };
+    existing.createdAt = Math.max(existing.createdAt || 0, Number(chunk.createdAt || 0));
+    existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
+    existing.score = Math.max(existing.score || 0, Number(chunk.matchScore || 0));
+    existing.chunks.push(chunk);
+    grouped.set(chunk.path, existing);
+  }
+  const cards = [];
+  for (const group of grouped.values()) {
+    const text = group.chunks.map((chunk) => `${chunk.title || group.title}\n${chunk.text || ""}`).join("\n\n");
+    const signals = adaptiveContextSignals(text, query, group.title, group.path);
+    const excerpt = rankedContextExcerpt(text, query, settings);
+    const citationNumber = group.source && options.citationMap instanceof Map ? options.citationMap.get(group.source) : null;
+    const freshnessAt = group.createdAt || group.modifiedAt || 0;
+    cards.push({
+      title: group.title,
+      path: group.path,
+      source: group.source,
+      citationNumber,
+      type: signals.type,
+      score: (group.score || 0) + signals.score + recencyBoost(freshnessAt),
+      recency: freshnessAt,
+      people: signals.people,
+      outcomes: signals.outcomes,
+      problems: signals.problems,
+      dependencies: signals.dependencies,
+      nextSteps: signals.nextSteps,
+      decisions: signals.decisions,
+      topics: signals.topics,
+      evidence: truncateAtWord(excerpt, 950)
+    });
+  }
+  return cards
+    .sort((a, b) => b.score - a.score || b.recency - a.recency || a.path.localeCompare(b.path))
+    .slice(0, Math.max(1, options.maxCards || adaptiveContextBudget().maxNotes));
+}
+
+function adaptiveContextSignals(text = "", query = "", title = "", path = "") {
+  const sourceText = singleLine([title, path, text].filter(Boolean).join(" "));
+  const people = extractPeopleCandidates(sourceText);
+  const outcomes = signalSentences(text, /(outcome|result|resolved|resolution|put in place|implemented|finalized|approved|agreed|confirmed|decided|decision|next version|process|workflow)/i, 3);
+  const problems = signalSentences(text, /(problem|issue|risk|concern|unclear|blocked|blocker|gap|challenge|constraint|missing|waiting|delay|stuck)/i, 3);
+  const dependencies = signalSentences(text, /(depend|dependency|waiting|need(?:s|ed)?|requires?|approval|confirm|clarify|input|feedback|review from|blocked by)/i, 3);
+  const nextSteps = signalSentences(text, /(next step|action|todo|follow[-\s]?up|review|send|draft|update|share|schedule|coordinate|prepare|complete|finalize|ask|confirm)/i, 4);
+  const decisions = signalSentences(text, /(decided|decision|agreed|approved|confirmed|changed|superseded|current guidance|now use|will use|should use)/i, 3);
+  const topics = adaptiveTopics([title, path, query, text].join(" "));
+  const type = /meeting|discussion|touchbase|sync|call|agenda|minutes/i.test([title, path].join(" ")) ? "meeting note" : /email/i.test(path) ? "email note" : "vault note";
+  const score = Math.min(1.6, (people.length ? 0.15 : 0) + outcomes.length * 0.18 + problems.length * 0.16 + dependencies.length * 0.14 + nextSteps.length * 0.12 + decisions.length * 0.18);
+  return { type, score, people, outcomes, problems, dependencies, nextSteps, decisions, topics };
+}
+
+function signalSentences(text = "", pattern, limit = 3) {
+  const lines = String(text || "")
+    .split(/\n+/)
+    .flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()))
+    .map((line) => singleLine(line))
+    .filter((line) => line.length >= 24 && pattern.test(line));
+  const seen = new Set();
+  const unique = [];
+  for (const line of lines) {
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(truncateAtWord(line, 220));
+    if (unique.length >= limit) break;
+  }
+  return unique;
+}
+
+function adaptiveTopics(text = "", limit = 6) {
+  const counts = termCounts(text);
+  const stop = new Set(["task", "tasks", "todoist", "note", "notes", "meeting", "meetings", "project", "projects", "context", "source", "semantic", "sync", "review", "follow", "update", "need", "needs", "using", "with", "from", "that", "this", "have", "will", "your"]);
+  return Object.entries(counts)
+    .filter(([term]) => term.length >= 4 && !stop.has(term))
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([term]) => term);
+}
+
+function extractPeopleCandidates(text = "", limit = 8) {
+  const candidates = [];
+  const add = (value) => {
+    const clean = singleLine(value || "").replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "");
+    if (!clean || clean.length < 2 || clean.length > 40) return;
+    if (/^(The|This|That|Todoist|Semantic|Obsidian|Google|OpenAI|Gemini|Email|Project|Meeting|Source|Context|Task|Tasks|May|June|July|August|September|October|November|December|January|February|March|April)$/i.test(clean)) return;
+    if (!candidates.some((item) => item.toLowerCase() === clean.toLowerCase())) candidates.push(clean);
+  };
+  String(text || "").replace(/\b(?:with|from|to|for|by|ask|asked|email|meet(?:ing)? with|discussion with)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/g, (_, name) => {
+    add(name);
+    return _;
+  });
+  String(text || "").replace(/\b([A-Z][a-z]+)\s+(?:and|&)\s+([A-Z][a-z]+)\b/g, (_, first, second) => {
+    add(first);
+    add(second);
+    return _;
+  });
+  return candidates.slice(0, limit);
+}
+
+function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
+  const groups = new Map();
+  const add = (key, patch) => {
+    const cleanKey = singleLine(key || "").replace(/\.md$/i, "");
+    if (!cleanKey) return;
+    const group = groups.get(cleanKey) || { name: cleanKey, score: 0, notes: [], tasks: [], people: new Set(), topics: new Set(), problems: 0, outcomes: 0, nextSteps: 0 };
+    Object.assign(group, patch(group));
+    groups.set(cleanKey, group);
+  };
+  for (const card of noteCards || []) {
+    const project = noteProjectKey(card.path, card.title);
+    add(project, (group) => {
+      group.score += (card.score || 0) + recencyBoost(card.recency || 0);
+      group.notes.push(card);
+      for (const person of card.people || []) group.people.add(person);
+      for (const topic of card.topics || []) group.topics.add(topic);
+      group.problems += card.problems?.length || 0;
+      group.outcomes += card.outcomes?.length || 0;
+      group.nextSteps += card.nextSteps?.length || 0;
+      return group;
+    });
+  }
+  for (const card of taskCards || []) {
+    const project = card.project || noteProjectKey(card.path, card.title);
+    add(project, (group) => {
+      group.score += (card.score || 0) + (card.priority || 0) * 0.2;
+      group.tasks.push(card);
+      for (const person of card.knowledge?.people || []) group.people.add(person);
+      for (const topic of card.knowledge?.topics || []) group.topics.add(topic);
+      if (card.knowledge?.problem) group.problems += 1;
+      if (card.knowledge?.outcome) group.outcomes += 1;
+      if (card.knowledge?.nextStep) group.nextSteps += 1;
+      return group;
+    });
+  }
+  return Array.from(groups.values())
+    .map((group) => ({
+      name: group.name,
+      score: group.score,
+      noteCount: group.notes.length,
+      taskCount: group.tasks.length,
+      people: Array.from(group.people).slice(0, 6),
+      topics: Array.from(group.topics).slice(0, 8),
+      problems: group.problems,
+      outcomes: group.outcomes,
+      nextSteps: group.nextSteps,
+      topNotes: group.notes.slice(0, 3).map((note) => note.title),
+      topTasks: group.tasks.slice(0, 4).map((task) => task.title)
+    }))
+    .sort((a, b) => b.score - a.score || b.taskCount - a.taskCount || a.name.localeCompare(b.name))
+    .slice(0, Math.max(1, options.maxCards || adaptiveContextBudget().maxProjects));
+}
+
+function noteProjectKey(path = "", title = "") {
+  const parts = String(path || "").split("/").filter(Boolean);
+  if (parts.length >= 2) return parts.slice(0, Math.min(3, parts.length - 1)).join("/");
+  return parts[0]?.replace(/\.md$/i, "") || title || "Vault";
+}
+
+function uniqueAdaptiveTaskCards(cards = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const card of cards || []) {
+    const titleKey = singleLine(card.title).toLowerCase();
+    const pathTitleKey = `${card.path || ""}:${titleKey}`;
+    const keys = [card.id ? `id:${card.id}` : "", pathTitleKey !== ":" ? `path-title:${pathTitleKey}` : "", titleKey ? `title:${titleKey}` : ""].filter(Boolean);
+    if (!keys.length || keys.some((key) => seen.has(key))) continue;
+    for (const key of keys) seen.add(key);
+    unique.push(card);
+  }
+  return unique;
+}
+
+function taskKnowledgeSnapshot(task = {}, settings = DEFAULT_SETTINGS, childText = "", previous = null) {
+  const source = [
+    task.content,
+    task.description,
+    task.parentContent,
+    childText,
+    task.projectName,
+    task.section,
+    (task.labels || []).join(" ")
+  ].filter(Boolean).join("\n");
+  const fingerprint = shortHash(source);
+  if (previous?.fingerprint === fingerprint) return previous;
+  const signals = adaptiveContextSignals(source, task.content || "", task.content || "", task.path || "");
+  const outcomeType = classifyTaskOutcomeType(source);
+  const intent = deriveTaskIntent(task, outcomeType, signals);
+  const rationale = deriveTaskRationale(task, signals, intent);
+  return {
+    version: 1,
+    fingerprint,
+    intent,
+    rationale,
+    outcomeType,
+    problem: signals.problems[0] || "",
+    outcome: signals.outcomes[0] || "",
+    dependency: signals.dependencies[0] || "",
+    nextStep: signals.nextSteps[0] || "",
+    people: signals.people,
+    topics: signals.topics,
+    evidence: truncateAtWord([signals.problems[0], signals.outcomes[0], signals.dependencies[0], signals.nextSteps[0], task.description].filter(Boolean).join(" "), 700)
+  };
+}
+
+function compactTaskKnowledge(value = {}) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    version: value.version || 1,
+    fingerprint: value.fingerprint || "",
+    intent: value.intent || "",
+    rationale: value.rationale || "",
+    outcomeType: value.outcomeType || "",
+    problem: value.problem || "",
+    outcome: value.outcome || "",
+    dependency: value.dependency || "",
+    nextStep: value.nextStep || "",
+    people: (value.people || []).slice(0, 8),
+    topics: (value.topics || []).slice(0, 8),
+    evidence: truncateAtWord(value.evidence || "", 700)
+  };
+}
+
+function classifyTaskOutcomeType(text = "") {
+  const value = String(text || "").toLowerCase();
+  if (/follow[-\s]?up|check in|ask|confirm|clarify|coordinate|discuss|reply|email/.test(value)) return "follow-up or coordination";
+  if (/draft|write|prepare|create|develop|build|template|document|summary/.test(value)) return "create or document";
+  if (/review|read|assess|evaluate|analy[sz]e|compare/.test(value)) return "review or assess";
+  if (/decide|decision|approve|finali[sz]e|sign off/.test(value)) return "decision or approval";
+  if (/schedule|plan|timeline|workday|calendar/.test(value)) return "planning or scheduling";
+  if (/fix|resolve|repair|debug|correct|issue|problem|blocked/.test(value)) return "resolve a problem";
+  return "general action";
+}
+
+function deriveTaskIntent(task = {}, outcomeType = "general action", signals = {}) {
+  const title = singleLine(task.content || "this task");
+  const project = task.projectName ? ` for ${singleLine(task.projectName)}` : "";
+  const parent = task.parentContent ? ` as part of "${singleLine(task.parentContent)}"` : "";
+  if (signals.problems?.[0]) return `Resolve or move forward the issue behind "${title}"${project}${parent}.`;
+  if (signals.outcomes?.[0]) return `Put the captured outcome into action for "${title}"${project}${parent}.`;
+  if (signals.dependencies?.[0]) return `Clear the dependency or missing information needed for "${title}"${project}${parent}.`;
+  if (outcomeType === "follow-up or coordination") return `Move the related conversation, dependency, or handoff forward for "${title}"${project}${parent}.`;
+  if (outcomeType === "create or document") return `Create a useful artifact or process output for "${title}"${project}${parent}.`;
+  if (outcomeType === "review or assess") return `Review the relevant material so the next decision or action for "${title}" can proceed${project}${parent}.`;
+  if (outcomeType === "resolve a problem") return `Resolve the open problem or implementation gap represented by "${title}"${project}${parent}.`;
+  return `Complete the user-owned action represented by "${title}"${project}${parent}.`;
+}
+
+function deriveTaskRationale(task = {}, signals = {}, intent = "") {
+  const useful = signals.problems?.[0] || signals.outcomes?.[0] || signals.dependencies?.[0] || signals.decisions?.[0] || signals.nextSteps?.[0] || "";
+  if (useful) return truncateAtWord(useful, 280);
+  const description = cleanGeneratedDescriptionSummary(task.description || "");
+  if (description) return truncateAtWord(description, 280);
+  return truncateAtWord(intent, 280);
+}
+
+function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
+  const depth = Math.max(1, Math.min(7, Number(pack.depth || 4)));
+  const sections = [];
+  sections.push(`Adaptive context depth: ${depth}/7 (${ADAPTIVE_CONTEXT_TIERS.slice(0, depth).join(" -> ")}).`);
+  sections.push("Use this local-first context to understand why tasks exist, what they are trying to resolve or put in place, and which recent source notes should guide the answer.");
+  if (pack.active?.path || pack.sourceTitle) {
+    sections.push([
+      "Tier 1 - Active/source note:",
+      `- ${pack.sourceTitle || pack.active?.title || "Active source"}${pack.active?.path ? ` (${pack.active.path})` : ""}.`
+    ].join("\n"));
+  }
+  if (depth >= 6 && pack.projectCards?.length) {
+    sections.push(["Tier 6-7 - Project and portfolio context:"].concat(pack.projectCards.map(formatAdaptiveProjectCard)).join("\n"));
+  }
+  if (depth >= 2 && pack.taskCards?.length) {
+    sections.push(["Tier 2-3 - Task snapshots, intent, and rationale:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
+  } else if (depth >= 2 && pack.taskContext) {
+    sections.push(["Tier 2 - Existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
+  }
+  if (depth >= 4 && pack.noteCards?.length) {
+    sections.push(["Tier 4-5 - Origin meeting/outcome and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
+  }
+  return truncateMarkdownAtWord(sections.filter(Boolean).join("\n\n"), maxChars);
+}
+
+function formatAdaptiveTaskCard(card) {
+  const meta = [
+    card.status,
+    card.project ? `project: ${card.project}` : "",
+    card.section ? `section: ${card.section}` : "",
+    card.priority ? `priority: ${card.priority}` : "",
+    card.due ? `due: ${card.due}` : "",
+    card.deadline ? `deadline: ${card.deadline}` : ""
+  ].filter(Boolean).join("; ");
+  const parts = [
+    `- Task: ${card.todoistLink || card.title}${meta ? ` (${meta})` : ""}`,
+    card.parent ? `  Parent: ${card.parent}` : "",
+    card.knowledge?.intent ? `  Intent: ${card.knowledge.intent}` : "",
+    card.knowledge?.rationale ? `  Rationale: ${card.knowledge.rationale}` : "",
+    card.knowledge?.dependency ? `  Dependency/blocker: ${card.knowledge.dependency}` : "",
+    card.knowledge?.nextStep ? `  Next step signal: ${card.knowledge.nextStep}` : "",
+    card.knowledge?.people?.length ? `  People: ${card.knowledge.people.join(", ")}` : "",
+    card.path ? `  Source note: [${card.path}](obsidian://open?file=${encodeURIComponent(card.path)})` : ""
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function formatAdaptiveNoteCard(card) {
+  const heading = card.citationNumber
+    ? `- Context Note (${card.citationNumber}): [${card.title}](obsidian://open?file=${encodeURIComponent(card.path)})`
+    : `- Related note: [${card.title}](obsidian://open?file=${encodeURIComponent(card.path)})`;
+  const parts = [
+    `${heading} (${card.type || "vault note"})`,
+    card.people?.length ? `  People/entities: ${card.people.join(", ")}` : "",
+    card.decisions?.length ? `  Decisions/current guidance: ${card.decisions.join(" ")}` : "",
+    card.outcomes?.length ? `  Outcomes/resolutions: ${card.outcomes.join(" ")}` : "",
+    card.problems?.length ? `  Problems/open issues: ${card.problems.join(" ")}` : "",
+    card.dependencies?.length ? `  Dependencies: ${card.dependencies.join(" ")}` : "",
+    card.nextSteps?.length ? `  Next steps: ${card.nextSteps.join(" ")}` : "",
+    card.evidence ? `  Evidence excerpt: ${card.evidence}` : ""
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function formatAdaptiveProjectCard(card) {
+  const parts = [
+    `- Project/thread: ${card.name} (${card.noteCount} note${card.noteCount === 1 ? "" : "s"}, ${card.taskCount} task${card.taskCount === 1 ? "" : "s"})`,
+    card.people?.length ? `  People/entities: ${card.people.join(", ")}` : "",
+    card.topics?.length ? `  Topics: ${card.topics.join(", ")}` : "",
+    card.outcomes || card.problems || card.nextSteps ? `  Signals: ${card.outcomes} outcome/resolution, ${card.problems} problem/dependency, ${card.nextSteps} next-step mention${card.nextSteps === 1 ? "" : "s"}.` : "",
+    card.topNotes?.length ? `  Key notes: ${card.topNotes.join("; ")}` : "",
+    card.topTasks?.length ? `  Key tasks: ${card.topTasks.join("; ")}` : ""
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
 function embedBareMarkdownLinks(value) {
   const lines = String(value || "").split("\n");
   let inFence = false;
@@ -11043,12 +11871,14 @@ function formatCachedTaskReference(id, task, settings = DEFAULT_SETTINGS) {
   const path = task.path || "";
   const source = path ? ` Note: [${path}](obsidian://open?file=${encodeURIComponent(path)}).` : "";
   const title = task.content || "Untitled task";
-  return `- ${status}: ${title}.${due}${labels} Todoist: ${todoistTaskMarkdownLink(id, settings, title)}. OID: ${task.oid || "unknown"}.${source}`;
+  const intent = task.knowledge?.intent ? ` Intent: ${task.knowledge.intent}` : "";
+  return `- ${status}: ${title}.${due}${labels}${intent} Todoist: ${todoistTaskMarkdownLink(id, settings, title)}. OID: ${task.oid || "unknown"}.${source}`;
 }
 
 function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childText = "") {
   const content = singleLine(task?.content || "");
   if (!content) return "";
+  const knowledge = task?.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, settings, childText, task?.knowledge || null);
   const parts = [
     task?.isSubtask ? "Todoist subtask" : "Todoist task",
     task?.isCompleted ? "completed" : "open",
@@ -11065,6 +11895,10 @@ function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childT
   if (task?.section) parts.push(`section: ${singleLine(task.section)}`);
   if (task?.projectName) parts.push(`project: ${singleLine(task.projectName)}`);
   if (task?.description && !task?.isSubtask) parts.push(`description: ${truncateAtWord(cleanGeneratedDescriptionSummary(task.description, settings), 160)}`);
+  if (knowledge?.intent) parts.push(`intent: ${truncateAtWord(knowledge.intent, 180)}`);
+  if (knowledge?.rationale) parts.push(`rationale: ${truncateAtWord(knowledge.rationale, 220)}`);
+  if (knowledge?.outcomeType) parts.push(`outcome type: ${knowledge.outcomeType}`);
+  if (knowledge?.dependency) parts.push(`dependency: ${truncateAtWord(knowledge.dependency, 160)}`);
   if (task?.oid) parts.push(`oid: ${task.oid}`);
   return `- ${parts.filter(Boolean).join(". ")}.`;
 }
@@ -11542,6 +12376,11 @@ function usesGeminiEmbeddingModel(value) {
 function usesOpenAIEmbeddingModel(value) {
   return !usesGeminiEmbeddingModel(value);
 }
+function modelIdentity(value) {
+  if (usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value)) return `gemini:${normalizeGeminiModelId(value).toLowerCase()}`;
+  if (usesOpenAIChatModel(value) || usesOpenAIEmbeddingModel(value)) return `openai:${normalizeOpenAIModelId(value).toLowerCase()}`;
+  return String(value || "").trim().toLowerCase();
+}
 function isDeprecatedGeminiChatModel(value) {
   const model = normalizeGeminiModelId(value).toLowerCase();
   return model === "gemini-2.0-flash";
@@ -11598,8 +12437,7 @@ function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
     }
   }
   if (usesOpenAIChatModel(primary) && settings.chatFallbackModel && usesOpenAIChatModel(settings.chatFallbackModel)) {
-    const fallback = normalizeOpenAIModelId(settings.chatFallbackModel);
-    if (fallback && fallback !== normalizeOpenAIModelId(primary)) return fallback;
+    return normalizeOpenAIModelId(primary);
   }
   return primary;
 }

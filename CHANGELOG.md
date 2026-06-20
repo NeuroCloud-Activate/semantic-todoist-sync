@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.11
+
+- Changed the default AI setup to OpenAI, using GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback/strong model, and `text-embedding-3-large` for semantic vault indexing.
+- Added an off-by-default strong-model gate that locally scores broad, recent/conflicting, multi-project, and action-heavy requests before using the configured stronger model, without making an extra AI routing call.
+- Wired the local model gate into chat, task generation, task descriptions, description improvement, and scheduler duration estimation while keeping routine scheduler previews on the primary model unless escalation is clearly justified.
+- Hardened the Todoist References settings table so wide columns keep their minimum widths and scroll horizontally instead of collapsing into unreadable one-character columns.
+
 ## 0.6.10
 
 - Improved dark-mode sidebar chat links so embedded note and task links are easier to read while still standing apart from normal response text.

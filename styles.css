@@ -11,14 +11,19 @@
 }
 
 .semantic-todoist-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   flex-wrap: nowrap;
   gap: 6px;
-  margin: 12px 0 18px;
+  margin: 8px 0 16px;
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
-  padding-bottom: 2px;
+  padding: 8px 0 7px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -26,6 +31,7 @@
   flex: 0 0 auto;
   border-radius: 6px;
   min-height: 36px;
+  scroll-margin-inline: 16px;
   white-space: nowrap;
 }
 
@@ -332,23 +338,24 @@
 }
 
 .semantic-todoist-relevant strong {
-  display: inline-block;
-  margin: 0 6px 0 0;
+  display: block;
+  margin: 0 0 4px 0;
   color: var(--text-normal);
 }
 
 .semantic-todoist-source-tabs {
-  display: inline-flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 4px;
-  vertical-align: middle;
+  width: 100%;
 }
 
 .semantic-todoist-source-card {
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   padding: 2px 7px;
-  max-width: 18ch;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -478,6 +485,28 @@
   margin-block: 0;
 }
 
+.semantic-todoist-message-text a {
+  color: var(--link-color);
+  font-weight: 600;
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.14em;
+}
+
+.theme-dark .semantic-todoist-message-assistant .semantic-todoist-message-text a {
+  color: var(--semantic-todoist-chat-link-color-dark, #9dccff);
+}
+
+.theme-dark .semantic-todoist-message-assistant .semantic-todoist-message-text a:hover,
+.theme-dark .semantic-todoist-message-assistant .semantic-todoist-message-text a:focus {
+  color: var(--semantic-todoist-chat-link-hover-color-dark, #c7e4ff);
+}
+
+.semantic-todoist-message-user .semantic-todoist-message-text a {
+  color: var(--text-on-accent);
+  text-decoration-color: var(--text-on-accent);
+}
+
 .semantic-todoist-message-text ul,
 .semantic-todoist-message-text ol {
   padding-inline-start: 1.3em;
@@ -576,7 +605,7 @@
 }
 
 .semantic-todoist-reference-table-wrap {
-  max-height: 520px;
+  max-height: min(520px, 58vh);
   max-width: 100%;
   overflow: auto;
   border: 1px solid var(--background-modifier-border);
@@ -586,8 +615,8 @@
 }
 
 .semantic-todoist-reference-table {
-  width: 100%;
-  min-width: 2720px;
+  width: 3460px;
+  min-width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: var(--font-ui-smaller);
@@ -598,9 +627,11 @@
   border-bottom: 1px solid var(--background-modifier-border);
   padding: 6px 8px;
   text-align: left;
-  vertical-align: top;
-  white-space: normal;
-  overflow-wrap: anywhere;
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
 }
 
 .semantic-todoist-reference-table th {
@@ -617,7 +648,7 @@
 .semantic-todoist-reference-table td:nth-child(2) { width: 126px; }
 
 .semantic-todoist-reference-table th:nth-child(3),
-.semantic-todoist-reference-table td:nth-child(3) { width: 240px; }
+.semantic-todoist-reference-table td:nth-child(3) { width: 320px; }
 
 .semantic-todoist-reference-table th:nth-child(4),
 .semantic-todoist-reference-table td:nth-child(4) { width: 74px; }
@@ -628,7 +659,7 @@
 .semantic-todoist-reference-table td:nth-child(6) { width: 104px; }
 
 .semantic-todoist-reference-table th:nth-child(7),
-.semantic-todoist-reference-table td:nth-child(7) { width: 170px; }
+.semantic-todoist-reference-table td:nth-child(7) { width: 92px; }
 
 .semantic-todoist-reference-table th:nth-child(8),
 .semantic-todoist-reference-table td:nth-child(8),
@@ -639,24 +670,31 @@
 .semantic-todoist-reference-table td:nth-child(9) { width: 190px; }
 
 .semantic-todoist-reference-table th:nth-child(11),
-.semantic-todoist-reference-table td:nth-child(11) { width: 90px; }
+.semantic-todoist-reference-table td:nth-child(11) { width: 160px; }
 
 .semantic-todoist-reference-table th:nth-child(12),
 .semantic-todoist-reference-table td:nth-child(12) { width: 140px; }
 
 .semantic-todoist-reference-table th:nth-child(13),
-.semantic-todoist-reference-table td:nth-child(13) { width: 220px; }
+.semantic-todoist-reference-table td:nth-child(13) { width: 112px; }
 
 .semantic-todoist-reference-table th:nth-child(14),
-.semantic-todoist-reference-table td:nth-child(14),
-.semantic-todoist-reference-table th:nth-child(16),
-.semantic-todoist-reference-table td:nth-child(16) { width: 260px; }
+.semantic-todoist-reference-table td:nth-child(14) { width: 142px; }
 
 .semantic-todoist-reference-table th:nth-child(15),
-.semantic-todoist-reference-table td:nth-child(15) { width: 300px; }
+.semantic-todoist-reference-table td:nth-child(15) { width: 320px; }
+
+.semantic-todoist-reference-table th:nth-child(16),
+.semantic-todoist-reference-table td:nth-child(16) { width: 360px; }
 
 .semantic-todoist-reference-table th:nth-child(17),
-.semantic-todoist-reference-table td:nth-child(17) { width: 110px; }
+.semantic-todoist-reference-table td:nth-child(17) { width: 420px; }
+
+.semantic-todoist-reference-table th:nth-child(18),
+.semantic-todoist-reference-table td:nth-child(18) { width: 320px; }
+
+.semantic-todoist-reference-table th:nth-child(19),
+.semantic-todoist-reference-table td:nth-child(19) { width: 100px; }
 
 .semantic-todoist-prompt-textarea {
   width: 100%;
@@ -1280,28 +1318,26 @@
 
 .is-mobile .semantic-todoist-relevant {
   padding: 5px 7px;
-  max-height: 42px;
+  max-height: 74px;
   overflow: hidden;
 }
 
 .is-mobile .semantic-todoist-relevant {
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .is-mobile .semantic-todoist-source-tabs {
-  display: inline-flex;
-  flex-wrap: nowrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   max-width: 100%;
-  width: calc(100% - 92px);
-  overflow-x: auto;
+  width: 100%;
+  overflow-x: hidden;
   overflow-y: hidden;
   padding-bottom: 1px;
-  -webkit-overflow-scrolling: touch;
 }
 
 .is-mobile .semantic-todoist-source-card {
-  flex: 0 0 auto;
-  max-width: 15ch;
+  max-width: 100%;
 }
 
 .is-mobile .semantic-todoist-message {

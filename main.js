@@ -132,10 +132,10 @@ const DEFAULT_SETTINGS = {
   todoistToken: "",
   workerUrl: "",
   workerToken: "",
+  aiModelProvider: "openai",
   chatModel: "gpt-5.4-mini",
   chatFallbackModel: "gpt-5.4",
   enableAiModelFallback: true,
-  enableStrongModelEscalation: false,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
   embeddingModel: "text-embedding-3-large",
@@ -707,12 +707,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       changed = true;
     }
-    if (!this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatModel)) {
-      this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
+    const normalizedProviderSetting = normalizeAiProvider(this.settings.aiModelProvider, aiProviderForModel(this.settings.chatModel));
+    if (this.settings.aiModelProvider !== normalizedProviderSetting) {
+      this.settings.aiModelProvider = normalizedProviderSetting;
       changed = true;
     }
-    if (typeof this.settings.enableStrongModelEscalation !== "boolean") {
-      this.settings.enableStrongModelEscalation = DEFAULT_SETTINGS.enableStrongModelEscalation;
+    if (Object.prototype.hasOwnProperty.call(this.settings, "enableStrongModelEscalation")) {
+      delete this.settings.enableStrongModelEscalation;
+      changed = true;
+    }
+    if (!this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatModel)) {
+      this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
       changed = true;
     }
     const dedupeDefaults = {
@@ -742,6 +747,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (!Array.isArray(this.settings.availableGeminiEmbeddingModels) || !this.settings.availableGeminiEmbeddingModels.length) {
       this.settings.availableGeminiEmbeddingModels = DEFAULT_SETTINGS.availableGeminiEmbeddingModels;
+      changed = true;
+    }
+    const preferredProvider = normalizeAiProvider(this.settings.aiModelProvider, aiProviderForModel(this.settings.chatModel));
+    if ((preferredProvider === "gemini" && !usesGeminiChatModel(this.settings.chatModel)) || (preferredProvider === "openai" && !usesOpenAIChatModel(this.settings.chatModel))) {
+      this.settings.chatModel = preferredChatModelForProvider(this.settings, preferredProvider);
+      this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, preferredProvider, this.settings.chatModel);
+      this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, preferredProvider);
       changed = true;
     }
     if (usesGeminiChatModel(this.settings.chatModel) && !usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
@@ -1294,8 +1306,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async setChatModel(value) {
     this.settings.chatModel = value;
+    this.settings.aiModelProvider = aiProviderForModel(value);
+    this.ensureSameProviderFallbackModel();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.saveSettings();
+  }
+
+  async setAiModelProvider(value) {
+    const provider = normalizeAiProvider(value, this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel));
+    const beforeEmbedding = this.settings.embeddingModel;
+    this.settings.aiModelProvider = provider;
+    this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
+    this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
+    this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, provider);
+    if (this.settings.embeddingModel !== beforeEmbedding) {
+      this.queryEmbeddingCache?.clear?.();
+      this.semanticIndexLoaded = false;
+      this.semanticIndex = [];
+      this.semanticIndexPathMeta?.clear?.();
+      this.semanticIndexPathMetaSnapshotFingerprint = "";
+      await this.loadSemanticIndex();
+    }
+    await this.saveSettings();
+  }
+
+  ensureSameProviderFallbackModel() {
+    const provider = aiProviderForModel(this.settings.chatModel);
+    const fallback = this.settings.chatFallbackModel || "";
+    if ((provider === "gemini" && usesGeminiChatModel(fallback)) || (provider === "openai" && usesOpenAIChatModel(fallback))) return;
+    this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
   }
 
   async setEmbeddingModel(value) {
@@ -2570,26 +2609,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   strongModelEscalationDecision(mode, options = {}) {
     const primary = options.primaryModel || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
-    const strongModel = this.strongModelForPrimary(primary);
-    const signals = modelEscalationSignals(mode, options);
-    const score = modelEscalationScore(mode, signals);
-    const sameModel = !strongModel || modelIdentity(strongModel) === modelIdentity(primary);
-    const enabled = this.settings.enableStrongModelEscalation === true;
-    const synthesisPattern = signals.broadPrompt && signals.recencyPrompt && signals.actionPrompt;
-    const highValuePattern = synthesisPattern
-      || signals.validationRepair
-      || mode === "description"
-      || (mode === "task-generation" && (signals.broadPrompt || signals.recencyPrompt));
-    const scheduleNeedsSynthesis = mode !== "schedule" || (signals.recencyPrompt && (signals.broadPrompt || signals.actionPrompt));
-    const useStrong = enabled && !sameModel && scheduleNeedsSynthesis && highValuePattern && score >= STRONG_MODEL_ESCALATION_THRESHOLD;
     return {
-      model: useStrong ? strongModel : primary,
+      model: primary,
       primaryModel: primary,
-      strongModel,
-      useStrong,
-      score,
-      signals,
-      reasons: modelEscalationReasons(mode, signals, score)
+      strongModel: "",
+      useStrong: false,
+      score: 0,
+      signals: {},
+      reasons: []
     };
   }
 
@@ -6053,13 +6080,13 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     ]);
     secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
     secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
+    aiProviderSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "AI Models", "Choose the primary chat model, one same-provider fallback, and the embedding model used for semantic vault indexing.");
     new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
     modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels");
     modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin);
-    toggleSetting(containerEl, "Use stronger model when locally justified", "Off by default. When enabled, broad portfolio questions, recency/conflict checks, complex task generation, and task descriptions can use the configured fallback model only when local context signals strongly justify it.", this.plugin, "enableStrongModelEscalation");
     toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
     new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
       try {
@@ -6379,7 +6406,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Reference rebuild worker count", this.plugin, "referenceRebuildWorkerCount");
     numberSetting(containerEl, "Todoist snapshot cache minutes", this.plugin, "todoistSnapshotCacheMinutes");
     new Setting(containerEl).setName("Last automatic rebuild").setDesc(this.plugin.settings.lastReferenceRebuildAt || "Not yet rebuilt.");
-    new Setting(containerEl).setName("Rebuild local reference table").setDesc("Read-only Todoist reconciliation. Scans vault task references, rebuilds the local OID table from Todoist, and recovers missing Todoist IDs for OID-only note tasks by exact task-name matching. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => {
+    const rebuildSetting = new Setting(containerEl).setName("Rebuild local reference table").setDesc("Read-only Todoist reconciliation. Scans vault task references, rebuilds the local OID table from Todoist, and recovers missing Todoist IDs for OID-only note tasks by exact task-name matching. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => {
       try {
         await this.plugin.rebuildTodoistReferenceTable(true);
         this.display();
@@ -6390,6 +6417,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
         this.display();
       } catch {}
     }));
+    rebuildSetting.settingEl.addClass("semantic-todoist-reference-action-setting");
     new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
     const rows = referenceRows(this.plugin.settings);
     containerEl.createDiv({ text: `${rows.length} local reference${rows.length === 1 ? "" : "s"}.` });
@@ -7246,10 +7274,10 @@ const SETTING_DESCRIPTIONS = {
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
   googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
-  chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries. The same model can be used as the stronger model when local escalation is enabled.",
+  aiModelProvider: "Choose which provider to prefer when both OpenAI and Gemini API keys are saved. Model dropdowns follow this provider.",
+  chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
-  enableStrongModelEscalation: "Off by default. Locally scores broad, recent/conflicting, multi-project, and action-heavy requests; high-scoring requests use the configured fallback/strong model without an extra routing AI call.",
-  showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback or stronger model answered the question.",
+  showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
@@ -7390,6 +7418,21 @@ function textSetting(containerEl, name, desc, plugin, key) {
     plugin.settings[key] = key === "workerUrl" ? normalizeHttpsUrl(value) : value;
     await plugin.saveSettings();
   }));
+}
+
+function aiProviderSetting(containerEl, plugin, refreshDisplay) {
+  const current = normalizeAiProvider(plugin.settings.aiModelProvider, aiProviderForModel(plugin.settings.chatModel));
+  new Setting(containerEl)
+    .setName("Preferred AI provider")
+    .setDesc(settingDescription("Preferred AI provider", "aiModelProvider"))
+    .addDropdown((dropdown) => {
+      dropdown.addOption("openai", "OpenAI");
+      dropdown.addOption("gemini", "Google Gemini");
+      dropdown.setValue(current).onChange(async (value) => {
+        await plugin.setAiModelProvider(value);
+        if (refreshDisplay) refreshDisplay();
+      });
+    });
 }
 
 function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
@@ -7771,10 +7814,10 @@ function yesNo(value) {
 }
 
 function aiSetupSummary(settings) {
-  const provider = usesGeminiChatModel(settings.chatModel) ? "Gemini" : usesOpenAIChatModel(settings.chatModel) ? "OpenAI" : "AI";
-  const keyReady = usesGeminiChatModel(settings.chatModel) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
+  const provider = normalizeAiProvider(settings.aiModelProvider, aiProviderForModel(settings.chatModel));
+  const keyReady = provider === "gemini" ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
   const embeddingReady = usesGeminiEmbeddingModel(settings.embeddingModel) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
-  return `${provider} is selected. Chat key: ${keyReady ? "set" : "missing"}. Embedding key: ${embeddingReady ? "set" : "missing"}. Model list: ${settings.modelsFetchedAt || settings.geminiModelsFetchedAt ? "loaded" : "not loaded"}.`;
+  return `${providerDisplayName(provider)} is preferred. Chat key: ${keyReady ? "set" : "missing"}. Embedding key: ${embeddingReady ? "set" : "missing"}. Model list: ${settings.modelsFetchedAt || settings.geminiModelsFetchedAt ? "loaded" : "not loaded"}.`;
 }
 
 function aiAccessConfigured(settings) {
@@ -7839,14 +7882,13 @@ function modelSummary(settings) {
 function configuredAiModelSummary(plugin) {
   const settings = plugin.settings || DEFAULT_SETTINGS;
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
-  const primaryText = `Primary: ${modelDisplayName(primary)}`;
+  const primaryText = `Provider: ${providerDisplayName(settings.aiModelProvider || aiProviderForModel(primary))}. Primary: ${modelDisplayName(primary)}`;
   if (!settings.enableAiModelFallback) return `${primaryText}. Fallback: off.`;
   const fallback = plugin.sameProviderFallbackModels(primary)[0] || "";
   const mode = settings.chatFallbackModel ? "Manual" : "Automatic";
-  const escalation = settings.enableStrongModelEscalation ? " Strong-model gate: on." : " Strong-model gate: off.";
   return fallback
-    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.${escalation}`
-    : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.${escalation}`;
+    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.`
+    : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.`;
 }
 
 function modelProviderSummaries(settings) {
@@ -12853,6 +12895,15 @@ function shortHash(value) {
   }
   return (hash >>> 0).toString(36);
 }
+function normalizeAiProvider(value, fallback = "openai") {
+  const provider = String(value || "").toLowerCase();
+  if (provider === "gemini" || provider === "google") return "gemini";
+  if (provider === "openai" || provider === "open-ai") return "openai";
+  return fallback === "gemini" ? "gemini" : "openai";
+}
+function providerDisplayName(provider) {
+  return normalizeAiProvider(provider) === "gemini" ? "Gemini" : "OpenAI";
+}
 function normalizeOpenAIModelId(value) {
   return String(value || "").replace(/^openai[/:]/i, "").trim();
 }
@@ -12876,6 +12927,9 @@ function usesGeminiEmbeddingModel(value) {
 }
 function usesOpenAIEmbeddingModel(value) {
   return !usesGeminiEmbeddingModel(value);
+}
+function aiProviderForModel(value) {
+  return usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value) ? "gemini" : "openai";
 }
 function modelIdentity(value) {
   if (usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value)) return `gemini:${normalizeGeminiModelId(value).toLowerCase()}`;
@@ -12922,6 +12976,66 @@ function rankGeminiPrimaryModels(models = []) {
   };
   return list.sort((a, b) => score(a) - score(b) || a.localeCompare(b));
 }
+function openAiChatModels(settings = DEFAULT_SETTINGS) {
+  return uniqueValues((settings.availableChatModels?.length ? settings.availableChatModels : DEFAULT_SETTINGS.availableChatModels)
+    .map(normalizeOpenAIModelId)
+    .filter(Boolean));
+}
+function openAiEmbeddingModels(settings = DEFAULT_SETTINGS) {
+  return uniqueValues((settings.availableEmbeddingModels?.length ? settings.availableEmbeddingModels : DEFAULT_SETTINGS.availableEmbeddingModels)
+    .map(normalizeOpenAIModelId)
+    .filter(Boolean));
+}
+function geminiChatModels(settings = DEFAULT_SETTINGS) {
+  return rankGeminiPrimaryModels(settings.availableGeminiModels?.length ? settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels);
+}
+function geminiEmbeddingModels(settings = DEFAULT_SETTINGS) {
+  return uniqueValues((settings.availableGeminiEmbeddingModels?.length ? settings.availableGeminiEmbeddingModels : DEFAULT_SETTINGS.availableGeminiEmbeddingModels)
+    .map(normalizeGeminiModelId)
+    .filter(Boolean));
+}
+function preferredChatModelForProvider(settings = DEFAULT_SETTINGS, provider = "openai") {
+  const normalized = normalizeAiProvider(provider);
+  const current = settings.chatModel || DEFAULT_SETTINGS.chatModel;
+  if (normalized === "gemini") {
+    if (usesGeminiChatModel(current) && isUsableGeminiChatModel(current)) return `gemini/${normalizeGeminiModelId(current)}`;
+    const models = geminiChatModels(settings);
+    const preferred = models.includes("gemini-3.5-flash") ? "gemini-3.5-flash" : models[0] || "gemini-3.5-flash";
+    return `gemini/${preferred}`;
+  }
+  if (usesOpenAIChatModel(current)) return normalizeOpenAIModelId(current);
+  const models = openAiChatModels(settings);
+  return models.includes(DEFAULT_SETTINGS.chatModel) ? DEFAULT_SETTINGS.chatModel : models[0] || DEFAULT_SETTINGS.chatModel;
+}
+function preferredFallbackModelForProvider(settings = DEFAULT_SETTINGS, provider = "openai", primaryModel = "") {
+  const normalized = normalizeAiProvider(provider);
+  if (normalized === "gemini") {
+    const primary = normalizeGeminiModelId(primaryModel || preferredChatModelForProvider(settings, normalized));
+    const manual = settings.chatFallbackModel && usesGeminiChatModel(settings.chatFallbackModel) ? normalizeGeminiModelId(settings.chatFallbackModel) : "";
+    const models = rankGeminiFallbackModels(geminiChatModels(settings));
+    const preferred = uniqueValues([manual, "gemini-3.1-flash-lite"].concat(models))
+      .find((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary);
+    return preferred ? `gemini/${normalizeGeminiModelId(preferred)}` : "";
+  }
+  const primary = normalizeOpenAIModelId(primaryModel || preferredChatModelForProvider(settings, normalized));
+  const manual = settings.chatFallbackModel && usesOpenAIChatModel(settings.chatFallbackModel) ? normalizeOpenAIModelId(settings.chatFallbackModel) : "";
+  const models = openAiChatModels(settings);
+  return uniqueValues([manual, DEFAULT_SETTINGS.chatFallbackModel].concat(models))
+    .find((model) => normalizeOpenAIModelId(model) && normalizeOpenAIModelId(model) !== primary) || "";
+}
+function preferredEmbeddingModelForProvider(settings = DEFAULT_SETTINGS, provider = "openai") {
+  const normalized = normalizeAiProvider(provider);
+  const current = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  if (normalized === "gemini") {
+    if (usesGeminiEmbeddingModel(current)) return `gemini/${normalizeGeminiModelId(current)}`;
+    const models = geminiEmbeddingModels(settings);
+    const preferred = models.includes("gemini-embedding-2") ? "gemini-embedding-2" : models[0] || "gemini-embedding-2";
+    return `gemini/${preferred}`;
+  }
+  if (usesOpenAIEmbeddingModel(current)) return normalizeOpenAIModelId(current);
+  const models = openAiEmbeddingModels(settings);
+  return models.includes(DEFAULT_SETTINGS.embeddingModel) ? DEFAULT_SETTINGS.embeddingModel : models[0] || DEFAULT_SETTINGS.embeddingModel;
+}
 function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
   if (usesGeminiChatModel(primary)) {
@@ -12944,19 +13058,24 @@ function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
 }
 function aiModelOptions(settings, key, listKey) {
   const options = [];
+  const provider = normalizeAiProvider(settings.aiModelProvider, aiProviderForModel(settings.chatModel));
   if (key === "chatModel") {
-    for (const model of settings.availableChatModels || []) options.push({ value: model, label: `OpenAI: ${model}` });
-    const geminiModels = settings.availableGeminiModels?.length ? settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
-    for (const model of rankGeminiPrimaryModels(geminiModels)) {
-      const id = normalizeGeminiModelId(model);
-      if (isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
+    if (provider === "openai") {
+      for (const model of openAiChatModels(settings)) options.push({ value: model, label: `OpenAI: ${model}` });
+    } else {
+      for (const model of geminiChatModels(settings)) {
+        const id = normalizeGeminiModelId(model);
+        if (isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
+      }
     }
     return uniqueModelOptions(options);
   }
   if (key === "embeddingModel") {
-    for (const model of settings.availableEmbeddingModels || []) options.push({ value: model, label: `OpenAI: ${model}` });
-    const geminiModels = settings.availableGeminiEmbeddingModels?.length ? settings.availableGeminiEmbeddingModels : DEFAULT_SETTINGS.availableGeminiEmbeddingModels;
-    for (const model of geminiModels) options.push({ value: `gemini/${normalizeGeminiModelId(model)}`, label: `Gemini: ${normalizeGeminiModelId(model)}` });
+    if (provider === "openai") {
+      for (const model of openAiEmbeddingModels(settings)) options.push({ value: model, label: `OpenAI: ${model}` });
+    } else {
+      for (const model of geminiEmbeddingModels(settings)) options.push({ value: `gemini/${normalizeGeminiModelId(model)}`, label: `Gemini: ${normalizeGeminiModelId(model)}` });
+    }
     return uniqueModelOptions(options);
   }
   return (settings[listKey] || []).map((model) => ({ value: model, label: model }));

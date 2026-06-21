@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.14
+
+- Removed the separate "Use stronger model when locally justified" setting so AI requests follow the configured primary model and only use the fallback model for same-provider transient failures.
+- Added a preferred AI provider selector in Setup so OpenAI and Gemini keys can both be saved without mixed-provider model choices.
+- Fixed the References tab rebuild controls so long explanatory text wraps cleanly and the Rebuild / Recover IDs buttons no longer overlap it.
+
 ## 0.6.13
 
 - Added local-first task deduplication for Notes-To-Todoist and Email-To-Todoist so confident matches reuse existing open Todoist tasks instead of creating duplicate work.

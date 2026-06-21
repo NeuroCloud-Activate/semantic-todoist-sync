@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.13
+
+- Added local-first task deduplication for Notes-To-Todoist and Email-To-Todoist so confident matches reuse existing open Todoist tasks instead of creating duplicate work.
+- Added a Task Deduplication settings tab with conservative matching controls, editable merge policy, optional AI-assisted ambiguous matching, and separate chat policy history while keeping runtime logs in Activity.
+- Hardened the local reference table so multiple note OIDs can safely point to the same Todoist task and still sync through the existing local snapshot without extra API calls.
+
 ## 0.6.12
 
 - Rebalanced sidebar chat answers so vault note content is treated as the primary evidence, with existing Todoist tasks shown as supporting action links instead of driving every response.

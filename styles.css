@@ -120,6 +120,30 @@
   margin-inline-start: 0;
 }
 
+.semantic-todoist-reference-action-setting {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+
+.semantic-todoist-reference-action-setting .setting-item-info {
+  flex: 1 1 420px;
+  min-width: 280px;
+}
+
+.semantic-todoist-reference-action-setting .setting-item-control {
+  flex: 0 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  min-width: min(100%, 260px);
+}
+
+.semantic-todoist-reference-action-setting .setting-item-control button {
+  margin-inline-start: 0;
+}
+
 .semantic-todoist-project-setting {
   align-items: flex-start;
   gap: 12px;
@@ -1097,6 +1121,16 @@
   .semantic-todoist-settings .setting-item-control button {
     min-height: 40px;
     margin-inline-start: 0;
+  }
+
+  .semantic-todoist-reference-action-setting .setting-item-info,
+  .semantic-todoist-reference-action-setting .setting-item-control {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .semantic-todoist-reference-action-setting .setting-item-control {
+    justify-content: flex-start;
   }
 }
 

@@ -24,23 +24,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.13
+## What's New In 0.6.14
 
-1. **Duplicate task prevention**
+1. **Clear AI provider choice**
 
-   Notes-To-Todoist and Email-To-Todoist now check the local reference table before creating tasks. When a confident open-task match is found, the plugin reuses the existing Todoist task, links the new note line with its own local OID, and updates the task instead of making duplicate work.
+   Setup now has a preferred provider dropdown, so you can keep both OpenAI and Gemini keys saved without the model lists getting mixed together.
 
-2. **Editable merge policy**
+2. **Simpler model behavior**
 
-   A new Task Deduplication settings tab keeps the matching behavior understandable: conservative by default, labels additive by default, optional AI only for ambiguous matches, and an editable plain-language policy you can also update from the chat sidebar.
+   The separate strong-model gate was removed. The plugin now follows your selected primary model and only uses the configured fallback model for same-provider overload or temporary model failures.
 
-3. **Stronger local OID mapping**
+3. **Cleaner References tab**
 
-   The local reference table now supports multiple note OIDs pointing to the same Todoist task, so reused tasks can stay traceable across notes without extra Todoist API calls.
+   The local reference rebuild controls now wrap properly, so the Rebuild and Recover IDs buttons no longer cover the explanatory text.
 
 ## What It Uses
 
-- OpenAI by default through the user's own API key, with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback/optional strong model, and Gemini still supported through Google AI Studio.
+- OpenAI by default through the user's own API key, with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback, and Gemini still supported through Google AI Studio.
 - A local semantic index for vault search, context-aware task descriptions, and compact task-reference retrieval.
 - Todoist API access for task creation, updates, and reference reconciliation.
 - Optional Cloudflare Email Routing and Workers for the Email-To-Todoist workflow.

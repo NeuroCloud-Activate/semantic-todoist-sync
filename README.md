@@ -24,19 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.11
+## What's New In 0.6.13
 
-1. **OpenAI is now the default AI setup**
+1. **Duplicate task prevention**
 
-   New installs default to OpenAI with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback, and `text-embedding-3-large` for the semantic vault index. Gemini is still supported if you prefer it.
+   Notes-To-Todoist and Email-To-Todoist now check the local reference table before creating tasks. When a confident open-task match is found, the plugin reuses the existing Todoist task, links the new note line with its own local OID, and updates the task instead of making duplicate work.
 
-2. **Optional strong-model routing**
+2. **Editable merge policy**
 
-   There is a new Setup option, off by default, that lets the plugin use the stronger fallback model only when local context signals strongly justify it. It looks for things like broad project questions, recent-vs-older guidance, multi-project context, and action-heavy requests, and it does that locally without a separate AI routing call.
+   A new Task Deduplication settings tab keeps the matching behavior understandable: conservative by default, labels additive by default, optional AI only for ambiguous matches, and an editable plain-language policy you can also update from the chat sidebar.
 
-3. **Better wide settings tables**
+3. **Stronger local OID mapping**
 
-   The Todoist References table keeps stable column widths and scrolls horizontally, so long paths, descriptions, and status fields should stay readable instead of being squeezed into one-character columns.
+   The local reference table now supports multiple note OIDs pointing to the same Todoist task, so reused tasks can stay traceable across notes without extra Todoist API calls.
 
 ## What It Uses
 

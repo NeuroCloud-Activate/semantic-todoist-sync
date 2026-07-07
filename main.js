@@ -277,14 +277,14 @@ const DEFAULT_SETTINGS = {
   tagInstructions: "Only create Todoist labels that are explicitly named in these instructions. Add labels only when the source content clearly matches a configured rule.",
   priorityInstructions: "Assign priority 1 to 4 to each task and subtask, where 4 is highest priority and 1 is no priority.",
   descriptionInstructions: "Include concise, actionable context from the source and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the source note, source subject, or filename.",
-  emailMainTaskInstructions: "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
+  emailMainTaskInstructions: "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
   emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task and supported by the email or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   emailSectionTitleInstructions: "Create one Todoist section for all tasks from the same email using Email_YY_MM_DD_Subject based on the email received date and subject.",
   emailDateInstructions: "Determine due dates and deadlines from the email's urgency, stated dates, complexity, and sender expectations. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   emailTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   emailPriorityInstructions: "Assign priority 1 to 4 to each email-derived task and subtask, where 4 is highest priority and 1 is no priority.",
   emailDescriptionInstructions: "Include concise, actionable email-thread context and relevant ranked vault context so the task can be completed without rereading the full thread. Focus on people, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the email subject or source file.",
-  noteMainTaskInstructions: "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
+  noteMainTaskInstructions: "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
   noteSubtaskInstructions: "Create note subtasks only for concrete steps required to complete the parent task and supported by the note or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   noteSectionTitleInstructions: "Create one Todoist section for all tasks from the same note using Notes_YY_MM_DD_Subject based on the note date and note subject.",
   noteDateInstructions: "Determine due dates and deadlines from the note's timing, urgency, complexity, and any explicit dates. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
@@ -831,6 +831,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ],
       emailMainTaskInstructions: [
         "Review the email chain and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email context to act without rereading the full thread.",
+        "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
         DEFAULT_SETTINGS.emailMainTaskInstructions
       ],
       emailSubtaskInstructions: [
@@ -839,6 +840,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ],
       noteMainTaskInstructions: [
         "Review the active note or selected note text and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
+        "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
         DEFAULT_SETTINGS.noteMainTaskInstructions
       ],
       noteSubtaskInstructions: [
@@ -2956,6 +2958,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const parsed = JSON.parse(json);
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
+    if (!parsed.tasks.length) {
+      const fallbackTask = explicitReviewRequestFallbackTask(source, sourceSummary, this.settings);
+      if (fallbackTask) parsed.tasks = [cleanTask(fallbackTask, allowedLabels, this.settings)].filter((task) => task.content);
+    }
     parsed.sectionName = cleanGeneratedSectionName(parsed.section_name || parsed.sectionName || source.sectionName);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
@@ -12689,7 +12695,7 @@ function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
     .slice(0, 20);
   const actionLines = cleaned.split("\n").filter((line) => {
     const l = line.toLowerCase();
-    return /please|action|todo|to do|follow up|review|send|confirm|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
+    return /please|action|todo|to do|follow up|review|comment|tracked changes?|verify|verification|accuracy|gap|highlight|draft|document|report|send|confirm|confirmation|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
   }).slice(0, 120).join("\n");
   const compact = [
     actionLines || cleaned.slice(0, Math.floor(maxChars * 0.75)),
@@ -12705,6 +12711,32 @@ function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
     return clamp(cleaned, maxChars);
   }
   return compressForTaskPrompt(source.text, maxChars, settings);
+}
+
+function explicitReviewRequestFallbackTask(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+  const text = cleanupEmailText(stripExcludedLinks([source.title, source.text, sourceSummary].filter(Boolean).join("\n"), settings));
+  if (!/\b(?:review|comment|comments|tracked\s+changes?|verify|verification|accuracy|gap|gaps|highlighted?|confirmation)\b/i.test(text)) return null;
+  if (!/\b(?:draft|document|doc|report|spotlight|attachment|linked|link|file)\b/i.test(text)) return null;
+  if (!/\b(?:may\s+i\s+ask|please|seeking|for\s+your\s+review|your\s+comments|your\s+initial|at\s+your\s+earliest\s+convenience|provide|confirm|confirmation|verify|verification)\b/i.test(text)) return null;
+  const sender = firstNameFromEmailHeader(text.match(/^From:\s*(.+)$/im)?.[1] || "");
+  const documentLabel = /\bspotlight\b/i.test(text) ? "draft report" : /\breport\b/i.test(text) ? "draft report" : "draft document";
+  const provider = sender ? ` that ${sender} has provided` : "";
+  const highlighted = /\byellow\s+highlighted|highlighted\s+segments?\b/i.test(text);
+  return {
+    content: truncateAtWord(`Review the linked ${documentLabel}${provider} for verification of accuracy and confirmation of any gaps${highlighted ? " (note yellow highlighted segments within the document)" : ""}.`, 250),
+    due_date: null,
+    deadline_date: null,
+    priority: /\bearliest convenience|urgent|asap|deadline|due\b/i.test(text) ? 3 : 2,
+    labels: [],
+    subtasks: []
+  };
+}
+
+function firstNameFromEmailHeader(value = "") {
+  const text = singleLine(value).replace(/<[^>]+>/g, " ").replace(/["']/g, " ").trim();
+  const match = text.match(/[A-Za-z][A-Za-z'-]*/);
+  if (!match) return "";
+  return match[0].charAt(0).toUpperCase() + match[0].slice(1);
 }
 
 function cosine(a, b) {

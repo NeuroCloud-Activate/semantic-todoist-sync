@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.20
+
+- Fixed email and note task generation so polite draft/document review requests for comments, tracked changes, accuracy verification, or gap confirmation are treated as actionable tasks even when sent to multiple recipients.
+
 ## 0.6.19
 
 - Kept duplicate matching local-first, required AI-mediated confirmation for all task merges, defaulted automatic dedupe model selection to the chat fallback model, and made AI-off dedupe post possible duplicate candidates to chat for manual review without merging tasks.

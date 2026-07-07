@@ -24,22 +24,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.23
+## What's New In 0.6.24
 
-1. **0.6.23 - Updated default AI models**
+1. **0.6.24 - Fallback model safety**
+
+   Automatic same-provider fallback selection now rejects any fallback that matches the primary model. If the primary OpenAI model is GPT 5.4, the automatic fallback is GPT 5.4 Mini.
+
+2. **0.6.23 - Updated default AI models**
 
    OpenAI now defaults to GPT 5.4 as the primary model and GPT 5.4 Mini as the fallback. Gemini defaults to Gemini 3.5 Flash as primary and Gemini 3.1 Flash Lite as fallback. Primary, embedding, fallback, and deduplication model selectors stay aligned with the preferred AI provider chosen during setup.
 
-2. **0.6.22 - Current release notes stay visible**
+3. **0.6.22 - Current release notes stay visible**
 
    The README keeps this section aligned with the latest three releases, while the full history remains in `CHANGELOG.md`.
 
-3. **0.6.21 - Smarter duplicate-task handling**
-
-   Duplicate checking uses Todoist project, parent task, parent description, sibling/subtask context, task descriptions, and local task knowledge before deciding whether a new task should update an existing one. Ambiguous merges stay AI-mediated when that option is enabled.
-
 ## Recent Updates Since 0.6.14
 
+- **0.6.24:** Automatic same-provider fallback selection now guarantees the fallback differs from the primary model, including migrated OpenAI settings and automatic AI deduplication.
 - **0.6.23:** OpenAI defaults now use GPT 5.4 primary with GPT 5.4 Mini fallback, Gemini defaults use Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and model selectors stay scoped to the preferred provider.
 - **0.6.22:** README and changelog upkeep now make the latest release story easier to verify from GitHub.
 - **0.6.21:** Deduplication was calibrated so same-project richer same-action tasks, parent/subtask restatements, and near-identical cross-parent tasks can be reviewed as likely duplicates, while distinct progress steps, component subtasks, and tasks in different concrete Todoist projects stay separate.

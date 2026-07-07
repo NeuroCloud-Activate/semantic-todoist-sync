@@ -780,6 +780,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, preferredProvider);
       changed = true;
     }
+    const fallbackProviderMatches = (preferredProvider === "gemini" && usesGeminiChatModel(this.settings.chatFallbackModel)) || (preferredProvider === "openai" && usesOpenAIChatModel(this.settings.chatFallbackModel));
+    if (!fallbackProviderMatches || modelIdentity(this.settings.chatFallbackModel) === modelIdentity(this.settings.chatModel)) {
+      this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, preferredProvider, this.settings.chatModel);
+      changed = true;
+    }
     if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== preferredProvider) {
       this.settings.taskDeduplicationAiModel = "";
       changed = true;
@@ -1366,7 +1371,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   ensureSameProviderFallbackModel() {
     const provider = aiProviderForModel(this.settings.chatModel);
     const fallback = this.settings.chatFallbackModel || "";
-    if ((provider === "gemini" && usesGeminiChatModel(fallback)) || (provider === "openai" && usesOpenAIChatModel(fallback))) return;
+    const providerMatches = (provider === "gemini" && usesGeminiChatModel(fallback)) || (provider === "openai" && usesOpenAIChatModel(fallback));
+    if (providerMatches && modelIdentity(fallback) !== modelIdentity(this.settings.chatModel)) return;
     this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
   }
 
@@ -2661,8 +2667,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         : "";
       const models = this.settings.availableGeminiModels?.length ? this.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
       return uniqueValues([preferred].concat(rankGeminiFallbackModels(models)
-        .map((model) => `gemini/${normalizeGeminiModelId(model)}`)
-        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary))).slice(0, 1)[0] || "";
+        .map((model) => `gemini/${normalizeGeminiModelId(model)}`)))
+        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary).slice(0, 1)[0] || "";
     }
     if (usesOpenAIChatModel(primaryModel)) {
       const primary = normalizeOpenAIModelId(primaryModel);
@@ -2714,16 +2720,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         ? `gemini/${normalizeGeminiModelId(this.settings.chatFallbackModel)}`
         : "";
       return uniqueValues([preferred].concat(rankGeminiFallbackModels(models)
-        .map((model) => `gemini/${normalizeGeminiModelId(model)}`)
-        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary))).slice(0, 1);
+        .map((model) => `gemini/${normalizeGeminiModelId(model)}`)))
+        .filter((model) => isUsableGeminiChatModel(model) && normalizeGeminiModelId(model) !== primary).slice(0, 1);
     }
     const primary = normalizeOpenAIModelId(primaryModel);
     const preferred = this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatFallbackModel)
       ? normalizeOpenAIModelId(this.settings.chatFallbackModel)
       : "";
     return uniqueValues([preferred].concat((this.settings.availableChatModels || [])
-      .map((model) => normalizeOpenAIModelId(model))
-      .filter((model) => model && model !== primary))).slice(0, 1);
+      .map((model) => normalizeOpenAIModelId(model))))
+      .filter((model) => model && model !== primary).slice(0, 1);
   }
 
   async openaiProviderResponse({ model, system, user, jsonSchema }) {
@@ -8975,10 +8981,12 @@ function taskDeduplicationPolicySettingsSummary(settings = DEFAULT_SETTINGS) {
 function taskDeduplicationAiModel(settings = DEFAULT_SETTINGS) {
   const selected = settings.taskDeduplicationAiModel || "";
   if (selected) return selected;
-  const fallback = settings.chatFallbackModel || DEFAULT_SETTINGS.chatFallbackModel || "";
+  const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
+  const provider = normalizeAiProvider(settings.aiModelProvider, aiProviderForModel(primary));
+  const fallback = preferredFallbackModelForProvider(settings, provider, primary) || "";
   if (usesGeminiChatModel(fallback)) return `gemini/${normalizeGeminiModelId(fallback)}`;
   if (usesOpenAIChatModel(fallback)) return normalizeOpenAIModelId(fallback);
-  return fallback || DEFAULT_SETTINGS.chatModel;
+  return fallback || primary;
 }
 
 function hasChatCredentialForModel(settings = DEFAULT_SETTINGS, model = "") {

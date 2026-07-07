@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.24
+
+- Hardened automatic same-provider fallback selection so the fallback model is never the same model as the primary, including migrated settings and AI-mediated deduplication defaults.
+
 ## 0.6.23
 
 - Set OpenAI defaults to GPT 5.4 primary with GPT 5.4 Mini fallback, documented Gemini defaults as Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and kept settings model selectors scoped to the preferred AI provider.

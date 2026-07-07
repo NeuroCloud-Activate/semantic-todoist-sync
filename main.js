@@ -61,10 +61,12 @@ const DEFAULT_TASK_DEDUPLICATION_POLICY = [
   "When an open existing task is confidently matched, link the new note line to the existing Todoist task with a new local OID, then update Todoist with newer title, due date, deadline, priority, description, and added labels.",
   "Merge labels additively by default. Do not delete existing labels unless that setting is disabled.",
   "Subtasks can match across notes and can be added or updated under the matched parent. Remove an existing subtask only when the newer source clearly says it is obsolete, no longer needed, or should be removed.",
+  "Ignore email-routing boilerplate such as reply-to aliases, tracking mailbox wording, ticket-like intake wording, or generic instructions to copy a mailbox; these are not duplicate-task evidence.",
   "If local signals are ambiguous, create a new task unless AI-facilitated ambiguous deduplication is enabled and the AI returns a high-confidence same-action decision."
 ].join("\n");
 const TASK_DEDUPLICATION_POLICY_UPDATE_LIMIT = 8;
 const TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD = 88;
+const TASK_DEDUPLICATION_AI_MERGE_CONFIDENCE_THRESHOLD = 75;
 const TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND = 8;
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
@@ -211,7 +213,8 @@ const DEFAULT_SETTINGS = {
   taskDeduplicationStrictness: "conservative",
   taskDeduplicationMergeLabelsAdditive: true,
   taskDeduplicationAllowExplicitSubtaskRemoval: true,
-  enableAiAmbiguousTaskDeduplication: false,
+  enableAiAmbiguousTaskDeduplication: true,
+  taskDeduplicationAiReviewSensitivity: "balanced",
   taskDeduplicationAiModel: "",
   taskDeduplicationPolicy: DEFAULT_TASK_DEDUPLICATION_POLICY,
   taskDeduplicationPolicyUpdates: [],
@@ -726,6 +729,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskDeduplicationMergeLabelsAdditive: DEFAULT_SETTINGS.taskDeduplicationMergeLabelsAdditive,
       taskDeduplicationAllowExplicitSubtaskRemoval: DEFAULT_SETTINGS.taskDeduplicationAllowExplicitSubtaskRemoval,
       enableAiAmbiguousTaskDeduplication: DEFAULT_SETTINGS.enableAiAmbiguousTaskDeduplication,
+      taskDeduplicationAiReviewSensitivity: DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity,
       taskDeduplicationAiModel: DEFAULT_SETTINGS.taskDeduplicationAiModel,
       taskDeduplicationPolicy: DEFAULT_SETTINGS.taskDeduplicationPolicy,
       taskDeduplicationPolicyUpdates: DEFAULT_SETTINGS.taskDeduplicationPolicyUpdates,
@@ -4655,21 +4659,52 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.checked = flat.length;
     if (!tasks?.length || this.settings.enableTaskDeduplication === false) return stats;
     this.setSidebarStatus("Checking for existing tasks...");
+    const generatedDedupe = await deduplicateGeneratedTaskBatch(tasks, this.settings, options, (task, decision, mergeOptions) => this.aiTaskDeduplicationMerge(task, decision, mergeOptions));
+    stats.generatedDuplicates += generatedDedupe.merged;
+    stats.aiUsed += generatedDedupe.aiUsed || 0;
+    stats.ambiguous += generatedDedupe.ambiguous || 0;
+    stats.candidateFlags.push(...(generatedDedupe.candidateFlags || []));
+    stats.matches.push(...generatedDedupe.matches);
     const candidates = this.taskDeduplicationCandidates();
     if (!candidates.length) {
-      stats.created = flat.length;
+      stats.created = flattenTaskPlan(tasks).length;
       this.settings.taskDeduplicationLastRunSummary = taskDeduplicationRunSummary(stats);
+      if (stats.generatedDuplicates) {
+        this.logLocal("Task deduplication complete", {
+          source: options.source || "",
+          checked: stats.checked,
+          merged: stats.merged,
+          created: stats.created,
+          ambiguous: stats.ambiguous,
+          copiedSubtasks: stats.copiedSubtasks,
+          generatedDuplicates: stats.generatedDuplicates,
+          aiUsed: stats.aiUsed
+        });
+      }
+      await this.postTaskDeduplicationCandidateFlags(stats, options);
       return stats;
     }
     for (const task of tasks) {
       const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, options, { isSubtask: false }));
-      if (mainDecision.decision === "merge") {
+      if (isAiMediatedTaskDeduplicationCandidate(mainDecision)) {
+        if (this.settings.enableAiAmbiguousTaskDeduplication !== true) {
+          stats.candidateFlags.push(taskDeduplicationCandidateFlag(task, mainDecision, this.settings, options));
+          stats.ambiguous += 1;
+          stats.created += 1;
+          for (const subtask of task.subtasks || []) stats.created += 1;
+          continue;
+        }
+        const aiMerge = await this.aiTaskDeduplicationMerge(task, mainDecision, options);
+        if (aiMerge?.used) stats.aiUsed += 1;
+        if (aiMerge?.match !== true) {
+          stats.ambiguous += 1;
+          continue;
+        }
         applyTaskDeduplicationMatch(task, mainDecision, this.settings, options);
+        applyAiTaskDeduplicationMerge(task, aiMerge.task, this.settings);
         stats.merged += 1;
         stats.matches.push(taskDeduplicationMatchSummary(task, mainDecision));
         await this.mergeDeduplicatedSubtasks(task, candidates, stats, options);
-      } else if (mainDecision.decision === "ambiguous") {
-        stats.ambiguous += 1;
       } else {
         stats.created += 1;
       }
@@ -4686,9 +4721,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       created: stats.created,
       ambiguous: stats.ambiguous,
       copiedSubtasks: stats.copiedSubtasks,
+      generatedDuplicates: stats.generatedDuplicates,
       aiUsed: stats.aiUsed
     });
+    await this.postTaskDeduplicationCandidateFlags(stats, options);
     return stats;
+  }
+
+  async postTaskDeduplicationCandidateFlags(stats = emptyTaskDeduplicationStats(), options = {}) {
+    const flags = (stats.candidateFlags || []).filter(Boolean);
+    if (!flags.length || this.settings.enableAiAmbiguousTaskDeduplication === true) return;
+    const message = taskDeduplicationCandidateChatMessage(flags, options);
+    this.settings.taskDeduplicationLastRunSummary = `${this.settings.taskDeduplicationLastRunSummary || taskDeduplicationRunSummary(stats)} Local-only candidate details were posted to chat.`;
+    this.logLocal("Task deduplication local-only candidates flagged", {
+      source: options.source || "",
+      path: options.path || "",
+      candidates: flags.length
+    });
+    try {
+      if (!this.app?.workspace?.getLeavesOfType) return;
+      await this.openSidebar();
+      const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+      if (view && view instanceof SemanticTodoistView) view.addMessage("assistant", message);
+    } catch (error) {
+      this.logLocal("Task deduplication chat flag skipped", { error: error.message || String(error), candidates: flags.length });
+    }
   }
 
   taskDeduplicationCandidates() {
@@ -4696,30 +4753,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const candidates = [];
     for (const [id, task] of index.entries || []) {
       if (!id || !task?.content || task.isCompleted) continue;
-      const knowledge = task.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, this.settings, index.childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "", task.knowledge || null);
-      candidates.push({ id: String(id), task: Object.assign({}, task, { id: String(id), knowledge }) });
+      const childText = index.childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "";
+      const knowledge = task.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, this.settings, childText, task.knowledge || null);
+      candidates.push({ id: String(id), task: Object.assign({}, task, { id: String(id), knowledge, childText }) });
     }
     return candidates;
   }
 
   async taskDeduplicationDecision(task, candidates, options = {}) {
-    const local = bestTaskDeduplicationMatch(task, candidates, this.settings, options);
-    if (local.decision === "merge" || local.decision === "create") return local;
-    if (this.settings.enableAiAmbiguousTaskDeduplication !== true || !local.candidate) return local;
-    try {
-      const aiDecision = await this.aiTaskDeduplicationDecision(task, local, options);
-      if (aiDecision.match) {
-        local.decision = "merge";
-        local.confidence = Math.max(local.confidence || 0, aiDecision.confidence || TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD);
-        local.reasons = uniqueValues((local.reasons || []).concat(aiDecision.reason || "AI confirmed same open action."));
-        local.aiUsed = true;
-      }
-      local.aiUsed = true;
-      return local;
-    } catch (error) {
-      this.logLocal("Task deduplication AI check skipped", { error: error.message || String(error) });
-      return local;
-    }
+    return bestTaskDeduplicationMatch(task, candidates, this.settings, options);
   }
 
   async aiTaskDeduplicationDecision(task, localDecision, options = {}) {
@@ -4755,6 +4797,56 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
   }
 
+  async aiTaskDeduplicationMerge(task, localDecision, options = {}) {
+    const candidate = localDecision.candidate;
+    if (!candidate?.task) return null;
+    const model = taskDeduplicationAiModel(this.settings);
+    if (!hasChatCredentialForModel(this.settings, model)) return null;
+    try {
+      const json = await this.withAiActivity("Combining duplicate task details", () => this.openaiResponse({
+        model,
+        jsonSchema: taskDeduplicationAiMergeSchema(this.settings),
+        system: [
+          "Run the task generation workflow for a likely duplicate pair.",
+          "Confirm whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
+          "Ignore email routing, reply-to aliases, mailbox-copy instructions, and ticket-tracking boilerplate unless that routing work is the actual requested action.",
+          "If they are the same, return one merged generated task that preserves the clearest title plus useful non-conflicting details from both records.",
+          "If they are only related, return match false and keep the proposed merged task empty."
+        ].join(" "),
+        user: [
+          "Deduplication policy:",
+          taskDeduplicationPolicyText(this.settings),
+          "",
+          taskDeduplicationSourceContextText(options),
+          "",
+          options.intraBatch ? "Later generated task likely duplicating an earlier generated task:" : "New generated task likely duplicating an existing Todoist task:",
+          taskDeduplicationAiTaskCard(task),
+          "",
+          options.intraBatch ? "Earlier generated task to keep if merged:" : "Existing open Todoist task to update if merged:",
+          taskDeduplicationAiTaskCard(candidate.task),
+          "",
+          `Local candidate score: ${localDecision.confidence || 0}`,
+          `Local candidate reasons: ${(localDecision.reasons || []).join("; ")}`,
+          `Workflow source: ${options.source || "task generation"}`,
+          "",
+          "Return the same task shape used by task generation: content, due_date, deadline_date, priority, labels, and subtasks."
+        ].filter(Boolean).join("\n")
+      }));
+      const parsed = JSON.parse(json);
+      const confidence = Number(parsed?.confidence || 0);
+      return {
+        used: true,
+        match: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_MERGE_CONFIDENCE_THRESHOLD,
+        confidence,
+        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160),
+        task: taskDeduplicationAiMergeTaskFromResponse(parsed, candidate.task, task, this.settings)
+      };
+    } catch (error) {
+      this.logLocal("Task deduplication AI merge skipped", { error: error.message || String(error) });
+      return null;
+    }
+  }
+
   async mergeDeduplicatedSubtasks(parentTask, candidates, stats, options = {}) {
     if (!parentTask?.id) return;
     const existingChildren = candidates.filter((candidate) => {
@@ -4770,8 +4862,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         parentId: parentTask.id,
         parentContent: parentTask.content
       }));
-      if (decision.decision === "merge") {
+      if (isAiMediatedTaskDeduplicationCandidate(decision)) {
+        if (this.settings.enableAiAmbiguousTaskDeduplication !== true) {
+          stats.candidateFlags.push(taskDeduplicationCandidateFlag(subtask, decision, this.settings, Object.assign({}, options, {
+            isSubtask: true,
+            parentContent: parentTask.content
+          })));
+          nextSubtasks.push(subtask);
+          continue;
+        }
+        const aiMerge = await this.aiTaskDeduplicationMerge(subtask, decision, Object.assign({}, options, {
+          isSubtask: true,
+          parentId: parentTask.id,
+          parentContent: parentTask.content
+        }));
+        if (aiMerge?.used) stats.aiUsed += 1;
+        if (aiMerge?.match !== true) {
+          nextSubtasks.push(subtask);
+          continue;
+        }
         applyTaskDeduplicationMatch(subtask, decision, this.settings, Object.assign({}, options, { parentTask }));
+        applyAiTaskDeduplicationMerge(subtask, aiMerge.task, this.settings);
         subtask.isSubtask = true;
         subtask.parentId = parentTask.id;
         subtask.parentOid = parentTask.oid || "";
@@ -4779,17 +4890,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         usedExistingIds.add(decision.id);
         stats.matches.push(taskDeduplicationMatchSummary(subtask, decision));
       }
-      if (decision.decision === "merge" && this.settings.taskDeduplicationAllowExplicitSubtaskRemoval !== false && isExplicitSubtaskRemovalInstruction(subtask)) {
+      if (subtask.id && this.settings.taskDeduplicationAllowExplicitSubtaskRemoval !== false && isExplicitSubtaskRemovalInstruction(subtask)) {
         stats.removedSubtasks += 1;
         continue;
       }
       nextSubtasks.push(subtask);
-    }
-    for (const candidate of existingChildren) {
-      if (usedExistingIds.has(candidate.id)) continue;
-      nextSubtasks.push(copyExistingTaskAsDedupedSubtask(candidate, parentTask, this.settings, options.path || ""));
-      usedExistingIds.add(candidate.id);
-      stats.copiedSubtasks += 1;
     }
     parentTask.subtasks = nextSubtasks;
   }
@@ -6374,16 +6479,17 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderTaskDeduplication(containerEl) {
     settingsHeading(containerEl, "Task Deduplication", "Checks generated note and email tasks against the local Todoist reference table before creating anything new.");
-    toggleSetting(containerEl, "Enable task deduplication", "Enabled by default. Confident matches reuse the existing Todoist task with a new local note OID instead of creating duplicate work.", this.plugin, "enableTaskDeduplication");
+    toggleSetting(containerEl, "Enable task deduplication", "Enabled by default. Local scoring identifies likely duplicate candidates; AI-mediated deduplication must be enabled to merge or update tasks.", this.plugin, "enableTaskDeduplication");
     taskDeduplicationStrictnessSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Merge labels additively", "Keep existing Todoist labels and add newly generated labels. Turn off only if newer generated task labels should replace the existing label set.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
     toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Only omit a previously linked subtask when newer source text clearly says it is obsolete, no longer needed, or should be removed.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
 
-    settingsHeading(containerEl, "Ambiguous Matches", "The normal check is local-only. This optional AI step is used only for narrow borderline matches.");
-    toggleSetting(containerEl, "Enable AI-facilitated ambiguous task deduplication", "Off by default. When local matching is close but not confident, ask the selected low-cost model to decide whether it is the same open action item.", this.plugin, "enableAiAmbiguousTaskDeduplication");
+    settingsHeading(containerEl, "AI-Mediated Deduplication", "Local matching nominates duplicate candidates first. The selected AI model must confirm and merge task details before any existing or same-batch task is updated.");
+    toggleSetting(containerEl, "Enable AI-mediated deduplication", "Enabled by default. When off, dedupe runs local-only candidate detection, posts possible duplicates to chat for manual review, and leaves tasks unmerged because local-only dedupe may be less accurate and less efficient than AI-mediated merge review.", this.plugin, "enableAiAmbiguousTaskDeduplication");
+    taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
     taskDeduplicationAiModelSetting(containerEl, this.plugin);
 
-    settingsHeading(containerEl, "Deduplication Merge Policy", "Plain-language local rules used by the matcher and the optional ambiguous AI check. You can also update this from the chat sidebar with an explicit dedupe policy request.");
+    settingsHeading(containerEl, "Deduplication Merge Policy", "Plain-language rules used by local candidate matching and AI-mediated merge confirmation. You can also update this from the chat sidebar with an explicit dedupe policy request.");
     textAreaSetting(containerEl, "Deduplication policy", this.plugin, "taskDeduplicationPolicy", { compact: true });
     activitySetting(containerEl, "Policy impact", taskDeduplicationPolicyImpactText(this.plugin.settings));
     const updates = this.plugin.settings.taskDeduplicationPolicyUpdates || [];
@@ -7339,13 +7445,14 @@ const SETTING_DESCRIPTIONS = {
   scheduleTodayWeightSemanticUrgency: "How much urgent wording in the task and local context affects the schedule order.",
   scheduleTodayWeightNoteRecency: "How much recent note/task context affects the schedule order.",
   scheduleTodayWeightParentDependency: "How much parent/subtask dependency context affects the schedule order.",
-  enableTaskDeduplication: "Checks generated tasks against open tasks in the local reference table and reuses confident matches instead of creating duplicate Todoist tasks.",
-  taskDeduplicationStrictness: "Controls how much local evidence is required before a generated task is linked to an existing open Todoist task.",
+  enableTaskDeduplication: "Checks generated tasks against open tasks in the local reference table. Local scoring identifies candidates; AI-mediated deduplication must be enabled to merge or update tasks.",
+  taskDeduplicationStrictness: "Controls how much local evidence is required before a generated task is nominated as a duplicate candidate.",
   taskDeduplicationMergeLabelsAdditive: "When enabled, existing Todoist labels are kept and new generated labels are added.",
   taskDeduplicationAllowExplicitSubtaskRemoval: "When enabled, an existing linked subtask is omitted from the merge only when newer source text clearly says it is obsolete or should be removed.",
-  enableAiAmbiguousTaskDeduplication: "Optional. Uses an AI model only for narrow borderline matches after the local matcher cannot decide confidently.",
-  taskDeduplicationAiModel: "Model used only for optional ambiguous duplicate checks and chat-assisted policy edits. Defaults to GPT 5.4 Mini for OpenAI or Gemini 3.1 Flash Lite for Gemini.",
-  taskDeduplicationPolicy: "Editable local merge policy used by task deduplication and the optional ambiguous AI check.",
+  enableAiAmbiguousTaskDeduplication: "When enabled, all duplicate task updates and same-batch merges require AI confirmation and AI-synthesized merged task details. When disabled, dedupe is local-only candidate detection: possible duplicates are posted to chat for manual review and left unmerged because local-only dedupe may be less accurate and less efficient.",
+  taskDeduplicationAiReviewSensitivity: "Controls how broadly local candidates are sent to the AI deduplication step. Matching strictness still controls how much local evidence is needed to nominate a candidate.",
+  taskDeduplicationAiModel: "Model used to confirm duplicate candidates and synthesize merged task details. Automatic uses the configured chat fallback model unless you choose a specific deduplication model.",
+  taskDeduplicationPolicy: "Editable merge policy used by local duplicate candidate matching and AI-mediated merge confirmation.",
   emailMainTaskInstructions: "Plain-language rules for deciding which email items become main tasks.",
   emailSubtaskInstructions: "Plain-language rules for creating email-derived subtasks.",
   emailSectionTitleInstructions: "Plain-language rules for naming Todoist sections for email tasks.",
@@ -7619,10 +7726,27 @@ function taskDeduplicationStrictnessSetting(containerEl, plugin) {
   };
 }
 
+function taskDeduplicationAiReviewSensitivitySetting(containerEl, plugin) {
+  const options = ["narrow", "balanced", "broad"];
+  const labels = { narrow: "Narrow", balanced: "Balanced", broad: "Broad" };
+  const current = options.includes(plugin.settings.taskDeduplicationAiReviewSensitivity) ? plugin.settings.taskDeduplicationAiReviewSensitivity : DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
+  new Setting(containerEl)
+    .setName("AI review sensitivity")
+    .setDesc(settingDescription("AI review sensitivity", "taskDeduplicationAiReviewSensitivity"))
+    .addDropdown((dropdown) => {
+      for (const option of options) dropdown.addOption(option, labels[option]);
+      dropdown.setValue(current);
+      dropdown.onChange(async (value) => {
+        plugin.settings.taskDeduplicationAiReviewSensitivity = options.includes(value) ? value : DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
+        await plugin.saveSettings();
+      });
+    });
+}
+
 function taskDeduplicationAiModelSetting(containerEl, plugin) {
   const current = plugin.settings.taskDeduplicationAiModel || "";
   const automatic = taskDeduplicationAiModel(plugin.settings);
-  const options = [{ value: "", label: `Automatic: ${modelDisplayName(automatic)}` }];
+  const options = [{ value: "", label: `Automatic chat fallback: ${modelDisplayName(automatic)}` }];
   for (const model of plugin.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels) {
     options.push({ value: normalizeOpenAIModelId(model), label: `OpenAI: ${normalizeOpenAIModelId(model)}` });
   }
@@ -7632,8 +7756,8 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
     if (id && isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
   }
   new Setting(containerEl)
-    .setName("Ambiguous deduplication AI model")
-    .setDesc(settingDescription("Ambiguous deduplication AI model", "taskDeduplicationAiModel"))
+    .setName("AI deduplication and merge model")
+    .setDesc(settingDescription("AI deduplication and merge model", "taskDeduplicationAiModel"))
     .addDropdown((dropdown) => {
       for (const option of uniqueModelOptions(options)) dropdown.addOption(option.value, option.label);
       dropdown.setValue(current);
@@ -8725,6 +8849,21 @@ function taskDeduplicationAiDecisionSchema() {
   };
 }
 
+function taskDeduplicationAiMergeSchema(settings = DEFAULT_SETTINGS) {
+  const task = taskSchema().properties.tasks.items;
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      match: { type: "boolean" },
+      confidence: { type: "integer", minimum: 0, maximum: 100 },
+      reason: { type: "string" },
+      task
+    },
+    required: ["match", "confidence", "reason", "task"]
+  };
+}
+
 function taskDeduplicationPolicyCommandFromAi(value = {}, currentPolicy = "") {
   const policyText = normalizeTaskDeduplicationPolicyText(value?.policy_text || currentPolicy || DEFAULT_TASK_DEDUPLICATION_POLICY);
   return {
@@ -8750,11 +8889,12 @@ function appendTaskDeduplicationPolicyInstruction(currentPolicy = "", instructio
 
 function taskDeduplicationPolicyImpactText(settings = DEFAULT_SETTINGS, policyText = "") {
   const strictness = settings.taskDeduplicationStrictness || DEFAULT_SETTINGS.taskDeduplicationStrictness;
-  const ai = settings.enableAiAmbiguousTaskDeduplication ? `on with ${modelDisplayName(taskDeduplicationAiModel(settings))}` : "off";
+  const ai = modelDisplayName(taskDeduplicationAiModel(settings));
   const labels = settings.taskDeduplicationMergeLabelsAdditive === false ? "replacement" : "additive";
   const removal = settings.taskDeduplicationAllowExplicitSubtaskRemoval === false ? "explicit subtask removal disabled" : "explicit obsolete subtasks can be omitted";
   const policy = policyText || taskDeduplicationPolicyText(settings);
-  return `Strictness: ${strictness}. AI ambiguous checks: ${ai}. Labels: ${labels}. Subtasks: ${removal}. Policy length: ${policy.split(/\n+/).filter(Boolean).length} lines.`;
+  const sensitivity = settings.taskDeduplicationAiReviewSensitivity || DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
+  return `Strictness: ${strictness}. AI dedupe model: ${ai}. AI-mediated dedupe: ${settings.enableAiAmbiguousTaskDeduplication ? `on (${sensitivity})` : "off"}. Labels: ${labels}. Subtasks: ${removal}. Policy length: ${policy.split(/\n+/).filter(Boolean).length} lines.`;
 }
 
 function taskDeduplicationPolicySettingsSummary(settings = DEFAULT_SETTINGS) {
@@ -8770,8 +8910,10 @@ function taskDeduplicationPolicySettingsSummary(settings = DEFAULT_SETTINGS) {
 function taskDeduplicationAiModel(settings = DEFAULT_SETTINGS) {
   const selected = settings.taskDeduplicationAiModel || "";
   if (selected) return selected;
-  if (usesGeminiChatModel(settings.chatModel)) return "gemini/gemini-3.1-flash-lite";
-  return "gpt-5.4-mini";
+  const fallback = settings.chatFallbackModel || DEFAULT_SETTINGS.chatFallbackModel || "";
+  if (usesGeminiChatModel(fallback)) return `gemini/${normalizeGeminiModelId(fallback)}`;
+  if (usesOpenAIChatModel(fallback)) return normalizeOpenAIModelId(fallback);
+  return fallback || DEFAULT_SETTINGS.chatModel;
 }
 
 function hasChatCredentialForModel(settings = DEFAULT_SETTINGS, model = "") {
@@ -13456,13 +13598,155 @@ function emptyTaskDeduplicationStats() {
     ambiguous: 0,
     copiedSubtasks: 0,
     removedSubtasks: 0,
+    generatedDuplicates: 0,
     aiUsed: 0,
+    candidateFlags: [],
     matches: []
   };
 }
 
 function taskDeduplicationRunSummary(stats = emptyTaskDeduplicationStats()) {
-  return `${stats.merged || 0} linked to existing tasks, ${stats.created || 0} left as new, ${stats.ambiguous || 0} ambiguous, ${stats.copiedSubtasks || 0} existing subtasks copied.`;
+  return `${stats.merged || 0} linked to existing tasks, ${stats.created || 0} left as new, ${stats.ambiguous || 0} ambiguous, ${stats.copiedSubtasks || 0} existing subtasks copied, ${stats.generatedDuplicates || 0} generated duplicates collapsed, ${(stats.candidateFlags || []).length} local-only duplicate candidates flagged.`;
+}
+
+async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETTINGS, options = {}, aiMergeFn = null) {
+  const stats = { merged: 0, matches: [], aiUsed: 0, ambiguous: 0, candidateFlags: [] };
+  if (!Array.isArray(tasks) || tasks.length < 2) return stats;
+  for (let i = 0; i < tasks.length; i += 1) {
+    const task = tasks[i];
+    if (!task || task.id || task.isSubtask) continue;
+    const candidates = generatedTaskBatchCandidates(tasks, i);
+    const decision = bestTaskDeduplicationMatch(task, candidates, settings, Object.assign({}, options, { isSubtask: false, intraBatch: true }));
+    if (!decision.candidate?.generatedTask) continue;
+    if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
+    if (settings.enableAiAmbiguousTaskDeduplication !== true) {
+      stats.ambiguous += 1;
+      stats.candidateFlags.push(taskDeduplicationCandidateFlag(task, decision, settings, { intraBatch: true }));
+      continue;
+    }
+    const aiMerge = typeof aiMergeFn === "function" ? await aiMergeFn(task, decision, Object.assign({}, options, { intraBatch: true })) : null;
+    if (aiMerge?.used) stats.aiUsed += 1;
+    if (aiMerge?.match !== true) continue;
+    mergeGeneratedDuplicateTask(decision.candidate.generatedTask, task, decision, settings, aiMerge.task);
+    stats.merged += 1;
+    stats.matches.push(taskDeduplicationMatchSummary(task, Object.assign({}, decision, {
+      id: "",
+      reasons: uniqueValues(["merged with generated task"].concat(decision.reasons || []))
+    })));
+    tasks.splice(i, 1);
+    i -= 1;
+  }
+  return stats;
+}
+
+function generatedTaskBatchCandidates(tasks = [], beforeIndex = 0) {
+  const candidates = [];
+  for (let index = 0; index < beforeIndex; index += 1) {
+    const task = tasks[index];
+    if (!task || task.isSubtask) continue;
+    candidates.push({
+      id: task.id || task.oid || `generated:${index}`,
+      generatedTask: task,
+      task: Object.assign({}, task, {
+        id: task.id || task.oid || `generated:${index}`,
+        childText: taskDeduplicationSubtaskText(task)
+      })
+    });
+  }
+  return candidates;
+}
+
+function mergeGeneratedDuplicateTask(target, duplicate, decision = {}, settings = DEFAULT_SETTINGS, aiTask = null) {
+  if (!target || !duplicate) return target;
+  if (aiTask) applyAiTaskDeduplicationMerge(target, aiTask, settings);
+  else return target;
+  target.knowledge = taskKnowledgeSnapshot(target, settings, "", target.knowledge || duplicate.knowledge || null);
+  target.descriptionShouldSync = true;
+  target.deduplication = {
+    todoistId: target.id || "",
+    confidence: decision.confidence || 0,
+    reasons: uniqueValues(["merged with generated task"].concat(decision.reasons || []))
+  };
+  return target;
+}
+
+function applyAiTaskDeduplicationMerge(task, aiTask = {}, settings = DEFAULT_SETTINGS) {
+  if (!task || !aiTask) return task;
+  task.content = singleLine(aiTask.content || task.content || "");
+  task.description = isRichTodoistDescription(aiTask.description) ? aiTask.description : task.description || aiTask.description || "";
+  if (Object.prototype.hasOwnProperty.call(aiTask, "due_date")) task.due_date = aiTask.due_date || "";
+  if (Object.prototype.hasOwnProperty.call(aiTask, "deadline_date")) task.deadline_date = aiTask.deadline_date || "";
+  task.priority = normalizePriority(aiTask.priority || task.priority || 1);
+  task.labels = (aiTask.labels || task.labels || []).map(cleanLabel).filter(Boolean);
+  if (Array.isArray(aiTask.subtasks) && !task.isSubtask) {
+    task.subtasks = aiTask.subtasks
+      .map((subtask, index) => aiMergedSubtask(subtask, task.subtasks?.[index] || {}, task, settings))
+      .filter((subtask) => subtask.content);
+  }
+  task.knowledge = taskKnowledgeSnapshot(task, settings, taskDeduplicationSubtaskText(task), task.knowledge || null);
+  task.descriptionShouldSync = true;
+  return task;
+}
+
+function aiMergedSubtask(aiSubtask = {}, existing = {}, parentTask = {}, settings = DEFAULT_SETTINGS) {
+  const merged = Object.assign({}, existing, {
+    content: singleLine(aiSubtask.content || existing.content || ""),
+    description: aiSubtask.description || existing.description || "",
+    due_date: aiSubtask.due_date || existing.due_date || "",
+    deadline_date: aiSubtask.deadline_date || existing.deadline_date || "",
+    priority: normalizePriority(aiSubtask.priority || existing.priority || 1),
+    labels: (aiSubtask.labels || existing.labels || []).map(cleanLabel).filter(Boolean),
+    isSubtask: true,
+    oid: existing.oid || generateUniqueOid(settings),
+    parentId: parentTask.id || existing.parentId || "",
+    parentOid: parentTask.oid || existing.parentOid || "",
+    parentContent: parentTask.content || existing.parentContent || "",
+    projectId: parentTask.projectId || existing.projectId || "",
+    projectName: parentTask.projectName || existing.projectName || "",
+    section: parentTask.section || existing.section || "",
+    sectionId: parentTask.sectionId || existing.sectionId || ""
+  });
+  merged.knowledge = taskKnowledgeSnapshot(merged, settings, "", merged.knowledge || null);
+  return merged;
+}
+
+function taskDeduplicationAiMergeTaskFromResponse(parsed = {}, existing = {}, incoming = {}, settings = DEFAULT_SETTINGS) {
+  const task = parsed?.task && typeof parsed.task === "object" ? parsed.task : {};
+  return {
+    content: singleLine(task.content || incoming.content || existing.content || ""),
+    description: truncateMarkdownAtWord(task.description || incoming.description || existing.description || "", Number(settings.todoistDescriptionMaxChars || DEFAULT_SETTINGS.todoistDescriptionMaxChars || 8000)),
+    due_date: task.due_date || incoming.due_date || existing.due_date || "",
+    deadline_date: task.deadline_date || incoming.deadline_date || existing.deadline_date || "",
+    priority: normalizePriority(task.priority || incoming.priority || existing.priority || 1),
+    labels: (task.labels || mergedTaskLabelsForDeduplication(incoming.labels || [], existing.labels || [], settings)).map(cleanLabel).filter(Boolean),
+    subtasks: (task.subtasks || []).map((subtask) => ({
+      content: singleLine(subtask.content || ""),
+      description: subtask.description || "",
+      due_date: subtask.due_date || "",
+      deadline_date: subtask.deadline_date || "",
+      priority: normalizePriority(subtask.priority || 1),
+      labels: (subtask.labels || []).map(cleanLabel).filter(Boolean)
+    })).filter((subtask) => subtask.content)
+  };
+}
+
+function mergeGeneratedDuplicateSubtasks(targetSubtasks = [], duplicateSubtasks = [], settings = DEFAULT_SETTINGS) {
+  const merged = Array.isArray(targetSubtasks) ? targetSubtasks : [];
+  for (const subtask of duplicateSubtasks || []) {
+    if (!subtask?.content) continue;
+    const candidates = merged.map((task, index) => ({
+      id: task.id || task.oid || `generated-subtask:${index}`,
+      generatedTask: task,
+      task: Object.assign({}, task, { id: task.id || task.oid || `generated-subtask:${index}` })
+    }));
+    const decision = bestTaskDeduplicationMatch(subtask, candidates, settings, { isSubtask: true, intraBatch: true });
+    if (decision.decision === "merge" && decision.candidate?.generatedTask) {
+      continue;
+    } else {
+      merged.push(subtask);
+    }
+  }
+  return merged;
 }
 
 function taskDeduplicationThreshold(settings = DEFAULT_SETTINGS) {
@@ -13470,6 +13754,38 @@ function taskDeduplicationThreshold(settings = DEFAULT_SETTINGS) {
   if (strictness === "strict") return 90;
   if (strictness === "permissive") return 78;
   return 84;
+}
+
+function taskDeduplicationAiReviewConfig(settings = DEFAULT_SETTINGS, options = {}) {
+  const sensitivity = settings.taskDeduplicationAiReviewSensitivity || DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
+  const configs = {
+    narrow: {
+      band: options.intraBatch ? 18 : Math.max(8, TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND - 6),
+      titleOverlap: options.intraBatch ? 0.28 : 0.48,
+      contextOverlap: options.intraBatch ? 0.38 : 0.48,
+      batchTitleOverlap: 0.22,
+      batchContextOverlap: 0.26
+    },
+    balanced: {
+      band: options.intraBatch ? 24 : TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND,
+      titleOverlap: options.intraBatch ? 0.24 : 0.42,
+      contextOverlap: options.intraBatch ? 0.34 : 0.42,
+      batchTitleOverlap: 0.18,
+      batchContextOverlap: 0.22
+    },
+    broad: {
+      band: options.intraBatch ? 32 : TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND + 8,
+      titleOverlap: options.intraBatch ? 0.2 : 0.36,
+      contextOverlap: options.intraBatch ? 0.28 : 0.36,
+      batchTitleOverlap: 0.12,
+      batchContextOverlap: 0.16
+    }
+  };
+  return configs[sensitivity] || configs.balanced;
+}
+
+function isAiMediatedTaskDeduplicationCandidate(decision = {}) {
+  return Boolean(decision?.candidate && (decision.decision === "merge" || decision.decision === "ambiguous"));
 }
 
 function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
@@ -13482,8 +13798,12 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
     if (!best || scored.confidence > best.confidence) best = scored;
   }
   if (!best || !best.candidate) return { decision: "create", confidence: 0, reasons: ["No active local candidate."], candidate: null };
-  if (best.confidence >= threshold && best.titleOverlap >= 0.52 && !best.hardMismatch) return Object.assign(best, { decision: "merge" });
-  if (best.confidence >= threshold - TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND && best.titleOverlap >= 0.42 && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
+  const contextSupported = best.projectContextMatch === true;
+  if (best.confidence >= threshold && (best.titleOverlap >= 0.52 || contextSupported) && !best.hardMismatch) return Object.assign(best, { decision: "merge" });
+  const aiReview = taskDeduplicationAiReviewConfig(settings, options);
+  if (options.intraBatch && best.batchContextMatch && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
+  if (options.intraBatch && best.titleOverlap >= aiReview.batchTitleOverlap && best.contextOverlap >= aiReview.batchContextOverlap && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
+  if (best.confidence >= threshold - aiReview.band && (best.titleOverlap >= aiReview.titleOverlap || best.contextOverlap >= aiReview.contextOverlap || contextSupported) && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
   return Object.assign(best, { decision: "create" });
 }
 
@@ -13501,6 +13821,10 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
   const sourceContextTokens = taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, task, { knowledge: sourceKnowledge })));
   const existingContextTokens = taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, existing, { knowledge: existingKnowledge })));
   const contextOverlap = tokenDiceScore(sourceContextTokens, existingContextTokens);
+  const sameProject = sameTaskDeduplicationProject(task, existing);
+  const projectContextEligible = sameProject && !isGenericTodoistInboxTask(task) && !isGenericTodoistInboxTask(existing);
+  const sameSection = sameTaskDeduplicationSection(task, existing);
+  const sharedTitleTokens = tokenIntersection(sourceTitleTokens, existingTitleTokens);
   const peopleOverlap = tokenOverlapCount(sourceKnowledge.people || [], existingKnowledge.people || []);
   const topicOverlap = tokenOverlapCount(sourceKnowledge.topics || [], existingKnowledge.topics || []);
   const labelOverlap = tokenOverlapCount(task?.labels || [], existing.labels || []);
@@ -13536,9 +13860,23 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     score += Math.min(6, labelOverlap * 3);
     reasons.push("same labels");
   }
+  if (sameSection) {
+    score += 4;
+    reasons.push("same generated section");
+  }
   if (task?.due_date && existing.due_date && datePart(task.due_date) === datePart(existing.due_date)) score += 4;
   if (task?.deadline_date && existing.deadline_date && task.deadline_date === existing.deadline_date) score += 4;
-  if (task?.projectName && existing.projectName && singleLine(task.projectName).toLowerCase() === singleLine(existing.projectName).toLowerCase()) score += 4;
+  let projectContextMatch = false;
+  if (projectContextEligible) {
+    score += 12;
+    reasons.push("same Todoist project");
+    if (sharedTitleTokens.length >= 2 && titleOverlap >= 0.34 && contextOverlap >= 0.34) {
+      const projectContextScore = Math.min(40, 30 + sharedTitleTokens.length * 2);
+      score += projectContextScore;
+      projectContextMatch = true;
+      reasons.push("same project action context");
+    }
+  }
   if (options.parentId && existing.parentId && String(options.parentId) === String(existing.parentId)) {
     score += 16;
     reasons.push("same parent task");
@@ -13548,7 +13886,17 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     score -= 24;
     hardMismatch = true;
   }
-  if (sourceTitleTokens.size >= 3 && titleOverlap < 0.3 && contextOverlap < 0.25) hardMismatch = true;
+  const aiReview = taskDeduplicationAiReviewConfig(settings, options);
+  const batchContextMatch = Boolean(options.intraBatch
+    && (sameSection || labelOverlap || topicOverlap || peopleOverlap)
+    && (titleOverlap >= aiReview.batchTitleOverlap || contextOverlap >= aiReview.batchContextOverlap || sharedTitleTokens.length >= 1 || (labelOverlap && topicOverlap)));
+  if (sourceTitleTokens.size >= 3) {
+    if (options.intraBatch) {
+      if (titleOverlap < 0.1 && contextOverlap < 0.1 && !batchContextMatch) hardMismatch = true;
+    } else if (titleOverlap < 0.3 && contextOverlap < 0.25) {
+      hardMismatch = true;
+    }
+  }
   const confidence = Math.max(0, Math.min(100, Math.round(score)));
   return {
     id: candidate.id,
@@ -13557,6 +13905,8 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     confidence,
     titleOverlap,
     contextOverlap,
+    projectContextMatch,
+    batchContextMatch,
     hardMismatch,
     reasons: reasons.length ? reasons : ["weak local overlap"]
   };
@@ -13633,6 +13983,45 @@ function taskDeduplicationMatchSummary(task, decision) {
   };
 }
 
+function taskDeduplicationCandidateFlag(task = {}, decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  const existing = decision.task || decision.candidate?.task || {};
+  const isGenerated = Boolean(options.intraBatch || decision.candidate?.generatedTask);
+  return {
+    task: truncateAtWord(singleLine(task.content || ""), 120),
+    candidate: truncateAtWord(singleLine(existing.content || ""), 120),
+    candidateId: isGenerated ? "" : decision.id || existing.id || "",
+    candidateType: isGenerated ? "same task generation batch" : "existing Todoist task",
+    confidence: Math.round(decision.confidence || 0),
+    reasons: (decision.reasons || []).slice(0, 3),
+    projectName: singleLine(task.projectName || existing.projectName || ""),
+    section: singleLine(task.section || existing.section || ""),
+    parentContent: singleLine(options.parentContent || task.parentContent || existing.parentContent || ""),
+    link: !isGenerated && (decision.id || existing.id) ? todoistTaskMarkdownLink(decision.id || existing.id, settings, existing.content || "Open task") : ""
+  };
+}
+
+function taskDeduplicationCandidateChatMessage(flags = [], options = {}) {
+  const source = options.source ? ` from ${options.source}` : "";
+  const path = options.path ? `\nSource: ${options.path}` : "";
+  const lines = [
+    `Possible duplicate tasks were found${source}, but AI-mediated deduplication is off.`,
+    "No task merge was applied. Local-only deduplication can be less accurate and less efficient than AI-mediated review, so please manually inspect these candidates and edit Todoist or the generated task list as needed.",
+    path,
+    ""
+  ].filter((line) => line !== "");
+  flags.slice(0, 8).forEach((flag, index) => {
+    const where = [flag.projectName ? `Project: ${flag.projectName}` : "", flag.section ? `Section: ${flag.section}` : "", flag.parentContent ? `Parent: ${truncateAtWord(flag.parentContent, 80)}` : ""].filter(Boolean).join(" | ");
+    lines.push(`${index + 1}. Generated task: ${flag.task || "Untitled task"}`);
+    lines.push(`   Possible duplicate: ${flag.link || flag.candidate || "Earlier generated task"} (${flag.candidateType}, local score ${flag.confidence || 0})`);
+    if (where) lines.push(`   Context: ${where}`);
+    if (flag.reasons?.length) lines.push(`   Local evidence: ${flag.reasons.join("; ")}`);
+  });
+  if (flags.length > 8) lines.push(`...and ${flags.length - 8} more possible duplicate${flags.length - 8 === 1 ? "" : "s"}.`);
+  lines.push("");
+  lines.push("To merge automatically next time, turn on AI-mediated deduplication or choose a dedupe model in settings.");
+  return lines.join("\n");
+}
+
 function mergedTaskLabelsForDeduplication(generated = [], existing = [], settings = DEFAULT_SETTINGS) {
   const generatedLabels = (generated || []).map(cleanLabel).filter(Boolean);
   if (settings.taskDeduplicationMergeLabelsAdditive === false) return generatedLabels;
@@ -13645,7 +14034,7 @@ function isExplicitSubtaskRemovalInstruction(task = {}) {
 }
 
 function canonicalTaskMatchTitle(value = "") {
-  return singleLine(value)
+  return singleLine(scrubTaskDeduplicationBoilerplate(value))
     .replace(/%%\\[oid::\\s*[^\\]]+\\]%%/gi, " ")
     .replace(/#[\\w/-]+/g, " ")
     .replace(/[📅⏳✅⛔⏫🔼🔽]/g, " ")
@@ -13661,7 +14050,39 @@ const TASK_DEDUPE_STOP_WORDS = new Set(["the", "and", "for", "with", "from", "th
 
 function taskDedupeTokenSet(text = "") {
   const tokens = String(text || "").toLowerCase().match(/[a-z0-9]{3,}/g) || [];
-  return new Set(tokens.filter((token) => !TASK_DEDUPE_STOP_WORDS.has(token)));
+  return new Set(tokens.map(normalizeTaskDedupeToken).filter((token) => token && !TASK_DEDUPE_STOP_WORDS.has(token)));
+}
+
+function normalizeTaskDedupeToken(token = "") {
+  const value = String(token || "").toLowerCase();
+  if (value.length > 4 && value.endsWith("ies")) return `${value.slice(0, -3)}y`;
+  if (value.length > 5 && /(ches|shes|xes|zes|ses)$/.test(value)) return value.slice(0, -2);
+  if (value.length > 4 && value.endsWith("s") && !/(ss|us|is)$/.test(value)) return value.slice(0, -1);
+  return value;
+}
+
+function tokenIntersection(left = new Set(), right = new Set()) {
+  const matches = [];
+  for (const token of left) if (right.has(token)) matches.push(token);
+  return matches;
+}
+
+function sameTaskDeduplicationProject(task = {}, existing = {}) {
+  if (task.projectId && existing.projectId && String(task.projectId) === String(existing.projectId)) return true;
+  const sourceProject = singleLine(task.projectName || "").toLowerCase();
+  const existingProject = singleLine(existing.projectName || "").toLowerCase();
+  return Boolean(sourceProject && existingProject && sourceProject === existingProject);
+}
+
+function isGenericTodoistInboxTask(task = {}) {
+  return Boolean(task?.isInbox || singleLine(task.projectName || "").toLowerCase() === "inbox");
+}
+
+function sameTaskDeduplicationSection(task = {}, existing = {}) {
+  if (task.sectionId && existing.sectionId && String(task.sectionId) === String(existing.sectionId)) return true;
+  const sourceSection = singleLine(task.section || "").toLowerCase();
+  const existingSection = singleLine(existing.section || "").toLowerCase();
+  return Boolean(sourceSection && existingSection && sourceSection === existingSection);
 }
 
 function tokenDiceScore(left = new Set(), right = new Set()) {
@@ -13680,10 +14101,12 @@ function tokenOverlapCount(left = [], right = []) {
 
 function taskDeduplicationContextText(task = {}) {
   const knowledge = task.knowledge || {};
-  return [
+  return scrubTaskDeduplicationBoilerplate([
     task.content,
     task.description,
     task.parentContent,
+    task.childText,
+    taskDeduplicationSubtaskText(task),
     task.section,
     task.projectName,
     (task.labels || []).join(" "),
@@ -13696,25 +14119,64 @@ function taskDeduplicationContextText(task = {}) {
     knowledge.evidence,
     (knowledge.people || []).join(" "),
     (knowledge.topics || []).join(" ")
-  ].filter(Boolean).join(" ");
+  ].filter(Boolean).join(" "));
+}
+
+function taskDeduplicationSubtaskText(task = {}) {
+  return (task.subtasks || [])
+    .map((subtask) => [subtask?.content, subtask?.description].filter(Boolean).join(" "))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function taskDeduplicationSourceContextText(options = {}) {
+  const lines = ["Source and note context for AI-mediated deduplication:"];
+  if (options.source) lines.push(`Workflow: ${options.source}`);
+  if (options.path) lines.push(`Source path: ${options.path}`);
+  if (options.sectionName) lines.push(`Generated Todoist section: ${options.sectionName}`);
+  const noteLines = (options.contextNotes || []).slice(0, 5).map((note) => {
+    const title = note.title || note.path || "Context note";
+    const path = note.path ? ` (${note.path})` : "";
+    const excerpt = note.excerpt || note.summary || note.text || "";
+    return `- ${singleLine(title)}${path}${excerpt ? `: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(singleLine(excerpt)), 260)}` : ""}`;
+  });
+  if (noteLines.length) lines.push("Relevant notes:", ...noteLines);
+  const semanticLines = (options.semanticContext || []).slice(0, 5).map((chunk) => {
+    const path = chunk.path || chunk.file || chunk.title || "Context";
+    const text = chunk.text || chunk.content || chunk.chunk || "";
+    return `- ${singleLine(path)}${text ? `: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(singleLine(text)), 320)}` : ""}`;
+  });
+  if (semanticLines.length) lines.push("Relevant semantic context:", ...semanticLines);
+  return lines.join("\n");
 }
 
 function taskDeduplicationAiTaskCard(task = {}) {
   const knowledge = task.knowledge || {};
   return [
-    `Title: ${task.content || ""}`,
-    `Description: ${truncateAtWord(task.description || "", 900)}`,
-    `Intent: ${knowledge.intent || ""}`,
-    `Rationale: ${knowledge.rationale || ""}`,
+    `Title: ${scrubTaskDeduplicationBoilerplate(task.content || "")}`,
+    `Description: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(task.description || ""), 900)}`,
+    `Intent: ${scrubTaskDeduplicationBoilerplate(knowledge.intent || "")}`,
+    `Rationale: ${scrubTaskDeduplicationBoilerplate(knowledge.rationale || "")}`,
     `People: ${(knowledge.people || []).join(", ")}`,
     `Topics: ${(knowledge.topics || []).join(", ")}`,
     `Parent: ${task.parentContent || ""}`,
+    `Subtasks: ${truncateAtWord(scrubTaskDeduplicationBoilerplate([task.childText, taskDeduplicationSubtaskText(task)].filter(Boolean).join(" ")), 500)}`,
     `Project: ${task.projectName || ""}`,
     `Section: ${task.section || ""}`,
     `Labels: ${(task.labels || []).join(", ")}`,
     `Due: ${task.due_date || ""}`,
     `Deadline: ${task.deadline_date || ""}`
   ].join("\n");
+}
+
+function scrubTaskDeduplicationBoilerplate(text = "") {
+  return String(text || "")
+    .replace(/\b\S*reply[-_\s]?to\S*\b/gi, " ")
+    .replace(/\b(?:cc|copy|keep|include)\s+(?:the\s+)?(?:reply[-_\s]?to|tracking|ticket|mailbox|inbox)\s+(?:address|alias|mailbox|email)?\b/gi, " ")
+    .replace(/\b(?:so|to ensure)\s+(?:records?|tickets?|emails?)\s+(?:are|is)\s+(?:captured|tracked|logged)\b/gi, " ")
+    .replace(/\bunique\s+(?:email|mailbox|reply[-\s]?to|tracking)\s+(?:address|alias)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function normalizeDate(value) {

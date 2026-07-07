@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.23
+
+- Set OpenAI defaults to GPT 5.4 primary with GPT 5.4 Mini fallback, documented Gemini defaults as Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and kept settings model selectors scoped to the preferred AI provider.
+
 ## 0.6.22
 
 - Refreshed README release notes so What's New summarizes the latest three updates and the README captures the deduplication and task-generation improvements since 0.6.14.

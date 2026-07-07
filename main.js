@@ -141,13 +141,13 @@ const DEFAULT_SETTINGS = {
   workerUrl: "",
   workerToken: "",
   aiModelProvider: "openai",
-  chatModel: "gpt-5.4-mini",
-  chatFallbackModel: "gpt-5.4",
+  chatModel: "gpt-5.4",
+  chatFallbackModel: "gpt-5.4-mini",
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
   embeddingModel: "text-embedding-3-large",
-  availableChatModels: ["gpt-5.4-mini", "gpt-5.4"],
+  availableChatModels: ["gpt-5.4", "gpt-5.4-mini"],
   availableEmbeddingModels: ["text-embedding-3-large"],
   availableGeminiModels: ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
   availableGeminiEmbeddingModels: ["gemini-embedding-2", "gemini-embedding-001"],
@@ -716,6 +716,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       changed = true;
     }
+    if (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4-mini" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4") {
+      this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
+      this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
+      changed = true;
+    }
+    if (Array.isArray(this.settings.availableChatModels) && this.settings.availableChatModels.join("|") === "gpt-5.4-mini|gpt-5.4") {
+      this.settings.availableChatModels = DEFAULT_SETTINGS.availableChatModels.slice();
+      changed = true;
+    }
     const normalizedProviderSetting = normalizeAiProvider(this.settings.aiModelProvider, aiProviderForModel(this.settings.chatModel));
     if (this.settings.aiModelProvider !== normalizedProviderSetting) {
       this.settings.aiModelProvider = normalizedProviderSetting;
@@ -769,6 +778,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.chatModel = preferredChatModelForProvider(this.settings, preferredProvider);
       this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, preferredProvider, this.settings.chatModel);
       this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, preferredProvider);
+      changed = true;
+    }
+    if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== preferredProvider) {
+      this.settings.taskDeduplicationAiModel = "";
       changed = true;
     }
     if (usesGeminiChatModel(this.settings.chatModel) && !usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
@@ -1336,6 +1349,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
     this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
     this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, provider);
+    if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== provider) {
+      this.settings.taskDeduplicationAiModel = "";
+    }
     if (this.settings.embeddingModel !== beforeEmbedding) {
       this.queryEmbeddingCache?.clear?.();
       this.semanticIndexLoaded = false;
@@ -2844,7 +2860,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.availableEmbeddingModels = embeddings;
       this.settings.modelsFetchedAt = deviceTimestamp();
       loadedOpenAI = chat.length + embeddings.length;
-      if (usesOpenAIChatModel(this.settings.chatModel) && !chat.includes(normalizeOpenAIModelId(this.settings.chatModel)) && chat.length) this.settings.chatModel = chat[0];
+      if (usesOpenAIChatModel(this.settings.chatModel) && !chat.includes(normalizeOpenAIModelId(this.settings.chatModel)) && chat.length) this.settings.chatModel = preferredChatModelForProvider(this.settings, "openai");
       if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && !embeddings.includes(normalizeOpenAIModelId(this.settings.embeddingModel))) {
         this.settings.embeddingModel = embeddings.includes("text-embedding-3-large") ? "text-embedding-3-large" : embeddings[0] || this.settings.embeddingModel;
       }
@@ -2860,6 +2876,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!usesGeminiChatModel(this.settings.chatModel) && !usesOpenAIChatModel(this.settings.chatModel)) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
     }
+    this.ensureSameProviderFallbackModel();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.saveSettings();
     this.queryEmbeddingCache.clear();
@@ -7772,20 +7789,26 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
   const current = plugin.settings.taskDeduplicationAiModel || "";
   const automatic = taskDeduplicationAiModel(plugin.settings);
   const options = [{ value: "", label: `Automatic chat fallback: ${modelDisplayName(automatic)}` }];
-  for (const model of plugin.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels) {
-    options.push({ value: normalizeOpenAIModelId(model), label: `OpenAI: ${normalizeOpenAIModelId(model)}` });
+  const provider = normalizeAiProvider(plugin.settings.aiModelProvider, aiProviderForModel(plugin.settings.chatModel));
+  if (provider === "gemini") {
+    const geminiModels = plugin.settings.availableGeminiModels?.length ? plugin.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
+    for (const model of rankGeminiFallbackModels(geminiModels)) {
+      const id = normalizeGeminiModelId(model);
+      if (id && isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
+    }
+  } else {
+    for (const model of plugin.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels) {
+      const id = normalizeOpenAIModelId(model);
+      if (id) options.push({ value: id, label: `OpenAI: ${id}` });
+    }
   }
-  const geminiModels = plugin.settings.availableGeminiModels?.length ? plugin.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
-  for (const model of rankGeminiFallbackModels(geminiModels)) {
-    const id = normalizeGeminiModelId(model);
-    if (id && isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
-  }
+  const selected = options.some((option) => option.value === current) ? current : "";
   new Setting(containerEl)
     .setName("AI deduplication and merge model")
     .setDesc(settingDescription("AI deduplication and merge model", "taskDeduplicationAiModel"))
     .addDropdown((dropdown) => {
       for (const option of uniqueModelOptions(options)) dropdown.addOption(option.value, option.label);
-      dropdown.setValue(current);
+      dropdown.setValue(selected);
       dropdown.onChange(async (value) => {
         plugin.settings.taskDeduplicationAiModel = value;
         await plugin.saveSettings();

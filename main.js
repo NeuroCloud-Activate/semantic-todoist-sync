@@ -62,6 +62,12 @@ const DEFAULT_TASK_DEDUPLICATION_POLICY = [
   "Merge labels additively by default. Do not delete existing labels unless that setting is disabled.",
   "Subtasks can match across notes and can be added or updated under the matched parent. Remove an existing subtask only when the newer source clearly says it is obsolete, no longer needed, or should be removed.",
   "Ignore email-routing boilerplate such as reply-to aliases, tracking mailbox wording, ticket-like intake wording, or generic instructions to copy a mailbox; these are not duplicate-task evidence.",
+  "Treat same-project tasks as duplicates when one is a richer, poorer, broader, or more concise expression of the same action and the existing task would be satisfied by merging the newer details.",
+  "Treat parent and subtask records as duplicates when the subtask merely restates the parent action or the parent only adds context around the same single action; hierarchy alone is not a reason to keep duplicate task records.",
+  "Treat identical or near-identical task titles as duplicate candidates even when they sit under different parent tasks, unless parent context clearly changes the object, person, deliverable, or next step.",
+  "Do not merge similar tasks across different concrete Todoist projects. Treat Inbox as generic, but two named non-Inbox projects are separate work contexts unless the user explicitly moves or links the task across projects.",
+  "Do not merge a distinct component subtask into a broader parent task when the parent contains multiple decisions, questions, recipients, documents, or steps and the subtask represents only one separable piece.",
+  "Do not merge a newer specific progress task, such as reviewing a named person's edits, approvals, returned comments, or current status update, into an older broader project task unless both records require the same immediate next action.",
   "If local signals are ambiguous, create a new task unless AI-facilitated ambiguous deduplication is enabled and the AI returns a high-confidence same-action decision."
 ].join("\n");
 const TASK_DEDUPLICATION_POLICY_UPDATE_LIMIT = 8;
@@ -740,6 +746,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings[key] = Array.isArray(value) ? value.slice() : value;
         changed = true;
       }
+    }
+    const calibratedDedupePolicy = calibratedTaskDeduplicationPolicyText(this.settings.taskDeduplicationPolicy);
+    if (this.settings.taskDeduplicationPolicy !== calibratedDedupePolicy) {
+      this.settings.taskDeduplicationPolicy = calibratedDedupePolicy;
+      changed = true;
     }
     if (!this.settings.googleApiKey) {
       this.settings.googleApiKey = DEFAULT_SETTINGS.googleApiKey;
@@ -4760,8 +4771,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const [id, task] of index.entries || []) {
       if (!id || !task?.content || task.isCompleted) continue;
       const childText = index.childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "";
-      const knowledge = task.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, this.settings, childText, task.knowledge || null);
-      candidates.push({ id: String(id), task: Object.assign({}, task, { id: String(id), knowledge, childText }) });
+      const parentContext = taskReferenceParentContext(task, index);
+      const enrichedTask = Object.assign({}, task, parentContext, { id: String(id), childText });
+      const knowledge = enrichedTask.knowledge?.intent ? enrichedTask.knowledge : taskKnowledgeSnapshot(enrichedTask, this.settings, childText, enrichedTask.knowledge || null);
+      candidates.push({ id: String(id), task: Object.assign(enrichedTask, { knowledge }) });
     }
     return candidates;
   }
@@ -4816,6 +4829,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Run the task generation workflow for a likely duplicate pair.",
           "Confirm whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
           "Ignore email routing, reply-to aliases, mailbox-copy instructions, and ticket-tracking boilerplate unless that routing work is the actual requested action.",
+          "Treat richer/poorer same-action records as duplicates when the existing task can be updated to satisfy the new task.",
+          "Treat parent/subtask pairs as duplicates when one merely restates the other or adds context around the same single next action.",
+          "Treat identical or near-identical titles under different parents as duplicates unless the parent context changes the person, object, deliverable, or next step.",
+          "Treat different concrete non-Inbox Todoist projects as separate work contexts. Do not merge similar tasks across different named projects unless the source explicitly says the task moved or spans both projects.",
+          "Return match false when one task is only a distinct component of a broader parent task with multiple decisions, questions, recipients, documents, or steps.",
+          "Return match false when a newer task reflects specific progress, such as reviewing a named person's edits, approvals, returned comments, or a current status update, and the older task is a broader project/status task.",
           "If they are the same, return one merged generated task that preserves the clearest title plus useful non-conflicting details from both records.",
           "If they are only related, return match false and keep the proposed merged task empty."
         ].join(" "),
@@ -8883,8 +8902,25 @@ function normalizeTaskDeduplicationPolicyText(value = "") {
   return text || DEFAULT_TASK_DEDUPLICATION_POLICY;
 }
 
+function calibratedTaskDeduplicationPolicyText(value = "") {
+  let text = normalizeTaskDeduplicationPolicyText(value || DEFAULT_TASK_DEDUPLICATION_POLICY);
+  const additions = [
+    "Treat same-project tasks as duplicates when one is a richer, poorer, broader, or more concise expression of the same action and the existing task would be satisfied by merging the newer details.",
+    "Treat parent and subtask records as duplicates when the subtask merely restates the parent action or the parent only adds context around the same single action; hierarchy alone is not a reason to keep duplicate task records.",
+    "Treat identical or near-identical task titles as duplicate candidates even when they sit under different parent tasks, unless parent context clearly changes the object, person, deliverable, or next step.",
+    "Do not merge similar tasks across different concrete Todoist projects. Treat Inbox as generic, but two named non-Inbox projects are separate work contexts unless the user explicitly moves or links the task across projects.",
+    "Do not merge a distinct component subtask into a broader parent task when the parent contains multiple decisions, questions, recipients, documents, or steps and the subtask represents only one separable piece.",
+    "Do not merge a newer specific progress task, such as reviewing a named person's edits, approvals, returned comments, or current status update, into an older broader project task unless both records require the same immediate next action."
+  ];
+  for (const addition of additions) {
+    const marker = addition.slice(0, 72).toLowerCase();
+    if (!text.toLowerCase().includes(marker)) text = `${text}\n- ${addition}`;
+  }
+  return normalizeTaskDeduplicationPolicyText(text);
+}
+
 function taskDeduplicationPolicyText(settings = DEFAULT_SETTINGS) {
-  return normalizeTaskDeduplicationPolicyText(settings.taskDeduplicationPolicy || DEFAULT_TASK_DEDUPLICATION_POLICY);
+  return calibratedTaskDeduplicationPolicyText(settings.taskDeduplicationPolicy || DEFAULT_TASK_DEDUPLICATION_POLICY);
 }
 
 function appendTaskDeduplicationPolicyInstruction(currentPolicy = "", instruction = "") {
@@ -12936,6 +12972,43 @@ function taskChildTextByParentOid(entries) {
   return map;
 }
 
+function taskReferenceParentContext(task = {}, index = emptyTaskReferenceIndex()) {
+  const parent = taskReferenceParentTask(task, index);
+  if (!parent) return {};
+  const parentChildText = taskReferenceParentChildText(parent, task, index);
+  return {
+    parentContent: task.parentContent || parent.content || "",
+    parentDescription: parent.description || "",
+    parentProjectName: parent.projectName || "",
+    parentSection: parent.section || "",
+    parentChildText,
+    siblingText: parentChildText
+  };
+}
+
+function taskReferenceParentTask(task = {}, index = emptyTaskReferenceIndex()) {
+  const parentId = String(task.parentId || "");
+  if (parentId && index.byId?.has(parentId)) return index.byId.get(parentId);
+  const parentOid = String(task.parentOid || "").toUpperCase();
+  if (parentOid && index.byOid?.has(parentOid)) {
+    const id = index.byOid.get(parentOid);
+    if (id && index.byId?.has(id)) return index.byId.get(id);
+  }
+  return null;
+}
+
+function taskReferenceParentChildText(parent = {}, task = {}, index = emptyTaskReferenceIndex()) {
+  const parentOid = String(parent.oid || task.parentOid || "").toUpperCase();
+  if (parentOid && index.childTextByParentOid?.has(parentOid)) return index.childTextByParentOid.get(parentOid) || "";
+  const parentId = String(parent.id || task.parentId || "");
+  if (!parentId) return "";
+  return (index.entries || [])
+    .filter(([, child]) => String(child?.parentId || "") === parentId)
+    .map(([, child]) => [child?.content, child?.description, (child?.labels || []).join(" ")].filter(Boolean).join(" "))
+    .filter(Boolean)
+    .join(" ");
+}
+
 function taskReferenceKey(task, id = "") {
   const oid = String(task?.oid || "").toUpperCase();
   if (oid) return `oid:${oid}`;
@@ -13825,8 +13898,8 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
   let best = null;
   for (const candidate of candidates) {
     if (!candidate?.id || candidate.task?.isCompleted) continue;
-    if (Boolean(candidate.task?.isSubtask) !== Boolean(options.isSubtask || task.isSubtask)) continue;
     const scored = taskDeduplicationScore(task, candidate, settings, options);
+    if (scored.hierarchyMismatch && !scored.hierarchyCandidate) continue;
     if (!best || scored.confidence > best.confidence) best = scored;
   }
   if (!best || !best.candidate) return { decision: "create", confidence: 0, reasons: ["No active local candidate."], candidate: null };
@@ -13854,12 +13927,30 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
   const existingContextTokens = taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, existing, { knowledge: existingKnowledge })));
   const contextOverlap = tokenDiceScore(sourceContextTokens, existingContextTokens);
   const sameProject = sameTaskDeduplicationProject(task, existing);
+  const differentConcreteProject = differentConcreteTaskDeduplicationProject(task, existing);
   const projectContextEligible = sameProject && !isGenericTodoistInboxTask(task) && !isGenericTodoistInboxTask(existing);
   const sameSection = sameTaskDeduplicationSection(task, existing);
   const sharedTitleTokens = tokenIntersection(sourceTitleTokens, existingTitleTokens);
   const peopleOverlap = tokenOverlapCount(sourceKnowledge.people || [], existingKnowledge.people || []);
   const topicOverlap = tokenOverlapCount(sourceKnowledge.topics || [], existingKnowledge.topics || []);
   const labelOverlap = tokenOverlapCount(task?.labels || [], existing.labels || []);
+  const hierarchy = taskDeduplicationHierarchySignal(task, existing, options, {
+    titleOverlap,
+    contextOverlap,
+    sharedTitleTokens
+  });
+  const progressDistinct = taskDeduplicationProgressDistinct(task, existing, {
+    titleOverlap,
+    contextOverlap
+  });
+  const componentDistinct = taskDeduplicationComponentDistinct(task, existing, {
+    titleOverlap,
+    contextOverlap
+  });
+  const sequentialDistinct = taskDeduplicationSequentialActionDistinct(task, existing, {
+    titleOverlap,
+    contextOverlap
+  });
   const reasons = [];
   let score = 0;
   if (sourceTitle && existingTitle && sourceTitle === existingTitle) {
@@ -13899,24 +13990,52 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
   if (task?.due_date && existing.due_date && datePart(task.due_date) === datePart(existing.due_date)) score += 4;
   if (task?.deadline_date && existing.deadline_date && task.deadline_date === existing.deadline_date) score += 4;
   let projectContextMatch = false;
-  if (projectContextEligible) {
+  if (projectContextEligible && !progressDistinct && !componentDistinct && !sequentialDistinct) {
     score += 12;
     reasons.push("same Todoist project");
-    if (sharedTitleTokens.length >= 2 && titleOverlap >= 0.34 && contextOverlap >= 0.34) {
+    if (sharedTitleTokens.length >= 2 && titleOverlap >= 0.3 && contextOverlap >= 0.28) {
       const projectContextScore = Math.min(40, 30 + sharedTitleTokens.length * 2);
       score += projectContextScore;
       projectContextMatch = true;
       reasons.push("same project action context");
     }
   }
-  if (options.parentId && existing.parentId && String(options.parentId) === String(existing.parentId)) {
+  if (hierarchy.sameParent) {
     score += 16;
     reasons.push("same parent task");
   }
+  if (hierarchy.parentSubtaskRestatement) {
+    score += 18;
+    reasons.push("parent/subtask restatement");
+  }
+  if (hierarchy.identicalAcrossParents) {
+    score += 12;
+    reasons.push("same action under different parents");
+  }
   let hardMismatch = false;
-  if (options.parentId && existing.parentId && String(options.parentId) !== String(existing.parentId)) {
-    score -= 24;
+  if (differentConcreteProject) {
+    score -= 42;
+    reasons.push("different Todoist projects");
     hardMismatch = true;
+  }
+  if (hierarchy.differentParent && !hierarchy.identicalAcrossParents) {
+    score -= 16;
+    if (!hierarchy.parentSubtaskRestatement && titleOverlap < 0.72) hardMismatch = true;
+  }
+  if (progressDistinct) {
+    score -= 30;
+    reasons.push("newer progress step differs from older task");
+    if (titleOverlap < 0.78) hardMismatch = true;
+  }
+  if (componentDistinct) {
+    score -= 28;
+    reasons.push("distinct component of broader task");
+    if (titleOverlap < 0.7) hardMismatch = true;
+  }
+  if (sequentialDistinct) {
+    score -= 26;
+    reasons.push("distinct sequential action");
+    if (titleOverlap < 0.65) hardMismatch = true;
   }
   const aiReview = taskDeduplicationAiReviewConfig(settings, options);
   const batchContextMatch = Boolean(options.intraBatch
@@ -13939,6 +14058,8 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     contextOverlap,
     projectContextMatch,
     batchContextMatch,
+    hierarchyMismatch: hierarchy.mismatch,
+    hierarchyCandidate: hierarchy.candidate,
     hardMismatch,
     reasons: reasons.length ? reasons : ["weak local overlap"]
   };
@@ -14110,6 +14231,14 @@ function isGenericTodoistInboxTask(task = {}) {
   return Boolean(task?.isInbox || singleLine(task.projectName || "").toLowerCase() === "inbox");
 }
 
+function differentConcreteTaskDeduplicationProject(task = {}, existing = {}) {
+  if (isGenericTodoistInboxTask(task) || isGenericTodoistInboxTask(existing)) return false;
+  if (task.projectId && existing.projectId && String(task.projectId) !== String(existing.projectId)) return true;
+  const sourceProject = singleLine(task.projectName || "").toLowerCase();
+  const existingProject = singleLine(existing.projectName || "").toLowerCase();
+  return Boolean(sourceProject && existingProject && sourceProject !== existingProject);
+}
+
 function sameTaskDeduplicationSection(task = {}, existing = {}) {
   if (task.sectionId && existing.sectionId && String(task.sectionId) === String(existing.sectionId)) return true;
   const sourceSection = singleLine(task.section || "").toLowerCase();
@@ -14131,13 +14260,100 @@ function tokenOverlapCount(left = [], right = []) {
   return count;
 }
 
+function taskDeduplicationHierarchySignal(task = {}, existing = {}, options = {}, metrics = {}) {
+  const sourceIsSubtask = Boolean(options.isSubtask || task.isSubtask || task.parentId || task.parentContent);
+  const existingIsSubtask = Boolean(existing.isSubtask || existing.parentId || existing.parentContent);
+  const sourceParentId = String(options.parentId || task.parentId || "");
+  const existingParentId = String(existing.parentId || "");
+  const sameParent = Boolean(sourceParentId && existingParentId && sourceParentId === existingParentId);
+  const differentParent = Boolean(sourceIsSubtask && existingIsSubtask && sourceParentId && existingParentId && sourceParentId !== existingParentId);
+  const crossHierarchy = sourceIsSubtask !== existingIsSubtask;
+  const sourceTitleTokens = taskDedupeTokenSet(task?.content || "");
+  const existingTitleTokens = taskDedupeTokenSet(existing.content || "");
+  const sourceParentOverlap = tokenDiceScore(taskDedupeTokenSet([task.parentContent || options.parentContent || "", task.parentDescription || ""].join(" ")), existingTitleTokens);
+  const existingParentOverlap = tokenDiceScore(taskDedupeTokenSet([existing.parentContent || "", existing.parentDescription || ""].join(" ")), sourceTitleTokens);
+  const parentSubtaskRestatement = Boolean(crossHierarchy && (
+    (metrics.titleOverlap || 0) >= 0.58 ||
+    (metrics.contextOverlap || 0) >= 0.56 ||
+    sourceParentOverlap >= 0.62 ||
+    existingParentOverlap >= 0.62
+  ) && (metrics.sharedTitleTokens || []).length >= 2);
+  const identicalAcrossParents = Boolean(differentParent && (metrics.titleOverlap || 0) >= 0.9);
+  const hierarchyMismatch = Boolean(crossHierarchy || differentParent);
+  const hierarchyCandidate = Boolean(parentSubtaskRestatement || identicalAcrossParents || (!hierarchyMismatch && !differentParent));
+  return {
+    sourceIsSubtask,
+    existingIsSubtask,
+    crossHierarchy,
+    sameParent,
+    differentParent,
+    parentSubtaskRestatement,
+    identicalAcrossParents,
+    mismatch: hierarchyMismatch,
+    candidate: hierarchyCandidate
+  };
+}
+
+function taskDeduplicationProgressDistinct(task = {}, existing = {}, metrics = {}) {
+  if ((metrics.titleOverlap || 0) >= 0.8) return false;
+  const sourceRaw = [task.content, task.description].filter(Boolean).join(" ");
+  const targetRaw = [existing.content, existing.description].filter(Boolean).join(" ");
+  const source = canonicalTaskMatchTitle(sourceRaw);
+  const target = canonicalTaskMatchTitle(targetRaw);
+  const progressSpecific = /\b(edits?|comments?|returned|minor comment|approval|approve|review and approve|current status|status update|currently with|where they sit|decision points?|outstanding)\b/i;
+  const broadStatus = /\b(currently with|where they sit|status|decision points?|outstanding|advance them|check status|project status|concept notes?|broader|overall)\b/i;
+  const oneSpecific = progressSpecific.test(source) || progressSpecific.test(target);
+  const oneBroad = broadStatus.test(source) || broadStatus.test(target);
+  if (!oneSpecific || !oneBroad) return false;
+  const sourceNames = taskDedupeNameTokens(sourceRaw);
+  const targetNames = taskDedupeNameTokens(targetRaw);
+  const sharedNames = tokenIntersection(sourceNames, targetNames);
+  const hasDifferentNamedProgress = sourceNames.size && targetNames.size && !sharedNames.length;
+  return Boolean(hasDifferentNamedProgress || (metrics.contextOverlap || 0) < 0.62);
+}
+
+function taskDeduplicationComponentDistinct(task = {}, existing = {}, metrics = {}) {
+  if ((metrics.titleOverlap || 0) >= 0.7) return false;
+  const source = canonicalTaskMatchTitle([task.content, task.description, task.parentContent, task.parentDescription].filter(Boolean).join(" "));
+  const target = canonicalTaskMatchTitle([existing.content, existing.description, existing.parentContent, existing.parentDescription].filter(Boolean).join(" "));
+  const sourceTitle = canonicalTaskMatchTitle(task.content || "");
+  const targetTitle = canonicalTaskMatchTitle(existing.content || "");
+  const sourceChild = canonicalTaskMatchTitle([task.childText, task.parentChildText, task.siblingText, taskDeduplicationSubtaskText(task)].filter(Boolean).join(" "));
+  const targetChild = canonicalTaskMatchTitle([existing.childText, existing.parentChildText, existing.siblingText, taskDeduplicationSubtaskText(existing)].filter(Boolean).join(" "));
+  const broad = /\b(prepare questions?|prepare question|plan|coordinate|organize|list|identify|decisions?|decision|multiple|several|package|process)\b/i;
+  const specific = /\b(ask|approve|send|confirm|book|draft|review|revise|finalize|provide)\b/i;
+  const oneBroad = broad.test(source) || broad.test(target);
+  const oneSpecific = specific.test(source) || specific.test(target);
+  const childMentionsOther = (sourceChild && targetTitle && sourceChild.includes(targetTitle)) || (targetChild && sourceTitle && targetChild.includes(sourceTitle));
+  return Boolean(oneBroad && oneSpecific && childMentionsOther);
+}
+
+function taskDeduplicationSequentialActionDistinct(task = {}, existing = {}, metrics = {}) {
+  if ((metrics.titleOverlap || 0) >= 0.65) return false;
+  const source = canonicalTaskMatchTitle([task.content, task.description, task.parentContent, task.parentDescription].filter(Boolean).join(" "));
+  const target = canonicalTaskMatchTitle([existing.content, existing.description, existing.parentContent, existing.parentDescription].filter(Boolean).join(" "));
+  const reviewFirst = /\b(review|check|identify|list|determine|which|select|assess|evaluate)\b/i;
+  const sendLater = /\b(send|issue|deliver|submit|publish|notify|confirming status|letter|letters|forms)\b/i;
+  const sourceReviewTargetSend = reviewFirst.test(source) && sendLater.test(target);
+  const targetReviewSourceSend = reviewFirst.test(target) && sendLater.test(source);
+  return Boolean((sourceReviewTargetSend || targetReviewSourceSend) && (metrics.contextOverlap || 0) < 0.62);
+}
+
+function taskDedupeNameTokens(text = "") {
+  const words = String(text || "").match(/\b[A-Z][a-z][A-Za-z'-]*\b/g) || [];
+  return new Set(words.map((word) => canonicalTaskMatchTitle(word)).filter((word) => word.length > 2 && !TASK_DEDUPE_STOP_WORDS.has(word)));
+}
+
 function taskDeduplicationContextText(task = {}) {
   const knowledge = task.knowledge || {};
   return scrubTaskDeduplicationBoilerplate([
     task.content,
     task.description,
     task.parentContent,
+    task.parentDescription,
     task.childText,
+    task.parentChildText,
+    task.siblingText,
     taskDeduplicationSubtaskText(task),
     task.section,
     task.projectName,
@@ -14192,7 +14408,8 @@ function taskDeduplicationAiTaskCard(task = {}) {
     `People: ${(knowledge.people || []).join(", ")}`,
     `Topics: ${(knowledge.topics || []).join(", ")}`,
     `Parent: ${task.parentContent || ""}`,
-    `Subtasks: ${truncateAtWord(scrubTaskDeduplicationBoilerplate([task.childText, taskDeduplicationSubtaskText(task)].filter(Boolean).join(" ")), 500)}`,
+    `Parent description: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(task.parentDescription || ""), 500)}`,
+    `Related parent/sibling/subtask context: ${truncateAtWord(scrubTaskDeduplicationBoilerplate([task.parentChildText, task.siblingText, task.childText, taskDeduplicationSubtaskText(task)].filter(Boolean).join(" ")), 700)}`,
     `Project: ${task.projectName || ""}`,
     `Section: ${task.section || ""}`,
     `Labels: ${(task.labels || []).join(", ")}`,

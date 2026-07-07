@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.21
+
+- Calibrated task deduplication so same-project richer same-action tasks, parent/subtask restatements, and same-title cross-parent tasks can be AI-reviewed while distinct progress steps, component subtasks, and different-project tasks stay separate.
+
 ## 0.6.20
 
 - Fixed email and note task generation so polite draft/document review requests for comments, tracked changes, accuracy verification, or gap confirmation are treated as actionable tasks even when sent to multiple recipients.

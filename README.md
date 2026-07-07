@@ -24,19 +24,30 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.14
+## What's New In 0.6.22
 
-1. **Clear AI provider choice**
+1. **Current release notes stay visible**
 
-   Setup now has a preferred provider dropdown, so you can keep both OpenAI and Gemini keys saved without the model lists getting mixed together.
+   The README now keeps this section aligned with the latest three releases, while the full history remains in `CHANGELOG.md`.
 
-2. **Simpler model behavior**
+2. **Smarter duplicate-task handling**
 
-   The separate strong-model gate was removed. The plugin now follows your selected primary model and only uses the configured fallback model for same-provider overload or temporary model failures.
+   Duplicate checking now uses Todoist project, parent task, parent description, sibling/subtask context, task descriptions, and local task knowledge before deciding whether a new task should update an existing one. Ambiguous merges stay AI-mediated when that option is enabled.
 
-3. **Cleaner References tab**
+3. **Better email and note task extraction**
 
-   The local reference rebuild controls now wrap properly, so the Rebuild and Recover IDs buttons no longer cover the explanatory text.
+   Polite review requests in emails and notes, including requests for comments, tracked changes, accuracy verification, or gap confirmation, are treated as actionable tasks instead of being skipped.
+
+## Recent Updates Since 0.6.14
+
+- **0.6.22:** README and changelog upkeep now make the latest release story easier to verify from GitHub.
+- **0.6.21:** Deduplication was calibrated so same-project richer same-action tasks, parent/subtask restatements, and near-identical cross-parent tasks can be reviewed as likely duplicates, while distinct progress steps, component subtasks, and tasks in different concrete Todoist projects stay separate.
+- **0.6.20:** Email-To-Todoist and Notes-To-Todoist now recognize polite document-review requests as actionable task requests.
+- **0.6.19:** Duplicate matching remains local-first, but automatic merging requires AI-mediated confirmation by default; when AI-mediated dedupe is off, possible duplicates are surfaced for manual review instead of merged.
+- **0.6.18:** Duplicate validation was broadened across domains and filters out generic routing or ticket-mailbox wording that should not count as duplicate evidence.
+- **0.6.17:** Duplicate merges now go through a task-generation-shaped AI merge step so useful context can be preserved when tasks are combined.
+- **0.6.16:** Duplicates generated within the same task-creation batch are collapsed before Todoist creation while preserving useful metadata and subtasks.
+- **0.6.15:** Local deduplication became less title-bound by using same-project context, task descriptions, and subtask evidence.
 
 ## What It Uses
 
@@ -95,10 +106,11 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - The preview shows scheduled tasks, unscheduled work, moved-out tasks, and up to ten suggested swaps.
    - The default `Schedule today's tasks` prompt is created in the prompts folder and can be edited there. Settings still control the scheduler rules; the prompt coordinates the duration-estimation request.
 
-6. Optional: enable stronger-model routing.
+6. Optional: configure task deduplication.
    - Open `Settings > Semantic Todoist Sync > Setup`.
-   - Leave `Use stronger model when locally justified` off for the fastest and cheapest default behavior.
-   - Turn it on when you want broad portfolio questions, recency/conflict-heavy answers, complex task generation, or richer task descriptions to use the configured stronger model only when the local score is high enough.
+   - Keep task deduplication on to compare newly generated tasks against existing open Todoist tasks and other tasks generated in the same batch.
+   - Leave AI-mediated deduplication enabled for the safest automatic merges. The default dedupe model follows the configured chat fallback model, and you can choose another model if you prefer.
+   - If AI-mediated deduplication is disabled, local-only detection can still flag possible duplicates in chat for manual review, but it will not merge tasks automatically.
 
 ## Sidebar And Prompts
 
@@ -187,7 +199,7 @@ Each GitHub release tag matches the version in `manifest.json` and includes `mai
 
 - API keys are stored in Obsidian plugin settings on the user's device and sync only if the user syncs Obsidian settings.
 - Vault content is sent to the selected AI provider when using chat, semantic indexing, task extraction, or task description generation.
-- The optional strong-model gate is decided locally from already-retrieved context and does not make an extra AI call just to choose a model.
+- AI-mediated task deduplication sends the likely duplicate pair and relevant task/note context to the selected dedupe model when automatic merging is enabled.
 - The local status bar and sync reconciliation logic do not use AI API calls.
 - Todoist receives task content, descriptions, labels, due dates, priorities, project IDs, and section IDs needed for sync.
 - The local Todoist reference table stores Todoist task snapshots on device and is used to reduce repeated Todoist API reads.

@@ -24,22 +24,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.22
+## What's New In 0.6.23
 
-1. **Current release notes stay visible**
+1. **0.6.23 - Updated default AI models**
 
-   The README now keeps this section aligned with the latest three releases, while the full history remains in `CHANGELOG.md`.
+   OpenAI now defaults to GPT 5.4 as the primary model and GPT 5.4 Mini as the fallback. Gemini defaults to Gemini 3.5 Flash as primary and Gemini 3.1 Flash Lite as fallback. Primary, embedding, fallback, and deduplication model selectors stay aligned with the preferred AI provider chosen during setup.
 
-2. **Smarter duplicate-task handling**
+2. **0.6.22 - Current release notes stay visible**
 
-   Duplicate checking now uses Todoist project, parent task, parent description, sibling/subtask context, task descriptions, and local task knowledge before deciding whether a new task should update an existing one. Ambiguous merges stay AI-mediated when that option is enabled.
+   The README keeps this section aligned with the latest three releases, while the full history remains in `CHANGELOG.md`.
 
-3. **Better email and note task extraction**
+3. **0.6.21 - Smarter duplicate-task handling**
 
-   Polite review requests in emails and notes, including requests for comments, tracked changes, accuracy verification, or gap confirmation, are treated as actionable tasks instead of being skipped.
+   Duplicate checking uses Todoist project, parent task, parent description, sibling/subtask context, task descriptions, and local task knowledge before deciding whether a new task should update an existing one. Ambiguous merges stay AI-mediated when that option is enabled.
 
 ## Recent Updates Since 0.6.14
 
+- **0.6.23:** OpenAI defaults now use GPT 5.4 primary with GPT 5.4 Mini fallback, Gemini defaults use Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and model selectors stay scoped to the preferred provider.
 - **0.6.22:** README and changelog upkeep now make the latest release story easier to verify from GitHub.
 - **0.6.21:** Deduplication was calibrated so same-project richer same-action tasks, parent/subtask restatements, and near-identical cross-parent tasks can be reviewed as likely duplicates, while distinct progress steps, component subtasks, and tasks in different concrete Todoist projects stay separate.
 - **0.6.20:** Email-To-Todoist and Notes-To-Todoist now recognize polite document-review requests as actionable task requests.
@@ -51,7 +52,8 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What It Uses
 
-- OpenAI by default through the user's own API key, with GPT 5.4 Mini as the primary model, GPT 5.4 as the same-provider fallback, and Gemini still supported through Google AI Studio.
+- OpenAI by default through the user's own API key, with GPT 5.4 as the primary model and GPT 5.4 Mini as the same-provider fallback.
+- Gemini through Google AI Studio, with Gemini 3.5 Flash as the primary model and Gemini 3.1 Flash Lite as the same-provider fallback when Gemini is selected as the preferred provider.
 - A local semantic index for vault search, context-aware task descriptions, and compact task-reference retrieval.
 - Todoist API access for task creation, updates, and reference reconciliation.
 - Optional Cloudflare Email Routing and Workers for the Email-To-Todoist workflow.
@@ -70,7 +72,7 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Use `OpenAI API keys` to open OpenAI Platform's key page.
    - Paste the OpenAI key into `OpenAI API key`.
    - Click `Test AI`.
-   - Optional: use Gemini instead by adding a Gemini key and choosing Gemini models.
+   - Optional: use Gemini instead by adding a Gemini key and choosing Gemini as the preferred provider.
 
 2. Add Todoist access.
    - Use `Token instructions` if Todoist does not open directly to the token page.
@@ -110,6 +112,7 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Open `Settings > Semantic Todoist Sync > Setup`.
    - Keep task deduplication on to compare newly generated tasks against existing open Todoist tasks and other tasks generated in the same batch.
    - Leave AI-mediated deduplication enabled for the safest automatic merges. The default dedupe model follows the configured chat fallback model, and you can choose another model if you prefer.
+   - Model choices shown in settings stay scoped to the preferred AI provider selected during setup.
    - If AI-mediated deduplication is disabled, local-only detection can still flag possible duplicates in chat for manual review, but it will not merge tasks automatically.
 
 ## Sidebar And Prompts

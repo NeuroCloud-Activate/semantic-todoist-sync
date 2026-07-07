@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.22
+
+- Refreshed README release notes so What's New summarizes the latest three updates and the README captures the deduplication and task-generation improvements since 0.6.14.
+
 ## 0.6.21
 
 - Calibrated task deduplication so same-project richer same-action tasks, parent/subtask restatements, and same-title cross-parent tasks can be AI-reviewed while distinct progress steps, component subtasks, and different-project tasks stay separate.

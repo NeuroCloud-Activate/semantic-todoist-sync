@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.19
+
+- Kept duplicate matching local-first, required AI-mediated confirmation for all task merges, defaulted automatic dedupe model selection to the chat fallback model, and made AI-off dedupe post possible duplicate candidates to chat for manual review without merging tasks.
+
+## 0.6.18
+
+- Broadened duplicate validation across multiple task domains, taught dedupe to ignore generic email-routing boilerplate, and added AI-mediated merge coverage for review/decision, agreement follow-up, and inbox-impact task patterns.
+
+## 0.6.17
+
+- Required duplicate task merges to be AI-mediated through a task-generation-shaped merge step so likely duplicates are confirmed and combined with note/email context before updating existing tasks or collapsing same-batch tasks.
+
+## 0.6.16
+
+- Collapsed duplicate tasks generated in the same task-creation batch before Todoist creation while preserving useful description, due date, label, priority, and subtask details.
+
+## 0.6.15
+
+- Improved local task deduplication so same-project tasks with shared action context, descriptions, and subtask evidence can match even when their titles use different wording.
+
 ## 0.6.14
 
 - Removed the separate "Use stronger model when locally justified" setting so AI requests follow the configured primary model and only use the fallback model for same-provider transient failures.

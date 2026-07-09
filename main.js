@@ -288,7 +288,7 @@ const DEFAULT_SETTINGS = {
   tagInstructions: "Only create Todoist labels that are explicitly named in these instructions. Add labels only when the source content clearly matches a configured rule.",
   priorityInstructions: "Assign priority 1 to 4 to each task and subtask, where 4 is highest priority and 1 is no priority.",
   descriptionInstructions: "Include concise, actionable context from the source and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the source note, source subject, or filename.",
-  emailMainTaskInstructions: "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
+  emailMainTaskInstructions: "Assume every email forwarded into Email-To-Todoist is intended to create at least one Todoist task. Review the email chain together with relevant ranked vault context and identify the most useful action, follow-up, review, decision, or completion task for the user. Requests for thoughts, feedback, review, comments, tracked changes, verification of accuracy, confirmation of gaps, or document/draft review are actionable even when phrased politely, marked non-urgent, or sent to multiple recipients. Exclude signatures, disclaimers, logos, and work clearly owned by someone else unless the user needs to follow up. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
   emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task and supported by the email or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   emailSectionTitleInstructions: "Create one Todoist section for all tasks from the same email using Email_YY_MM_DD_Subject based on the email received date and subject.",
   emailDateInstructions: "Determine due dates and deadlines from the email's urgency, stated dates, complexity, and sender expectations. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
@@ -881,6 +881,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       emailMainTaskInstructions: [
         "Review the email chain and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email context to act without rereading the full thread.",
         "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
+        "Review the email chain together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Exclude informational updates, vague possibilities, and tasks owned by others unless I need to follow up on them. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
         DEFAULT_SETTINGS.emailMainTaskInstructions
       ],
       emailSubtaskInstructions: [
@@ -897,8 +898,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         DEFAULT_SETTINGS.noteSubtaskInstructions
       ]
     };
-    for (const [key, [oldValue, newValue]] of Object.entries(taskInstructionUpdates)) {
-      if (this.settings[key] === oldValue) {
+    for (const [key, values] of Object.entries(taskInstructionUpdates)) {
+      const oldValues = values.slice(0, -1);
+      const newValue = values[values.length - 1];
+      if (oldValues.includes(this.settings[key])) {
         this.settings[key] = newValue;
         changed = true;
       }
@@ -2986,8 +2989,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
         "When ranked vault context conflicts on the same topic, prefer the newest matching note as the current guidance while preserving older notes only as background.",
         "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
-        "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
-        source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, use only explicit action, follow-up, review, waiting-on, or decision requests from the email thread.",
+        source.type === "email" ? "For emails, assume the user forwarded the message because they want at least one Todoist task created. Create a concise review, reply, follow-up, decision, or completion task from the most relevant thread context unless the email is unreadable or contains only signature/disclaimer material." : "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
+        source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, soft language such as 'let me know what you think', 'for review', 'no immediate review', or 'lots of time to finalize' still indicates a task when the thread includes a draft, document, link, decision, reply, or follow-up context.",
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
         "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
@@ -3015,7 +3018,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
     if (!parsed.tasks.length) {
-      const fallbackTask = explicitReviewRequestFallbackTask(source, sourceSummary, this.settings);
+      const fallbackTask = source.type === "email"
+        ? emailIntendedActionFallbackTask(source, sourceSummary, this.settings)
+        : explicitReviewRequestFallbackTask(source, sourceSummary, this.settings);
       if (fallbackTask) parsed.tasks = [cleanTask(fallbackTask, allowedLabels, this.settings)].filter((task) => task.content);
     }
     parsed.sectionName = cleanGeneratedSectionName(parsed.section_name || parsed.sectionName || source.sectionName);
@@ -3668,11 +3673,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const cloudflareReceivedAt = email.receivedAt || "";
         const receivedAt = originalEmailReceivedAt(parsed, cloudflareReceivedAt);
         const fallbackSectionName = makeSectionName(receivedAt, subject);
+        const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
+        const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
         const emailSourceText = [
           `From: ${email.from || parsed.from || ""}`,
           `To: ${email.to || parsed.to || ""}`,
-          `Original email received: ${receivedAt}`,
-          cloudflareReceivedAt ? `Forward received by Cloudflare: ${cloudflareReceivedAt}` : "",
+          `Original email received: ${displayedReceivedAt}`,
+          displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
           `Subject: ${subject}`,
           "",
           parsed.text
@@ -5720,12 +5727,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await ensureVaultFolder(this.app, folder);
     const noteTitle = emailTaskNoteTitle(receivedAt, subject);
     const path = uniqueMarkdownPath(this.app, folder, noteTitle);
+    const visibleTitle = markdownTitleFromPath(path) || noteTitle;
+    const displayedProcessedAt = formatEmailWorkflowTimestamp(new Date());
+    const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
+    const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
     const lines = [
-      `# ${noteTitle}`,
+      `# ${visibleTitle}`,
       "",
-      `Date processed: ${deviceTimestamp()}`,
-      `Original email received: ${receivedAt || ""}`,
-      cloudflareReceivedAt ? `Forward received by Cloudflare: ${cloudflareReceivedAt}` : "",
+      `Date processed: ${displayedProcessedAt}`,
+      `Original email received: ${displayedReceivedAt}`,
+      displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
       `From: ${from || ""}`,
       `Email subject: ${subject || ""}`,
       `Todoist section: ${sectionName}`,
@@ -13298,6 +13309,65 @@ function explicitReviewRequestFallbackTask(source = {}, sourceSummary = "", sett
   };
 }
 
+function emailIntendedActionFallbackTask(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+  const explicit = explicitReviewRequestFallbackTask(source, sourceSummary, settings);
+  if (explicit) return explicit;
+  const text = cleanupEmailText(stripExcludedLinks([source.title, source.text, sourceSummary].filter(Boolean).join("\n"), settings));
+  if (!hasUsefulForwardedEmailContent(text)) return null;
+  const sender = firstNameFromEmailHeader(text.match(/^From:\s*(.+)$/im)?.[1] || "");
+  const subject = normalizeEmailSubject(source.title || text.match(/^Subject:\s*(.+)$/im)?.[1] || "");
+  const linkedDocument = extractLinkedDocumentTitle(text);
+  const topic = linkedDocument || subject || "the forwarded email";
+  const hasDocumentContext = /\b(?:draft|document|docx?|attachment|linked|link|file|sharepoint|notification|report|letter|proposal|application|materials?)\b/i.test(text);
+  const hasFeedbackContext = /\b(?:let me know what you think|thoughts?|feedback|review|comments?|tracked\s+changes?|input|confirm|confirmation|verify|verification|approval|finali[sz]e|adjustments?)\b/i.test(text);
+  const timing = /\b(?:no immediate review|not require immediate review|lots of time|not urgent)\b/i.test(text) ? " when timing allows" : "";
+  const content = hasDocumentContext || hasFeedbackContext
+    ? `Review the ${topic}${hasDocumentContext && !/\b(?:draft|document|email notification|letter|report|proposal|application|materials?)\b/i.test(topic) ? " draft/document" : ""} and send any comments, confirmation, or follow-up needed${sender ? ` to ${sender}` : ""}${timing}.`
+    : `Review ${topic} and complete the needed follow-up${sender ? ` for ${sender}` : ""}${timing}.`;
+  return {
+    content: truncateAtWord(content, 250),
+    due_date: null,
+    deadline_date: null,
+    priority: /\bearliest convenience|urgent|asap|deadline|due\b/i.test(text) ? 3 : 2,
+    labels: [],
+    subtasks: []
+  };
+}
+
+function hasUsefulForwardedEmailContent(value = "") {
+  const text = String(value || "");
+  const withoutBoilerplate = text
+    .replace(/\bThis e-mail, including any attachments[\s\S]*$/i, "")
+    .replace(/\bIf you are not the intended recipient[\s\S]*$/i, "")
+    .replace(/\bImage\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const words = withoutBoilerplate.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  return words.length >= 6;
+}
+
+function normalizeEmailSubject(value = "") {
+  return singleLine(value || "")
+    .replace(/^(?:re|fw|fwd):\s*/gi, "")
+    .replace(/\s*[-:–—]\s*(?:review|for review|please review)\s*$/i, "")
+    .trim();
+}
+
+function extractLinkedDocumentTitle(value = "") {
+  const markdownLink = String(value || "").match(/\[([^\]]+\.(?:docx?|pdf|xlsx?|pptx?))\]\([^)]+\)/i)?.[1] || "";
+  const urlFile = String(value || "").match(/\/([^\/?#]+\.(?:docx?|pdf|xlsx?|pptx?))(?:[?#)]|$)/i)?.[1] || "";
+  const raw = markdownLink || urlFile;
+  if (!raw) return "";
+  let title = raw;
+  try { title = decodeURIComponent(title); } catch {}
+  title = title
+    .replace(/\.(?:docx?|pdf|xlsx?|pptx?)$/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return title ? safeMarkdownFileName(title, 120) : "";
+}
+
 function firstNameFromEmailHeader(value = "") {
   const text = singleLine(value).replace(/<[^>]+>/g, " ").replace(/["']/g, " ").trim();
   const match = text.match(/[A-Za-z][A-Za-z'-]*/);
@@ -14112,6 +14182,50 @@ function deviceTimestamp(date = new Date()) {
   const hours = pad(Math.floor(Math.abs(offsetMinutes) / 60));
   const minutes = pad(Math.abs(offsetMinutes) % 60);
   return `${safeDate.getFullYear()}-${pad(safeDate.getMonth() + 1)}-${pad(safeDate.getDate())}T${pad(safeDate.getHours())}:${pad(safeDate.getMinutes())}:${pad(safeDate.getSeconds())}.${pad(safeDate.getMilliseconds(), 3)}${sign}${hours}:${minutes}`;
+}
+function deviceTimeZoneAbbreviation(date = new Date()) {
+  const value = date instanceof Date ? date : new Date(date);
+  const safeDate = Number.isFinite(value.getTime()) ? value : new Date();
+  try {
+    const parts = Intl.DateTimeFormat(undefined, { timeZone: deviceTimeZone(), timeZoneName: "short" }).formatToParts(safeDate);
+    const value = parts.find((part) => part.type === "timeZoneName")?.value || "";
+    return (value.match(/[A-Za-z]+/g) || []).join("").toUpperCase();
+  } catch {
+    return "";
+  }
+}
+function deviceTimestampWithZone(date = new Date()) {
+  const value = date instanceof Date ? date : new Date(date);
+  const safeDate = Number.isFinite(value.getTime()) ? value : new Date();
+  const pad = (number) => String(Math.trunc(Math.abs(number))).padStart(2, "0");
+  const parts = { year: "", month: "", day: "", hour: "", minute: "", second: "" };
+  try {
+    for (const part of Intl.DateTimeFormat("en-CA", {
+      timeZone: deviceTimeZone(),
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(safeDate)) {
+      if (part.type in parts) parts[part.type] = part.value;
+    }
+  } catch {}
+  const year = parts.year || String(safeDate.getFullYear());
+  const month = parts.month || pad(safeDate.getMonth() + 1);
+  const day = parts.day || pad(safeDate.getDate());
+  const hour = parts.hour || pad(safeDate.getHours());
+  const minute = parts.minute || pad(safeDate.getMinutes());
+  const second = parts.second || pad(safeDate.getSeconds());
+  const abbreviation = deviceTimeZoneAbbreviation(safeDate) || "UTC";
+  return `${year}-${month}-${day} - ${hour}:${minute}:${second} (${abbreviation})`;
+}
+function formatEmailWorkflowTimestamp(value) {
+  if (!value) return "";
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(date.getTime()) ? deviceTimestampWithZone(date) : singleLine(value);
 }
 function deviceDateString(date = new Date()) {
   const value = date instanceof Date ? date : new Date(date);
@@ -15060,6 +15174,10 @@ function uniqueMarkdownPath(app, folder, title) {
     counter += 1;
   }
   return path;
+}
+
+function markdownTitleFromPath(path = "") {
+  return String(path || "").split("/").pop()?.replace(/\.md$/i, "") || "";
 }
 
 function makeNoteSectionName(title, text = "", path = "") {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.27
+
+- Updated Email-To-Todoist so forwarded emails are treated as intentional task-capture requests and soft review language can still create a useful review or follow-up task.
+- Added an email-only empty-result fallback for draft/document, feedback, reply, and follow-up threads so the workflow does not silently create no tasks when the AI returns an empty task list.
+- Fixed duplicate email log note titles by matching the visible note title to the unique filename, and normalized email workflow timestamps to `YYYY-MM-DD - HH:MM:SS (TZ)` in the user's device timezone.
+
 ## 0.6.26
 
 - Fixed generated Todoist description formatting so source lists stay as multiline `Source List`, `Primary Note`, and `Context Notes` blocks instead of collapsing into one line.

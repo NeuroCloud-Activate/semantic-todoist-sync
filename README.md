@@ -24,33 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.25
+## What's New In 0.6.26
 
-1. **0.6.25 - Email dedupe, citations, and lightweight MCP bridge**
+1. **0.6.26 - Source lists and citation-safe links**
+
+   Generated Todoist descriptions now preserve source lists as readable multiline blocks with `Primary Note` and `Context Notes` lines. The formatter also repairs flattened `Source List:` or older `Sources:` blocks, and context citations are inserted outside raw URLs, Obsidian/Todoist links, and Markdown link targets.
+
+2. **0.6.25 - Email dedupe, citations, and lightweight MCP bridge**
 
    Email-To-Todoist now uses the same pre-create deduplication context as Notes-To-Todoist: generated email tasks get their target Todoist project context before duplicate checks, live open Todoist tasks are considered before creation, and AI-mediated dedupe can update matching existing tasks instead of recreating old email work in the Inbox. Generated descriptions also cite matched context-note sentences more reliably while keeping the source list format unchanged. An off-by-default External MCP Bridge can also publish a small vault-readable manifest for a separate Obsidian MCP server.
 
-2. **0.6.24 - Fallback model safety**
+3. **0.6.24 - Fallback model safety**
 
    Automatic same-provider fallback selection now rejects any fallback that matches the primary model. If the primary OpenAI model is GPT 5.4, the automatic fallback is GPT 5.4 Mini.
-
-3. **0.6.23 - Updated default AI models**
-
-   OpenAI now defaults to GPT 5.4 as the primary model and GPT 5.4 Mini as the fallback. Gemini defaults to Gemini 3.5 Flash as primary and Gemini 3.1 Flash Lite as fallback. Primary, embedding, fallback, and deduplication model selectors stay aligned with the preferred AI provider chosen during setup.
-
-## Recent Updates Since 0.6.14
-
-- **0.6.25:** Email-To-Todoist now checks live open Todoist tasks with the same target-project dedupe context used by Notes-To-Todoist before creating new tasks; generated task descriptions cite matched context-note sentences more reliably without changing source lists; the optional External MCP Bridge also writes pointer files and a read-only access profile without duplicating plugin data.
-- **0.6.24:** Automatic same-provider fallback selection now guarantees the fallback differs from the primary model, including migrated OpenAI settings and automatic AI deduplication.
-- **0.6.23:** OpenAI defaults now use GPT 5.4 primary with GPT 5.4 Mini fallback, Gemini defaults use Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and model selectors stay scoped to the preferred provider.
-- **0.6.22:** README and changelog upkeep now make the latest release story easier to verify from GitHub.
-- **0.6.21:** Deduplication was calibrated so same-project richer same-action tasks, parent/subtask restatements, and near-identical cross-parent tasks can be reviewed as likely duplicates, while distinct progress steps, component subtasks, and tasks in different concrete Todoist projects stay separate.
-- **0.6.20:** Email-To-Todoist and Notes-To-Todoist now recognize polite document-review requests as actionable task requests.
-- **0.6.19:** Duplicate matching remains local-first, but automatic merging requires AI-mediated confirmation by default; when AI-mediated dedupe is off, possible duplicates are surfaced for manual review instead of merged.
-- **0.6.18:** Duplicate validation was broadened across domains and filters out generic routing or ticket-mailbox wording that should not count as duplicate evidence.
-- **0.6.17:** Duplicate merges now go through a task-generation-shaped AI merge step so useful context can be preserved when tasks are combined.
-- **0.6.16:** Duplicates generated within the same task-creation batch are collapsed before Todoist creation while preserving useful metadata and subtasks.
-- **0.6.15:** Local deduplication became less title-bound by using same-project context, task descriptions, and subtask evidence.
 
 ## What It Uses
 

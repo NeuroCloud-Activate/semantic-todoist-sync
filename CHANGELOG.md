@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.25
+
+- Added an off-by-default External MCP Bridge setting that writes only small pointer files and an MCP server access profile for a separate Obsidian MCP server, leaving the existing semantic index shards, Todoist task cache, and local reference table as the only data sources.
+- Aligned Email-To-Todoist duplicate prevention with Notes-To-Todoist by assigning target project context before dedupe and checking live open Todoist tasks before creating new email tasks.
+- Improved generated task description citation fallback so context-note summaries can be matched per sentence while preserving the existing source list format.
+
 ## 0.6.24
 
 - Hardened automatic same-provider fallback selection so the fallback model is never the same model as the primary, including migrated settings and AI-mediated deduplication defaults.

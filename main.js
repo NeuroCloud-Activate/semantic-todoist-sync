@@ -78,6 +78,9 @@ const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
 const TASK_CONTEXT_MIN_TASK_SCORE = 1;
+const EXTERNAL_MCP_EXPORT_FOLDER = `${PLUGIN_DATA_FOLDER}/MCP Export`;
+const EXTERNAL_MCP_EXPORT_README_FILE = "README.md";
+const EXTERNAL_MCP_EXPORT_MANIFEST_FILE = "manifest.md";
 const ADAPTIVE_CONTEXT_TIERS = [
   "Active/source note",
   "Todoist task snapshot",
@@ -226,6 +229,8 @@ const DEFAULT_SETTINGS = {
   taskDeduplicationPolicyUpdates: [],
   taskDeduplicationLastRunSummary: "",
   taskReferenceSnapshotMeta: {},
+  externalMcpExportEnabled: false,
+  externalMcpExportFolder: EXTERNAL_MCP_EXPORT_FOLDER,
   linksAppURI: false,
   subtaskIndentSpaces: 4,
   subtaskIncludeLabels: true,
@@ -689,6 +694,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.taskReferenceSnapshotMeta = meta;
     this.taskReferenceSnapshotFingerprint = fingerprint;
     this.taskReferenceSnapshotDirty = false;
+    await this.writeExternalMcpExport(false);
+    return true;
+  }
+
+  async writeExternalMcpExport(showNotice = false) {
+    if (!this.settings.externalMcpExportEnabled) return false;
+    const folder = externalMcpExportFolder(this.settings);
+    await ensureVaultFolder(this.app, folder);
+    if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
+    const files = await externalMcpExportFiles(this, folder);
+    for (const file of files) {
+      await this.app.vault.adapter.write(file.path, file.body);
+    }
+    this.logLocal("External MCP bridge refreshed", { folder, files: files.length, mode: "bridge-manifest-only" });
+    if (showNotice) new Notice(`External MCP bridge refreshed in ${folder}.`);
     return true;
   }
 
@@ -1170,6 +1190,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndexKnownShardFiles = shardFiles;
       if (!this.semanticIndexPathMeta?.size && (this.semanticIndex || []).some((chunk) => chunk.path)) await this.refreshSemanticIndexPathMetaAsync();
       await this.saveSemanticIndexPathMetaSnapshot();
+      await this.writeExternalMcpExport(false);
       return;
     }
     await this.removeSemanticIndexShardFiles(indexFile, shardFiles, this.semanticIndexKnownShardFiles);
@@ -1182,6 +1203,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexStorageFingerprint = storageFingerprint;
     await this.refreshSemanticIndexPathMetaAsync();
     await this.saveSemanticIndexPathMetaSnapshot();
+    await this.writeExternalMcpExport(false);
   }
 
   refreshSemanticIndexPathMeta() {
@@ -3668,28 +3690,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.setSidebarStatus("Creating local email task OIDs...");
         ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
         assignGeneratedTaskOids(tasks, this.settings);
-        this.setSidebarStatus("Preparing descriptions and Todoist section...");
-        const sectionIdPromise = this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName));
-        const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], subject, plan.descriptionInstructions, {
-          contextNotes: plan.contextNotes || [],
-          basePath: vaultBasePath(this.app),
-          citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false
-        })
-          .then(() => {
-            this.setSidebarStatus("Adding email source context...");
-            addContextToTaskDescriptions(tasks, plan.contextNotes || [], { title: subject, path: "", text: emailSourceText }, this.settings, plan.semanticContext || [], vaultBasePath(this.app), this.settings.emailIncludeSourceListInDescriptions !== false);
-          });
-        const [sectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
-        enforceGeneratedTaskLimits(tasks, this.settings);
-        await this.applyTaskDeduplicationPlan(tasks, {
+        const prepared = await this.prepareGeneratedTasksForTodoistWorkflow(tasks, plan, {
           source: "email",
           path: "",
           sectionName,
+          sourceTitle: subject,
+          sourceContext: { title: subject, path: "", text: emailSourceText },
+          citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false,
+          prepareTodoistSection: true,
+          status: "Preparing descriptions and Todoist section...",
+          contextStatus: "Adding email source context...",
           contextNotes: plan.contextNotes || [],
           semanticContext: plan.semanticContext || []
         });
         this.setSidebarStatus("Syncing Todoist section...");
-        const created = await this.createTodoistTaskBatch(sectionName, tasks, sectionId);
+        const created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
         await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
         await this.workerJson("/complete", "POST", { id: item.id });
         count += 1;
@@ -3897,26 +3912,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       enforceGeneratedTaskLimits(tasks, this.settings);
       ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
       assignGeneratedTaskOids(tasks, this.settings);
-      let preparedSectionId = "";
-      this.setSidebarStatus(shouldInsert && shouldSyncAfterInsert ? "Preparing descriptions and Todoist section..." : "Writing task descriptions...");
-      const sectionIdPromise = shouldInsert && shouldSyncAfterInsert
-        ? this.getTaskProjectId().then((projectId) => this.ensureTodoistSectionId(projectId, sectionName))
-        : Promise.resolve("");
-      const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], active.title, plan.descriptionInstructions, {
-        contextNotes: plan.contextNotes || [],
-        basePath: vaultBasePath(this.app),
-        citeContextNotes: this.settings.noteIncludeSourceListInDescriptions !== false
-      })
-        .then(() => {
-          this.setSidebarStatus("Adding source context to descriptions...");
-          addContextToTaskDescriptions(tasks, plan.contextNotes || [], active, this.settings, plan.semanticContext || [], vaultBasePath(this.app), this.settings.noteIncludeSourceListInDescriptions !== false);
-        });
-      [preparedSectionId] = await Promise.all([sectionIdPromise, descriptionPromise]);
-      enforceGeneratedTaskLimits(tasks, this.settings);
-      await this.applyTaskDeduplicationPlan(tasks, {
+      const prepared = await this.prepareGeneratedTasksForTodoistWorkflow(tasks, plan, {
         source: "note",
         path: active.path,
         sectionName,
+        sourceTitle: active.title,
+        sourceContext: active,
+        citeContextNotes: this.settings.noteIncludeSourceListInDescriptions !== false,
+        prepareTodoistSection: shouldInsert && shouldSyncAfterInsert,
+        status: shouldInsert && shouldSyncAfterInsert ? "Preparing descriptions and Todoist section..." : "Writing task descriptions...",
+        contextStatus: "Adding source context to descriptions...",
         contextNotes: plan.contextNotes || [],
         semanticContext: plan.semanticContext || []
       });
@@ -3934,7 +3939,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (shouldSyncAfterInsert) {
           this.cancelQueuedNoteSync(active.path);
           this.setSidebarStatus("Syncing Todoist tasks...");
-          const sectionId = preparedSectionId || await this.ensureTodoistSectionId(await this.getTaskProjectId(), sectionName);
+          const sectionId = prepared.sectionId || await this.ensureTodoistSectionId(await this.getTaskProjectId(), sectionName);
           assignGeneratedTaskSectionId(tasks, sectionId);
           this.savePendingTaskReferences(active.path, tasks);
           await this.saveSettings();
@@ -3951,6 +3956,39 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     } finally {
       this.setSidebarStatus("Ready");
     }
+  }
+
+  async prepareGeneratedTasksForTodoistWorkflow(tasks, plan = {}, options = {}) {
+    const todoistBound = options.prepareTodoistSection === true;
+    const sectionName = options.sectionName || plan.sectionName || "";
+    this.setSidebarStatus(options.status || (todoistBound ? "Preparing descriptions and Todoist section..." : "Writing task descriptions..."));
+    const projectIdPromise = todoistBound ? this.getTaskProjectId() : Promise.resolve("");
+    const projectNamePromise = projectIdPromise.then((projectId) => projectId ? this.todoistProjectNameForId(projectId) : "");
+    const sectionIdPromise = todoistBound
+      ? projectIdPromise.then((projectId) => this.ensureTodoistSectionId(projectId, sectionName))
+      : Promise.resolve("");
+    const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], options.sourceTitle || "", plan.descriptionInstructions, {
+      contextNotes: plan.contextNotes || [],
+      basePath: vaultBasePath(this.app),
+      citeContextNotes: options.citeContextNotes !== false
+    })
+      .then(() => {
+        this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
+        addContextToTaskDescriptions(tasks, plan.contextNotes || [], options.sourceContext || {}, this.settings, plan.semanticContext || [], vaultBasePath(this.app), options.citeContextNotes !== false);
+      });
+    const [projectId, projectName, sectionId] = await Promise.all([projectIdPromise, projectNamePromise, sectionIdPromise, descriptionPromise]);
+    if (todoistBound) assignGeneratedTaskProject(tasks, projectId, projectName);
+    enforceGeneratedTaskLimits(tasks, this.settings);
+    const dedupeOptions = {
+      source: options.source || "",
+      path: options.path || "",
+      sectionName,
+      contextNotes: options.contextNotes || plan.contextNotes || [],
+      semanticContext: options.semanticContext || plan.semanticContext || [],
+      includeLiveTodoistCandidates: todoistBound
+    };
+    await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
+    return { projectId, projectName, sectionId };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -4705,7 +4743,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.ambiguous += generatedDedupe.ambiguous || 0;
     stats.candidateFlags.push(...(generatedDedupe.candidateFlags || []));
     stats.matches.push(...generatedDedupe.matches);
-    const candidates = this.taskDeduplicationCandidates();
+    const candidates = await this.taskDeduplicationCandidates(options);
     if (!candidates.length) {
       stats.created = flattenTaskPlan(tasks).length;
       this.settings.taskDeduplicationLastRunSummary = taskDeduplicationRunSummary(stats);
@@ -4788,7 +4826,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
-  taskDeduplicationCandidates() {
+  async taskDeduplicationCandidates(options = {}) {
     const index = this.getTaskReferenceIndex();
     const candidates = [];
     for (const [id, task] of index.entries || []) {
@@ -4799,7 +4837,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const knowledge = enrichedTask.knowledge?.intent ? enrichedTask.knowledge : taskKnowledgeSnapshot(enrichedTask, this.settings, childText, enrichedTask.knowledge || null);
       candidates.push({ id: String(id), task: Object.assign(enrichedTask, { knowledge }) });
     }
+    if (shouldUseLiveTodoistDeduplicationCandidates(options)) {
+      candidates.push(...await this.liveTodoistTaskDeduplicationCandidates(candidates, options));
+    }
     return candidates;
+  }
+
+  async liveTodoistTaskDeduplicationCandidates(existingCandidates = [], options = {}) {
+    const seenIds = new Set((existingCandidates || []).map((candidate) => String(candidate.id || candidate.task?.id || "")).filter(Boolean));
+    try {
+      const remote = await this.getAllTodoistReferenceTasks({ force: false });
+      const active = (remote.tasks || []).filter((task) => task?.id && task.content && !task.isCompleted && !seenIds.has(String(task.id)));
+      if (!active.length) return [];
+      this.logLocal("Task deduplication live Todoist candidates loaded", {
+        source: options.source || "",
+        candidates: active.length
+      });
+      return liveTodoistTaskDeduplicationCandidates(active, this.settings);
+    } catch (error) {
+      this.logLocal("Task deduplication live Todoist candidates unavailable", {
+        source: options.source || "",
+        error: error.message || String(error)
+      });
+      return [];
+    }
   }
 
   async taskDeduplicationDecision(task, candidates, options = {}) {
@@ -6427,6 +6488,19 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin))
       .addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)))
       .addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
+    settingsHeading(containerEl, "External MCP Bridge", "Optional compatibility manifest for a separate Obsidian MCP server plugin such as MCPVault. This plugin does not start an MCP server.");
+    toggleSetting(containerEl, "Publish MCP bridge manifest", "When enabled, write a small vault-readable manifest that points an external MCP server to the existing Semantic Todoist Sync databases. It does not copy or rebuild the semantic index, shards, Todoist cache, or reference table.", this.plugin, "externalMcpExportEnabled");
+    textSetting(containerEl, "MCP bridge folder", "Vault folder where the bridge manifest is written. Keep it outside hidden folders such as .obsidian so file-based MCP tools can discover it.", this.plugin, "externalMcpExportFolder");
+    setupStatusSetting(containerEl, "External MCP bridge", externalMcpExportSummary(this.plugin), [
+      ["Refresh bridge", async () => {
+        try {
+          await this.plugin.writeExternalMcpExport(true);
+          this.display();
+        } catch (error) {
+          new Notice(`Could not refresh external MCP bridge: ${error.message || error}`);
+        }
+      }]
+    ]);
   }
 
   renderEmail(containerEl) {
@@ -8010,6 +8084,321 @@ function todoistSetupSummary(settings) {
 
 function emailSetupSummary(settings) {
   return `Requires AI + Todoist first. Optional Cloudflare Worker URL: ${settings.workerUrl ? "set" : "missing"}. Worker token: ${settings.workerToken ? "set" : "missing"}. Automatic processing: ${settings.autoProcessEmails ? "on" : "off"}. Poll floor: ${MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS} seconds.`;
+}
+
+function externalMcpExportSummary(plugin) {
+  const folder = externalMcpExportFolder(plugin.settings);
+  const enabled = plugin.settings.externalMcpExportEnabled ? "on" : "off";
+  const chunks = Number(plugin.settings.semanticIndexMeta?.chunks || 0);
+  const refs = plugin.taskReferenceIndex?.entries?.length || Object.keys(plugin.settings.taskCache || {}).length;
+  return `Bridge: ${enabled}. Folder: ${folder}. Existing semantic chunks: ${chunks}. Task cache entries: ${refs}. The bridge writes only pointer files; the external MCP server must read the existing plugin database files.`;
+}
+
+async function externalMcpExportFiles(plugin, folder) {
+  const generatedAt = deviceTimestamp();
+  const manifest = externalMcpBridgeManifest(plugin, folder, generatedAt);
+  return [
+    { path: `${folder}/${EXTERNAL_MCP_EXPORT_README_FILE}`, body: externalMcpBridgeReadmeMarkdown(manifest) },
+    { path: `${folder}/${EXTERNAL_MCP_EXPORT_MANIFEST_FILE}`, body: externalMcpBridgeManifestMarkdown(manifest) },
+    { path: `${folder}/bridge-manifest.json`, body: JSON.stringify(manifest, null, 2) }
+  ];
+}
+
+function externalMcpBridgeManifest(plugin, folder, generatedAt) {
+  const indexFile = plugin.settings.semanticIndexMeta?.file || (plugin.semanticIndexFileName ? plugin.semanticIndexFileName() : SEMANTIC_INDEX_FILE);
+  const pluginDir = plugin.manifest?.dir || ".obsidian/plugins/semantic-todoist-sync";
+  const taskCount = Object.keys(plugin.settings.taskCache || {}).length;
+  const pendingReferenceCount = Object.keys(plugin.settings.pendingTaskReferences || {}).length;
+  const liveSnapshot = plugin.todoistSnapshotCache?.snapshot || null;
+  const knownShardFiles = plugin.semanticIndexKnownShardFiles || [];
+  const bridgeFiles = [
+    `${folder}/${EXTERNAL_MCP_EXPORT_README_FILE}`,
+    `${folder}/${EXTERNAL_MCP_EXPORT_MANIFEST_FILE}`,
+    `${folder}/bridge-manifest.json`
+  ];
+  const pluginDataReadPaths = [
+    `${pluginDir}/${indexFile}`,
+    ...knownShardFiles.map((file) => `${pluginDir}/${file}`),
+    `${pluginDir}/${SEMANTIC_INDEX_PATH_META_FILE}`,
+    `${pluginDir}/${TASK_REFERENCE_SNAPSHOT_FILE}`,
+    `${pluginDir}/${TASK_REFERENCE_INDEX_FILE}`,
+    `${pluginDir}/${SCHEDULER_MEMORY_FILE}`
+  ];
+  return {
+    version: 1,
+    generatedAt,
+    sourcePlugin: plugin.manifest?.id || "semantic-todoist-sync",
+    sourcePluginVersion: plugin.manifest?.version || "",
+    exportFolder: folder,
+    mode: "bridge-manifest-only",
+    note: "This hook does not recreate or alter Semantic Todoist Sync databases. It points an external Obsidian MCP server plugin to the existing files maintained by Semantic Todoist Sync.",
+    directPluginDataAccessRequired: true,
+    databases: {
+      semanticIndex: {
+        type: "semantic-index-manifest",
+        path: `${pluginDir}/${indexFile}`,
+        meta: plugin.settings.semanticIndexMeta || {},
+        knownShardFiles,
+        access: "Read this manifest first; its shards array names the existing semantic index shard files in the same plugin data directory."
+      },
+      semanticIndexPathMeta: {
+        type: "semantic-index-path-metadata",
+        path: `${pluginDir}/${SEMANTIC_INDEX_PATH_META_FILE}`
+      },
+      localReferenceTable: {
+        type: "task-reference-snapshot",
+        path: `${pluginDir}/${TASK_REFERENCE_SNAPSHOT_FILE}`,
+        indexPath: `${pluginDir}/${TASK_REFERENCE_INDEX_FILE}`,
+        taskCount,
+        pendingReferenceCount,
+        jsonPointers: {
+          taskCache: "/taskCache",
+          pendingTaskReferences: "/pendingTaskReferences",
+          pendingTaskDescriptions: "/pendingTaskDescriptions",
+          compactIndex: "/index"
+        }
+      },
+      todoistSnapshot: {
+        type: "local-cached-todoist-snapshot",
+        path: `${pluginDir}/${TASK_REFERENCE_SNAPSHOT_FILE}`,
+        jsonPointer: "/taskCache",
+        taskCount,
+        liveSnapshotCurrentlyCachedInMemory: Boolean(liveSnapshot),
+        liveSnapshotResourceTypes: liveSnapshot ? Object.keys(liveSnapshot).filter((key) => Array.isArray(liveSnapshot[key])) : [],
+        note: "Semantic Todoist Sync persists the local Todoist task cache in task-reference-snapshot.json. A live Todoist API snapshot is only in memory and is not duplicated by this hook."
+      },
+      schedulerMemory: {
+        type: "scheduler-memory",
+        path: `${pluginDir}/${SCHEDULER_MEMORY_FILE}`
+      }
+    },
+    expectedExternalMcpCapabilities: [
+      "Read files from this plugin data directory through Obsidian's vault adapter or plugin API.",
+      "Allow explicit read access to the Semantic Todoist Sync plugin data directory when the MCP server filters hidden folders by default.",
+      "Parse the existing semantic-index manifest and shard files without asking Semantic Todoist Sync to regenerate them.",
+      "Parse task-reference-snapshot.json for Todoist task cache, local OID references, pending references, and descriptions."
+    ],
+    mcpServerAccessProfile: {
+      minimumConfiguration: "Enable this bridge in Semantic Todoist Sync, point the external MCP server at the vault root, and allow read-only access to the listed Semantic Todoist Sync plugin data files.",
+      discoveryFiles: bridgeFiles,
+      requiredReadOnlyPaths: pluginDataReadPaths,
+      requiredExtensions: [".md", ".json"],
+      stockMcpVaultCompatibility: {
+        canDiscoverBridgeFolder: true,
+        canReadBridgeMarkdown: true,
+        canSearchBridgeMarkdown: true,
+        canReadBridgeJson: false,
+        canReadPluginDataDirectory: false,
+        reason: "MCPVault's default path filter blocks .obsidian, .git, node_modules, and dotfile paths at any depth, and its default note reader excludes .json files."
+      },
+      mcpVaultCompatibleConfiguration: {
+        pathFilter: "Use an imported MCPVault createServer() with a custom read-only PathFilter that allows only discoveryFiles plus requiredReadOnlyPaths.",
+        allowedReadPrefixes: [folder, pluginDir],
+        blockedWritePrefixes: [pluginDir],
+        safeAllowedTools: [
+          "read_note",
+          "read_multiple_notes",
+          "get_notes_info",
+          "get_frontmatter",
+          "get_vault_stats",
+          "list_all_tags",
+          "list_directory",
+          "search_notes"
+        ],
+        semanticTodoistTools: [
+          "semantic_todoist.search_semantic_index",
+          "semantic_todoist.get_todoist_snapshot",
+          "semantic_todoist.get_reference_table"
+        ],
+        mustHideOrGateTools: [
+          "write_note",
+          "patch_note",
+          "update_frontmatter",
+          "delete_note",
+          "move_note",
+          "move_file",
+          "manage_tags"
+        ],
+        chatGptAllowedToolsHint: "Configure the ChatGPT MCP connector or client to expose only safeAllowedTools plus semanticTodoistTools for this bridge. Keep mustHideOrGateTools unavailable or approval-gated.",
+        discoveryTools: ["list_directory", "read_note", "read_multiple_notes", "search_notes"],
+        note: "MCPVault's built-in search_notes indexes Markdown notes, so semantic-index and Todoist JSON querying should be exposed through the recommended semantic_todoist.* read-only tools.",
+        recommendedWriteToolPolicy: "Keep write_note, patch_note, update_frontmatter, delete_note, move_note, and move_file disabled or approval-gated for the Semantic Todoist Sync plugin data directory."
+      }
+    },
+    recommendedReadOnlyTools: externalMcpRecommendedTools()
+  };
+}
+
+function externalMcpRecommendedTools() {
+  return [
+    {
+      name: "semantic_todoist.search_semantic_index",
+      description: "Use this when ChatGPT needs ranked note context from the existing Semantic Todoist Sync semantic index.",
+      readOnlyHint: true,
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Natural-language search query." },
+          limit: { type: "integer", minimum: 1, maximum: 20, default: 8 }
+        },
+        required: ["query"],
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          results: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string" },
+                title: { type: "string" },
+                score: { type: "number" },
+                text: { type: "string" },
+                chunkId: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      name: "semantic_todoist.get_todoist_snapshot",
+      description: "Use this when ChatGPT needs the local cached Todoist task snapshot already persisted by Semantic Todoist Sync.",
+      readOnlyHint: true,
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        type: "object",
+        properties: {
+          taskIds: { type: "array", items: { type: "string" }, description: "Optional Todoist task IDs to retrieve from /taskCache." },
+          includeCompleted: { type: "boolean", default: false }
+        },
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          tasks: { type: "array", items: { type: "object" } },
+          sourcePath: { type: "string" },
+          sourcePointer: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "semantic_todoist.get_reference_table",
+      description: "Use this when ChatGPT needs local OID mappings, note references, pending references, or the compact reference index.",
+      readOnlyHint: true,
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        type: "object",
+        properties: {
+          oids: { type: "array", items: { type: "string" }, description: "Optional Semantic Todoist Sync OIDs to retrieve." },
+          includePending: { type: "boolean", default: true }
+        },
+        additionalProperties: false
+      },
+      outputSchema: {
+        type: "object",
+        properties: {
+          entries: { type: "array", items: { type: "object" } },
+          pendingTaskReferences: { type: "object" },
+          pendingTaskDescriptions: { type: "object" },
+          sourcePath: { type: "string" },
+          indexPath: { type: "string" }
+        }
+      }
+    }
+  ];
+}
+
+function externalMcpBridgeReadmeMarkdown(manifest) {
+  return [
+    "# Semantic Todoist Sync MCP Bridge",
+    "",
+    `Generated: ${manifest.generatedAt}`,
+    "",
+    "This folder contains a lightweight bridge manifest for a separate Obsidian MCP server plugin.",
+    "It does not contain a copy of the semantic index, Todoist snapshot, or reference table.",
+    "",
+    "The external MCP server should use `bridge-manifest.json` to locate the existing Semantic Todoist Sync database files.",
+    "Because the databases live in the plugin data directory, the MCP server must be configured to read that directory directly.",
+    "",
+    "## Existing Databases",
+    "",
+    `- Semantic index manifest: \`${manifest.databases.semanticIndex.path}\``,
+    `- Semantic path metadata: \`${manifest.databases.semanticIndexPathMeta.path}\``,
+    `- Local reference table snapshot: \`${manifest.databases.localReferenceTable.path}\``,
+    `- Local reference table compact index: \`${manifest.databases.localReferenceTable.indexPath}\``,
+    `- Todoist local snapshot: \`${manifest.databases.todoistSnapshot.path}\` at \`${manifest.databases.todoistSnapshot.jsonPointer}\``,
+    "",
+    "## Suggested Read-Only MCP Tools",
+    "",
+    manifest.recommendedReadOnlyTools.map((tool) => `- \`${tool.name}\`: ${tool.description}`).join("\n"),
+    "",
+    "## MCPVault Compatibility",
+    "",
+    "Stock MCPVault can list, read, and search this bridge folder, but it cannot read the plugin data directory by default because that directory is under `.obsidian`.",
+    "For full access, configure the MCP server with the read-only paths in `bridge-manifest.json` and keep writes blocked for those paths.",
+    "Expose only the safe read-only MCP tools listed in `bridge-manifest.json` plus the suggested `semantic_todoist.*` tools.",
+    "",
+    "Semantic Todoist Sync does not start an MCP server for this feature.",
+    ""
+  ].join("\n");
+}
+
+function externalMcpBridgeManifestMarkdown(manifest) {
+  return [
+    "# Semantic Todoist Sync MCP Bridge Manifest",
+    "",
+    `Generated: ${manifest.generatedAt}`,
+    `Source plugin: ${manifest.sourcePlugin} ${manifest.sourcePluginVersion}`,
+    `Mode: ${manifest.mode}`,
+    `Requires plugin data access: ${manifest.directPluginDataAccessRequired ? "yes" : "no"}`,
+    "",
+    manifest.note,
+    "",
+    "## Semantic Index",
+    "",
+    `Manifest path: ${manifest.databases.semanticIndex.path}`,
+    `Known shard files: ${manifest.databases.semanticIndex.knownShardFiles.length}`,
+    `Chunks recorded in settings: ${manifest.databases.semanticIndex.meta?.chunks || 0}`,
+    "",
+    "## Local Reference Table",
+    "",
+    `Snapshot path: ${manifest.databases.localReferenceTable.path}`,
+    `Index path: ${manifest.databases.localReferenceTable.indexPath}`,
+    `Task cache count: ${manifest.databases.localReferenceTable.taskCount}`,
+    `Pending reference count: ${manifest.databases.localReferenceTable.pendingReferenceCount}`,
+    "",
+    "## Todoist Snapshot",
+    "",
+    `Path: ${manifest.databases.todoistSnapshot.path}`,
+    `JSON pointer: ${manifest.databases.todoistSnapshot.jsonPointer}`,
+    `Task count: ${manifest.databases.todoistSnapshot.taskCount}`,
+    "",
+    "## Suggested Read-Only MCP Tools",
+    "",
+    manifest.recommendedReadOnlyTools.map((tool) => `- ${tool.name}`).join("\n"),
+    "",
+    "## MCP Server Access Profile",
+    "",
+    `Discovery files: ${manifest.mcpServerAccessProfile.discoveryFiles.length}`,
+    `Required read-only paths: ${manifest.mcpServerAccessProfile.requiredReadOnlyPaths.length}`,
+    `Stock MCPVault can read plugin data: ${manifest.mcpServerAccessProfile.stockMcpVaultCompatibility.canReadPluginDataDirectory ? "yes" : "no"}`,
+    `Safe MCPVault tools: ${manifest.mcpServerAccessProfile.mcpVaultCompatibleConfiguration.safeAllowedTools.join(", ")}`,
+    `Tools to hide or approval-gate: ${manifest.mcpServerAccessProfile.mcpVaultCompatibleConfiguration.mustHideOrGateTools.join(", ")}`,
+    "",
+    "Use `bridge-manifest.json` for machine-readable paths and metadata.",
+    ""
+  ].join("\n");
+}
+
+function externalMcpExportFolder(settings = DEFAULT_SETTINGS) {
+  const folder = trimSlashes(settings.externalMcpExportFolder || EXTERNAL_MCP_EXPORT_FOLDER);
+  if (!folder || folder.startsWith(".") || folder.split("/").some((part) => part === "." || part === ".." || part.startsWith("."))) return EXTERNAL_MCP_EXPORT_FOLDER;
+  return folder;
 }
 
 function notesSetupSummary(settings) {
@@ -10193,6 +10582,18 @@ function assignGeneratedTaskSectionId(tasks, sectionId) {
   }
 }
 
+function assignGeneratedTaskProject(tasks = [], projectId = "", projectName = "") {
+  for (const task of tasks || []) {
+    if (!task) continue;
+    task.projectId = task.projectId || projectId || "";
+    task.projectName = task.projectName || projectName || "";
+    for (const subtask of task.subtasks || []) {
+      subtask.projectId = subtask.projectId || task.projectId || projectId || "";
+      subtask.projectName = subtask.projectName || task.projectName || projectName || "";
+    }
+  }
+}
+
 function emptySyncStats() {
   return { created: 0, updated: 0, relinked: 0, deleted: 0, completedForgotten: 0, normalized: 0, conflicts: 0, preservedCompleted: 0 };
 }
@@ -12352,7 +12753,7 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
       number,
       source: notePath,
       title: note.title || note.basename || notePath,
-      text: note.text || note.excerpt || ""
+      text: note.text || note.excerpt || note.summary || ""
     });
   }
   return {
@@ -12397,9 +12798,27 @@ function hasValidContextCitation(value, citationState = {}) {
 
 function ensureContextCitation(value, taskTitle = "", citationState = {}) {
   const text = String(value || "").trim();
-  if (!text || !citationState.citeContextNotes || hasValidContextCitation(text, citationState)) return text;
+  if (!text || !citationState.citeContextNotes) return text;
   const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
   if (!notes.length) return text;
+  const segments = splitCitationSentences(text);
+  if (segments.length > 1) {
+    const cited = segments.map((segment) => {
+      const clean = segment.trim();
+      if (!clean || hasValidContextCitation(clean, citationState)) return clean;
+      const number = bestContextCitationNumber(clean, taskTitle, notes);
+      return number ? appendContextCitation(clean, number) : clean;
+    }).filter(Boolean).join(" ");
+    if (cited && cited !== text) return cited;
+    if (hasValidContextCitation(cited || text, citationState)) return cited || text;
+  } else if (hasValidContextCitation(text, citationState)) {
+    return text;
+  }
+  const bestNumber = bestContextCitationNumber(text, taskTitle, notes);
+  return bestNumber ? appendContextCitation(text, bestNumber) : text;
+}
+
+function bestContextCitationNumber(text, taskTitle = "", notes = []) {
   const queryTerms = termCounts([text, taskTitle].filter(Boolean).join(" "));
   let bestNumber = 0;
   let bestScore = 0;
@@ -12411,10 +12830,22 @@ function ensureContextCitation(value, taskTitle = "", citationState = {}) {
       bestNumber = note.number;
     }
   }
-  if (!bestNumber || bestScore < 1.5) return text;
+  if (!bestNumber || bestScore < 1.5) return 0;
+  return bestNumber;
+}
+
+function appendContextCitation(text, number) {
   const punctuation = /[.!?]$/.test(text) ? text.slice(-1) : "";
   const body = punctuation ? text.slice(0, -1).trim() : text;
-  return `${body} (${bestNumber})${punctuation}`;
+  return `${body} (${number})${punctuation}`;
+}
+
+function splitCitationSentences(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g)
+    ?.map((sentence) => sentence.trim())
+    .filter(Boolean) || [];
 }
 
 function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {
@@ -13745,6 +14176,56 @@ function taskDeduplicationRunSummary(stats = emptyTaskDeduplicationStats()) {
   return `${stats.merged || 0} linked to existing tasks, ${stats.created || 0} left as new, ${stats.ambiguous || 0} ambiguous, ${stats.copiedSubtasks || 0} existing subtasks copied, ${stats.generatedDuplicates || 0} generated duplicates collapsed, ${(stats.candidateFlags || []).length} local-only duplicate candidates flagged.`;
 }
 
+function shouldUseLiveTodoistDeduplicationCandidates(options = {}) {
+  if (options.includeLiveTodoistCandidates === false) return false;
+  if (options.includeLiveTodoistCandidates === true) return true;
+  return /^(email|note|notes|task generation|task-generation)$/i.test(String(options.source || ""));
+}
+
+function liveTodoistTaskDeduplicationCandidates(tasks = [], settings = DEFAULT_SETTINGS) {
+  const byId = new Map((tasks || []).map((task) => [String(task.id || ""), task]).filter(([id]) => id));
+  const childTextByParentId = new Map();
+  for (const task of tasks || []) {
+    const parentId = String(task.parentId || "");
+    if (!parentId) continue;
+    const text = [task.content, task.description].filter(Boolean).join(" ");
+    if (!text) continue;
+    childTextByParentId.set(parentId, [childTextByParentId.get(parentId) || "", text].filter(Boolean).join(" "));
+  }
+  return (tasks || [])
+    .filter((task) => task?.id && task.content && !task.isCompleted)
+    .map((task) => {
+      const parentId = String(task.parentId || "");
+      const parent = parentId ? byId.get(parentId) || {} : {};
+      const childText = childTextByParentId.get(String(task.id || "")) || "";
+      const siblingText = parentId ? childTextByParentId.get(parentId) || "" : "";
+      const normalized = {
+        id: String(task.id || ""),
+        content: task.content || "",
+        description: task.description || "",
+        labels: (task.labels || []).map(cleanLabel).filter(Boolean),
+        priority: normalizePriority(task.priority || 1),
+        due_date: datePart(task.due_date || task.dueDate || ""),
+        deadline_date: task.deadline_date || task.deadlineDate || "",
+        duration: normalizeTodoistDuration(task.duration),
+        isCompleted: false,
+        isSubtask: Boolean(parentId),
+        parentId,
+        parentContent: parent.content || task.parentContent || "",
+        parentDescription: parent.description || task.parentDescription || "",
+        section: task.section || "",
+        sectionId: task.sectionId || "",
+        projectId: task.projectId || "",
+        projectName: task.projectName || "",
+        childText,
+        siblingText,
+        parentChildText: siblingText
+      };
+      normalized.knowledge = taskKnowledgeSnapshot(normalized, settings, childText, task.knowledge || null);
+      return { id: normalized.id, task: normalized };
+    });
+}
+
 async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETTINGS, options = {}, aiMergeFn = null) {
   const stats = { merged: 0, matches: [], aiUsed: 0, ambiguous: 0, candidateFlags: [] };
   if (!Array.isArray(tasks) || tasks.length < 2) return stats;
@@ -14017,6 +14498,10 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
   if (sameSection) {
     score += 4;
     reasons.push("same generated section");
+    if (!progressDistinct && !componentDistinct && !sequentialDistinct && sharedTitleTokens.length >= 1 && (titleOverlap >= 0.18 || contextOverlap >= 0.18)) {
+      score += 18;
+      reasons.push("same section action context");
+    }
   }
   if (task?.due_date && existing.due_date && datePart(task.due_date) === datePart(existing.due_date)) score += 4;
   if (task?.deadline_date && existing.deadline_date && task.deadline_date === existing.deadline_date) score += 4;
@@ -14263,10 +14748,10 @@ function isGenericTodoistInboxTask(task = {}) {
 }
 
 function differentConcreteTaskDeduplicationProject(task = {}, existing = {}) {
-  if (isGenericTodoistInboxTask(task) || isGenericTodoistInboxTask(existing)) return false;
   if (task.projectId && existing.projectId && String(task.projectId) !== String(existing.projectId)) return true;
   const sourceProject = singleLine(task.projectName || "").toLowerCase();
   const existingProject = singleLine(existing.projectName || "").toLowerCase();
+  if (sourceProject && sourceProject !== "inbox" && existingProject === "inbox") return true;
   return Boolean(sourceProject && existingProject && sourceProject !== existingProject);
 }
 

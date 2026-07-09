@@ -12599,19 +12599,22 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
 }
 
 function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}) {
+  const splitSummary = splitDescriptionSourceListBlock(taskSummary);
+  const sourceBlock = normalizeDescriptionSourceList(sources || splitSummary.sourceList);
   const summary = ensureContextCitation(
-    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(taskSummary, settings)], settings), taskTitle), sourceTitle), citationState),
+    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(splitSummary.summary, settings)], settings), taskTitle), sourceTitle), citationState),
     taskTitle,
     citationState
   );
   const parts = [];
   if (isUsefulDescriptionSummary(summary, taskTitle, settings)) parts.push(summary);
-  if (sources) parts.push(sources);
+  if (sourceBlock) parts.push(sourceBlock);
   return formatTodoistDescription(parts.join("\n\n"), settings);
 }
 
 function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
-  const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
+  const splitSummary = splitDescriptionSourceListBlock(value);
+  const cleaned = cleanGeneratedDescriptionSummary(splitSummary.summary || "", settings);
   return ensureContextCitation(
     sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle), citationState),
     taskTitle,
@@ -12729,6 +12732,43 @@ function descriptionSourceList(active, contextNotes, basePath = "") {
   return lines.join("\n");
 }
 
+function sourceListStartIndex(value) {
+  return String(value || "").search(/\b(?:source list|sources?)\s*:/i);
+}
+
+function splitDescriptionSourceListBlock(value) {
+  const text = String(value || "").replace(/\r\n/g, "\n");
+  const index = sourceListStartIndex(text);
+  if (index < 0) return { summary: text, sourceList: "" };
+  return {
+    summary: text.slice(0, index).trim(),
+    sourceList: text.slice(index).trim()
+  };
+}
+
+function normalizeDescriptionSourceList(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return normalizeStoredSourceList(text) || restoreSourceListLineBreaks(text);
+}
+
+function restoreSourceListLineBreaks(value) {
+  const restored = String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\s*((?:source list|sources?)\s*:)\s*/i, "Source List:\n")
+    .replace(/\s*(primary note\s*:)\s*/i, "\nPrimary Note: ")
+    .replace(/\s*(context notes?\s*:)\s*/i, "\n\nContext Notes:\n")
+    .replace(/\s+(\d{1,2}\.\s+)/g, "\n$1")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return restored
+    .replace(/^Source List:\n+/i, "Source List:\n")
+    .replace(/^Source List:\n+Primary Note:/i, "Source List:\nPrimary Note:")
+    .replace(/\n+Context Notes:\n+/i, "\n\nContext Notes:\n");
+}
+
 function contextCitationMap(contextNotes, basePath = "", primary = null) {
   const map = new Map();
   const primaryPath = sourceReference(primary, basePath);
@@ -12777,6 +12817,12 @@ function contextCitationInstructions(enabled) {
 function sanitizeContextCitations(value, citationState = {}) {
   const text = String(value || "");
   if (!text) return "";
+  const splitSummary = splitDescriptionSourceListBlock(text);
+  if (splitSummary.sourceList) {
+    const summary = sanitizeContextCitations(splitSummary.summary, citationState);
+    const sourceBlock = normalizeDescriptionSourceList(splitSummary.sourceList);
+    return [summary, sourceBlock].filter(Boolean).join("\n\n");
+  }
   const allowed = citationState.allowedContextCitations instanceof Set ? citationState.allowedContextCitations : null;
   const citationsEnabled = citationState.citeContextNotes !== false && allowed && allowed.size > 0;
   return text
@@ -12799,6 +12845,12 @@ function hasValidContextCitation(value, citationState = {}) {
 function ensureContextCitation(value, taskTitle = "", citationState = {}) {
   const text = String(value || "").trim();
   if (!text || !citationState.citeContextNotes) return text;
+  const splitSummary = splitDescriptionSourceListBlock(text);
+  if (splitSummary.sourceList) {
+    const citedSummary = ensureContextCitation(splitSummary.summary, taskTitle, citationState);
+    const sourceBlock = normalizeDescriptionSourceList(splitSummary.sourceList);
+    return [citedSummary, sourceBlock].filter(Boolean).join("\n\n");
+  }
   const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
   if (!notes.length) return text;
   const segments = splitCitationSentences(text);
@@ -12841,11 +12893,25 @@ function appendContextCitation(text, number) {
 }
 
 function splitCitationSentences(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
+  const protectedText = protectCitationLinks(text);
+  return protectedText.text
+    .replace(/[ \t\r\n]+/g, " ")
     .match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g)
-    ?.map((sentence) => sentence.trim())
+    ?.map((sentence) => protectedText.restore(sentence.trim()))
     .filter(Boolean) || [];
+}
+
+function protectCitationLinks(value) {
+  const spans = [];
+  const text = String(value || "").replace(/\[[^\]]+\]\([^)]+\)|\b(?:https?:\/\/|obsidian:\/\/|todoist:\/\/)[^\s<>)\]]+/gi, (match) => {
+    const token = `__CITATION_LINK_${spans.length}__`;
+    spans.push(match);
+    return token;
+  });
+  return {
+    text,
+    restore: (next) => String(next || "").replace(/__CITATION_LINK_(\d+)__/g, (_, rawIndex) => spans[Number(rawIndex)] || "")
+  };
 }
 
 function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {
@@ -12992,6 +13058,8 @@ function isRichTodoistDescription(value) {
 
 function normalizeStoredSourceList(value) {
   const rawLines = String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[\s\S]*/, (text) => restoreSourceListLineBreaks(text))
     .replace(/\[[^\]]+\]\(obsidian:\/\/open\?file=([^)]+)\)/g, (_, file) => decodeURIComponent(file))
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
     .replace(/obsidian:\/\/\S+/g, "")
@@ -14013,7 +14081,15 @@ function formatTodoistDescription(value, settings = DEFAULT_SETTINGS) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  return cleaned.length <= max ? cleaned : truncateMarkdownAtWord(cleaned, max);
+  const normalized = normalizeTodoistDescriptionSourceList(cleaned);
+  return normalized.length <= max ? normalized : truncateMarkdownAtWord(normalized, max);
+}
+
+function normalizeTodoistDescriptionSourceList(value) {
+  const splitSummary = splitDescriptionSourceListBlock(value);
+  if (!splitSummary.sourceList) return String(value || "");
+  const sourceBlock = normalizeDescriptionSourceList(splitSummary.sourceList);
+  return [splitSummary.summary.trim(), sourceBlock].filter(Boolean).join("\n\n");
 }
 function cleanLabel(label) { return String(label || "").replace(/^#/, "").replace(/\s+/g, "").trim(); }
 function shortTitle(value, max) { const text = singleLine(String(value || "").replace(/\.md$/i, "")); return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`; }

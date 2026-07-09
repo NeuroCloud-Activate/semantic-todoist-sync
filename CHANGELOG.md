@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.26
+
+- Fixed generated Todoist description formatting so source lists stay as multiline `Source List`, `Primary Note`, and `Context Notes` blocks instead of collapsing into one line.
+- Protected raw URLs, Obsidian/Todoist links, and Markdown links during context citation insertion so numbered citations are added outside links instead of splitting link targets.
+
 ## 0.6.25
 
 - Added an off-by-default External MCP Bridge setting that writes only small pointer files and an MCP server access profile for a separate Obsidian MCP server, leaving the existing semantic index shards, Todoist task cache, and local reference table as the only data sources.

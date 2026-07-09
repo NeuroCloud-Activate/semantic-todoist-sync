@@ -24,22 +24,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.24
+## What's New In 0.6.25
 
-1. **0.6.24 - Fallback model safety**
+1. **0.6.25 - Email dedupe, citations, and lightweight MCP bridge**
+
+   Email-To-Todoist now uses the same pre-create deduplication context as Notes-To-Todoist: generated email tasks get their target Todoist project context before duplicate checks, live open Todoist tasks are considered before creation, and AI-mediated dedupe can update matching existing tasks instead of recreating old email work in the Inbox. Generated descriptions also cite matched context-note sentences more reliably while keeping the source list format unchanged. An off-by-default External MCP Bridge can also publish a small vault-readable manifest for a separate Obsidian MCP server.
+
+2. **0.6.24 - Fallback model safety**
 
    Automatic same-provider fallback selection now rejects any fallback that matches the primary model. If the primary OpenAI model is GPT 5.4, the automatic fallback is GPT 5.4 Mini.
 
-2. **0.6.23 - Updated default AI models**
+3. **0.6.23 - Updated default AI models**
 
    OpenAI now defaults to GPT 5.4 as the primary model and GPT 5.4 Mini as the fallback. Gemini defaults to Gemini 3.5 Flash as primary and Gemini 3.1 Flash Lite as fallback. Primary, embedding, fallback, and deduplication model selectors stay aligned with the preferred AI provider chosen during setup.
 
-3. **0.6.22 - Current release notes stay visible**
-
-   The README keeps this section aligned with the latest three releases, while the full history remains in `CHANGELOG.md`.
-
 ## Recent Updates Since 0.6.14
 
+- **0.6.25:** Email-To-Todoist now checks live open Todoist tasks with the same target-project dedupe context used by Notes-To-Todoist before creating new tasks; generated task descriptions cite matched context-note sentences more reliably without changing source lists; the optional External MCP Bridge also writes pointer files and a read-only access profile without duplicating plugin data.
 - **0.6.24:** Automatic same-provider fallback selection now guarantees the fallback differs from the primary model, including migrated OpenAI settings and automatic AI deduplication.
 - **0.6.23:** OpenAI defaults now use GPT 5.4 primary with GPT 5.4 Mini fallback, Gemini defaults use Gemini 3.5 Flash primary with Gemini 3.1 Flash Lite fallback, and model selectors stay scoped to the preferred provider.
 - **0.6.22:** README and changelog upkeep now make the latest release story easier to verify from GitHub.
@@ -115,6 +116,15 @@ The setup tab is step-wise with links to open each provider pages in the browser
    - Leave AI-mediated deduplication enabled for the safest automatic merges. The default dedupe model follows the configured chat fallback model, and you can choose another model if you prefer.
    - Model choices shown in settings stay scoped to the preferred AI provider selected during setup.
    - If AI-mediated deduplication is disabled, local-only detection can still flag possible duplicates in chat for manual review, but it will not merge tasks automatically.
+
+7. Optional: publish an MCP bridge manifest.
+   - Open `Settings > Semantic Todoist Sync > Setup`.
+   - Leave `Publish MCP bridge manifest` off unless a separate Obsidian MCP server is installed and configured to read the plugin data directory.
+   - When enabled, the plugin writes only a small manifest and README in a normal vault folder. These files point to the existing semantic index manifest and shard files, `task-reference-snapshot.json`, and `task-reference-index.json`.
+   - The bridge does not start an MCP server, copy the Todoist snapshot, copy the reference table, rebuild the semantic index, or create new shard files for MCP access.
+   - MCPVault-style file servers can discover the bridge folder with their normal vault tools. Full access to the existing database files requires a narrow read-only allowlist for the paths listed in `bridge-manifest.json`, because stock MCPVault blocks `.obsidian` paths by default.
+   - Use the manifest's safe read-only MCPVault tool list for bridge access, and hide or approval-gate MCPVault write/move/delete/tag-management tools for the plugin data directory.
+   - For ChatGPT-facing querying, expose the bridge's suggested read-only tools: `semantic_todoist.search_semantic_index`, `semantic_todoist.get_todoist_snapshot`, and `semantic_todoist.get_reference_table`.
 
 ## Sidebar And Prompts
 

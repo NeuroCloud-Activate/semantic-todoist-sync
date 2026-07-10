@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.28
+
+- Preserved wording from note and email links when building Todoist descriptions, converting bare URLs into descriptive Markdown hyperlinks instead of exposing direct links.
+- Removed the repeated opening H1 from Email-To-Todoist log notes so the filename remains the document title and the note begins with workflow metadata.
+- Validated the installed plugin against the live testing vault's semantic index, task-reference snapshot, email/note generation paths, and AI-mediated deduplication path.
+
 ## 0.6.27
 
 - Updated Email-To-Todoist so forwarded emails are treated as intentional task-capture requests and soft review language can still create a useful review or follow-up task.

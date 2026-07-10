@@ -24,19 +24,20 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.27
+## What's New In 0.6.28
 
-1. **0.6.27 - More reliable Email-To-Todoist capture**
+1. **0.6.28 - Source-aware task links and cleaner email notes**
+
+   Todoist task descriptions now keep the wording supplied by the note or email as clickable Markdown link text, converting bare URLs into hyperlinks without exposing the direct address. Email-To-Todoist notes no longer repeat the filename as a starting H1; the filename remains the document title and the note begins with processing metadata. The installed plugin was validated against the live testing vault's semantic index, task generation, Todoist command preparation, and AI-mediated deduplication path.
+
+2. **0.6.27 - More reliable Email-To-Todoist capture**
 
    Email-To-Todoist now assumes forwarded emails are intended to create at least one task. Soft review language such as “let me know what you think” or non-urgent draft/document review requests can still produce a conservative review or follow-up task, and existing installs migrate from the older stricter email prompt. Email log notes also use unique visible titles when duplicate files are created, and workflow timestamps now display as `YYYY-MM-DD - HH:MM:SS (TZ)` in the user's device timezone.
 
-2. **0.6.26 - Source lists and citation-safe links**
+3. **0.6.26 - Source lists and citation-safe links**
 
    Generated Todoist descriptions now preserve source lists as readable multiline blocks with `Primary Note` and `Context Notes` lines. The formatter also repairs flattened `Source List:` or older `Sources:` blocks, and context citations are inserted outside raw URLs, Obsidian/Todoist links, and Markdown link targets.
 
-3. **0.6.25 - Email dedupe, citations, and lightweight MCP bridge**
-
-   Email-To-Todoist now uses the same pre-create deduplication context as Notes-To-Todoist: generated email tasks get their target Todoist project context before duplicate checks, live open Todoist tasks are considered before creation, and AI-mediated dedupe can update matching existing tasks instead of recreating old email work in the Inbox. Generated descriptions also cite matched context-note sentences more reliably while keeping the source list format unchanged. An off-by-default External MCP Bridge can also publish a small vault-readable manifest for a separate Obsidian MCP server.
 
 ## What It Uses
 

@@ -3083,7 +3083,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Explain the useful why/so-what behind the context in plain language so the task can be actioned without reopening every source.",
         "Never return an empty description. Never say only to use the source material.",
         "Avoid vague openings such as 'This task requires', 'Review the source', 'Complete the task', or 'Use the source material'.",
-        "Do not mention whether web links or linked files were found, missing, excluded, or unavailable.",
+        "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
         "Do not include source lists, headings, bullets, tags, section names, date metadata, or subtask lists.",
         "Subtasks must not receive descriptions."
       ].join(" "),
@@ -3178,7 +3178,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
-        "Do not mention whether web links or linked files were found, missing, excluded, or unavailable.",
+        "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
         "Do not include source lists, headings, bullets, tags, dates, section names, metadata, or subtask lists."
       ].join(" "),
       user: [
@@ -3981,7 +3981,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     })
       .then(() => {
         this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
-        addContextToTaskDescriptions(tasks, plan.contextNotes || [], options.sourceContext || {}, this.settings, plan.semanticContext || [], vaultBasePath(this.app), options.citeContextNotes !== false);
+        addContextToTaskDescriptions(
+          tasks,
+          plan.contextNotes || [],
+          Object.assign({}, options.sourceContext || {}, { sourceSummary: plan.sourceSummary || "" }),
+          this.settings,
+          plan.semanticContext || [],
+          vaultBasePath(this.app),
+          options.citeContextNotes !== false
+        );
       });
     const [projectId, projectName, sectionId] = await Promise.all([projectIdPromise, projectNamePromise, sectionIdPromise, descriptionPromise]);
     if (todoistBound) assignGeneratedTaskProject(tasks, projectId, projectName);
@@ -5727,13 +5735,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await ensureVaultFolder(this.app, folder);
     const noteTitle = emailTaskNoteTitle(receivedAt, subject);
     const path = uniqueMarkdownPath(this.app, folder, noteTitle);
-    const visibleTitle = markdownTitleFromPath(path) || noteTitle;
     const displayedProcessedAt = formatEmailWorkflowTimestamp(new Date());
     const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
     const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
     const lines = [
-      `# ${visibleTitle}`,
-      "",
       `Date processed: ${displayedProcessedAt}`,
       `Original email received: ${displayedReceivedAt}`,
       displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
@@ -12600,20 +12605,30 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
   const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
   const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
+  const linkContext = [
+    active?.text || "",
+    active?.sourceSummary || "",
+    ...(contextChunks || []).map((chunk) => `${chunk?.title || chunk?.path || ""}\n${chunk?.text || ""}`)
+  ].filter(Boolean).join("\n\n");
   for (const task of tasks || []) {
     const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings) ? task.description : fallbackActionSummary(task, active?.text || "", contextChunks, active?.title || "", settings);
-    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "", citationState);
+    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "", citationState, linkContext);
     for (const subtask of task.subtasks || []) {
       subtask.description = "";
     }
   }
 }
 
-function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}) {
+function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}, linkContext = "") {
   const splitSummary = splitDescriptionSourceListBlock(taskSummary);
   const sourceBlock = normalizeDescriptionSourceList(sources || splitSummary.sourceList);
+  const normalizedSummary = normalizeDescriptionLinks(
+    conciseDescriptionSummary([cleanGeneratedDescriptionSummary(splitSummary.summary, settings)], settings),
+    linkContext,
+    settings
+  );
   const summary = ensureContextCitation(
-    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(conciseDescriptionSummary([cleanGeneratedDescriptionSummary(splitSummary.summary, settings)], settings), taskTitle), sourceTitle), citationState),
+    sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(normalizedSummary, taskTitle), sourceTitle), citationState),
     taskTitle,
     citationState
   );
@@ -13265,18 +13280,144 @@ function markdownLinkText(value) {
   return text.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
 }
 
+function normalizeDescriptionLinkUrl(value = "") {
+  let url = String(value || "").trim().replace(/[.,;!?]+$/g, "");
+  for (const [opening, closing] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+    while (url.endsWith(closing) && (url.match(new RegExp(`\\${closing}`, "g")) || []).length > (url.match(new RegExp(`\\${opening}`, "g")) || []).length) {
+      url = url.slice(0, -1);
+    }
+  }
+  return url;
+}
+
+function descriptionLinkKey(value = "") {
+  return normalizeDescriptionLinkUrl(value).toLowerCase();
+}
+
+function isDescriptionLinkUrl(value = "") {
+  return /^(?:https?|obsidian|todoist):\/\//i.test(normalizeDescriptionLinkUrl(value));
+}
+
+function normalizeDescriptionLinkLabel(value = "") {
+  return singleLine(String(value || "").replace(/\s+/g, " ").trim());
+}
+
+function isGenericDescriptionLinkLabel(value = "") {
+  const label = normalizeDescriptionLinkLabel(value);
+  return !label || isDescriptionLinkUrl(label) || /^(?:link|here|click here|url|open|open linked document|download|document|file|attachment|this|it)$/i.test(label);
+}
+
+function descriptionLinkLabelFromUrl(url = "") {
+  let label = "";
+  try {
+    const pathname = new URL(normalizeDescriptionLinkUrl(url)).pathname;
+    label = decodeURIComponent(pathname.split("/").pop() || "");
+  } catch {}
+  label = normalizeDescriptionLinkLabel(label)
+    .replace(/\.(?:docx?|pdf|xlsx?|pptx?|html?)$/i, "")
+    .replace(/[_+.-]+/g, " ");
+  return normalizeDescriptionLinkLabel(label) || "Open linked document";
+}
+
+function inferDescriptionLinkLabel(text = "", startIndex = 0, url = "") {
+  const source = String(text || "");
+  const start = Math.max(0, Number(startIndex) || 0);
+  const lineStart = source.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+  const lineEnd = source.indexOf("\n", start);
+  let before = source.slice(lineStart, lineEnd < 0 ? start : Math.min(start, lineEnd));
+  before = before.replace(/^\s*[-*]\s+/, "").replace(/\[[^\]]*\]\(\s*$/, "").trim();
+  if (before.includes(":")) before = before.slice(before.lastIndexOf(":") + 1).trim();
+  before = before.replace(/^[\s:;,\-–—]+|[\s:;,\-–—]+$/g, "").trim();
+  before = before.replace(/^(?:please\s+)?(?:see|view|open|access|download|read|review|find|use|click)(?:\s+(?:on|the|this|that))?\s+/i, "").trim();
+  before = before.replace(/\s+(?:at|here|below)$/i, "").trim();
+  return before.length >= 3 && before.length <= 140 && !isGenericDescriptionLinkLabel(before)
+    ? before
+    : descriptionLinkLabelFromUrl(url);
+}
+
+function extractDescriptionLinkRecords(value = "", settings = DEFAULT_SETTINGS) {
+  const text = String(value || "");
+  if (!text) return [];
+  const records = [];
+  const byKey = new Map();
+  const markdownRanges = [];
+  const add = (label, rawUrl, startIndex = 0) => {
+    const url = normalizeDescriptionLinkUrl(rawUrl);
+    if (!isDescriptionLinkUrl(url) || isExcludedUrl(url, settings)) return;
+    const key = descriptionLinkKey(url);
+    const resolvedLabel = isGenericDescriptionLinkLabel(label) ? inferDescriptionLinkLabel(text, startIndex, url) : normalizeDescriptionLinkLabel(label);
+    const record = { label: resolvedLabel, url };
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, record);
+      records.push(record);
+    } else if (isGenericDescriptionLinkLabel(existing.label) && !isGenericDescriptionLinkLabel(record.label)) {
+      existing.label = record.label;
+    }
+  };
+  const markdownPattern = /\[([^\]\n]+)\]\(\s*((?:https?|obsidian|todoist):\/\/[^)\s]+)\s*\)/gi;
+  for (const match of text.matchAll(markdownPattern)) {
+    const startIndex = Number(match.index || 0);
+    markdownRanges.push([startIndex, startIndex + match[0].length]);
+    add(match[1], match[2], startIndex);
+  }
+  const rawPattern = /(?:https?|obsidian|todoist):\/\/[^\s<>\]]+/gi;
+  for (const match of text.matchAll(rawPattern)) {
+    const startIndex = Number(match.index || 0);
+    if (markdownRanges.some(([start, end]) => start <= startIndex && startIndex < end)) continue;
+    add(inferDescriptionLinkLabel(text, startIndex, match[0]), match[0], startIndex);
+  }
+  return records;
+}
+
+function descriptionLinkReferences(records = []) {
+  return (records || [])
+    .filter((record) => record?.url && record?.label)
+    .map((record) => `- [${markdownLinkText(record.label)}](${record.url})`)
+    .join("\n");
+}
+
+function normalizeDescriptionLinks(value, sourceText = "", settings = DEFAULT_SETTINGS) {
+  const text = String(value || "");
+  if (!text) return "";
+  const sourceRecords = extractDescriptionLinkRecords(sourceText, settings);
+  const sourceByKey = new Map(sourceRecords.map((record) => [descriptionLinkKey(record.url), record]));
+  const protectedLinks = [];
+  const markdownPattern = /\[([^\]\n]+)\]\(\s*((?:https?|obsidian|todoist):\/\/[^)\s]+)\s*\)/gi;
+  const protectedText = text.replace(markdownPattern, (match, rawLabel, rawUrl) => {
+    const url = normalizeDescriptionLinkUrl(rawUrl);
+    const sourceRecord = sourceByKey.get(descriptionLinkKey(url));
+    const label = sourceRecord?.label && !isGenericDescriptionLinkLabel(sourceRecord.label)
+      ? sourceRecord.label
+      : (isGenericDescriptionLinkLabel(rawLabel) ? descriptionLinkLabelFromUrl(url) : normalizeDescriptionLinkLabel(rawLabel));
+    const token = `__TODOIST_DESCRIPTION_LINK_${protectedLinks.length}__`;
+    protectedLinks.push(`[${markdownLinkText(label)}](${url})`);
+    return token;
+  });
+  const rawPattern = /(?:https?|obsidian|todoist):\/\/[^\s<>\]]+/gi;
+  const converted = protectedText.replace(rawPattern, (rawUrl, offset) => {
+    const url = normalizeDescriptionLinkUrl(rawUrl);
+    if (!isDescriptionLinkUrl(url)) return rawUrl;
+    const sourceRecord = sourceByKey.get(descriptionLinkKey(url));
+    const label = sourceRecord?.label && !isGenericDescriptionLinkLabel(sourceRecord.label)
+      ? sourceRecord.label
+      : inferDescriptionLinkLabel(text, Number(offset || 0), url);
+    return `[${markdownLinkText(label)}](${url})${rawUrl.slice(url.length)}`;
+  });
+  return converted.replace(/__TODOIST_DESCRIPTION_LINK_(\d+)__/g, (_, index) => protectedLinks[Number(index)] || "");
+}
+
 function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
-  const cleaned = cleanupEmailText(stripExcludedLinks(String(text || ""), settings));
-  const links = Array.from(new Set(cleaned.match(/https?:\/\/\S+/g) || []))
-    .filter((url) => !isExcludedUrl(url, settings))
-    .slice(0, 20);
+  const sourceText = stripExcludedLinks(String(text || ""), settings);
+  const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
+  const links = extractDescriptionLinkRecords(cleaned, settings).slice(0, 20);
   const actionLines = cleaned.split("\n").filter((line) => {
     const l = line.toLowerCase();
     return /please|action|todo|to do|follow up|review|comment|tracked changes?|verify|verification|accuracy|gap|highlight|draft|document|report|send|confirm|confirmation|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
   }).slice(0, 120).join("\n");
   const compact = [
     actionLines || cleaned.slice(0, Math.floor(maxChars * 0.75)),
-    links.length ? `\nReferenced links:\n${links.join("\n")}` : ""
+    links.length ? `\nReferenced links:\n${descriptionLinkReferences(links)}` : ""
   ].join("\n").trim();
   return clamp(compact || cleaned, maxChars);
 }
@@ -13284,7 +13425,8 @@ function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
 function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
   const maxChars = source.maxChars || DEFAULT_SETTINGS.maxEmailChars;
   if (source.type === "note") {
-    const cleaned = cleanupEmailText(stripExcludedLinks(stripGeneratedActionItemsSection(String(source.text || "")), settings));
+    const sourceText = stripExcludedLinks(stripGeneratedActionItemsSection(String(source.text || "")), settings);
+    const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
     return clamp(cleaned, maxChars);
   }
   return compressForTaskPrompt(source.text, maxChars, settings);
@@ -14143,7 +14285,7 @@ function truncateMarkdownAtWord(value, max) {
   const boundary = Math.max(sliced.lastIndexOf(" "), sliced.lastIndexOf("\n"));
   return sliced.slice(0, boundary > Math.floor(max * 0.75) ? boundary : max).trim();
 }
-function formatTodoistDescription(value, settings = DEFAULT_SETTINGS) {
+function formatTodoistDescription(value, settings = DEFAULT_SETTINGS, sourceText = "") {
   const max = Math.min(TODOIST_DESCRIPTION_LIMIT, Math.max(1, parseInt(settings.todoistDescriptionMaxChars, 10) || DEFAULT_SETTINGS.todoistDescriptionMaxChars));
   const cleaned = String(value || "")
     .replace(/\r\n/g, "\n")
@@ -14151,7 +14293,7 @@ function formatTodoistDescription(value, settings = DEFAULT_SETTINGS) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  const normalized = normalizeTodoistDescriptionSourceList(cleaned);
+  const normalized = normalizeTodoistDescriptionSourceList(normalizeDescriptionLinks(cleaned, sourceText, settings));
   return normalized.length <= max ? normalized : truncateMarkdownAtWord(normalized, max);
 }
 

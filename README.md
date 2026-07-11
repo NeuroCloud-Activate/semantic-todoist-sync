@@ -24,13 +24,17 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.28
+## What's New In 0.6.29
 
-1. **0.6.28 - Source-aware task links and cleaner email notes**
+1. **0.6.29 - More focused context and safer duplicate handling**
+
+   Project-history and task questions now keep their retrieval scope focused, collapse repeated context, and refresh changed semantic-index content safely. Generated task descriptions use task-specific evidence, and deduplication resolves clear local matches quickly while posting credible ambiguous matches to chat for review.
+
+2. **0.6.28 - Source-aware task links and cleaner email notes**
 
    Todoist task descriptions now keep the wording supplied by the note or email as clickable Markdown link text, converting bare URLs into hyperlinks without exposing the direct address. Email-To-Todoist notes no longer repeat the filename as a starting H1; the filename remains the document title and the note begins with processing metadata. The installed plugin was validated against the live testing vault's semantic index, task generation, Todoist command preparation, and AI-mediated deduplication path.
 
-2. **0.6.27 - More reliable Email-To-Todoist capture**
+3. **0.6.27 - More reliable Email-To-Todoist capture**
 
    Email-To-Todoist now assumes forwarded emails are intended to create at least one task. Soft review language such as “let me know what you think” or non-urgent draft/document review requests can still produce a conservative review or follow-up task, and existing installs migrate from the older stricter email prompt. Email log notes also use unique visible titles when duplicate files are created, and workflow timestamps now display as `YYYY-MM-DD - HH:MM:SS (TZ)` in the user's device timezone.
 

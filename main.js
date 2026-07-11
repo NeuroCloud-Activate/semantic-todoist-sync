@@ -40,6 +40,7 @@ const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
+const SEMANTIC_EMBEDDING_CONTENT_VERSION = 2;
 const GEMINI_EMBEDDING_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
@@ -72,8 +73,8 @@ const DEFAULT_TASK_DEDUPLICATION_POLICY = [
 ].join("\n");
 const TASK_DEDUPLICATION_POLICY_UPDATE_LIMIT = 8;
 const TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD = 88;
-const TASK_DEDUPLICATION_AI_MERGE_CONFIDENCE_THRESHOLD = 75;
 const TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND = 8;
+const TASK_DUPLICATE_CANDIDATE_MARKER = "[dup?]";
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
@@ -99,6 +100,11 @@ const ADAPTIVE_CONTEXT_MODE_BUDGETS = {
 const BROAD_CONTEXT_QUERY_RE = /\b(across|all|overall|portfolio|project|projects|priorit(?:y|ies|ize)|important|most important|top|rank|compare|status|where things stand|everything|whole vault|all notes)\b/i;
 const TASK_ACTION_CONTEXT_RE = /\b(tasks?|todo|actions?|next steps?|what should i do|complete|finish|work on|how do i|schedule|plan|deadline|due|follow[-\s]?up)\b/i;
 const RECENCY_OR_CONFLICT_QUERY_RE = /\b(recent|current|latest|newest|older|past|changed?|updated?|guidance|conflict|conflicting|discrepanc(?:y|ies)|instead|now|history|previous(?:ly)?)\b/i;
+const CONTEXT_HISTORY_QUERY_RE = /\b(change history|history|timeline|evolution|over time|progress(?:ion)?|what changed|how .* changed|developed|milestones?)\b/i;
+const CONTEXT_TASK_SUMMARY_QUERY_RE = /\b(major|main|key|important|open|outstanding|associated|related)?\s*(tasks?|actions?|next steps?|follow[-\s]?ups?)\b/i;
+const CONTEXT_QUERY_SCOPE_STOP_WORDS = new Set([
+  "about", "across", "action", "actions", "any", "associated", "change", "changed", "changes", "current", "developed", "did", "evolution", "find", "give", "have", "history", "important", "latest", "major", "main", "meeting", "milestone", "milestones", "most", "notes", "outstanding", "overall", "portfolio", "program", "programs", "progress", "project", "projects", "related", "relevant", "review", "said", "say", "show", "status", "summarize", "summary", "task", "tasks", "timeline", "update", "updated", "updates", "what", "which"
+]);
 const STRONG_MODEL_ESCALATION_THRESHOLD = 95;
 const STRONG_MODEL_HARD_ESCALATION_THRESHOLD = 99;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
@@ -1289,6 +1295,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (indexFile !== SEMANTIC_INDEX_FILE) await this.removeSemanticIndexFiles(SEMANTIC_INDEX_FILE);
     this.semanticIndex = [];
     this.semanticChunkTermCache?.clear?.();
+    this.contextQueryProfileCache?.clear?.();
     window.clearTimeout(this.semanticIndexWarmupTimer);
     this.semanticIndexWarmupTimer = null;
     this.semanticIndexWarmupInProgress = false;
@@ -1717,9 +1724,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         const text = await this.app.vault.cachedRead(file);
         const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-        const fileChunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote);
+        const fileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
+          .filter((chunk) => !isSemanticNoiseChunk(chunk));
         for (let index = 0; index < fileChunks.length; index += 1) {
-          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource });
+          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
         }
       }
       this.setSidebarStatus("Preparing task reference chunks...");
@@ -1733,6 +1741,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
       this.semanticIndex = indexed;
       this.semanticChunkTermCache?.clear?.();
+      this.contextQueryProfileCache?.clear?.();
       this.queueSemanticIndexWarmup();
       this.settings.semanticIndexMeta = {
         model: this.settings.embeddingModel,
@@ -1740,7 +1749,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         chunks: indexed.length,
         maxChunkChars: this.settings.semanticIndexMaxChunkChars,
         maxChunksPerNote: this.settings.semanticIndexMaxChunksPerNote,
-        embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision
+        embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision,
+        embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
       };
       await this.saveSemanticIndex();
       await this.saveSettings();
@@ -1895,8 +1905,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.requireAiAccess();
     const text = await this.app.vault.cachedRead(file);
     const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-    const chunks = chunkMarkdown(text, this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
-      .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource }));
+    const chunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
+      .filter((chunk) => !isSemanticNoiseChunk(chunk))
+      .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION }));
     chunks.push(...this.semanticTaskReferenceChunks(path));
     if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return this.refreshSemanticPathChunkMetadata(path, chunks);
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
@@ -1905,6 +1916,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`);
     this.semanticIndex = previousIndex.filter((chunk) => chunk.path !== path).concat(embedded.indexed);
     this.semanticChunkTermCache?.clear?.();
+    this.contextQueryProfileCache?.clear?.();
     this.queueSemanticIndexWarmup();
     this.logLocal("Semantic note index refreshed", { path, chunks: chunks.length, embedded: embedded.embedded, reused: embedded.reused });
     return true;
@@ -1933,7 +1945,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const embeddings = await this.embedTexts(batch.map((item) => semanticChunkEmbeddingInput(item.chunk)), "document");
       for (let j = 0; j < batch.length; j += 1) {
         const item = batch[j];
-        indexed[item.index] = Object.assign({}, item.chunk, { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision) });
+        indexed[item.index] = Object.assign({}, item.chunk, { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision), embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
       }
       embedded += batch.length;
       await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
@@ -2006,7 +2018,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           text: textChunks[index],
           kind: "todoist-task-reference",
           source: "local-reference-table",
-          modifiedAt: group.modifiedAt || (file instanceof TFile ? file.stat?.mtime || 0 : 0)
+          modifiedAt: group.modifiedAt || (file instanceof TFile ? file.stat?.mtime || 0 : 0),
+          embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
         });
       }
     }
@@ -2019,6 +2032,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const changed = before !== this.semanticIndex.length;
     if (changed) {
       this.semanticChunkTermCache?.clear?.();
+      this.contextQueryProfileCache?.clear?.();
       this.queueSemanticIndexWarmup();
     }
     if (save && changed) {
@@ -2095,12 +2109,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return response;
   }
 
-  async retrieveSemanticContext(query, limit) {
+  async retrieveSemanticContext(query, limit, queryPlan = null) {
     if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
       await this.ensureSemanticIndexLoaded("semantic search index");
     }
-    const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
-    if (!index.length) return this.retrieveLexicalContext(query, limit);
+    const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const plan = queryPlan || contextQueryPlan(query, "chat");
+    const profile = buildContextQueryProfile(this, index, plan);
+    if (!index.length) return this.retrieveLexicalContext(query, limit, profile);
     const cacheKey = `${this.settings.embeddingModel}:${singleLine(query).slice(0, 500)}`;
     let queryEmbedding = this.queryEmbeddingCache.get(cacheKey);
     if (!queryEmbedding) {
@@ -2117,34 +2133,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const scores = this.contextLexicalScores(chunk, queryTerms);
         const lexical = scores.lexical;
         const title = scores.title;
-        return { chunk, semantic, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) };
+        return Object.assign({ chunk, semantic, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) }, contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk)));
       });
     await this.hydrateCandidateCreatedTimes(semanticRawCandidates, Math.max(poolSize * 2, 60));
     const semanticCandidates = rankContextCandidates(semanticRawCandidates)
       .slice(0, poolSize);
-    const lexicalCandidates = this.lexicalContextCandidates(query, poolSize);
-    const candidates = rankContextCandidates(mergeContextCandidates(semanticCandidates, lexicalCandidates));
-    return diversifyContextCandidates(candidates, limit).map((item) => annotateContextChunk(item));
+    const lexicalCandidates = this.lexicalContextCandidates(query, poolSize, profile);
+    const candidates = rankContextCandidates(filterContextCandidatesForPlan(mergeContextCandidates(semanticCandidates, lexicalCandidates), profile));
+    const uniqueCandidates = deduplicateContextCandidateBodies(candidates);
+    return selectContextCandidatesForPlan(uniqueCandidates, limit, profile).map((item) => annotateContextChunk(item, profile));
   }
 
   async retrieveAdaptiveSemanticContext(query, mode = "chat", baseLimit = 8, prompt = "") {
-    return this.retrieveSemanticContext(query, adaptiveSemanticRetrievalLimit(this.settings, mode, baseLimit, prompt || query));
+    const plan = contextQueryPlan(prompt || query, mode);
+    return this.retrieveSemanticContext(query, adaptiveSemanticRetrievalLimit(this.settings, mode, baseLimit, prompt || query), plan);
   }
 
-  retrieveLexicalContext(query, limit) {
-    return this.lexicalContextCandidates(query, limit).slice(0, limit).map((item) => annotateContextChunk(item));
+  retrieveLexicalContext(query, limit, queryPlan = null) {
+    const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const profile = queryPlan?.anchorTerms ? queryPlan : buildContextQueryProfile(this, index, queryPlan || contextQueryPlan(query, "chat"));
+    const candidates = rankContextCandidates(filterContextCandidatesForPlan(this.lexicalContextCandidates(query, Math.max(limit * 4, 24), profile), profile));
+    return selectContextCandidatesForPlan(deduplicateContextCandidateBodies(candidates), limit, profile).map((item) => annotateContextChunk(item, profile));
   }
 
-  lexicalContextCandidates(query, limit) {
-    const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || ""));
+  lexicalContextCandidates(query, limit, queryPlan = null) {
+    const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
     const queryTerms = termCounts(query);
+    const profile = queryPlan?.anchorTerms ? queryPlan : buildContextQueryProfile(this, chunks, queryPlan || contextQueryPlan(query, "chat"));
     const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
     return rankContextCandidates(chunks
       .map((chunk) => {
         const scores = this.contextLexicalScores(chunk, queryTerms);
         const lexical = scores.lexical;
         const title = scores.title;
-        return { chunk, semantic: 0, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) };
+        return Object.assign({ chunk, semantic: 0, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) }, contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk)));
       })
       .filter((item) => item.lexical > 0 || item.title > 0))
       .slice(0, Math.max(limit, 1));
@@ -2178,43 +2200,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!paths.length) return 0;
     let hydrated = 0;
     this.semanticCreatedAtPathCache = this.semanticCreatedAtPathCache || new Map();
-    for (let index = 0; index < paths.length; index += 1) {
-      const notePath = paths[index];
-      let createdMeta = this.semanticCreatedAtPathCache.get(notePath);
-      if (createdMeta === undefined) {
-        createdMeta = { createdAt: 0, createdAtSource: "" };
-        try {
-          const file = this.app.vault.getAbstractFileByPath(notePath);
-          if (file instanceof TFile) {
-            createdMeta = useNoteCreatedTime
-              ? semanticCreatedMetadataForFile(file, await this.app.vault.cachedRead(file), this.settings)
-              : semanticCreatedMetadataForFile(file, "", this.settings);
-          }
-        } catch {}
-        this.semanticCreatedAtPathCache.set(notePath, createdMeta);
+    const targetsByPath = semanticCreatedAtTargetsByPath(paths, this.semanticIndex || [], candidates || []);
+    const batchSize = 12;
+    for (let offset = 0; offset < paths.length; offset += batchSize) {
+      const batch = paths.slice(offset, offset + batchSize);
+      const metadata = await Promise.all(batch.map(async (notePath) => [
+        notePath,
+        await semanticCreatedMetadataForPath(this, notePath, useNoteCreatedTime)
+      ]));
+      for (const [notePath, createdMeta] of metadata) {
+        hydrated += applySemanticCreatedMetadata(
+          targetsByPath.get(notePath),
+          createdMeta,
+          useNoteCreatedTime
+        );
       }
-      const createdAt = Number(createdMeta?.createdAt || 0);
-      const createdAtSource = String(createdMeta?.createdAtSource || "");
-      if (createdAt) {
-        for (const chunk of this.semanticIndex || []) {
-          const shouldApply = chunk.path === notePath && (!chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file"));
-          if (shouldApply) {
-            chunk.createdAt = createdAt;
-            if (createdAtSource) chunk.createdAtSource = createdAtSource;
-            hydrated += 1;
-          }
-        }
-        for (const item of candidates || []) {
-          const chunk = item.chunk || item;
-          const shouldApply = chunk.path === notePath && (!chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file"));
-          if (shouldApply) {
-            chunk.createdAt = createdAt;
-            if (createdAtSource) chunk.createdAtSource = createdAtSource;
-          }
-          if (chunk.path === notePath) item.recency = recencyBoost(contextCandidateFreshnessAt(item));
-        }
-      }
-      if (index % 12 === 11) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      if (offset + batchSize < paths.length) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
     }
     return hydrated;
   }
@@ -2247,17 +2248,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const referenceIndex = this.getTaskReferenceIndex();
     const taskCacheEntries = referenceIndex.entries;
     const cachedTaskPaths = referenceIndex.cachedTaskPaths;
-    const byPath = new Map();
-    if (active?.path) byPath.set(active.path, active.text || "");
-    for (const file of matchedTaskFiles) {
-      if (!file.path || byPath.has(file.path)) continue;
-      byPath.set(file.path, await this.app.vault.cachedRead(file));
-    }
-    for (const chunk of chunks || []) {
-      if (!chunk.path || byPath.has(chunk.path)) continue;
-      const file = this.app.vault.getAbstractFileByPath(chunk.path);
-      if (file instanceof TFile) byPath.set(chunk.path, await this.app.vault.cachedRead(file));
-    }
+    const byPath = await loadTaskContextTexts(this, active, matchedTaskFiles, chunks);
     const taskRows = [];
     const matchedPathTaskCounts = {};
     for (const [path, text] of byPath.entries()) {
@@ -2327,6 +2318,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const prompt = [options.prompt, options.sourceTitle, options.sourceSummary].filter(Boolean).join("\n");
     const depth = adaptiveContextDepth(mode, prompt);
     const budget = adaptiveContextBudget(mode);
+    const queryPlan = options.queryPlan || contextQueryPlan(options.prompt || prompt, mode);
+    const retrievedScopeTerms = uniqueValues((options.context || []).flatMap((chunk) => chunk.retrievalScopeTerms || []));
+    if (retrievedScopeTerms.length) queryPlan.primaryAnchorTerms = retrievedScopeTerms;
     const basePath = vaultBasePath(this.app);
     const citationMap = options.citationMap instanceof Map ? options.citationMap : null;
     const query = [
@@ -2339,7 +2333,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       depth,
       maxCards: budget.maxNotes,
       basePath,
-      citationMap
+      citationMap,
+      queryPlan
     });
     const taskCards = this.adaptiveTaskCards({
       depth,
@@ -2348,11 +2343,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       active: options.active || null,
       tasks: options.tasks || [],
       context: options.context || [],
-      maxCards: budget.maxTasks
+      maxCards: budget.maxTasks,
+      queryPlan
     });
     const projectCards = adaptiveProjectCards(noteCards, taskCards, {
       depth,
-      maxCards: budget.maxProjects
+      maxCards: budget.maxProjects,
+      queryPlan
     });
     const text = formatAdaptiveContextPack({
       depth,
@@ -2364,15 +2361,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskCards,
       projectCards,
       taskContext: options.taskContext || "",
+      queryPlan,
       settings: this.settings
     }, Math.min(budget.maxChars, this.settings.maxContextChars ? Math.max(5000, this.settings.maxContextChars) : budget.maxChars));
-    return { depth, mode, noteCards, taskCards, projectCards, text };
+    return { depth, mode, queryPlan, noteCards, taskCards, projectCards, text };
   }
 
   adaptiveTaskCards(options = {}) {
     const depth = Number(options.depth || 4);
     const query = options.query || "";
     const queryTerms = taskSearchTermCounts(query);
+    const queryPlan = options.queryPlan || contextQueryPlan(query, options.mode || "chat");
     const contextPaths = new Set((options.context || []).map((chunk) => chunk.path).filter(Boolean));
     const activePath = options.active?.path || "";
     const explicitTasks = flattenTaskPlan(options.tasks || []);
@@ -2385,8 +2384,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const childText = childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "";
       const score = taskReferenceScore(task, queryTerms, query, childText);
       const pathMatch = Boolean(notePath && (notePath === activePath || contextPaths.has(notePath)));
-      const broad = depth >= 7;
+      const broad = depth >= 7 && queryPlan.portfolio;
       const taskKnowledge = taskKnowledgeSnapshot(task, this.settings, childText, task.knowledge || task.taskKnowledge || null);
+      const scopeText = [task.content, task.description, task.parentContent, task.projectName, task.section, notePath, childText, taskKnowledge.intent, taskKnowledge.rationale, taskKnowledge.dependency].filter(Boolean).join(" ");
+      const scopeMatch = contextTextMatchesQueryScope(scopeText, queryPlan);
+      if (queryPlan.strictScope && !scopeMatch && source !== "current task") return;
       if (!broad && !pathMatch && score <= 0 && source !== "current task") return;
       const dueScore = task.due_date || task.deadline_date || task.scheduledDueDateTime ? 0.35 : 0;
       const priorityScore = (normalizePriority(task.priority) - 1) * 0.25;
@@ -2396,6 +2398,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         title: task.content || "",
         path: notePath,
         source,
+        scopeMatch,
         score: sourcePriority + score + priorityScore + dueScore + recency + (pathMatch ? 1.25 : 0),
         status: task.isCompleted ? "completed" : task.isSubtask ? "subtask" : "open",
         priority: normalizePriority(task.priority),
@@ -2472,6 +2475,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
         "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
         "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
+        "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
+        "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
+        "For change-history questions, present supported changes in chronological order and separate historical state, later changes, and current state. For project-task questions, keep open tasks separate from completed work and omit tasks from other projects.",
         "Use markdown links exactly as supplied, and do not invent sources.",
         "When providing any link, use descriptive linked text in markdown form such as [task title](url) or [note title](url). Do not display full raw URLs in the visible answer.",
         "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
@@ -2499,7 +2505,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "User prompt:",
         prompt
       ].join("\n"),
-      appendFallbackNotice: this.settings.showAiFallbackNotice !== false
+      appendFallbackNotice: this.settings.showAiFallbackNotice !== false,
+      background: false
     }));
     if (modelChoice.useStrong && this.settings.showAiFallbackNotice !== false && modelIdentity(this.lastAiResponseModel) === modelIdentity(modelChoice.model)) {
       response = `${String(response || "").trimEnd()}\n\nStronger AI model used: ${modelDisplayName(modelChoice.model)}`;
@@ -2707,7 +2714,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -2717,7 +2724,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (index > 0) this.setSidebarStatus(`Retrying AI with ${modelDisplayName(candidateModel)}...`);
         const response = usesGeminiChatModel(candidateModel)
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema });
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, background });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -2757,15 +2764,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, background = true }) {
     const body = {
       model: normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel),
-      background: true,
       input: [
         { role: "system", content: [{ type: "input_text", text: system }] },
         { role: "user", content: [{ type: "input_text", text: user }] }
       ]
     };
+    if (background !== false) body.background = true;
     if (jsonSchema) {
       body.text = { format: { type: "json_schema", name: "semantic_todoist_tasks", strict: true, schema: jsonSchema } };
     }
@@ -2947,13 +2954,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await this.ensureCompatibleEmbeddingForChatModel();
     const sourceSummary = compressSourceForTaskPrompt(source, this.settings);
     const taskQuery = `${source.title}\n${sourceSummary}`;
-    const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, source.templateInstructions || "");
+    const retrievalPrompt = taskGenerationContextQuery(source, sourceSummary, this.settings);
+    const retrievalPlan = contextQueryPlan(retrievalPrompt, "task-generation");
+    const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt);
     const taskContext = await this.buildTaskContext(
       source.type === "note" ? { path: source.path || "", text: source.text || "" } : null,
       context,
       taskQuery
     );
-    const contextNotes = contextNotesForTaskPlan(context, source.path, Math.max(this.settings.taskContextSummaryMaxNotes || 0, adaptiveContextBudget("task-generation").maxNotes));
     const taskInstructions = this.taskInstructionsForSource(source.type);
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
@@ -2969,7 +2977,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       sourceTitle: source.title,
       sourceSummary,
       context,
-      taskContext
+      taskContext,
+      queryPlan: retrievalPlan
     });
     const modelChoice = this.aiModelForRequest("task-generation", {
       prompt: [taskQuery, instructions].join("\n"),
@@ -3016,18 +3025,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     const parsed = JSON.parse(json);
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
-    parsed.tasks = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), maxMainTasks, maxSubtasks);
+    const cleanedTasks = (parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content);
+    const grounding = groundGeneratedTaskPlan(cleanedTasks, `${source.title || ""}\n${sourceSummary}`, this.settings);
+    parsed.tasks = limitGeneratedTasks(grounding.tasks, maxMainTasks, maxSubtasks);
+    if (grounding.rejected.length) {
+      this.logLocal("Rejected generated tasks without primary-source grounding", {
+        source: source.type || "",
+        count: grounding.rejected.length,
+        tasks: grounding.rejected.map((task) => truncateAtWord(task.content || "", 100))
+      });
+    }
     if (!parsed.tasks.length) {
       const fallbackTask = source.type === "email"
         ? emailIntendedActionFallbackTask(source, sourceSummary, this.settings)
         : explicitReviewRequestFallbackTask(source, sourceSummary, this.settings);
       if (fallbackTask) parsed.tasks = [cleanTask(fallbackTask, allowedLabels, this.settings)].filter((task) => task.content);
     }
+    const contextNotes = contextNotesForTaskPlan(
+      context,
+      source.path,
+      Math.max(this.settings.taskContextSummaryMaxNotes || 0, adaptiveContextBudget("task-generation").maxNotes),
+      [taskQuery, flattenTaskPlan(parsed.tasks || []).map((task) => task.content || "").join("\n")].join("\n"),
+      this.settings
+    );
     parsed.sectionName = cleanGeneratedSectionName(parsed.section_name || parsed.sectionName || source.sectionName);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
     parsed.semanticContext = context;
     parsed.adaptiveContextDepth = adaptivePack.depth;
+    parsed.allowedLabels = Array.from(allowedLabels);
     parsed.descriptionInstructions = taskInstructions.descriptions;
     return parsed;
   }
@@ -3044,6 +3070,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
     const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
+    const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, this.settings, citationState);
+    const evidenceByIndex = new Map(evidenceBundles.map((evidence) => [evidence.index, evidence]));
+    for (const item of mainTasks) item.evidence = evidenceByIndex.get(item.index)?.prompt || "";
     const contextQuery = [sourceTitle, sourceSummary, mainTasks.map((task) => task.title).join("\n")].join("\n");
     const adaptivePack = this.buildAdaptiveContextPack({
       mode: "description",
@@ -3077,6 +3106,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not write openings like 'The note says', 'The source records', 'The email indicates', a source-title recap, or any filename-first framing.",
         "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
         "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
+        "Each task has its own evidence bundle. Use only that task's primary-source and supporting evidence; never borrow a person, document, decision, dependency, date, or status from another task's bundle.",
+        "Do not add a specific fact, person, date, link, or dependency unless it appears in the corresponding evidence bundle.",
         "Use the adaptive context pack as required supporting context when it is available; prioritize the highest-ranked excerpts that explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
@@ -3101,13 +3132,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Context-note citation rule:",
         contextCitationInstructions(citeContextNotes),
         "",
-        "Main tasks needing descriptions:",
+        "Main tasks and their task-specific evidence bundles:",
         JSON.stringify(mainTasks),
         "",
         "Active source content:",
         sourceSummary || "",
         "",
-        "Adaptive portfolio-level context for writing task descriptions:",
+        "Supporting evidence catalog (use a fact only when it also appears in the matching task-specific evidence bundle):",
         adaptivePack.text || formatContext(context, this.settings.maxContextChars, this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
     }));
@@ -3119,33 +3150,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       task.description = truncateAtWord(summary || task.description || "", 1200);
       for (const subtask of task.subtasks || []) subtask.description = "";
     }
-    const weakTasks = (tasks || []).map((task, index) => ({ task, index })).filter(({ task }) => !isUsefulDescriptionSummary(task.description, task.content, this.settings));
+    const weakTasks = (tasks || []).map((task, index) => {
+      const evidence = evidenceByIndex.get(index) || null;
+      return { task, index, evidence, reason: taskDescriptionGroundingReason(task.description, task, evidence, this.settings) };
+    }).filter(({ reason }) => reason !== "passed");
     if (weakTasks.length) {
       this.logLocal("Task descriptions needed improvement", {
         count: weakTasks.length,
-        tasks: weakTasks.map(({ task }) => ({ title: task.content || "", reason: descriptionQualityReason(task.description, task.content, this.settings) }))
+        tasks: weakTasks.map(({ task, reason }) => ({ title: task.content || "", reason }))
       });
       this.setSidebarStatus(`Improving ${weakTasks.length} task description${weakTasks.length === 1 ? "" : "s"}...`);
       await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options);
     }
     this.setSidebarStatus("Finalizing task descriptions...");
-    for (const task of tasks || []) {
-      if (!isUsefulDescriptionSummary(task.description, task.content, this.settings)) {
-        task.description = fallbackActionSummary(task, sourceSummary, context, sourceTitle, this.settings);
+    for (let index = 0; index < (tasks || []).length; index += 1) {
+      const task = tasks[index];
+      const evidence = evidenceByIndex.get(index) || null;
+      if (taskDescriptionGroundingReason(task.description, task, evidence, this.settings) !== "passed") {
+        task.description = fallbackActionSummary(task, sourceSummary, evidence?.contextChunks || [], sourceTitle, this.settings);
       }
       for (const subtask of task.subtasks || []) subtask.description = "";
     }
   }
 
   async repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
-    const repairItems = weakTasks.map(({ task, index }) => ({
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
+    const fallbackEvidence = buildTaskDescriptionEvidenceBundles(weakTasks.map(({ task }) => task), sourceSummary, context, sourceTitle, this.settings, citationState);
+    const repairItems = weakTasks.map(({ task, index, evidence }, position) => ({
       index,
       title: task.content || "",
       labels: task.labels || [],
-      subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
+      subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean),
+      evidence: (evidence || fallbackEvidence[position])?.prompt || ""
     }));
     if (!repairItems.length) return;
-    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
     const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
     const contextQuery = [sourceTitle, sourceSummary, repairItems.map((task) => task.title).join("\n")].join("\n");
@@ -3175,6 +3213,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Return only JSON matching the schema.",
         "Each description must be 80-1200 characters and must explain the specific context, rationale, dependencies, people, documents, and next information needed to action the task.",
         "Use active source content first, then use the adaptive portfolio-level context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
+        "Use only the evidence bundle attached to the matching task index. Do not borrow specific facts from another task or from unrelated supporting context.",
+        "Do not add a person, date, link, document, dependency, decision, or status unless it appears in that task's evidence bundle.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
@@ -3198,7 +3238,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Active source content:",
         sourceSummary || "",
         "",
-        "Adaptive portfolio-level context for repairing task descriptions:",
+        "Supporting evidence catalog (use a fact only when it also appears in the matching task-specific evidence bundle):",
         adaptivePack.text || formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
       ].join("\n")
     }));
@@ -3207,7 +3247,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const match = weakTasks.find(({ index }) => index === item.index);
       if (!match) continue;
       const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings, citationState);
-      if (isUsefulDescriptionSummary(summary, match.task.content, this.settings)) match.task.description = truncateAtWord(summary, 1200);
+      const position = weakTasks.indexOf(match);
+      const evidence = match.evidence || fallbackEvidence[position] || null;
+      if (taskDescriptionGroundingReason(summary, match.task, evidence, this.settings) === "passed") match.task.description = truncateAtWord(summary, 1200);
     }
   }
 
@@ -3642,7 +3684,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async processPendingEmails(showNotice = true, options = {}) {
-    if (this.emailProcessingInProgress) return;
+    if (this.emailProcessingInProgress) return { processed: 0, failed: 0, skipped: true };
     this.emailProcessingInProgress = true;
     this.setSidebarStatus("Processing email tasks...");
     try {
@@ -3663,62 +3705,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         else await this.saveSettings();
         this.logLocal("Email poll complete", { pending: 0 });
         if (showNotice) new Notice("No pending email tasks.");
-        return;
+        return { processed: 0, failed: 0 };
       }
-      let count = 0;
-      for (const item of emails) {
-        const email = await this.workerJson(`/email?id=${encodeURIComponent(item.id)}`, "GET");
-        const parsed = parseRawEmail(email.raw || "");
-        const subject = decodeHeader(email.subject || parsed.subject || "(no subject)");
-        const cloudflareReceivedAt = email.receivedAt || "";
-        const receivedAt = originalEmailReceivedAt(parsed, cloudflareReceivedAt);
-        const fallbackSectionName = makeSectionName(receivedAt, subject);
-        const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
-        const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
-        const emailSourceText = [
-          `From: ${email.from || parsed.from || ""}`,
-          `To: ${email.to || parsed.to || ""}`,
-          `Original email received: ${displayedReceivedAt}`,
-          displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
-          `Subject: ${subject}`,
-          "",
-          parsed.text
-        ].filter(Boolean).join("\n");
-        const plan = await this.createTaskPlan({
-          type: "email",
-          title: subject,
-          text: emailSourceText,
-          sectionName: fallbackSectionName,
-          maxChars: this.settings.maxEmailChars
-        });
-        const sectionName = plan.sectionName || fallbackSectionName;
-        const tasks = plan.tasks || [];
-        enforceGeneratedTaskLimits(tasks, this.settings);
-        this.setSidebarStatus("Creating local email task OIDs...");
-        ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
-        assignGeneratedTaskOids(tasks, this.settings);
-        const prepared = await this.prepareGeneratedTasksForTodoistWorkflow(tasks, plan, {
-          source: "email",
-          path: "",
-          sectionName,
-          sourceTitle: subject,
-          sourceContext: { title: subject, path: "", text: emailSourceText },
-          citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false,
-          prepareTodoistSection: true,
-          status: "Preparing descriptions and Todoist section...",
-          contextStatus: "Adding email source context...",
-          contextNotes: plan.contextNotes || [],
-          semanticContext: plan.semanticContext || []
-        });
-        this.setSidebarStatus("Syncing Todoist section...");
-        const created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
-        await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
-        await this.workerJson("/complete", "POST", { id: item.id });
-        count += 1;
-      }
+      const { processed: count, failed } = await this.processPendingEmailBatch(emails);
       await this.saveSettings();
-      this.logLocal("Email processing complete", { processed: count });
-      if (showNotice) new Notice(`Processed ${count} email${count === 1 ? "" : "s"} into Todoist.`);
+      this.logLocal("Email processing complete", { processed: count, failed, pending: emails.length });
+      if (showNotice) {
+        const failureText = failed ? ` ${failed} email${failed === 1 ? "" : "s"} could not be processed and will remain pending for retry.` : "";
+        new Notice(`Processed ${count} email${count === 1 ? "" : "s"} into Todoist.${failureText}`);
+      }
+      return { processed: count, failed };
     } catch (error) {
       console.error(error);
       this.logLocal("Email task processing failed", { error: error.message || String(error) });
@@ -3727,6 +3723,72 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.emailProcessingInProgress = false;
       this.setSidebarStatus("Ready");
     }
+  }
+
+  async processPendingEmailBatch(emails = []) {
+    let processed = 0;
+    let failed = 0;
+    for (const item of emails || []) {
+      try {
+        await this.processPendingEmailItem(item);
+        processed += 1;
+      } catch (error) {
+        failed += 1;
+        this.logLocal("Email item processing failed", { id: item?.id || "", error: error.message || String(error) });
+      }
+    }
+    return { processed, failed };
+  }
+
+  async processPendingEmailItem(item) {
+    const email = await this.workerJson(`/email?id=${encodeURIComponent(item.id)}`, "GET");
+    const parsed = parseRawEmail(email.raw || "");
+    const subject = decodeHeader(email.subject || parsed.subject || "(no subject)");
+    const cloudflareReceivedAt = email.receivedAt || "";
+    const receivedAt = originalEmailReceivedAt(parsed, cloudflareReceivedAt);
+    const fallbackSectionName = makeSectionName(receivedAt, subject);
+    const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
+    const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
+    const emailSourceText = [
+      `From: ${email.from || parsed.from || ""}`,
+      `To: ${email.to || parsed.to || ""}`,
+      `Original email received: ${displayedReceivedAt}`,
+      displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
+      `Subject: ${subject}`,
+      "",
+      parsed.text
+    ].filter(Boolean).join("\n");
+    const plan = await this.createTaskPlan({
+      type: "email",
+      title: subject,
+      text: emailSourceText,
+      sectionName: fallbackSectionName,
+      maxChars: this.settings.maxEmailChars
+    });
+    const sectionName = plan.sectionName || fallbackSectionName;
+    const tasks = plan.tasks || [];
+    enforceGeneratedTaskLimits(tasks, this.settings);
+    this.setSidebarStatus("Creating local email task OIDs...");
+    ensureGeneratedTaskMetadata(tasks, sectionName, this.settings);
+    assignGeneratedTaskOids(tasks, this.settings);
+    const prepared = await this.prepareGeneratedTasksForTodoistWorkflow(tasks, plan, {
+      source: "email",
+      path: "",
+      sectionName,
+      sourceTitle: subject,
+      sourceContext: { title: subject, path: "", text: emailSourceText },
+      citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false,
+      prepareTodoistSection: true,
+      status: "Preparing descriptions and Todoist section...",
+      contextStatus: "Adding email source context...",
+      contextNotes: plan.contextNotes || [],
+      semanticContext: plan.semanticContext || []
+    });
+    this.setSidebarStatus("Syncing Todoist section...");
+    const created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
+    await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
+    await this.workerJson("/complete", "POST", { id: item.id });
+    return { id: item.id, subject, tasks: created.length };
   }
 
   async workerJson(path, method, body) {
@@ -4002,8 +4064,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       semanticContext: options.semanticContext || plan.semanticContext || [],
       includeLiveTodoistCandidates: todoistBound
     };
-    await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
-    return { projectId, projectName, sectionId };
+    const dedupeStats = await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
+    if (options.citeContextNotes !== false && (dedupeStats.generatedDuplicates > 0 || dedupeStats.merged > 0)) {
+      addContextToTaskDescriptions(
+        tasks,
+        plan.contextNotes || [],
+        Object.assign({}, options.sourceContext || {}, { sourceSummary: plan.sourceSummary || "" }),
+        this.settings,
+        plan.semanticContext || [],
+        vaultBasePath(this.app),
+        true
+      );
+    }
+    const quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
+    plan.localQualityReport = quality;
+    if (!quality.passed) {
+      this.logLocal("Task generation local quality check flagged output", {
+        source: options.source || "",
+        score: quality.score,
+        issues: quality.issues.map((issue) => issue.code),
+        elapsedMs: quality.elapsedMs
+      });
+    }
+    if (quality.blockingIssues > 0) throw new Error(`Generated tasks failed ${quality.blockingIssues} blocking local quality check${quality.blockingIssues === 1 ? "" : "s"}.`);
+    return { projectId, projectName, sectionId, quality };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -4752,9 +4836,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.checked = flat.length;
     if (!tasks?.length || this.settings.enableTaskDeduplication === false) return stats;
     this.setSidebarStatus("Checking for existing tasks...");
-    const generatedDedupe = await deduplicateGeneratedTaskBatch(tasks, this.settings, options, (task, decision, mergeOptions) => this.aiTaskDeduplicationMerge(task, decision, mergeOptions));
+    const generatedDedupe = await deduplicateGeneratedTaskBatch(
+      tasks,
+      this.settings,
+      options,
+      (task, decision, detectionOptions) => this.aiTaskDeduplicationDecision(task, decision, detectionOptions),
+      (task, decision, generationOptions) => this.taskGenerationUpdateForDuplicate(task, decision, generationOptions)
+    );
     stats.generatedDuplicates += generatedDedupe.merged;
+    stats.localConfirmed += generatedDedupe.localConfirmed || 0;
     stats.aiUsed += generatedDedupe.aiUsed || 0;
+    stats.taskGenerationUsed += generatedDedupe.taskGenerationUsed || 0;
     stats.ambiguous += generatedDedupe.ambiguous || 0;
     stats.candidateFlags.push(...(generatedDedupe.candidateFlags || []));
     stats.matches.push(...generatedDedupe.matches);
@@ -4771,33 +4863,54 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ambiguous: stats.ambiguous,
           copiedSubtasks: stats.copiedSubtasks,
           generatedDuplicates: stats.generatedDuplicates,
-          aiUsed: stats.aiUsed
+          localConfirmed: stats.localConfirmed,
+          aiUsed: stats.aiUsed,
+          taskGenerationUsed: stats.taskGenerationUsed
         });
       }
       await this.postTaskDeduplicationCandidateFlags(stats, options);
       return stats;
     }
+    const matchingOptions = Object.assign({}, options, { taskDeduplicationFeatureCache: new WeakMap() });
     for (const task of tasks) {
-      const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, options, { isSubtask: false }));
+      const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, matchingOptions, { isSubtask: false }));
       if (isAiMediatedTaskDeduplicationCandidate(mainDecision)) {
-        if (this.settings.enableAiAmbiguousTaskDeduplication !== true) {
-          stats.candidateFlags.push(taskDeduplicationCandidateFlag(task, mainDecision, this.settings, options));
-          stats.ambiguous += 1;
+        const resolution = taskDeduplicationResolution(mainDecision, this.settings, matchingOptions);
+        if (resolution === "none") {
           stats.created += 1;
           for (const subtask of task.subtasks || []) stats.created += 1;
           continue;
         }
-        const aiMerge = await this.aiTaskDeduplicationMerge(task, mainDecision, options);
-        if (aiMerge?.used) stats.aiUsed += 1;
-        if (aiMerge?.match !== true) {
-          stats.ambiguous += 1;
+        if (resolution === "manual") {
+          flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
+          stats.created += 1;
+          for (const subtask of task.subtasks || []) stats.created += 1;
           continue;
         }
-        applyTaskDeduplicationMatch(task, mainDecision, this.settings, options);
-        applyAiTaskDeduplicationMerge(task, aiMerge.task, this.settings);
+        if (resolution === "local") {
+          stats.localConfirmed += 1;
+        } else {
+          const aiDecision = await this.aiTaskDeduplicationDecision(task, mainDecision, matchingOptions);
+          if (aiDecision?.used) stats.aiUsed += 1;
+          if (aiDecision?.match !== true) {
+            stats.created += 1;
+            for (const subtask of task.subtasks || []) stats.created += 1;
+            continue;
+          }
+        }
+        const generatedUpdate = await this.taskGenerationUpdateForDuplicate(task, mainDecision, matchingOptions);
+        if (!generatedUpdate?.task) {
+          flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
+          continue;
+        }
+        if (generatedUpdate.used) {
+          stats.taskGenerationUsed += 1;
+          applyTaskGenerationDuplicateUpdate(task, generatedUpdate.task, this.settings);
+        }
+        applyTaskDeduplicationMatch(task, mainDecision, this.settings, matchingOptions);
         stats.merged += 1;
         stats.matches.push(taskDeduplicationMatchSummary(task, mainDecision));
-        await this.mergeDeduplicatedSubtasks(task, candidates, stats, options);
+        await this.mergeDeduplicatedSubtasks(task, candidates, stats, matchingOptions);
       } else {
         stats.created += 1;
       }
@@ -4815,7 +4928,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ambiguous: stats.ambiguous,
       copiedSubtasks: stats.copiedSubtasks,
       generatedDuplicates: stats.generatedDuplicates,
-      aiUsed: stats.aiUsed
+      localConfirmed: stats.localConfirmed,
+      aiUsed: stats.aiUsed,
+      taskGenerationUsed: stats.taskGenerationUsed
     });
     await this.postTaskDeduplicationCandidateFlags(stats, options);
     return stats;
@@ -4823,7 +4938,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async postTaskDeduplicationCandidateFlags(stats = emptyTaskDeduplicationStats(), options = {}) {
     const flags = (stats.candidateFlags || []).filter(Boolean);
-    if (!flags.length || this.settings.enableAiAmbiguousTaskDeduplication === true) return;
+    if (!flags.length) return;
     const message = taskDeduplicationCandidateChatMessage(flags, options);
     this.settings.taskDeduplicationLastRunSummary = `${this.settings.taskDeduplicationLastRunSummary || taskDeduplicationRunSummary(stats)} Local-only candidate details were posted to chat.`;
     this.logLocal("Task deduplication local-only candidates flagged", {
@@ -4884,58 +4999,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async aiTaskDeduplicationDecision(task, localDecision, options = {}) {
     const candidate = localDecision.candidate;
-    const json = await this.withAiActivity("Checking possible duplicate task", () => this.openaiResponse({
-      model: taskDeduplicationAiModel(this.settings),
-      jsonSchema: taskDeduplicationAiDecisionSchema(),
-      system: [
-        "Decide whether a newly generated task and an existing open Todoist task are the same actionable work item.",
-        "Be conservative. Nuanced related tasks should not match.",
-        "Completed tasks are not provided and must not be inferred as duplicates.",
-        "Return match true only when the existing task would satisfy the new action after being updated with newer source details."
-      ].join(" "),
-      user: [
-        "Deduplication policy:",
-        taskDeduplicationPolicyText(this.settings),
-        "",
-        "New generated task:",
-        taskDeduplicationAiTaskCard(task),
-        "",
-        "Existing open task:",
-        taskDeduplicationAiTaskCard(candidate.task),
-        "",
-        `Local score: ${localDecision.confidence || 0}`,
-        `Workflow source: ${options.source || "task generation"}`
-      ].join("\n")
-    }));
-    const parsed = JSON.parse(json);
-    return {
-      match: parsed?.match === true && Number(parsed?.confidence || 0) >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD,
-      confidence: Number(parsed?.confidence || 0),
-      reason: truncateAtWord(singleLine(parsed?.reason || ""), 160)
-    };
-  }
-
-  async aiTaskDeduplicationMerge(task, localDecision, options = {}) {
-    const candidate = localDecision.candidate;
     if (!candidate?.task) return null;
     const model = taskDeduplicationAiModel(this.settings);
     if (!hasChatCredentialForModel(this.settings, model)) return null;
     try {
-      const json = await this.withAiActivity("Combining duplicate task details", () => this.openaiResponse({
+      const json = await this.withAiActivity("Confirming possible duplicate task", () => this.openaiResponse({
         model,
-        jsonSchema: taskDeduplicationAiMergeSchema(this.settings),
+        jsonSchema: taskDeduplicationAiDecisionSchema(),
         system: [
-          "Run the task generation workflow for a likely duplicate pair.",
-          "Confirm whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
+          "Decide only whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
           "Ignore email routing, reply-to aliases, mailbox-copy instructions, and ticket-tracking boilerplate unless that routing work is the actual requested action.",
-          "Treat richer/poorer same-action records as duplicates when the existing task can be updated to satisfy the new task.",
+          "Treat richer/poorer same-action records as duplicates when one record would be satisfied by completing the other.",
           "Treat parent/subtask pairs as duplicates when one merely restates the other or adds context around the same single next action.",
           "Treat identical or near-identical titles under different parents as duplicates unless the parent context changes the person, object, deliverable, or next step.",
           "Treat different concrete non-Inbox Todoist projects as separate work contexts. Do not merge similar tasks across different named projects unless the source explicitly says the task moved or spans both projects.",
           "Return match false when one task is only a distinct component of a broader parent task with multiple decisions, questions, recipients, documents, or steps.",
           "Return match false when a newer task reflects specific progress, such as reviewing a named person's edits, approvals, returned comments, or a current status update, and the older task is a broader project/status task.",
-          "If they are the same, return one merged generated task that preserves the clearest title plus useful non-conflicting details from both records.",
-          "If they are only related, return match false and keep the proposed merged task empty."
+          "Return only match, confidence, and reason. Do not rewrite, merge, summarize, or propose any task title, description, date, priority, label, or subtask."
         ].join(" "),
         user: [
           "Deduplication policy:",
@@ -4946,27 +5026,77 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           options.intraBatch ? "Later generated task likely duplicating an earlier generated task:" : "New generated task likely duplicating an existing Todoist task:",
           taskDeduplicationAiTaskCard(task),
           "",
-          options.intraBatch ? "Earlier generated task to keep if merged:" : "Existing open Todoist task to update if merged:",
+          options.intraBatch ? "Earlier generated task candidate:" : "Existing open Todoist task candidate:",
           taskDeduplicationAiTaskCard(candidate.task),
           "",
           `Local candidate score: ${localDecision.confidence || 0}`,
           `Local candidate reasons: ${(localDecision.reasons || []).join("; ")}`,
-          `Workflow source: ${options.source || "task generation"}`,
-          "",
-          "Return the same task shape used by task generation: content, due_date, deadline_date, priority, labels, and subtasks."
+          `Workflow source: ${options.source || "task generation"}`
         ].filter(Boolean).join("\n")
       }));
       const parsed = JSON.parse(json);
       const confidence = Number(parsed?.confidence || 0);
       return {
         used: true,
-        match: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_MERGE_CONFIDENCE_THRESHOLD,
+        match: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD,
         confidence,
-        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160),
-        task: taskDeduplicationAiMergeTaskFromResponse(parsed, candidate.task, task, this.settings)
+        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160)
       };
     } catch (error) {
-      this.logLocal("Task deduplication AI merge skipped", { error: error.message || String(error) });
+      this.logLocal("Task deduplication AI duplicate detection skipped", { error: error.message || String(error) });
+      return null;
+    }
+  }
+
+  async taskGenerationUpdateForDuplicate(task, localDecision, options = {}) {
+    const existing = localDecision.candidate?.task;
+    if (!existing) return null;
+    if (!duplicatePairNeedsTaskGeneration(task, existing, options)) return { used: false, task };
+    const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
+    const instructions = taskGenerationRequirements(this.taskInstructionsForSource(sourceType), this.settings);
+    const prompt = [taskDeduplicationAiTaskCard(task), taskDeduplicationAiTaskCard(existing), taskDeduplicationSourceContextText(options)].join("\n\n");
+    const modelChoice = this.aiModelForRequest("task-generation", {
+      prompt,
+      context: options.semanticContext || [],
+      taskCount: 1 + generationSubtaskLimit(this.settings)
+    });
+    try {
+      const json = await this.withAiActivity("Updating confirmed duplicate through task generation", () => this.openaiResponse({
+        model: modelChoice.model,
+        jsonSchema: taskCreationSchema(1, generationSubtaskLimit(this.settings)),
+        system: [
+          "Use the regular task-generation workflow to produce exactly one canonical task from two records already confirmed as duplicates.",
+          "This is not a duplicate-detection decision. Preserve the most accurate title, actionable description, dates, priority, labels, and supported subtasks from the provided records and source context.",
+          "Do not invent people, documents, dates, links, dependencies, or status details.",
+          "Return only JSON matching the standard task-generation schema with exactly one main task."
+        ].join(" "),
+        user: [
+          "Task generation instructions:",
+          instructions,
+          "",
+          taskDeduplicationSourceContextText(options),
+          "",
+          "Current generated task:",
+          taskDeduplicationAiTaskCard(task),
+          "",
+          options.intraBatch ? "Other generated duplicate:" : "Existing Todoist duplicate:",
+          taskDeduplicationAiTaskCard(existing)
+        ].join("\n")
+      }));
+      const parsed = JSON.parse(json);
+      const allowedLabels = new Set(uniqueValues([...(task.labels || []), ...(existing.labels || [])]).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+      const generated = cleanTask(parsed?.tasks?.[0] || {}, allowedLabels, this.settings);
+      if (!duplicateTaskGenerationPreservesEvidence(generated, task, existing, this.settings)) {
+        this.logLocal("Confirmed duplicate task generation update rejected", {
+          source: options.source || "",
+          task: truncateAtWord(task.content || "", 100),
+          candidate: truncateAtWord(existing.content || "", 100)
+        });
+        return null;
+      }
+      return { used: true, task: generated };
+    } catch (error) {
+      this.logLocal("Confirmed duplicate task generation update skipped", { error: error.message || String(error) });
       return null;
     }
   }
@@ -4987,26 +5117,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         parentContent: parentTask.content
       }));
       if (isAiMediatedTaskDeduplicationCandidate(decision)) {
-        if (this.settings.enableAiAmbiguousTaskDeduplication !== true) {
-          stats.candidateFlags.push(taskDeduplicationCandidateFlag(subtask, decision, this.settings, Object.assign({}, options, {
-            isSubtask: true,
-            parentContent: parentTask.content
-          })));
+        const subtaskOptions = Object.assign({}, options, {
+          isSubtask: true,
+          parentContent: parentTask.content
+        });
+        const resolution = taskDeduplicationResolution(decision, this.settings, subtaskOptions);
+        if (resolution === "none") {
           nextSubtasks.push(subtask);
           continue;
         }
-        const aiMerge = await this.aiTaskDeduplicationMerge(subtask, decision, Object.assign({}, options, {
-          isSubtask: true,
-          parentId: parentTask.id,
-          parentContent: parentTask.content
-        }));
-        if (aiMerge?.used) stats.aiUsed += 1;
-        if (aiMerge?.match !== true) {
+        if (resolution === "manual") {
+          flagPossibleDuplicateTask(stats, subtask, decision, this.settings, subtaskOptions);
           nextSubtasks.push(subtask);
           continue;
+        }
+        if (resolution === "local") {
+          stats.localConfirmed += 1;
+        } else {
+          const aiDecision = await this.aiTaskDeduplicationDecision(subtask, decision, Object.assign({}, subtaskOptions, {
+            parentId: parentTask.id
+          }));
+          if (aiDecision?.used) stats.aiUsed += 1;
+          if (aiDecision?.match !== true) {
+            nextSubtasks.push(subtask);
+            continue;
+          }
         }
         applyTaskDeduplicationMatch(subtask, decision, this.settings, Object.assign({}, options, { parentTask }));
-        applyAiTaskDeduplicationMerge(subtask, aiMerge.task, this.settings);
         subtask.isSubtask = true;
         subtask.parentId = parentTask.id;
         subtask.parentOid = parentTask.oid || "";
@@ -6617,23 +6754,23 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderTaskDeduplication(containerEl) {
     settingsHeading(containerEl, "Task Deduplication", "Checks generated note and email tasks against the local Todoist reference table before creating anything new.");
-    toggleSetting(containerEl, "Enable task deduplication", "Enabled by default. Local scoring identifies likely duplicate candidates; AI-mediated deduplication must be enabled to merge or update tasks.", this.plugin, "enableTaskDeduplication");
+    toggleSetting(containerEl, "Enable task deduplication", "Enabled by default. Fast local scoring resolves confirmed matches and posts credible ambiguous candidates to chat with [dup?] for manual review. The marker is never sent to Todoist.", this.plugin, "enableTaskDeduplication");
     taskDeduplicationStrictnessSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Merge labels additively", "Keep existing Todoist labels and add newly generated labels. Turn off only if newer generated task labels should replace the existing label set.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
     toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Only omit a previously linked subtask when newer source text clearly says it is obsolete, no longer needed, or should be removed.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
 
-    settingsHeading(containerEl, "AI-Mediated Deduplication", "Local matching nominates duplicate candidates first. The selected AI model must confirm and merge task details before any existing or same-batch task is updated.");
-    toggleSetting(containerEl, "Enable AI-mediated deduplication", "Enabled by default. When off, dedupe runs local-only candidate detection, posts possible duplicates to chat for manual review, and leaves tasks unmerged because local-only dedupe may be less accurate and less efficient than AI-mediated merge review.", this.plugin, "enableAiAmbiguousTaskDeduplication");
+    settingsHeading(containerEl, "AI-Mediated Duplicate Detection", "Local matching resolves conclusive duplicates and flags credible ambiguous pairs in chat. The selected dedupe model is reserved for stronger unresolved candidates and cannot rewrite task fields. Confirmed pairs use regular task generation only when consolidation is needed.");
+    toggleSetting(containerEl, "Enable AI-mediated deduplication", "Enabled by default. When off, local merge decisions still proceed through regular task generation. When on, the selected model confirms only strong matches that local scoring cannot settle; ambiguous candidates remain a local chat review.", this.plugin, "enableAiAmbiguousTaskDeduplication");
     taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
     taskDeduplicationAiModelSetting(containerEl, this.plugin);
 
-    settingsHeading(containerEl, "Deduplication Merge Policy", "Plain-language rules used by local candidate matching and AI-mediated merge confirmation. You can also update this from the chat sidebar with an explicit dedupe policy request.");
+    settingsHeading(containerEl, "Deduplication Policy", "Plain-language rules used by local candidate matching and AI duplicate confirmation. You can also update this from the chat sidebar with an explicit dedupe policy request.");
     textAreaSetting(containerEl, "Deduplication policy", this.plugin, "taskDeduplicationPolicy", { compact: true });
     activitySetting(containerEl, "Policy impact", taskDeduplicationPolicyImpactText(this.plugin.settings));
     const updates = this.plugin.settings.taskDeduplicationPolicyUpdates || [];
     activitySetting(containerEl, "Recent chat policy updates", updates.length ? updates.map((entry) => `${entry.at}: ${entry.instruction}`).join("\n") : "No chat policy updates yet.");
     activitySetting(containerEl, "Last task deduplication run", this.plugin.settings.taskDeduplicationLastRunSummary || "No task generation run has checked duplicates yet.");
-    new Setting(containerEl).setName("Reset policy").setDesc("Restores the default conservative merge policy.").addButton((button) => button.setButtonText("Reset").onClick(async () => {
+    new Setting(containerEl).setName("Reset policy").setDesc("Restores the default conservative duplicate-detection policy.").addButton((button) => button.setButtonText("Reset").onClick(async () => {
       this.plugin.settings.taskDeduplicationPolicy = DEFAULT_TASK_DEDUPLICATION_POLICY;
       this.plugin.recordTaskDeduplicationPolicyUpdate("Reset from settings.");
       await this.plugin.saveSettings();
@@ -7583,14 +7720,14 @@ const SETTING_DESCRIPTIONS = {
   scheduleTodayWeightSemanticUrgency: "How much urgent wording in the task and local context affects the schedule order.",
   scheduleTodayWeightNoteRecency: "How much recent note/task context affects the schedule order.",
   scheduleTodayWeightParentDependency: "How much parent/subtask dependency context affects the schedule order.",
-  enableTaskDeduplication: "Checks generated tasks against open tasks in the local reference table. Local scoring identifies candidates; AI-mediated deduplication must be enabled to merge or update tasks.",
-  taskDeduplicationStrictness: "Controls how much local evidence is required before a generated task is nominated as a duplicate candidate.",
+  enableTaskDeduplication: "Checks generated tasks against open tasks in the local reference table. Conclusive local matches avoid AI; credible ambiguous candidates are flagged locally in chat and never marked in Todoist.",
+  taskDeduplicationStrictness: "Controls both candidate nomination and how strong local evidence must be before a duplicate can be confirmed without AI.",
   taskDeduplicationMergeLabelsAdditive: "When enabled, existing Todoist labels are kept and new generated labels are added.",
   taskDeduplicationAllowExplicitSubtaskRemoval: "When enabled, an existing linked subtask is omitted from the merge only when newer source text clearly says it is obsolete or should be removed.",
-  enableAiAmbiguousTaskDeduplication: "When enabled, all duplicate task updates and same-batch merges require AI confirmation and AI-synthesized merged task details. When disabled, dedupe is local-only candidate detection: possible duplicates are posted to chat for manual review and left unmerged because local-only dedupe may be less accurate and less efficient.",
-  taskDeduplicationAiReviewSensitivity: "Controls how broadly local candidates are sent to the AI deduplication step. Matching strictness still controls how much local evidence is needed to nominate a candidate.",
-  taskDeduplicationAiModel: "Model used to confirm duplicate candidates and synthesize merged task details. Automatic uses the configured chat fallback model unless you choose a specific deduplication model.",
-  taskDeduplicationPolicy: "Editable merge policy used by local duplicate candidate matching and AI-mediated merge confirmation.",
+  enableAiAmbiguousTaskDeduplication: "When enabled, conclusive duplicates are confirmed locally, credible ambiguous pairs are posted to chat, and the selected dedupe model reviews only strong unresolved matches. When disabled, local merge decisions still proceed through regular task generation and ambiguous candidates remain manual. The dedupe model never rewrites task fields.",
+  taskDeduplicationAiReviewSensitivity: "Controls how broadly same-batch and unresolved local candidates are considered. Matching strictness controls nomination, local confirmation, and manual-review thresholds.",
+  taskDeduplicationAiModel: "Model used only to confirm whether duplicate candidates match. Automatic uses the configured chat fallback model unless you choose a specific deduplication model; task updates use the regular task-generation model.",
+  taskDeduplicationPolicy: "Editable duplicate policy used by local candidate matching and AI-mediated duplicate confirmation.",
   emailMainTaskInstructions: "Plain-language rules for deciding which email items become main tasks.",
   emailSubtaskInstructions: "Plain-language rules for creating email-derived subtasks.",
   emailSectionTitleInstructions: "Plain-language rules for naming Todoist sections for email tasks.",
@@ -7869,8 +8006,8 @@ function taskDeduplicationAiReviewSensitivitySetting(containerEl, plugin) {
   const labels = { narrow: "Narrow", balanced: "Balanced", broad: "Broad" };
   const current = options.includes(plugin.settings.taskDeduplicationAiReviewSensitivity) ? plugin.settings.taskDeduplicationAiReviewSensitivity : DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
   new Setting(containerEl)
-    .setName("AI review sensitivity")
-    .setDesc(settingDescription("AI review sensitivity", "taskDeduplicationAiReviewSensitivity"))
+    .setName("Candidate search sensitivity")
+    .setDesc(settingDescription("Candidate search sensitivity", "taskDeduplicationAiReviewSensitivity"))
     .addDropdown((dropdown) => {
       for (const option of options) dropdown.addOption(option, labels[option]);
       dropdown.setValue(current);
@@ -8435,7 +8572,11 @@ function indexSummary(pluginOrSettings) {
   const bytes = stats.bytes ? ` Largest file: ${formatBytes(stats.bytes)}.` : "";
   const total = stats.totalBytes && stats.totalBytes !== stats.bytes ? ` Total: ${formatBytes(stats.totalBytes)} across ${stats.files || 1} files.` : "";
   const chunks = Number(meta.chunks || pluginOrSettings.semanticIndex?.length || 0);
-  if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}${total}`;
+  const contentVersion = Number(meta.embeddingContentVersion || 1);
+  const upgrade = chunks && contentVersion < SEMANTIC_EMBEDDING_CONTENT_VERSION
+    ? " Retrieval metadata upgrade available: rebuild the semantic vault index to embed project paths and note dates and remove low-value placeholder chunks."
+    : "";
+  if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}${total}${upgrade}`;
   if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes}${total} Rebuild the semantic vault index.`;
   if (stats.bytes) return `No semantic index chunks are available. ${bytes}${total} Rebuild the semantic vault index.`;
   return "No semantic index has been built yet.";
@@ -8954,6 +9095,48 @@ function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
   });
 }
 
+const GENERATED_TASK_GROUNDING_STOP_WORDS = new Set([
+  "action", "actions", "ask", "complete", "confirm", "coordinate", "create", "decide", "draft", "dup", "email", "finalize", "follow", "prepare", "reply", "respond", "review", "send", "task", "tasks", "update", "verify", "work"
+]);
+
+function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT_SETTINGS) {
+  const grounded = [];
+  const rejected = [];
+  for (const task of tasks || []) {
+    if (!generatedTaskMatchesPrimarySource(task, sourceText)) {
+      rejected.push(task);
+      continue;
+    }
+    const subtasks = [];
+    for (const subtask of task.subtasks || []) {
+      if (generatedTaskMatchesPrimarySource(subtask, `${sourceText}\n${task.content || ""}`)) subtasks.push(subtask);
+      else rejected.push(subtask);
+    }
+    grounded.push(Object.assign({}, task, { subtasks }));
+  }
+  return { tasks: grounded, rejected };
+}
+
+function generatedTaskMatchesPrimarySource(task = {}, sourceText = "") {
+  const title = singleLine(task.content || "");
+  if (!title) return false;
+  const sourceCounts = termCounts(sourceText);
+  const objectTerms = generatedTaskObjectTerms(title);
+  if (!objectTerms.length) return false;
+  const matches = objectTerms.filter((term) => contextAnchorVariants(term).some((variant) => sourceCounts[variant]));
+  if (matches.length) return true;
+  const normalizedTitle = canonicalTaskMatchTitle(title);
+  const normalizedSource = canonicalTaskMatchTitle(sourceText);
+  return normalizedTitle.length >= 12 && normalizedSource.includes(normalizedTitle);
+}
+
+function generatedTaskObjectTerms(value = "") {
+  return uniqueValues(Object.keys(termCounts(value))
+    .map(normalizeContextAnchorTerm)
+    .filter((term) => term.length >= 3 && !GENERATED_TASK_GROUNDING_STOP_WORDS.has(term) && !contextQueryTemporalToken(term))
+  );
+}
+
 function enforceGeneratedTaskLimits(tasks, settings = DEFAULT_SETTINGS) {
   const maxMain = generationMainTaskLimit(settings);
   const maxSubtasks = generationSubtaskLimit(settings);
@@ -9308,21 +9491,6 @@ function taskDeduplicationAiDecisionSchema() {
   };
 }
 
-function taskDeduplicationAiMergeSchema(settings = DEFAULT_SETTINGS) {
-  const task = taskSchema().properties.tasks.items;
-  return {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      match: { type: "boolean" },
-      confidence: { type: "integer", minimum: 0, maximum: 100 },
-      reason: { type: "string" },
-      task
-    },
-    required: ["match", "confidence", "reason", "task"]
-  };
-}
-
 function taskDeduplicationPolicyCommandFromAi(value = {}, currentPolicy = "") {
   const policyText = normalizeTaskDeduplicationPolicyText(value?.policy_text || currentPolicy || DEFAULT_TASK_DEDUPLICATION_POLICY);
   return {
@@ -9370,7 +9538,7 @@ function taskDeduplicationPolicyImpactText(settings = DEFAULT_SETTINGS, policyTe
   const removal = settings.taskDeduplicationAllowExplicitSubtaskRemoval === false ? "explicit subtask removal disabled" : "explicit obsolete subtasks can be omitted";
   const policy = policyText || taskDeduplicationPolicyText(settings);
   const sensitivity = settings.taskDeduplicationAiReviewSensitivity || DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity;
-  return `Strictness: ${strictness}. AI dedupe model: ${ai}. AI-mediated dedupe: ${settings.enableAiAmbiguousTaskDeduplication ? `on (${sensitivity})` : "off"}. Labels: ${labels}. Subtasks: ${removal}. Policy length: ${policy.split(/\n+/).filter(Boolean).length} lines.`;
+  return `Strictness: ${strictness}. AI duplicate-detection model: ${ai}. AI-mediated detection: ${settings.enableAiAmbiguousTaskDeduplication ? `on (${sensitivity})` : "off"}. Confirmed updates use regular task generation. Labels: ${labels}. Subtasks: ${removal}. Policy length: ${policy.split(/\n+/).filter(Boolean).length} lines.`;
 }
 
 function taskDeduplicationPolicySettingsSummary(settings = DEFAULT_SETTINGS) {
@@ -11741,20 +11909,136 @@ function stripHtml(html) {
   return html.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
 }
 
+function semanticIndexSourceText(text = "") {
+  const lines = String(text || "").split("\n");
+  const output = [];
+  let skipping = false;
+  let skipLevel = 0;
+  for (const line of lines) {
+    const generatedHeading = /^(\s*#{1,6})\s+Semantic Todoist Sync\s*-\s*Action Items\b/i.exec(line);
+    if (generatedHeading) {
+      skipping = true;
+      skipLevel = generatedHeading[1].trim().length;
+      continue;
+    }
+    if (skipping) {
+      const heading = /^(\s*#{1,6})\s+/.exec(line);
+      if (heading && heading[1].trim().length <= skipLevel) skipping = false;
+      else continue;
+    }
+    output.push(line);
+  }
+  return output.join("\n").trim();
+}
+
 function chunkMarkdown(text, maxChars = 900, maxChunks = 12) {
   const cleaned = text.replace(/```[\s\S]*?```/g, " ").replace(/\n{3,}/g, "\n\n");
+  const pieces = [];
+  let currentHeading = "";
+  for (const rawBlock of cleaned.split(/\n(?=#{1,6}\s)|\n\n/)) {
+    const block = rawBlock.trim();
+    if (!block) continue;
+    const heading = block.match(/^(#{1,6}\s+[^\n]+)/)?.[1] || "";
+    if (heading) currentHeading = heading;
+    pieces.push(...splitSemanticMarkdownBlock(block, maxChars, heading || currentHeading));
+  }
   const chunks = [];
   let current = "";
-  for (const block of cleaned.split(/\n(?=#{1,6}\s)|\n\n/)) {
-    const compactBlock = clamp(block.trim(), maxChars);
-    if ((current + "\n\n" + compactBlock).length > maxChars && current.trim()) {
+  for (const piece of pieces) {
+    if ((current + "\n\n" + piece).length > maxChars && current.trim()) {
       chunks.push(current.trim());
-      if (chunks.length >= maxChunks) break;
-      current = compactBlock;
-    } else current = current ? `${current}\n\n${compactBlock}` : compactBlock;
+      current = piece;
+    } else current = current ? `${current}\n\n${piece}` : piece;
   }
-  if (current.trim() && chunks.length < maxChunks) chunks.push(current.trim());
-  return chunks;
+  if (current.trim()) chunks.push(current.trim());
+  return selectSemanticIndexChunks(chunks, maxChunks);
+}
+
+function splitSemanticMarkdownBlock(block = "", maxChars = 900, heading = "") {
+  const value = String(block || "").trim();
+  if (!value) return [];
+  if (value.length <= maxChars) return [value];
+  const ownHeading = value.match(/^(#{1,6}\s+[^\n]+)/)?.[1] || "";
+  const prefix = ownHeading || heading || "";
+  const body = ownHeading ? value.slice(ownHeading.length).trim() : value;
+  const available = Math.max(180, maxChars - (prefix ? prefix.length + 2 : 0));
+  const segments = body
+    .split(/\n+/)
+    .flatMap((line) => splitDescriptionSentences(line).length ? splitDescriptionSentences(line) : [line])
+    .map((line) => singleLine(line))
+    .filter(Boolean);
+  const windows = [];
+  let current = "";
+  for (const segment of segments) {
+    for (const part of splitSemanticTextSegment(segment, available)) {
+      const next = current ? `${current} ${part}` : part;
+      if (next.length > available && current) {
+        windows.push(current);
+        current = part;
+      } else current = next;
+    }
+  }
+  if (current) windows.push(current);
+  return windows.map((windowText) => prefix ? `${prefix}\n${windowText}` : windowText);
+}
+
+function splitSemanticTextSegment(segment = "", maxChars = 700) {
+  const words = String(segment || "").split(/\s+/).filter(Boolean);
+  if (!words.length) return [];
+  const parts = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > maxChars && current) {
+      parts.push(current);
+      current = word;
+    } else current = next;
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+function selectSemanticIndexChunks(chunks = [], maxChunks = 12) {
+  const limit = Math.max(1, Number(maxChunks || 1));
+  if (chunks.length <= limit) return chunks;
+  const ranked = chunks.map((text, index) => ({
+    text,
+    index,
+    score: semanticIndexChunkPriority(text) + (index === 0 || index === chunks.length - 1 ? 2 : 0)
+  }));
+  const selected = new Map();
+  const add = (item) => { if (item && selected.size < limit) selected.set(item.index, item.text); };
+  add(ranked[0]);
+  add(ranked[ranked.length - 1]);
+  const prioritySlots = Math.max(2, limit - Math.max(2, Math.ceil(limit * 0.25)));
+  for (const item of ranked.slice().sort((a, b) => b.score - a.score || a.index - b.index)) {
+    if (selected.size >= prioritySlots) break;
+    add(item);
+  }
+  for (let slot = 0; slot < limit; slot += 1) {
+    add(ranked[Math.round(slot * (ranked.length - 1) / Math.max(1, limit - 1))]);
+  }
+  for (const item of ranked) add(item);
+  return Array.from(selected.entries()).sort((a, b) => a[0] - b[0]).map(([, text]) => text);
+}
+
+function semanticIndexChunkPriority(text = "") {
+  const value = String(text || "");
+  let score = 0;
+  if (/\b(todo|action|next step|follow[-\s]?up|review|send|confirm|complete|finalize|prepare|draft|update|respond|reply|decide|approve|deadline|due|owner|assigned)\b/i.test(value)) score += 5;
+  if (/\b(decided|decision|agreed|approved|confirmed|changed|superseded|current guidance|outcome|resolved|blocked|dependency|risk|issue)\b/i.test(value)) score += 4;
+  if (/^#{1,6}\s+/m.test(value)) score += 1;
+  if (/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b/i.test(value)) score += 1;
+  return score;
+}
+
+function isSemanticNoiseChunk(chunk = "") {
+  const text = singleLine(typeof chunk === "string" ? chunk : chunk?.text || "").toLowerCase();
+  if (!text || text.length < 18) return true;
+  const todoistPlaceholder = text.includes("action items") &&
+    text.includes("tasks & projects completed, processed or delegated") &&
+    text.includes("current todoist list");
+  return todoistPlaceholder && text.length < 500;
 }
 
 function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = "", options = {}) {
@@ -11777,9 +12061,10 @@ function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = ""
   }).join("\n\n---\n\n"), maxChars);
 }
 
-function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS) {
+function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, options = {}) {
   const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
   const queryTerms = termCounts(query);
+  const anchorTerms = uniqueValues((options.anchorTerms || []).map(normalizeContextAnchorTerm).filter(Boolean));
   const segments = cleaned
     .split(/\n{2,}|\n(?=#{1,6}\s)/)
     .flatMap((block) => {
@@ -11790,19 +12075,24 @@ function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS) {
     })
     .map((segment, index) => {
       const value = singleLine(segment.replace(/^#{1,6}\s*/, ""));
+      const valueTerms = termCounts(value);
+      const anchorHits = anchorTerms.filter((term) => contextAnchorVariants(term).some((variant) => valueTerms[variant])).length;
       const actionScore = /action|todo|follow|review|send|confirm|complete|deadline|due|need|waiting|owner|lead|draft|update|share|clarify|coordinate|decision|dependency|risk|block/i.test(value) ? 0.75 : 0;
       const lexical = lexicalScore(queryTerms, value);
-      return { value, index, lexical, score: lexical + actionScore };
+      return { value, index, lexical, anchorHits, score: lexical + actionScore + anchorHits * 2 };
     })
     .filter((item) => item.value && item.value.length >= 18);
-  const directMatches = segments.filter((item) => item.lexical > 0);
-  const ranked = (directMatches.length ? directMatches : segments)
+  const directMatches = options.strictAnchors && anchorTerms.length
+    ? segments.filter((item) => item.anchorHits > 0)
+    : segments.filter((item) => item.lexical > 0);
+  const rankedPool = directMatches.length ? directMatches : options.strictAnchors && anchorTerms.length ? [] : segments;
+  const ranked = rankedPool
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .slice(0, 8)
     .sort((a, b) => a.index - b.index)
     .map((item) => item.value);
-  const excerpt = ranked.length ? ranked.join(" ") : cleaned;
+  const excerpt = ranked.length ? ranked.join(" ") : options.strictAnchors && anchorTerms.length ? "" : cleaned;
   return clamp(excerpt, 1400);
 }
 
@@ -11848,7 +12138,202 @@ function adaptiveSemanticRetrievalLimit(settings = DEFAULT_SETTINGS, mode = "cha
   const budget = adaptiveContextBudget(mode);
   const base = Math.max(1, Number(baseLimit || settings.maxChatContextChunks || 8));
   const expanded = depth >= 7 ? Math.max(base * budget.retrievalMultiplier, budget.maxNotes * 2) : depth >= 5 ? Math.max(base, Math.ceil(base * 1.5)) : base;
-  return Math.max(base, Math.min(budget.maxRetrieval, expanded));
+  const plan = contextQueryPlan(prompt, mode);
+  const scopedLimit = mode === "chat" && plan.scoped ? Math.max(base, budget.maxNotes * 2) : budget.maxRetrieval;
+  return Math.max(base, Math.min(scopedLimit, expanded));
+}
+
+function contextQueryPlan(prompt = "", mode = "chat") {
+  const text = singleLine(prompt || "");
+  const history = CONTEXT_HISTORY_QUERY_RE.test(text);
+  const tasks = CONTEXT_TASK_SUMMARY_QUERY_RE.test(text);
+  const broad = BROAD_CONTEXT_QUERY_RE.test(text) || history;
+  const rawTerms = Object.keys(termCounts(text));
+  const anchorTerms = uniqueValues(rawTerms
+    .map(normalizeContextAnchorTerm)
+    .filter((term) => term.length >= 3 && !CONTEXT_QUERY_SCOPE_STOP_WORDS.has(term) && !contextQueryTemporalToken(term))
+  ).slice(0, 8);
+  const scoped = anchorTerms.length > 0;
+  return {
+    mode,
+    intent: history ? "history" : tasks ? "tasks" : broad && !scoped ? "portfolio" : "focused",
+    broad,
+    history,
+    tasks,
+    scoped,
+    portfolio: broad && !scoped,
+    strictScope: ["chat", "task-generation", "description"].includes(mode) && scoped,
+    anchorTerms,
+    prompt: text
+  };
+}
+
+function normalizeContextAnchorTerm(term = "") {
+  const value = String(term || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  if (value.length > 5 && value.endsWith("ies")) return `${value.slice(0, -3)}y`;
+  if (value.length > 5 && value.endsWith("s") && !/(?:ss|us|is)$/.test(value)) return value.slice(0, -1);
+  return value;
+}
+
+function contextQueryTemporalToken(term = "") {
+  return /^(?:today|tomorrow|yesterday|recent|newest|older|past|previously|last|meeting|january|february|march|april|may|june|july|august|september|october|november|december|20\d{2}|\d{1,2})$/i.test(term);
+}
+
+function contextAnchorVariants(term = "") {
+  const normalized = normalizeContextAnchorTerm(term);
+  const variants = [normalized];
+  if (normalized.endsWith("y")) variants.push(`${normalized.slice(0, -1)}ies`);
+  else if (normalized.length >= 4) variants.push(`${normalized}s`);
+  return uniqueValues(variants.filter(Boolean));
+}
+
+function contextTermEntryHas(entry = {}, term = "", field = "allTerms") {
+  return contextAnchorVariants(term).some((variant) => Number(entry?.[field]?.[variant] || 0) > 0);
+}
+
+function contextTextMatchesQueryScope(text = "", plan = {}) {
+  const anchors = plan.primaryAnchorTerms || plan.anchorTerms || [];
+  if (!anchors.length) return !plan.strictScope;
+  const counts = termCounts(text);
+  const entry = { allTerms: counts, titleTerms: counts };
+  return anchors.some((term) => contextTermEntryHas(entry, term));
+}
+
+function buildContextQueryProfile(plugin, index = [], plan = {}) {
+  const anchors = Array.isArray(plan.anchorTerms) ? plan.anchorTerms : [];
+  if (!anchors.length) return Object.assign({}, plan, { anchorTerms: [], anchorFrequencies: {}, primaryAnchorTerms: [] });
+  const cacheKey = `${(index || []).length}:${anchors.join("|")}`;
+  plugin.contextQueryProfileCache = plugin.contextQueryProfileCache || new Map();
+  const cached = plugin.contextQueryProfileCache.get(cacheKey);
+  if (cached) return Object.assign({}, plan, cached);
+  const frequencies = Object.fromEntries(anchors.map((term) => [term, 0]));
+  for (const chunk of index || []) {
+    const entry = plugin.semanticChunkTerms(chunk);
+    for (const term of anchors) if (contextTermEntryHas(entry, term)) frequencies[term] += 1;
+  }
+  const found = anchors.filter((term) => frequencies[term] > 0);
+  const ordered = found.sort((left, right) => frequencies[left] - frequencies[right] || left.localeCompare(right));
+  const primary = ordered.filter((term) => frequencies[term] / Math.max(1, index.length) <= 0.35);
+  const lowestFrequency = ordered.length ? frequencies[ordered[0]] : 0;
+  const required = ordered.filter((term) => frequencies[term] <= Math.max(lowestFrequency * 3, lowestFrequency + 2)).slice(0, 3);
+  const profile = {
+    anchorTerms: anchors,
+    anchorFrequencies: frequencies,
+    primaryAnchorTerms: (primary.length ? primary : ordered).slice(0, 5),
+    requiredAnchorTerms: (required.length ? required : ordered.slice(0, 1))
+  };
+  plugin.contextQueryProfileCache.set(cacheKey, profile);
+  if (plugin.contextQueryProfileCache.size > 50) plugin.contextQueryProfileCache.delete(plugin.contextQueryProfileCache.keys().next().value);
+  return Object.assign({}, plan, profile);
+}
+
+function contextCandidateScopeMetadata(chunk = {}, profile = {}, entry = {}) {
+  const anchors = profile.primaryAnchorTerms || [];
+  if (!anchors.length) return { scopeMatch: !profile.strictScope, scopeScore: 0, scopeHits: 0, scopeCoverage: 0 };
+  const matched = anchors.filter((term) => contextTermEntryHas(entry, term));
+  const titleHits = matched.filter((term) => contextTermEntryHas(entry, term, "titleTerms")).length;
+  const rarity = matched.reduce((sum, term) => {
+    const frequency = Number(profile.anchorFrequencies?.[term] || 0);
+    return sum + (frequency ? 1 / Math.sqrt(frequency) : 0);
+  }, 0);
+  const coverage = matched.length / Math.max(1, anchors.length);
+  const required = profile.requiredAnchorTerms || anchors.slice(0, 1);
+  const requiredMatches = required.filter((term) => contextTermEntryHas(entry, term));
+  return {
+    scopeMatch: requiredMatches.length > 0,
+    scopeScore: Math.min(0.42, coverage * 0.24 + titleHits * 0.08 + rarity * 0.05),
+    scopeHits: matched.length,
+    scopeCoverage: coverage,
+    matchedScopeTerms: matched,
+    matchedRequiredScopeTerms: requiredMatches
+  };
+}
+
+function filterContextCandidatesForPlan(candidates = [], profile = {}) {
+  if (!profile.strictScope) return candidates;
+  if ((profile.anchorTerms || []).length && !(profile.primaryAnchorTerms || []).length) return [];
+  return (candidates || []).filter((item) => item.scopeMatch === true);
+}
+
+function deduplicateContextCandidateBodies(candidates = []) {
+  const seen = new Set();
+  const tokenSignatures = [];
+  const unique = [];
+  for (const item of candidates || []) {
+    const chunk = item.chunk || item;
+    const body = singleLine(chunk.text || "").toLowerCase();
+    const key = body.length >= 60 ? shortHash(body) : `${chunk.path || ""}:${chunk.id || body}`;
+    if (seen.has(key)) continue;
+    const terms = body.length >= 240 ? new Set(Object.keys(termCounts(body))) : null;
+    if (terms?.size >= 24 && tokenSignatures.some((signature) => contextTokenJaccard(terms, signature) >= 0.9)) continue;
+    seen.add(key);
+    if (terms?.size >= 24) tokenSignatures.push(terms);
+    unique.push(item);
+  }
+  return unique;
+}
+
+function contextTokenJaccard(left = new Set(), right = new Set()) {
+  if (!left.size || !right.size) return 0;
+  let overlap = 0;
+  const smaller = left.size <= right.size ? left : right;
+  const larger = smaller === left ? right : left;
+  for (const term of smaller) if (larger.has(term)) overlap += 1;
+  return overlap / Math.max(1, left.size + right.size - overlap);
+}
+
+function selectContextCandidatesForPlan(candidates = [], limit = 8, profile = {}) {
+  if (profile.history) return temporalContextCandidates(candidates, limit);
+  if (profile.portfolio) return diversifyProjectContextCandidates(candidates, limit);
+  return diversifyContextCandidates(candidates, limit);
+}
+
+function temporalContextCandidates(candidates = [], limit = 8) {
+  const maxItems = Math.max(1, Number(limit || 1));
+  const topByPath = new Map();
+  for (const item of candidates || []) {
+    const chunk = item.chunk || item;
+    const key = chunk.path || chunk.id || "";
+    if (!key || topByPath.has(key)) continue;
+    topByPath.set(key, item);
+  }
+  const dated = Array.from(topByPath.values()).sort((left, right) => contextCandidateFreshnessAt(left) - contextCandidateFreshnessAt(right));
+  if (dated.length <= maxItems) return dated;
+  const selected = [];
+  const selectedKeys = new Set();
+  for (let slot = 0; slot < maxItems; slot += 1) {
+    const index = Math.round(slot * (dated.length - 1) / Math.max(1, maxItems - 1));
+    const item = dated[index];
+    const chunk = item.chunk || item;
+    const key = chunk.path || chunk.id || String(index);
+    if (!selectedKeys.has(key)) {
+      selectedKeys.add(key);
+      selected.push(item);
+    }
+  }
+  return selected.sort((left, right) => contextCandidateFreshnessAt(left) - contextCandidateFreshnessAt(right));
+}
+
+function diversifyProjectContextCandidates(candidates = [], limit = 8) {
+  const selected = [];
+  const perProject = new Map();
+  const selectedKeys = new Set();
+  const maxItems = Math.max(1, Number(limit || 1));
+  for (const maxPerProject of [1, 2, Number.POSITIVE_INFINITY]) {
+    for (const item of candidates || []) {
+      const chunk = item.chunk || item;
+      const key = chunk.id || `${chunk.path || ""}:${String(chunk.text || "").slice(0, 80)}`;
+      if (selectedKeys.has(key)) continue;
+      const project = noteProjectKey(chunk.path || "", chunk.title || "");
+      const count = perProject.get(project) || 0;
+      if (count >= maxPerProject) continue;
+      selected.push(item);
+      selectedKeys.add(key);
+      perProject.set(project, count + 1);
+      if (selected.length >= maxItems) return selected;
+    }
+  }
+  return selected;
 }
 
 function modelEscalationSignals(mode = "chat", options = {}) {
@@ -11958,6 +12443,9 @@ function datePartFromText(value = "") {
 }
 
 function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT_SETTINGS, options = {}) {
+  const queryPlan = options.queryPlan || contextQueryPlan(query, "chat");
+  const retrievedScopeTerms = uniqueValues((chunks || []).flatMap((chunk) => chunk.retrievalScopeTerms || []));
+  if (retrievedScopeTerms.length) queryPlan.primaryAnchorTerms = retrievedScopeTerms;
   const grouped = new Map();
   for (const chunk of chunks || []) {
     if (!chunk?.path) continue;
@@ -11970,19 +12458,27 @@ function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT
       createdAt: Number(chunk.createdAt || 0),
       modifiedAt: Number(chunk.modifiedAt || 0),
       score: 0,
+      scopeMatch: false,
       chunks: []
     };
     existing.createdAt = Math.max(existing.createdAt || 0, Number(chunk.createdAt || 0));
     existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
     existing.score = Math.max(existing.score || 0, Number(chunk.matchScore || 0));
+    existing.scopeMatch = existing.scopeMatch || chunk.retrievalScopeMatch === true;
     existing.chunks.push(chunk);
     grouped.set(chunk.path, existing);
   }
   const cards = [];
   for (const group of grouped.values()) {
     const text = group.chunks.map((chunk) => `${chunk.title || group.title}\n${chunk.text || ""}`).join("\n\n");
-    const signals = adaptiveContextSignals(text, query, group.title, group.path);
-    const excerpt = rankedContextExcerpt(text, query, settings);
+    const signalText = queryPlan.strictScope
+      ? contextScopedEvidenceText(text, queryPlan.primaryAnchorTerms || queryPlan.anchorTerms || [])
+      : text;
+    const signals = adaptiveContextSignals(signalText, query, group.title, group.path);
+    const excerpt = rankedContextExcerpt(text, query, settings, {
+      anchorTerms: queryPlan.primaryAnchorTerms || queryPlan.anchorTerms || [],
+      strictAnchors: queryPlan.strictScope === true
+    });
     const citationNumber = group.source && options.citationMap instanceof Map ? options.citationMap.get(group.source) : null;
     const freshnessAt = group.createdAt || group.modifiedAt || 0;
     cards.push({
@@ -11991,6 +12487,8 @@ function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT
       source: group.source,
       citationNumber,
       type: signals.type,
+      date: freshnessAt ? formatLocalDate(new Date(freshnessAt)) : datePartFromText(`${group.title} ${group.path} ${text}`),
+      scopeMatch: group.scopeMatch,
       score: (group.score || 0) + signals.score + recencyBoost(freshnessAt),
       recency: freshnessAt,
       people: signals.people,
@@ -12003,9 +12501,44 @@ function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT
       evidence: truncateAtWord(excerpt, 950)
     });
   }
-  return cards
-    .sort((a, b) => b.score - a.score || b.recency - a.recency || a.path.localeCompare(b.path))
-    .slice(0, Math.max(1, options.maxCards || adaptiveContextBudget().maxNotes));
+  return selectAdaptiveNoteCards(cards, Math.max(1, options.maxCards || adaptiveContextBudget().maxNotes), queryPlan);
+}
+
+function contextScopedEvidenceText(text = "", anchorTerms = []) {
+  const anchors = uniqueValues((anchorTerms || []).map(normalizeContextAnchorTerm).filter(Boolean));
+  if (!anchors.length) return String(text || "");
+  return String(text || "")
+    .split(/\n+/)
+    .flatMap((line) => splitDescriptionSentences(line))
+    .map((line) => singleLine(line))
+    .filter((line) => {
+      const counts = termCounts(line);
+      const entry = { allTerms: counts, titleTerms: counts };
+      return anchors.some((term) => contextTermEntryHas(entry, term));
+    })
+    .join("\n");
+}
+
+function selectAdaptiveNoteCards(cards = [], limit = 7, queryPlan = {}) {
+  const eligible = queryPlan.strictScope ? cards.filter((card) => card.scopeMatch) : cards.slice();
+  if (!queryPlan.history) {
+    return eligible
+      .sort((a, b) => b.score - a.score || b.recency - a.recency || a.path.localeCompare(b.path))
+      .slice(0, limit);
+  }
+  const chronological = eligible.sort((a, b) => a.recency - b.recency || b.score - a.score || a.path.localeCompare(b.path));
+  if (chronological.length <= limit) return chronological;
+  const selected = [];
+  const seen = new Set();
+  for (let slot = 0; slot < limit; slot += 1) {
+    const index = Math.round(slot * (chronological.length - 1) / Math.max(1, limit - 1));
+    const card = chronological[index];
+    if (!seen.has(card.path)) {
+      seen.add(card.path);
+      selected.push(card);
+    }
+  }
+  return selected.sort((a, b) => a.recency - b.recency || b.score - a.score);
 }
 
 function adaptiveContextSignals(text = "", query = "", title = "", path = "") {
@@ -12079,8 +12612,9 @@ function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
     Object.assign(group, patch(group));
     groups.set(cleanKey, group);
   };
+  const scopedProject = options.queryPlan?.strictScope ? contextScopeLabel(options.queryPlan) : "";
   for (const card of noteCards || []) {
-    const project = noteProjectKey(card.path, card.title);
+    const project = scopedProject || noteProjectKey(card.path, card.title);
     add(project, (group) => {
       group.score += (card.score || 0) + recencyBoost(card.recency || 0);
       group.notes.push(card);
@@ -12093,7 +12627,7 @@ function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
     });
   }
   for (const card of taskCards || []) {
-    const project = card.project || noteProjectKey(card.path, card.title);
+    const project = scopedProject || card.project || noteProjectKey(card.path, card.title);
     add(project, (group) => {
       group.score += (card.score || 0) + (card.priority || 0) * 0.2;
       group.tasks.push(card);
@@ -12121,6 +12655,12 @@ function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
     }))
     .sort((a, b) => b.score - a.score || b.taskCount - a.taskCount || a.name.localeCompare(b.name))
     .slice(0, Math.max(1, options.maxCards || adaptiveContextBudget().maxProjects));
+}
+
+function contextScopeLabel(plan = {}) {
+  return (plan.primaryAnchorTerms || plan.anchorTerms || [])
+    .map((term) => term.charAt(0).toUpperCase() + term.slice(1))
+    .join(" ") || "Requested subject";
 }
 
 function noteProjectKey(path = "", title = "") {
@@ -12232,6 +12772,14 @@ function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
   const sections = [];
   sections.push(`Adaptive context depth: ${depth}/7 (${ADAPTIVE_CONTEXT_TIERS.slice(0, depth).join(" -> ")}).`);
   sections.push("Use this local-first context to understand why tasks exist, what they are trying to resolve or put in place, and which recent source notes should guide the answer.");
+  if (pack.queryPlan?.strictScope) {
+    sections.push(`Evidence scope: use only evidence that directly mentions the requested subject (${(pack.queryPlan.anchorTerms || []).join(", ")}). Do not combine unrelated details merely because they appear in the same note or rank nearby.`);
+  }
+  if (pack.queryPlan?.history) {
+    sections.push("History synthesis: evidence is ordered across time. Describe what changed at each supported point, distinguish older context from current state, and do not fill timeline gaps with inference.");
+  } else if (pack.queryPlan?.tasks && pack.queryPlan?.strictScope) {
+    sections.push("Task synthesis: include only tasks whose title, description, parent, project, section, or linked note evidence matches the requested subject. Keep completed work separate from open work.");
+  }
   if (chatMode) sections.push("Chat evidence hierarchy: answer from vault note content first; use existing Todoist tasks only as secondary links to related actions unless the user explicitly asks about tasks.");
   if (pack.active?.path || pack.sourceTitle) {
     sections.push([
@@ -12294,7 +12842,8 @@ function formatAdaptiveNoteCard(card) {
     ? `- Context Note (${card.citationNumber}): [${card.title}](obsidian://open?file=${encodeURIComponent(card.path)})`
     : `- Related note: [${card.title}](obsidian://open?file=${encodeURIComponent(card.path)})`;
   const parts = [
-    `${heading} (${card.type || "vault note"})`,
+    `${heading} (${[card.type || "vault note", card.date || ""].filter(Boolean).join("; ")})`,
+    card.scopeMatch ? "  Scope confidence: direct subject match." : "",
     card.people?.length ? `  People/entities: ${card.people.join(", ")}` : "",
     card.decisions?.length ? `  Decisions/current guidance: ${card.decisions.join(" ")}` : "",
     card.outcomes?.length ? `  Outcomes/resolutions: ${card.outcomes.join(" ")}` : "",
@@ -12421,6 +12970,12 @@ function mergeContextCandidates(...groups) {
       existing.lexical = Math.max(existing.lexical || 0, item.lexical || 0);
       existing.title = Math.max(existing.title || 0, item.title || 0);
       existing.recency = Math.max(existing.recency || 0, item.recency || 0);
+      existing.scopeScore = Math.max(existing.scopeScore || 0, item.scopeScore || 0);
+      existing.scopeHits = Math.max(existing.scopeHits || 0, item.scopeHits || 0);
+      existing.scopeCoverage = Math.max(existing.scopeCoverage || 0, item.scopeCoverage || 0);
+      existing.scopeMatch = existing.scopeMatch === true || item.scopeMatch === true;
+      existing.matchedScopeTerms = uniqueValues([...(existing.matchedScopeTerms || []), ...(item.matchedScopeTerms || [])]);
+      existing.matchedRequiredScopeTerms = uniqueValues([...(existing.matchedRequiredScopeTerms || []), ...(item.matchedRequiredScopeTerms || [])]);
     }
   }
   return Array.from(byId.values());
@@ -12446,7 +13001,8 @@ function rankContextCandidates(candidates = []) {
 function contextCandidateRelevanceScore(item) {
   return (item.semantic || 0) * 0.72 +
     Math.min(0.22, (item.lexical || 0) * 0.018) +
-    Math.min(0.08, (item.title || 0) * 0.025);
+    Math.min(0.08, (item.title || 0) * 0.025) +
+    Math.min(0.42, item.scopeScore || 0);
 }
 
 function contextCandidateScore(item) {
@@ -12505,7 +13061,7 @@ function diversifyContextCandidates(candidates, limit) {
   return selected;
 }
 
-function annotateContextChunk(item) {
+function annotateContextChunk(item, profile = {}) {
   const chunk = item.chunk || item;
   const score = contextCandidateScore(item);
   const reasons = [];
@@ -12514,9 +13070,14 @@ function annotateContextChunk(item) {
   if (item.title) reasons.push("title/path match");
   if (item.relativeRecency) reasons.push("newer matching note");
   if (item.recency) reasons.push("recent note");
+  if (item.scopeMatch && (profile.primaryAnchorTerms || []).length) reasons.push(`subject match: ${(item.matchedScopeTerms || []).join(", ")}`);
   return Object.assign({}, chunk, {
     matchScore: Math.round(score * 1000) / 1000,
-    matchRationale: reasons.join("; ") || "lexical fallback"
+    matchRationale: reasons.join("; ") || "lexical fallback",
+    retrievalIntent: profile.intent || "focused",
+    retrievalScopeTerms: (profile.requiredAnchorTerms || profile.primaryAnchorTerms || []).slice(0, 5),
+    retrievalScopeMatch: item.scopeMatch === true,
+    retrievalScopeCoverage: Math.round(Number(item.scopeCoverage || 0) * 1000) / 1000
   });
 }
 
@@ -12586,20 +13147,208 @@ function subtaskCriteriaInstructions(settings = DEFAULT_SETTINGS) {
   ].join(" ");
 }
 
-function contextNotesForTaskPlan(chunks, activePath, maxNotes) {
+function contextNotesForTaskPlan(chunks, activePath, maxNotes, query = "", settings = DEFAULT_SETTINGS) {
   const seen = new Set();
   const notes = [];
   for (const chunk of chunks || []) {
     if (!chunk.path || chunk.path === activePath || seen.has(chunk.path)) continue;
     seen.add(chunk.path);
+    const scopeTerms = chunk.retrievalScopeTerms || [];
+    const summary = rankedContextExcerpt(chunk.text || "", query, settings, {
+      anchorTerms: scopeTerms,
+      strictAnchors: scopeTerms.length > 0
+    });
+    if (!summary) continue;
     notes.push({
       path: chunk.path,
       title: chunk.title || chunk.path.split("/").pop()?.replace(/\.md$/i, "") || chunk.path,
-      summary: truncateAtWord(singleLine(stripGeneratedActionItemsSection(chunk.text || "")), 180)
+      summary: truncateAtWord(singleLine(summary), 240)
     });
     if (notes.length >= Math.max(1, maxNotes || 5)) break;
   }
   return notes;
+}
+
+function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", context = [], sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
+  return (tasks || []).map((task, index) => {
+    const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
+    const sourceEvidence = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900);
+    const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3);
+    const contextEvidenceEntries = contextChunks.map((chunk) => {
+      const source = sourceReference(chunk, citationState.basePath || "");
+      const citationNumber = source ? citationState.citationMap?.get(source) : null;
+      const anchorTerms = generatedTaskObjectTerms(query);
+      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520);
+      if (!excerpt) return null;
+      const label = citationNumber ? `Context Note (${citationNumber})` : "Supporting note";
+      const evidence = truncateAtWord(excerpt, 520);
+      return { prompt: `${label}: ${chunk.title || chunk.path || "Vault note"}\nEvidence: ${evidence}`, evidence };
+    }).filter(Boolean);
+    const contextEvidence = contextEvidenceEntries.map((entry) => entry.prompt);
+    const prompt = [
+      `Task ${index}: ${task.content || "Untitled task"}`,
+      "Primary source evidence:",
+      sourceEvidence || "No task-specific primary-source excerpt was found.",
+      contextEvidence.length ? "Supporting context evidence:" : "",
+      contextEvidence.join("\n")
+    ].filter(Boolean).join("\n");
+    return {
+      index,
+      prompt: truncateMarkdownAtWord(prompt, 2200),
+      corpus: [sourceEvidence, ...contextEvidenceEntries.map((entry) => entry.evidence)].filter(Boolean).join("\n\n"),
+      contextChunks
+    };
+  });
+}
+
+function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_SETTINGS, maxChars = 700) {
+  const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
+  const anchors = generatedTaskObjectTerms(query);
+  if (!anchors.length) return summarizeSourceForTaskContext(cleaned, query, maxChars, settings, { strictQuery: true });
+  const sentences = cleaned
+    .split(/\n+/)
+    .flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()))
+    .map((line) => singleLine(line))
+    .filter((line) => line.length >= 18);
+  const selected = new Set();
+  for (let index = 0; index < sentences.length; index += 1) {
+    const counts = termCounts(sentences[index]);
+    const matches = anchors.some((term) => contextAnchorVariants(term).some((variant) => counts[variant]));
+    if (!matches) continue;
+    selected.add(index);
+    for (const neighborIndex of [index - 1, index + 1]) {
+      if (neighborIndex < 0 || neighborIndex >= sentences.length) continue;
+      if (taskEvidenceNeighborIsCohesive(sentences[neighborIndex], sentences[index])) selected.add(neighborIndex);
+    }
+  }
+  const excerpt = Array.from(selected).sort((left, right) => left - right).map((index) => sentences[index]).join(" ");
+  return truncateAtWord(excerpt, maxChars);
+}
+
+function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
+  if (/\b(this|that|these|those|it|they|he|she|same|before|after|depends?|dependency|requires?|required|must|approval|approved|response|wording|document|draft)\b/i.test(candidate)) return true;
+  const anchorTerms = new Set(generatedTaskObjectTerms(anchor));
+  return generatedTaskObjectTerms(candidate).some((term) => anchorTerms.has(term));
+}
+
+function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFAULT_SETTINGS, limit = 3) {
+  const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
+  const queryTerms = termCounts(query);
+  const anchors = generatedTaskObjectTerms(query);
+  return uniqueChunksByPath((context || [])
+    .map((chunk) => {
+      const text = `${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`;
+      const counts = termCounts(text);
+      const anchorHits = anchors.filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
+      const score = lexicalScore(queryTerms, text) + anchorHits * 3 + Number(chunk.matchScore || 0);
+      return { chunk, score, anchorHits };
+    })
+    .filter((item) => item.anchorHits > 0 && item.score > 0)
+    .sort((left, right) => right.score - left.score || Number(right.chunk.createdAt || right.chunk.modifiedAt || 0) - Number(left.chunk.createdAt || left.chunk.modifiedAt || 0))
+    .map((item) => item.chunk))
+    .slice(0, Math.max(0, limit));
+}
+
+function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
+  const corpus = String(evidence?.corpus || "");
+  if (!corpus.trim()) return "missing task-specific evidence";
+  const corpusLower = corpus.toLowerCase();
+  const dates = uniqueValues(String(value || "").match(/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*20\d{2})?\b/gi) || []);
+  const unsupportedDate = dates.find((date) => !corpusLower.includes(date.toLowerCase()));
+  if (unsupportedDate) return `unsupported date: ${unsupportedDate}`;
+  const people = uniqueValues([...extractPeopleCandidates(value, 12), ...descriptionSpecificEntities(value)]);
+  const unsupportedPerson = people.find((person) => !corpusLower.includes(person.toLowerCase()));
+  if (unsupportedPerson) return `unsupported person or entity: ${unsupportedPerson}`;
+  const links = extractDescriptionLinkRecords(value, settings);
+  const unsupportedLink = links.find((link) => !corpus.includes(link.url));
+  if (unsupportedLink) return "unsupported link";
+  const descriptionTerms = generatedTaskObjectTerms(value);
+  const corpusCounts = termCounts(corpus);
+  const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
+  if (descriptionTerms.length >= 3 && !supportedTerms.length) return "description has no specific overlap with its evidence";
+  return "passed";
+}
+
+function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
+  const startedAt = Date.now();
+  const issues = [];
+  const addIssue = (code, taskIndex, blocking = true) => issues.push({ code, taskIndex, blocking });
+  const sourceContext = options.sourceContext || {};
+  const sourceEvidence = [options.sourceTitle, sourceContext.title, plan.sourceSummary, sourceContext.text]
+    .filter(Boolean)
+    .join("\n");
+  const context = plan.semanticContext || options.semanticContext || [];
+  const contextEvidence = context.map((chunk) => `${chunk.title || chunk.path || ""}\n${chunk.text || ""}`).join("\n\n");
+  const groundingEvidence = [sourceEvidence, contextEvidence].filter(Boolean).join("\n\n");
+  const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false);
+  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, plan.sourceSummary || sourceContext.text || "", context, options.sourceTitle || sourceContext.title || "", settings, citationState);
+  const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+  const seenTitles = new Set();
+  let subtaskCount = 0;
+  let labelCount = 0;
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    const task = tasks[index] || {};
+    const titleKey = canonicalTaskMatchTitle(task.content || "");
+    if (!titleKey) addIssue("missing-main-title", index);
+    else if (seenTitles.has(titleKey) && !task.possibleDuplicate) addIssue("duplicate-main-title", index);
+    else seenTitles.add(titleKey);
+    if (task.content && !generatedTaskMatchesPrimarySource(task, groundingEvidence)) addIssue("ungrounded-main-title", index);
+    const splitDescription = splitDescriptionSourceListBlock(task.description || "");
+    const descriptionReason = taskDescriptionGroundingReason(splitDescription.summary, task, evidenceBundles[index], settings);
+    if (descriptionReason !== "passed") addIssue("ungrounded-main-description", index);
+    if (options.citeContextNotes !== false && !splitDescription.sourceList) addIssue("missing-source-list", index);
+    if (task.due_date && !validDate(task.due_date)) addIssue("invalid-due-date", index);
+    if (task.deadline_date && !validDate(task.deadline_date)) addIssue("invalid-deadline-date", index);
+    if (normalizePriority(task.priority) !== Number(task.priority || 1)) addIssue("invalid-priority", index);
+    const taskLabels = (task.labels || []).map(cleanLabel).filter(Boolean);
+    labelCount += taskLabels.length;
+    if (new Set(taskLabels.map((label) => label.toLowerCase())).size !== taskLabels.length) addIssue("duplicate-label", index);
+    if (!task.id && taskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("label-not-allowed", index);
+    const seenSubtasks = new Set();
+    for (const subtask of task.subtasks || []) {
+      subtaskCount += 1;
+      const subtaskKey = canonicalTaskMatchTitle(subtask.content || "");
+      if (!subtaskKey) addIssue("missing-subtask-title", index);
+      else if (seenSubtasks.has(subtaskKey)) addIssue("duplicate-subtask-title", index);
+      else seenSubtasks.add(subtaskKey);
+      const subtaskEvidence = [groundingEvidence, task.content, splitDescription.summary].filter(Boolean).join("\n");
+      if (subtask.content && !generatedTaskMatchesPrimarySource(subtask, subtaskEvidence)) addIssue("ungrounded-subtask", index);
+      const subtaskLabels = (subtask.labels || []).map(cleanLabel).filter(Boolean);
+      labelCount += subtaskLabels.length;
+      if (!subtask.id && subtaskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("subtask-label-not-allowed", index);
+      if (subtask.due_date && !validDate(subtask.due_date)) addIssue("invalid-subtask-due-date", index);
+      if (subtask.deadline_date && !validDate(subtask.deadline_date)) addIssue("invalid-subtask-deadline-date", index);
+    }
+  }
+  const blockingIssues = issues.filter((issue) => issue.blocking).length;
+  return {
+    passed: blockingIssues === 0,
+    score: Math.max(0, 100 - blockingIssues * 12),
+    blockingIssues,
+    issues,
+    mainTaskCount: (tasks || []).length,
+    subtaskCount,
+    labelCount,
+    aiCalls: 0,
+    elapsedMs: Math.max(0, Date.now() - startedAt)
+  };
+}
+
+function descriptionSpecificEntities(value = "") {
+  const ignored = new Set([
+    "The", "This", "That", "These", "Those", "A", "An", "Before", "After", "Once", "Then", "Earlier", "Later",
+    "Because", "Although", "However", "When", "While",
+    "Keep", "Include", "Review", "Confirm", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
+    "Todoist", "Obsidian", "Context", "Task", "Source"
+  ]);
+  const entities = String(value || "").match(/\b[A-Z][A-Za-z&'-]{2,}(?:\s+[A-Z][A-Za-z&'-]{2,}){0,2}\b/g) || [];
+  return uniqueValues(entities.map((entity) => {
+    const words = singleLine(entity).split(/\s+/).filter(Boolean);
+    while (words.length && ignored.has(words[0])) words.shift();
+    while (words.length && ignored.has(words[words.length - 1])) words.pop();
+    return words.join(" ");
+  }).filter((entity) => entity && !/^(January|February|March|April|May|June|July|August|September|October|November|December)$/i.test(entity))).slice(0, 12);
 }
 
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
@@ -12669,8 +13418,8 @@ function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETT
 
 function fallbackActionSummary(task, sourceText, contextChunks, sourceTitle = "", settings = DEFAULT_SETTINGS) {
   const query = [task.content, (task.labels || []).join(" "), sourceTitle].filter(Boolean).join(" ");
-  const activeContext = summarizeSourceForTaskContext(sourceText, query, 780, settings);
-  const vaultContext = summarizeSourceForTaskContext((contextChunks || []).map((chunk) => `${chunk.title || chunk.path}\n${chunk.text || ""}`).join("\n\n"), query, 420, settings);
+  const activeContext = summarizeSourceForTaskContext(sourceText, query, 780, settings, { strictQuery: true });
+  const vaultContext = summarizeSourceForTaskContext((contextChunks || []).map((chunk) => `${chunk.title || chunk.path}\n${chunk.text || ""}`).join("\n\n"), query, 420, settings, { strictQuery: true });
   const summary = removeTitleEcho(conciseDescriptionSummary(mergeStrings([activeContext], [vaultContext]), settings), task.content);
   if (isUsefulDescriptionSummary(summary, task.content, settings)) return truncateAtWord(summary, 1200);
   return truncateAtWord(`The source context indicates this is a user-owned action from ${sourceTitle || "the source material"}. Review the active note or email for the current status, confirm the relevant people, documents, and timing, then complete the next concrete follow-up required for this item.`, 1200);
@@ -12823,6 +13572,7 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
     });
   }
   return {
+    basePath,
     citationMap,
     contextCitationNotes,
     citeContextNotes: enabled !== false && citationMap.size > 0,
@@ -13108,7 +13858,7 @@ function normalizeStoredSourceList(value) {
   return lines.join("\n");
 }
 
-function summarizeSourceForTaskContext(text, query = "", maxChars = 360, settings = DEFAULT_SETTINGS) {
+function summarizeSourceForTaskContext(text, query = "", maxChars = 360, settings = DEFAULT_SETTINGS, options = {}) {
   const cleaned = stripExcludedLinks(stripTaskAndMetadataLines(String(text || "")), settings);
   const queryTerms = termCounts(query);
   const lines = cleaned
@@ -13122,9 +13872,10 @@ function summarizeSourceForTaskContext(text, query = "", maxChars = 360, setting
     })
     .map((line, index) => {
       const actionScore = /action|todo|follow|review|send|confirm|complete|deadline|due|need|waiting|owner|lead|draft|update|share|clarify|coordinate|post|blog|email|document/i.test(line) ? 1 : 0;
-      return { line, index, score: lexicalScore(queryTerms, line) + actionScore };
+      const lexical = lexicalScore(queryTerms, line);
+      return { line, index, lexical, score: lexical + actionScore };
     })
-    .filter((item) => item.score > 0)
+    .filter((item) => options.strictQuery ? item.lexical > 0 : item.score > 0)
     .sort((a, b) => b.score - a.score || a.index - b.index)
     .slice(0, Math.max(2, Math.min(6, Math.ceil(maxChars / 180))))
     .sort((a, b) => a.index - b.index)
@@ -13218,6 +13969,7 @@ function semanticPathChunksMatch(index, path, nextChunks) {
     if (String(current.title || "") !== String(next.title || "")) return false;
     if (String(current.kind || "") !== String(next.kind || "")) return false;
     if (String(current.source || "") !== String(next.source || "")) return false;
+    if (Number(current.embeddingContentVersion || 1) !== Number(next.embeddingContentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION)) return false;
     if (Number(current.createdAt || 0) !== Number(next.createdAt || 0)) return false;
     if (String(current.createdAtSource || "") !== String(next.createdAtSource || "")) return false;
   }
@@ -13225,11 +13977,23 @@ function semanticPathChunksMatch(index, path, nextChunks) {
 }
 
 function semanticChunkEmbeddingInput(chunk) {
-  return `${chunk?.title || ""}\n${chunk?.text || ""}`;
+  const path = chunk?.path || "";
+  const project = noteProjectKey(path, chunk?.title || "");
+  const date = contextDatePart(chunk);
+  return [
+    `Title: ${chunk?.title || ""}`,
+    path ? `Vault path: ${path}` : "",
+    project ? `Project context: ${project}` : "",
+    date ? `Note date: ${date}` : "",
+    chunk?.kind === "todoist-task-reference" ? "Content type: local Todoist task references" : "Content type: vault note",
+    chunk?.text || ""
+  ].filter(Boolean).join("\n");
 }
 
 function semanticChunkReuseKey(chunk) {
   return [
+    String(SEMANTIC_EMBEDDING_CONTENT_VERSION),
+    String(chunk?.path || ""),
     String(chunk?.title || ""),
     String(chunk?.kind || ""),
     String(chunk?.source || ""),
@@ -13243,7 +14007,8 @@ function semanticChunkEmbeddingsReusable(settings = DEFAULT_SETTINGS, meta = {})
   if (indexedModel && indexedModel !== currentModel) return false;
   const currentPrecision = Number(settings.semanticIndexEmbeddingPrecision || DEFAULT_SETTINGS.semanticIndexEmbeddingPrecision);
   const indexedPrecision = Number(meta?.embeddingPrecision || currentPrecision);
-  return indexedPrecision === currentPrecision;
+  const indexedContentVersion = Number(meta?.embeddingContentVersion || 1);
+  return indexedPrecision === currentPrecision && indexedContentVersion === SEMANTIC_EMBEDDING_CONTENT_VERSION;
 }
 
 function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {}) {
@@ -13260,7 +14025,7 @@ function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {
 function reusedSemanticChunk(chunk, reuseMap) {
   const embedding = reuseMap?.get(semanticChunkReuseKey(chunk));
   if (!Array.isArray(embedding) || !embedding.length) return null;
-  return Object.assign({}, chunk, { embedding });
+  return Object.assign({}, chunk, { embedding, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
 }
 
 function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS, label = "") {
@@ -13430,6 +14195,18 @@ function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
     return clamp(cleaned, maxChars);
   }
   return compressForTaskPrompt(source.text, maxChars, settings);
+}
+
+function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+  const sourceTitle = singleLine(source.title || "");
+  const intent = summarizeSourceForTaskContext(sourceSummary, sourceTitle, 1200, settings);
+  const explicitActions = String(sourceSummary || "")
+    .split(/\n+/)
+    .map((line) => singleLine(line))
+    .filter((line) => /#todo\b|\b(?:please|need(?:s|ed)? to|must|should|action|follow[-\s]?up|review|verify|confirm|send|prepare|draft|finalize|respond|reply|complete|update|coordinate|decide|approve)\b/i.test(line))
+    .slice(0, 8)
+    .join("\n");
+  return [sourceTitle, explicitActions, intent].filter(Boolean).join("\n");
 }
 
 function explicitReviewRequestFallbackTask(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
@@ -13646,6 +14423,58 @@ function semanticCreatedMetadataForFile(file, text = "", settings = DEFAULT_SETT
   return { createdAt: 0, createdAtSource: "" };
 }
 
+function semanticCreatedAtTargetsByPath(paths = [], semanticIndex = [], candidates = []) {
+  const targets = new Map(paths.map((path) => [path, { chunks: [], candidates: [] }]));
+  for (const chunk of semanticIndex || []) {
+    const target = targets.get(chunk?.path || "");
+    if (target) target.chunks.push(chunk);
+  }
+  for (const item of candidates || []) {
+    const target = targets.get((item?.chunk || item)?.path || "");
+    if (target) target.candidates.push(item);
+  }
+  return targets;
+}
+
+async function semanticCreatedMetadataForPath(plugin, notePath, useNoteCreatedTime) {
+  let createdMeta = plugin.semanticCreatedAtPathCache.get(notePath);
+  if (createdMeta !== undefined) return createdMeta;
+  createdMeta = { createdAt: 0, createdAtSource: "" };
+  try {
+    const file = plugin.app.vault.getAbstractFileByPath(notePath);
+    if (file instanceof TFile) {
+      const text = useNoteCreatedTime ? await plugin.app.vault.cachedRead(file) : "";
+      createdMeta = semanticCreatedMetadataForFile(file, text, plugin.settings);
+    }
+  } catch {}
+  plugin.semanticCreatedAtPathCache.set(notePath, createdMeta);
+  return createdMeta;
+}
+
+function applySemanticCreatedMetadata(target = {}, createdMeta = {}, useNoteCreatedTime = true) {
+  const createdAt = Number(createdMeta?.createdAt || 0);
+  if (!createdAt) return 0;
+  const createdAtSource = String(createdMeta?.createdAtSource || "");
+  let hydrated = 0;
+  for (const chunk of target.chunks || []) {
+    const shouldApply = !chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file");
+    if (!shouldApply) continue;
+    chunk.createdAt = createdAt;
+    if (createdAtSource) chunk.createdAtSource = createdAtSource;
+    hydrated += 1;
+  }
+  for (const item of target.candidates || []) {
+    const chunk = item.chunk || item;
+    const shouldApply = !chunk.createdAt || (!useNoteCreatedTime && chunk.createdAtSource !== "file");
+    if (shouldApply) {
+      chunk.createdAt = createdAt;
+      if (createdAtSource) chunk.createdAtSource = createdAtSource;
+    }
+    item.recency = recencyBoost(contextCandidateFreshnessAt(item));
+  }
+  return hydrated;
+}
+
 function noteDateTimestamp(...values) {
   return parseLooseDateTimestamp(values.filter(Boolean).join(" "));
 }
@@ -13700,6 +14529,28 @@ function taskReferenceSearchText(task, childText = "") {
 function taskReferenceScore(task, queryTerms, queryText = "", childText = "") {
   const text = taskReferenceSearchText(task, childText);
   return taskSearchLexicalScore(queryTerms, text);
+}
+
+async function loadTaskContextTexts(plugin, active = {}, matchedTaskFiles = [], chunks = []) {
+  const byPath = new Map();
+  if (active?.path) byPath.set(active.path, active.text || "");
+  const queuedPaths = new Set(byPath.keys());
+  const filesToRead = [];
+  for (const file of matchedTaskFiles || []) {
+    if (!file?.path || queuedPaths.has(file.path)) continue;
+    queuedPaths.add(file.path);
+    filesToRead.push(file);
+  }
+  for (const chunk of chunks || []) {
+    if (!chunk?.path || queuedPaths.has(chunk.path)) continue;
+    const file = plugin.app.vault.getAbstractFileByPath(chunk.path);
+    if (!(file instanceof TFile)) continue;
+    queuedPaths.add(chunk.path);
+    filesToRead.push(file);
+  }
+  const loadedTexts = await Promise.all(filesToRead.map(async (file) => [file.path, await plugin.app.vault.cachedRead(file)]));
+  for (const [path, text] of loadedTexts) byPath.set(path, text);
+  return byPath;
 }
 
 function taskChildTextByParentOid(entries) {
@@ -14498,14 +15349,16 @@ function emptyTaskDeduplicationStats() {
     copiedSubtasks: 0,
     removedSubtasks: 0,
     generatedDuplicates: 0,
+    localConfirmed: 0,
     aiUsed: 0,
+    taskGenerationUsed: 0,
     candidateFlags: [],
     matches: []
   };
 }
 
 function taskDeduplicationRunSummary(stats = emptyTaskDeduplicationStats()) {
-  return `${stats.merged || 0} linked to existing tasks, ${stats.created || 0} left as new, ${stats.ambiguous || 0} ambiguous, ${stats.copiedSubtasks || 0} existing subtasks copied, ${stats.generatedDuplicates || 0} generated duplicates collapsed, ${(stats.candidateFlags || []).length} local-only duplicate candidates flagged.`;
+  return `${stats.merged || 0} linked to existing tasks, ${stats.created || 0} left as new, ${stats.ambiguous || 0} ambiguous, ${stats.localConfirmed || 0} confirmed locally, ${stats.aiUsed || 0} sent to AI as a last resort, ${stats.copiedSubtasks || 0} existing subtasks copied, ${stats.generatedDuplicates || 0} generated duplicates collapsed, ${stats.taskGenerationUsed || 0} confirmed duplicate updates regenerated, ${(stats.candidateFlags || []).length} local-only duplicate candidates flagged.`;
 }
 
 function shouldUseLiveTodoistDeduplicationCandidates(options = {}) {
@@ -14558,8 +15411,8 @@ function liveTodoistTaskDeduplicationCandidates(tasks = [], settings = DEFAULT_S
     });
 }
 
-async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETTINGS, options = {}, aiMergeFn = null) {
-  const stats = { merged: 0, matches: [], aiUsed: 0, ambiguous: 0, candidateFlags: [] };
+async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETTINGS, options = {}, aiDecisionFn = null, taskGenerationFn = null) {
+  const stats = { merged: 0, matches: [], localConfirmed: 0, aiUsed: 0, taskGenerationUsed: 0, ambiguous: 0, candidateFlags: [] };
   if (!Array.isArray(tasks) || tasks.length < 2) return stats;
   for (let i = 0; i < tasks.length; i += 1) {
     const task = tasks[i];
@@ -14568,15 +15421,33 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     const decision = bestTaskDeduplicationMatch(task, candidates, settings, Object.assign({}, options, { isSubtask: false, intraBatch: true }));
     if (!decision.candidate?.generatedTask) continue;
     if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
-    if (settings.enableAiAmbiguousTaskDeduplication !== true) {
-      stats.ambiguous += 1;
-      stats.candidateFlags.push(taskDeduplicationCandidateFlag(task, decision, settings, { intraBatch: true }));
+    const resolutionOptions = Object.assign({}, options, { intraBatch: true });
+    const resolution = taskDeduplicationResolution(decision, settings, resolutionOptions);
+    if (resolution === "none") continue;
+    if (resolution === "manual") {
+      flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
       continue;
     }
-    const aiMerge = typeof aiMergeFn === "function" ? await aiMergeFn(task, decision, Object.assign({}, options, { intraBatch: true })) : null;
-    if (aiMerge?.used) stats.aiUsed += 1;
-    if (aiMerge?.match !== true) continue;
-    mergeGeneratedDuplicateTask(decision.candidate.generatedTask, task, decision, settings, aiMerge.task);
+    if (resolution === "local") {
+      stats.localConfirmed += 1;
+    } else {
+      const aiDecision = typeof aiDecisionFn === "function" ? await aiDecisionFn(task, decision, resolutionOptions) : null;
+      if (aiDecision?.used) stats.aiUsed += 1;
+      if (aiDecision?.match !== true) continue;
+    }
+    const generatedUpdate = typeof taskGenerationFn === "function"
+      ? await taskGenerationFn(task, decision, resolutionOptions)
+      : null;
+    if (!generatedUpdate?.task) {
+      flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
+      continue;
+    }
+    const target = decision.candidate.generatedTask;
+    if (generatedUpdate.used) {
+      stats.taskGenerationUsed += 1;
+      applyTaskGenerationDuplicateUpdate(target, generatedUpdate.task, settings);
+    }
+    markGeneratedDuplicateTask(target, decision, settings);
     stats.merged += 1;
     stats.matches.push(taskDeduplicationMatchSummary(task, Object.assign({}, decision, {
       id: "",
@@ -14605,11 +15476,113 @@ function generatedTaskBatchCandidates(tasks = [], beforeIndex = 0) {
   return candidates;
 }
 
-function mergeGeneratedDuplicateTask(target, duplicate, decision = {}, settings = DEFAULT_SETTINGS, aiTask = null) {
-  if (!target || !duplicate) return target;
-  if (aiTask) applyAiTaskDeduplicationMerge(target, aiTask, settings);
-  else return target;
-  target.knowledge = taskKnowledgeSnapshot(target, settings, "", target.knowledge || duplicate.knowledge || null);
+function duplicatePairNeedsTaskGeneration(incoming = {}, existing = {}, options = {}) {
+  if (duplicateTaskPayloadEquivalent(incoming, existing)) return false;
+  if (options.intraBatch === true) return true;
+  if (options.isSubtask === true) return false;
+  if (existing.due_date && !incoming.due_date) return true;
+  if (existing.deadline_date && !incoming.deadline_date) return true;
+  const incomingText = taskDeduplicationContextText(incoming);
+  const incomingCounts = termCounts(incomingText);
+  const existingTerms = generatedTaskObjectTerms(taskDeduplicationContextText(existing));
+  const missingTerms = existingTerms.filter((term) => !contextAnchorVariants(term).some((variant) => incomingCounts[variant]));
+  if (missingTerms.length >= 2) return true;
+  if (isRichTodoistDescription(existing.description) && !isRichTodoistDescription(incoming.description)) return true;
+  const incomingSubtaskText = taskDeduplicationSubtaskText(incoming);
+  const existingSubtaskText = [taskDeduplicationSubtaskText(existing), existing.childText || ""].filter(Boolean).join(" ");
+  if (existingSubtaskText && !duplicateActionRepresented(existingSubtaskText, incomingSubtaskText || incomingText)) return true;
+  const incomingLinks = new Set(extractDescriptionLinkRecords(incoming.description || "", DEFAULT_SETTINGS).map((link) => link.url));
+  return extractDescriptionLinkRecords(existing.description || "", DEFAULT_SETTINGS).some((link) => !incomingLinks.has(link.url));
+}
+
+function duplicateTaskPayloadEquivalent(incoming = {}, existing = {}) {
+  if (canonicalTaskMatchTitle(incoming.content || "") !== canonicalTaskMatchTitle(existing.content || "")) return false;
+  const incomingDescription = singleLine(splitDescriptionSourceListBlock(incoming.description || "").summary).toLowerCase();
+  const existingDescription = singleLine(splitDescriptionSourceListBlock(existing.description || "").summary).toLowerCase();
+  if (incomingDescription !== existingDescription) return false;
+  if (String(incoming.due_date || "") !== String(existing.due_date || "")) return false;
+  if (String(incoming.deadline_date || "") !== String(existing.deadline_date || "")) return false;
+  const labels = (task) => uniqueValues((task.labels || []).map(cleanLabel).filter(Boolean)).sort().join("|").toLowerCase();
+  if (labels(incoming) !== labels(existing)) return false;
+  const subtasks = (task) => (task.subtasks || []).map((subtask) => canonicalTaskMatchTitle(subtask.content || "")).filter(Boolean).sort().join("|");
+  return subtasks(incoming) === subtasks(existing);
+}
+
+function duplicateTaskGenerationPreservesEvidence(generated = {}, incoming = {}, existing = {}, settings = DEFAULT_SETTINGS) {
+  if (!generated?.content) return false;
+  const evidence = [
+    taskDeduplicationContextText(incoming),
+    taskDeduplicationContextText(existing),
+    taskDeduplicationSubtaskText(incoming),
+    taskDeduplicationSubtaskText(existing),
+    existing.childText || ""
+  ].filter(Boolean).join("\n");
+  if (!generatedTaskMatchesPrimarySource(generated, evidence)) return false;
+  if ((isRichTodoistDescription(incoming.description) || isRichTodoistDescription(existing.description)) && !isUsefulDescriptionSummary(generated.description, generated.content, settings)) return false;
+  const generatedText = taskDeduplicationContextText(generated);
+  const generatedCounts = termCounts(generatedText);
+  const sourceTerms = uniqueValues([
+    ...generatedTaskObjectTerms(incoming.content || ""),
+    ...generatedTaskObjectTerms(existing.content || "")
+  ]);
+  const representedTerms = sourceTerms.filter((term) => contextAnchorVariants(term).some((variant) => generatedCounts[variant]));
+  if (sourceTerms.length >= 4 && representedTerms.length < Math.min(3, Math.ceil(sourceTerms.length * 0.4))) return false;
+  const sourceDueDates = uniqueValues([incoming.due_date, existing.due_date].filter(Boolean));
+  if (sourceDueDates.length && !generated.due_date) return false;
+  const sourceDeadlines = uniqueValues([incoming.deadline_date, existing.deadline_date].filter(Boolean));
+  if (sourceDeadlines.length && !generated.deadline_date) return false;
+  const generatedLinks = new Set(extractDescriptionLinkRecords(generated.description || "", settings).map((link) => link.url));
+  const sourceLinks = uniqueValues([incoming.description, existing.description]
+    .flatMap((description) => extractDescriptionLinkRecords(description || "", settings).map((link) => link.url)));
+  if (sourceLinks.some((link) => !generatedLinks.has(link))) return false;
+  const generatedActionText = [generated.content, generated.description, taskDeduplicationSubtaskText(generated)].filter(Boolean).join(" ");
+  const sourceSubtasks = [...(incoming.subtasks || []), ...(existing.subtasks || [])].filter((subtask) => subtask?.content);
+  if (sourceSubtasks.some((subtask) => !duplicateActionRepresented(subtask.content, generatedActionText))) return false;
+  return true;
+}
+
+function duplicateActionRepresented(source = "", target = "") {
+  const sourceTerms = generatedTaskObjectTerms(source);
+  if (!sourceTerms.length) return true;
+  const targetCounts = termCounts(target);
+  const matches = sourceTerms.filter((term) => contextAnchorVariants(term).some((variant) => targetCounts[variant])).length;
+  return matches >= Math.min(2, sourceTerms.length);
+}
+
+function applyTaskGenerationDuplicateUpdate(target = {}, generated = {}, settings = DEFAULT_SETTINGS) {
+  const previousSubtasks = target.subtasks || [];
+  target.content = singleLine(generated.content || target.content || "");
+  target.description = generated.description || target.description || "";
+  target.due_date = generated.due_date || target.due_date || "";
+  target.deadline_date = generated.deadline_date || target.deadline_date || "";
+  target.priority = normalizePriority(generated.priority || target.priority || 1);
+  target.labels = mergedTaskLabelsForDeduplication(generated.labels || [], target.labels || [], settings);
+  if (!target.isSubtask) {
+    target.subtasks = (generated.subtasks || []).map((subtask, index) => {
+      const previous = previousSubtasks[index] || {};
+      const next = Object.assign({}, previous, subtask, {
+        oid: previous.oid || generateUniqueOid(settings),
+        isSubtask: true,
+        parentId: target.id || previous.parentId || "",
+        parentOid: target.oid || previous.parentOid || "",
+        parentContent: target.content || "",
+        projectId: target.projectId || previous.projectId || "",
+        projectName: target.projectName || previous.projectName || "",
+        section: target.section || previous.section || "",
+        sectionId: target.sectionId || previous.sectionId || ""
+      });
+      next.knowledge = taskKnowledgeSnapshot(next, settings, "", previous.knowledge || null);
+      return next;
+    });
+  }
+  target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
+  target.descriptionShouldSync = true;
+  return target;
+}
+
+function markGeneratedDuplicateTask(target, decision = {}, settings = DEFAULT_SETTINGS) {
+  if (!target) return target;
+  target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
   target.descriptionShouldSync = true;
   target.deduplication = {
     todoistId: target.id || "",
@@ -14617,85 +15590,6 @@ function mergeGeneratedDuplicateTask(target, duplicate, decision = {}, settings 
     reasons: uniqueValues(["merged with generated task"].concat(decision.reasons || []))
   };
   return target;
-}
-
-function applyAiTaskDeduplicationMerge(task, aiTask = {}, settings = DEFAULT_SETTINGS) {
-  if (!task || !aiTask) return task;
-  task.content = singleLine(aiTask.content || task.content || "");
-  task.description = isRichTodoistDescription(aiTask.description) ? aiTask.description : task.description || aiTask.description || "";
-  if (Object.prototype.hasOwnProperty.call(aiTask, "due_date")) task.due_date = aiTask.due_date || "";
-  if (Object.prototype.hasOwnProperty.call(aiTask, "deadline_date")) task.deadline_date = aiTask.deadline_date || "";
-  task.priority = normalizePriority(aiTask.priority || task.priority || 1);
-  task.labels = (aiTask.labels || task.labels || []).map(cleanLabel).filter(Boolean);
-  if (Array.isArray(aiTask.subtasks) && !task.isSubtask) {
-    task.subtasks = aiTask.subtasks
-      .map((subtask, index) => aiMergedSubtask(subtask, task.subtasks?.[index] || {}, task, settings))
-      .filter((subtask) => subtask.content);
-  }
-  task.knowledge = taskKnowledgeSnapshot(task, settings, taskDeduplicationSubtaskText(task), task.knowledge || null);
-  task.descriptionShouldSync = true;
-  return task;
-}
-
-function aiMergedSubtask(aiSubtask = {}, existing = {}, parentTask = {}, settings = DEFAULT_SETTINGS) {
-  const merged = Object.assign({}, existing, {
-    content: singleLine(aiSubtask.content || existing.content || ""),
-    description: aiSubtask.description || existing.description || "",
-    due_date: aiSubtask.due_date || existing.due_date || "",
-    deadline_date: aiSubtask.deadline_date || existing.deadline_date || "",
-    priority: normalizePriority(aiSubtask.priority || existing.priority || 1),
-    labels: (aiSubtask.labels || existing.labels || []).map(cleanLabel).filter(Boolean),
-    isSubtask: true,
-    oid: existing.oid || generateUniqueOid(settings),
-    parentId: parentTask.id || existing.parentId || "",
-    parentOid: parentTask.oid || existing.parentOid || "",
-    parentContent: parentTask.content || existing.parentContent || "",
-    projectId: parentTask.projectId || existing.projectId || "",
-    projectName: parentTask.projectName || existing.projectName || "",
-    section: parentTask.section || existing.section || "",
-    sectionId: parentTask.sectionId || existing.sectionId || ""
-  });
-  merged.knowledge = taskKnowledgeSnapshot(merged, settings, "", merged.knowledge || null);
-  return merged;
-}
-
-function taskDeduplicationAiMergeTaskFromResponse(parsed = {}, existing = {}, incoming = {}, settings = DEFAULT_SETTINGS) {
-  const task = parsed?.task && typeof parsed.task === "object" ? parsed.task : {};
-  return {
-    content: singleLine(task.content || incoming.content || existing.content || ""),
-    description: truncateMarkdownAtWord(task.description || incoming.description || existing.description || "", Number(settings.todoistDescriptionMaxChars || DEFAULT_SETTINGS.todoistDescriptionMaxChars || 8000)),
-    due_date: task.due_date || incoming.due_date || existing.due_date || "",
-    deadline_date: task.deadline_date || incoming.deadline_date || existing.deadline_date || "",
-    priority: normalizePriority(task.priority || incoming.priority || existing.priority || 1),
-    labels: (task.labels || mergedTaskLabelsForDeduplication(incoming.labels || [], existing.labels || [], settings)).map(cleanLabel).filter(Boolean),
-    subtasks: (task.subtasks || []).map((subtask) => ({
-      content: singleLine(subtask.content || ""),
-      description: subtask.description || "",
-      due_date: subtask.due_date || "",
-      deadline_date: subtask.deadline_date || "",
-      priority: normalizePriority(subtask.priority || 1),
-      labels: (subtask.labels || []).map(cleanLabel).filter(Boolean)
-    })).filter((subtask) => subtask.content)
-  };
-}
-
-function mergeGeneratedDuplicateSubtasks(targetSubtasks = [], duplicateSubtasks = [], settings = DEFAULT_SETTINGS) {
-  const merged = Array.isArray(targetSubtasks) ? targetSubtasks : [];
-  for (const subtask of duplicateSubtasks || []) {
-    if (!subtask?.content) continue;
-    const candidates = merged.map((task, index) => ({
-      id: task.id || task.oid || `generated-subtask:${index}`,
-      generatedTask: task,
-      task: Object.assign({}, task, { id: task.id || task.oid || `generated-subtask:${index}` })
-    }));
-    const decision = bestTaskDeduplicationMatch(subtask, candidates, settings, { isSubtask: true, intraBatch: true });
-    if (decision.decision === "merge" && decision.candidate?.generatedTask) {
-      continue;
-    } else {
-      merged.push(subtask);
-    }
-  }
-  return merged;
 }
 
 function taskDeduplicationThreshold(settings = DEFAULT_SETTINGS) {
@@ -14737,14 +15631,68 @@ function isAiMediatedTaskDeduplicationCandidate(decision = {}) {
   return Boolean(decision?.candidate && (decision.decision === "merge" || decision.decision === "ambiguous"));
 }
 
+function taskDeduplicationResolution(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  if (!isAiMediatedTaskDeduplicationCandidate(decision)) return "none";
+  if (decision.decision === "ambiguous") return isCredibleLocalAmbiguousTaskCandidate(decision, settings, options) ? "manual" : "none";
+  if (settings.enableAiAmbiguousTaskDeduplication !== true) return "local";
+  return isLocallyConclusiveTaskDuplicate(decision, settings, options) ? "local" : "ai";
+}
+
+function isCredibleLocalAmbiguousTaskCandidate(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  if (decision.decision !== "ambiguous" || decision.hardMismatch || !decision.candidate?.task) return false;
+  if (isTaskDeduplicationRoutingBoilerplate(decision.sourceTask) || isTaskDeduplicationRoutingBoilerplate(decision.candidate.task)) return false;
+  const strictness = settings.taskDeduplicationStrictness || DEFAULT_SETTINGS.taskDeduplicationStrictness;
+  const band = strictness === "strict" ? 6 : strictness === "permissive" ? 14 : 10;
+  const confidenceFloor = taskDeduplicationThreshold(settings) - band;
+  const confidence = Number(decision.confidence || 0);
+  const titleOverlap = Number(decision.titleOverlap || 0);
+  const contextOverlap = Number(decision.contextOverlap || 0);
+  if (contextOverlap >= 0.55) return true;
+  if (confidence >= confidenceFloor && (titleOverlap >= 0.3 || contextOverlap >= 0.38 || decision.projectContextMatch === true)) return true;
+  return Boolean(options.intraBatch && decision.batchContextMatch === true && titleOverlap >= 0.2 && contextOverlap >= 0.3);
+}
+
+function isTaskDeduplicationRoutingBoilerplate(task = {}) {
+  const text = `${task?.content || ""} ${task?.description || ""}`;
+  return /\blive[-_\s]?reply[-_\s]?to\b|\breply[-_\s]?to\s+(?:address|alias|mailbox)\b.*\b(?:captur|track|ticket|cop(?:y|ied))\w*/i.test(text);
+}
+
+function isLocallyConclusiveTaskDuplicate(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  if (decision.decision !== "merge" || decision.hardMismatch || !decision.candidate?.task) return false;
+  const incomingTitle = canonicalTaskMatchTitle(decision.sourceTask?.content || decision.taskSource?.content || "");
+  const existingTitle = canonicalTaskMatchTitle(decision.candidate.task.content || "");
+  const exactTitleReason = (decision.reasons || []).some((reason) => /exact task title|near-exact task title/i.test(reason));
+  const exactTitle = exactTitleReason || Boolean(incomingTitle && incomingTitle === existingTitle);
+  if (exactTitle && Number(decision.titleOverlap || 0) >= 0.94) return true;
+  if (decision.hierarchyMismatch && !exactTitle) return false;
+  const strictness = settings.taskDeduplicationStrictness || DEFAULT_SETTINGS.taskDeduplicationStrictness;
+  const config = strictness === "strict"
+    ? { confidence: 98, title: 0.9, context: 0.6, corroboratedTitle: 0.8, corroboratedContext: 0.78 }
+    : strictness === "permissive"
+      ? { confidence: 94, title: 0.84, context: 0.5, corroboratedTitle: 0.7, corroboratedContext: 0.68 }
+      : { confidence: 96, title: 0.86, context: 0.55, corroboratedTitle: 0.75, corroboratedContext: 0.72 };
+  const confidence = Number(decision.confidence || 0);
+  const titleOverlap = Number(decision.titleOverlap || 0);
+  const contextOverlap = Number(decision.contextOverlap || 0);
+  if (confidence >= config.confidence && titleOverlap >= config.title && contextOverlap >= config.context) return true;
+  return Boolean(
+    confidence >= config.confidence + 1 &&
+    decision.projectContextMatch === true &&
+    titleOverlap >= config.corroboratedTitle &&
+    contextOverlap >= config.corroboratedContext &&
+    !options.crossProject
+  );
+}
+
 function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
   const threshold = taskDeduplicationThreshold(settings);
+  const sourceFeatures = taskDeduplicationFeatures(task, settings, options);
   let best = null;
   for (const candidate of candidates) {
     if (!candidate?.id || candidate.task?.isCompleted) continue;
-    const scored = taskDeduplicationScore(task, candidate, settings, options);
+    const scored = taskDeduplicationScore(task, candidate, settings, options, sourceFeatures);
     if (scored.hierarchyMismatch && !scored.hierarchyCandidate) continue;
-    if (!best || scored.confidence > best.confidence) best = scored;
+    if (!best || scored.confidence > best.confidence) best = Object.assign(scored, { sourceTask: task });
   }
   if (!best || !best.candidate) return { decision: "create", confidence: 0, reasons: ["No active local candidate."], candidate: null };
   const contextSupported = best.projectContextMatch === true;
@@ -14756,20 +15704,37 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
   return Object.assign(best, { decision: "create" });
 }
 
-function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, options = {}) {
+function taskDeduplicationFeatures(task = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  const knowledge = task?.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, settings, "", task?.knowledge || null);
+  if (task && !task.knowledge?.intent) task.knowledge = knowledge;
+  const title = canonicalTaskMatchTitle(task?.content || "");
+  return {
+    knowledge,
+    title,
+    titleTokens: taskDedupeTokenSet(title),
+    hierarchyTitleTokens: taskDedupeTokenSet(task?.content || ""),
+    contextTokens: taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, task, { knowledge }))),
+    parentTokens: taskDedupeTokenSet([task.parentContent || options.parentContent || "", task.parentDescription || ""].join(" "))
+  };
+}
+
+function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, options = {}, preparedSource = null) {
   const existing = candidate.task || {};
-  const sourceKnowledge = task?.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, settings, "", task?.knowledge || null);
-  const existingKnowledge = existing.knowledge?.intent ? existing.knowledge : taskKnowledgeSnapshot(existing, settings, "", existing.knowledge || null);
-  if (task && !task.knowledge?.intent) task.knowledge = sourceKnowledge;
-  if (existing && !existing.knowledge?.intent) existing.knowledge = existingKnowledge;
-  const sourceTitle = canonicalTaskMatchTitle(task?.content || "");
-  const existingTitle = canonicalTaskMatchTitle(existing.content || "");
-  const sourceTitleTokens = taskDedupeTokenSet(sourceTitle);
-  const existingTitleTokens = taskDedupeTokenSet(existingTitle);
+  const sourceFeatures = preparedSource || taskDeduplicationFeatures(task, settings, options);
+  const featureCache = options.taskDeduplicationFeatureCache instanceof WeakMap ? options.taskDeduplicationFeatureCache : null;
+  let existingFeatures = featureCache?.get(existing);
+  if (!existingFeatures) {
+    existingFeatures = taskDeduplicationFeatures(existing, settings);
+    if (featureCache && existing && typeof existing === "object") featureCache.set(existing, existingFeatures);
+  }
+  const sourceKnowledge = sourceFeatures.knowledge;
+  const existingKnowledge = existingFeatures.knowledge;
+  const sourceTitle = sourceFeatures.title;
+  const existingTitle = existingFeatures.title;
+  const sourceTitleTokens = sourceFeatures.titleTokens;
+  const existingTitleTokens = existingFeatures.titleTokens;
   const titleOverlap = tokenDiceScore(sourceTitleTokens, existingTitleTokens);
-  const sourceContextTokens = taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, task, { knowledge: sourceKnowledge })));
-  const existingContextTokens = taskDedupeTokenSet(taskDeduplicationContextText(Object.assign({}, existing, { knowledge: existingKnowledge })));
-  const contextOverlap = tokenDiceScore(sourceContextTokens, existingContextTokens);
+  const contextOverlap = tokenDiceScore(sourceFeatures.contextTokens, existingFeatures.contextTokens);
   const sameProject = sameTaskDeduplicationProject(task, existing);
   const differentConcreteProject = differentConcreteTaskDeduplicationProject(task, existing);
   const projectContextEligible = sameProject && !isGenericTodoistInboxTask(task) && !isGenericTodoistInboxTask(existing);
@@ -14781,7 +15746,11 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
   const hierarchy = taskDeduplicationHierarchySignal(task, existing, options, {
     titleOverlap,
     contextOverlap,
-    sharedTitleTokens
+    sharedTitleTokens,
+    sourceTitleTokens: sourceFeatures.hierarchyTitleTokens,
+    existingTitleTokens: existingFeatures.hierarchyTitleTokens,
+    sourceParentTokens: sourceFeatures.parentTokens,
+    existingParentTokens: existingFeatures.parentTokens
   });
   const progressDistinct = taskDeduplicationProgressDistinct(task, existing, {
     titleOverlap,
@@ -14922,7 +15891,7 @@ function applyTaskDeduplicationMatch(task, decision, settings = DEFAULT_SETTINGS
   task.due_date = task.due_date || existing.due_date || "";
   task.deadline_date = task.deadline_date || existing.deadline_date || "";
   task.duration = normalizeTodoistDuration(task.duration) || normalizeTodoistDuration(existing.duration);
-  task.description = isRichTodoistDescription(task.description) ? task.description : existing.description || task.description || "";
+  task.description = task.description || existing.description || "";
   task.section = task.section || existing.section || "";
   task.sectionId = task.sectionId || existing.sectionId || "";
   task.projectId = task.projectId || existing.projectId || "";
@@ -15001,25 +15970,36 @@ function taskDeduplicationCandidateFlag(task = {}, decision = {}, settings = DEF
   };
 }
 
+function flagPossibleDuplicateTask(stats = emptyTaskDeduplicationStats(), task = {}, decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
+  stats.candidateFlags.push(taskDeduplicationCandidateFlag(task, decision, settings, options));
+  stats.ambiguous += 1;
+  task.possibleDuplicate = {
+    candidateId: decision.id || decision.candidate?.id || "",
+    confidence: Number(decision.confidence || 0),
+    reasons: (decision.reasons || []).slice(0, 3)
+  };
+  return task;
+}
+
 function taskDeduplicationCandidateChatMessage(flags = [], options = {}) {
   const source = options.source ? ` from ${options.source}` : "";
   const path = options.path ? `\nSource: ${options.path}` : "";
   const lines = [
-    `Possible duplicate tasks were found${source}, but AI-mediated deduplication is off.`,
-    "No task merge was applied. Local-only deduplication can be less accurate and less efficient than AI-mediated review, so please manually inspect these candidates and edit Todoist or the generated task list as needed.",
+    `${TASK_DUPLICATE_CANDIDATE_MARKER} Possible duplicate task${flags.length === 1 ? "" : "s"} found locally${source}.`,
+    "No automatic merge was applied, and the marker is shown only in chat; it is never added to Todoist.",
     path,
     ""
   ].filter((line) => line !== "");
   flags.slice(0, 8).forEach((flag, index) => {
     const where = [flag.projectName ? `Project: ${flag.projectName}` : "", flag.section ? `Section: ${flag.section}` : "", flag.parentContent ? `Parent: ${truncateAtWord(flag.parentContent, 80)}` : ""].filter(Boolean).join(" | ");
-    lines.push(`${index + 1}. Generated task: ${flag.task || "Untitled task"}`);
+    lines.push(`${index + 1}. ${TASK_DUPLICATE_CANDIDATE_MARKER} Generated task: ${flag.task || "Untitled task"}`);
     lines.push(`   Possible duplicate: ${flag.link || flag.candidate || "Earlier generated task"} (${flag.candidateType}, local score ${flag.confidence || 0})`);
     if (where) lines.push(`   Context: ${where}`);
     if (flag.reasons?.length) lines.push(`   Local evidence: ${flag.reasons.join("; ")}`);
   });
   if (flags.length > 8) lines.push(`...and ${flags.length - 8} more possible duplicate${flags.length - 8 === 1 ? "" : "s"}.`);
   lines.push("");
-  lines.push("To merge automatically next time, turn on AI-mediated deduplication or choose a dedupe model in settings.");
+  lines.push("Review the generated task and likely match in Todoist.");
   return lines.join("\n");
 }
 
@@ -15116,10 +16096,12 @@ function taskDeduplicationHierarchySignal(task = {}, existing = {}, options = {}
   const sameParent = Boolean(sourceParentId && existingParentId && sourceParentId === existingParentId);
   const differentParent = Boolean(sourceIsSubtask && existingIsSubtask && sourceParentId && existingParentId && sourceParentId !== existingParentId);
   const crossHierarchy = sourceIsSubtask !== existingIsSubtask;
-  const sourceTitleTokens = taskDedupeTokenSet(task?.content || "");
-  const existingTitleTokens = taskDedupeTokenSet(existing.content || "");
-  const sourceParentOverlap = tokenDiceScore(taskDedupeTokenSet([task.parentContent || options.parentContent || "", task.parentDescription || ""].join(" ")), existingTitleTokens);
-  const existingParentOverlap = tokenDiceScore(taskDedupeTokenSet([existing.parentContent || "", existing.parentDescription || ""].join(" ")), sourceTitleTokens);
+  const sourceTitleTokens = metrics.sourceTitleTokens || taskDedupeTokenSet(task?.content || "");
+  const existingTitleTokens = metrics.existingTitleTokens || taskDedupeTokenSet(existing.content || "");
+  const sourceParentTokens = metrics.sourceParentTokens || taskDedupeTokenSet([task.parentContent || options.parentContent || "", task.parentDescription || ""].join(" "));
+  const existingParentTokens = metrics.existingParentTokens || taskDedupeTokenSet([existing.parentContent || "", existing.parentDescription || ""].join(" "));
+  const sourceParentOverlap = tokenDiceScore(sourceParentTokens, existingTitleTokens);
+  const existingParentOverlap = tokenDiceScore(existingParentTokens, sourceTitleTokens);
   const parentSubtaskRestatement = Boolean(crossHierarchy && (
     (metrics.titleOverlap || 0) >= 0.58 ||
     (metrics.contextOverlap || 0) >= 0.56 ||
@@ -15226,7 +16208,7 @@ function taskDeduplicationSubtaskText(task = {}) {
 }
 
 function taskDeduplicationSourceContextText(options = {}) {
-  const lines = ["Source and note context for AI-mediated deduplication:"];
+  const lines = ["Source and note context for duplicate detection and task generation:"];
   if (options.source) lines.push(`Workflow: ${options.source}`);
   if (options.path) lines.push(`Source path: ${options.path}`);
   if (options.sectionName) lines.push(`Generated Todoist section: ${options.sectionName}`);
@@ -15268,6 +16250,7 @@ function taskDeduplicationAiTaskCard(task = {}) {
 
 function scrubTaskDeduplicationBoilerplate(text = "") {
   return String(text || "")
+    .replace(/\s*\[dup\?\]\s*/gi, " ")
     .replace(/\b\S*reply[-_\s]?to\S*\b/gi, " ")
     .replace(/\b(?:cc|copy|keep|include)\s+(?:the\s+)?(?:reply[-_\s]?to|tracking|ticket|mailbox|inbox)\s+(?:address|alias|mailbox|email)?\b/gi, " ")
     .replace(/\b(?:so|to ensure)\s+(?:records?|tickets?|emails?)\s+(?:are|is)\s+(?:captured|tracked|logged)\b/gi, " ")

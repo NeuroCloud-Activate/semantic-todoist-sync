@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.29
+
+- Improved semantic context retrieval with project-aware history and task-query scoping, duplicate-context collapse, and updated embedding content keys so changed index content is refreshed safely.
+- Grounded generated task descriptions in task-specific source and context evidence, while preserving source links and concise citations.
+- Made task deduplication faster and more conservative: clear local matches are resolved locally, credible ambiguities are flagged in chat for review, and AI confirmation is limited to unresolved strong matches without allowing it to rewrite task fields.
+
 ## 0.6.28
 
 - Preserved wording from note and email links when building Todoist descriptions, converting bare URLs into descriptive Markdown hyperlinks instead of exposing direct links.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.30
+
+- Expanded local task-request analysis to preserve passive requests, staged work, document-specific criteria, named decision alternatives, decision criteria, requested output formats, and deliverable-recipient bindings before AI repair is considered.
+- Strengthened task hierarchy and description validation so generated tasks retain source-supported intent, purpose, dependencies, constraints, exclusions, expected outcomes, and task-specific semantic-index evidence without borrowing details from neighbouring tasks.
+- Improved local-first duplicate handling and post-match task generation so duplicate detection does not overwrite richer generated task details, ambiguous candidates stay out of Todoist payloads, and same-batch or existing-task updates continue through the regular grounded generation workflow.
+- Unified and hardened Email-To-Todoist and Notes-To-Todoist processing for actionability, chronology, ownership, descriptive links, source-list formatting, unique email-note titles, and timezone-consistent timestamps.
+- Kept provider-aware model selection configurable with GPT 5.4 and GPT 5.4 Mini as the OpenAI primary/fallback defaults and Gemini 3.5 Flash and Gemini 3.1 Flash Lite as the Gemini defaults.
+
 ## 0.6.29
 
 - Improved semantic context retrieval with project-aware history and task-query scoping, duplicate-context collapse, and updated embedding content keys so changed index content is refreshed safely.

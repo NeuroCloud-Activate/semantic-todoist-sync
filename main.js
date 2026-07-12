@@ -2963,11 +2963,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskQuery
     );
     const taskInstructions = this.taskInstructionsForSource(source.type);
+    const requestedActionSignals = taskRequestedActionSignals(sourceSummary, source.type);
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
     const instructions = [
       source.templateInstructions ? `Selected prompt:\n${source.templateInstructions}` : "",
       `Generation limits:\nCreate no more than ${maxMainTasks} main tasks. Create no more than ${maxSubtasks} subtasks under any main task. It is better to create fewer high-confidence tasks than to fill the limit.`,
+      taskRequestSignalInstructions(requestedActionSignals),
       taskGenerationRequirements(taskInstructions, this.settings)
     ].filter(Boolean).join("\n\n");
     const adaptivePack = this.buildAdaptiveContextPack({
@@ -2999,7 +3001,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "When ranked vault context conflicts on the same topic, prefer the newest matching note as the current guidance while preserving older notes only as background.",
         "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
         source.type === "email" ? "For emails, assume the user forwarded the message because they want at least one Todoist task created. Create a concise review, reply, follow-up, decision, or completion task from the most relevant thread context unless the email is unreadable or contains only signature/disclaimer material." : "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
+        source.type === "email" ? "Treat the labeled current/latest email message as authoritative for present status and next action. Use earlier quoted history only to identify the object, purpose, dependencies, and unresolved follow-up. Never recreate work that the current message says was reviewed, adjusted, sent, approved, finalized, or otherwise completed; create the next unresolved action instead." : "",
         source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, soft language such as 'let me know what you think', 'for review', 'no immediate review', or 'lots of time to finalize' still indicates a task when the thread includes a draft, document, link, decision, reply, or follow-up context.",
+        source.type === "note" ? "When #todo markers exist, cover every marked action before considering unmarked text. Do not turn unmarked historical, hypothetical, or background imperatives into additional tasks merely because they use an action verb." : "",
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
         "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
@@ -3054,7 +3058,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parsed.semanticContext = context;
     parsed.adaptiveContextDepth = adaptivePack.depth;
     parsed.allowedLabels = Array.from(allowedLabels);
+    parsed.requestedActionSignals = requestedActionSignals;
     parsed.descriptionInstructions = taskInstructions.descriptions;
+    parsed.dateInstructions = taskInstructions.dates;
+    parsed.priorityInstructions = taskInstructions.priorities;
+    parsed.labelInstructions = taskInstructions.tags;
     return parsed;
   }
 
@@ -3063,11 +3071,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       index,
       title: task.content || "",
       currentDescription: task.description || "",
+      intent: task.knowledge?.intent || "",
+      purpose: task.knowledge?.rationale || "",
+      expectedOutcome: task.knowledge?.outcome || task.knowledge?.nextStep || "",
       labels: task.labels || [],
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
     if (!mainTasks.length) return;
-    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
+    hydrateContextCitationEvidence(citationState, context, options.basePath || "");
     const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
     const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, this.settings, citationState);
@@ -3098,7 +3110,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       system: [
         "Write Todoist main-task descriptions only.",
         "Do not change task titles, due dates, priorities, labels, or subtasks.",
-        "For each main task, write one concrete, useful paragraph between 120 and 900 characters, usually 2-4 sentences.",
+        "For each main task, write one concrete, useful paragraph between 120 and 900 characters using 2-4 complete sentences.",
+        "Organize the paragraph in this order without headings: the specific intent and working context; why the work matters or what decision/process it supports; and the expected outcome or observable completion condition.",
+        "Every description must make the task's purpose and expected outcome clear. Use supplied intent, purpose, and expectedOutcome fields as grounded planning hints, not as text to copy.",
         "Every description must pass this local quality gate: at least 80 characters, at least 12 words, not empty, not title-only, not a generic instruction to review/use the source, and not a close paraphrase of the task title.",
         "Do not repeat or paraphrase the task title.",
         "Start with the actionable context itself: name the relevant people, documents, program, meeting, decision, dependency, timing, or constraint when the source provides it.",
@@ -3106,6 +3120,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not write openings like 'The note says', 'The source records', 'The email indicates', a source-title recap, or any filename-first framing.",
         "Then explain why the task matters or what must be clarified so the task can be actioned without reopening every source.",
         "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
+        "Write complete prose sentences. Do not return transcript fragments, dangling questions, pasted subject lines, or sentences that begin with unexplained lowercase text.",
         "Each task has its own evidence bundle. Use only that task's primary-source and supporting evidence; never borrow a person, document, decision, dependency, date, or status from another task's bundle.",
         "Do not add a specific fact, person, date, link, or dependency unless it appears in the corresponding evidence bundle.",
         "Use the adaptive context pack as required supporting context when it is available; prioritize the highest-ranked excerpts that explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
@@ -3116,6 +3131,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Avoid vague openings such as 'This task requires', 'Review the source', 'Complete the task', or 'Use the source material'.",
         "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
         "Do not include source lists, headings, bullets, tags, section names, date metadata, or subtask lists.",
+        "Never mention generated Todoist section identifiers such as Notes_YY_MM_DD_Subject or Email_YY_MM_DD_Subject in a description.",
         "Subtasks must not receive descriptions."
       ].join(" "),
       user: [
@@ -3162,6 +3178,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.setSidebarStatus(`Improving ${weakTasks.length} task description${weakTasks.length === 1 ? "" : "s"}...`);
       await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options);
     }
+    const remainingWeakTasks = (tasks || []).map((task, index) => {
+      const evidence = evidenceByIndex.get(index) || null;
+      return { task, index, evidence, reason: taskDescriptionGroundingReason(task.description, task, evidence, this.settings) };
+    }).filter(({ reason }) => reason !== "passed");
+    if (remainingWeakTasks.length) {
+      this.logLocal("Task descriptions require final targeted repair", {
+        count: remainingWeakTasks.length,
+        tasks: remainingWeakTasks.map(({ task, reason }) => ({ title: task.content || "", reason }))
+      });
+      await this.repairTaskDescriptions(remainingWeakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, Object.assign({}, options, { finalClarityRepair: true }));
+    }
     this.setSidebarStatus("Finalizing task descriptions...");
     for (let index = 0; index < (tasks || []).length; index += 1) {
       const task = tasks[index];
@@ -3174,11 +3201,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
-    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false);
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
+    hydrateContextCitationEvidence(citationState, context, options.basePath || "");
     const fallbackEvidence = buildTaskDescriptionEvidenceBundles(weakTasks.map(({ task }) => task), sourceSummary, context, sourceTitle, this.settings, citationState);
-    const repairItems = weakTasks.map(({ task, index, evidence }, position) => ({
+    const repairItems = weakTasks.map(({ task, index, evidence, reason }, position) => ({
       index,
       title: task.content || "",
+      qualityIssue: reason || "",
+      intent: task.knowledge?.intent || "",
+      purpose: task.knowledge?.rationale || "",
+      expectedOutcome: task.knowledge?.outcome || task.knowledge?.nextStep || "",
       labels: task.labels || [],
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean),
       evidence: (evidence || fallbackEvidence[position])?.prompt || ""
@@ -3211,15 +3243,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       system: [
         "Improve incomplete Todoist main-task descriptions.",
         "Return only JSON matching the schema.",
-        "Each description must be 80-1200 characters and must explain the specific context, rationale, dependencies, people, documents, and next information needed to action the task.",
+        "Each description must be 80-1200 characters and use 2-4 complete sentences that explain the specific intent and context, why the work matters, and the expected outcome or observable completion condition.",
+        "Fix the supplied qualityIssue for every task. Do not return a description with the same defect.",
+        options.finalClarityRepair ? "This is the final targeted repair attempt. Begin with task intent, include an explicit purpose, and end with a supported completion outcome while removing any unsupported fact." : "",
+        "Use supplied intent, purpose, and expectedOutcome fields as grounded planning hints, not as text to copy.",
         "Use active source content first, then use the adaptive portfolio-level context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
         "Use only the evidence bundle attached to the matching task index. Do not borrow specific facts from another task or from unrelated supporting context.",
         "Do not add a person, date, link, document, dependency, decision, or status unless it appears in that task's evidence bundle.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
+        "Do not return transcript fragments, dangling questions, pasted subject lines, or sentences that begin with unexplained lowercase text.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
-        "Do not include source lists, headings, bullets, tags, dates, section names, metadata, or subtask lists."
+        "Do not include source lists, headings, bullets, tags, dates, section names, metadata, or subtask lists.",
+        "Never mention generated Todoist section identifiers such as Notes_YY_MM_DD_Subject or Email_YY_MM_DD_Subject in a description."
       ].join(" "),
       user: [
         `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
@@ -3249,7 +3286,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings, citationState);
       const position = weakTasks.indexOf(match);
       const evidence = match.evidence || fallbackEvidence[position] || null;
-      if (taskDescriptionGroundingReason(summary, match.task, evidence, this.settings) === "passed") match.task.description = truncateAtWord(summary, 1200);
+      const reason = taskDescriptionGroundingReason(summary, match.task, evidence, this.settings);
+      if (reason === "passed") {
+        match.task.description = truncateAtWord(summary, 1200);
+      } else {
+        this.logLocal("Task description repair rejected", { title: match.task.content || "", reason });
+      }
     }
   }
 
@@ -3593,7 +3635,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         });
         if (!ok) continue;
         await this.removeScheduledSubtaskFromNote(item);
-        delete this.settings.taskCache[item.id];
+        this.forgetCachedTaskReference(item.id);
         removed += 1;
       }
       for (const item of undo.previous || []) {
@@ -4027,10 +4069,108 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  async ensureGeneratedTaskRequestCoverage(tasks, plan = {}, options = {}) {
+    const signals = plan.requestedActionSignals || taskRequestedActionSignals(options.sourceContext?.text || plan.sourceSummary || "", options.source || "note");
+    const coverage = taskRequestCoverageReport(tasks, signals);
+    const primarySource = `${options.sourceTitle || ""}\n${options.sourceContext?.text || plan.sourceSummary || ""}`;
+    const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
+    const hierarchyIssues = taskPlanRepairableHierarchyIssues(tasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
+    if (coverage.passed && !hierarchyIssues.length) return { used: false, coverage, hierarchyIssues: [] };
+    const taskInstructions = this.taskInstructionsForSource(sourceType);
+    const prompt = [
+      taskRequestSignalInstructions(signals),
+      `Missing coverage: ${JSON.stringify(coverage)}`,
+      `Hierarchy issues: ${JSON.stringify(hierarchyIssues)}`,
+      `Current generated tasks: ${JSON.stringify(tasks)}`,
+      `Primary source: ${primarySource}`
+    ].join("\n\n");
+    const modelChoice = this.aiModelForRequest("task-generation", {
+      prompt,
+      context: plan.semanticContext || [],
+      taskCount: generationMainTaskLimit(this.settings) + generationSubtaskLimit(this.settings),
+      validationRepair: true
+    });
+    const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+    let repairSeedTasks = tasks;
+    let currentCoverage = coverage;
+    let currentHierarchyIssues = hierarchyIssues;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const attemptPrompt = [
+          taskRequestSignalInstructions(signals),
+          `Missing coverage: ${JSON.stringify(currentCoverage)}`,
+          `Hierarchy issues: ${JSON.stringify(currentHierarchyIssues)}`,
+          `Current generated tasks: ${JSON.stringify(repairSeedTasks)}`,
+          `Primary source: ${primarySource}`
+        ].join("\n\n");
+        const json = await this.withAiActivity(attempt === 1 ? "Repairing missing requested task outcomes" : "Retrying task hierarchy and coverage repair", () => this.openaiResponse({
+          model: modelChoice.model,
+          jsonSchema: taskCreationSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
+          system: [
+            "Repair a generated Todoist task tree that omitted explicit source requests or has a locally detected hierarchy defect.",
+            "Use the regular task-generation schema. Preserve every accurate supported title detail, label, priority, due date, deadline, and useful subtask already present.",
+            "Add or revise only what is needed to cover the supplied missing request signals. Keep one coherent parent with required subtasks when the source describes one staged outcome.",
+            "When hierarchy issues are supplied, make each parent title name its overall deliverable or completion outcome, remove parent/subtask restatements and overlapping siblings, and separate independently completable outcomes. Preserve every distinct required action, criterion, recipient, dependency, and handoff exactly once.",
+            currentHierarchyIssues.some((issue) => issue.code === "subtask-restates-parent") ? "For every subtask-restates-parent issue, remove the redundant child when the parent already carries the full action, or replace it with a genuinely distinct required step supported by the source. Never return one child with the same leading action and object as its parent." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "subtask-mismatched-parent") ? "For every subtask-mismatched-parent issue, move the child under the listed expected parent when it is a required step toward that parent's outcome, or rewrite the hierarchy from the source so every child supports its own parent. Do not delete a distinct requested step merely to clear the issue." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "overlapping-subtasks") ? "For overlapping-subtasks issues, consolidate duplicate wording into one complete child while retaining every distinct criterion and handoff." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "unclear-main-title") ? "For every unclear-main-title issue, rewrite the main title so it independently states the concrete user action and the specific object, document, decision, deliverable, or topic. Replace unexplained pronouns and recipient-only follow-ups with source-supported scope." : "",
+            currentHierarchyIssues.some((issue) => /(?:due|deadline)(?:-date)?$|^explicit-(?:due|deadline)/.test(issue.code)) ? "For date issues, preserve explicit source dates and their stated roles: target or due dates belong in due_date, while explicit hard deadlines belong in deadline_date. Otherwise choose a reasonable future date supported by the source timing and configured date rules, or return null when no defensible date can be inferred." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "stale-email-action") ? "For stale-email-action issues, do not recreate work the current/latest message marks complete. Use quoted history only to identify the object and purpose, then generate the next unresolved action supported by the latest status." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "wrong-owner-action") ? "For wrong-owner-action issues, do not assign the user work explicitly owned by another person or team. Generate only the user's supported review, follow-up, request, coordination, decision, or handoff action." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "unsupported-high-priority") ? "For unsupported-high-priority issues, keep priority 4 only when the source, timing, consequences, or configured priority rules clearly support the highest urgency. Otherwise return the appropriate lower priority." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "under-prioritized-urgent-task") ? "For under-prioritized-urgent-task issues, assign priority 3 or 4 according to the configured priority rules because the task-specific source evidence explicitly marks that work urgent, critical, blocking, overdue, or immediate. Do not raise unrelated tasks." : "",
+            currentHierarchyIssues.some((issue) => issue.code === "unsupported-task-label") ? "For unsupported-task-label issues, remove the label or apply it only to a task whose title and scope satisfy that label's explicit configured condition. Do not move labels between unrelated task topics." : "",
+            attempt === maxAttempts ? "This is the final focused repair attempt. Resolve every listed issue in the supplied current tree without repeating a parent as its own subtask." : "",
+            "Do not invent people, recipients, documents, dates, links, dependencies, ownership, or outcomes.",
+            "Return descriptions as empty strings because descriptions are generated after this repair.",
+            taskGenerationRequirements(taskInstructions, this.settings)
+          ].filter(Boolean).join(" "),
+          user: [
+            attemptPrompt,
+            "",
+            "Relevant local semantic-index context:",
+            formatContext(plan.semanticContext || [], Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, options.sourceTitle || plan.sourceSummary || "") || "No additional semantic context."
+          ].join("\n")
+        }));
+        const parsed = JSON.parse(json);
+        const repaired = limitGeneratedTasks((parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content), generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings));
+        const grounded = groundGeneratedTaskPlan(repaired, primarySource, this.settings);
+        const repairedCoverage = taskRequestCoverageReport(grounded.tasks, signals);
+        const repairedHierarchyIssues = taskPlanRepairableHierarchyIssues(grounded.tasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
+        if (grounded.tasks.length && !grounded.rejected.length && repairedCoverage.passed && !repairedHierarchyIssues.length && taskRequestRepairPreservesExisting(tasks, grounded.tasks)) {
+          tasks.splice(0, tasks.length, ...grounded.tasks);
+          this.logLocal("Requested task outcomes repaired", { source: options.source || "", tasks: flattenTaskPlan(tasks).length, attempts: attempt });
+          return { used: true, applied: true, coverage: repairedCoverage, hierarchyIssues: repairedHierarchyIssues, attempts: attempt };
+        }
+        this.logLocal("Requested task outcome repair rejected", {
+          source: options.source || "",
+          attempt,
+          missing: currentCoverage,
+          repairedMissing: repairedCoverage,
+          repairedHierarchyIssues,
+          groundedTasks: grounded.tasks.length,
+          rejectedTasks: grounded.rejected.length
+        });
+        if (grounded.tasks.length && !grounded.rejected.length) {
+          repairSeedTasks = grounded.tasks;
+          currentCoverage = repairedCoverage;
+          currentHierarchyIssues = repairedHierarchyIssues;
+        }
+      } catch (error) {
+        this.logLocal("Requested task outcome repair skipped", { source: options.source || "", attempt, error: error.message || String(error) });
+      }
+    }
+    return { used: true, applied: false, coverage, hierarchyIssues, attempts: maxAttempts };
+  }
+
   async prepareGeneratedTasksForTodoistWorkflow(tasks, plan = {}, options = {}) {
     const todoistBound = options.prepareTodoistSection === true;
     const sectionName = options.sectionName || plan.sectionName || "";
     this.setSidebarStatus(options.status || (todoistBound ? "Preparing descriptions and Todoist section..." : "Writing task descriptions..."));
+    const requestRepair = await this.ensureGeneratedTaskRequestCoverage(tasks, plan, options);
+    plan.requestCoverageRepair = requestRepair;
     const projectIdPromise = todoistBound ? this.getTaskProjectId() : Promise.resolve("");
     const projectNamePromise = projectIdPromise.then((projectId) => projectId ? this.todoistProjectNameForId(projectId) : "");
     const sectionIdPromise = todoistBound
@@ -4064,7 +4204,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       semanticContext: options.semanticContext || plan.semanticContext || [],
       includeLiveTodoistCandidates: todoistBound
     };
+    const preDedupeStructure = taskStructureSafetySnapshot(tasks);
     const dedupeStats = await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
+    const restoredDedupeStructures = restoreTaskStructureAfterDedupeRegression(tasks, preDedupeStructure);
+    if (restoredDedupeStructures > 0) this.logLocal("Restored validated task structure after deduplication regression", { source: options.source || "", tasks: restoredDedupeStructures });
     if (options.citeContextNotes !== false && (dedupeStats.generatedDuplicates > 0 || dedupeStats.merged > 0)) {
       addContextToTaskDescriptions(
         tasks,
@@ -4076,6 +4219,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         true
       );
     }
+    const deterministicFallbacks = enforceDeterministicDescriptionFallbacks(tasks, plan, options, this.settings);
+    if (deterministicFallbacks > 0) this.logLocal("Applied final deterministic task description fallback", { source: options.source || "", count: deterministicFallbacks });
     const quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
     plan.localQualityReport = quality;
     if (!quality.passed) {
@@ -4086,8 +4231,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         elapsedMs: quality.elapsedMs
       });
     }
-    if (quality.blockingIssues > 0) throw new Error(`Generated tasks failed ${quality.blockingIssues} blocking local quality check${quality.blockingIssues === 1 ? "" : "s"}.`);
-    return { projectId, projectName, sectionId, quality };
+    if (quality.blockingIssues > 0) {
+      const details = quality.issues.filter((issue) => issue.blocking).map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
+      throw new Error(`Generated tasks failed ${quality.blockingIssues} blocking local quality check${quality.blockingIssues === 1 ? "" : "s"}: ${details}.`);
+    }
+    return { projectId, projectName, sectionId, quality, requestRepair };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -4958,6 +5106,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async taskDeduplicationCandidates(options = {}) {
     const index = this.getTaskReferenceIndex();
+    const semanticRanks = semanticTaskReferenceCandidateRanks(options.semanticContext || []);
     const candidates = [];
     for (const [id, task] of index.entries || []) {
       if (!id || !task?.content || task.isCompleted) continue;
@@ -4965,10 +5114,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const parentContext = taskReferenceParentContext(task, index);
       const enrichedTask = Object.assign({}, task, parentContext, { id: String(id), childText });
       const knowledge = enrichedTask.knowledge?.intent ? enrichedTask.knowledge : taskKnowledgeSnapshot(enrichedTask, this.settings, childText, enrichedTask.knowledge || null);
-      candidates.push({ id: String(id), task: Object.assign(enrichedTask, { knowledge }) });
+      const semanticIndexRank = semanticRanks.get(String(task.oid || "").toUpperCase()) || 0;
+      candidates.push({ id: String(id), task: Object.assign(enrichedTask, { knowledge }), semanticIndexRank });
     }
     if (shouldUseLiveTodoistDeduplicationCandidates(options)) {
       candidates.push(...await this.liveTodoistTaskDeduplicationCandidates(candidates, options));
+    }
+    for (const candidate of candidates) {
+      if (candidate.semanticIndexRank) continue;
+      candidate.semanticIndexRank = semanticRanks.get(String(candidate.task?.oid || "").toUpperCase()) || 0;
     }
     return candidates;
   }
@@ -5086,11 +5240,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const parsed = JSON.parse(json);
       const allowedLabels = new Set(uniqueValues([...(task.labels || []), ...(existing.labels || [])]).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
       const generated = cleanTask(parsed?.tasks?.[0] || {}, allowedLabels, this.settings);
-      if (!duplicateTaskGenerationPreservesEvidence(generated, task, existing, this.settings)) {
+      const hierarchyIssues = taskPlanRepairableHierarchyIssues([generated]);
+      const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
+      const priorityEvidence = [taskDeduplicationSourceContextText(options), taskDeduplicationContextText(task), taskDeduplicationContextText(existing)].filter(Boolean).join("\n\n");
+      const priorityValidationTask = Number(generated.priority || 1) === Number(existing.priority || 1)
+        ? Object.assign({}, generated, { id: existing.id || "existing-priority" })
+        : generated;
+      const priorityIssues = generatedTaskPriorityIssues([priorityValidationTask], priorityEvidence, this.taskInstructionsForSource(sourceType).priorities || "", this.settings);
+      if (!duplicateTaskGenerationPreservesEvidence(generated, task, existing, this.settings) || hierarchyIssues.length || priorityIssues.length) {
         this.logLocal("Confirmed duplicate task generation update rejected", {
           source: options.source || "",
           task: truncateAtWord(task.content || "", 100),
-          candidate: truncateAtWord(existing.content || "", 100)
+          candidate: truncateAtWord(existing.content || "", 100),
+          hierarchyIssues: hierarchyIssues.concat(priorityIssues).map((issue) => issue.code)
         });
         return null;
       }
@@ -5273,7 +5435,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const [id, cached] of cachedEntries) {
       if (presentIds.has(id)) continue;
       if (cached.isCompleted) {
-        delete this.settings.taskCache[id];
+        this.forgetCachedTaskReference(id);
         forgotCompleted += 1;
         continue;
       }
@@ -5289,7 +5451,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           projectId: cached.projectId || ""
         });
       }
-      delete this.settings.taskCache[id];
+      this.forgetCachedTaskReference(id);
       deleted += 1;
     }
     if (deleted || forgotCompleted) this.markTaskReferenceStateDirty();
@@ -5580,8 +5742,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           continue;
         }
         await this.removeDeletedTodoistTaskFromNote(cached);
-        delete this.settings.taskCache[taskId];
-        this.markTaskReferenceStateDirty();
+        this.forgetCachedTaskReference(taskId);
         savedEvents.add(event.id);
         continue;
       }
@@ -5706,6 +5867,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.markTaskReferenceStateDirty();
     this.queueTaskReferenceIndexUpdate(path);
     this.observeSchedulerMemoryForTask(id, this.settings.taskCache[id], "task-cache");
+  }
+
+  forgetCachedTaskReference(id) {
+    const cached = this.settings.taskCache?.[id];
+    if (!cached) return false;
+    delete this.settings.taskCache[id];
+    this.markTaskReferenceStateDirty();
+    this.queueTaskReferenceIndexUpdate(cached.path || "");
+    return true;
   }
 
   savePendingTaskDescriptions(path, tasks) {
@@ -9109,7 +9279,7 @@ function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT
     }
     const subtasks = [];
     for (const subtask of task.subtasks || []) {
-      if (generatedTaskMatchesPrimarySource(subtask, `${sourceText}\n${task.content || ""}`)) subtasks.push(subtask);
+      if (generatedTaskMatchesPrimarySource(subtask, `${sourceText}\n${task.content || ""}`) && subtaskClarityReason(subtask, task) === "passed") subtasks.push(subtask);
       else rejected.push(subtask);
     }
     grounded.push(Object.assign({}, task, { subtasks }));
@@ -10712,13 +10882,15 @@ function cleanTask(task, allowedLabels = null, settings = DEFAULT_SETTINGS) {
 }
 
 function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false, settings = DEFAULT_SETTINGS) {
-  const labels = (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
+  const labels = isSubtask && !settings.subtaskIncludeLabels
+    ? []
+    : (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
   return {
     content: clamp(singleLine(task.content || ""), 250),
     description: isSubtask ? "" : cleanGeneratedDescriptionSummary(task.description || ""),
-    due_date: validDate(task.due_date) ? task.due_date : null,
-    deadline_date: validDate(task.deadline_date) ? task.deadline_date : null,
-    priority: normalizePriority(task.priority),
+    due_date: isSubtask && !settings.subtaskIncludeDueDate ? null : validDate(task.due_date) ? task.due_date : null,
+    deadline_date: isSubtask && !settings.subtaskIncludeDeadline ? null : validDate(task.deadline_date) ? task.deadline_date : null,
+    priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority),
     labels,
     subtasks: (task.subtasks || []).map((subtask) => cleanTaskWithRole(subtask, allowedLabels, true, settings)).filter((subtask) => subtask.content)
   };
@@ -12796,7 +12968,8 @@ function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
     }
     if (depth >= 2 && pack.taskCards?.length) {
       sections.push(["Secondary Todoist task references - related existing actions only:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
-    } else if (depth >= 2 && pack.taskContext) {
+    }
+    if (depth >= 2 && pack.taskContext) {
       sections.push(["Secondary existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
     }
   } else {
@@ -12805,7 +12978,8 @@ function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
     }
     if (depth >= 2 && pack.taskCards?.length) {
       sections.push(["Tier 2-3 - Task snapshots, intent, and rationale:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
-    } else if (depth >= 2 && pack.taskContext) {
+    }
+    if (depth >= 2 && pack.taskContext) {
       sections.push(["Tier 2 - Existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
     }
     if (depth >= 4 && pack.noteCards?.length) {
@@ -13073,6 +13247,8 @@ function annotateContextChunk(item, profile = {}) {
   if (item.scopeMatch && (profile.primaryAnchorTerms || []).length) reasons.push(`subject match: ${(item.matchedScopeTerms || []).join(", ")}`);
   return Object.assign({}, chunk, {
     matchScore: Math.round(score * 1000) / 1000,
+    semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000,
+    lexicalScore: Math.round(Number(item.lexical || 0) * 1000) / 1000,
     matchRationale: reasons.join("; ") || "lexical fallback",
     retrievalIntent: profile.intent || "focused",
     retrievalScopeTerms: (profile.requiredAnchorTerms || profile.primaryAnchorTerms || []).slice(0, 5),
@@ -13105,7 +13281,7 @@ function labelsAllowedByInstructions(text) {
   const value = String(text || "");
   if (/\b(?:do\s+not|don't|never)\s+(?:add|create|use)\s+(?:any\s+)?labels?\b|\bno\s+labels?\b/i.test(value)) return new Set();
   const labels = new Set((value.match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
-  return labels.size ? labels : null;
+  return labels;
 }
 
 function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTINGS) {
@@ -13117,6 +13293,10 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "",
     "Main task requirements:",
     `- Actionability: ${taskInstructions.main || "Create only concrete user-owned actions."}`,
+    "- Precision: each title must state the user's immediate action and its specific object, document, person, decision, or deliverable. Preserve named scope and requested outcome when the source supplies them.",
+    "- Hierarchy: when one outcome requires several steps, use a concise parent title that names the overall deliverable or completion outcome. Put review criteria, checks, recipients, dependencies, and handoffs in subtasks instead of listing the full checklist in the parent title.",
+    "- Relevance: do not turn background discussion, quoted history, another person's completed work, or loosely related vault context into a task.",
+    "- Separation: create distinct main tasks only when they have different immediate actions or independently completable outcomes; do not split one requested outcome into paraphrased task records.",
     `- Section title: Return one section_name for the full generated task group. Follow this setting exactly: ${taskInstructions.sectionTitle || "Create one Todoist section for tasks from the same source."}`,
     `- Labels: ${taskInstructions.tags || "Do not add labels unless explicitly instructed."}`,
     `- Priority: ${taskInstructions.priorities || "Assign priority 1 to 4."}`,
@@ -13129,6 +13309,10 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "Subtask requirements:",
     `- Actionability: ${taskInstructions.subtasks || "Create subtasks only for concrete required steps under a main task."}`,
     "- Relationship: every subtask must support its parent main task and must not duplicate the parent task title.",
+    "- Necessity: include a subtask only when it represents a required, independently checkable step toward the parent's expected outcome.",
+    "- Clarity: make every subtask independently understandable in Todoist by stating the specific action and its object, document, decision, or deliverable. Repeat the minimum necessary named scope from the source instead of using unexplained pronouns such as 'it' or 'this'. A recipient alone is not enough; say what must be sent, reviewed, confirmed, or discussed with that person.",
+    "- Do not use background facts, vague reminders, recipient-only follow-ups, or a shorter paraphrase of the parent as a subtask.",
+    "- Coverage: when the source requests review criteria, named checks, recipients, or a final handoff, preserve those as distinct subtasks only when each is actually required.",
     `- Labels: ${settings.subtaskIncludeLabels ? `Allowed when useful, but only from the main label rules: ${taskInstructions.tags || "no labels configured"}` : "Disabled. Return an empty labels array for every subtask."}`,
     `- Priority: ${settings.subtaskIncludePriority ? `Allowed. Assign priority 1 to 4 using the same priority rules: ${taskInstructions.priorities || "use task urgency and importance"}` : "Disabled. Return priority 1 for every subtask."}`,
     `- Due date: ${settings.subtaskIncludeDueDate ? `Allowed only when supported by the source and the Dates and Deadlines setting: ${taskInstructions.dates || "use YYYY-MM-DD dates"}` : "Disabled. Return due_date null for every subtask."}`,
@@ -13136,6 +13320,416 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "- Descriptions: subtasks must not have descriptions.",
     "- Section/project: subtasks inherit the parent task location; do not create a separate section concept for subtasks."
   ].join("\n");
+}
+
+const TASK_REQUEST_SIGNAL_FAMILIES = {
+  review: ["review", "assess", "evaluate", "read"],
+  comparison: ["compare", "reconcile", "cross-check", "cross check", "contrast"],
+  drafting: ["draft", "prepare", "write", "compose"],
+  accuracy: ["accuracy", "accurate", "verify", "verification", "validate", "correct"],
+  gaps: ["gap", "gaps", "missing", "omission", "omissions", "incomplete"],
+  feedback: ["comment", "comments", "feedback", "thought", "thoughts", "input"],
+  revisions: ["tracked changes", "edit", "edits", "revision", "revisions", "adjustment", "adjustments"],
+  incorporation: ["incorporate", "incorporating", "apply", "applying", "integrate", "integrating"],
+  finalization: ["finalize", "finalise", "finalizing", "finalising", "complete", "completing"],
+  documentation: ["document", "documenting", "record", "recording", "summarize", "summarise", "summarizing", "summarising"],
+  recommendation: ["recommend", "recommendation", "recommendations", "propose", "proposal"],
+  highlighted: ["highlight", "highlighted", "highlighting", "marked", "flagged", "annotated"],
+  approval: ["approve", "approval", "sign off", "sign-off"],
+  confirmation: ["confirm", "confirmed", "confirmation", "determine", "verify whether"],
+  response: ["respond", "response", "reply", "follow up", "follow-up"],
+  send: ["send", "share", "submit", "forward", "circulate"],
+  decision: ["decide", "decision", "determine whether", "yes or no"]
+};
+
+const TASK_REQUEST_ACTION_FAMILY_PATTERNS = {
+  review: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:review|reviewing|assess|assessing|evaluate|evaluating|read)\b/i,
+  comparison: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:compare|comparing|reconcile|reconciling|cross[- ]check|cross[- ]checking|contrast|contrasting)\b/i,
+  drafting: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:draft|drafting|prepare|preparing|write|writing|compose|composing)\b/i,
+  revisions: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:edit|editing|revise|revising|update|updating|adjust|adjusting)\b/i,
+  incorporation: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:incorporate|incorporating|apply|applying|integrate|integrating)\b/i,
+  finalization: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:finali[sz]e|finali[sz]ing|complete|completing)\b/i,
+  documentation: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:document|documenting|record|recording|summari[sz]e|summari[sz]ing)\b/i,
+  recommendation: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:recommend|recommending|propose|proposing|provide\s+(?:(?:a|the)\s+)?(?:written\s+)?recommendation|prepare\s+(?:(?:a|the)\s+)?(?:written\s+)?recommendation)\b/i,
+  approval: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:approve|approving|sign[- ]?off)\b/i,
+  confirmation: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:confirm|confirming|determine|determining|verify whether|verifying whether)\b/i,
+  send: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:send|sending|share|sharing|submit|submitting|forward|forwarding|circulate|circulating)\b/i,
+  decision: /(?:^|[.!?]\s*|[,;:]\s*|\b(?:and|then|by|please|to|should|must|needs? to|need to|could you|can you|would you)\s+)(?:decide|deciding|determine whether|determining whether)\b/i
+};
+
+const TASK_REQUEST_PASSIVE_FAMILY_TERMS = {
+  review: ["review", "assessment", "evaluation"],
+  comparison: ["comparison", "reconciliation", "cross-check", "cross check"],
+  drafting: ["draft", "preparation"],
+  feedback: ["feedback", "comments", "input"],
+  revisions: ["revision", "revisions", "edits", "adjustments"],
+  approval: ["approval", "sign-off", "sign off"],
+  confirmation: ["confirmation", "verification"],
+  response: ["response", "reply"],
+  decision: ["decision"]
+};
+
+function taskRequestPassiveFamilyPresent(text = "", family = "") {
+  const variants = TASK_REQUEST_PASSIVE_FAMILY_TERMS[family] || [];
+  if (!variants.length) return false;
+  const term = variants.sort((left, right) => right.length - left.length).map(escapeRegExp).join("|");
+  const value = singleLine(text);
+  return new RegExp(`\\b(?:your\\s+)?(?:${term})\\b[^.!?]{0,120}\\b(?:is|are|remains?|was|were)\\s+(?:still\\s+)?(?:needed|required|requested)\\b`, "i").test(value)
+    || new RegExp(`\\b(?:need|needs|needed|require|requires|required|request|requests|requested)\\s+(?:your|an?|the)\\s+(?:${term})\\b`, "i").test(value);
+}
+
+function taskRequestFamilyPresent(text = "", family = "") {
+  const actionPattern = TASK_REQUEST_ACTION_FAMILY_PATTERNS[family];
+  if (actionPattern?.test(singleLine(text))) return true;
+  if (taskRequestPassiveFamilyPresent(text, family)) return true;
+  if (["drafting", "incorporation", "finalization", "documentation", "recommendation"].includes(family)) return false;
+  return (TASK_REQUEST_SIGNAL_FAMILIES[family] || []).some((variant) => new RegExp(`\\b${escapeRegExp(variant).replace(/\s+/g, "\\s+")}\\b`, "i").test(text));
+}
+
+const TASK_REQUEST_OBJECT_TERMS = new Set(["application", "applications", "draft", "document", "email", "finding", "findings", "guide", "letter", "material", "materials", "memo", "message", "notification", "recommendation", "reply", "report", "response", "summary", "template", "worksheet", "wording"]);
+
+function taskRequestedActionSignals(sourceText = "", sourceType = "note") {
+  const signalText = sourceType === "email" ? emailCurrentSignalText(sourceText) : noteRequiredSignalText(sourceText);
+  const lines = stripTaskAndMetadataLines(signalText).split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const sentences = lines.flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "")));
+  const directRequest = /\b(?:please|may i ask|could you|can you|would you|will you|seeking your|request(?:ed|ing)?|let me know|need(?:ed)? to|needs? your|should|must|required|at your earliest convenience|action item|follow[- ]?up)\b/i;
+  const noteImperative = /^(?:review|assess|compare|verify|confirm|identify|draft|prepare|send|submit|provide|update|finali[sz]e|decide|respond|follow[- ]?up)\b/i;
+  const completedStatus = /\b(?:already|has|have|had|was|were)\s+(?:reviewed|completed|finished|sent|submitted|finali[sz]ed|approved|adjusted)\b|^(?:quickly\s+)?reviewed\b/i;
+  const passiveRequest = (sentence) => Object.keys(TASK_REQUEST_PASSIVE_FAMILY_TERMS).some((family) => taskRequestPassiveFamilyPresent(sentence, family));
+  const requestedSentences = sentences.filter((sentence) => !completedStatus.test(sentence) && (directRequest.test(sentence) || passiveRequest(sentence) || (sourceType !== "email" && noteImperative.test(sentence))));
+  const rawRequestText = requestedSentences.join(". ");
+  const exclusions = taskRequestExplicitExclusions(rawRequestText);
+  const positiveSentences = requestedSentences.map((sentence) => exclusions.reduce((value, exclusion) => value.replace(exclusion.phrase, " "), sentence)).map(singleLine).filter(Boolean);
+  const requestText = positiveSentences.join(". ");
+  const families = Object.entries(TASK_REQUEST_SIGNAL_FAMILIES).filter(([family]) => {
+    if (family === "review" && /\b(?:no|not|does not|doesn't)\s+(?:require|need)\s+(?:an?\s+)?(?:immediate\s+)?review\b/i.test(requestText)) return false;
+    return taskRequestFamilyPresent(requestText, family);
+  }).map(([family]) => family);
+  const objects = uniqueValues([
+    ...generatedTaskObjectTerms(requestText).filter((term) => TASK_REQUEST_OBJECT_TERMS.has(term)).map(normalizeTaskRequestObject),
+    ...(/\b(?:email|message|reply)\b/i.test(requestText) ? ["response"] : [])
+  ]);
+  const people = extractPeopleCandidates(requestText, 8).map(normalizeTaskRequestEntity).filter(Boolean);
+  const entities = uniqueValues(descriptionSpecificEntities(requestText).map(normalizeTaskRequestEntity).filter((entity) => {
+    if (/^(Please|May|Could|Would|Seeking|Let|Your|Subject|Concrete|Steps|Email|Thread)$/i.test(entity)) return false;
+    if (people.some((person) => singleLine(person).toLowerCase() === singleLine(entity).toLowerCase())) return true;
+    const escaped = escapeRegExp(entity).replace(/\s+/g, "\\s+");
+    return new RegExp(`(?:\\b(?:to|with|from|by)\\s+(?:the\\s+)?${escaped}\\b|\\b${escaped}[’']s\\b)`, "i").test(requestText);
+  })).slice(0, 6);
+  const conditional = Boolean(taskRequestConditionType(requestText) || /\bwhether\b/i.test(requestText));
+  const bindings = taskRequestActionBindings(positiveSentences);
+  const constraints = taskRequestExplicitConstraints(requestText);
+  const decisionDetails = families.includes("decision") ? taskRequestDecisionDetails(requestText) : { alternatives: [], criteria: [] };
+  return { sentences: requestedSentences.slice(0, 8), families, objects, entities, conditional, bindings, constraints, exclusions, decisionAlternatives: decisionDetails.alternatives, decisionCriteria: decisionDetails.criteria };
+}
+
+function taskRequestDecisionDetails(value = "") {
+  const text = singleLine(value);
+  const alternatives = [];
+  const optionPatterns = [
+    /\bbetween\s+([^,.;]{2,100}?)\s+and\s+([^,.;]{2,100}?)(?=\s+(?:based on|considering|using|according to)\b|[,.;]|$)/gi,
+    /\beither\s+([^,.;]{2,100}?)\s+or\s+([^,.;]{2,100}?)(?=\s+(?:based on|considering|using|according to)\b|[,.;]|$)/gi
+  ];
+  for (const pattern of optionPatterns) {
+    for (const match of text.matchAll(pattern)) alternatives.push(match[1], match[2]);
+  }
+  const criteria = [];
+  for (const match of text.matchAll(/\b(?:based on|considering|using)\s+([^.;]+?)(?=\s+(?:before|after|then|and then)\b|[.;]|$)/gi)) {
+    criteria.push(...match[1].split(/\s*,\s*|\s+(?:and|or)\s+/i));
+  }
+  const normalize = (item) => singleLine(item).replace(/^(?:(?:and|or)\s+)?(?:(?:the|an|a)\s+)?/i, "").replace(/\s+(?:option|approach|alternative)$/i, "").trim();
+  const generic = new Set(["alternative", "approach", "choice", "criterion", "criteria", "option"]);
+  const useful = (item) => generatedTaskObjectTerms(item).some((term) => !generic.has(term));
+  return {
+    alternatives: uniqueValues(alternatives.map(normalize).filter((item) => item && useful(item))).slice(0, 6),
+    criteria: uniqueValues(criteria.map(normalize).filter((item) => item && useful(item))).slice(0, 8)
+  };
+}
+
+const TASK_REQUEST_EXCLUSION_ACTIONS = {
+  change: ["change", "edit", "revise", "update", "modify", "alter", "rewrite"],
+  send: ["send", "share", "submit", "forward", "circulate", "publish"],
+  review: ["review", "assess", "evaluate", "check", "verify"],
+  include: ["include", "add", "incorporate", "cover", "address"]
+};
+
+function taskRequestExplicitExclusions(value = "") {
+  const text = singleLine(value || "");
+  const exclusions = [];
+  const add = (action, object, phrase) => {
+    const terms = generatedTaskObjectTerms(object).filter((term) => term.length >= 3);
+    if (!terms.length) return;
+    const key = `${action}:${terms.join("|")}`;
+    if (exclusions.some((item) => item.key === key)) return;
+    exclusions.push({ key, action, object: singleLine(object), terms, phrase: singleLine(phrase) });
+  };
+  const actionPattern = Object.values(TASK_REQUEST_EXCLUSION_ACTIONS).flat().sort((left, right) => right.length - left.length).map(escapeRegExp).join("|");
+  const negated = new RegExp(`\\b(?:do not|don't|must not|should not|need not|not required to)\\s+(${actionPattern})\\s+(?:the\\s+)?([^,.;]+?)(?=\\s+(?:and|but)\\s+(?:(?:do not|don't|must not|should not)\\s+)?(?:${actionPattern}|leave|exclude|skip|omit)\\b|[,.;]|$)`, "gi");
+  for (const match of text.matchAll(negated)) add(taskRequestExclusionActionGroup(match[1]), match[2], match[0]);
+  const gerundPattern = Object.values(TASK_REQUEST_EXCLUSION_ACTIONS).flat().map((verb) => verb.endsWith("e") ? `${escapeRegExp(verb.slice(0, -1))}ing` : `${escapeRegExp(verb)}ing`).join("|");
+  const without = new RegExp(`\\bwithout\\s+(${gerundPattern})\\s+(?:the\\s+)?([^,.;]+?)(?=\\s+(?:and|but)\\s+|[,.;]|$)`, "gi");
+  for (const match of text.matchAll(without)) add(taskRequestExclusionActionGroup(match[1]), match[2], match[0]);
+  for (const match of text.matchAll(/\bleave\s+(?:the\s+)?([^,.;]+?)\s+unchanged\b/gi)) add("change", match[1], match[0]);
+  for (const match of text.matchAll(/\b(?:exclude|excluding|skip|omit)\s+(?:the\s+)?([^,.;]+?)(?=\s+(?:and|but)\s+|[,.;]|$)/gi)) add("any", match[1], match[0]);
+  for (const match of text.matchAll(/\bexcept(?:\s+for)?\s+(?:the\s+)?([^,.;]+?)(?=\s+(?:and|but)\s+|[,.;]|$)/gi)) add("any", match[1], match[0]);
+  return exclusions.map(({ key, ...item }) => item);
+}
+
+function taskRequestExclusionActionGroup(value = "") {
+  const verb = singleLine(value).toLowerCase();
+  return Object.entries(TASK_REQUEST_EXCLUSION_ACTIONS).find(([, variants]) => variants.some((variant) => verb === variant || verb === `${variant}ing` || verb === `${variant}ed` || (variant.endsWith("e") && verb === `${variant.slice(0, -1)}ing`)))?.[0] || verb;
+}
+
+function taskRequestExplicitConstraints(value = "") {
+  const text = singleLine(value || "");
+  const patterns = [
+    /(?:[$€£]\s?\d[\d,]*(?:\.\d+)?)/gi,
+    /\b\d+(?:\.\d+)?\s*(?:%|percent)\b/gi,
+    /\bpages?\s+\d+\s*(?:-|–|—|to|through)\s*\d+\b/gi,
+    /\b\d+(?:\.\d+)?\s+(?:pages?|words?|items?|options?|applications?|sections?|documents?|letters?|examples?|rounds?|responses?|reviews?|business days?|days?|weeks?|hours?)\b/gi,
+    /\b(?:version|v)\s*\d+(?:\.\d+)+\b/gi,
+    /\b(?:at least|at most|no more than|no fewer than|fewer than|less than|under|minimum(?: of)?|maximum(?: of)?|exactly|up to)\s+\d+(?:\.\d+)?(?:\s+(?:pages?|words?|items?|options?|applications?|sections?|documents?|letters?|examples?|rounds?|responses?|reviews?|business days?|days?|weeks?|hours?))?\b/gi
+  ];
+  const values = uniqueValues(patterns.flatMap((pattern) => text.match(pattern) || []).map(normalizeTaskRequestConstraint).filter(Boolean));
+  const maximal = values.filter((value) => !values.some((other) => other !== value && other.includes(value)));
+  const normalizedText = normalizeTaskRequestConstraint(text);
+  return maximal.sort((left, right) => normalizedText.indexOf(left) - normalizedText.indexOf(right) || right.length - left.length);
+}
+
+function normalizeTaskRequestConstraint(value = "") {
+  return singleLine(value).toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
+}
+
+function noteRequiredSignalText(sourceText = "") {
+  const text = String(sourceText || "");
+  const lines = text.split("\n");
+  const marked = [];
+  let foundMarker = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/#todo\b/i.test(lines[index])) continue;
+    foundMarker = true;
+    const cleaned = lines[index].replace(/#todo\b/gi, " ").replace(/^\s*[-*]\s+/, "").trim();
+    const words = cleaned.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+    if (words.length >= 2) {
+      marked.push(cleaned);
+      continue;
+    }
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const candidate = lines[next].trim();
+      if (!candidate) continue;
+      if (/^#+\s/.test(candidate)) break;
+      marked.push(candidate.replace(/^[-*]\s+/, ""));
+      break;
+    }
+  }
+  return foundMarker ? marked.join("\n") : text;
+}
+
+function emailCurrentSignalText(sourceText = "") {
+  const text = String(sourceText || "");
+  const current = emailCurrentMessageText(text);
+  if (!current) return text;
+  const meaningful = /\b(?:please|need|should|must|review|comment|verify|confirm|send|prepare|draft|finali[sz]e|respond|reply|complete|update|coordinate|decide|approve|adjusted|finished|submitted|waiting|follow[- ]?up)\b/i.test(current);
+  const terminalStatus = /\b(?:done|handled|resolved|completed|finished|approved|reviewed|sent|submitted|all set|taken care of|looks good|no (?:further )?changes?|nothing (?:else|further) (?:is )?needed|no further action)\b/i.test(current);
+  return meaningful || terminalStatus ? current : text;
+}
+
+function emailCurrentMessageText(sourceText = "") {
+  const match = String(sourceText || "").match(/Current\/latest email message \(primary status and next-action evidence\):\n([\s\S]*?)(?:\n\nEarlier quoted email thread \(background and unresolved context only\):|$)/i);
+  return match?.[1]?.trim() || "";
+}
+
+function normalizeTaskRequestEntity(value = "") {
+  return singleLine(value).replace(/[’']s\b$/i, "").trim();
+}
+
+function normalizeTaskRequestObject(value = "") {
+  const term = normalizeContextAnchorTerm(value);
+  if (["email", "message", "reply"].includes(term)) return "response";
+  if (term === "material") return "materials";
+  return term;
+}
+
+function taskRequestObjectPresent(text = "", counts = {}, object = "") {
+  if (object === "response" && /\b(?:response|reply|message|email)\b/i.test(text)) return true;
+  return contextAnchorVariants(object).some((variant) => counts[variant]);
+}
+
+const TASK_REQUEST_BOUND_ACTION_FAMILIES = ["review", "comparison", "drafting", "accuracy", "gaps", "feedback", "revisions", "incorporation", "finalization", "documentation", "recommendation", "highlighted", "approval", "confirmation", "send", "decision"];
+const TASK_REQUEST_CRITERION_BINDING_FAMILIES = new Set(["accuracy", "gaps", "feedback", "revisions", "highlighted"]);
+const TASK_REQUEST_ACTION_CLAUSE_SPLIT_RE = /\s*(?:[,;]|\b(?:and|by)\s+(?=(?:review|reviewing|assess|assessing|evaluate|evaluating|compare|comparing|reconcile|reconciling|cross[- ]check|cross[- ]checking|contrast|contrasting|draft|drafting|prepare|preparing|write|writing|compose|composing|edit|editing|revise|revising|update|updating|incorporate|incorporating|apply|applying|integrate|integrating|finali[sz]e|finali[sz]ing|complete|completing|document|documenting|record|recording|summari[sz]e|summari[sz]ing|recommend|recommending|propose|proposing|provide\s+(?:a\s+)?(?:written\s+)?recommendation|approve|approving|confirm|confirming|determine|determining|send|sending|share|sharing|submit|submitting|forward|forwarding|circulate|circulating|decide|deciding)\b)|\bthen\s+(?=(?:review|compare|reconcile|draft|prepare|write|compose|edit|revise|update|incorporate|apply|integrate|finali[sz]e|complete|document|record|summari[sz]e|recommend|propose|provide\s+(?:a\s+)?(?:written\s+)?recommendation|approve|confirm|determine|send|share|submit|forward|circulate|decide)\b))\s*/i;
+
+function taskRequestActionBindings(sentences = []) {
+  const bindings = [];
+  const seen = new Set();
+  for (const sentence of sentences || []) {
+    const recipientBindings = taskRequestRecipientBindings(sentence);
+    for (const binding of recipientBindings) {
+      const key = JSON.stringify(binding);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      bindings.push(binding);
+    }
+    let previousObjects = [];
+    for (const clause of String(sentence || "").split(TASK_REQUEST_ACTION_CLAUSE_SPLIT_RE).map(singleLine).filter(Boolean)) {
+      const boundFamilies = TASK_REQUEST_BOUND_ACTION_FAMILIES.filter((family) => taskRequestBindingFamilyPresent(clause, family));
+      let objects = uniqueValues(Object.keys(termCounts(clause)).map(normalizeContextAnchorTerm).filter((term) => TASK_REQUEST_OBJECT_TERMS.has(term)).map(normalizeTaskRequestObject));
+      if (boundFamilies.includes("drafting") && /(?:^|[,;:]\s*|\b(?:and|then|by|please|to)\s+)draft(?:ing)?\b/i.test(clause)) objects = objects.filter((term) => term !== "draft");
+      if (!objects.length && previousObjects.length) objects = previousObjects.slice();
+      if (objects.length) previousObjects = objects.slice();
+      const entities = uniqueValues(descriptionSpecificEntities(clause).map(normalizeTaskRequestEntity).filter((entity) => entity && !/^(Please|May|Could|Would|Seeking|Let|Your|Subject|Concrete|Steps|Email|Thread)$/i.test(entity)));
+      const conditionType = taskRequestConditionType(clause);
+      const conditional = Boolean(conditionType);
+      for (const family of boundFamilies) {
+        if (family === "send" && recipientBindings.length >= 2) continue;
+        if (!objects.length && !entities.length) continue;
+        const binding = { family, objects, entities, conditional, conditionType };
+        const key = JSON.stringify(binding);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        bindings.push(binding);
+      }
+    }
+  }
+  return bindings.slice(0, 16);
+}
+
+function taskRequestRecipientBindings(sentence = "") {
+  const text = singleLine(sentence);
+  if (!/\b(?:send|share|submit|forward|circulate)\b/i.test(text)) return [];
+  const segments = text.split(/\s+(?:,?\s*and|then)\s+(?=(?:(?:send|share|submit|forward|circulate)\s+)?(?:the\s+)?[^,.;]{1,100}\s+to\s+[A-Z])/i);
+  if (segments.length < 2) return [];
+  const bindings = [];
+  for (const rawSegment of segments) {
+    const segment = rawSegment.replace(/^(?:please\s+)?(?:send|share|submit|forward|circulate)\s+/i, "");
+    const match = segment.match(/^(?:the\s+)?(.+?)\s+to\s+([A-Z][A-Za-z&'-]*(?:\s+[A-Z][A-Za-z&'-]*){0,2})(?=\s+(?:if|unless|after|before|once|when|pending)\b|[,.;]|$)/);
+    if (!match) continue;
+    const objects = uniqueValues(Object.keys(termCounts(match[1])).map(normalizeContextAnchorTerm).filter((term) => TASK_REQUEST_OBJECT_TERMS.has(term)).map(normalizeTaskRequestObject));
+    if (!objects.length) continue;
+    const conditionType = taskRequestConditionType(segment);
+    bindings.push({ family: "send", objects, entities: [normalizeTaskRequestEntity(match[2])], conditional: Boolean(conditionType), conditionType });
+  }
+  return bindings.length >= 2 ? bindings : [];
+}
+
+function taskRequestConditionType(value = "") {
+  const text = singleLine(value);
+  if (/\bunless\b/i.test(text)) return "unless";
+  if (/\bbefore\b/i.test(text)) return "before";
+  if (/\b(?:after|once|upon)\b/i.test(text)) return "after";
+  if (/\b(?:only if|if)\b/i.test(text)) return "if";
+  if (/\bwhen\b/i.test(text)) return "when";
+  if (/\b(?:pending|subject to|depending on)\b/i.test(text)) return "pending";
+  if (/\b(?:required|as needed|if needed|if necessary)\b/i.test(text)) return "required";
+  return "";
+}
+
+function taskRequestBindingFamilyPresent(clause = "", family = "") {
+  const actionPattern = TASK_REQUEST_ACTION_FAMILY_PATTERNS[family];
+  if (actionPattern?.test(singleLine(clause))) return true;
+  if (taskRequestPassiveFamilyPresent(clause, family)) return true;
+  return !actionPattern || TASK_REQUEST_CRITERION_BINDING_FAMILIES.has(family) ? (TASK_REQUEST_SIGNAL_FAMILIES[family] || []).some((variant) => new RegExp(`\\b${escapeRegExp(variant).replace(/\s+/g, "\\s+")}\\b`, "i").test(clause)) : false;
+}
+
+function taskRequestSignalInstructions(signals = {}) {
+  const parts = [];
+  if (signals.families?.length) parts.push(`requested outcomes: ${signals.families.join(", ")}`);
+  if (signals.objects?.length) parts.push(`named work objects: ${signals.objects.join(", ")}`);
+  if (signals.entities?.length) parts.push(`named recipients or stakeholders: ${signals.entities.join(", ")}`);
+  if (signals.bindings?.length) parts.push(`action-to-object bindings: ${signals.bindings.map((binding) => `${binding.family} -> ${(binding.objects || []).join("/") || "named work"}${binding.entities?.length ? ` with ${(binding.entities || []).join("/")}` : ""}${binding.conditional ? " conditionally" : ""}`).join("; ")}`);
+  if (signals.constraints?.length) parts.push(`explicit numeric or version constraints: ${signals.constraints.join(", ")}`);
+  if (signals.decisionAlternatives?.length) parts.push(`named decision alternatives: ${signals.decisionAlternatives.join(" vs ")}`);
+  if (signals.decisionCriteria?.length) parts.push(`required decision criteria: ${signals.decisionCriteria.join(", ")}`);
+  if (signals.exclusions?.length) parts.push(`explicit exclusions that must not become positive work: ${signals.exclusions.map((item) => item.phrase).join("; ")}`);
+  if (signals.conditional) parts.push("preserve the source's conditional requirement");
+  return parts.length
+    ? `Explicit request coverage:\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ")}.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
+    : "Explicit request coverage:\n- No additional direct-request criteria were extracted locally; follow the source-specific actionability rules without inventing work.";
+}
+
+function taskRequestCoverageReport(tasks = [], signals = {}) {
+  const flatTasks = flattenTaskPlan(tasks || []);
+  const text = flatTasks.map((task) => `${task.content || ""} ${task.description || ""}`).join("; ");
+  const normalized = singleLine(text).toLowerCase();
+  const missingFamilies = (signals.families || []).filter((family) => !taskRequestFamilyPresent(normalized, family));
+  const counts = termCounts(normalized);
+  const missingObjects = (signals.objects || []).filter((term) => !taskRequestObjectPresent(normalized, counts, term));
+  const missingEntities = (signals.entities || []).filter((entity) => !normalized.includes(singleLine(entity).toLowerCase()));
+  const missingConditional = Boolean(signals.conditional && !taskRequestConditionType(normalized) && !/\bwhether\b/i.test(normalized));
+  const normalizedConstraintText = normalizeTaskRequestConstraint(text);
+  const missingConstraints = (signals.constraints || []).filter((constraint) => !normalizedConstraintText.includes(normalizeTaskRequestConstraint(constraint)));
+  const decisionDetailPresent = (detail) => {
+    const terms = generatedTaskObjectTerms(detail).filter((term) => !["alternative", "approach", "choice", "criterion", "criteria", "option"].includes(term));
+    return terms.length > 0 && terms.every((term) => contextAnchorVariants(term).some((variant) => counts[variant]));
+  };
+  const missingDecisionAlternatives = (signals.decisionAlternatives || []).filter((detail) => !decisionDetailPresent(detail));
+  const missingDecisionCriteria = (signals.decisionCriteria || []).filter((detail) => !decisionDetailPresent(detail));
+  const violatedExclusions = taskRequestExclusionViolations(flatTasks, signals.exclusions || []);
+  const taskLines = taskRequestBindingLines(tasks);
+  const missingBindings = (signals.bindings || []).filter((binding) => !taskLines.some((line) => {
+    if (!taskRequestFamilyPresent(line.actionText, binding.family)) return false;
+    const counts = termCounts(line.contextText);
+    if ((binding.objects || []).some((term) => !taskRequestObjectPresent(line.contextText, counts, term))) return false;
+    if (TASK_REQUEST_CRITERION_BINDING_FAMILIES.has(binding.family)) {
+      const boundObjects = new Set((binding.objects || []).map(normalizeTaskRequestObject));
+      const conflictingObject = (signals.objects || []).map(normalizeTaskRequestObject).find((term) => !boundObjects.has(term) && taskRequestObjectPresent(line.contextText, counts, term));
+      if (conflictingObject) return false;
+    }
+    if ((binding.entities || []).some((entity) => !line.contextText.includes(singleLine(entity).toLowerCase()))) return false;
+    if (binding.conditional && !taskRequestConditionType(line.actionText)) return false;
+    if (binding.conditionType && taskRequestConditionType(line.actionText) !== binding.conditionType) return false;
+    return true;
+  }));
+  return { passed: !missingFamilies.length && !missingObjects.length && !missingEntities.length && !missingConditional && !missingBindings.length && !missingConstraints.length && !missingDecisionAlternatives.length && !missingDecisionCriteria.length && !violatedExclusions.length, missingFamilies, missingObjects, missingEntities, missingConditional, missingBindings, missingConstraints, missingDecisionAlternatives, missingDecisionCriteria, violatedExclusions };
+}
+
+function taskRequestExclusionViolations(tasks = [], exclusions = []) {
+  const violations = [];
+  for (const task of tasks || []) {
+    const segments = [task.content, ...splitDescriptionSentences(task.description || "")].map(singleLine).filter(Boolean);
+    for (const exclusion of exclusions || []) {
+      const minimumHits = Math.min(2, Math.max(1, exclusion.terms?.length || 0));
+      const segment = segments.find((item) => {
+        const counts = termCounts(item);
+        const objectHits = (exclusion.terms || []).filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
+        if (objectHits < minimumHits) return false;
+        if (/\b(?:do not|don't|must not|should not|without|exclude|excluding|skip|omit|except|leave\b.{0,80}\bunchanged)\b/i.test(item)) return false;
+        if (exclusion.action === "any") return true;
+        return (TASK_REQUEST_EXCLUSION_ACTIONS[exclusion.action] || [exclusion.action]).some((verb) => new RegExp(`\\b${escapeRegExp(verb)}(?:d|ed|ing|s)?\\b`, "i").test(item));
+      });
+      if (segment) violations.push({ action: exclusion.action, object: exclusion.object, phrase: exclusion.phrase, generatedText: segment });
+    }
+  }
+  return violations;
+}
+
+function taskRequestBindingLines(tasks = []) {
+  const lines = [];
+  const visit = (task = {}, parentText = "") => {
+    const own = singleLine(task.content || "");
+    const ownsNamedWorkObject = Object.keys(termCounts(own)).map(normalizeContextAnchorTerm).some((term) => TASK_REQUEST_OBJECT_TERMS.has(normalizeTaskRequestObject(term)));
+    const combined = [ownsNamedWorkObject ? "" : parentText, own].filter(Boolean).join(" ").toLowerCase();
+    if (combined) lines.push({ actionText: own.toLowerCase(), contextText: combined });
+    for (const subtask of task.subtasks || []) visit(subtask, own);
+  };
+  for (const task of tasks || []) visit(task, "");
+  return lines;
+}
+
+function taskRequestRepairPreservesExisting(originalTasks = [], repairedTasks = []) {
+  if (!repairedTasks.length) return false;
+  const originalFlat = flattenTaskPlan(originalTasks);
+  const repairedFlat = flattenTaskPlan(repairedTasks);
+  const repairedCounts = termCounts(repairedFlat.map((task) => `${task.content || ""} ${task.description || ""}`).join(" "));
+  const originalTerms = uniqueValues(originalFlat.flatMap((task) => generatedTaskObjectTerms(`${task.content || ""} ${task.description || ""}`)));
+  const representedTerms = originalTerms.filter((term) => contextAnchorVariants(term).some((variant) => repairedCounts[variant]));
+  if (originalTerms.length >= 4 && representedTerms.length / originalTerms.length < 0.7) return false;
+  const repairedLabels = new Set(repairedFlat.flatMap((task) => (task.labels || []).map(cleanLabel).filter(Boolean)).map((label) => label.toLowerCase()));
+  const originalLabels = uniqueValues(originalFlat.flatMap((task) => (task.labels || []).map(cleanLabel).filter(Boolean)));
+  if (originalLabels.some((label) => !repairedLabels.has(label.toLowerCase()))) return false;
+  const repairedDates = new Set(repairedFlat.flatMap((task) => [task.due_date, task.deadline_date]).filter(Boolean));
+  const originalDates = uniqueValues(originalFlat.flatMap((task) => [task.due_date, task.deadline_date]).filter(Boolean));
+  return originalDates.every((date) => repairedDates.has(date));
 }
 
 function subtaskCriteriaInstructions(settings = DEFAULT_SETTINGS) {
@@ -13170,15 +13764,20 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes, query = "", setti
 }
 
 function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", context = [], sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
+  const queries = (tasks || []).map((task) => [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" "));
   return (tasks || []).map((task, index) => {
-    const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
-    const sourceEvidence = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900);
-    const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3);
+    const query = queries[index];
+    const exclusiveAnchors = taskExclusiveEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
+    const competingAnchors = taskCompetingEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
+    const sourceEvidence = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors });
+    const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3, { requiredAnchors: exclusiveAnchors });
     const contextEvidenceEntries = contextChunks.map((chunk) => {
       const source = sourceReference(chunk, citationState.basePath || "");
       const citationNumber = source ? citationState.citationMap?.get(source) : null;
       const anchorTerms = generatedTaskObjectTerms(query);
-      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520);
+      const anchorHits = taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`, anchorTerms);
+      const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchorTerms);
+      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors }) || (semanticEligible ? truncateAtWord(stripTaskAndMetadataLines(chunk.text || ""), 520) : "");
       if (!excerpt) return null;
       const label = citationNumber ? `Context Note (${citationNumber})` : "Supporting note";
       const evidence = truncateAtWord(excerpt, 520);
@@ -13201,55 +13800,133 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
   });
 }
 
-function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_SETTINGS, maxChars = 700) {
+function taskExclusiveEvidenceAnchors(query = "", competingQueries = []) {
+  if (!(competingQueries || []).length) return [];
+  const competing = new Set((competingQueries || []).flatMap((item) => generatedTaskObjectTerms(item)));
+  return generatedTaskObjectTerms(query).filter((term) => !competing.has(term));
+}
+
+function taskCompetingEvidenceAnchors(query = "", competingQueries = []) {
+  const current = new Set(generatedTaskObjectTerms(query));
+  return uniqueValues((competingQueries || []).flatMap((item) => generatedTaskObjectTerms(item))).filter((term) => !current.has(term));
+}
+
+function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_SETTINGS, maxChars = 700, options = {}) {
   const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
   const anchors = generatedTaskObjectTerms(query);
   if (!anchors.length) return summarizeSourceForTaskContext(cleaned, query, maxChars, settings, { strictQuery: true });
   const sentences = cleaned
     .split(/\n+/)
-    .flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()))
-    .map((line) => singleLine(line))
-    .filter((line) => line.length >= 18);
+    .flatMap((line, paragraphIndex) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()).map((sentence) => ({ text: singleLine(sentence), paragraphIndex })))
+    .filter((item) => item.text.length >= 18);
+  const minimumHits = taskEvidenceMinimumAnchorHits(anchors);
+  const requiredAnchors = options.requiredAnchors || [];
+  const excludedNeighborAnchors = options.excludedNeighborAnchors || [];
+  const requireExclusiveAnchor = requiredAnchors.length > 0 && sentences.some((item) => taskEvidenceAnchorHitCount(item.text, requiredAnchors) > 0);
   const selected = new Set();
   for (let index = 0; index < sentences.length; index += 1) {
-    const counts = termCounts(sentences[index]);
-    const matches = anchors.some((term) => contextAnchorVariants(term).some((variant) => counts[variant]));
-    if (!matches) continue;
+    const anchorHits = taskEvidenceAnchorHitCount(sentences[index].text, anchors);
+    if (anchorHits < minimumHits) continue;
+    if (requireExclusiveAnchor && taskEvidenceAnchorHitCount(sentences[index].text, requiredAnchors) < 1) continue;
     selected.add(index);
     for (const neighborIndex of [index - 1, index + 1]) {
       if (neighborIndex < 0 || neighborIndex >= sentences.length) continue;
-      if (taskEvidenceNeighborIsCohesive(sentences[neighborIndex], sentences[index])) selected.add(neighborIndex);
+      if (sentences[neighborIndex].paragraphIndex !== sentences[index].paragraphIndex) continue;
+      const neighborText = sentences[neighborIndex].text;
+      const referentialNeighbor = /^(?:it|this|that|these|those|they|he|she)\b/i.test(singleLine(neighborText));
+      const competingAnchorHit = taskEvidenceAnchorHitCount(neighborText, excludedNeighborAnchors) > 0;
+      const preservesExclusiveScope = !requireExclusiveAnchor || referentialNeighbor || taskEvidenceAnchorHitCount(neighborText, requiredAnchors) > 0 || !competingAnchorHit;
+      if (preservesExclusiveScope && taskEvidenceNeighborIsCohesive(neighborText, sentences[index].text)) selected.add(neighborIndex);
     }
   }
-  const excerpt = Array.from(selected).sort((left, right) => left - right).map((index) => sentences[index]).join(" ");
+  const excerpt = Array.from(selected).sort((left, right) => left - right).map((index) => sentences[index].text).join(" ");
   return truncateAtWord(excerpt, maxChars);
 }
 
 function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
-  if (/\b(this|that|these|those|it|they|he|she|same|before|after|depends?|dependency|requires?|required|must|approval|approved|response|wording|document|draft)\b/i.test(candidate)) return true;
   const anchorTerms = new Set(generatedTaskObjectTerms(anchor));
-  return generatedTaskObjectTerms(candidate).some((term) => anchorTerms.has(term));
+  if (generatedTaskObjectTerms(candidate).some((term) => anchorTerms.has(term))) return true;
+  const referentialStart = /^(?:it|this|that|these|those|they|he|she)\b/i.test(singleLine(candidate));
+  const dependencyContinuation = /\b(?:must|should|cannot|can't|depends?|dependency|requires?|required|needed|approval|approved|before|after|once|until)\b/i.test(candidate);
+  const namedDependencyOwner = /^(?!Before\b|After\b|Once\b|When\b|This\b|That\b)[A-Z][A-Za-z'-]{2,}\b/.test(singleLine(candidate));
+  return dependencyContinuation && (referentialStart || namedDependencyOwner);
 }
 
-function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFAULT_SETTINGS, limit = 3) {
+function taskEvidenceAnchorHitCount(text = "", anchors = []) {
+  const counts = termCounts(text);
+  return (anchors || []).filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
+}
+
+function taskEvidenceMinimumAnchorHits(anchors = []) {
+  return (anchors || []).length >= 4 ? 2 : 1;
+}
+
+function taskSemanticEvidenceEligible(chunk = {}, anchorHits = 0, anchors = []) {
+  const scopeTerms = chunk.retrievalScopeTerms || [];
+  if (scopeTerms.length && chunk.retrievalScopeMatch !== true) return false;
+  const semanticScore = Number(chunk.semanticScore || 0);
+  const matchScore = Number(chunk.matchScore || 0);
+  const scopeCoverage = Number(chunk.retrievalScopeCoverage || 0);
+  if (chunk.retrievalScopeMatch === true && scopeCoverage >= 0.5 && semanticScore >= 0.4 && matchScore >= 0.4) return true;
+  return Boolean(anchorHits >= 1 && semanticScore >= 0.62 && matchScore >= 0.5 && (anchors || []).length >= 2);
+}
+
+function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFAULT_SETTINGS, limit = 3, options = {}) {
   const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
   const queryTerms = termCounts(query);
   const anchors = generatedTaskObjectTerms(query);
-  return uniqueChunksByPath((context || [])
+  const requiredAnchors = options.requiredAnchors || [];
+  const candidates = (context || [])
     .map((chunk) => {
       const text = `${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`;
-      const counts = termCounts(text);
-      const anchorHits = anchors.filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
+      const anchorHits = taskEvidenceAnchorHitCount(text, anchors);
+      const requiredAnchorHits = taskEvidenceAnchorHitCount(text, requiredAnchors);
       const score = lexicalScore(queryTerms, text) + anchorHits * 3 + Number(chunk.matchScore || 0);
-      return { chunk, score, anchorHits };
-    })
-    .filter((item) => item.anchorHits > 0 && item.score > 0)
+      const scopeMismatch = Boolean((chunk.retrievalScopeTerms || []).length && chunk.retrievalScopeMatch !== true);
+      const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchors);
+      return { chunk, score, anchorHits, requiredAnchorHits, scopeMismatch, semanticEligible };
+    });
+  const requireExclusiveAnchor = requiredAnchors.length > 0 && candidates.some((item) => item.requiredAnchorHits > 0);
+  return uniqueChunksByPath(candidates
+    .filter((item) => !item.scopeMismatch && (!requireExclusiveAnchor || item.requiredAnchorHits > 0) && (item.anchorHits >= taskEvidenceMinimumAnchorHits(anchors) || item.semanticEligible) && item.score > 0)
     .sort((left, right) => right.score - left.score || Number(right.chunk.createdAt || right.chunk.modifiedAt || 0) - Number(left.chunk.createdAt || left.chunk.modifiedAt || 0))
     .map((item) => item.chunk))
     .slice(0, Math.max(0, limit));
 }
 
 function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  const evidenceReason = taskDescriptionEvidenceReason(value, task, evidence, settings);
+  if (evidenceReason !== "passed") return evidenceReason;
+  const clarityReason = taskDescriptionClarityReason(value, task, settings);
+  if (clarityReason !== "passed") return clarityReason;
+  const knowledgeReason = taskDescriptionKnowledgeCoverageReason(value, task, evidence);
+  if (knowledgeReason !== "passed") return knowledgeReason;
+  return "passed";
+}
+
+const TASK_DESCRIPTION_GENERIC_KNOWLEDGE_TERMS = new Set(["action", "complete", "completed", "completion", "deliverable", "forward", "matter", "matters", "next", "outcome", "process", "project", "purpose", "ready", "request", "result", "step", "steps", "task", "work"]);
+
+function taskDescriptionKnowledgeCoverageReason(value = "", task = {}, evidence = null) {
+  const descriptionCounts = termCounts(value);
+  const titleCounts = termCounts(task.content || "");
+  const corpusCounts = termCounts(evidence?.corpus || "");
+  const fields = [
+    ["rationale", task.knowledge?.rationale || task.knowledge?.purpose || ""],
+    ["dependency", task.knowledge?.dependency || ""],
+    ["outcome", task.knowledge?.outcome || task.knowledge?.nextStep || ""]
+  ];
+  for (const [name, field] of fields) {
+    const anchors = generatedTaskObjectTerms(field).filter((term) => {
+      if (TASK_DESCRIPTION_GENERIC_KNOWLEDGE_TERMS.has(term) || titleCounts[term]) return false;
+      return contextAnchorVariants(term).some((variant) => corpusCounts[variant]);
+    });
+    if (anchors.length < 2) continue;
+    if (!anchors.some((term) => contextAnchorVariants(term).some((variant) => descriptionCounts[variant]))) return `missing source-grounded ${name} detail`;
+  }
+  return "passed";
+}
+
+function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
   if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
   const corpus = String(evidence?.corpus || "");
   if (!corpus.trim()) return "missing task-specific evidence";
@@ -13257,8 +13934,10 @@ function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, 
   const dates = uniqueValues(String(value || "").match(/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*20\d{2})?\b/gi) || []);
   const unsupportedDate = dates.find((date) => !corpusLower.includes(date.toLowerCase()));
   if (unsupportedDate) return `unsupported date: ${unsupportedDate}`;
+  const unsupportedState = unsupportedDescriptionWorkflowState(value, corpus);
+  if (unsupportedState) return unsupportedState;
   const people = uniqueValues([...extractPeopleCandidates(value, 12), ...descriptionSpecificEntities(value)]);
-  const unsupportedPerson = people.find((person) => !corpusLower.includes(person.toLowerCase()));
+  const unsupportedPerson = people.find((person) => !descriptionEntitySupportedByCorpus(person, corpusLower));
   if (unsupportedPerson) return `unsupported person or entity: ${unsupportedPerson}`;
   const links = extractDescriptionLinkRecords(value, settings);
   const unsupportedLink = links.find((link) => !corpus.includes(link.url));
@@ -13270,10 +13949,531 @@ function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, 
   return "passed";
 }
 
+const DESCRIPTION_WORKFLOW_STATE_RE = /\b(?:(?:already|currently|still|previously|earlier)\s+(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:is|are|was|were|has been|have been|had been)\s+(?:already\s+|currently\s+|still\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:has|have|had)\s+(?:already\s+|previously\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|rejected|accepted|resolved|closed|assigned)|(?:is|are|was|were)\s+being\s+(reviewed|drafted|prepared|finali[sz]ed))\b/i;
+
+function unsupportedDescriptionWorkflowState(value = "", corpus = "") {
+  const corpusCounts = termCounts(corpus);
+  for (const sentence of splitDescriptionSentences(value)) {
+    const match = sentence.match(DESCRIPTION_WORKFLOW_STATE_RE);
+    if (!match) continue;
+    const futureOutcome = /\b(?:complete when|completion|done when|expected outcome|will|would|should|must|needs? to|to be|ready to|if|once|after|before)\b/i.test(sentence);
+    const explicitCurrentState = /\b(?:already|currently|still|previously|earlier|has been|have been|had been|was|were)\b/i.test(sentence) || /\b(?:is|are)\s+(?:blocked|waiting|pending|overdue|reviewing|drafting|preparing|working)\b/i.test(sentence);
+    if (futureOutcome && !explicitCurrentState) continue;
+    const rawState = match.slice(1).find(Boolean) || "";
+    const state = normalizeContextAnchorTerm(rawState);
+    const stateSupported = contextAnchorVariants(state).some((variant) => corpusCounts[variant]);
+    const objectTerms = generatedTaskObjectTerms(sentence).filter((term) => term !== state);
+    const objectSupported = objectTerms.some((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
+    if (!stateSupported || !objectSupported) return `unsupported workflow state: ${singleLine(match[0])}`;
+  }
+  return "";
+}
+
+function descriptionEntitySupportedByCorpus(entity = "", corpusLower = "") {
+  const normalized = singleLine(entity).toLowerCase();
+  if (!normalized) return true;
+  const variants = uniqueValues([
+    normalized,
+    normalized.replace(/[’']s\b/g, ""),
+    normalized.replace(/[-\s]related\b/g, ""),
+    normalized.replace(/s\b/g, ""),
+    normalized.replace(/[-\s]related\b/g, "").replace(/[’']s\b/g, "").replace(/s\b/g, "")
+  ].map((value) => value.trim()).filter(Boolean));
+  return variants.some((variant) => corpusLower.includes(variant));
+}
+
+function taskDescriptionClarityReason(value = "", task = {}, settings = DEFAULT_SETTINGS) {
+  const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
+  const title = singleLine(task.content || "").toLowerCase();
+  if (title && singleLine(cleaned).toLowerCase().startsWith(title)) return "starts by repeating the task title";
+  const text = removeTitleEcho(cleaned, task.content || "");
+  if (/^subject\s*:/i.test(text)) return "starts with a pasted subject line";
+  if (/(?:^|[.!?]\s+)[a-z][^.!?]{12,}(?:[.!?]|$)/.test(text)) return "contains a sentence fragment";
+  if ((text.match(/;/g) || []).length >= 2) return "contains a semicolon-delimited excerpt fragment";
+  const sentences = splitDescriptionSentences(text);
+  const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  if (sentences.length < 2 && words.length < 18) return "missing separate context, purpose, and outcome detail";
+  const intentText = sentences[0] || text;
+  if (/^(?:this matters|because|the (?:purpose|goal|reason) (?:is|for))\b/i.test(intentText)) return "starts with purpose instead of task intent";
+  const intentSignal = /\b(?:review|compare|draft|confirm|send|prepare|identify|finali[sz]e|coordinate|verify|update|complete|decide|assess|provide|resolve|clarify|determine|check|summari[sz]e|respond|apply|incorporate|use)\b/i.test(intentText) || /\b(?:needs?|should|must|is|are)\s+(?:to\s+)?be\s+(?:reviewed|compared|drafted|confirmed|sent|prepared|identified|finali[sz]ed|coordinated|verified|updated|completed|decided|assessed|provided|resolved|clarified|determined|checked|summari[sz]ed|applied|incorporated|used)\b/i.test(intentText);
+  if (!intentSignal) return "missing clear task intent";
+  const actionAlignment = taskDescriptionActionAlignmentReason(text, task);
+  if (actionAlignment !== "passed") return actionAlignment;
+  const titleScopeReason = taskDescriptionTitleScopeReason(text, task);
+  if (titleScopeReason !== "passed") return titleScopeReason;
+  const purposeSignal = /\b(?:so that|so the|so .{0,40}\bcan|because|in order to|before .{0,60}\b(?:can|approval|publication|release|submission|decision|handoff)|needed for|required for|depends? on|goal is|purpose is|makes? it (?:important|necessary) to|to (?:support|enable|ensure|allow|inform)|helps? (?:support|ensure|clarify)|supports? the|enables? the|allows? the|informs? the|gives? (?:the )?\w+ .{0,30}\b(?:corrections?|guidance|information))\b/i.test(text);
+  if (!purposeSignal) return "missing clear task purpose";
+  if (/\b(?:so (?:that )?)?(?:the |this )?(?:task|work|process|project|request)\s+(?:can|may|will|should)\s+(?:proceed|continue|move forward|advance|be completed)\b/i.test(text)) return "task purpose is generic";
+  const finalSentence = sentences[sentences.length - 1] || text;
+  const outcomeSignal = /\b(?:complete when|done when|expected outcome|result(?:ing)?|deliverable|ready for|decision|sign[- ]?off|response|approval|comments?|tracked changes|gaps?|approved|confirmed|verified|identified|documented|sent|submitted|resolved|closed|finali[sz]ed|completed|ready|publish(?:ed|ation)?|releas(?:ed|ing)|proceed)\b/i.test(finalSentence);
+  if (!outcomeSignal) return "missing expected outcome or completion condition";
+  if (circularDescriptionOutcome(finalSentence)) return "expected outcome is circular or non-specific";
+  if (/\b(?:ready for (?:the )?(?:next steps?|further action)|successful completion|completion of (?:the |this )?(?:task|work|request)|(?:task|work|request) (?:is )?(?:completed|done|finished))\b/i.test(finalSentence)) return "expected outcome is generic";
+  const historicalOutcome = /\b(?:was|were|had been|already|previously|earlier)\s+(?:approved|confirmed|verified|identified|documented|sent|submitted|resolved|closed|finali[sz]ed|completed|published|released)\b/i.test(finalSentence);
+  const observableOutcome = /\b(?:complete when|done when|expected outcome|result(?:ing)?|deliverable|ready for|will|would|can|should|must|needs? to|is to|are to|to be|so that|so the|before|after|once|when|if)\b/i.test(finalSentence);
+  if (historicalOutcome && !observableOutcome) return "ends with historical status instead of the expected outcome";
+  const taskTreeText = [task.content, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ");
+  const hasConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending)\b/i.test(taskTreeText);
+  const preservesConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending|requires?|required)\b/i.test(text);
+  if (hasConditionalHandoff && !preservesConditionalHandoff) return "missing conditional dependency or handoff requirement";
+  return "passed";
+}
+
+function taskDescriptionTitleScopeReason(value = "", task = {}) {
+  const title = singleLine(task.content || "");
+  if (!title) return "passed";
+  const description = singleLine(value || "");
+  const descriptionLower = description.toLowerCase();
+  const namedScope = uniqueValues(Array.from(title.matchAll(/\b(?:with|to|from|for|by)\s+(?:the\s+)?([A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2})/g)).map((match) => match[1]).filter((entity) => !/^(?:Review|Approval|Publication|Completion|Response|Report|Draft)$/i.test(entity)));
+  const missingNamedScope = namedScope.find((entity) => !descriptionEntitySupportedByCorpus(entity, descriptionLower));
+  if (missingNamedScope) return `description omits named task stakeholder or recipient: ${missingNamedScope}`;
+  const namedScopeTerms = new Set(namedScope.flatMap((entity) => Array.from(taskStructureObjectTokens(entity))));
+  const titleTerms = Array.from(taskStructureObjectTokens(title)).filter((term) => !namedScopeTerms.has(term));
+  if (titleTerms.length >= 2) {
+    const descriptionCounts = termCounts(description);
+    const overlaps = titleTerms.filter((term) => contextAnchorVariants(term).some((variant) => descriptionCounts[variant]));
+    if (!overlaps.length) return "description omits the task's named object or scope";
+  }
+  return "passed";
+}
+
+function circularDescriptionOutcome(value = "") {
+  const text = singleLine(value).replace(/[.!?]+$/, "").trim();
+  if (!text || /:\s*\S.{8,}$/.test(text)) return false;
+  return /^(?:(?:the\s+)?(?:expected\s+)?(?:outcome|result|deliverable|completion)\s+(?:is|means)\s+)?(?:(?:that\s+)?(?:the|this)\s+)?(?:task|work|requested action|request)\s+(?:is\s+)?(?:complete|completed|done|finished)$|^(?:the\s+)?(?:expected\s+)?(?:outcome|result)\s+is\s+(?:the\s+)?completion\s+of\s+(?:(?:the|this)\s+)?(?:task|work|requested action|request)$|^(?:the\s+)?(?:task|work|requested action|request)\s+is\s+(?:complete|done)\s+when\s+(?:(?:the|this)\s+)?(?:task|work|requested action|request)\s+is\s+(?:complete|completed|done|finished)$/i.test(text);
+}
+
+function taskDescriptionActionAlignmentReason(value = "", task = {}) {
+  const title = singleLine(task.content || "");
+  const families = Object.keys(TASK_REQUEST_SIGNAL_FAMILIES);
+  const detectFamilies = (text) => {
+    const detected = families.filter((family) => taskRequestFamilyPresent(text, family));
+    if (/\bcheck(?:ed|ing)?\b/i.test(text)) detected.push("review", "confirmation");
+    return uniqueValues(detected);
+  };
+  const titleFamilies = detectFamilies(title);
+  if (!titleFamilies.length) return "passed";
+  const sentences = splitDescriptionSentences(value || "");
+  const intentSentence = sentences.find((sentence, index) => !(index === 0 && /^Use\s+\[[^\]]+\]\([^)]+\)\s+as the working document\.?$/i.test(singleLine(sentence)))) || "";
+  const intentFamilies = detectFamilies(intentSentence);
+  if (!intentFamilies.length) return "description intent does not state the task title's action";
+  if (titleFamilies.some((family) => intentFamilies.includes(family))) return "passed";
+  const compatibleGroups = [
+    ["review", "comparison", "accuracy", "gaps", "confirmation"],
+    ["drafting", "revisions"],
+    ["send", "response"],
+    ["approval", "decision", "confirmation"]
+  ];
+  const compatible = compatibleGroups.some((group) => group.some((family) => titleFamilies.includes(family)) && group.some((family) => intentFamilies.includes(family)));
+  return compatible ? "passed" : "description intent action does not align with the task title";
+}
+
+const TASK_STRUCTURE_ACTION_WORDS = new Set([
+  "apply", "approve", "ask", "assess", "check", "circulate", "clarify", "collect", "compare", "complete", "confirm", "coordinate", "decide", "deliver", "document", "draft", "edit", "finalize", "follow", "forward", "identify", "incorporate", "inspect", "obtain", "prepare", "provide", "publish", "read", "request", "resolve", "respond", "review", "revise", "schedule", "send", "share", "submit", "summarize", "update", "upload", "use", "validate", "verify", "write"
+]);
+
+const SUBTASK_VAGUE_OBJECT_WORDS = new Set([
+  "detail", "details", "document", "draft", "file", "form", "information", "item", "items", "it", "letter", "material", "materials", "next", "report", "request", "response", "status", "step", "steps", "stuff", "that", "them", "these", "thing", "things", "this", "those", "wording"
+]);
+
+function subtaskClarityReason(subtask = {}, parentTask = {}) {
+  const text = singleLine(subtask.content || "");
+  if (!text) return "missing subtask title";
+  const words = canonicalTaskMatchTitle(text).split(/\s+/).filter(Boolean);
+  if (words.length < 3) return "subtask is too short to identify a checkable step";
+  const conditionalAction = text.match(/^(?:if|unless|once|after|before|when)\b[^,]{3,},\s*(.+)$/i)?.[1] || "";
+  const actionText = conditionalAction || text;
+  if (/^(?:it|this|that|these|those|them)\b/i.test(actionText)) return "subtask starts with an unexplained pronoun";
+  if (!taskStructureLeadingAction(actionText)) return "subtask does not start with a concrete user action";
+  if (/^(?:apply|approve|check|circulate|confirm|deliver|edit|finalize|forward|incorporate|prepare|provide|publish|review|revise|send|share|submit|update|upload|use|validate|verify)\s+(?:it|this|that|them|these|those)(?:\s+(?:to|with|for|after|before|once|if|when)\b|$)/i.test(actionText)) return "subtask uses an unexplained pronoun instead of naming its object or deliverable";
+  if (/\b(?:about|on|regarding)\s+(?:it|this|that|them|these|those)\b/i.test(actionText)) return "subtask uses an unexplained pronoun instead of naming its topic or decision";
+  if (/^(?:check|confirm|follow\s+up)\s+with\s+\S+(?:\s+\S+)?[.!?]?$/i.test(actionText)) return "subtask names a recipient but not what must be checked or confirmed";
+  const objectTokens = Array.from(taskStructureObjectTokens(actionText)).filter((word) => !SUBTASK_VAGUE_OBJECT_WORDS.has(word));
+  if (!objectTokens.length) return "subtask does not name a concrete object, recipient, decision, or deliverable";
+  if (/^(?:check|confirm|follow(?:\s+up)?|review|update)\s+(?:it|this|that|them|these|those|details?|information|status|next steps?)\.?$/i.test(actionText)) return "subtask is a generic follow-up without actionable scope";
+  const parentKey = canonicalTaskMatchTitle(parentTask.content || "");
+  if (parentKey && canonicalTaskMatchTitle(text) === parentKey) return "subtask repeats the parent task";
+  return "passed";
+}
+
+function mainTaskClarityReason(task = {}) {
+  const text = singleLine(task.content || "");
+  if (!text) return "missing main task title";
+  const words = canonicalTaskMatchTitle(text).split(/\s+/).filter(Boolean);
+  if (words.length < 3) return "main task title is too short to identify its action and scope";
+  if (/^(?:it|this|that|these|those|them)\b/i.test(text)) return "main task title starts with an unexplained pronoun";
+  if (!taskStructureLeadingAction(text)) return "main task title does not start with a concrete user action";
+  if (/^(?:apply|approve|check|circulate|confirm|deliver|edit|finalize|forward|incorporate|prepare|provide|publish|review|revise|send|share|submit|update|upload|use|validate|verify)\s+(?:it|this|that|them|these|those)(?:\s+(?:to|with|for|after|before|once|if|when)\b|$)/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its object or deliverable";
+  if (/\b(?:about|on|regarding)\s+(?:it|this|that|them|these|those)\b/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its topic or decision";
+  if (/^(?:check|confirm|follow\s+up)\s+with\s+\S+(?:\s+\S+)?[.!?]?$/i.test(text)) return "main task title names a recipient but not what must be checked or confirmed";
+  const objectTokens = Array.from(taskStructureObjectTokens(text)).filter((word) => !SUBTASK_VAGUE_OBJECT_WORDS.has(word));
+  if (!objectTokens.length) return "main task title does not name a concrete object, recipient, decision, or deliverable";
+  if (/^(?:check|confirm|follow(?:\s+up)?|review|update)\s+(?:it|this|that|them|these|those|details?|information|status|next steps?)\.?$/i.test(text)) return "main task title is a generic follow-up without actionable scope";
+  return "passed";
+}
+
+function taskStructureActionClauses(value = "") {
+  const text = singleLine(value || "");
+  if (!text) return [];
+  return text
+    .split(/\s*(?:,|;|\band then\b|\bthen\b|\band\s+(?=(?:approve|ask|assess|check|clarify|compare|complete|confirm|coordinate|decide|document|draft|edit|finali[sz]e|identify|prepare|provide|publish|resolve|respond|review|schedule|send|submit|summari[sz]e|update|verify|write)\b))\s*/i)
+    .map((clause) => singleLine(clause))
+    .filter((clause) => taskStructureLeadingAction(clause));
+}
+
+function taskStructureLeadingAction(value = "") {
+  const words = canonicalTaskMatchTitle(value).split(/\s+/).filter(Boolean).slice(0, 4);
+  return words.find((word) => TASK_STRUCTURE_ACTION_WORDS.has(word)) || "";
+}
+
+function taskStructureObjectTokens(value = "") {
+  return new Set(canonicalTaskMatchTitle(value).split(/\s+/).filter((word) => word.length >= 3 && !TASK_STRUCTURE_ACTION_WORDS.has(word) && !TASK_DEDUPE_STOP_WORDS.has(word)));
+}
+
+function taskStructureTitleOverlap(left = "", right = "") {
+  return tokenDiceScore(taskStructureObjectTokens(left), taskStructureObjectTokens(right));
+}
+
+function generatedTaskStructureIssues(tasks = []) {
+  const issues = [];
+  const add = (code, taskIndex, details = {}) => issues.push(Object.assign({ code, taskIndex, blocking: false }, details));
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    const task = tasks[taskIndex] || {};
+    const subtasks = task.subtasks || [];
+    const clauses = taskStructureActionClauses(task.content || "");
+    if (subtasks.length >= 2 && clauses.length >= 3) add("overloaded-main-title", taskIndex, { actionClauses: clauses.length, subtaskCount: subtasks.length });
+    if (!subtasks.length && clauses.length >= 2) {
+      const objectSets = clauses.map(taskStructureObjectTokens);
+      const independent = objectSets.every((tokens) => tokens.size > 0) && objectSets.slice(1).every((tokens, index) => tokenDiceScore(objectSets[index], tokens) < 0.25);
+      if (independent) add("bundled-main-actions", taskIndex);
+    }
+    for (let subtaskIndex = 0; subtaskIndex < subtasks.length; subtaskIndex += 1) {
+      const subtask = subtasks[subtaskIndex] || {};
+      const sameAction = taskStructureLeadingAction(task.content) && taskStructureLeadingAction(task.content) === taskStructureLeadingAction(subtask.content);
+      if (clauses.length <= 1 && sameAction && taskStructureTitleOverlap(task.content, subtask.content) >= 0.78) add("subtask-restates-parent", taskIndex, { subtaskIndex });
+      for (let siblingIndex = 0; siblingIndex < subtaskIndex; siblingIndex += 1) {
+        const sibling = subtasks[siblingIndex] || {};
+        const sameSiblingAction = taskStructureLeadingAction(sibling.content) && taskStructureLeadingAction(sibling.content) === taskStructureLeadingAction(subtask.content);
+        if (sameSiblingAction && taskStructureTitleOverlap(sibling.content, subtask.content) >= 0.84) add("overlapping-subtasks", taskIndex, { subtaskIndex, siblingIndex });
+      }
+      const parentAffinity = subtaskParentAffinity(subtask, task, tasks, taskIndex);
+      if (parentAffinity.mismatched) add("subtask-mismatched-parent", taskIndex, { subtaskIndex, expectedParentTaskIndex: parentAffinity.expectedParentTaskIndex, parentScore: parentAffinity.parentScore, expectedParentScore: parentAffinity.expectedParentScore });
+    }
+    for (let previousIndex = 0; previousIndex < taskIndex; previousIndex += 1) {
+      const previous = tasks[previousIndex] || {};
+      if (task.possibleDuplicate || previous.possibleDuplicate) continue;
+      const sameMainAction = taskStructureLeadingAction(previous.content) && taskStructureLeadingAction(previous.content) === taskStructureLeadingAction(task.content);
+      if (sameMainAction && taskStructureTitleOverlap(previous.content, task.content) >= 0.86) add("overlapping-main-tasks", taskIndex, { previousTaskIndex: previousIndex });
+    }
+  }
+  return issues;
+}
+
+function subtaskParentAffinity(subtask = {}, parentTask = {}, tasks = [], parentTaskIndex = -1) {
+  if ((tasks || []).length < 2) return { mismatched: false, expectedParentTaskIndex: -1, parentScore: 0, expectedParentScore: 0 };
+  const subtaskTokens = taskStructureObjectTokens(subtask.content || "");
+  if (subtaskTokens.size < 2) return { mismatched: false, expectedParentTaskIndex: -1, parentScore: 0, expectedParentScore: 0 };
+  const parentScore = tokenDiceScore(subtaskTokens, taskStructureObjectTokens(parentTask.content || ""));
+  let expectedParentTaskIndex = -1;
+  let expectedParentScore = 0;
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    if (index === parentTaskIndex) continue;
+    const score = tokenDiceScore(subtaskTokens, taskStructureObjectTokens(tasks[index]?.content || ""));
+    if (score > expectedParentScore) {
+      expectedParentScore = score;
+      expectedParentTaskIndex = index;
+    }
+  }
+  const mismatched = expectedParentScore >= 0.55 && expectedParentScore - parentScore >= 0.3 && parentScore < 0.5;
+  return { mismatched, expectedParentTaskIndex, parentScore, expectedParentScore };
+}
+
+function taskStructureSafetySnapshot(tasks = []) {
+  const initialIssues = new Set(taskPlanRepairableHierarchyIssues(tasks).map((issue) => `${issue.taskIndex}:${issue.code}`));
+  return (tasks || []).map((task, index) => ({
+    key: task.oid ? `oid:${task.oid}` : `index:${index}`,
+    index,
+    content: task.content || "",
+    subtasks: (task.subtasks || []).map((subtask) => Object.assign({}, subtask)),
+    initialIssueCodes: Array.from(initialIssues).filter((value) => value.startsWith(`${index}:`)).map((value) => value.split(":")[1])
+  }));
+}
+
+function restoreTaskStructureAfterDedupeRegression(tasks = [], snapshot = []) {
+  const issues = taskPlanRepairableHierarchyIssues(tasks);
+  if (!issues.length) return 0;
+  const snapshotByKey = new Map((snapshot || []).map((item) => [item.key, item]));
+  const restored = new Set();
+  for (const issue of issues) {
+    const task = tasks[issue.taskIndex];
+    if (!task) continue;
+    const key = task.oid ? `oid:${task.oid}` : `index:${issue.taskIndex}`;
+    const previous = snapshotByKey.get(key);
+    if (!previous || previous.initialIssueCodes.includes(issue.code) || restored.has(key)) continue;
+    const currentSubtasks = task.subtasks || [];
+    task.content = previous.content;
+    task.subtasks = previous.subtasks.map((subtask, index) => {
+      const current = currentSubtasks.find((candidate) => candidate.oid && subtask.oid && candidate.oid === subtask.oid)
+        || currentSubtasks.find((candidate) => canonicalTaskMatchTitle(candidate.content || "") === canonicalTaskMatchTitle(subtask.content || ""))
+        || currentSubtasks[index]
+        || {};
+      return Object.assign({}, subtask, {
+        id: current.id || subtask.id || "",
+        oid: current.oid || subtask.oid || "",
+        deduplication: current.deduplication || subtask.deduplication,
+        parentId: task.id || current.parentId || subtask.parentId || "",
+        parentOid: task.oid || current.parentOid || subtask.parentOid || "",
+        parentContent: previous.content
+      });
+    });
+    restored.add(key);
+  }
+  return restored.size;
+}
+
+const TASK_PLAN_REPAIRABLE_STRUCTURE_CODES = new Set(["bundled-main-actions", "overloaded-main-title", "subtask-restates-parent", "subtask-mismatched-parent", "overlapping-subtasks", "overlapping-main-tasks"]);
+
+function taskPlanRepairableHierarchyIssues(tasks = [], options = {}) {
+  const issues = generatedTaskStructureIssues(tasks).filter((issue) => TASK_PLAN_REPAIRABLE_STRUCTURE_CODES.has(issue.code));
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    const reason = mainTaskClarityReason(tasks[taskIndex] || {});
+    if (reason !== "passed") issues.push({ code: "unclear-main-title", taskIndex, blocking: true, reason });
+  }
+  if (options.sourceEvidence) issues.push(...generatedTaskTemporalIssues(tasks, options.sourceEvidence));
+  if (options.sourceEvidence) issues.push(...generatedTaskPriorityIssues(tasks, options.sourceEvidence, options.priorityInstructions || "", options.settings || DEFAULT_SETTINGS));
+  if (options.labelInstructions) issues.push(...generatedTaskLabelIssues(tasks, options.labelInstructions));
+  if (options.sourceType === "email") {
+    issues.push(...generatedEmailChronologyIssues(tasks, options.chronologyEvidence || ""));
+    issues.push(...generatedEmailOwnershipIssues(tasks, options.sourceEvidence || "", options.chronologyEvidence || ""));
+  }
+  return issues;
+}
+
+function generatedTaskLabelIssues(tasks = [], labelInstructions = "") {
+  const instructionSentences = String(labelInstructions || "").split(/\n+/).flatMap((line) => splitDescriptionSentences(line));
+  const genericTerms = new Set(["add", "apply", "create", "for", "if", "involving", "item", "items", "label", "labels", "only", "task", "tasks", "the", "use", "user", "when", "work"]);
+  const ruleForLabel = (label) => {
+    const escaped = escapeRegExp(cleanLabel(label));
+    const sentence = instructionSentences.find((item) => new RegExp(`#${escaped}\\b`, "i").test(item));
+    if (!sentence) return null;
+    const condition = sentence.match(/\b(?:only\s+for|for|when|if|involving|related\s+to)\s+(.+?)(?=\s+(?:and\s+)?(?:add|apply|use|create)\s+#|[.;]|$)/i)?.[1] || "";
+    if (!condition) return null;
+    const anchors = uniqueValues(generatedTaskObjectTerms(condition).concat(Object.keys(termCounts(condition)).map(normalizeContextAnchorTerm).filter((term) => term.length >= 4 && !genericTerms.has(term))));
+    return anchors.length ? { sentence, condition, anchors } : null;
+  };
+  const issues = [];
+  const inspect = (task, taskIndex, subtaskIndex = null) => {
+    if (!task || task.id || task.deduplication?.todoistId) return;
+    const text = [task.content, task.description, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ");
+    const counts = termCounts(text);
+    for (const label of task.labels || []) {
+      const rule = ruleForLabel(label);
+      if (!rule) continue;
+      const normalizedLabel = cleanLabel(label).toLowerCase();
+      const semanticFollowUp = normalizedLabel === "followup" && /\b(?:ask|confirm|contact|coordinate|finali[sz]e|follow[- ]?up|reply|request|respond|review|send|submit)\b/i.test(text);
+      const matched = semanticFollowUp || rule.anchors.some((anchor) => contextAnchorVariants(anchor).some((variant) => counts[variant]));
+      if (!matched) issues.push({ code: "unsupported-task-label", taskIndex, ...(subtaskIndex == null ? {} : { subtaskIndex }), blocking: true, label: cleanLabel(label), condition: rule.condition, reason: "task scope does not satisfy the label's explicit configured condition" });
+    }
+  };
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    inspect(tasks[taskIndex], taskIndex);
+    for (let subtaskIndex = 0; subtaskIndex < (tasks[taskIndex]?.subtasks || []).length; subtaskIndex += 1) inspect(tasks[taskIndex].subtasks[subtaskIndex], taskIndex, subtaskIndex);
+  }
+  return issues;
+}
+
+function generatedTaskPriorityIssues(tasks = [], sourceEvidence = "", priorityInstructions = "", settings = DEFAULT_SETTINGS) {
+  const urgencyPattern = /\b(?:urgent|urgently|asap|immediately|critical|highest priority|top priority|time[- ]sensitive|overdue|blocking|cannot proceed|can't proceed|must be completed now)\b/i;
+  const sourceSentences = String(sourceEvidence || "").split(/\n+/).flatMap((line) => splitDescriptionSentences(line)).map(singleLine).filter(Boolean);
+  const urgencyForTask = (task = {}, parent = null) => {
+    const taskAnchors = generatedTaskObjectTerms(task.content || "").filter((term) => !/^(?:urgent|urgently|asap|immediately|critical|priority|blocking|overdue)$/.test(term));
+    const anchors = taskAnchors.length ? taskAnchors : generatedTaskObjectTerms(parent?.content || "").filter((term) => !/^(?:urgent|urgently|asap|immediately|critical|priority|blocking|overdue)$/.test(term));
+    const urgentSentences = sourceSentences.filter((sentence) => urgencyPattern.test(sentence));
+    if (!urgentSentences.length || !anchors.length) return false;
+    return urgentSentences.some((sentence) => taskEvidenceAnchorHitCount(sentence, anchors) >= taskEvidenceMinimumAnchorHits(anchors));
+  };
+  const current = new Date(`${today()}T12:00:00`).getTime();
+  const hasNearDate = (task = {}) => [task.due_date, task.deadline_date].filter(validDate).some((value) => {
+    const time = new Date(`${value}T12:00:00`).getTime();
+    const days = Math.round((time - current) / 86400000);
+    return days >= 0 && days <= 2;
+  });
+  const issues = [];
+  const inspect = (task, taskIndex, subtaskIndex = null, parent = null) => {
+    if (!task || task.id || task.deduplication?.todoistId) return;
+    const priority = normalizePriority(task.priority);
+    const localUrgency = urgencyForTask(task, parent);
+    const configuredRule = priorityInstructionSupportsTask(task, priority, priorityInstructions);
+    if (priority === 4 && !localUrgency && !hasNearDate(task) && !(parent && hasNearDate(parent)) && !configuredRule) issues.push({ code: "unsupported-high-priority", taskIndex, ...(subtaskIndex == null ? {} : { subtaskIndex }), blocking: true, priority: 4, reason: "new highest-priority assignment lacks task-specific urgency, criticality, near-date, or configured-rule support" });
+    const canPrioritize = subtaskIndex == null || settings.subtaskIncludePriority !== false;
+    if (canPrioritize && priority <= 2 && localUrgency && !configuredRule) issues.push({ code: "under-prioritized-urgent-task", taskIndex, ...(subtaskIndex == null ? {} : { subtaskIndex }), blocking: true, priority, reason: "source explicitly marks this task urgent, critical, blocking, overdue, or immediate, but it was assigned ordinary or no priority" });
+  };
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    const task = tasks[taskIndex] || {};
+    inspect(task, taskIndex);
+    for (let subtaskIndex = 0; subtaskIndex < (task.subtasks || []).length; subtaskIndex += 1) inspect(task.subtasks[subtaskIndex], taskIndex, subtaskIndex, task);
+  }
+  return issues;
+}
+
+function priorityInstructionSupportsTask(task = {}, priority = 1, priorityInstructions = "") {
+  const sentences = String(priorityInstructions || "").split(/\n+/).flatMap((line) => splitDescriptionSentences(line));
+  const matching = sentences.filter((sentence) => new RegExp(`\\bpriority\\s*${priority}\\b`, "i").test(sentence));
+  for (const sentence of matching) {
+    if (/\b(?:all|every)\s+tasks?\b/i.test(sentence)) return true;
+    const requiredFamilies = TASK_REQUEST_BOUND_ACTION_FAMILIES.filter((family) => taskRequestFamilyPresent(sentence, family));
+    if (requiredFamilies.length && !requiredFamilies.some((family) => taskRequestFamilyPresent(task.content || "", family))) continue;
+    const scope = sentence.replace(/\b(?:always|assign|set|use|priority|tasks?|items?|work|urgent|urgently|asap|immediately|critical|highest|top)\b|\b[1-4]\b/gi, " ");
+    const anchors = generatedTaskObjectTerms(scope);
+    if (anchors.length && taskEvidenceAnchorHitCount(task.content || "", anchors) < taskEvidenceMinimumAnchorHits(anchors)) continue;
+    if (requiredFamilies.length || anchors.length) return true;
+  }
+  return false;
+}
+
+function generatedEmailOwnershipIssues(tasks = [], sourceEvidence = "", sourceSummary = "") {
+  const current = emailCurrentMessageText(sourceSummary);
+  if (!current) return [];
+  const recipientNames = new Set((String(sourceEvidence || "").match(/^To:\s*(.+)$/im)?.[1] || "")
+    .split(/[;,]/)
+    .flatMap((part) => part.replace(/<[^>]+>/g, " ").match(/[A-Z][A-Za-z'-]+/g) || [])
+    .map((name) => name.toLowerCase()));
+  const sentences = splitDescriptionSentences(current);
+  const owned = [];
+  const unowned = [];
+  const ownerPattern = /^([A-Z][A-Za-z&'-]*(?:\s+[A-Z][A-Za-z&'-]*){0,2}|the\s+[A-Za-z&'-]+\s+team)\s+(?:will|should|must|needs? to|is responsible for|has agreed to|plans? to|is going to)\s+(.+)$/i;
+  for (const sentence of sentences) {
+    const match = singleLine(sentence).match(ownerPattern);
+    const owner = match?.[1] || "";
+    if (!match || /^(?:i|we|you|user)$/i.test(owner) || recipientNames.has(owner.split(/\s+/)[0].toLowerCase())) {
+      unowned.push(sentence);
+      continue;
+    }
+    const families = TASK_REQUEST_BOUND_ACTION_FAMILIES.filter((family) => taskRequestFamilyPresent(match[2], family));
+    if (families.length) owned.push({ owner, families });
+  }
+  if (!owned.length) return [];
+  const activeFamilies = new Set(taskRequestedActionSignals(unowned.join(". "), "email").families || []);
+  const issues = [];
+  const inspect = (task, taskIndex, subtaskIndex = null) => {
+    const title = task?.content || "";
+    if (/^(?:ask|request|follow\s+up|contact|coordinate|check\s+with|confirm\s+with)\b/i.test(title)) return;
+    const matches = owned.flatMap((entry) => entry.families.filter((family) => !activeFamilies.has(family) && taskRequestFamilyPresent(title, family)).map((family) => ({ owner: entry.owner, family })));
+    if (!matches.length) return;
+    issues.push({ code: "wrong-owner-action", taskIndex, ...(subtaskIndex == null ? {} : { subtaskIndex }), blocking: true, owners: uniqueValues(matches.map((match) => match.owner)), families: uniqueValues(matches.map((match) => match.family)), reason: "source assigns this action to another named owner without a separate user request" });
+  };
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    inspect(tasks[taskIndex], taskIndex);
+    for (let subtaskIndex = 0; subtaskIndex < (tasks[taskIndex]?.subtasks || []).length; subtaskIndex += 1) inspect(tasks[taskIndex].subtasks[subtaskIndex], taskIndex, subtaskIndex);
+  }
+  return issues;
+}
+
+function generatedEmailChronologyIssues(tasks = [], sourceSummary = "") {
+  const current = emailCurrentMessageText(sourceSummary);
+  if (!current) return [];
+  const completedPatterns = {
+    review: /\b(?:reviewed|checked|assessed|evaluated|read)\b/i,
+    drafting: /\b(?:drafted|prepared|wrote|written|composed)\b/i,
+    revisions: /\b(?:adjusted|edited|revised|updated|changed)\b/i,
+    send: /\b(?:sent|submitted|shared|forwarded|circulated|delivered)\b/i,
+    approval: /\b(?:approved|signed[- ]?off)\b/i,
+    confirmation: /\b(?:confirmed|verified)\b/i,
+    decision: /\b(?:decided|determined)\b/i
+  };
+  const completedFamilies = Object.entries(completedPatterns).filter(([, pattern]) => pattern.test(current)).map(([family]) => family);
+  if (!completedFamilies.length) return [];
+  const activeFamilies = new Set(taskRequestedActionSignals(current, "email").families || []);
+  const issues = [];
+  const inspect = (task, taskIndex, subtaskIndex = null) => {
+    const staleFamilies = completedFamilies.filter((family) => !activeFamilies.has(family) && taskRequestFamilyPresent(task?.content || "", family));
+    if (!staleFamilies.length) return;
+    issues.push({ code: "stale-email-action", taskIndex, ...(subtaskIndex == null ? {} : { subtaskIndex }), blocking: true, families: staleFamilies, reason: "current/latest email message marks this action complete without requesting it again" });
+  };
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    inspect(tasks[taskIndex], taskIndex);
+    for (let subtaskIndex = 0; subtaskIndex < (tasks[taskIndex]?.subtasks || []).length; subtaskIndex += 1) inspect(tasks[taskIndex].subtasks[subtaskIndex], taskIndex, subtaskIndex);
+  }
+  return issues;
+}
+
+function generatedTaskTemporalIssues(tasks = [], sourceEvidence = "") {
+  const issues = [];
+  const explicitDates = sourceExplicitDateKeys(sourceEvidence);
+  const explicitRoles = sourceExplicitTemporalRoles(sourceEvidence);
+  const current = new Date(`${today()}T12:00:00`);
+  const minTime = current.getTime();
+  const maxTime = minTime + 548 * 86400000;
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    const task = tasks[taskIndex] || {};
+    if (task.id || task.deduplication?.todoistId) continue;
+    const records = [
+      { field: "due_date", code: "implausible-due-date" },
+      { field: "deadline_date", code: "implausible-deadline-date" }
+    ];
+    for (const record of records) {
+      const value = task[record.field] || "";
+      if (!value || !validDate(value) || explicitDates.has(value)) continue;
+      const time = new Date(`${value}T12:00:00`).getTime();
+      if (time < minTime || time > maxTime) issues.push({ code: record.code, taskIndex, blocking: true, field: record.field, value, reason: "inferred date is in the past or beyond the supported planning horizon" });
+    }
+    issues.push(...generatedTaskTemporalRoleIssues(task, explicitRoles, taskIndex));
+    for (let subtaskIndex = 0; subtaskIndex < (task.subtasks || []).length; subtaskIndex += 1) {
+      const subtask = task.subtasks[subtaskIndex] || {};
+      if (subtask.id || subtask.deduplication?.todoistId) continue;
+      for (const record of records) {
+        const value = subtask[record.field] || "";
+        if (!value || !validDate(value) || explicitDates.has(value)) continue;
+        const time = new Date(`${value}T12:00:00`).getTime();
+        if (time < minTime || time > maxTime) issues.push({ code: record.code, taskIndex, subtaskIndex, blocking: true, field: record.field, value, reason: "inferred subtask date is in the past or beyond the supported planning horizon" });
+      }
+      issues.push(...generatedTaskTemporalRoleIssues(subtask, explicitRoles, taskIndex, subtaskIndex));
+    }
+  }
+  return issues;
+}
+
+function generatedTaskTemporalRoleIssues(task = {}, roles = {}, taskIndex = 0, subtaskIndex = null) {
+  const location = subtaskIndex == null ? {} : { subtaskIndex };
+  const issues = [];
+  if (task.due_date && roles.notBeforeDates?.has(task.due_date)) issues.push({ code: "explicit-not-before-used-as-due-date", taskIndex, ...location, blocking: true, field: "due_date", value: task.due_date, reason: "source identifies this as the earliest allowed action date, not a due date" });
+  if (task.deadline_date && roles.notBeforeDates?.has(task.deadline_date)) issues.push({ code: "explicit-not-before-used-as-deadline", taskIndex, ...location, blocking: true, field: "deadline_date", value: task.deadline_date, reason: "source identifies this as the earliest allowed action date, not a deadline" });
+  if (task.due_date && roles.deadlines?.has(task.due_date) && task.deadline_date !== task.due_date) issues.push({ code: "explicit-deadline-used-as-due-date", taskIndex, ...location, blocking: true, field: "due_date", value: task.due_date, reason: "source identifies this date as a deadline, not the task's due date" });
+  if (task.deadline_date && roles.dueDates?.has(task.deadline_date) && task.due_date !== task.deadline_date) issues.push({ code: "explicit-due-date-used-as-deadline", taskIndex, ...location, blocking: true, field: "deadline_date", value: task.deadline_date, reason: "source identifies this as a due or target date, not a hard deadline" });
+  return issues;
+}
+
+function sourceExplicitTemporalRoles(value = "") {
+  const text = String(value || "");
+  const month = "(?:January|February|March|April|May|June|July|August|September|October|November|December)";
+  const datePattern = `(?:20\\d{2}-\\d{2}-\\d{2}|${month}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,\\s*20\\d{2})?)`;
+  const dueDates = new Set();
+  const deadlines = new Set();
+  const notBeforeDates = new Set();
+  const collect = (pattern, target) => {
+    for (const match of text.matchAll(pattern)) for (const date of sourceExplicitDateKeys(match[1])) target.add(date);
+  };
+  collect(new RegExp(`\\b(?:due(?:\\s+date)?|target\\s+date|scheduled\\s+for)(?:\\s+(?:is|on))?\\s*[:=-]?\\s*(${datePattern})`, "gi"), dueDates);
+  collect(new RegExp(`\\b(?:hard\\s+deadline|deadline|hard\\s+cutoff|no\\s+later\\s+than)(?:\\s+(?:is|of|on))?\\s*[:=-]?\\s*(${datePattern})`, "gi"), deadlines);
+  collect(new RegExp(`\\b(?:not\\s+before|no\\s+earlier\\s+than|start\\s+after|begin\\s+after)\\s*[:=-]?\\s*(${datePattern})`, "gi"), notBeforeDates);
+  collect(new RegExp(`\\b(?:do not|don't)\\s+(?:start|begin|send|submit|publish)\\b[^.;]{0,100}\\bbefore\\s+(${datePattern})`, "gi"), notBeforeDates);
+  return { dueDates, deadlines, notBeforeDates };
+}
+
+function sourceExplicitDateKeys(value = "") {
+  const dates = new Set(String(value || "").match(/\b20\d{2}-\d{2}-\d{2}\b/g) || []);
+  const named = String(value || "").match(/\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*20\d{2})?\b/gi) || [];
+  for (const item of named) {
+    const parsed = new Date(item.replace(/(\d)(?:st|nd|rd|th)\b/i, "$1"));
+    if (Number.isFinite(parsed.getTime())) dates.add(deviceDateString(parsed));
+  }
+  return dates;
+}
+
 function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
   const startedAt = Date.now();
   const issues = [];
-  const addIssue = (code, taskIndex, blocking = true) => issues.push({ code, taskIndex, blocking });
+  const addIssue = (code, taskIndex, blocking = true, reason = "") => issues.push({ code, taskIndex, blocking, reason });
   const sourceContext = options.sourceContext || {};
   const sourceEvidence = [options.sourceTitle, sourceContext.title, plan.sourceSummary, sourceContext.text]
     .filter(Boolean)
@@ -13293,10 +14493,16 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     if (!titleKey) addIssue("missing-main-title", index);
     else if (seenTitles.has(titleKey) && !task.possibleDuplicate) addIssue("duplicate-main-title", index);
     else seenTitles.add(titleKey);
+    const mainTitleClarity = mainTaskClarityReason(task);
+    if (mainTitleClarity !== "passed") addIssue("unclear-main-title", index, true, mainTitleClarity);
     if (task.content && !generatedTaskMatchesPrimarySource(task, groundingEvidence)) addIssue("ungrounded-main-title", index);
     const splitDescription = splitDescriptionSourceListBlock(task.description || "");
-    const descriptionReason = taskDescriptionGroundingReason(splitDescription.summary, task, evidenceBundles[index], settings);
-    if (descriptionReason !== "passed") addIssue("ungrounded-main-description", index);
+    const descriptionReason = taskDescriptionEvidenceReason(splitDescription.summary, task, evidenceBundles[index], settings);
+    if (descriptionReason !== "passed") addIssue("ungrounded-main-description", index, true, descriptionReason);
+    const clarityReason = taskDescriptionClarityReason(splitDescription.summary, task, settings);
+    if (descriptionReason === "passed" && clarityReason !== "passed") addIssue("ungrounded-main-description", index, true, clarityReason);
+    const linkReason = taskDescriptionLinkIntegrityReason(splitDescription.summary, task, evidenceBundles[index], settings);
+    if (linkReason !== "passed") addIssue("invalid-main-description-link", index, true, linkReason);
     if (options.citeContextNotes !== false && !splitDescription.sourceList) addIssue("missing-source-list", index);
     if (task.due_date && !validDate(task.due_date)) addIssue("invalid-due-date", index);
     if (task.deadline_date && !validDate(task.deadline_date)) addIssue("invalid-deadline-date", index);
@@ -13310,10 +14516,13 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
       subtaskCount += 1;
       const subtaskKey = canonicalTaskMatchTitle(subtask.content || "");
       if (!subtaskKey) addIssue("missing-subtask-title", index);
+      else if (subtaskKey === titleKey) addIssue("subtask-restates-parent", index);
       else if (seenSubtasks.has(subtaskKey)) addIssue("duplicate-subtask-title", index);
       else seenSubtasks.add(subtaskKey);
       const subtaskEvidence = [groundingEvidence, task.content, splitDescription.summary].filter(Boolean).join("\n");
       if (subtask.content && !generatedTaskMatchesPrimarySource(subtask, subtaskEvidence)) addIssue("ungrounded-subtask", index);
+      const subtaskClarity = subtaskClarityReason(subtask, task);
+      if (subtaskClarity !== "passed") addIssue("unclear-subtask", index, true, subtaskClarity);
       const subtaskLabels = (subtask.labels || []).map(cleanLabel).filter(Boolean);
       labelCount += subtaskLabels.length;
       if (!subtask.id && subtaskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("subtask-label-not-allowed", index);
@@ -13321,26 +14530,60 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
       if (subtask.deadline_date && !validDate(subtask.deadline_date)) addIssue("invalid-subtask-deadline-date", index);
     }
   }
+  for (const issue of generatedTaskTemporalIssues(tasks, sourceEvidence)) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
+  for (const issue of generatedTaskPriorityIssues(tasks, sourceEvidence, plan.priorityInstructions || "", settings)) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
+  for (const issue of generatedTaskLabelIssues(tasks, plan.labelInstructions || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
+  if (options.source === "email") {
+    for (const issue of generatedEmailChronologyIssues(tasks, plan.sourceSummary || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
+    for (const issue of generatedEmailOwnershipIssues(tasks, sourceEvidence, plan.sourceSummary || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
+  }
+  for (const issue of generatedTaskStructureIssues(tasks)) addIssue(issue.code, issue.taskIndex, TASK_PLAN_REPAIRABLE_STRUCTURE_CODES.has(issue.code), JSON.stringify(issue));
+  const requestSignals = plan.requestedActionSignals || taskRequestedActionSignals(sourceContext.text || plan.sourceSummary || "", options.source || "note");
+  const requestCoverage = taskRequestCoverageReport(tasks, requestSignals);
+  if (!requestCoverage.passed) addIssue("missing-requested-outcome", 0, true, JSON.stringify(requestCoverage));
   const blockingIssues = issues.filter((issue) => issue.blocking).length;
+  const advisoryIssues = issues.length - blockingIssues;
   return {
-    passed: blockingIssues === 0,
-    score: Math.max(0, 100 - blockingIssues * 12),
+    passed: issues.length === 0,
+    score: Math.max(0, 100 - blockingIssues * 12 - advisoryIssues * 4),
     blockingIssues,
+    advisoryIssues,
     issues,
     mainTaskCount: (tasks || []).length,
     subtaskCount,
     labelCount,
+    requestCoverage,
     aiCalls: 0,
     elapsedMs: Math.max(0, Date.now() - startedAt)
   };
 }
 
+function enforceDeterministicDescriptionFallbacks(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
+  const sourceContext = options.sourceContext || {};
+  const sourceTitle = options.sourceTitle || sourceContext.title || "";
+  const sourceSummary = plan.sourceSummary || sourceContext.text || "";
+  const context = plan.semanticContext || options.semanticContext || [];
+  const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
+  hydrateContextCitationEvidence(citationState, context, sourceContext.path || options.path || "");
+  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
+  let applied = 0;
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    const task = tasks[index] || {};
+    const split = splitDescriptionSourceListBlock(task.description || "");
+    if (taskDescriptionGroundingReason(split.summary, task, evidenceBundles[index], settings) === "passed") continue;
+    const fallback = deterministicTaskFallbackDescription(task, settings, evidenceBundles[index]);
+    task.description = taskDescriptionWithSources(fallback, task.content || "", split.sourceList, settings, sourceTitle, citationState, [sourceSummary, ...context.map((chunk) => chunk.text || "")].filter(Boolean).join("\n\n"));
+    applied += 1;
+  }
+  return applied;
+}
+
 function descriptionSpecificEntities(value = "") {
   const ignored = new Set([
     "The", "This", "That", "These", "Those", "A", "An", "Before", "After", "Once", "Then", "Earlier", "Later",
-    "Because", "Although", "However", "When", "While",
-    "Keep", "Include", "Review", "Confirm", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
-    "Todoist", "Obsidian", "Context", "Task", "Source"
+    "Because", "Although", "However", "When", "While", "For", "Related",
+    "Keep", "Include", "Review", "Compare", "Confirm", "Verify", "Identify", "Coordinate", "Complete", "Resolve", "Clarify", "Determine", "Check", "Summarize", "Respond", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
+    "Todoist", "Obsidian", "Context", "Task", "Source", "Subject", "Concrete", "Steps", "Completion", "Outcome", "Result", "Expected"
   ]);
   const entities = String(value || "").match(/\b[A-Z][A-Za-z&'-]{2,}(?:\s+[A-Z][A-Za-z&'-]{2,}){0,2}\b/g) || [];
   return uniqueValues(entities.map((entity) => {
@@ -13353,6 +14596,7 @@ function descriptionSpecificEntities(value = "") {
 
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
   const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
+  hydrateContextCitationEvidence(citationState, contextChunks, basePath);
   const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
   const linkContext = [
     active?.text || "",
@@ -13371,8 +14615,9 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
 function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}, linkContext = "") {
   const splitSummary = splitDescriptionSourceListBlock(taskSummary);
   const sourceBlock = normalizeDescriptionSourceList(sources || splitSummary.sourceList);
+  const linkedSummary = ensureRequiredTaskWorkingLink(splitSummary.summary, taskTitle, linkContext, settings);
   const normalizedSummary = normalizeDescriptionLinks(
-    conciseDescriptionSummary([cleanGeneratedDescriptionSummary(splitSummary.summary, settings)], settings),
+    conciseDescriptionSummary([cleanGeneratedDescriptionSummary(linkedSummary, settings)], settings),
     linkContext,
     settings
   );
@@ -13385,6 +14630,45 @@ function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = 
   if (isUsefulDescriptionSummary(summary, taskTitle, settings)) parts.push(summary);
   if (sourceBlock) parts.push(sourceBlock);
   return formatTodoistDescription(parts.join("\n\n"), settings);
+}
+
+function ensureRequiredTaskWorkingLink(summary = "", taskTitle = "", linkContext = "", settings = DEFAULT_SETTINGS) {
+  const text = String(summary || "");
+  const required = requiredTaskWorkingLinkRecord(taskTitle, linkContext, settings);
+  if (!required) return text;
+  const existingKeys = new Set(extractDescriptionLinkRecords(text, settings).map((record) => descriptionLinkKey(record.url)));
+  if (existingKeys.has(descriptionLinkKey(required.url))) return text;
+  const link = `[${markdownLinkText(required.label || descriptionLinkLabelFromUrl(required.url))}](${required.url})`;
+  return `Use ${link} as the working document. ${text}`.trim();
+}
+
+function requiredTaskWorkingLinkRecord(taskTitle = "", linkContext = "", settings = DEFAULT_SETTINGS) {
+  if (!/\b(?:linked|link|draft|document|attachment|file|report|spreadsheet|workbook|presentation|form|letter|proposal|application|materials?)\b/i.test(taskTitle)) return null;
+  const sourceLinks = extractDescriptionLinkRecords(linkContext, settings).filter((record) => /^https?:\/\//i.test(record.url || ""));
+  if (!sourceLinks.length) return null;
+  const anchors = generatedTaskObjectTerms(taskTitle);
+  const ranked = sourceLinks.map((record, index) => ({
+    record,
+    index,
+    score: taskEvidenceAnchorHitCount(`${record.label || ""} ${descriptionLinkLabelFromUrl(record.url || "")}`, anchors)
+  })).sort((left, right) => right.score - left.score || left.index - right.index);
+  const selected = ranked[0];
+  if (!selected || (sourceLinks.length > 1 && selected.score < 1)) return null;
+  return selected.record;
+}
+
+function taskDescriptionLinkIntegrityReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  const summary = splitDescriptionSourceListBlock(value || "").summary;
+  if (/\[[^\]\n]*\(\d+\)[^\]\n]*\]\([^)]*\)|\[[^\]\n]+\]\([^)]*\(\d+\)[^)]*\)/.test(summary)) return "context citation appears inside a Markdown link";
+  const markdownPattern = /\[([^\]\n]+)\]\(\s*((?:https?|obsidian|todoist):\/\/[^)\s]+)\s*\)/gi;
+  const withoutMarkdownLinks = summary.replace(markdownPattern, "");
+  if (/(?:https?|obsidian|todoist):\/\/[^\s<>\]]+/i.test(withoutMarkdownLinks)) return "description contains a bare or malformed URL";
+  const required = requiredTaskWorkingLinkRecord(task.content || "", evidence?.corpus || "", settings);
+  if (!required) return "passed";
+  const links = extractDescriptionLinkRecords(summary, settings);
+  return links.some((link) => descriptionLinkKey(link.url) === descriptionLinkKey(required.url))
+    ? "passed"
+    : "description is missing its required working-document link";
 }
 
 function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
@@ -13421,8 +14705,59 @@ function fallbackActionSummary(task, sourceText, contextChunks, sourceTitle = ""
   const activeContext = summarizeSourceForTaskContext(sourceText, query, 780, settings, { strictQuery: true });
   const vaultContext = summarizeSourceForTaskContext((contextChunks || []).map((chunk) => `${chunk.title || chunk.path}\n${chunk.text || ""}`).join("\n\n"), query, 420, settings, { strictQuery: true });
   const summary = removeTitleEcho(conciseDescriptionSummary(mergeStrings([activeContext], [vaultContext]), settings), task.content);
-  if (isUsefulDescriptionSummary(summary, task.content, settings)) return truncateAtWord(summary, 1200);
-  return truncateAtWord(`The source context indicates this is a user-owned action from ${sourceTitle || "the source material"}. Review the active note or email for the current status, confirm the relevant people, documents, and timing, then complete the next concrete follow-up required for this item.`, 1200);
+  if (isUsefulDescriptionSummary(summary, task.content, settings) && taskDescriptionClarityReason(summary, task, settings) === "passed") return truncateAtWord(summary, 1200);
+  return deterministicTaskFallbackDescription(task, settings);
+}
+
+function deterministicTaskFallbackDescription(task = {}, settings = DEFAULT_SETTINGS, evidence = null) {
+  const title = singleLine(task.content || "the requested task").replace(/[.!?]+$/, "");
+  const action = title ? `${title.charAt(0).toLowerCase()}${title.slice(1)}` : "complete the requested task";
+  const subtasks = (task.subtasks || []).map((subtask) => singleLine(subtask.content || "").replace(/[.!?]+$/, "")).filter(Boolean);
+  const outcome = subtasks.length
+    ? `these source-supported steps are complete: ${naturalLanguageList(subtasks.map((subtask) => `${subtask.charAt(0).toLowerCase()}${subtask.slice(1)}`))}`
+    : `the requested action is complete: ${action}`;
+  const generic = truncateAtWord([
+    `The immediate action is to ${action}.`,
+    "This supports the requested outcome by keeping each source-supported step tied to the same work and expected result.",
+    `The expected outcome is reached when ${outcome}.`
+  ].join(" "), 1200);
+  const knowledge = task.knowledge || {};
+  const evidenceSignals = evidence?.corpus ? adaptiveContextSignals(evidence.corpus, title, title, "") : { problems: [], dependencies: [], outcomes: [], nextSteps: [] };
+  const evidencePurpose = (evidenceSignals.dependencies || []).find((item) => /\b(?:because|in order to|needed before|needed for|required for|so that|supports?|enables?|allows?|intention|purpose)\b/i.test(item)) || "";
+  const evidenceDependency = (evidenceSignals.dependencies || []).find((item) => canonicalTaskMatchTitle(item) !== canonicalTaskMatchTitle(evidencePurpose) && /\b(?:requires?|depends?|waiting|blocked|approval|missing information|input|feedback)\b/i.test(item)) || "";
+  const rationale = cleanFallbackKnowledgeDetail(knowledge.rationale || knowledge.problem || evidencePurpose || evidenceSignals.problems?.[0] || evidenceSignals.outcomes?.[0] || "", title);
+  const dependency = cleanFallbackKnowledgeDetail(knowledge.dependency || evidenceDependency || (evidenceSignals.dependencies || []).find((item) => canonicalTaskMatchTitle(item) !== canonicalTaskMatchTitle(rationale)) || "", title);
+  const expected = cleanFallbackKnowledgeDetail(knowledge.outcome || knowledge.nextStep || evidenceSignals.outcomes?.[0] || evidenceSignals.nextSteps?.[0] || "", title);
+  if (!evidence?.corpus || (!rationale && !dependency && !expected)) return generic;
+  const grounded = truncateAtWord([
+    `The immediate action is to ${action}.`,
+    rationale ? `This work matters because ${fallbackDetailClause(rationale)}.` : "This supports the requested outcome by keeping the work tied to its stated purpose.",
+    dependency ? `A relevant constraint is that ${fallbackDetailClause(dependency)}.` : "",
+    expected ? `The expected outcome is ${fallbackDetailClause(expected)}.` : `The expected outcome is reached when ${outcome}.`
+  ].filter(Boolean).join(" "), 1200);
+  return taskDescriptionEvidenceReason(grounded, task, evidence, settings) === "passed" && taskDescriptionClarityReason(grounded, task, settings) === "passed"
+    ? grounded
+    : generic;
+}
+
+function cleanFallbackKnowledgeDetail(value = "", taskTitle = "") {
+  const cleaned = singleLine(value).replace(/^[-:;,.\s]+|[.!?]+$/g, "").replace(/^(?:the\s+)?expected\s+(?:outcome|result)\s+is\s+/i, "").trim();
+  if (!cleaned || cleaned.length < 12) return "";
+  if (taskStructureTitleOverlap(cleaned, taskTitle) >= 0.86) return "";
+  return truncateAtWord(cleaned, 300);
+}
+
+function fallbackDetailClause(value = "") {
+  const text = singleLine(value);
+  if (!text || /^[A-Z]{2,}\b/.test(text)) return text;
+  return `${text.charAt(0).toLowerCase()}${text.slice(1)}`;
+}
+
+function naturalLanguageList(items = []) {
+  const values = (items || []).filter(Boolean);
+  if (values.length <= 1) return values[0] || "";
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(", ")}, and ${values[values.length - 1]}`;
 }
 
 function enrichTaskDescriptions(tasks, sourceText, contextChunks, sourceTitle = "") {
@@ -13458,6 +14793,14 @@ function removeSourceLeadIn(summary, sourceTitle = "") {
   let text = singleLine(summary || "");
   if (!text) return text;
   const aliases = sourceTitleAliases(sourceTitle);
+  text = text.replace(/^subject\s*:\s*/i, "");
+  text = text.replace(/^(?:for|in)\s+(?:this|the)\s+(?:email\s+)?(?:subject|thread)(?:\s+["“][^"”]+["”])?\s*,?\s*/i, "");
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (const alias of aliases) {
+      const pattern = new RegExp(`^${escapeRegExp(alias).replace(/\s+/g, "\\s+")}(?:\\.md)?(?:\\s*[-:–—]\\s*|\\s+)`, "i");
+      text = text.replace(pattern, "");
+    }
+  }
   const titlePattern = aliases.length ? aliases.map((title) => escapeRegExp(title).replace(/\s+/g, "\\s+")).join("|") : "";
   const genericLead = "the\\s+(?:active\\s+|primary\\s+|source\\s+)?(?:note|source|email|thread|meeting\\s+note|document)";
   const verbs = "(?:records?|notes?|states?|says?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?)";
@@ -13467,6 +14810,20 @@ function removeSourceLeadIn(summary, sourceTitle = "") {
     new RegExp(`^(?:according\\s+to|based\\s+on|from)\\s+(?:${genericLead}${titlePattern ? `|${titlePattern}(?:\\.md)?` : ""})\\s*,?\\s*`, "i")
   ].filter(Boolean);
   for (const pattern of patterns) text = text.replace(pattern, "");
+  if (aliases.length) {
+    const canonicalAliases = new Set(aliases.map((alias) => canonicalTaskMatchTitle(alias)).filter(Boolean));
+    const aliasTokenSets = aliases.map((alias) => taskDedupeTokenSet(canonicalTaskMatchTitle(alias)));
+    text = splitDescriptionSentences(text)
+      .filter((sentence) => {
+        const normalized = canonicalTaskMatchTitle(sentence.replace(/\s*\(\d+\)\s*[.!?]?$/, ""));
+        if (canonicalAliases.has(normalized)) return false;
+        const sentenceTokens = taskDedupeTokenSet(normalized);
+        const nearTitle = aliasTokenSets.some((tokens) => tokenDiceScore(sentenceTokens, tokens) >= 0.82);
+        const actionSentence = /\b(?:review|compare|draft|confirm|send|prepare|identify|finali[sz]e|verify|update|complete|decide|resolve)\b/i.test(sentence);
+        return !nearTitle || actionSentence;
+      })
+      .join(" ");
+  }
   return capitalizeSentenceStart(text.trim().replace(/^[,;:\-–—]\s*/, ""));
 }
 
@@ -13575,9 +14932,22 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
     basePath,
     citationMap,
     contextCitationNotes,
+    primaryText: [primary?.title, primary?.text, primary?.sourceSummary].filter(Boolean).join("\n"),
     citeContextNotes: enabled !== false && citationMap.size > 0,
     allowedContextCitations: new Set(citationMap.values())
   };
+}
+
+function hydrateContextCitationEvidence(citationState = {}, contextChunks = [], basePath = "") {
+  const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
+  for (const note of notes) {
+    const matchingText = (contextChunks || [])
+      .filter((chunk) => sourceReference(chunk, basePath) === note.source)
+      .map((chunk) => chunk.text || "")
+      .filter(Boolean);
+    note.text = uniqueValues([note.text, ...matchingText].filter(Boolean)).join("\n\n");
+  }
+  return citationState;
 }
 
 function contextCitationInstructions(enabled) {
@@ -13630,20 +15000,38 @@ function ensureContextCitation(value, taskTitle = "", citationState = {}) {
   const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
   if (!notes.length) return text;
   const segments = splitCitationSentences(text);
-  if (segments.length > 1) {
-    const cited = segments.map((segment) => {
-      const clean = segment.trim();
-      if (!clean || hasValidContextCitation(clean, citationState)) return clean;
-      const number = bestContextCitationNumber(clean, taskTitle, notes);
-      return number ? appendContextCitation(clean, number) : clean;
-    }).filter(Boolean).join(" ");
-    if (cited && cited !== text) return cited;
-    if (hasValidContextCitation(cited || text, citationState)) return cited || text;
-  } else if (hasValidContextCitation(text, citationState)) {
-    return text;
-  }
-  const bestNumber = bestContextCitationNumber(text, taskTitle, notes);
-  return bestNumber ? appendContextCitation(text, bestNumber) : text;
+  return segments.map((segment) => reconcileSentenceContextCitation(segment, taskTitle, notes, citationState)).filter(Boolean).join(" ") || text;
+}
+
+function reconcileSentenceContextCitation(sentence = "", taskTitle = "", notes = [], citationState = {}) {
+  const clean = String(sentence || "").trim();
+  if (!clean) return "";
+  const existingNumber = Number(clean.match(/\((\d{1,3})\)(?=([.!?;,)]|$))/)?.[1] || 0);
+  const plain = clean.replace(/\s*\(\d{1,3}\)(?=([.!?;,)]|$))/g, "").replace(/\s+([.!?,;:])/g, "$1").trim();
+  const existingNote = notes.find((note) => Number(note.number) === existingNumber);
+  if (existingNote && contextCitationSupportsSentence(plain, existingNote, citationState)) return appendContextCitation(plain, existingNote.number);
+  const bestNumber = bestContextCitationNumber(plain, taskTitle, notes);
+  const bestNote = notes.find((note) => Number(note.number) === Number(bestNumber));
+  return bestNote && contextCitationSupportsSentence(plain, bestNote, citationState) ? appendContextCitation(plain, bestNote.number) : plain;
+}
+
+function contextCitationSupportsSentence(sentence = "", note = {}, citationState = {}) {
+  const noteText = [note.title, note.source, note.text].filter(Boolean).join("\n");
+  const primaryText = String(citationState.primaryText || "");
+  const queryTerms = termCounts(sentence);
+  const noteScore = lexicalScore(queryTerms, noteText);
+  if (noteScore < 1.5) return false;
+  if (!primaryText.trim()) return true;
+  const primaryScore = lexicalScore(queryTerms, primaryText);
+  const sentenceTerms = generatedTaskObjectTerms(sentence);
+  const noteCounts = termCounts(noteText);
+  const primaryCounts = termCounts(primaryText);
+  const primarySupportedTerms = sentenceTerms.filter((term) => contextAnchorVariants(term).some((variant) => primaryCounts[variant]));
+  const contextExclusiveTerms = sentenceTerms.filter((term) => contextAnchorVariants(term).some((variant) => noteCounts[variant]) && !contextAnchorVariants(term).some((variant) => primaryCounts[variant]));
+  if (!contextExclusiveTerms.length && primarySupportedTerms.length >= Math.max(1, Math.ceil(sentenceTerms.length * 0.5))) return false;
+  if (contextExclusiveTerms.length >= 2) return true;
+  if (contextExclusiveTerms.length >= 1 && (primaryScore < 1.5 || noteScore > primaryScore * 1.05)) return true;
+  return noteScore > Math.max(1.5, primaryScore * 1.25);
 }
 
 function bestContextCitationNumber(text, taskTitle = "", notes = []) {
@@ -13695,6 +15083,8 @@ function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {
     .replace(/\r\n/g, "\n")
     .replace(/\.\.\.\s*\[truncated\]/gi, "")
     .replace(/\[truncated\]/gi, "")
+    .replace(/\b(?:without|instead of)\s+reopening\s+(?:Notes|Email)_\d{2}_\d{2}_\d{2}_[A-Za-z0-9_-]+/gi, "")
+    .replace(/\b(?:from|in|for)\s+the\s+(?:email\s+)?(?:thread|subject)(?:\s+with\s+subject)?\s+["“][^"”]+["”]\s*,?/gi, "")
     .replace(/\b(document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?|source(?:s)?(?:\s+note)?|useful\s+vault\s+context|vault\s+context|note\s+context)\s*:\s*/gi, "")
     .split("\n")
     .map((line) => line.trim())
@@ -13748,6 +15138,7 @@ function isUsableDescriptionSentence(sentence) {
   if (/\b(web\s*links?|links?|linked files?|referenced files?|attachments?)\b.{0,60}\b(no|not|missing|unavailable|found|provided|included)\b/i.test(text)) return false;
   const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
   if (words.length < 5) return false;
+  if (/^[a-z]/.test(text) && !/^(?:e\.g\.|i\.e\.)\s/i.test(text)) return false;
   if (!/[.!?]$/.test(text) && text.length > 180) return false;
   return true;
 }
@@ -14176,15 +15567,36 @@ function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
   const sourceText = stripExcludedLinks(String(text || ""), settings);
   const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
   const links = extractDescriptionLinkRecords(cleaned, settings).slice(0, 20);
-  const actionLines = cleaned.split("\n").filter((line) => {
+  const thread = splitEmailCurrentAndQuotedHistory(cleaned);
+  const relevantLines = (value, limit) => String(value || "").split("\n").filter((line) => {
     const l = line.toLowerCase();
     return /please|action|todo|to do|follow up|review|comment|tracked changes?|verify|verification|accuracy|gap|highlight|draft|document|report|send|confirm|confirmation|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
-  }).slice(0, 120).join("\n");
+  }).slice(0, limit).join("\n");
+  const currentLines = relevantLines(thread.current, 60) || thread.current.slice(0, Math.floor(maxChars * 0.45));
+  const historyLines = relevantLines(thread.history, 60) || thread.history.slice(0, Math.floor(maxChars * 0.3));
   const compact = [
-    actionLines || cleaned.slice(0, Math.floor(maxChars * 0.75)),
+    "Current/latest email message (primary status and next-action evidence):",
+    currentLines || cleaned.slice(0, Math.floor(maxChars * 0.75)),
+    thread.history ? "\nEarlier quoted email thread (background and unresolved context only):" : "",
+    thread.history ? historyLines : "",
     links.length ? `\nReferenced links:\n${descriptionLinkReferences(links)}` : ""
   ].join("\n").trim();
   return clamp(compact || cleaned, maxChars);
+}
+
+function splitEmailCurrentAndQuotedHistory(text = "") {
+  const value = cleanupEmailText(String(text || ""));
+  const boundaries = [
+    /\n(?:-{2,}\s*(?:original message|forwarded message)\s*-{2,}|begin forwarded message:)\s*\n/i,
+    /\nFrom:\s*[^\n]+\n(?:Sent|Date):\s*[^\n]+\n(?:To|Subject):/i
+  ];
+  let boundary = -1;
+  for (const pattern of boundaries) {
+    const match = pattern.exec(value);
+    if (match && (boundary < 0 || match.index < boundary)) boundary = match.index;
+  }
+  if (boundary < 0) return { current: value, history: "" };
+  return { current: value.slice(0, boundary).trim(), history: value.slice(boundary).trim() };
 }
 
 function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
@@ -15158,7 +16570,12 @@ function cleanLabel(label) { return String(label || "").replace(/^#/, "").replac
 function shortTitle(value, max) { const text = singleLine(String(value || "").replace(/\.md$/i, "")); return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`; }
 function compactEmbedding(values, precision) { const factor = Math.pow(10, precision || 4); return (values || []).map((value) => Math.round(value * factor) / factor); }
 function normalizePriority(value) { const priority = parseInt(value, 10); return Number.isFinite(priority) ? Math.max(1, Math.min(4, priority)) : 1; }
-function validDate(value) { return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value); }
+function validDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
+}
 function deviceTimeZone() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || "America/Toronto";
@@ -15386,6 +16803,7 @@ function liveTodoistTaskDeduplicationCandidates(tasks = [], settings = DEFAULT_S
       const siblingText = parentId ? childTextByParentId.get(parentId) || "" : "";
       const normalized = {
         id: String(task.id || ""),
+        oid: task.oid || "",
         content: task.content || "",
         description: task.description || "",
         labels: (task.labels || []).map(cleanLabel).filter(Boolean),
@@ -15796,6 +17214,11 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     score += Math.min(6, labelOverlap * 3);
     reasons.push("same labels");
   }
+  const semanticIndexRank = Number(candidate.semanticIndexRank || 0);
+  if (semanticIndexRank > 0 && (titleOverlap >= 0.18 || contextOverlap >= 0.18 || topicOverlap || peopleOverlap)) {
+    score += Math.max(2, 7 - Math.min(5, semanticIndexRank));
+    reasons.push("local semantic index match");
+  }
   if (sameSection) {
     score += 4;
     reasons.push("same generated section");
@@ -15880,6 +17303,21 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     hardMismatch,
     reasons: reasons.length ? reasons : ["weak local overlap"]
   };
+}
+
+function semanticTaskReferenceCandidateRanks(context = []) {
+  const ranks = new Map();
+  let rank = 0;
+  for (const chunk of context || []) {
+    if (chunk?.kind !== "todoist-task-reference" && chunk?.source !== "local-reference-table") continue;
+    rank += 1;
+    const text = String(chunk.text || chunk.content || chunk.chunk || "");
+    for (const match of text.matchAll(/\boid:\s*([a-z0-9-]+)/gi)) {
+      const oid = String(match[1] || "").toUpperCase();
+      if (oid && !ranks.has(oid)) ranks.set(oid, rank);
+    }
+  }
+  return ranks;
 }
 
 function applyTaskDeduplicationMatch(task, decision, settings = DEFAULT_SETTINGS, options = {}) {

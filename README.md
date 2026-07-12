@@ -24,23 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.29
+## What's New In 0.6.30
 
-1. **0.6.29 - More focused context and safer duplicate handling**
+1. **0.6.30 - More precise, source-grounded task generation**
+
+   Task generation now preserves more of what a request actually requires: passive requests, staged actions, decision alternatives and criteria, requested outputs, deliverable-recipient pairs, constraints, exclusions, dependencies, and observable outcomes. Local validation uses task-specific semantic-index evidence before targeted AI repair, while duplicate resolution keeps richer generated details and routes updates through the regular grounded task-generation workflow.
+
+2. **0.6.29 - More focused context and safer duplicate handling**
 
    Project-history and task questions now keep their retrieval scope focused, collapse repeated context, and refresh changed semantic-index content safely. Generated task descriptions use task-specific evidence, and deduplication resolves clear local matches quickly while posting credible ambiguous matches to chat for review.
 
-2. **0.6.28 - Source-aware task links and cleaner email notes**
+3. **0.6.28 - Source-aware task links and cleaner email notes**
 
-   Todoist task descriptions now keep the wording supplied by the note or email as clickable Markdown link text, converting bare URLs into hyperlinks without exposing the direct address. Email-To-Todoist notes no longer repeat the filename as a starting H1; the filename remains the document title and the note begins with processing metadata. The installed plugin was validated against the live testing vault's semantic index, task generation, Todoist command preparation, and AI-mediated deduplication path.
-
-3. **0.6.27 - More reliable Email-To-Todoist capture**
-
-   Email-To-Todoist now assumes forwarded emails are intended to create at least one task. Soft review language such as “let me know what you think” or non-urgent draft/document review requests can still produce a conservative review or follow-up task, and existing installs migrate from the older stricter email prompt. Email log notes also use unique visible titles when duplicate files are created, and workflow timestamps now display as `YYYY-MM-DD - HH:MM:SS (TZ)` in the user's device timezone.
-
-3. **0.6.26 - Source lists and citation-safe links**
-
-   Generated Todoist descriptions now preserve source lists as readable multiline blocks with `Primary Note` and `Context Notes` lines. The formatter also repairs flattened `Source List:` or older `Sources:` blocks, and context citations are inserted outside raw URLs, Obsidian/Todoist links, and Markdown link targets.
+   Todoist task descriptions keep note and email wording as descriptive Markdown link text instead of exposing bare URLs. Email-To-Todoist notes no longer repeat the filename as an opening heading, and their workflow metadata remains clean and readable.
 
 
 ## What It Uses

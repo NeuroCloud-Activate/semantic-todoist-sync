@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.32
+
+- Added independent primary and fallback reasoning controls for configured AI chat models, preserving provider defaults unless an explicit level is selected.
+- Added provider-specific request mapping: OpenAI reasoning models receive `reasoning.effort`, while Gemini 3 models receive `thinkingConfig.thinkingLevel`; unsupported model families safely remain on provider defaults.
+
 ## 0.6.31
 
 - Passed task-specific local action, object, recipient, condition, and decision requirements into the first description-generation call instead of relying only on post-generation validation.

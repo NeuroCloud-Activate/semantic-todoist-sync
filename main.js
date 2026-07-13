@@ -143,6 +143,9 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
   }
 ];
 
+const DEFAULT_REASONING_EFFORT = "default";
+const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
   googleApiKey: "",
@@ -151,7 +154,9 @@ const DEFAULT_SETTINGS = {
   workerToken: "",
   aiModelProvider: "openai",
   chatModel: "gpt-5.4",
+  chatReasoningEffort: DEFAULT_REASONING_EFFORT,
   chatFallbackModel: "gpt-5.4-mini",
+  chatFallbackReasoningEffort: DEFAULT_REASONING_EFFORT,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
@@ -309,6 +314,60 @@ const DEFAULT_SETTINGS = {
   notePriorityInstructions: "Assign priority 1 to 4 to each note-derived task and subtask, where 4 is highest priority and 1 is no priority.",
   noteDescriptionInstructions: "Include concise, actionable note context and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the active note, source note title, or filename."
 };
+
+function normalizeReasoningEffort(value, fallback = DEFAULT_REASONING_EFFORT) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return REASONING_EFFORT_VALUES.includes(normalized) ? normalized : fallback;
+}
+
+function isGemini3ReasoningModel(model) {
+  const id = normalizeGeminiModelId(model);
+  return /^gemini-3(?:\.\d+)?-/.test(id);
+}
+
+function supportedReasoningEffortsForModel(model) {
+  if (usesOpenAIChatModel(model)) {
+    const id = normalizeOpenAIModelId(model);
+    if (/^gpt-5\.4(?:-|$)/.test(id)) return ["default", "none", "low", "medium", "high", "xhigh"];
+    if (/^gpt-5(?:-|\.)/.test(id) || /^o\d(?:-|\.)/.test(id)) return ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    return ["default"];
+  }
+  if (usesGeminiChatModel(model)) {
+    if (isGemini3ReasoningModel(model)) {
+      const id = normalizeGeminiModelId(model);
+      if (/^gemini-3\.1-pro(?:-|$)/.test(id)) return ["default", "low", "medium", "high"];
+      if (/^gemini-3(?:\.1)?-pro(?:-|$)/.test(id)) return ["default", "low", "high"];
+      return ["default", "minimal", "low", "medium", "high"];
+    }
+    return ["default"];
+  }
+  return ["default"];
+}
+
+function reasoningEffortLabel(value) {
+  const normalized = normalizeReasoningEffort(value);
+  if (normalized === "default") return "Provider default";
+  if (normalized === "none") return "None";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function reasoningEffortOptionsForModel(model, current = DEFAULT_REASONING_EFFORT) {
+  const supported = supportedReasoningEffortsForModel(model);
+  const options = supported.map((value) => ({ value, label: reasoningEffortLabel(value) }));
+  const normalizedCurrent = normalizeReasoningEffort(current);
+  if (!supported.includes(normalizedCurrent)) {
+    options.unshift({ value: normalizedCurrent, label: `Saved: ${reasoningEffortLabel(normalizedCurrent)} (not supported by this model)` });
+  }
+  return options;
+}
+
+function modelReasoningConfig(model, configuredEffort) {
+  const effort = normalizeReasoningEffort(configuredEffort);
+  if (effort === DEFAULT_REASONING_EFFORT || !supportedReasoningEffortsForModel(model).includes(effort)) return {};
+  if (usesOpenAIChatModel(model)) return { openai: { effort } };
+  if (isGemini3ReasoningModel(model)) return { gemini: { thinkingLevel: effort } };
+  return {};
+}
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
@@ -763,6 +822,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!this.settings.chatFallbackModel && usesOpenAIChatModel(this.settings.chatModel)) {
       this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
       changed = true;
+    }
+    const reasoningDefaults = {
+      chatReasoningEffort: DEFAULT_SETTINGS.chatReasoningEffort,
+      chatFallbackReasoningEffort: DEFAULT_SETTINGS.chatFallbackReasoningEffort
+    };
+    for (const [key, fallback] of Object.entries(reasoningDefaults)) {
+      const normalized = normalizeReasoningEffort(this.settings[key], fallback);
+      if (this.settings[key] !== normalized) {
+        this.settings[key] = normalized;
+        changed = true;
+      }
     }
     const dedupeDefaults = {
       enableTaskDeduplication: DEFAULT_SETTINGS.enableTaskDeduplication,
@@ -2722,9 +2792,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const candidateModel = candidates[index];
       try {
         if (index > 0) this.setSidebarStatus(`Retrying AI with ${modelDisplayName(candidateModel)}...`);
+        const reasoningConfig = modelReasoningConfig(
+          candidateModel,
+          index > 0 ? this.settings.chatFallbackReasoningEffort : this.settings.chatReasoningEffort
+        );
         const response = usesGeminiChatModel(candidateModel)
-          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, background });
+          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig })
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -2764,7 +2838,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, background = true }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true }) {
     const body = {
       model: normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel),
       input: [
@@ -2772,6 +2846,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         { role: "user", content: [{ type: "input_text", text: user }] }
       ]
     };
+    if (reasoningConfig.openai) body.reasoning = reasoningConfig.openai;
     if (background !== false) body.background = true;
     if (jsonSchema) {
       body.text = { format: { type: "json_schema", name: "semantic_todoist_tasks", strict: true, schema: jsonSchema } };
@@ -2789,9 +2864,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return completed.output_text || extractOutputText(completed);
   }
 
-  async geminiResponse({ model, system, user, jsonSchema }) {
+  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {} }) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || "gemini-3.5-flash");
     const generationConfig = {};
+    if (reasoningConfig.gemini) generationConfig.thinkingConfig = reasoningConfig.gemini;
     if (jsonSchema) {
       generationConfig.responseMimeType = "application/json";
       generationConfig.responseSchema = geminiCompatibleSchema(jsonSchema);
@@ -2830,7 +2906,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             "",
             user || ""
           ].join("\n") }] }],
-          generationConfig: { responseMimeType: "application/json" }
+          generationConfig: Object.assign({}, generationConfig, { responseSchema: undefined })
         }),
         throw: false
       });
@@ -6612,10 +6688,13 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     aiProviderSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "AI Models", "Choose the primary chat model, one same-provider fallback, and the embedding model used for semantic vault indexing.");
     new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
-    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels");
+    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels", () => this.display());
+    reasoningEffortSetting(containerEl, "Primary reasoning effort", "Controls reasoning for the selected primary model. Provider default preserves the model provider's default behavior.", this.plugin, "chatReasoningEffort", this.plugin.settings.chatModel);
     modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
-    aiFallbackModelSetting(containerEl, this.plugin);
+    aiFallbackModelSetting(containerEl, this.plugin, () => this.display());
+    const fallbackModel = this.plugin.settings.chatFallbackModel || this.plugin.sameProviderFallbackModels(this.plugin.settings.chatModel)[0] || this.plugin.settings.chatModel;
+    reasoningEffortSetting(containerEl, "Fallback reasoning effort", "Controls reasoning for the selected fallback model. Provider default preserves the model provider's default behavior.", this.plugin, "chatFallbackReasoningEffort", fallbackModel);
     toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
     new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
       try {
@@ -7818,7 +7897,9 @@ const SETTING_DESCRIPTIONS = {
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
   googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
   aiModelProvider: "Choose which provider to prefer when both OpenAI and Gemini API keys are saved. Model dropdowns follow this provider.",
+  chatReasoningEffort: "Controls the primary model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries.",
+  chatFallbackReasoningEffort: "Controls the fallback model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
@@ -7979,7 +8060,7 @@ function aiProviderSetting(containerEl, plugin, refreshDisplay) {
     });
 }
 
-function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
+function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey, refreshDisplay = null) {
   const options = aiModelOptions(plugin.settings, key, listKey);
   new Setting(containerEl).setName(name).setDesc(options.length ? desc : `${desc} Refresh available AI models in API Access to populate this list.`).addDropdown((dropdown) => {
     const current = plugin.settings[key] || DEFAULT_SETTINGS[key];
@@ -7988,6 +8069,7 @@ function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
     dropdown.setValue(current).onChange(async (value) => {
       if (key === "chatModel") {
         await plugin.setChatModel(value);
+        if (refreshDisplay) refreshDisplay();
         return;
       }
       if (key === "embeddingModel") {
@@ -8000,7 +8082,28 @@ function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey) {
   });
 }
 
-function aiFallbackModelSetting(containerEl, plugin) {
+function reasoningEffortSetting(containerEl, name, desc, plugin, key, model) {
+  const current = normalizeReasoningEffort(plugin.settings[key], DEFAULT_SETTINGS[key]);
+  const options = reasoningEffortOptionsForModel(model, current);
+  const modelName = modelDisplayName(model);
+  const providerNote = usesOpenAIChatModel(model)
+    ? "OpenAI reasoning models use the Responses API reasoning.effort field."
+    : isGemini3ReasoningModel(model)
+      ? "Gemini 3 models use the provider's thinkingLevel field."
+      : "This model has no compatible level control here, so Provider default is used.";
+  new Setting(containerEl)
+    .setName(name)
+    .setDesc(`${desc} Active model: ${modelName}. ${providerNote}`)
+    .addDropdown((dropdown) => {
+      for (const option of options) dropdown.addOption(option.value, option.label);
+      dropdown.setValue(current).onChange(async (value) => {
+        plugin.settings[key] = normalizeReasoningEffort(value);
+        await plugin.saveSettings();
+      });
+    });
+}
+
+function aiFallbackModelSetting(containerEl, plugin, refreshDisplay = null) {
   const primary = plugin.settings.chatModel || DEFAULT_SETTINGS.chatModel;
   const automaticFallback = plugin.sameProviderFallbackModels(primary)[0] || "";
   const options = [{ value: "", label: automaticFallback ? `Automatic: ${modelDisplayName(automaticFallback)}` : "Automatic same provider" }];
@@ -8028,6 +8131,7 @@ function aiFallbackModelSetting(containerEl, plugin) {
       dropdown.setValue(selected || "").onChange(async (value) => {
         plugin.settings.chatFallbackModel = value;
         await plugin.saveSettings();
+        if (refreshDisplay) refreshDisplay();
       });
     });
 }
@@ -8768,12 +8872,12 @@ function modelSummary(settings) {
 function configuredAiModelSummary(plugin) {
   const settings = plugin.settings || DEFAULT_SETTINGS;
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
-  const primaryText = `Provider: ${providerDisplayName(settings.aiModelProvider || aiProviderForModel(primary))}. Primary: ${modelDisplayName(primary)}`;
+  const primaryText = `Provider: ${providerDisplayName(settings.aiModelProvider || aiProviderForModel(primary))}. Primary: ${modelDisplayName(primary)} (${reasoningEffortLabel(settings.chatReasoningEffort)})`;
   if (!settings.enableAiModelFallback) return `${primaryText}. Fallback: off.`;
   const fallback = plugin.sameProviderFallbackModels(primary)[0] || "";
   const mode = settings.chatFallbackModel ? "Manual" : "Automatic";
   return fallback
-    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)}.`
+    ? `${primaryText}. Fallback: ${mode}: ${modelDisplayName(fallback)} (${reasoningEffortLabel(settings.chatFallbackReasoningEffort)}).`
     : `${primaryText}. Fallback: ${mode}, but no compatible same-provider model is available.`;
 }
 

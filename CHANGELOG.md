@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.35
+
+- Reworked generated Todoist descriptions as concise task-specific narratives instead of mandatory intent, purpose, and expected-outcome templates.
+- Rejected and locally removed prompt-like boilerplate about requested outcomes, source-supported steps, validation, and generic completion status before deciding whether an AI repair is needed.
+- Kept concrete steps in subtasks rather than repeating them in descriptions, and removed dedicated completion-goal fields from description prompts.
+- Used matching semantic-index notes to fill context explicitly missing from sparse source notes while preserving primary-source authority, recency preference, citations, and strict task scope.
+- Reduced description input tokens by dropping near-duplicate primary-source and supporting-note excerpts, retaining one bounded task evidence bundle, and preserving default-enabled stable-prefix prompt caching without adding AI calls.
+
 ## 0.6.34
 
 - Reduced description-generation input usage by removing repeated full-source and broad context payloads while retaining compact task-specific source, semantic-index, request-coverage, citation, and workflow evidence.

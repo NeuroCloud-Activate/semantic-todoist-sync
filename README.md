@@ -24,19 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.34
+## What's New In 0.6.35
 
-1. **0.6.34 - Lower AI usage without weaker descriptions**
+1. **0.6.35 - Clear task narratives with smarter context**
+
+   Todoist descriptions now explain the task's intent and useful working context in concise prose instead of repeating prompt requirements, generic goals, completion language, or subtask checklists. When a source note is sparse or marks details as missing, matching semantic-index notes can fill the gap without introducing another AI call. Near-duplicate evidence is removed locally, and stable description instructions remain eligible for default-enabled OpenAI prompt caching.
+
+2. **0.6.34 - Lower AI usage without weaker descriptions**
 
    Description generation keeps the selected primary model and its configured reasoning effort, but no longer repeats the full source and broad context catalog after building task-specific evidence. Default-enabled GPT 5.6+ OpenAI prompt caching reuses stable schemas and system instructions without caching changing task evidence. The final quality report stays local, task-tree repair is limited to one AI call, and duplicate checks use the fallback model with independent Medium reasoning by default.
 
-2. **0.6.33 - Settings that stay readable across devices**
+3. **0.6.33 - Settings that stay readable across devices**
 
    Settings tabs now wrap on desktop instead of clipping at the edge, while narrow mobile panes keep touch-friendly horizontal scrolling. Dropdown controls use a readable bounded width on desktop and full-width stacked controls on mobile/iPadOS, so selected values are not needlessly ellipsized.
-
-3. **0.6.32 - Configurable primary and fallback reasoning**
-
-   Configure separate reasoning effort for the primary and fallback AI models. Provider default preserves the model's normal behavior, while supported OpenAI and Gemini 3 models expose their provider-specific reasoning controls.
 
 ## What It Uses
 

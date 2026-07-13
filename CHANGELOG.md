@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.36
+
+- Prevented task-local quality failures from cancelling an otherwise valid generated batch after duplicate review.
+- Added local recovery for unsupported description sentences and unambiguous noun-only parent titles, while keeping unsupported facts and redundant child restatements out of Todoist.
+- Isolated irreparable generated items individually and continued validated tasks, with a concise notice describing how many items were omitted.
+- Kept the full-batch stop only when no safe task remains or a remaining task still has a blocking local quality issue.
+- Stopped treating supported Markdown link labels and generic Office document artifacts as unsupported people or named entities.
+
 ## 0.6.35
 
 - Reworked generated Todoist descriptions as concise task-specific narratives instead of mandatory intent, purpose, and expected-outcome templates.

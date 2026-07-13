@@ -3141,6 +3141,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
         "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
+        "Make every main-task title independently actionable and specific enough to distinguish it from neighboring work. Preserve the source-supported document, program, person, decision, deliverable, review focus, or current stage that tells the user exactly what the task covers.",
+        "Use relevant vault context to disambiguate a title or preserve a named scope already implied by the source, but never introduce a new action that the active source does not request.",
         "Do not write task descriptions in this step. Descriptions are generated in a separate pass after local OIDs are assigned.",
         "For date fields, follow the Dates and Deadlines instructions exactly. Use null for due_date or deadline_date when the source and settings do not support that field.",
         "due_date and deadline_date are separate fields. Do not copy one into the other unless the Dates and Deadlines instructions explicitly say to do that.",
@@ -3235,8 +3237,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       system: [
         "Write Todoist main-task descriptions only.",
         "Do not change task titles, due dates, priorities, labels, or subtasks.",
-        "For each main task, write one clear, concise narrative paragraph between 80 and 700 characters using 1-3 complete sentences.",
+        "For each main task, write one clear narrative paragraph between 100 and 900 characters using 1-4 complete sentences. Stay concise when evidence is sparse, but do not omit useful details merely to be brief.",
         "Describe the task's real-world intent and only the context needed to understand and complete it, such as the relevant recipient, decision, dependency, constraint, status, timing, or working link.",
+        "When the evidence bundle contains them, include multiple concrete action-enabling facts: what changed or is already known, why the work is needed, what deserves special attention, which criteria or distinction matter, who is involved, and what dependency or next handoff constrains the work.",
+        "A strong description should let the user act without reopening every cited note. Prefer two or more distinct supported details beyond the task title whenever the evidence provides them.",
         "Use workingContext only when it provides concrete task facts. Omit generic goals and the fact that work must be completed.",
         "Do not force the description into labeled intent, purpose, or outcome sections, and never narrate prompt structure, source grounding, validation, or generic completion status.",
         "Do not enumerate, paraphrase, or summarize relatedStepsForExclusion. Those actions already belong in subtasks; include only context that helps the user perform them.",
@@ -3346,13 +3350,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       system: [
         "Improve incomplete Todoist main-task descriptions.",
         "Return only JSON matching the schema.",
-        "Each description must be an 80-700 character narrative using 1-3 complete sentences about the task's intent and the concrete context needed to complete it.",
+        "Each description must be a 100-900 character narrative using 1-4 complete sentences about the task's intent and the concrete context needed to complete it.",
         "Fix the supplied qualityIssue for every task. Do not return a description with the same defect.",
         options.finalClarityRepair ? "This is the final targeted repair attempt. Keep only supported task facts and remove generic framing, repeated title text, and procedural restatements." : "",
         "Use workingContext only as grounded facts, not as a required outline or text to copy.",
         "Never narrate prompt requirements, source-grounding status, validation rules, generic goals, or generic completion status.",
         "Do not enumerate, paraphrase, or summarize relatedStepsForExclusion; those actions remain subtasks.",
         "Use the compact task-specific evidence bundle. Do not repeat the title. Do not say to use the source material.",
+        "When the evidence provides useful background, include at least two distinct action-enabling facts beyond the title, such as current status, rationale, review focus, criteria, stakeholder input, a meaningful program distinction, or a dependency.",
         "Use only the evidence bundle attached to the matching task index. Do not borrow specific facts from another task or from unrelated supporting context.",
         "When useSupportingContextToFillGaps is true, fill omissions in the primary source with relevant semantic-index note facts, preferring the newest matching note and never inferring beyond supplied evidence.",
         "Do not add a person, date, link, document, dependency, decision, or status unless it appears in that task's evidence bundle.",
@@ -4332,10 +4337,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const deterministicFallbacks = enforceDeterministicDescriptionFallbacks(tasks, plan, options, this.settings);
     if (deterministicFallbacks > 0) this.logLocal("Applied final deterministic task description fallback", { source: options.source || "", count: deterministicFallbacks });
     let quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
-    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, degradedDescriptionTaskKeys: [], removedTasks: [] };
+    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, retainedDescriptionTaskKeys: [], degradedDescriptionTaskKeys: [], removedTasks: [] };
     if (quality.blockingIssues > 0) {
       salvage = salvageGeneratedTaskBatch(tasks, plan, options, this.settings);
-      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.degradedDescriptionTaskKeys.length || salvage.removedTasks.length) {
+      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.retainedDescriptionTaskKeys.length || salvage.degradedDescriptionTaskKeys.length || salvage.removedTasks.length) {
         quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
         quality.salvage = salvage;
         this.logLocal("Salvaged valid tasks after local quality checks", {
@@ -4343,6 +4348,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           localCorrections: salvage.localCorrections.length,
           repairedTitles: salvage.repairedTitles,
           repairedDescriptions: salvage.repairedDescriptions,
+          retainedSafeDescriptions: salvage.retainedDescriptionTaskKeys.length,
           retainedTasksWithSourceOnlyDescriptions: salvage.degradedDescriptionTaskKeys.length,
           removedTasks: salvage.removedTasks.length,
           remainingTasks: tasks.length
@@ -4364,11 +4370,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         elapsedMs: quality.elapsedMs
       });
     }
+    const retainedDescriptionTaskKeys = new Set(salvage.retainedDescriptionTaskKeys || []);
     const degradedDescriptionTaskKeys = new Set(salvage.degradedDescriptionTaskKeys || []);
     const fatalIssues = quality.issues.filter((issue) => {
       if (!issue.blocking) return false;
       if (salvage.removedTasks.length && tasks.length && issue.code === "missing-requested-outcome") return false;
       const taskKey = canonicalTaskMatchTitle(tasks[issue.taskIndex]?.content || "");
+      if (retainedDescriptionTaskKeys.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code)) return false;
       if (degradedDescriptionTaskKeys.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code)) return false;
       return true;
     });
@@ -13966,7 +13974,10 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
     const competingAnchors = taskCompetingEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
     const sourceEvidence = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors });
     const sourceEvidenceTokens = taskDedupeTokenSet(canonicalTaskMatchTitle(sourceEvidence));
-    const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3, { requiredAnchors: exclusiveAnchors });
+    const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3, {
+      requiredAnchors: exclusiveAnchors,
+      excludedNeighborAnchors: competingAnchors
+    });
     const contextEvidenceEntries = contextChunks.map((chunk) => {
       const source = sourceReference(chunk, citationState.basePath || "");
       const citationNumber = source ? citationState.citationMap?.get(source) : null;
@@ -13979,7 +13990,13 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
       if (sourceEvidenceTokens.size && contextTokens.size && tokenDiceScore(sourceEvidenceTokens, contextTokens) >= 0.9) return null;
       const label = citationNumber ? `Context Note (${citationNumber})` : "Supporting note";
       const evidence = truncateAtWord(excerpt, 520);
-      return { prompt: `${label}: ${chunk.title || chunk.path || "Vault note"}\nEvidence: ${evidence}`, evidence };
+      return {
+        prompt: `${label}: ${chunk.title || chunk.path || "Vault note"}\nEvidence: ${evidence}`,
+        evidence,
+        source,
+        citationNumber: citationNumber || 0,
+        chunk
+      };
     }).filter(Boolean);
     const contextEvidence = contextEvidenceEntries.map((entry) => entry.prompt);
     const sourceContextGap = sourceDescriptionContextGap(sourceEvidence);
@@ -13997,6 +14014,7 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
       prompt: truncateMarkdownAtWord(prompt, 2200),
       corpus: [sourceEvidence, ...contextEvidenceEntries.map((entry) => entry.evidence)].filter(Boolean).join("\n\n"),
       contextChunks,
+      contextEvidenceEntries,
       needsSupportingContext
     };
   });
@@ -14034,7 +14052,10 @@ function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_S
   for (let index = 0; index < sentences.length; index += 1) {
     const anchorHits = taskEvidenceAnchorHitCount(sentences[index].text, anchors);
     if (anchorHits < minimumHits) continue;
-    if (requireExclusiveAnchor && taskEvidenceAnchorHitCount(sentences[index].text, requiredAnchors) < 1) continue;
+    if (requireExclusiveAnchor && taskEvidenceAnchorHitCount(sentences[index].text, requiredAnchors) < 1) {
+      const competingHits = taskEvidenceAnchorHitCount(sentences[index].text, excludedNeighborAnchors);
+      if (competingHits > 0 || anchorHits < Math.max(2, minimumHits + 1)) continue;
+    }
     selected.add(index);
     for (const neighborIndex of [index - 1, index + 1]) {
       if (neighborIndex < 0 || neighborIndex >= sentences.length) continue;
@@ -14083,19 +14104,27 @@ function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFA
   const queryTerms = termCounts(query);
   const anchors = generatedTaskObjectTerms(query);
   const requiredAnchors = options.requiredAnchors || [];
+  const excludedNeighborAnchors = options.excludedNeighborAnchors || [];
   const candidates = (context || [])
     .map((chunk) => {
       const text = `${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`;
       const anchorHits = taskEvidenceAnchorHitCount(text, anchors);
       const requiredAnchorHits = taskEvidenceAnchorHitCount(text, requiredAnchors);
-      const score = lexicalScore(queryTerms, text) + anchorHits * 3 + Number(chunk.matchScore || 0);
+      const competingAnchorHits = taskEvidenceAnchorHitCount(text, excludedNeighborAnchors);
+      const score = lexicalScore(queryTerms, text) + anchorHits * 3 + requiredAnchorHits * 4 - competingAnchorHits * 2 + Number(chunk.matchScore || 0);
       const scopeMismatch = Boolean((chunk.retrievalScopeTerms || []).length && chunk.retrievalScopeMatch !== true);
       const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchors);
-      return { chunk, score, anchorHits, requiredAnchorHits, scopeMismatch, semanticEligible };
+      return { chunk, score, anchorHits, requiredAnchorHits, competingAnchorHits, scopeMismatch, semanticEligible };
     });
   const requireExclusiveAnchor = requiredAnchors.length > 0 && candidates.some((item) => item.requiredAnchorHits > 0);
   return uniqueChunksByPath(candidates
-    .filter((item) => !item.scopeMismatch && (!requireExclusiveAnchor || item.requiredAnchorHits > 0) && (item.anchorHits >= taskEvidenceMinimumAnchorHits(anchors) || item.semanticEligible) && item.score > 0)
+    .filter((item) => {
+      if (item.scopeMismatch || item.score <= 0) return false;
+      const generallyRelevant = item.anchorHits >= taskEvidenceMinimumAnchorHits(anchors) || item.semanticEligible;
+      if (!generallyRelevant) return false;
+      if (!requireExclusiveAnchor || item.requiredAnchorHits > 0) return true;
+      return item.competingAnchorHits === 0 && item.anchorHits >= Math.max(2, taskEvidenceMinimumAnchorHits(anchors) + 1);
+    })
     .sort((left, right) => right.score - left.score || Number(right.chunk.createdAt || right.chunk.modifiedAt || 0) - Number(left.chunk.createdAt || left.chunk.modifiedAt || 0))
     .map((item) => item.chunk))
     .slice(0, Math.max(0, limit));
@@ -14112,6 +14141,10 @@ function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, 
 }
 
 const TASK_DESCRIPTION_GENERIC_KNOWLEDGE_TERMS = new Set(["action", "complete", "completed", "completion", "deliverable", "forward", "matter", "matters", "next", "outcome", "process", "project", "purpose", "ready", "request", "result", "step", "steps", "task", "work"]);
+const TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS = new Set([
+  ...TASK_DESCRIPTION_GENERIC_KNOWLEDGE_TERMS,
+  "context", "current", "document", "documents", "information", "material", "materials", "note", "notes", "program", "review", "source", "title", "update", "updates"
+]);
 
 function taskDescriptionKnowledgeCoverageReason(value = "", task = {}, evidence = null) {
   const descriptionCounts = termCounts(value);
@@ -14142,7 +14175,25 @@ function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, s
   const corpusCounts = termCounts(corpus);
   const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
   if (descriptionTerms.length >= 3 && !supportedTerms.length) return "description has no specific overlap with its evidence";
+  const detailReason = taskDescriptionEvidenceDetailReason(value, task, evidence);
+  if (detailReason) return detailReason;
   return "passed";
+}
+
+function taskDescriptionEvidenceDetailReason(value = "", task = {}, evidence = null) {
+  const corpus = String(evidence?.corpus || "");
+  if (corpus.length < 120) return "";
+  const titleCounts = termCounts(task.content || "");
+  const descriptionCounts = termCounts(value);
+  const detailTerms = generatedTaskObjectTerms(corpus).filter((term) => (
+    !titleCounts[term] &&
+    !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term) &&
+    !/^\d+$/.test(term)
+  ));
+  if (detailTerms.length < 4) return "";
+  const covered = detailTerms.filter((term) => contextAnchorVariants(term).some((variant) => descriptionCounts[variant]));
+  const required = detailTerms.length >= 10 ? 3 : 2;
+  return covered.length >= required ? "" : `missing source-grounded action context (${covered.length}/${required} useful details)`;
 }
 
 function taskDescriptionUnsupportedFactReason(value = "", evidence = null, settings = DEFAULT_SETTINGS) {
@@ -14897,6 +14948,7 @@ function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings
     const candidates = [
       supportedSummary,
       fallbackActionSummary(task, sourceSummary, evidence?.contextChunks || [], sourceTitle, settings, evidence),
+      taskEvidenceNarrativeFallbackDescription(task, evidence, settings),
       deterministicTaskFallbackDescription(task, settings, evidence)
     ].map((value) => singleLine(value)).filter(Boolean);
     const replacement = candidates.find((value) => taskDescriptionGroundingReason(value, task, evidence, settings) === "passed") || "";
@@ -14911,14 +14963,24 @@ function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings
     blockingIssuesByTask.get(issue.taskIndex).push(issue);
   }
   const degradedDescriptionTaskKeys = [];
+  const retainedDescriptionTaskKeys = [];
   for (const [index, issues] of blockingIssuesByTask.entries()) {
     const task = tasks[index] || {};
     if (!issues.length || issues.some((issue) => !RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code))) continue;
     if (mainTaskClarityReason(task) !== "passed" || !generatedTaskMatchesPrimarySource(task, groundingEvidence)) continue;
     const split = splitDescriptionSourceListBlock(task.description || "");
-    const verifiedSources = split.sourceList || (options.citeContextNotes !== false
-      ? descriptionSourceList({ title: sourceTitle, path: sourceContext.path || options.path || "", text: sourceSummary }, plan.contextNotes || [], options.basePath || "")
-      : "");
+    if (taskDescriptionNarrativeSafetyReason(split.summary, task, evidenceBundles[index] || null, settings) === "passed") {
+      retainedDescriptionTaskKeys.push(canonicalTaskMatchTitle(task.content || ""));
+      continue;
+    }
+    const attribution = taskScopedDescriptionAttribution(
+      split.summary,
+      { title: sourceTitle, path: sourceContext.path || options.path || "", text: sourceSummary },
+      citationState,
+      options.basePath || "",
+      options.citeContextNotes !== false
+    );
+    const verifiedSources = split.sourceList || attribution.sources;
     task.description = verifiedSources;
     degradedDescriptionTaskKeys.push(canonicalTaskMatchTitle(task.content || ""));
   }
@@ -14939,14 +15001,35 @@ function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings
       if (removed) removedTasks.unshift({ content: removed.content || "", issueCodes: repairedQuality.issues.filter((issue) => issue.taskIndex === index && issue.blocking).map((issue) => issue.code) });
     }
   }
-  return { localCorrections, repairedTitles, repairedDescriptions, degradedDescriptionTaskKeys, removedTasks };
+  return { localCorrections, repairedTitles, repairedDescriptions, retainedDescriptionTaskKeys, degradedDescriptionTaskKeys, removedTasks };
+}
+
+function taskDescriptionNarrativeSafetyReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
+  const unsupported = taskDescriptionUnsupportedFactReason(value, evidence, settings);
+  if (unsupported) return unsupported;
+  const clarity = taskDescriptionClarityReason(value, task, settings);
+  if (clarity !== "passed") return clarity;
+  const link = taskDescriptionLinkIntegrityReason(value, task, evidence, settings);
+  return link === "passed" ? "passed" : link;
+}
+
+function taskEvidenceNarrativeFallbackDescription(task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  const corpus = String(evidence?.corpus || "");
+  if (!corpus.trim()) return "";
+  const excerpt = taskSpecificEvidenceExcerpt(corpus, task.content || "", settings, 900);
+  const summary = conciseDescriptionSummary([
+    removeTitleEcho(cleanGeneratedDescriptionSummary(excerpt, settings), task.content || "")
+  ], settings);
+  if (!summary || taskDescriptionNarrativeSafetyReason(summary, task, evidence, settings) !== "passed") return "";
+  return taskDescriptionEvidenceDetailReason(summary, task, evidence) ? "" : truncateAtWord(summary, 1200);
 }
 
 function descriptionSpecificEntities(value = "") {
   const ignored = new Set([
     "The", "This", "That", "These", "Those", "A", "An", "Before", "After", "Once", "Then", "Earlier", "Later",
     "Because", "Although", "However", "When", "While", "For", "Given", "Related",
-    "Keep", "Include", "Review", "Compare", "Confirm", "Verify", "Identify", "Coordinate", "Complete", "Resolve", "Clarify", "Determine", "Check", "Summarize", "Respond", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
+    "Keep", "Give", "Focus", "Pay", "Align", "Apply", "Assess", "Address", "Bring", "Document", "Evaluate", "Examine", "Flag", "Incorporate", "Note", "Prioritize", "Reconcile", "Refine", "Track", "Validate", "Include", "Review", "Compare", "Confirm", "Verify", "Identify", "Coordinate", "Complete", "Resolve", "Clarify", "Determine", "Check", "Summarize", "Respond", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
     "Todoist", "Obsidian", "Outlook", "Item", "Shape", "Context", "Task", "Source", "Subject", "Concrete", "Steps", "Completion", "Outcome", "Result", "Expected"
   ]);
   const entities = String(value || "").match(/\b[A-Z][A-Za-z&'-]{2,}(?:\s+[A-Z][A-Za-z&'-]{2,}){0,2}\b/g) || [];
@@ -14961,19 +15044,46 @@ function descriptionSpecificEntities(value = "") {
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
   const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
   hydrateContextCitationEvidence(citationState, contextChunks, basePath);
-  const sources = includeSourceList ? descriptionSourceList(active, contextNotes, basePath) : "";
-  const linkContext = [
-    active?.text || "",
-    active?.sourceSummary || "",
-    ...(contextChunks || []).map((chunk) => `${chunk?.title || chunk?.path || ""}\n${chunk?.text || ""}`)
-  ].filter(Boolean).join("\n\n");
-  for (const task of tasks || []) {
-    const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings) ? task.description : (fallbackActionSummary(task, active?.text || "", contextChunks, active?.title || "", settings) || task.description || "");
-    task.description = taskDescriptionWithSources(parentSummary, task.content, sources, settings, active?.title || "", citationState, linkContext);
+  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, active?.sourceSummary || active?.text || "", contextChunks, active?.title || "", settings, citationState);
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    const task = tasks[index] || {};
+    const evidence = evidenceBundles[index] || null;
+    const relevantContext = evidence?.contextChunks || [];
+    const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings)
+      ? task.description
+      : (fallbackActionSummary(task, active?.text || "", relevantContext, active?.title || "", settings, evidence) || task.description || "");
+    const attribution = taskScopedDescriptionAttribution(parentSummary, active, citationState, basePath, includeSourceList);
+    const linkContext = [
+      active?.text || "",
+      active?.sourceSummary || "",
+      ...relevantContext.map((chunk) => `${chunk?.title || chunk?.path || ""}\n${chunk?.text || ""}`)
+    ].filter(Boolean).join("\n\n");
+    task.description = taskDescriptionWithSources(attribution.summary, task.content, attribution.sources, settings, active?.title || "", attribution.citationState, linkContext);
     for (const subtask of task.subtasks || []) {
       subtask.description = "";
     }
   }
+}
+
+function taskScopedDescriptionAttribution(value = "", active = null, citationState = {}, basePath = "", includeSourceList = true) {
+  const split = splitDescriptionSourceListBlock(value);
+  const citedNumbers = new Set(Array.from(split.summary.matchAll(/\((\d{1,3})\)(?=([.!?;,)]|$))/g), (match) => Number(match[1])));
+  const selectedNotes = (citationState.contextCitationNotes || [])
+    .filter((note) => citedNumbers.has(Number(note.number)))
+    .sort((left, right) => Number(left.number) - Number(right.number));
+  const numberMap = new Map(selectedNotes.map((note, index) => [Number(note.number), index + 1]));
+  const summary = split.summary.replace(/\((\d{1,3})\)(?=([.!?;,)]|$))/g, (match, rawNumber) => {
+    const next = numberMap.get(Number(rawNumber));
+    return next ? `(${next})` : "";
+  }).replace(/\s+([.!?,;:])/g, "$1").replace(/\s{2,}/g, " ").trim();
+  const scopedNotes = selectedNotes.map((note) => ({
+    path: note.source || "",
+    title: note.title || note.source || "Context note",
+    summary: note.text || ""
+  }));
+  const scopedState = contextCitationState(scopedNotes, basePath, includeSourceList, active);
+  const sources = includeSourceList ? descriptionSourceList(active, scopedNotes, basePath) : "";
+  return { summary, sources, citationState: scopedState, contextNotes: scopedNotes };
 }
 
 function taskDescriptionWithSources(taskSummary, taskTitle, sources, settings = DEFAULT_SETTINGS, sourceTitle = "", citationState = {}, linkContext = "") {

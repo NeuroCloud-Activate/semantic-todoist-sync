@@ -157,6 +157,8 @@ const DEFAULT_SETTINGS = {
   chatReasoningEffort: DEFAULT_REASONING_EFFORT,
   chatFallbackModel: "gpt-5.4-mini",
   chatFallbackReasoningEffort: DEFAULT_REASONING_EFFORT,
+  optimizeStructuredAiUsage: true,
+  enableOpenAiPromptCaching: true,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
@@ -236,6 +238,7 @@ const DEFAULT_SETTINGS = {
   enableAiAmbiguousTaskDeduplication: true,
   taskDeduplicationAiReviewSensitivity: "balanced",
   taskDeduplicationAiModel: "",
+  taskDeduplicationAiReasoningEffort: "medium",
   taskDeduplicationPolicy: DEFAULT_TASK_DEDUPLICATION_POLICY,
   taskDeduplicationPolicyUpdates: [],
   taskDeduplicationLastRunSummary: "",
@@ -367,6 +370,28 @@ function modelReasoningConfig(model, configuredEffort) {
   if (usesOpenAIChatModel(model)) return { openai: { effort } };
   if (isGemini3ReasoningModel(model)) return { gemini: { thinkingLevel: effort } };
   return {};
+}
+
+function aiOperationReasoningEffort(configuredEffort, operation = "chat", optimizeStructured = true) {
+  const configured = normalizeReasoningEffort(configuredEffort);
+  if (!optimizeStructured || ["chat", "task-generation", "description"].includes(operation)) return configured;
+  const cap = "low";
+  const rank = { none: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 };
+  if (configured === DEFAULT_REASONING_EFFORT) return cap;
+  return (rank[configured] ?? rank[cap]) <= rank[cap] ? configured : cap;
+}
+
+function supportsExplicitOpenAiPromptCaching(model) {
+  const match = normalizeOpenAIModelId(model).match(/^gpt-(\d+)\.(\d+)(?:-|$)/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 5 || (major === 5 && minor >= 6);
+}
+
+function openAiPromptCacheKey(operation = "chat") {
+  const normalized = String(operation || "chat").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "chat";
+  return `semantic-todoist-${normalized}`.slice(0, 64);
 }
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
@@ -825,7 +850,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const reasoningDefaults = {
       chatReasoningEffort: DEFAULT_SETTINGS.chatReasoningEffort,
-      chatFallbackReasoningEffort: DEFAULT_SETTINGS.chatFallbackReasoningEffort
+      chatFallbackReasoningEffort: DEFAULT_SETTINGS.chatFallbackReasoningEffort,
+      taskDeduplicationAiReasoningEffort: DEFAULT_SETTINGS.taskDeduplicationAiReasoningEffort
     };
     for (const [key, fallback] of Object.entries(reasoningDefaults)) {
       const normalized = normalizeReasoningEffort(this.settings[key], fallback);
@@ -2537,6 +2563,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     const modelChoice = this.aiModelForRequest("chat", { prompt, context, adaptivePack, taskContext });
     let response = await this.withAiActivity("Answering question", () => this.openaiResponse({
+      operation: "chat",
       model: modelChoice.model,
       system: [
         "You are a concise Obsidian sidebar assistant.",
@@ -2647,6 +2674,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async interpretSchedulerMemoryPolicyCommand(prompt, policies, config) {
     const json = await this.withAiActivity("Reading scheduler memory instruction", () => this.openaiResponse({
+      operation: "policy",
       model: this.settings.chatModel,
       jsonSchema: schedulerMemoryPolicyCommandSchema(),
       system: [
@@ -2703,6 +2731,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async interpretTaskDeduplicationPolicyCommand(prompt, currentPolicy) {
     const json = await this.withAiActivity("Updating task deduplication policy", () => this.openaiResponse({
+      operation: "policy",
       model: taskDeduplicationAiModel(this.settings),
       jsonSchema: taskDeduplicationPolicyCommandSchema(),
       system: [
@@ -2784,7 +2813,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "" }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -2792,13 +2821,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const candidateModel = candidates[index];
       try {
         if (index > 0) this.setSidebarStatus(`Retrying AI with ${modelDisplayName(candidateModel)}...`);
-        const reasoningConfig = modelReasoningConfig(
-          candidateModel,
-          index > 0 ? this.settings.chatFallbackReasoningEffort : this.settings.chatReasoningEffort
-        );
+        const configuredEffort = reasoningEffort || (index > 0 ? this.settings.chatFallbackReasoningEffort : this.settings.chatReasoningEffort);
+        const effectiveEffort = reasoningEffort
+          ? normalizeReasoningEffort(reasoningEffort)
+          : aiOperationReasoningEffort(configuredEffort, operation, this.settings.optimizeStructuredAiUsage !== false);
+        const reasoningConfig = modelReasoningConfig(candidateModel, effectiveEffort);
         const response = usesGeminiChatModel(candidateModel)
-          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background });
+          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation })
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -2838,14 +2868,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat" }) {
+    const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
+    const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
+    const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
+    const systemContent = [{
+      type: "input_text",
+      text: system,
+      ...(usePromptCache ? { prompt_cache_breakpoint: { mode: "explicit" } } : {})
+    }];
     const body = {
-      model: normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel),
+      model: modelId,
       input: [
-        { role: "system", content: [{ type: "input_text", text: system }] },
+        { role: "system", content: systemContent },
         { role: "user", content: [{ type: "input_text", text: user }] }
       ]
     };
+    if (supportsPromptCacheControls) {
+      body.prompt_cache_options = { mode: "explicit" };
+      if (usePromptCache) body.prompt_cache_key = openAiPromptCacheKey(operation);
+    }
     if (reasoningConfig.openai) body.reasoning = reasoningConfig.openai;
     if (background !== false) body.background = true;
     if (jsonSchema) {
@@ -2861,10 +2903,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       throw new Error(`OpenAI returned ${response.status}: ${redactSecrets(response.text)}`);
     }
     const completed = await this.waitForOpenAIResponse(response.json);
+    this.recordAiTokenUsage(operation, model, completed.usage || {});
     return completed.output_text || extractOutputText(completed);
   }
 
-  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {} }) {
+  recordAiTokenUsage(operation = "chat", model = "", usage = {}) {
+    const inputTokens = Number(usage.input_tokens ?? usage.promptTokenCount ?? 0);
+    const outputTokens = Number(usage.output_tokens ?? usage.candidatesTokenCount ?? 0);
+    const reasoningTokens = Number(usage.output_tokens_details?.reasoning_tokens ?? usage.thoughtsTokenCount ?? 0);
+    const cachedInputTokens = Number(usage.input_tokens_details?.cached_tokens ?? usage.cachedContentTokenCount ?? 0);
+    const cacheWriteTokens = Number(usage.input_tokens_details?.cache_write_tokens ?? usage.cacheWritePromptTokenCount ?? 0);
+    const totalTokens = Number(usage.total_tokens ?? usage.totalTokenCount ?? (inputTokens + outputTokens));
+    if (!inputTokens && !outputTokens && !reasoningTokens && !totalTokens) return;
+    const summary = { operation, model: modelDisplayName(model), inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens, reasoningTokens, totalTokens };
+    this.lastAiTokenUsage = summary;
+    this.logLocal("AI token usage", summary);
+  }
+
+  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat" }) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || "gemini-3.5-flash");
     const generationConfig = {};
     if (reasoningConfig.gemini) generationConfig.thinkingConfig = reasoningConfig.gemini;
@@ -2914,6 +2970,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Gemini returned ${response.status}: ${redactSecrets(response.text)}`);
     }
+    this.recordAiTokenUsage(operation, model, response.json?.usageMetadata || {});
     const text = extractGeminiText(response.json);
     if (!text) throw new Error(`Gemini returned no text: ${redactSecrets(response.text)}`);
     return jsonSchema ? extractJsonPayload(text) : text;
@@ -3066,6 +3123,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskCount: maxMainTasks + maxSubtasks
     });
     const json = await this.withAiActivity("Generating task list", () => this.openaiResponse({
+      operation: "task-generation",
       model: modelChoice.model,
       jsonSchema: taskCreationSchema(maxMainTasks, maxSubtasks),
       system: [
@@ -3157,31 +3215,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!mainTasks.length) return;
     const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
     hydrateContextCitationEvidence(citationState, context, options.basePath || "");
-    const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
     const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, this.settings, citationState);
     const evidenceByIndex = new Map(evidenceBundles.map((evidence) => [evidence.index, evidence]));
     for (const item of mainTasks) item.evidence = evidenceByIndex.get(item.index)?.prompt || "";
-    const contextQuery = [sourceTitle, sourceSummary, mainTasks.map((task) => task.title).join("\n")].join("\n");
-    const adaptivePack = this.buildAdaptiveContextPack({
-      mode: "description",
-      prompt: contextQuery,
-      sourceTitle,
-      sourceSummary,
-      tasks,
-      context,
-      citationMap,
-      active: { title: sourceTitle || "", path: "", text: sourceSummary || "" }
-    });
+    const contextQuery = [sourceTitle, mainTasks.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
     const modelChoice = this.aiModelForRequest("description", {
       prompt: contextQuery,
       context,
-      adaptivePack,
-      taskContext: adaptivePack.text || "",
       taskCount: mainTasks.length
     });
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
     const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+      operation: "description",
       model: modelChoice.model,
       jsonSchema: taskDescriptionSchema(),
       system: [
@@ -3201,7 +3247,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Write complete prose sentences. Do not return transcript fragments, dangling questions, pasted subject lines, or sentences that begin with unexplained lowercase text.",
         "Each task has its own evidence bundle. Use only that task's primary-source and supporting evidence; never borrow a person, document, decision, dependency, date, or status from another task's bundle.",
         "Do not add a specific fact, person, date, link, or dependency unless it appears in the corresponding evidence bundle.",
-        "Use the adaptive context pack as required supporting context when it is available; prioritize the highest-ranked excerpts that explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
+        "Use only the compact task-specific evidence bundle to explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
         citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
         "Explain the useful why/so-what behind the context in plain language so the task can be actioned without reopening every source.",
@@ -3227,13 +3273,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         contextCitationInstructions(citeContextNotes),
         "",
         "Main tasks and their task-specific evidence bundles:",
-        JSON.stringify(mainTasks),
-        "",
-        "Active source content:",
-        sourceSummary || "",
-        "",
-        "Supporting evidence catalog (use a fact only when it also appears in the matching task-specific evidence bundle):",
-        adaptivePack.text || formatContext(context, this.settings.maxContextChars, this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
+        JSON.stringify(mainTasks)
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
@@ -3278,33 +3318,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       intent: task.knowledge?.intent || "",
       purpose: task.knowledge?.rationale || "",
       expectedOutcome: task.knowledge?.outcome || task.knowledge?.nextStep || "",
+      requiredRequestCoverage: taskDescriptionRequestCoverage(task, options.requestedActionSignals || {}),
       labels: task.labels || [],
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean),
       evidence: (evidence || fallbackEvidence[position])?.prompt || ""
     }));
     if (!repairItems.length) return;
-    const citationMap = citationState.citationMap;
     const citeContextNotes = citationState.citeContextNotes;
-    const contextQuery = [sourceTitle, sourceSummary, repairItems.map((task) => task.title).join("\n")].join("\n");
-    const adaptivePack = this.buildAdaptiveContextPack({
-      mode: "description",
-      prompt: contextQuery,
-      sourceTitle,
-      sourceSummary,
-      tasks: repairItems.map((item) => Object.assign({}, weakTasks.find(({ index }) => index === item.index)?.task || {}, { content: item.title })),
-      context,
-      citationMap,
-      active: { title: sourceTitle || "", path: "", text: sourceSummary || "" }
-    });
+    const contextQuery = [sourceTitle, repairItems.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
     const modelChoice = this.aiModelForRequest("description", {
       prompt: contextQuery,
       context,
-      adaptivePack,
-      taskContext: adaptivePack.text || "",
       taskCount: repairItems.length,
       validationRepair: true
     });
     const json = await this.withAiActivity(`Improving ${repairItems.length} task description${repairItems.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+      operation: "description",
       model: modelChoice.model,
       jsonSchema: taskDescriptionSchema(),
       system: [
@@ -3314,7 +3343,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Fix the supplied qualityIssue for every task. Do not return a description with the same defect.",
         options.finalClarityRepair ? "This is the final targeted repair attempt. Begin with task intent, include an explicit purpose, and end with a supported completion outcome while removing any unsupported fact." : "",
         "Use supplied intent, purpose, and expectedOutcome fields as grounded planning hints, not as text to copy.",
-        "Use active source content first, then use the adaptive portfolio-level context as required supporting context when available. Do not repeat the title. Do not say to use the source material.",
+        "Use the compact task-specific evidence bundle. Do not repeat the title. Do not say to use the source material.",
         "Use only the evidence bundle attached to the matching task index. Do not borrow specific facts from another task or from unrelated supporting context.",
         "Do not add a person, date, link, document, dependency, decision, or status unless it appears in that task's evidence bundle.",
         "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
@@ -3337,13 +3366,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         contextCitationInstructions(citeContextNotes),
         "",
         "Tasks needing improved descriptions:",
-        JSON.stringify(repairItems),
-        "",
-        "Active source content:",
-        sourceSummary || "",
-        "",
-        "Supporting evidence catalog (use a fact only when it also appears in the matching task-specific evidence bundle):",
-        adaptivePack.text || formatContext(context, Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, contextQuery, { citationMap, basePath: options.basePath || "" }) || "No relevant vault context found."
+        JSON.stringify(repairItems)
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
@@ -3517,6 +3540,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let parsed = { estimates: [] };
     try {
       const json = await this.withAiActivity(`Estimating ${missing.length} triaged task duration${missing.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+        operation: "scheduler",
         model: durationModel,
         jsonSchema: scheduleDurationSchema(),
         system: [
@@ -4138,6 +4162,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async ensureGeneratedTaskRequestCoverage(tasks, plan = {}, options = {}) {
     const signals = plan.requestedActionSignals || taskRequestedActionSignals(options.sourceContext?.text || plan.sourceSummary || "", options.source || "note");
+    const localCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
+      labelInstructions: plan.labelInstructions || "",
+      priorityInstructions: plan.priorityInstructions || "",
+      sourceEvidence: `${options.sourceTitle || ""}\n${options.sourceContext?.text || plan.sourceSummary || ""}`,
+      settings: this.settings
+    });
+    if (localCorrections.length) this.logLocal("Applied local task quality corrections before AI repair", { source: options.source || "", corrections: localCorrections });
     const coverage = taskRequestCoverageReport(tasks, signals);
     const primarySource = `${options.sourceTitle || ""}\n${options.sourceContext?.text || plan.sourceSummary || ""}`;
     const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
@@ -4161,7 +4192,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let repairSeedTasks = tasks;
     let currentCoverage = coverage;
     let currentHierarchyIssues = hierarchyIssues;
-    const maxAttempts = 2;
+    const maxAttempts = 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         const attemptPrompt = [
@@ -4172,6 +4203,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           `Primary source: ${primarySource}`
         ].join("\n\n");
         const json = await this.withAiActivity(attempt === 1 ? "Repairing missing requested task outcomes" : "Retrying task hierarchy and coverage repair", () => this.openaiResponse({
+          operation: "task-generation",
           model: modelChoice.model,
           jsonSchema: taskCreationSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
           system: [
@@ -5226,7 +5258,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!hasChatCredentialForModel(this.settings, model)) return null;
     try {
       const json = await this.withAiActivity("Confirming possible duplicate task", () => this.openaiResponse({
+        operation: "deduplication",
         model,
+        reasoningEffort: this.settings.taskDeduplicationAiReasoningEffort,
         jsonSchema: taskDeduplicationAiDecisionSchema(),
         system: [
           "Decide only whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
@@ -5284,6 +5318,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     try {
       const json = await this.withAiActivity("Updating confirmed duplicate through task generation", () => this.openaiResponse({
+        operation: "task-generation",
         model: modelChoice.model,
         jsonSchema: taskCreationSchema(1, generationSubtaskLimit(this.settings)),
         system: [
@@ -6695,6 +6730,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     aiFallbackModelSetting(containerEl, this.plugin, () => this.display());
     const fallbackModel = this.plugin.settings.chatFallbackModel || this.plugin.sameProviderFallbackModels(this.plugin.settings.chatModel)[0] || this.plugin.settings.chatModel;
     reasoningEffortSetting(containerEl, "Fallback reasoning effort", "Controls reasoning for the selected fallback model. Provider default preserves the model provider's default behavior.", this.plugin, "chatFallbackReasoningEffort", fallbackModel);
+    toggleSetting(containerEl, "Optimize structured AI token use", "Keep the selected reasoning effort for chat, task extraction, and descriptions, but cap simple scheduler and policy calls at low reasoning. AI duplicate checks use their own reasoning setting. Disable this to use the selected global reasoning effort for calls without a dedicated setting.", this.plugin, "optimizeStructuredAiUsage");
+    toggleSetting(containerEl, "Use OpenAI prompt caching", "Enabled by default. For GPT 5.6 and newer OpenAI models, cache only stable schemas and system instructions with an explicit breakpoint. Changing note, email, vault, and task content stays outside the cached prefix. Turning this off disables cache reads and billable cache writes for these models. Cache activity is included in local token diagnostics.", this.plugin, "enableOpenAiPromptCaching");
     toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
     new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
       try {
@@ -7004,6 +7041,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(containerEl, "Enable AI-mediated deduplication", "Enabled by default. When off, local merge decisions still proceed through regular task generation. When on, the selected model confirms only strong matches that local scoring cannot settle; ambiguous candidates remain a local chat review.", this.plugin, "enableAiAmbiguousTaskDeduplication");
     taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
     taskDeduplicationAiModelSetting(containerEl, this.plugin);
+    reasoningEffortSetting(containerEl, "AI deduplication reasoning effort", "Controls reasoning only for AI duplicate verdicts. Medium is the default for accurate last-resort checks; task descriptions and confirmed-task updates continue using the primary model reasoning setting.", this.plugin, "taskDeduplicationAiReasoningEffort", taskDeduplicationAiModel(this.plugin.settings));
 
     settingsHeading(containerEl, "Deduplication Policy", "Plain-language rules used by local candidate matching and AI duplicate confirmation. You can also update this from the chat sidebar with an explicit dedupe policy request.");
     textAreaSetting(containerEl, "Deduplication policy", this.plugin, "taskDeduplicationPolicy", { compact: true });
@@ -7900,6 +7938,8 @@ const SETTING_DESCRIPTIONS = {
   chatReasoningEffort: "Controls the primary model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries.",
   chatFallbackReasoningEffort: "Controls the fallback model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
+  optimizeStructuredAiUsage: "Reduces reasoning-token usage for simple scheduler and policy calls while preserving the selected reasoning effort for chat, task extraction, and descriptions. AI duplicate checks use their own reasoning setting.",
+  enableOpenAiPromptCaching: "Enabled by default. Uses explicit prompt caching on GPT 5.6 and newer OpenAI models for stable structured-output schemas and system instructions only. Dynamic user, note, email, vault, and Todoist context remains after the cache breakpoint. Turning this off disables reads and billable writes instead of reverting to implicit caching.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
@@ -7970,6 +8010,7 @@ const SETTING_DESCRIPTIONS = {
   enableAiAmbiguousTaskDeduplication: "When enabled, conclusive duplicates are confirmed locally, credible ambiguous pairs are posted to chat, and the selected dedupe model reviews only strong unresolved matches. When disabled, local merge decisions still proceed through regular task generation and ambiguous candidates remain manual. The dedupe model never rewrites task fields.",
   taskDeduplicationAiReviewSensitivity: "Controls how broadly same-batch and unresolved local candidates are considered. Matching strictness controls nomination, local confirmation, and manual-review thresholds.",
   taskDeduplicationAiModel: "Model used only to confirm whether duplicate candidates match. Automatic uses the configured chat fallback model unless you choose a specific deduplication model; task updates use the regular task-generation model.",
+  taskDeduplicationAiReasoningEffort: "Reasoning effort used only for AI duplicate verdicts. It is independent of primary and fallback reasoning settings and defaults to Medium; descriptions and confirmed-task updates retain primary-model reasoning.",
   taskDeduplicationPolicy: "Editable duplicate policy used by local candidate matching and AI-mediated duplicate confirmation.",
   emailMainTaskInstructions: "Plain-language rules for deciding which email items become main tasks.",
   emailSubtaskInstructions: "Plain-language rules for creating email-derived subtasks.",
@@ -8303,8 +8344,8 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
   }
   const selected = options.some((option) => option.value === current) ? current : "";
   new Setting(containerEl)
-    .setName("AI deduplication and merge model")
-    .setDesc(settingDescription("AI deduplication and merge model", "taskDeduplicationAiModel"))
+    .setName("AI duplicate detection model")
+    .setDesc(settingDescription("AI duplicate detection model", "taskDeduplicationAiModel"))
     .addDropdown((dropdown) => {
       for (const option of uniqueModelOptions(options)) dropdown.addOption(option.value, option.label);
       dropdown.setValue(selected);
@@ -13739,7 +13780,7 @@ function taskRequestSignalInstructions(signals = {}) {
   if (signals.exclusions?.length) parts.push(`explicit exclusions that must not become positive work: ${signals.exclusions.map((item) => item.phrase).join("; ")}`);
   if (signals.conditional) parts.push("preserve the source's conditional requirement");
   return parts.length
-    ? `Explicit request coverage:\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ")}.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
+    ? `Explicit request coverage checklist:\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ")}.\n- Represent every action-to-object binding in one task or subtask line that contains both the requested action and its matching object; include its named recipient and condition on that same line when supplied.\n- Before returning JSON, verify that every listed binding appears exactly once, every labeled task satisfies that label's configured scope, and no subtask repeats its parent.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
     : "Explicit request coverage:\n- No additional direct-request criteria were extracted locally; follow the source-specific actionability rules without inventing work.";
 }
 
@@ -14393,6 +14434,29 @@ function generatedTaskLabelIssues(tasks = [], labelInstructions = "") {
     for (let subtaskIndex = 0; subtaskIndex < (tasks[taskIndex]?.subtasks || []).length; subtaskIndex += 1) inspect(tasks[taskIndex].subtasks[subtaskIndex], taskIndex, subtaskIndex);
   }
   return issues;
+}
+
+function applyLocalGeneratedTaskQualityCorrections(tasks = [], options = {}) {
+  const corrections = [];
+  const taskForIssue = (issue) => issue.subtaskIndex == null
+    ? tasks[issue.taskIndex]
+    : tasks[issue.taskIndex]?.subtasks?.[issue.subtaskIndex];
+  for (const issue of generatedTaskLabelIssues(tasks, options.labelInstructions || "")) {
+    const task = taskForIssue(issue);
+    if (!task) continue;
+    const before = task.labels || [];
+    task.labels = before.filter((label) => cleanLabel(label).toLowerCase() !== cleanLabel(issue.label).toLowerCase());
+    if (task.labels.length !== before.length) corrections.push(`removed unsupported #${cleanLabel(issue.label)} label from task ${issue.taskIndex + 1}`);
+  }
+  for (const issue of generatedTaskPriorityIssues(tasks, options.sourceEvidence || "", options.priorityInstructions || "", options.settings || DEFAULT_SETTINGS)) {
+    const task = taskForIssue(issue);
+    if (!task) continue;
+    const nextPriority = 3;
+    if (normalizePriority(task.priority) === nextPriority) continue;
+    task.priority = nextPriority;
+    corrections.push(`${issue.code === "under-prioritized-urgent-task" ? "raised" : "reduced"} task ${issue.taskIndex + 1} priority to ${nextPriority}`);
+  }
+  return corrections;
 }
 
 function generatedTaskPriorityIssues(tasks = [], sourceEvidence = "", priorityInstructions = "", settings = DEFAULT_SETTINGS) {
@@ -17760,6 +17824,7 @@ function taskDeduplicationSubtaskText(task = {}) {
 
 function taskDeduplicationSourceContextText(options = {}) {
   const lines = ["Source and note context for duplicate detection and task generation:"];
+  const includedPaths = new Set();
   if (options.source) lines.push(`Workflow: ${options.source}`);
   if (options.path) lines.push(`Source path: ${options.path}`);
   if (options.sectionName) lines.push(`Generated Todoist section: ${options.sectionName}`);
@@ -17767,10 +17832,14 @@ function taskDeduplicationSourceContextText(options = {}) {
     const title = note.title || note.path || "Context note";
     const path = note.path ? ` (${note.path})` : "";
     const excerpt = note.excerpt || note.summary || note.text || "";
+    if (note.path) includedPaths.add(vaultRelativePath(note.path).toLowerCase());
     return `- ${singleLine(title)}${path}${excerpt ? `: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(singleLine(excerpt)), 260)}` : ""}`;
   });
   if (noteLines.length) lines.push("Relevant notes:", ...noteLines);
-  const semanticLines = (options.semanticContext || []).slice(0, 5).map((chunk) => {
+  const semanticLines = (options.semanticContext || []).filter((chunk) => {
+    const path = vaultRelativePath(chunk.path || chunk.file || "").toLowerCase();
+    return !path || !includedPaths.has(path);
+  }).slice(0, 5).map((chunk) => {
     const path = chunk.path || chunk.file || chunk.title || "Context";
     const text = chunk.text || chunk.content || chunk.chunk || "";
     return `- ${singleLine(path)}${text ? `: ${truncateAtWord(scrubTaskDeduplicationBoilerplate(singleLine(text)), 320)}` : ""}`;

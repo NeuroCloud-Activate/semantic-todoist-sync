@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.34
+
+- Reduced description-generation input usage by removing repeated full-source and broad context payloads while retaining compact task-specific source, semantic-index, request-coverage, citation, and workflow evidence.
+- Kept task generation and descriptions on the selected primary model reasoning effort, while optionally capping simpler scheduler and policy calls at low reasoning.
+- Added an independent AI duplicate-detection reasoning setting, defaulting to Medium, while automatic duplicate checks continue to use the configured chat fallback model and confirmed updates continue through primary-model task generation.
+- Kept the final quality report entirely local, reduced task-tree repair to one targeted AI call at most, strengthened first-pass action-binding instructions, and corrected unsupported labels and obvious priority mismatches locally before considering AI repair.
+- Added default-enabled, configurable GPT 5.6+ OpenAI prompt caching for stable schemas and system instructions, using explicit breakpoints so changing note, email, vault, and Todoist context does not trigger dynamic-payload cache writes.
+- Added local per-operation AI token-usage diagnostics for OpenAI and Gemini responses, including cache reads and GPT 5.6+ cache writes, without recording prompt or response content.
+
 ## 0.6.33
 
 - Reflowed settings tabs on desktop so every category remains visible without being cut off, while retaining horizontal touch scrolling on narrow mobile panes.

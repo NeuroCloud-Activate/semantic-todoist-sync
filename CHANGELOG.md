@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.33
+
+- Reflowed settings tabs on desktop so every category remains visible without being cut off, while retaining horizontal touch scrolling on narrow mobile panes.
+- Expanded desktop dropdown controls to use the available settings width and removed project-select ellipsis clipping, with full-width stacked controls preserved for mobile and iPadOS layouts.
+
 ## 0.6.32
 
 - Added independent primary and fallback reasoning controls for configured AI chat models, preserving provider defaults unless an explicit level is selected.

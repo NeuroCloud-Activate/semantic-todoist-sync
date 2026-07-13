@@ -24,13 +24,17 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.32
+## What's New In 0.6.33
 
-1. **0.6.32 - Configurable primary and fallback reasoning**
+1. **0.6.33 - Settings that stay readable across devices**
+
+   Settings tabs now wrap on desktop instead of clipping at the edge, while narrow mobile panes keep touch-friendly horizontal scrolling. Dropdown controls use a readable bounded width on desktop and full-width stacked controls on mobile/iPadOS, so selected values are not needlessly ellipsized.
+
+2. **0.6.32 - Configurable primary and fallback reasoning**
 
    Configure separate reasoning effort for the primary and fallback AI models. Provider default preserves the model's normal behavior, while supported OpenAI and Gemini 3 models expose their provider-specific reasoning controls.
 
-2. **0.6.31 - Faster first-pass task descriptions**
+3. **0.6.31 - Faster first-pass task descriptions**
 
    Task-specific local request evidence now informs the first description-generation call directly. Clean outputs still skip repair entirely, while malformed task trees and descriptions have tighter retry limits to reduce worst-case latency without weakening the final quality gate.
 

@@ -24,19 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.30
+## What's New In 0.6.31
 
-1. **0.6.30 - More precise, source-grounded task generation**
+1. **0.6.31 - Faster first-pass task descriptions**
 
-   Task generation now preserves more of what a request actually requires: passive requests, staged actions, decision alternatives and criteria, requested outputs, deliverable-recipient pairs, constraints, exclusions, dependencies, and observable outcomes. Local validation uses task-specific semantic-index evidence before targeted AI repair, while duplicate resolution keeps richer generated details and routes updates through the regular grounded task-generation workflow.
+   Task-specific local request evidence now informs the first description-generation call directly. Clean outputs still skip repair entirely, while malformed task trees and descriptions have tighter retry limits to reduce worst-case latency without weakening the final quality gate.
 
-2. **0.6.29 - More focused context and safer duplicate handling**
+2. **0.6.30 - More precise, source-grounded task generation**
 
-   Project-history and task questions now keep their retrieval scope focused, collapse repeated context, and refresh changed semantic-index content safely. Generated task descriptions use task-specific evidence, and deduplication resolves clear local matches quickly while posting credible ambiguous matches to chat for review.
+   Task generation preserves passive requests, staged actions, decision alternatives and criteria, requested outputs, deliverable-recipient pairs, constraints, exclusions, dependencies, and observable outcomes. Local validation uses task-specific semantic-index evidence before targeted AI repair.
 
-3. **0.6.28 - Source-aware task links and cleaner email notes**
+3. **0.6.29 - More focused context and safer duplicate handling**
 
-   Todoist task descriptions keep note and email wording as descriptive Markdown link text instead of exposing bare URLs. Email-To-Todoist notes no longer repeat the filename as an opening heading, and their workflow metadata remains clean and readable.
+   Project-history and task questions keep retrieval focused, collapse repeated context, and refresh changed semantic-index content safely. Generated descriptions use task-specific evidence, while duplicate handling resolves clear local matches quickly and flags credible ambiguities for review.
 
 
 ## What It Uses

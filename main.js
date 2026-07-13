@@ -3074,6 +3074,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       intent: task.knowledge?.intent || "",
       purpose: task.knowledge?.rationale || "",
       expectedOutcome: task.knowledge?.outcome || task.knowledge?.nextStep || "",
+      requiredRequestCoverage: taskDescriptionRequestCoverage(task, options.requestedActionSignals || {}),
       labels: task.labels || [],
       subtasks: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
     }));
@@ -3113,6 +3114,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "For each main task, write one concrete, useful paragraph between 120 and 900 characters using 2-4 complete sentences.",
         "Organize the paragraph in this order without headings: the specific intent and working context; why the work matters or what decision/process it supports; and the expected outcome or observable completion condition.",
         "Every description must make the task's purpose and expected outcome clear. Use supplied intent, purpose, and expectedOutcome fields as grounded planning hints, not as text to copy.",
+        "Use each task's requiredRequestCoverage field on the first pass to preserve its locally extracted action-to-object, recipient, condition, decision-alternative, and decision-criterion requirements without mixing requirements between tasks.",
         "Every description must pass this local quality gate: at least 80 characters, at least 12 words, not empty, not title-only, not a generic instruction to review/use the source, and not a close paraphrase of the task title.",
         "Do not repeat or paraphrase the task title.",
         "Start with the actionable context itself: name the relevant people, documents, program, meeting, decision, dependency, timing, or constraint when the source provides it.",
@@ -3177,17 +3179,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       this.setSidebarStatus(`Improving ${weakTasks.length} task description${weakTasks.length === 1 ? "" : "s"}...`);
       await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options);
-    }
-    const remainingWeakTasks = (tasks || []).map((task, index) => {
-      const evidence = evidenceByIndex.get(index) || null;
-      return { task, index, evidence, reason: taskDescriptionGroundingReason(task.description, task, evidence, this.settings) };
-    }).filter(({ reason }) => reason !== "passed");
-    if (remainingWeakTasks.length) {
-      this.logLocal("Task descriptions require final targeted repair", {
-        count: remainingWeakTasks.length,
-        tasks: remainingWeakTasks.map(({ task, reason }) => ({ title: task.content || "", reason }))
-      });
-      await this.repairTaskDescriptions(remainingWeakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, Object.assign({}, options, { finalClarityRepair: true }));
     }
     this.setSidebarStatus("Finalizing task descriptions...");
     for (let index = 0; index < (tasks || []).length; index += 1) {
@@ -4094,7 +4085,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let repairSeedTasks = tasks;
     let currentCoverage = coverage;
     let currentHierarchyIssues = hierarchyIssues;
-    const maxAttempts = 3;
+    const maxAttempts = 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         const attemptPrompt = [
@@ -4179,7 +4170,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], options.sourceTitle || "", plan.descriptionInstructions, {
       contextNotes: plan.contextNotes || [],
       basePath: vaultBasePath(this.app),
-      citeContextNotes: options.citeContextNotes !== false
+      citeContextNotes: options.citeContextNotes !== false,
+      requestedActionSignals: plan.requestedActionSignals || {}
     })
       .then(() => {
         this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
@@ -13645,6 +13637,23 @@ function taskRequestSignalInstructions(signals = {}) {
   return parts.length
     ? `Explicit request coverage:\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ")}.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
     : "Explicit request coverage:\n- No additional direct-request criteria were extracted locally; follow the source-specific actionability rules without inventing work.";
+}
+
+function taskDescriptionRequestCoverage(task = {}, signals = {}) {
+  const taskText = [task.content, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ");
+  const normalized = singleLine(taskText).toLowerCase();
+  const counts = termCounts(normalized);
+  const bindings = (signals.bindings || []).filter((binding) => {
+    const objectMatch = (binding.objects || []).some((object) => taskRequestObjectPresent(normalized, counts, object));
+    const entityMatch = (binding.entities || []).some((entity) => normalized.includes(singleLine(entity).toLowerCase()));
+    return objectMatch || entityMatch || taskRequestFamilyPresent(normalized, binding.family);
+  });
+  const decisionTask = taskRequestFamilyPresent(normalized, "decision");
+  const parts = [];
+  if (bindings.length) parts.push(bindings.map((binding) => `${binding.family} -> ${(binding.objects || []).join("/") || "named work"}${binding.entities?.length ? ` with ${(binding.entities || []).join("/")}` : ""}${binding.conditionType ? ` (${binding.conditionType})` : ""}`).join("; "));
+  if (decisionTask && signals.decisionAlternatives?.length) parts.push(`alternatives: ${signals.decisionAlternatives.join(" vs ")}`);
+  if (decisionTask && signals.decisionCriteria?.length) parts.push(`criteria: ${signals.decisionCriteria.join(", ")}`);
+  return parts.join("; ");
 }
 
 function taskRequestCoverageReport(tasks = [], signals = {}) {

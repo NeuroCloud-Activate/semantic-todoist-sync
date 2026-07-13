@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.31
+
+- Passed task-specific local action, object, recipient, condition, and decision requirements into the first description-generation call instead of relying only on post-generation validation.
+- Reduced worst-case serial AI work by limiting task-tree repair to two focused attempts and description repair to one attempt before the grounded deterministic fallback, while clean task trees continue without any repair call.
+- Added a local latency regression benchmark; full request-signal extraction and coverage validation averages under one millisecond per task tree on the development test system.
+
 ## 0.6.30
 
 - Expanded local task-request analysis to preserve passive requests, staged work, document-specific criteria, named decision alternatives, decision criteria, requested output formats, and deliverable-recipient bindings before AI repair is considered.

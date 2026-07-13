@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.38
+
+- Made generated task titles preserve the source-supported document, program, person, decision, deliverable, review focus, or current stage needed to distinguish and act on the work.
+- Expanded description generation to retain multiple useful task facts when available, including current status, rationale, special review focus, criteria, stakeholder input, dependencies, and handoffs, without repeating subtask actions or generic completion language.
+- Relaxed task-specific semantic evidence selection enough to admit strongly matching shared program context while continuing to reject context anchored to a neighboring task.
+- Added a fast local evidence-detail gate that uses the existing single targeted repair pass only when a description omits meaningful facts already present in its bounded evidence bundle.
+- Limited each task's source list to its primary note and the context notes actually cited in that task's narrative, with compact citation renumbering instead of attaching every plan-level source.
+- Preserved safe grounded narratives and added an extractive task-evidence fallback so local validation does not replace an actionable description with a source-only block when useful evidence remains.
+- Validated email and note generation against the live testing vault with intercepted Todoist writes, including task titles, descriptions, subtasks, labels, semantic context, source attribution, duplicate screening, and payload hygiene.
+
 ## 0.6.37
 
 - Stopped same-batch duplicate checks from treating a shared note, person, Inbox section, label, or semantic context as sufficient duplicate evidence when generated tasks have different actionable scopes.

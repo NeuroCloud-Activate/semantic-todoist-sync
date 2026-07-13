@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.37
+
+- Stopped same-batch duplicate checks from treating a shared note, person, Inbox section, label, or semantic context as sufficient duplicate evidence when generated tasks have different actionable scopes.
+- Added task-title identity checks, conflicting program-identifier detection, and sequential-action separation so BEAP, ESTMTA, GFP/PDF, Performance Goals delivery, and meeting-booking work remain distinct.
+- Recognized `Book`, `Develop`, and other common concrete verbs as valid leading task actions, preventing malformed local repairs such as `Send Develop ...`.
+- Preserved grounded task titles when only their descriptions fail local validation; unsafe narrative text is removed and verified source links are retained instead of dropping the task.
+- Added the July 9 multi-topic touchbase as a generic regression fixture and verified all five main tasks plus the ESTMTA subtask continue without same-batch flags, merges, or AI duplicate calls.
+
 ## 0.6.36
 
 - Prevented task-local quality failures from cancelling an otherwise valid generated batch after duplicate review.

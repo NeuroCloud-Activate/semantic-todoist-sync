@@ -24,19 +24,19 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.36
+## What's New In 0.6.37
 
-1. **0.6.36 - Resilient task batches**
+1. **0.6.37 - Accurate same-batch duplicate screening**
+
+   Tasks generated from one multi-topic note no longer look like duplicates merely because they share the same people, Inbox section, labels, or note context. Same-batch comparisons now require real title and task-scope identity, separate conflicting program identifiers and sequential actions, preserve valid `Book` and `Develop` titles, and keep grounded tasks even when an unsafe description must be reduced to verified source links.
+
+2. **0.6.36 - Resilient task batches**
 
    A malformed generated item no longer cancels every valid task after duplicate review. Unsupported description sentences are removed or replaced locally, unambiguous noun-only titles can recover their action from grounded context, and only irreparable items are omitted. The full batch still stops when no safe task remains.
 
-2. **0.6.35 - Clear task narratives with smarter context**
+3. **0.6.35 - Clear task narratives with smarter context**
 
    Todoist descriptions now explain the task's intent and useful working context in concise prose instead of repeating prompt requirements, generic goals, completion language, or subtask checklists. When a source note is sparse or marks details as missing, matching semantic-index notes can fill the gap without introducing another AI call. Near-duplicate evidence is removed locally, and stable description instructions remain eligible for default-enabled OpenAI prompt caching.
-
-3. **0.6.34 - Lower AI usage without weaker descriptions**
-
-   Description generation keeps the selected primary model and its configured reasoning effort, but no longer repeats the full source and broad context catalog after building task-specific evidence. Default-enabled GPT 5.6+ OpenAI prompt caching reuses stable schemas and system instructions without caching changing task evidence. The final quality report stays local, task-tree repair is limited to one AI call, and duplicate checks use the fallback model with independent Medium reasoning by default.
 
 ## What It Uses
 

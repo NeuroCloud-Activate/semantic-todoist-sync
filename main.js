@@ -4332,10 +4332,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const deterministicFallbacks = enforceDeterministicDescriptionFallbacks(tasks, plan, options, this.settings);
     if (deterministicFallbacks > 0) this.logLocal("Applied final deterministic task description fallback", { source: options.source || "", count: deterministicFallbacks });
     let quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
-    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, removedTasks: [] };
+    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, degradedDescriptionTaskKeys: [], removedTasks: [] };
     if (quality.blockingIssues > 0) {
       salvage = salvageGeneratedTaskBatch(tasks, plan, options, this.settings);
-      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.removedTasks.length) {
+      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.degradedDescriptionTaskKeys.length || salvage.removedTasks.length) {
         quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
         quality.salvage = salvage;
         this.logLocal("Salvaged valid tasks after local quality checks", {
@@ -4343,9 +4343,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           localCorrections: salvage.localCorrections.length,
           repairedTitles: salvage.repairedTitles,
           repairedDescriptions: salvage.repairedDescriptions,
+          retainedTasksWithSourceOnlyDescriptions: salvage.degradedDescriptionTaskKeys.length,
           removedTasks: salvage.removedTasks.length,
           remainingTasks: tasks.length
         });
+        if (salvage.degradedDescriptionTaskKeys.length) {
+          new Notice(`${salvage.degradedDescriptionTaskKeys.length} task description${salvage.degradedDescriptionTaskKeys.length === 1 ? " was" : "s were"} reduced to verified source links; all grounded task titles will continue.`);
+        }
         if (salvage.removedTasks.length && tasks.length) {
           new Notice(`${salvage.removedTasks.length} unsafe generated item${salvage.removedTasks.length === 1 ? " was" : "s were"} omitted; ${tasks.length} validated task${tasks.length === 1 ? " will" : "s will"} continue.`);
         }
@@ -4360,7 +4364,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         elapsedMs: quality.elapsedMs
       });
     }
-    const fatalIssues = quality.issues.filter((issue) => issue.blocking && !(salvage.removedTasks.length && tasks.length && issue.code === "missing-requested-outcome"));
+    const degradedDescriptionTaskKeys = new Set(salvage.degradedDescriptionTaskKeys || []);
+    const fatalIssues = quality.issues.filter((issue) => {
+      if (!issue.blocking) return false;
+      if (salvage.removedTasks.length && tasks.length && issue.code === "missing-requested-outcome") return false;
+      const taskKey = canonicalTaskMatchTitle(tasks[issue.taskIndex]?.content || "");
+      if (degradedDescriptionTaskKeys.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code)) return false;
+      return true;
+    });
     if (fatalIssues.length > 0) {
       const details = fatalIssues.map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
       throw new Error(`Generated tasks failed ${fatalIssues.length} blocking local quality check${fatalIssues.length === 1 ? "" : "s"}: ${details}.`);
@@ -14283,7 +14294,7 @@ function taskDescriptionActionAlignmentReason(value = "", task = {}) {
 }
 
 const TASK_STRUCTURE_ACTION_WORDS = new Set([
-  "apply", "approve", "ask", "assess", "check", "circulate", "clarify", "collect", "compare", "complete", "confirm", "coordinate", "decide", "deliver", "document", "draft", "edit", "finalize", "follow", "forward", "identify", "incorporate", "inspect", "obtain", "prepare", "provide", "publish", "read", "request", "resolve", "respond", "review", "revise", "schedule", "send", "share", "submit", "summarize", "update", "upload", "use", "validate", "verify", "write"
+  "apply", "approve", "ask", "assess", "book", "call", "check", "circulate", "clarify", "collect", "compare", "complete", "confirm", "contact", "coordinate", "create", "decide", "deliver", "design", "develop", "document", "draft", "edit", "email", "finalize", "follow", "forward", "help", "identify", "incorporate", "inspect", "make", "obtain", "organize", "plan", "prepare", "provide", "publish", "read", "request", "resolve", "respond", "review", "revise", "schedule", "send", "share", "submit", "summarize", "update", "upload", "use", "validate", "verify", "write"
 ]);
 
 const SUBTASK_VAGUE_OBJECT_WORDS = new Set([
@@ -14836,6 +14847,10 @@ const TASK_TITLE_REPAIR_ACTIONS = {
   decision: "Decide on"
 };
 
+const RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES = new Set([
+  "ungrounded-main-description", "invalid-main-description-link", "missing-source-list"
+]);
+
 function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
   const sourceContext = options.sourceContext || {};
   const sourceTitle = options.sourceTitle || sourceContext.title || "";
@@ -14889,9 +14904,32 @@ function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings
     task.description = taskDescriptionWithSources(replacement, task.content || "", split.sourceList, settings, sourceTitle, citationState, linkContext);
     repairedDescriptions += 1;
   }
-  const repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
+  let repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
+  const blockingIssuesByTask = new Map();
+  for (const issue of repairedQuality.issues.filter((item) => item.blocking && item.code !== "missing-requested-outcome")) {
+    if (!blockingIssuesByTask.has(issue.taskIndex)) blockingIssuesByTask.set(issue.taskIndex, []);
+    blockingIssuesByTask.get(issue.taskIndex).push(issue);
+  }
+  const degradedDescriptionTaskKeys = [];
+  for (const [index, issues] of blockingIssuesByTask.entries()) {
+    const task = tasks[index] || {};
+    if (!issues.length || issues.some((issue) => !RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code))) continue;
+    if (mainTaskClarityReason(task) !== "passed" || !generatedTaskMatchesPrimarySource(task, groundingEvidence)) continue;
+    const split = splitDescriptionSourceListBlock(task.description || "");
+    const verifiedSources = split.sourceList || (options.citeContextNotes !== false
+      ? descriptionSourceList({ title: sourceTitle, path: sourceContext.path || options.path || "", text: sourceSummary }, plan.contextNotes || [], options.basePath || "")
+      : "");
+    task.description = verifiedSources;
+    degradedDescriptionTaskKeys.push(canonicalTaskMatchTitle(task.content || ""));
+  }
+  if (degradedDescriptionTaskKeys.length) repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
+  const degradedDescriptionTaskKeySet = new Set(degradedDescriptionTaskKeys);
   const invalidIndexes = new Set(repairedQuality.issues
-    .filter((issue) => issue.blocking && issue.code !== "missing-requested-outcome")
+    .filter((issue) => {
+      if (!issue.blocking || issue.code === "missing-requested-outcome") return false;
+      const taskKey = canonicalTaskMatchTitle(tasks[issue.taskIndex]?.content || "");
+      return !(degradedDescriptionTaskKeySet.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code));
+    })
     .map((issue) => issue.taskIndex)
     .filter((index) => Number.isInteger(index) && index >= 0 && index < tasks.length));
   const removedTasks = [];
@@ -14901,7 +14939,7 @@ function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings
       if (removed) removedTasks.unshift({ content: removed.content || "", issueCodes: repairedQuality.issues.filter((issue) => issue.taskIndex === index && issue.blocking).map((issue) => issue.code) });
     }
   }
-  return { localCorrections, repairedTitles, repairedDescriptions, removedTasks };
+  return { localCorrections, repairedTitles, repairedDescriptions, degradedDescriptionTaskKeys, removedTasks };
 }
 
 function descriptionSpecificEntities(value = "") {
@@ -17469,6 +17507,40 @@ function taskDeduplicationFeatures(task = {}, settings = DEFAULT_SETTINGS, optio
   };
 }
 
+const TASK_DEDUPE_INTRA_BATCH_GENERIC_TOKENS = new Set([
+  "concept", "document", "draft", "file", "guideline", "material", "note", "process", "program", "project", "review", "task", "update", "wording"
+]);
+
+const TASK_DEDUPE_SCOPE_IDENTIFIER_IGNORES = new Set(["ASAP", "FYI", "TODO"]);
+
+function taskDedupeScopeIdentifiers(value = "") {
+  return new Set((String(value || "").match(/\b[A-Z][A-Z0-9]{1,11}\b/g) || [])
+    .filter((identifier) => !TASK_DEDUPE_SCOPE_IDENTIFIER_IGNORES.has(identifier) && !/^\d+$/.test(identifier)));
+}
+
+function conflictingIntraBatchTaskScopes(task = {}, existing = {}) {
+  const source = taskDedupeScopeIdentifiers(task.content || "");
+  const target = taskDedupeScopeIdentifiers(existing.content || "");
+  if (!source.size || !target.size) return false;
+  return tokenIntersection(source, target).length === 0;
+}
+
+function intraBatchTaskIdentitySignal(task = {}, existing = {}, metrics = {}, aiReview = {}) {
+  if (metrics.scopeConflict || metrics.sequentialDistinct) return false;
+  const meaningfulSharedTokens = (metrics.sharedTitleTokens || []).filter((token) => (
+    token &&
+    !/^\d+$/.test(token) &&
+    !TASK_DEDUPE_INTRA_BATCH_GENERIC_TOKENS.has(token)
+  ));
+  if (metrics.sourceTitle && metrics.sourceTitle === metrics.existingTitle) return true;
+  if (meaningfulSharedTokens.length >= 2) return true;
+  if (!meaningfulSharedTokens.length) return false;
+  return Boolean(
+    (metrics.titleOverlap || 0) >= Number(aiReview.batchTitleOverlap || 0.18) ||
+    (metrics.contextOverlap || 0) >= Number(aiReview.batchContextOverlap || 0.22)
+  );
+}
+
 function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, options = {}, preparedSource = null) {
   const existing = candidate.task || {};
   const sourceFeatures = preparedSource || taskDeduplicationFeatures(task, settings, options);
@@ -17515,6 +17587,7 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     titleOverlap,
     contextOverlap
   });
+  const scopeConflict = Boolean(options.intraBatch && conflictingIntraBatchTaskScopes(task, existing));
   const reasons = [];
   let score = 0;
   if (sourceTitle && existingTitle && sourceTitle === existingTitle) {
@@ -17611,9 +17684,25 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     if (titleOverlap < 0.65) hardMismatch = true;
   }
   const aiReview = taskDeduplicationAiReviewConfig(settings, options);
+  const intraBatchIdentityMatch = Boolean(options.intraBatch && intraBatchTaskIdentitySignal(task, existing, {
+    sourceTitle,
+    existingTitle,
+    titleOverlap,
+    contextOverlap,
+    sharedTitleTokens,
+    sequentialDistinct,
+    scopeConflict
+  }, aiReview));
   const batchContextMatch = Boolean(options.intraBatch
+    && intraBatchIdentityMatch
     && (sameSection || labelOverlap || topicOverlap || peopleOverlap)
     && (titleOverlap >= aiReview.batchTitleOverlap || contextOverlap >= aiReview.batchContextOverlap || sharedTitleTokens.length >= 1 || (labelOverlap && topicOverlap)));
+  if (scopeConflict) {
+    score -= 36;
+    reasons.push("different named task scopes");
+    hardMismatch = true;
+  }
+  if (options.intraBatch && !intraBatchIdentityMatch) hardMismatch = true;
   if (sourceTitleTokens.size >= 3) {
     if (options.intraBatch) {
       if (titleOverlap < 0.1 && contextOverlap < 0.1 && !batchContextMatch) hardMismatch = true;
@@ -17631,6 +17720,8 @@ function taskDeduplicationScore(task, candidate, settings = DEFAULT_SETTINGS, op
     contextOverlap,
     projectContextMatch,
     batchContextMatch,
+    intraBatchIdentityMatch,
+    scopeConflict,
     hierarchyMismatch: hierarchy.mismatch,
     hierarchyCandidate: hierarchy.candidate,
     hardMismatch,
@@ -17937,7 +18028,12 @@ function taskDeduplicationSequentialActionDistinct(task = {}, existing = {}, met
   const sendLater = /\b(send|issue|deliver|submit|publish|notify|confirming status|letter|letters|forms)\b/i;
   const sourceReviewTargetSend = reviewFirst.test(source) && sendLater.test(target);
   const targetReviewSourceSend = reviewFirst.test(target) && sendLater.test(source);
-  return Boolean((sourceReviewTargetSend || targetReviewSourceSend) && (metrics.contextOverlap || 0) < 0.62);
+  if ((sourceReviewTargetSend || targetReviewSourceSend) && (metrics.contextOverlap || 0) < 0.62) return true;
+  const scheduling = /\b(book|schedule|arrange|calendar|meeting|appointment)\b/i;
+  const delivery = /\b(send|deliver|submit|forward|share|email|provide|publish)\b/i;
+  const sourceSchedulesTargetDelivers = scheduling.test(source) && delivery.test(target);
+  const targetSchedulesSourceDelivers = scheduling.test(target) && delivery.test(source);
+  return Boolean(sourceSchedulesTargetDelivers || targetSchedulesSourceDelivers);
 }
 
 function taskDedupeNameTokens(text = "") {

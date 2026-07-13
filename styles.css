@@ -15,12 +15,11 @@
   top: 0;
   z-index: 10;
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 8px 0 16px;
   max-width: 100%;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: visible;
   padding: 8px 0 7px;
   background: var(--background-primary);
   border-bottom: 1px solid var(--background-modifier-border);
@@ -69,6 +68,17 @@
 
 .semantic-todoist-settings .setting-item-control {
   min-width: 0;
+}
+
+.semantic-todoist-settings .setting-item-control:has(select) {
+  flex: 0 1 min(100%, 360px);
+  min-width: min(220px, 100%);
+}
+
+.semantic-todoist-settings .setting-item-control:has(select) select {
+  max-width: none;
+  min-width: 0;
+  width: 100%;
 }
 
 .semantic-todoist-settings input,
@@ -161,10 +171,10 @@
 }
 
 .semantic-todoist-project-setting select {
-  max-width: 260px;
+  max-width: none;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
 }
 
 .semantic-todoist-folder-list {
@@ -183,6 +193,17 @@
 }
 
 @media (max-width: 700px) {
+  .semantic-todoist-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .semantic-todoist-settings .setting-item-control:has(select) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
   .semantic-todoist-project-setting {
     flex-direction: column;
   }

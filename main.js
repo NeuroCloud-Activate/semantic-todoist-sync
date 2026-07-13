@@ -4331,7 +4331,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const deterministicFallbacks = enforceDeterministicDescriptionFallbacks(tasks, plan, options, this.settings);
     if (deterministicFallbacks > 0) this.logLocal("Applied final deterministic task description fallback", { source: options.source || "", count: deterministicFallbacks });
-    const quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
+    let quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
+    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, removedTasks: [] };
+    if (quality.blockingIssues > 0) {
+      salvage = salvageGeneratedTaskBatch(tasks, plan, options, this.settings);
+      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.removedTasks.length) {
+        quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
+        quality.salvage = salvage;
+        this.logLocal("Salvaged valid tasks after local quality checks", {
+          source: options.source || "",
+          localCorrections: salvage.localCorrections.length,
+          repairedTitles: salvage.repairedTitles,
+          repairedDescriptions: salvage.repairedDescriptions,
+          removedTasks: salvage.removedTasks.length,
+          remainingTasks: tasks.length
+        });
+        if (salvage.removedTasks.length && tasks.length) {
+          new Notice(`${salvage.removedTasks.length} unsafe generated item${salvage.removedTasks.length === 1 ? " was" : "s were"} omitted; ${tasks.length} validated task${tasks.length === 1 ? " will" : "s will"} continue.`);
+        }
+      }
+    }
     plan.localQualityReport = quality;
     if (!quality.passed) {
       this.logLocal("Task generation local quality check flagged output", {
@@ -4341,9 +4360,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         elapsedMs: quality.elapsedMs
       });
     }
-    if (quality.blockingIssues > 0) {
-      const details = quality.issues.filter((issue) => issue.blocking).map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
-      throw new Error(`Generated tasks failed ${quality.blockingIssues} blocking local quality check${quality.blockingIssues === 1 ? "" : "s"}: ${details}.`);
+    const fatalIssues = quality.issues.filter((issue) => issue.blocking && !(salvage.removedTasks.length && tasks.length && issue.code === "missing-requested-outcome"));
+    if (fatalIssues.length > 0) {
+      const details = fatalIssues.map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
+      throw new Error(`Generated tasks failed ${fatalIssues.length} blocking local quality check${fatalIssues.length === 1 ? "" : "s"}: ${details}.`);
     }
     return { projectId, projectName, sectionId, quality, requestRepair };
   }
@@ -14105,23 +14125,32 @@ function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, s
   if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
   const corpus = String(evidence?.corpus || "");
   if (!corpus.trim()) return "missing task-specific evidence";
+  const unsupportedFact = taskDescriptionUnsupportedFactReason(value, evidence, settings);
+  if (unsupportedFact) return unsupportedFact;
+  const descriptionTerms = generatedTaskObjectTerms(value);
+  const corpusCounts = termCounts(corpus);
+  const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
+  if (descriptionTerms.length >= 3 && !supportedTerms.length) return "description has no specific overlap with its evidence";
+  return "passed";
+}
+
+function taskDescriptionUnsupportedFactReason(value = "", evidence = null, settings = DEFAULT_SETTINGS) {
+  const corpus = String(evidence?.corpus || "");
+  if (!corpus.trim()) return "missing task-specific evidence";
   const corpusLower = corpus.toLowerCase();
   const dates = uniqueValues(String(value || "").match(/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*20\d{2})?\b/gi) || []);
   const unsupportedDate = dates.find((date) => !corpusLower.includes(date.toLowerCase()));
   if (unsupportedDate) return `unsupported date: ${unsupportedDate}`;
   const unsupportedState = unsupportedDescriptionWorkflowState(value, corpus);
   if (unsupportedState) return unsupportedState;
-  const people = uniqueValues([...extractPeopleCandidates(value, 12), ...descriptionSpecificEntities(value)]);
+  const entityText = String(value || "").replace(/\[[^\]\n]+\]\([^)\n]+\)/g, "");
+  const people = uniqueValues([...extractPeopleCandidates(entityText, 12), ...descriptionSpecificEntities(entityText)]);
   const unsupportedPerson = people.find((person) => !descriptionEntitySupportedByCorpus(person, corpusLower));
   if (unsupportedPerson) return `unsupported person or entity: ${unsupportedPerson}`;
   const links = extractDescriptionLinkRecords(value, settings);
   const unsupportedLink = links.find((link) => !corpus.includes(link.url));
   if (unsupportedLink) return "unsupported link";
-  const descriptionTerms = generatedTaskObjectTerms(value);
-  const corpusCounts = termCounts(corpus);
-  const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
-  if (descriptionTerms.length >= 3 && !supportedTerms.length) return "description has no specific overlap with its evidence";
-  return "passed";
+  return "";
 }
 
 const DESCRIPTION_WORKFLOW_STATE_RE = /\b(?:(?:already|currently|still|previously|earlier)\s+(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:is|are|was|were|has been|have been|had been)\s+(?:already\s+|currently\s+|still\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:has|have|had)\s+(?:already\s+|previously\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|rejected|accepted|resolved|closed|assigned)|(?:is|are|was|were)\s+being\s+(reviewed|drafted|prepared|finali[sz]ed))\b/i;
@@ -14787,12 +14816,100 @@ function enforceDeterministicDescriptionFallbacks(tasks = [], plan = {}, options
   return applied;
 }
 
+const TASK_TITLE_REPAIR_ACTIONS = {
+  review: "Review",
+  comparison: "Compare",
+  drafting: "Draft",
+  accuracy: "Review",
+  gaps: "Review",
+  feedback: "Review",
+  revisions: "Update",
+  incorporation: "Incorporate",
+  finalization: "Finalize",
+  documentation: "Document",
+  recommendation: "Prepare",
+  highlighted: "Review",
+  approval: "Approve",
+  confirmation: "Confirm",
+  response: "Respond to",
+  send: "Send",
+  decision: "Decide on"
+};
+
+function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
+  const sourceContext = options.sourceContext || {};
+  const sourceTitle = options.sourceTitle || sourceContext.title || "";
+  const sourceSummary = plan.sourceSummary || sourceContext.text || "";
+  const context = plan.semanticContext || options.semanticContext || [];
+  const groundingEvidence = [sourceTitle, sourceContext.title, sourceSummary, sourceContext.text, ...context.map((chunk) => `${chunk.title || chunk.path || ""}\n${chunk.text || ""}`)].filter(Boolean).join("\n\n");
+  const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
+  hydrateContextCitationEvidence(citationState, context, sourceContext.path || options.path || "");
+  let evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
+  const linkContext = [sourceSummary, ...context.map((chunk) => chunk.text || "")].filter(Boolean).join("\n\n");
+  const localCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
+    labelInstructions: plan.labelInstructions || "",
+    priorityInstructions: plan.priorityInstructions || "",
+    sourceEvidence: [sourceTitle, sourceSummary, sourceContext.text || ""].filter(Boolean).join("\n"),
+    settings
+  });
+  let repairedTitles = 0;
+  let repairedDescriptions = 0;
+  for (let index = 0; index < tasks.length; index += 1) {
+    const task = tasks[index] || {};
+    if (mainTaskClarityReason(task) !== "passed") {
+      const subtaskAction = (task.subtasks || []).map((subtask) => taskStructureLeadingAction(subtask.content || "")).find(Boolean);
+      const descriptionAction = splitDescriptionSentences(splitDescriptionSourceListBlock(task.description || "").summary).map(taskStructureLeadingAction).find(Boolean);
+      const signalActions = uniqueValues((plan.requestedActionSignals?.families || []).map((family) => TASK_TITLE_REPAIR_ACTIONS[family]).filter(Boolean));
+      const signalAction = signalActions.length === 1 ? signalActions[0] : "";
+      const action = subtaskAction ? capitalizeSentenceStart(subtaskAction) : descriptionAction ? capitalizeSentenceStart(descriptionAction) : signalAction || "";
+      const candidate = action ? singleLine(`${action} ${task.content || ""}`) : "";
+      if (candidate && mainTaskClarityReason(Object.assign({}, task, { content: candidate })) === "passed" && generatedTaskMatchesPrimarySource(Object.assign({}, task, { content: candidate }), groundingEvidence)) {
+        task.content = truncateAtWord(candidate, 250);
+        if ((task.subtasks || []).length === 1 && taskStructureTitleOverlap(task.content, task.subtasks[0].content || "") >= 0.78) task.subtasks = [];
+        repairedTitles += 1;
+      }
+    }
+  }
+  if (repairedTitles) evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
+  for (let index = 0; index < tasks.length; index += 1) {
+    const task = tasks[index] || {};
+    const evidence = evidenceBundles[index] || null;
+    const split = splitDescriptionSourceListBlock(task.description || "");
+    if (taskDescriptionGroundingReason(split.summary, task, evidence, settings) === "passed") continue;
+    const supportedSummary = splitDescriptionSentences(split.summary)
+      .filter((sentence) => !taskDescriptionUnsupportedFactReason(sentence, evidence, settings))
+      .join(" ");
+    const candidates = [
+      supportedSummary,
+      fallbackActionSummary(task, sourceSummary, evidence?.contextChunks || [], sourceTitle, settings, evidence),
+      deterministicTaskFallbackDescription(task, settings, evidence)
+    ].map((value) => singleLine(value)).filter(Boolean);
+    const replacement = candidates.find((value) => taskDescriptionGroundingReason(value, task, evidence, settings) === "passed") || "";
+    if (!replacement) continue;
+    task.description = taskDescriptionWithSources(replacement, task.content || "", split.sourceList, settings, sourceTitle, citationState, linkContext);
+    repairedDescriptions += 1;
+  }
+  const repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
+  const invalidIndexes = new Set(repairedQuality.issues
+    .filter((issue) => issue.blocking && issue.code !== "missing-requested-outcome")
+    .map((issue) => issue.taskIndex)
+    .filter((index) => Number.isInteger(index) && index >= 0 && index < tasks.length));
+  const removedTasks = [];
+  if (invalidIndexes.size && invalidIndexes.size < tasks.length) {
+    for (const index of Array.from(invalidIndexes).sort((left, right) => right - left)) {
+      const [removed] = tasks.splice(index, 1);
+      if (removed) removedTasks.unshift({ content: removed.content || "", issueCodes: repairedQuality.issues.filter((issue) => issue.taskIndex === index && issue.blocking).map((issue) => issue.code) });
+    }
+  }
+  return { localCorrections, repairedTitles, repairedDescriptions, removedTasks };
+}
+
 function descriptionSpecificEntities(value = "") {
   const ignored = new Set([
     "The", "This", "That", "These", "Those", "A", "An", "Before", "After", "Once", "Then", "Earlier", "Later",
     "Because", "Although", "However", "When", "While", "For", "Given", "Related",
     "Keep", "Include", "Review", "Compare", "Confirm", "Verify", "Identify", "Coordinate", "Complete", "Resolve", "Clarify", "Determine", "Check", "Summarize", "Respond", "Finalize", "Ensure", "Use", "Add", "Update", "Draft", "Prepare", "Send",
-    "Todoist", "Obsidian", "Context", "Task", "Source", "Subject", "Concrete", "Steps", "Completion", "Outcome", "Result", "Expected"
+    "Todoist", "Obsidian", "Outlook", "Item", "Shape", "Context", "Task", "Source", "Subject", "Concrete", "Steps", "Completion", "Outcome", "Result", "Expected"
   ]);
   const entities = String(value || "").match(/\b[A-Z][A-Za-z&'-]{2,}(?:\s+[A-Z][A-Za-z&'-]{2,}){0,2}\b/g) || [];
   return uniqueValues(entities.map((entity) => {

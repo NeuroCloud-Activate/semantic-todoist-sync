@@ -146,6 +146,8 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
 const DEFAULT_REASONING_EFFORT = "default";
 const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a concise grounded brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
+
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
   googleApiKey: "",
@@ -194,6 +196,7 @@ const DEFAULT_SETTINGS = {
   todoistSectionCache: {},
   syncTag: "#STsync",
   subtaskSyncTag: "#STSubSync",
+  noteActionMarkerTags: "#todo",
   excludeSyncTagsFromLabels: true,
   legacyTodoistIdMode: "preserve",
   notesAutoSync: false,
@@ -301,21 +304,21 @@ const DEFAULT_SETTINGS = {
   dateInstructions: "Determine a task completion deadline and a due date for each main task based on urgency, priority, and complexity. Do not add due dates to subtasks. Avoid weekends and the holidays that apply to the user's locale.",
   tagInstructions: "Only create Todoist labels that are explicitly named in these instructions. Add labels only when the source content clearly matches a configured rule.",
   priorityInstructions: "Assign priority 1 to 4 to each task and subtask, where 4 is highest priority and 1 is no priority.",
-  descriptionInstructions: "Include concise, actionable context from the source and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the source note, source subject, or filename.",
+  descriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded information to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. Use direct execution guidance. Treat the source note or email as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the source note, source subject, email, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE,
   emailMainTaskInstructions: "Assume every email forwarded into Email-To-Todoist is intended to create at least one Todoist task. Review the email chain together with relevant ranked vault context and identify the most useful action, follow-up, review, decision, or completion task for the user. Requests for thoughts, feedback, review, comments, tracked changes, verification of accuracy, confirmation of gaps, or document/draft review are actionable even when phrased politely, marked non-urgent, or sent to multiple recipients. Exclude signatures, disclaimers, logos, and work clearly owned by someone else unless the user needs to follow up. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
   emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task and supported by the email or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   emailSectionTitleInstructions: "Create one Todoist section for all tasks from the same email using Email_YY_MM_DD_Subject based on the email received date and subject.",
   emailDateInstructions: "Determine due dates and deadlines from the email's urgency, stated dates, complexity, and sender expectations. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   emailTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   emailPriorityInstructions: "Assign priority 1 to 4 to each email-derived task and subtask, where 4 is highest priority and 1 is no priority.",
-  emailDescriptionInstructions: "Include concise, actionable email-thread context and relevant ranked vault context so the task can be completed without rereading the full thread. Focus on people, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the email subject or source file.",
-  noteMainTaskInstructions: "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Strongly prioritize items I manually marked with #todo and nearby context. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
+  emailDescriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded email-thread and semantic-index detail to perform the named task without reopening the full thread. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. Use direct execution guidance. Treat the current email direction as authoritative and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the email subject or source file. " + TASK_DESCRIPTION_ANTI_FILLER_RULE,
+  noteMainTaskInstructions: "Review the active note or selected note text together with relevant ranked vault context and identify only items that clearly require my action, follow-up, review, decision, or completion. Requests for my review, comments, tracked changes, verification of accuracy, or confirmation of gaps in a draft document are actionable even when phrased politely or sent to multiple recipients. Treat every configured required-action marker and its nearby context as requiring at least one relevant task for that topic or item. Exclude informational discussion, ideas owned by others, vague possibilities, and simple reminders unless the note indicates I need to act or follow up. Create detailed Todoist tasks that reflect the note's current state.",
   noteSubtaskInstructions: "Create note subtasks only for concrete steps required to complete the parent task and supported by the note or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   noteSectionTitleInstructions: "Create one Todoist section for all tasks from the same note using Notes_YY_MM_DD_Subject based on the note date and note subject.",
   noteDateInstructions: "Determine due dates and deadlines from the note's timing, urgency, complexity, and any explicit dates. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   noteTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   notePriorityInstructions: "Assign priority 1 to 4 to each note-derived task and subtask, where 4 is highest priority and 1 is no priority.",
-  noteDescriptionInstructions: "Include concise, actionable note context and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the active note, source note title, or filename."
+  noteDescriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded note and semantic-index detail to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. Use direct execution guidance. Treat the active/source note as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the active note, source note title, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE
 };
 
 function normalizeReasoningEffort(value, fallback = DEFAULT_REASONING_EFFORT) {
@@ -392,6 +395,24 @@ function supportsExplicitOpenAiPromptCaching(model) {
 function openAiPromptCacheKey(operation = "chat") {
   const normalized = String(operation || "chat").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "chat";
   return `semantic-todoist-${normalized}`.slice(0, 64);
+}
+
+const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
+
+function taskWorkflowSystemInstruction() {
+  return [
+    "You are generating one phase of a bounded Semantic Todoist Sync task workflow.",
+    "Return only JSON matching the supplied strict structured-output schema.",
+    "Use only the retained workflow context and the phase-specific task data supplied after it.",
+    "Never invent people, documents, links, dates, dependencies, ownership, status, decisions, or outcomes.",
+    "Keep each task scope isolated from neighboring topics and preserve explicit source action facts."
+  ].join(" ");
+}
+
+function openAiMaxOutputTokensForOperation(operation = "chat") {
+  if (operation === "task-generation") return 2500;
+  if (operation === "description") return 1800;
+  return 0;
 }
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
@@ -945,28 +966,29 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const descriptionUpdates = {
       descriptionInstructions: [
         "Include the source subject or note title, useful context, and links to referenced files in the Todoist description. Separate details with periods. Do not include preamble.",
+        "Include concise, actionable context from the source and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the source note, source subject, or filename.",
+        "Include the source subject or note title, useful source context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble.",
         DEFAULT_SETTINGS.descriptionInstructions
       ],
       emailDescriptionInstructions: [
         "Include the email subject, concise thread context, useful vault context, and links to referenced files in the Todoist description. Separate details with periods. Do not include preamble.",
+        "Include concise, actionable email-thread context and relevant ranked vault context so the task can be completed without rereading the full thread. Focus on people, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the email subject or source file.",
+        "Include the email subject, concise thread context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble.",
         DEFAULT_SETTINGS.emailDescriptionInstructions
       ],
       noteDescriptionInstructions: [
         "Include the source note title, concise note context, useful vault context, and relevant links in the Todoist description. Separate details with periods. Do not include preamble.",
+        "Include concise, actionable note context and relevant ranked vault context so the task can be completed without rereading every note. Focus on people, documents, decisions, dependencies, timing, constraints, and next information needed. Do not open by naming the active note, source note title, or filename.",
+        "Include the source note title, concise note context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble.",
         DEFAULT_SETTINGS.noteDescriptionInstructions
       ]
     };
-    descriptionUpdates.descriptionInstructions.push(
-      "Include the source subject or note title, useful source context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
-    );
-    descriptionUpdates.emailDescriptionInstructions.push(
-      "Include the email subject, concise thread context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
-    );
-    descriptionUpdates.noteDescriptionInstructions.push(
-      "Include the source note title, concise note context, and relevant ranked vault context in the Todoist description. Include directly relevant referenced links or files only when they are available and not excluded by settings. Do not mention whether links or linked files were found or missing. Separate details with periods. Do not include preamble."
-    );
-    for (const [key, [oldValue, newValue]] of Object.entries(descriptionUpdates)) {
-      if (this.settings[key] === oldValue || descriptionUpdates[key].slice(2).includes(this.settings[key])) {
+    for (const [key, values] of Object.entries(descriptionUpdates)) {
+      const newValue = values[values.length - 1];
+      const previousDefault = String(newValue || "").endsWith(` ${TASK_DESCRIPTION_ANTI_FILLER_RULE}`)
+        ? String(newValue).slice(0, -(TASK_DESCRIPTION_ANTI_FILLER_RULE.length + 1))
+        : "";
+      if (uniqueValues([...values.slice(0, -1), previousDefault].filter(Boolean)).includes(this.settings[key])) {
         this.settings[key] = newValue;
         changed = true;
       }
@@ -2813,7 +2835,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "" }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "" }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -2827,8 +2849,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           : aiOperationReasoningEffort(configuredEffort, operation, this.settings.optimizeStructuredAiUsage !== false);
         const reasoningConfig = modelReasoningConfig(candidateModel, effectiveEffort);
         const response = usesGeminiChatModel(candidateModel)
-          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation });
+          ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation, promptCachePrefix })
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -2868,25 +2890,38 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat" }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "" }) {
     const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
     const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
+    const contextPrefix = String(promptCachePrefix || "");
     const systemContent = [{
       type: "input_text",
-      text: system,
-      ...(usePromptCache ? { prompt_cache_breakpoint: { mode: "explicit" } } : {})
+      text: system
     }];
+    if (usePromptCache && !contextPrefix) systemContent[0].prompt_cache_breakpoint = { mode: "explicit" };
+    const userContent = [];
+    if (contextPrefix) {
+      userContent.push({
+        type: "input_text",
+        text: contextPrefix,
+        ...(usePromptCache ? { prompt_cache_breakpoint: { mode: "explicit" } } : {})
+      });
+    }
+    if (user) userContent.push({ type: "input_text", text: user });
     const body = {
       model: modelId,
       input: [
         { role: "system", content: systemContent },
-        { role: "user", content: [{ type: "input_text", text: user }] }
+        { role: "user", content: userContent }
       ]
     };
-    if (supportsPromptCacheControls) {
+    const maxOutputTokens = openAiMaxOutputTokensForOperation(operation);
+    if (maxOutputTokens > 0) body.max_output_tokens = maxOutputTokens;
+    if (usePromptCache) {
       body.prompt_cache_options = { mode: "explicit" };
-      if (usePromptCache) body.prompt_cache_key = openAiPromptCacheKey(operation);
+      if (promptCacheKey) body.prompt_cache_key = promptCacheKey;
+      else body.prompt_cache_key = openAiPromptCacheKey(operation);
     }
     if (reasoningConfig.openai) body.reasoning = reasoningConfig.openai;
     if (background !== false) body.background = true;
@@ -2920,9 +2955,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.logLocal("AI token usage", summary);
   }
 
-  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat" }) {
+  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "" }) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || "gemini-3.5-flash");
     const generationConfig = {};
+    const geminiUser = [promptCachePrefix, user].filter(Boolean).join("\n\n");
     if (reasoningConfig.gemini) generationConfig.thinkingConfig = reasoningConfig.gemini;
     if (jsonSchema) {
       generationConfig.responseMimeType = "application/json";
@@ -2937,7 +2973,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system || "" }] },
-        contents: [{ role: "user", parts: [{ text: user || "" }] }],
+        contents: [{ role: "user", parts: [{ text: geminiUser }] }],
         generationConfig
       }),
       throw: false
@@ -2960,7 +2996,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             "JSON schema to match:",
             JSON.stringify(geminiCompatibleSchema(jsonSchema)),
             "",
-            user || ""
+            geminiUser
           ].join("\n") }] }],
           generationConfig: Object.assign({}, generationConfig, { responseSchema: undefined })
         }),
@@ -3096,7 +3132,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskQuery
     );
     const taskInstructions = this.taskInstructionsForSource(source.type);
-    const requestedActionSignals = taskRequestedActionSignals(sourceSummary, source.type);
+    const requestedActionSignals = taskRequestedActionSignals(sourceSummary, source.type, this.settings);
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
     const instructions = [
@@ -3115,6 +3151,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskContext,
       queryPlan: retrievalPlan
     });
+    const workflowContext = taskWorkflowContextBundle({
+      source,
+      sourceType: source.type,
+      sourceTitle: source.title,
+      sourcePath: source.path || "",
+      sourceSummary,
+      taskContext,
+      adaptivePack,
+      semanticContext: context,
+      settings: this.settings
+    });
     const modelChoice = this.aiModelForRequest("task-generation", {
       prompt: [taskQuery, instructions].join("\n"),
       context,
@@ -3125,45 +3172,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const json = await this.withAiActivity("Generating task list", () => this.openaiResponse({
       operation: "task-generation",
       model: modelChoice.model,
-      jsonSchema: taskCreationSchema(maxMainTasks, maxSubtasks),
-      system: [
-        "Create Todoist task structure from the supplied source.",
-        "Return only JSON matching the schema.",
-        "Follow the Main task requirements for every top-level task and the Subtask requirements for every subtask.",
-        "Use the active source content and adaptive task/meeting/project context for every task-generation decision, including main tasks and subtasks.",
-        "Treat the vault context as required supporting context when it is available, but only use lines that are relevant to the source and task request.",
-        "When ranked vault context conflicts on the same topic, prefer the newest matching note as the current guidance while preserving older notes only as background.",
-        "Return exactly one section_name for the generated task group. Build section_name from the Section title instructions in settings.",
-        source.type === "email" ? "For emails, assume the user forwarded the message because they want at least one Todoist task created. Create a concise review, reply, follow-up, decision, or completion task from the most relevant thread context unless the email is unreadable or contains only signature/disclaimer material." : "Create only tasks that are truly actionable by the user. Skip informational discussion, vague ideas, duplicate tasks, status updates, and work clearly owned by someone else unless the user must follow up.",
-        source.type === "email" ? "Treat the labeled current/latest email message as authoritative for present status and next action. Use earlier quoted history only to identify the object, purpose, dependencies, and unresolved follow-up. Never recreate work that the current message says was reviewed, adjusted, sent, approved, finalized, or otherwise completed; create the next unresolved action instead." : "",
-        source.type === "note" ? "For notes, treat #todo markers and nearby lines as the strongest signal for user-owned actions. If no #todo markers exist, use only explicit action or follow-up language." : "For emails, soft language such as 'let me know what you think', 'for review', 'no immediate review', or 'lots of time to finalize' still indicates a task when the thread includes a draft, document, link, decision, reply, or follow-up context.",
-        source.type === "note" ? "When #todo markers exist, cover every marked action before considering unmarked text. Do not turn unmarked historical, hypothetical, or background imperatives into additional tasks merely because they use an action verb." : "",
-        `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
-        "Labels must omit the leading #. Do not create any label unless it is explicitly named in the tag instructions.",
-        "Use subtasks only when a main task has concrete required steps, dependencies, or follow-up actions.",
-        "Make every main-task title independently actionable and specific enough to distinguish it from neighboring work. Preserve the source-supported document, program, person, decision, deliverable, review focus, or current stage that tells the user exactly what the task covers.",
-        "Use relevant vault context to disambiguate a title or preserve a named scope already implied by the source, but never introduce a new action that the active source does not request.",
-        "Do not write task descriptions in this step. Descriptions are generated in a separate pass after local OIDs are assigned.",
-        "For date fields, follow the Dates and Deadlines instructions exactly. Use null for due_date or deadline_date when the source and settings do not support that field.",
-        "due_date and deadline_date are separate fields. Do not copy one into the other unless the Dates and Deadlines instructions explicitly say to do that.",
-        `Today is ${today()}. Use this only to interpret relative dates when the Dates and Deadlines instructions allow a date.`
-      ].join(" "),
+      jsonSchema: taskWorkflowResponseSchema(maxMainTasks, maxSubtasks),
+      system: taskWorkflowSystemInstruction(),
+      reasoningEffort: "medium",
+      promptCachePrefix: workflowContext.promptCachePrefix,
+      promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
       user: [
-        "Task generation request:",
+        "Workflow phase: task structure.",
+        "Return the tasks field only. Return section_name as an empty string and descriptions as an empty array.",
+        "Create Todoist task structure from the shared workflow context.",
         instructions,
-        "",
-        `Source type: ${source.type}`,
-        `Source title: ${source.title}`,
         `Fallback section name if the Section title instructions cannot be applied: ${source.sectionName || ""}`,
-        "",
-        "Source content:",
-        sourceSummary,
-        "",
-        "Adaptive task, meeting, project, and portfolio context (required supporting context when available; locally ranked and compacted):",
-        adaptivePack.text || taskContext || "No adaptive context found."
-      ].join("\n")
+        source.type === "email" ? "For emails, preserve the current/latest message as authoritative and create the user's next unresolved review, reply, follow-up, decision, or completion action." : "For notes, cover every distinct marked action before adding additional clearly user-owned actions from the source and matching context.",
+        "Follow the configured main-task, subtask, date, deadline, label, priority, and source-type instructions.",
+        `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
+        "Keep labels free of leading # characters. Do not write descriptions in this phase."
+      ].filter(Boolean).join("\n\n")
     }));
     const parsed = JSON.parse(json);
+    if (String(parsed.section_name || "").trim() || (parsed.descriptions || []).length) {
+      throw new Error("Task structure phase returned section or description content.");
+    }
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     const cleanedTasks = (parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content);
     const grounding = groundGeneratedTaskPlan(cleanedTasks, `${source.title || ""}\n${sourceSummary}`, this.settings);
@@ -3188,18 +3217,57 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       [taskQuery, flattenTaskPlan(parsed.tasks || []).map((task) => task.content || "").join("\n")].join("\n"),
       this.settings
     );
-    parsed.sectionName = cleanGeneratedSectionName(parsed.section_name || parsed.sectionName || source.sectionName);
+    parsed.sectionName = cleanGeneratedSectionName(source.sectionName);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
     parsed.semanticContext = context;
+    parsed.taskWorkflowContextBundle = workflowContext;
+    parsed.contextBundle = workflowContext;
     parsed.adaptiveContextDepth = adaptivePack.depth;
     parsed.allowedLabels = Array.from(allowedLabels);
     parsed.requestedActionSignals = requestedActionSignals;
+    parsed.sectionInstructions = taskInstructions.sectionTitle;
     parsed.descriptionInstructions = taskInstructions.descriptions;
     parsed.dateInstructions = taskInstructions.dates;
     parsed.priorityInstructions = taskInstructions.priorities;
     parsed.labelInstructions = taskInstructions.tags;
     return parsed;
+  }
+
+  async generateTaskSectionName(tasks = [], plan = {}, options = {}) {
+    const sourceType = options.source || plan.taskWorkflowContextBundle?.sourceType || "note";
+    const fallback = cleanGeneratedSectionName(options.sectionName || plan.sectionName || "Tasks");
+    const workflowContext = options.contextBundle || plan.taskWorkflowContextBundle || plan.contextBundle;
+    if (!workflowContext?.promptCachePrefix) return fallback;
+    const modelChoice = this.aiModelForRequest("task-generation", {
+      prompt: [options.sourceTitle || workflowContext.sourceTitle, (tasks || []).map((task) => task.content || "").join("\n")].filter(Boolean).join("\n"),
+      context: plan.semanticContext || workflowContext.semanticContext || [],
+      taskCount: (tasks || []).length
+    });
+    const json = await this.withAiActivity("Naming task section", () => this.openaiResponse({
+      operation: "section-title",
+      model: modelChoice.model,
+      jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
+      system: taskWorkflowSystemInstruction(),
+      reasoningEffort: "medium",
+      promptCachePrefix: workflowContext.promptCachePrefix,
+      promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
+      user: [
+        "Workflow phase: section title.",
+        "Return section_name only. Return tasks as an empty array and descriptions as an empty array.",
+        `Source type: ${sourceType}.`,
+        "Follow the configured section-title instructions and preserve the source's date and subject naming convention.",
+        `Section-title instructions: ${plan.sectionInstructions || this.taskInstructionsForSource(sourceType).sectionTitle || ""}`,
+        `Fallback section name: ${fallback}`,
+        "Generated main-task titles:",
+        JSON.stringify((tasks || []).map((task) => task.content || "").filter(Boolean))
+      ].join("\n")
+    }));
+    const parsed = JSON.parse(json);
+    if ((parsed.tasks || []).length || (parsed.descriptions || []).length) {
+      throw new Error("Section-title phase returned task or description content.");
+    }
+    return cleanGeneratedSectionName(parsed.section_name || fallback);
   }
 
   async refineTaskDescriptions(tasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
@@ -3209,8 +3277,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       currentDescription: task.description || "",
       workingContext: [task.knowledge?.intent, task.knowledge?.rationale].filter(Boolean).join(" "),
       requiredRequestCoverage: taskDescriptionRequestCoverage(task, options.requestedActionSignals || {}),
-      labels: task.labels || [],
-      relatedStepsForExclusion: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean)
+      labels: task.labels || []
     }));
     if (!mainTasks.length) return;
     const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
@@ -3221,7 +3288,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const item of mainTasks) {
       const evidence = evidenceByIndex.get(item.index);
       item.evidence = evidence?.prompt || "";
-      item.useSupportingContextToFillGaps = evidence?.needsSupportingContext === true;
     }
     const contextQuery = [sourceTitle, mainTasks.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
     const modelChoice = this.aiModelForRequest("description", {
@@ -3233,171 +3299,67 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
       operation: "description",
       model: modelChoice.model,
-      jsonSchema: taskDescriptionSchema(),
-      system: [
-        "Write Todoist main-task descriptions only.",
-        "Do not change task titles, due dates, priorities, labels, or subtasks.",
-        "For each main task, write one clear narrative paragraph between 100 and 900 characters using 1-4 complete sentences. Stay concise when evidence is sparse, but do not omit useful details merely to be brief.",
-        "Describe the task's real-world intent and only the context needed to understand and complete it, such as the relevant recipient, decision, dependency, constraint, status, timing, or working link.",
-        "When the evidence bundle contains them, include multiple concrete action-enabling facts: what changed or is already known, why the work is needed, what deserves special attention, which criteria or distinction matter, who is involved, and what dependency or next handoff constrains the work.",
-        "A strong description should let the user act without reopening every cited note. Prefer two or more distinct supported details beyond the task title whenever the evidence provides them.",
-        "Use workingContext only when it provides concrete task facts. Omit generic goals and the fact that work must be completed.",
-        "Do not force the description into labeled intent, purpose, or outcome sections, and never narrate prompt structure, source grounding, validation, or generic completion status.",
-        "Do not enumerate, paraphrase, or summarize relatedStepsForExclusion. Those actions already belong in subtasks; include only context that helps the user perform them.",
-        "Use each task's requiredRequestCoverage field on the first pass to preserve its locally extracted action-to-object, recipient, condition, decision-alternative, and decision-criterion requirements without mixing requirements between tasks.",
-        "Every description must pass this local quality gate: at least 80 characters, at least 12 words, not empty, not title-only, not a generic instruction to review/use the source, and not a close paraphrase of the task title.",
-        "Do not repeat or paraphrase the task title.",
-        "Start with the actionable context itself: name the relevant people, documents, program, meeting, decision, dependency, timing, or constraint when the source provides it.",
-        "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename.",
-        "Do not write openings like 'The note says', 'The source records', 'The email indicates', a source-title recap, or any filename-first framing.",
-        "Explain why the task matters only when the source provides a specific reason; do not add generic purpose or completion language to satisfy a template.",
-        "Do not copy raw note lines. Summarize the active note and ranked relevant vault context into useful action context.",
-        "Write complete prose sentences. Do not return transcript fragments, dangling questions, pasted subject lines, or sentences that begin with unexplained lowercase text.",
-        "Each task has its own evidence bundle. Use only that task's primary-source and supporting evidence; never borrow a person, document, decision, dependency, date, or status from another task's bundle.",
-        "When useSupportingContextToFillGaps is true, use relevant semantic-index note evidence to supply concrete context omitted or marked unclear in the primary source. Prefer the newest matching note, cite it when numbered, and never fill a gap by inference.",
-        "Do not add a specific fact, person, date, link, or dependency unless it appears in the corresponding evidence bundle.",
-        "Use only the compact task-specific evidence bundle to explain intent, rationale, dependencies, constraints, people, documents, program status, or next information needed.",
-        "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
-        citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
-        "Prefer direct task facts over commentary about goals, outcomes, source grounding, prompt rules, or validation.",
-        "Never return an empty description. Never say only to use the source material.",
-        "Avoid vague openings such as 'This task requires', 'Review the source', 'Complete the task', or 'Use the source material'.",
-        "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
-        "Do not include source lists, headings, bullets, tags, section names, date metadata, or subtask lists.",
-        "Never mention generated Todoist section identifiers such as Notes_YY_MM_DD_Subject or Email_YY_MM_DD_Subject in a description.",
-        "Subtasks must not receive descriptions."
-      ].join(" "),
+      jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
+      system: taskWorkflowSystemInstruction(),
+      reasoningEffort: "medium",
+      promptCachePrefix: options.contextBundle?.promptCachePrefix || "",
+      promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
       user: [
+        "Workflow phase: main-task descriptions.",
+        "Return one description object for every main task index. Return tasks as an empty array and section_name as an empty string.",
         `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
-        "",
         "Description instructions:",
         descriptionInstructions || "",
         "",
         `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
         "",
         "Local validation rule:",
-        "Descriptions that are too short, generic, title-only, procedural, or written as prompt commentary are rejected. Make the first response a specific task narrative.",
+        "Descriptions that are too short, generic, title-only, procedural, or written as prompt commentary are rejected. Write direct execution guidance rather than prompt commentary.",
+        "Description contract: write a standalone, detailed, task-specific execution brief that preserves the current artifact or state, intent when non-obvious, audience/reviewer/recipient needs, required details, decisions, dependencies, timing, constraints, substantive review criteria, and supported links or citations when available.",
+        "Use directly relevant current supporting-note evidence whenever it materially enriches the brief, even when the primary source is already detailed. The primary source remains authoritative for current direction; exclude stale, unrelated, or neighboring-task context.",
+        "Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
+        TASK_DESCRIPTION_ANTI_FILLER_RULE,
         "",
         "Context-note citation rule:",
         contextCitationInstructions(citeContextNotes),
         "",
+        "Keep every description between 80 and 1200 characters, with at least 12 words and complete sentences. Use only the matching task evidence bundle; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, and handoffs when supplied.",
         "Main tasks and their task-specific evidence bundles:",
         JSON.stringify(mainTasks)
       ].join("\n")
     }));
     const parsed = JSON.parse(json);
-    for (const item of parsed.descriptions || []) {
+    if ((parsed.tasks || []).length || String(parsed.section_name || "").trim()) {
+      throw new Error("Description phase returned task or section content.");
+    }
+    const descriptions = parsed.descriptions || [];
+    const expectedIndexes = new Set(mainTasks.map((task) => task.index));
+    const seenIndexes = new Set();
+    const validatedDescriptions = new Map();
+    for (const item of descriptions) {
+      if (!Number.isInteger(item?.index) || !expectedIndexes.has(item.index)) throw new Error(`Description phase returned an unexpected task index: ${item?.index}.`);
+      if (seenIndexes.has(item.index)) throw new Error(`Description phase returned duplicate task index: ${item.index}.`);
+      seenIndexes.add(item.index);
       const task = tasks[item.index];
-      if (!task || task.isSubtask) continue;
+      const evidence = evidenceByIndex.get(item.index) || null;
       const summary = cleanTaskDescriptionSummary(item.description || "", task.content, sourceTitle, this.settings, citationState);
-      task.description = truncateAtWord(summary || task.description || "", 1200);
-      for (const subtask of task.subtasks || []) subtask.description = "";
+      const contractReason = descriptionQualityReason(summary, task.content, this.settings);
+      if (contractReason !== "passed") throw new Error(`Description for task ${item.index + 1} failed the contract: ${contractReason}.`);
+      const groundingReason = taskDescriptionGroundingReason(summary, task, evidence, this.settings);
+      if (groundingReason !== "passed") throw new Error(`Description for task ${item.index + 1} failed local grounding: ${groundingReason}.`);
+      const requestFactReason = taskDescriptionRequestCoverageReason(summary, task, options.requestedActionSignals || {});
+      if (requestFactReason) throw new Error(`Description for task ${item.index + 1} omitted an explicit request fact: ${requestFactReason}.`);
+      validatedDescriptions.set(item.index, truncateAtWord(summary, 1200));
     }
-    const weakTasks = (tasks || []).map((task, index) => {
-      const evidence = evidenceByIndex.get(index) || null;
-      return { task, index, evidence, reason: taskDescriptionGroundingReason(task.description, task, evidence, this.settings) };
-    }).filter(({ reason }) => reason !== "passed");
-    if (weakTasks.length) {
-      this.logLocal("Task descriptions needed improvement", {
-        count: weakTasks.length,
-        tasks: weakTasks.map(({ task, reason }) => ({ title: task.content || "", reason }))
-      });
-      this.setSidebarStatus(`Improving ${weakTasks.length} task description${weakTasks.length === 1 ? "" : "s"}...`);
-      await this.repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options);
+    if (seenIndexes.size !== expectedIndexes.size) {
+      const missing = Array.from(expectedIndexes).filter((index) => !seenIndexes.has(index));
+      throw new Error(`Description phase omitted task indexes: ${missing.join(", ")}.`);
     }
-    this.setSidebarStatus("Finalizing task descriptions...");
-    for (let index = 0; index < (tasks || []).length; index += 1) {
-      const task = tasks[index];
-      const evidence = evidenceByIndex.get(index) || null;
-      if (taskDescriptionGroundingReason(task.description, task, evidence, this.settings) !== "passed") {
-        const fallback = fallbackActionSummary(task, sourceSummary, evidence?.contextChunks || [], sourceTitle, this.settings, evidence);
-        if (fallback) task.description = fallback;
-      }
-      for (const subtask of task.subtasks || []) subtask.description = "";
+    for (const item of mainTasks) {
+      tasks[item.index].description = validatedDescriptions.get(item.index);
+      for (const subtask of tasks[item.index].subtasks || []) subtask.description = "";
     }
-  }
-
-  async repairTaskDescriptions(weakTasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
-    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
-    hydrateContextCitationEvidence(citationState, context, options.basePath || "");
-    const fallbackEvidence = buildTaskDescriptionEvidenceBundles(weakTasks.map(({ task }) => task), sourceSummary, context, sourceTitle, this.settings, citationState);
-    const repairItems = weakTasks.map(({ task, index, evidence, reason }, position) => ({
-      index,
-      title: task.content || "",
-      qualityIssue: reason || "",
-      workingContext: [task.knowledge?.intent, task.knowledge?.rationale].filter(Boolean).join(" "),
-      requiredRequestCoverage: taskDescriptionRequestCoverage(task, options.requestedActionSignals || {}),
-      labels: task.labels || [],
-      relatedStepsForExclusion: (task.subtasks || []).map((subtask) => subtask.content).filter(Boolean),
-      evidence: (evidence || fallbackEvidence[position])?.prompt || ""
-    }));
-    for (let position = 0; position < repairItems.length; position += 1) {
-      repairItems[position].useSupportingContextToFillGaps = Boolean((weakTasks[position].evidence || fallbackEvidence[position])?.needsSupportingContext);
-    }
-    if (!repairItems.length) return;
-    const citeContextNotes = citationState.citeContextNotes;
-    const contextQuery = [sourceTitle, repairItems.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
-    const modelChoice = this.aiModelForRequest("description", {
-      prompt: contextQuery,
-      context,
-      taskCount: repairItems.length,
-      validationRepair: true
-    });
-    const json = await this.withAiActivity(`Improving ${repairItems.length} task description${repairItems.length === 1 ? "" : "s"}`, () => this.openaiResponse({
-      operation: "description",
-      model: modelChoice.model,
-      jsonSchema: taskDescriptionSchema(),
-      system: [
-        "Improve incomplete Todoist main-task descriptions.",
-        "Return only JSON matching the schema.",
-        "Each description must be a 100-900 character narrative using 1-4 complete sentences about the task's intent and the concrete context needed to complete it.",
-        "Fix the supplied qualityIssue for every task. Do not return a description with the same defect.",
-        options.finalClarityRepair ? "This is the final targeted repair attempt. Keep only supported task facts and remove generic framing, repeated title text, and procedural restatements." : "",
-        "Use workingContext only as grounded facts, not as a required outline or text to copy.",
-        "Never narrate prompt requirements, source-grounding status, validation rules, generic goals, or generic completion status.",
-        "Do not enumerate, paraphrase, or summarize relatedStepsForExclusion; those actions remain subtasks.",
-        "Use the compact task-specific evidence bundle. Do not repeat the title. Do not say to use the source material.",
-        "When the evidence provides useful background, include at least two distinct action-enabling facts beyond the title, such as current status, rationale, review focus, criteria, stakeholder input, a meaningful program distinction, or a dependency.",
-        "Use only the evidence bundle attached to the matching task index. Do not borrow specific facts from another task or from unrelated supporting context.",
-        "When useSupportingContextToFillGaps is true, fill omissions in the primary source with relevant semantic-index note facts, preferring the newest matching note and never inferring beyond supplied evidence.",
-        "Do not add a person, date, link, document, dependency, decision, or status unless it appears in that task's evidence bundle.",
-        "When context notes conflict on the same topic, prefer the newest matching context note as current guidance and use older notes only as background.",
-        "Do not start by naming, citing, or describing the active note, primary note, source title, email subject, or filename. Start with the information needed to action the task.",
-        "Do not return transcript fragments, dangling questions, pasted subject lines, or sentences that begin with unexplained lowercase text.",
-        citeContextNotes ? "When a sentence uses information primarily from a numbered context note, add the matching context note citation at the end of that sentence, using syntax like (1). Do not cite the active or primary source. Use only supplied Context Note numbers." : "Do not add numbered context-note citations.",
-        "When a task description needs a source link, use the descriptive wording supplied by the source as markdown link text; never display a bare URL.",
-        "Do not include source lists, headings, bullets, tags, dates, section names, metadata, or subtask lists.",
-        "Never mention generated Todoist section identifiers such as Notes_YY_MM_DD_Subject or Email_YY_MM_DD_Subject in a description."
-      ].join(" "),
-      user: [
-        `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
-        "",
-        "Description instructions:",
-        descriptionInstructions || "",
-        "",
-        `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
-        "",
-        "Context-note citation rule:",
-        contextCitationInstructions(citeContextNotes),
-        "",
-        "Tasks needing improved descriptions:",
-        JSON.stringify(repairItems)
-      ].join("\n")
-    }));
-    const parsed = JSON.parse(json);
-    for (const item of parsed.descriptions || []) {
-      const match = weakTasks.find(({ index }) => index === item.index);
-      if (!match) continue;
-      const summary = cleanTaskDescriptionSummary(item.description || "", match.task.content, sourceTitle, this.settings, citationState);
-      const position = weakTasks.indexOf(match);
-      const evidence = match.evidence || fallbackEvidence[position] || null;
-      const reason = taskDescriptionGroundingReason(summary, match.task, evidence, this.settings);
-      if (reason === "passed") {
-        match.task.description = truncateAtWord(summary, 1200);
-      } else {
-        this.logLocal("Task description repair rejected", { title: match.task.content || "", reason });
-      }
-    }
+    this.setSidebarStatus("Task descriptions validated.");
   }
 
   taskInstructionsForSource(type) {
@@ -3913,7 +3875,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       sectionName: fallbackSectionName,
       maxChars: this.settings.maxEmailChars
     });
-    const sectionName = plan.sectionName || fallbackSectionName;
+    let sectionName = plan.sectionName || fallbackSectionName;
     const tasks = plan.tasks || [];
     enforceGeneratedTaskLimits(tasks, this.settings);
     this.setSidebarStatus("Creating local email task OIDs...");
@@ -3932,6 +3894,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       contextNotes: plan.contextNotes || [],
       semanticContext: plan.semanticContext || []
     });
+    sectionName = prepared.sectionName || sectionName;
     this.setSidebarStatus("Syncing Todoist section...");
     const created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
     await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
@@ -4122,7 +4085,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         maxChars: this.settings.maxNoteChars,
         templateInstructions: template.prompt
       });
-      const sectionName = plan.sectionName || fallbackSectionName;
+      let sectionName = plan.sectionName || fallbackSectionName;
       const tasks = plan.tasks || [];
       if (!tasks.length) return { tasks: [], markdown: "" };
       this.setSidebarStatus("Creating local task OIDs...");
@@ -4142,6 +4105,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         contextNotes: plan.contextNotes || [],
         semanticContext: plan.semanticContext || []
       });
+      sectionName = prepared.sectionName || sectionName;
       this.savePendingTaskDescriptions(active.path, tasks);
       this.savePendingTaskReferences(active.path, tasks);
       await this.saveSettings();
@@ -4176,7 +4140,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async ensureGeneratedTaskRequestCoverage(tasks, plan = {}, options = {}) {
-    const signals = plan.requestedActionSignals || taskRequestedActionSignals(options.sourceContext?.text || plan.sourceSummary || "", options.source || "note");
+    const signals = plan.requestedActionSignals || taskRequestedActionSignals(options.sourceContext?.text || plan.sourceSummary || "", options.source || "note", this.settings);
     const localCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
       labelInstructions: plan.labelInstructions || "",
       priorityInstructions: plan.priorityInstructions || "",
@@ -4189,6 +4153,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
     const hierarchyIssues = taskPlanRepairableHierarchyIssues(tasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
     if (coverage.passed && !hierarchyIssues.length) return { used: false, coverage, hierarchyIssues: [] };
+    if (coverage.missingMarkedActions?.length) {
+      const missingGroups = (signals.markedActionGroups || []).filter((group) => coverage.missingMarkedActions.includes(group.action));
+      const localTrees = deterministicMarkedActionTaskTrees(missingGroups, primarySource, this.settings);
+      const mainTaskLimit = generationMainTaskLimit(this.settings);
+      const supplementedTasks = supplementMarkedActionTaskTrees(tasks, localTrees, missingGroups, mainTaskLimit);
+      const supplementedCoverage = taskRequestCoverageReport(supplementedTasks, signals);
+      const supplementedHierarchyIssues = taskPlanRepairableHierarchyIssues(supplementedTasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
+      const supplementedMainTaskCount = supplementedTasks.filter((task) => !task?.isSubtask).length;
+      const localTreesGrounded = localTrees.length > 0 && localTrees.every((task) => generatedTaskMatchesPrimarySource(task, primarySource));
+      if (localTreesGrounded && supplementedCoverage.passed && !supplementedHierarchyIssues.length && supplementedMainTaskCount <= mainTaskLimit) {
+        tasks.splice(0, tasks.length, ...supplementedTasks);
+        this.logLocal("Applied deterministic marked-action repair", { source: options.source || "", tasks: flattenTaskPlan(tasks).length, recovered: localTrees.length });
+        return { used: false, applied: true, local: true, coverage: supplementedCoverage, hierarchyIssues: supplementedHierarchyIssues, attempts: 0 };
+      }
+    }
     const taskInstructions = this.taskInstructionsForSource(sourceType);
     const prompt = [
       taskRequestSignalInstructions(signals),
@@ -4238,7 +4217,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             currentHierarchyIssues.some((issue) => issue.code === "unsupported-task-label") ? "For unsupported-task-label issues, remove the label or apply it only to a task whose title and scope satisfy that label's explicit configured condition. Do not move labels between unrelated task topics." : "",
             attempt === maxAttempts ? "This is the final focused repair attempt. Resolve every listed issue in the supplied current tree without repeating a parent as its own subtask." : "",
             "Do not invent people, recipients, documents, dates, links, dependencies, ownership, or outcomes.",
-            "Return descriptions as empty strings because descriptions are generated after this repair.",
+            "Return section_name as an empty string and descriptions as an empty array because descriptions are generated after this repair.",
             taskGenerationRequirements(taskInstructions, this.settings)
           ].filter(Boolean).join(" "),
           user: [
@@ -4257,6 +4236,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           tasks.splice(0, tasks.length, ...grounded.tasks);
           this.logLocal("Requested task outcomes repaired", { source: options.source || "", tasks: flattenTaskPlan(tasks).length, attempts: attempt });
           return { used: true, applied: true, coverage: repairedCoverage, hierarchyIssues: repairedHierarchyIssues, attempts: attempt };
+        }
+        if (currentCoverage.missingMarkedActions?.length) {
+          const mainTaskLimit = generationMainTaskLimit(this.settings);
+          const supplementedTasks = supplementMarkedActionTaskTrees(repairSeedTasks, grounded.tasks, currentCoverage.missingMarkedActions, mainTaskLimit);
+          const supplementedCoverage = taskRequestCoverageReport(supplementedTasks, signals);
+          const supplementedHierarchyIssues = taskPlanRepairableHierarchyIssues(supplementedTasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
+          const supplementedMainTaskCount = supplementedTasks.filter((task) => !task?.isSubtask).length;
+          if (supplementedTasks.length && supplementedCoverage.passed && !supplementedHierarchyIssues.length && supplementedMainTaskCount <= mainTaskLimit) {
+            tasks.splice(0, tasks.length, ...supplementedTasks);
+            this.logLocal("Applied additive marked-action repair", { source: options.source || "", tasks: flattenTaskPlan(tasks).length, attempts: attempt });
+            return { used: true, applied: true, coverage: supplementedCoverage, hierarchyIssues: supplementedHierarchyIssues, attempts: attempt };
+          }
         }
         this.logLocal("Requested task outcome repair rejected", {
           source: options.source || "",
@@ -4281,20 +4272,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async prepareGeneratedTasksForTodoistWorkflow(tasks, plan = {}, options = {}) {
     const todoistBound = options.prepareTodoistSection === true;
-    const sectionName = options.sectionName || plan.sectionName || "";
+    const fallbackSectionName = options.sectionName || plan.sectionName || "";
     this.setSidebarStatus(options.status || (todoistBound ? "Preparing descriptions and Todoist section..." : "Writing task descriptions..."));
     const requestRepair = await this.ensureGeneratedTaskRequestCoverage(tasks, plan, options);
     plan.requestCoverageRepair = requestRepair;
-    const projectIdPromise = todoistBound ? this.getTaskProjectId() : Promise.resolve("");
-    const projectNamePromise = projectIdPromise.then((projectId) => projectId ? this.todoistProjectNameForId(projectId) : "");
-    const sectionIdPromise = todoistBound
-      ? projectIdPromise.then((projectId) => this.ensureTodoistSectionId(projectId, sectionName))
-      : Promise.resolve("");
+    const workflowContext = plan.taskWorkflowContextBundle || plan.contextBundle;
+    const sectionNamePromise = this.generateTaskSectionName(tasks, plan, {
+      source: options.source || "",
+      sectionName: fallbackSectionName,
+      sourceTitle: options.sourceTitle || "",
+      contextBundle: workflowContext
+    });
     const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], options.sourceTitle || "", plan.descriptionInstructions, {
       contextNotes: plan.contextNotes || [],
       basePath: vaultBasePath(this.app),
       citeContextNotes: options.citeContextNotes !== false,
-      requestedActionSignals: plan.requestedActionSignals || {}
+      requestedActionSignals: plan.requestedActionSignals || {},
+      contextBundle: workflowContext
     })
       .then(() => {
         this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
@@ -4308,13 +4302,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           options.citeContextNotes !== false
         );
       });
-    const [projectId, projectName, sectionId] = await Promise.all([projectIdPromise, projectNamePromise, sectionIdPromise, descriptionPromise]);
+    const [sectionName] = await Promise.all([sectionNamePromise, descriptionPromise]);
+    plan.sectionName = sectionName || cleanGeneratedSectionName(fallbackSectionName);
+    for (const task of tasks || []) task.section = plan.sectionName;
+    let projectId = "";
+    let projectName = "";
+    let sectionId = "";
+    if (todoistBound) {
+      projectId = await this.getTaskProjectId();
+      projectName = projectId ? await this.todoistProjectNameForId(projectId) : "";
+    }
     if (todoistBound) assignGeneratedTaskProject(tasks, projectId, projectName);
     enforceGeneratedTaskLimits(tasks, this.settings);
     const dedupeOptions = {
       source: options.source || "",
       path: options.path || "",
-      sectionName,
+      sectionName: plan.sectionName,
       contextNotes: options.contextNotes || plan.contextNotes || [],
       semanticContext: options.semanticContext || plan.semanticContext || [],
       includeLiveTodoistCandidates: todoistBound
@@ -4334,33 +4337,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         true
       );
     }
-    const deterministicFallbacks = enforceDeterministicDescriptionFallbacks(tasks, plan, options, this.settings);
-    if (deterministicFallbacks > 0) this.logLocal("Applied final deterministic task description fallback", { source: options.source || "", count: deterministicFallbacks });
-    let quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
-    let salvage = { localCorrections: [], repairedTitles: 0, repairedDescriptions: 0, retainedDescriptionTaskKeys: [], degradedDescriptionTaskKeys: [], removedTasks: [] };
-    if (quality.blockingIssues > 0) {
-      salvage = salvageGeneratedTaskBatch(tasks, plan, options, this.settings);
-      if (salvage.localCorrections.length || salvage.repairedTitles || salvage.repairedDescriptions || salvage.retainedDescriptionTaskKeys.length || salvage.degradedDescriptionTaskKeys.length || salvage.removedTasks.length) {
-        quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
-        quality.salvage = salvage;
-        this.logLocal("Salvaged valid tasks after local quality checks", {
-          source: options.source || "",
-          localCorrections: salvage.localCorrections.length,
-          repairedTitles: salvage.repairedTitles,
-          repairedDescriptions: salvage.repairedDescriptions,
-          retainedSafeDescriptions: salvage.retainedDescriptionTaskKeys.length,
-          retainedTasksWithSourceOnlyDescriptions: salvage.degradedDescriptionTaskKeys.length,
-          removedTasks: salvage.removedTasks.length,
-          remainingTasks: tasks.length
-        });
-        if (salvage.degradedDescriptionTaskKeys.length) {
-          new Notice(`${salvage.degradedDescriptionTaskKeys.length} task description${salvage.degradedDescriptionTaskKeys.length === 1 ? " was" : "s were"} reduced to verified source links; all grounded task titles will continue.`);
-        }
-        if (salvage.removedTasks.length && tasks.length) {
-          new Notice(`${salvage.removedTasks.length} unsafe generated item${salvage.removedTasks.length === 1 ? " was" : "s were"} omitted; ${tasks.length} validated task${tasks.length === 1 ? " will" : "s will"} continue.`);
-        }
-      }
-    }
+    const quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
     plan.localQualityReport = quality;
     if (!quality.passed) {
       this.logLocal("Task generation local quality check flagged output", {
@@ -4370,21 +4347,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         elapsedMs: quality.elapsedMs
       });
     }
-    const retainedDescriptionTaskKeys = new Set(salvage.retainedDescriptionTaskKeys || []);
-    const degradedDescriptionTaskKeys = new Set(salvage.degradedDescriptionTaskKeys || []);
-    const fatalIssues = quality.issues.filter((issue) => {
-      if (!issue.blocking) return false;
-      if (salvage.removedTasks.length && tasks.length && issue.code === "missing-requested-outcome") return false;
-      const taskKey = canonicalTaskMatchTitle(tasks[issue.taskIndex]?.content || "");
-      if (retainedDescriptionTaskKeys.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code)) return false;
-      if (degradedDescriptionTaskKeys.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code)) return false;
-      return true;
-    });
+    const fatalIssues = quality.issues.filter((issue) => issue.blocking);
     if (fatalIssues.length > 0) {
       const details = fatalIssues.map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
       throw new Error(`Generated tasks failed ${fatalIssues.length} blocking local quality check${fatalIssues.length === 1 ? "" : "s"}: ${details}.`);
     }
-    return { projectId, projectName, sectionId, quality, requestRepair };
+    if (todoistBound) sectionId = await this.ensureTodoistSectionId(projectId, plan.sectionName);
+    return { projectId, projectName, sectionId, sectionName: plan.sectionName, quality, requestRepair };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -5374,7 +5343,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Use the regular task-generation workflow to produce exactly one canonical task from two records already confirmed as duplicates.",
           "This is not a duplicate-detection decision. Preserve the most accurate title, actionable description, dates, priority, labels, and supported subtasks from the provided records and source context.",
           "Do not invent people, documents, dates, links, dependencies, or status details.",
-          "Return only JSON matching the standard task-generation schema with exactly one main task."
+          "Return only JSON matching the standard task-generation schema with exactly one main task; return section_name as an empty string and descriptions as an empty array."
         ].join(" "),
         user: [
           "Task generation instructions:",
@@ -7002,6 +6971,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   renderNotes(containerEl) {
     settingsHeading(containerEl, "Marker Tags", "Tags used in note task lines to mark main tasks and subtasks for Todoist sync.");
+    textSetting(containerEl, "Required-action hashtags", "Comma-separated hashtags that require at least one relevant generated task for each marked topic or item. Repeated references to the same action may become one task. Default: #todo.", this.plugin, "noteActionMarkerTags");
     textSetting(containerEl, "Main sync tag", "Semantic Todoist Sync main task marker. Default: #STsync.", this.plugin, "syncTag");
     textSetting(containerEl, "Subtask sync tag", "Indented subtask marker. Default: #STSubSync.", this.plugin, "subtaskSyncTag");
     toggleSetting(containerEl, "Do not sync marker tags as Todoist labels", "", this.plugin, "excludeSyncTagsFromLabels");
@@ -8013,6 +7983,7 @@ const SETTING_DESCRIPTIONS = {
   maxGeneratedSubtasksPerMainTask: "Hard cap on subtasks below each AI-created main task.",
   syncTag: "Marker tag used in notes for main tasks that sync with Todoist.",
   subtaskSyncTag: "Marker tag used in notes for subtasks that sync with Todoist.",
+  noteActionMarkerTags: "Comma-separated note hashtags that require at least one relevant generated task for each marked topic or item. Repeated references to the same action can be combined; distinct actions remain separate.",
   excludeSyncTagsFromLabels: "Prevents internal sync marker tags from becoming Todoist labels.",
   notesAutoSync: "When enabled, changed note task lines sync with Todoist while Obsidian is open.",
   syncIntervalSeconds: "How often automatic Notes-To-Todoist checks run while Obsidian is open.",
@@ -9400,7 +9371,7 @@ function taskSchema() {
   };
 }
 
-function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTasks, maxSubtasks = DEFAULT_SETTINGS.maxGeneratedSubtasksPerMainTask) {
+function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTasks, maxSubtasks = DEFAULT_SETTINGS.maxGeneratedSubtasksPerMainTask) {
   const mainLimit = generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks });
   const subtaskLimit = generationSubtaskLimit({ maxGeneratedSubtasksPerMainTask: maxSubtasks });
   const task = {
@@ -9419,7 +9390,6 @@ function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTask
     type: "object",
     additionalProperties: false,
     properties: {
-      section_name: { type: "string" },
       tasks: {
         type: "array",
         maxItems: mainLimit,
@@ -9429,10 +9399,28 @@ function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTask
           }),
           required: task.required.concat(["subtasks"])
         })
+      },
+      section_name: { type: "string", maxLength: 120 },
+      descriptions: {
+        type: "array",
+        maxItems: mainLimit,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            index: { type: "integer", minimum: 0 },
+            description: { type: "string", minLength: 80, maxLength: 1200 }
+          },
+          required: ["index", "description"]
+        }
       }
     },
-    required: ["section_name", "tasks"]
+    required: ["tasks", "section_name", "descriptions"]
   };
+}
+
+function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTasks, maxSubtasks = DEFAULT_SETTINGS.maxGeneratedSubtasksPerMainTask) {
+  return taskWorkflowResponseSchema(maxMainTasks, maxSubtasks);
 }
 
 function generationMainTaskLimit(settings = DEFAULT_SETTINGS) {
@@ -9452,7 +9440,7 @@ function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
 }
 
 const GENERATED_TASK_GROUNDING_STOP_WORDS = new Set([
-  "action", "actions", "ask", "complete", "confirm", "coordinate", "create", "decide", "draft", "dup", "email", "finalize", "follow", "prepare", "reply", "respond", "review", "send", "task", "tasks", "update", "verify", "work"
+  "action", "actions", "ask", "book", "complete", "confirm", "coordinate", "create", "decide", "develop", "draft", "dup", "email", "finalize", "follow", "have", "need", "prepare", "reply", "respond", "review", "send", "start", "task", "tasks", "update", "use", "verify", "want", "work"
 ]);
 
 function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT_SETTINGS) {
@@ -9503,26 +9491,8 @@ function enforceGeneratedTaskLimits(tasks, settings = DEFAULT_SETTINGS) {
   return tasks;
 }
 
-function taskDescriptionSchema() {
-  return {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      descriptions: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            index: { type: "integer", minimum: 0 },
-            description: { type: "string", minLength: 80, maxLength: 1200 }
-          },
-          required: ["index", "description"]
-        }
-      }
-    },
-    required: ["descriptions"]
-  };
+function taskDescriptionSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTasks, maxSubtasks = DEFAULT_SETTINGS.maxGeneratedSubtasksPerMainTask) {
+  return taskWorkflowResponseSchema(maxMainTasks, maxSubtasks);
 }
 
 function scheduleDurationSchema() {
@@ -11067,12 +11037,24 @@ function cleanTask(task, allowedLabels = null, settings = DEFAULT_SETTINGS) {
   return cleanTaskWithRole(task, allowedLabels, false, settings);
 }
 
+function normalizeGeneratedTaskTitlePrefix(value = "") {
+  let title = singleLine(value || "").replace(/^(?:have|need|want)\s+to\s+/i, "");
+  title = title.replace(/^start\s+(?:to\s+)?finali[sz]ing\b/i, "Finalize");
+  title = title.replace(/^finali[sz]ing\b/i, "Finalize");
+  title = title.replace(/^go\s+through\b/i, "Review");
+  title = title.replace(/^(?:use|send)\s+(?:start\s+)?(?:to\s+)?(finali[sz](?:e|ing)|develop|review|prepare|draft)\b/i, (_, action) => {
+    const normalized = /^final/i.test(action) ? "Finalize" : capitalizeSentenceStart(action.replace(/ing$/i, ""));
+    return normalized;
+  });
+  return title;
+}
+
 function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false, settings = DEFAULT_SETTINGS) {
   const labels = isSubtask && !settings.subtaskIncludeLabels
     ? []
     : (task.labels || []).map(cleanLabel).filter(Boolean).filter((label) => !allowedLabels || allowedLabels.has(label.toLowerCase()));
   return {
-    content: clamp(singleLine(task.content || ""), 250),
+    content: clamp(normalizeGeneratedTaskTitlePrefix(task.content || ""), 250),
     description: isSubtask ? "" : cleanGeneratedDescriptionSummary(task.description || ""),
     due_date: isSubtask && !settings.subtaskIncludeDueDate ? null : validDate(task.due_date) ? task.due_date : null,
     deadline_date: isSubtask && !settings.subtaskIncludeDeadline ? null : validDate(task.deadline_date) ? task.deadline_date : null,
@@ -13478,6 +13460,7 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "- Treat vault context as required supporting context when it is available, while using only relevant ranked excerpts and not unrelated note content.",
     "",
     "Main task requirements:",
+    `- Required-action markers: for notes, every topic or item marked with ${noteActionMarkerTags(settings).join(", ")} requires a matching task tree. These markers establish minimum coverage, not an exclusive task list; inspect the full note and semantic context for additional user-owned actions that are stated less explicitly. Repeated references to the same action may be combined; distinct immediate actions must remain separate.`,
     `- Actionability: ${taskInstructions.main || "Create only concrete user-owned actions."}`,
     "- Precision: each title must state the user's immediate action and its specific object, document, person, decision, or deliverable. Preserve named scope and requested outcome when the source supplies them.",
     "- Hierarchy: when one outcome requires several steps, use a concise parent title that names the overall deliverable or completion outcome. Put review criteria, checks, recipients, dependencies, and handoffs in subtasks instead of listing the full checklist in the parent title.",
@@ -13574,8 +13557,146 @@ function taskRequestFamilyPresent(text = "", family = "") {
 
 const TASK_REQUEST_OBJECT_TERMS = new Set(["application", "applications", "draft", "document", "email", "finding", "findings", "guide", "letter", "material", "materials", "memo", "message", "notification", "recommendation", "reply", "report", "response", "summary", "template", "worksheet", "wording"]);
 
-function taskRequestedActionSignals(sourceText = "", sourceType = "note") {
-  const signalText = sourceType === "email" ? emailCurrentSignalText(sourceText) : noteRequiredSignalText(sourceText);
+function noteActionMarkerTags(settings = DEFAULT_SETTINGS) {
+  const values = String(settings?.noteActionMarkerTags || DEFAULT_SETTINGS.noteActionMarkerTags || "#todo")
+    .split(/[\s,]+/)
+    .map((value) => value.trim().replace(/^#+/, ""))
+    .filter(Boolean)
+    .map((value) => `#${value}`);
+  return uniqueValues(values.length ? values : ["#todo"]);
+}
+
+function noteActionMarkerRegex(settings = DEFAULT_SETTINGS, global = false) {
+  const alternatives = noteActionMarkerTags(settings).map((tag) => escapeRegExp(tag)).join("|");
+  return new RegExp(`(?:${alternatives})(?![\\w/-])`, global ? "gi" : "i");
+}
+
+function normalizeMarkedActionText(value = "") {
+  let normalized = singleLine(value)
+    .replace(/^[-*]\s*/, "")
+    .replace(/^(?:please|could you|can you|would you|will you)\s+/i, "")
+    .replace(/^(?:the\s+)?(?:next step|action)\s+is\s+to\s+/i, "")
+    .replace(/^action\s*:\s*/i, "")
+    .replace(/^(?:have|need|want)\s+to\s+/i, "")
+    .replace(/^start\s+(?:to\s+)?/i, "")
+    .replace(/^go\s+through\b/i, "Review")
+    .replace(/^finalizing\b/i, "Finalize")
+    .trim();
+  const leadingCondition = normalized.match(/^(after|before|once|when|if|unless|pending|subject to|depending on)\s+(.+?),\s*(.+)$/i);
+  if (leadingCondition) {
+    normalized = `${leadingCondition[3].replace(/[.!?]+$/, "").trim()} ${leadingCondition[1]} ${leadingCondition[2].replace(/[.!?]+$/, "").trim()}`
+      .replace(/^(?:please|could you|can you|would you|will you)\s+/i, "")
+      .trim();
+  }
+  return normalized.replace(/[.!?]+$/, "").trim();
+}
+
+function normalizeMarkedActionTitle(value = "") {
+  const title = normalizeMarkedActionText(value);
+  if (!title || taskStructureActionClauses(title).length > 1) return "";
+  const normalized = capitalizeSentenceStart(title);
+  return mainTaskClarityReason({ content: normalized }) === "passed" ? normalized : "";
+}
+
+function deterministicMarkedActionTaskTrees(groups = [], sourceText = "", settings = DEFAULT_SETTINGS) {
+  const source = String(sourceText || "").trim();
+  if (!source) return [];
+  return (groups || []).map((group) => {
+    const content = normalizeMarkedActionTitle(group?.action || "");
+    if (!content) return null;
+    const task = { content, description: "", subtasks: [] };
+    return generatedTaskMatchesPrimarySource(task, source) ? task : null;
+  }).filter(Boolean);
+}
+
+function cleanMarkedActionSourceText(value = "") {
+  return singleLine(value).replace(/^[-*]\s*/, "").trim();
+}
+
+function explicitNoteActionMarkers(sourceText = "", settings = DEFAULT_SETTINGS) {
+  const lines = String(sourceText || "").split("\n");
+  const markers = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const matches = Array.from(lines[index].matchAll(noteActionMarkerRegex(settings, true)));
+    for (let markerIndex = 0; markerIndex < matches.length; markerIndex += 1) {
+      const match = matches[markerIndex];
+      const end = matches[markerIndex + 1]?.index ?? lines[index].length;
+      let action = cleanMarkedActionSourceText(lines[index].slice((match.index || 0) + match[0].length, end));
+      if (!action) {
+        for (let next = index + 1; next < lines.length; next += 1) {
+          const candidate = lines[next].trim();
+          if (!candidate) continue;
+          if (/^#+\s/.test(candidate) || noteActionMarkerRegex(settings).test(candidate)) break;
+          action = cleanMarkedActionSourceText(candidate);
+          break;
+        }
+      }
+      if (action) markers.push({ tag: match[0], action, line: index + 1 });
+    }
+  }
+  return markers;
+}
+
+const MARKED_ACTION_FAMILY_PATTERNS = [
+  ["scheduling", /^(?:book|schedule|arrange|set up|organize|organise)\b/i],
+  ["send", /^(?:send|share|submit|forward|circulate|email)\b/i],
+  ["review", /^(?:review|check|assess|evaluate|read|inspect|verify)\b/i],
+  ["finalization", /^(?:finali[sz]e|complete|finish)\b/i],
+  ["development", /^(?:develop|create|build|design)\b/i],
+  ["drafting", /^(?:draft|prepare|write|compose)\b/i],
+  ["revisions", /^(?:edit|revise|update|adjust|change)\b/i],
+  ["confirmation", /^(?:confirm|determine|validate)\b/i],
+  ["decision", /^(?:decide|choose|select)\b/i],
+  ["response", /^(?:respond|reply|follow[- ]?up)\b/i],
+  ["comparison", /^(?:compare|reconcile|cross[- ]?check|contrast)\b/i],
+  ["approval", /^(?:approve|sign[- ]?off)\b/i],
+  ["documentation", /^(?:document|record|summari[sz]e)\b/i]
+];
+
+const MARKED_ACTION_GENERIC_TOKENS = new Set([
+  "action", "after", "asap", "before", "chair", "complete", "concept", "coordinator", "director", "document", "draft", "file", "guideline", "manager", "material", "note", "process", "program", "project", "review", "task", "today", "update", "vacation", "wording"
+]);
+
+function markedActionFamily(value = "") {
+  const action = normalizeMarkedActionText(value);
+  return MARKED_ACTION_FAMILY_PATTERNS.find(([, pattern]) => pattern.test(action))?.[0] || "action";
+}
+
+function markedActionObjectTokens(value = "") {
+  const tokens = taskDedupeTokenSet(normalizeMarkedActionText(value));
+  for (const token of Array.from(tokens)) {
+    if (MARKED_ACTION_GENERIC_TOKENS.has(token) || MARKED_ACTION_FAMILY_PATTERNS.some(([, pattern]) => pattern.test(token))) tokens.delete(token);
+  }
+  return tokens;
+}
+
+function markedActionsLikelySame(left = {}, right = {}) {
+  if (left.family !== right.family) return false;
+  if (conflictingIntraBatchTaskScopes({ content: left.action }, { content: right.action })) return false;
+  const leftTokens = markedActionObjectTokens(left.action);
+  const rightTokens = markedActionObjectTokens(right.action);
+  const shared = tokenIntersection(leftTokens, rightTokens).length;
+  const denominator = Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+  const normalizedLeft = canonicalTaskMatchTitle(left.action);
+  const normalizedRight = canonicalTaskMatchTitle(right.action);
+  return normalizedLeft === normalizedRight || normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft) || (shared >= 2 && shared / denominator >= 0.7);
+}
+
+function groupMarkedActions(markers = []) {
+  const groups = [];
+  for (const marker of markers) {
+    const candidate = { action: marker.action, family: markedActionFamily(marker.action), references: [marker] };
+    const existing = groups.find((group) => markedActionsLikelySame(group, candidate));
+    if (existing) existing.references.push(marker);
+    else groups.push(candidate);
+  }
+  return groups;
+}
+
+function taskRequestedActionSignals(sourceText = "", sourceType = "note", settings = DEFAULT_SETTINGS) {
+  const markedActions = sourceType === "note" ? explicitNoteActionMarkers(sourceText, settings) : [];
+  const markedActionGroups = groupMarkedActions(markedActions);
+  const signalText = sourceType === "email" ? emailCurrentSignalText(sourceText) : noteRequiredSignalText(sourceText, settings);
   const lines = stripTaskAndMetadataLines(signalText).split(/\n+/).map((line) => line.trim()).filter(Boolean);
   const sentences = lines.flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "")));
   const directRequest = /\b(?:please|may i ask|could you|can you|would you|will you|seeking your|request(?:ed|ing)?|let me know|need(?:ed)? to|needs? your|should|must|required|at your earliest convenience|action item|follow[- ]?up)\b/i;
@@ -13603,10 +13724,10 @@ function taskRequestedActionSignals(sourceText = "", sourceType = "note") {
     return new RegExp(`(?:\\b(?:to|with|from|by)\\s+(?:the\\s+)?${escaped}\\b|\\b${escaped}[’']s\\b)`, "i").test(requestText);
   })).slice(0, 6);
   const conditional = Boolean(taskRequestConditionType(requestText) || /\bwhether\b/i.test(requestText));
-  const bindings = taskRequestActionBindings(positiveSentences);
+  const bindings = taskRequestActionBindings(positiveSentences, markedActions.length > 0);
   const constraints = taskRequestExplicitConstraints(requestText);
   const decisionDetails = families.includes("decision") ? taskRequestDecisionDetails(requestText) : { alternatives: [], criteria: [] };
-  return { sentences: requestedSentences.slice(0, 8), families, objects, entities, conditional, bindings, constraints, exclusions, decisionAlternatives: decisionDetails.alternatives, decisionCriteria: decisionDetails.criteria };
+  return { sentences: requestedSentences.slice(0, 8), families, objects, entities, conditional, bindings, constraints, exclusions, decisionAlternatives: decisionDetails.alternatives, decisionCriteria: decisionDetails.criteria, markedActions: markedActions.map((item) => item.action), markedActionRecords: markedActions, markedActionGroups, markerTags: noteActionMarkerTags(settings) };
 }
 
 function taskRequestDecisionDetails(value = "") {
@@ -13686,29 +13807,10 @@ function normalizeTaskRequestConstraint(value = "") {
   return singleLine(value).toLowerCase().replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
 }
 
-function noteRequiredSignalText(sourceText = "") {
+function noteRequiredSignalText(sourceText = "", settings = DEFAULT_SETTINGS) {
   const text = String(sourceText || "");
-  const lines = text.split("\n");
-  const marked = [];
-  let foundMarker = false;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!/#todo\b/i.test(lines[index])) continue;
-    foundMarker = true;
-    const cleaned = lines[index].replace(/#todo\b/gi, " ").replace(/^\s*[-*]\s+/, "").trim();
-    const words = cleaned.match(/[A-Za-z][A-Za-z'-]*/g) || [];
-    if (words.length >= 2) {
-      marked.push(cleaned);
-      continue;
-    }
-    for (let next = index + 1; next < lines.length; next += 1) {
-      const candidate = lines[next].trim();
-      if (!candidate) continue;
-      if (/^#+\s/.test(candidate)) break;
-      marked.push(candidate.replace(/^[-*]\s+/, ""));
-      break;
-    }
-  }
-  return foundMarker ? marked.join("\n") : text;
+  const marked = explicitNoteActionMarkers(text, settings);
+  return noteActionMarkerRegex(settings).test(text) ? marked.map((item) => item.action).join("\n") : text;
 }
 
 function emailCurrentSignalText(sourceText = "") {
@@ -13729,6 +13831,11 @@ function normalizeTaskRequestEntity(value = "") {
   return singleLine(value).replace(/[’']s\b$/i, "").trim();
 }
 
+function taskRequestEntityExplicitlyBound(clause = "", entity = "") {
+  const escaped = escapeRegExp(entity).replace(/\s+/g, "\\s+");
+  return new RegExp(`(?:\\b(?:to|with|from|by)\\s+(?:the\\s+)?${escaped}\\b|\\b${escaped}[’']s\\b)`, "i").test(clause);
+}
+
 function normalizeTaskRequestObject(value = "") {
   const term = normalizeContextAnchorTerm(value);
   if (["email", "message", "reply"].includes(term)) return "response";
@@ -13745,7 +13852,7 @@ const TASK_REQUEST_BOUND_ACTION_FAMILIES = ["review", "comparison", "drafting", 
 const TASK_REQUEST_CRITERION_BINDING_FAMILIES = new Set(["accuracy", "gaps", "feedback", "revisions", "highlighted"]);
 const TASK_REQUEST_ACTION_CLAUSE_SPLIT_RE = /\s*(?:[,;]|\b(?:and|by)\s+(?=(?:review|reviewing|assess|assessing|evaluate|evaluating|compare|comparing|reconcile|reconciling|cross[- ]check|cross[- ]checking|contrast|contrasting|draft|drafting|prepare|preparing|write|writing|compose|composing|edit|editing|revise|revising|update|updating|incorporate|incorporating|apply|applying|integrate|integrating|finali[sz]e|finali[sz]ing|complete|completing|document|documenting|record|recording|summari[sz]e|summari[sz]ing|recommend|recommending|propose|proposing|provide\s+(?:a\s+)?(?:written\s+)?recommendation|approve|approving|confirm|confirming|determine|determining|send|sending|share|sharing|submit|submitting|forward|forwarding|circulate|circulating|decide|deciding)\b)|\bthen\s+(?=(?:review|compare|reconcile|draft|prepare|write|compose|edit|revise|update|incorporate|apply|integrate|finali[sz]e|complete|document|record|summari[sz]e|recommend|propose|provide\s+(?:a\s+)?(?:written\s+)?recommendation|approve|confirm|determine|send|share|submit|forward|circulate|decide)\b))\s*/i;
 
-function taskRequestActionBindings(sentences = []) {
+function taskRequestActionBindings(sentences = [], filterUnboundEntities = false) {
   const bindings = [];
   const seen = new Set();
   for (const sentence of sentences || []) {
@@ -13763,7 +13870,7 @@ function taskRequestActionBindings(sentences = []) {
       if (boundFamilies.includes("drafting") && /(?:^|[,;:]\s*|\b(?:and|then|by|please|to)\s+)draft(?:ing)?\b/i.test(clause)) objects = objects.filter((term) => term !== "draft");
       if (!objects.length && previousObjects.length) objects = previousObjects.slice();
       if (objects.length) previousObjects = objects.slice();
-      const entities = uniqueValues(descriptionSpecificEntities(clause).map(normalizeTaskRequestEntity).filter((entity) => entity && !/^(Please|May|Could|Would|Seeking|Let|Your|Subject|Concrete|Steps|Email|Thread)$/i.test(entity)));
+      const entities = uniqueValues(descriptionSpecificEntities(clause).map(normalizeTaskRequestEntity).filter((entity) => entity && !/^(Please|May|Could|Would|Seeking|Let|Your|Subject|Concrete|Steps|Email|Thread)$/i.test(entity) && (!filterUnboundEntities || taskRequestEntityExplicitlyBound(clause, entity))));
       const conditionType = taskRequestConditionType(clause);
       const conditional = Boolean(conditionType);
       for (const family of boundFamilies) {
@@ -13819,6 +13926,8 @@ function taskRequestBindingFamilyPresent(clause = "", family = "") {
 
 function taskRequestSignalInstructions(signals = {}) {
   const parts = [];
+  const markedGroups = signals.markedActionGroups || [];
+  const markerLabel = (signals.markerTags || ["#todo"]).join("/");
   if (signals.families?.length) parts.push(`requested outcomes: ${signals.families.join(", ")}`);
   if (signals.objects?.length) parts.push(`named work objects: ${signals.objects.join(", ")}`);
   if (signals.entities?.length) parts.push(`named recipients or stakeholders: ${signals.entities.join(", ")}`);
@@ -13828,8 +13937,11 @@ function taskRequestSignalInstructions(signals = {}) {
   if (signals.decisionCriteria?.length) parts.push(`required decision criteria: ${signals.decisionCriteria.join(", ")}`);
   if (signals.exclusions?.length) parts.push(`explicit exclusions that must not become positive work: ${signals.exclusions.map((item) => item.phrase).join("; ")}`);
   if (signals.conditional) parts.push("preserve the source's conditional requirement");
-  return parts.length
-    ? `Explicit request coverage checklist:\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ")}.\n- Represent every action-to-object binding in one task or subtask line that contains both the requested action and its matching object; include its named recipient and condition on that same line when supplied.\n- Before returning JSON, verify that every listed binding appears exactly once, every labeled task satisfies that label's configured scope, and no subtask repeats its parent.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
+  const markedInstructions = markedGroups.length
+    ? `\n${signals.markedActions?.length || markedGroups.length} explicit ${markerLabel} actions grouped into ${markedGroups.length} required marked action groups:\n${markedGroups.map((group, index) => `${index + 1}. ${group.action}${group.references?.length > 1 ? ` (combines ${group.references.length} references to this same action)` : ""}`).join("\n")}\n- Create one independently identifiable main task or task tree for every numbered group. A task tree may use subtasks for required steps in that same marked action.\n- Repeated same-action references may be combined, but different immediate actions must remain separate even when they mention the same topic or person.\n- Verify coverage against task and subtask titles; descriptions do not count as substitutes for a missing task.`
+    : "";
+  return parts.length || markedGroups.length
+    ? `Explicit request coverage checklist:${markedInstructions}\n- Preserve all of these source-supported signals across the main task and its subtasks: ${parts.join("; ") || "the numbered marked actions"}.\n- Represent every action-to-object binding in one task or subtask line that contains both the requested action and its matching object; include its named recipient and condition on that same line when supplied.\n- Before returning JSON, verify that every listed binding appears exactly once, every labeled task satisfies that label's configured scope, and no subtask repeats its parent.\n- Do not treat work already completed or explicitly owned by someone else as a new user action.`
     : "Explicit request coverage:\n- No additional direct-request criteria were extracted locally; follow the source-specific actionability rules without inventing work.";
 }
 
@@ -13848,6 +13960,43 @@ function taskDescriptionRequestCoverage(task = {}, signals = {}) {
   if (decisionTask && signals.decisionAlternatives?.length) parts.push(`alternatives: ${signals.decisionAlternatives.join(" vs ")}`);
   if (decisionTask && signals.decisionCriteria?.length) parts.push(`criteria: ${signals.decisionCriteria.join(", ")}`);
   return parts.join("; ");
+}
+
+function taskDescriptionRequestCoverageReason(value = "", task = {}, signals = {}) {
+  const description = singleLine(value || "").toLowerCase();
+  const taskText = singleLine([task.content, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ")).toLowerCase();
+  const descriptionCounts = termCounts(description);
+  const taskCounts = termCounts(taskText);
+  const detailPresent = (detail) => {
+    const terms = generatedTaskObjectTerms(detail).filter((term) => !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term));
+    return terms.length > 0 && terms.every((term) => contextAnchorVariants(term).some((variant) => descriptionCounts[variant]));
+  };
+  const relevantBindings = (signals.bindings || []).filter((binding) => (
+    taskRequestFamilyPresent(taskText, binding.family)
+    || (binding.objects || []).some((object) => taskRequestObjectPresent(taskText, taskCounts, object))
+    || (binding.entities || []).some((entity) => taskText.includes(singleLine(entity).toLowerCase()))
+  ));
+  for (const binding of relevantBindings) {
+    for (const entity of binding.entities || []) {
+      if (!description.includes(singleLine(entity).toLowerCase())) return `missing recipient or stakeholder: ${entity}`;
+    }
+    const object = (binding.objects || []).find((candidate) => taskRequestObjectPresent(taskText, taskCounts, candidate));
+    if (object && !taskRequestObjectPresent(description, descriptionCounts, object)) return `missing requested object: ${object}`;
+    if ((binding.conditional || binding.conditionType) && !taskRequestConditionType(description) && !/\b(?:if|unless|once|after|before|when|subject to|depending on|pending)\b/i.test(description)) {
+      return `missing condition: ${binding.conditionType || "conditional requirement"}`;
+    }
+  }
+  if (taskRequestFamilyPresent(taskText, "decision")) {
+    const alternative = (signals.decisionAlternatives || []).find((detail) => !detailPresent(detail));
+    if (alternative) return `missing decision alternative: ${alternative}`;
+    const criterion = (signals.decisionCriteria || []).find((detail) => !detailPresent(detail));
+    if (criterion) return `missing decision criterion: ${criterion}`;
+  }
+  const urgency = (signals.constraints || []).find((constraint) => /\b(?:urgent|asap|immediate|priority|critical|deadline|due|by\s+\w+|earliest|before|no later)\b/i.test(constraint) && taskText.includes(singleLine(constraint).toLowerCase().split(/\s+/)[0]));
+  if (urgency && !new RegExp(escapeRegExp(singleLine(urgency).split(/\s+/)[0]), "i").test(description) && !/\b(?:urgent|asap|immediate|critical|deadline|due|before|by|earliest)\b/i.test(description)) {
+    return `missing urgency or timing constraint: ${urgency}`;
+  }
+  return "";
 }
 
 function taskRequestCoverageReport(tasks = [], signals = {}) {
@@ -13883,7 +14032,72 @@ function taskRequestCoverageReport(tasks = [], signals = {}) {
     if (binding.conditionType && taskRequestConditionType(line.actionText) !== binding.conditionType) return false;
     return true;
   }));
-  return { passed: !missingFamilies.length && !missingObjects.length && !missingEntities.length && !missingConditional && !missingBindings.length && !missingConstraints.length && !missingDecisionAlternatives.length && !missingDecisionCriteria.length && !violatedExclusions.length, missingFamilies, missingObjects, missingEntities, missingConditional, missingBindings, missingConstraints, missingDecisionAlternatives, missingDecisionCriteria, violatedExclusions };
+  const missingMarkedActions = taskRequestMissingMarkedActions(tasks, signals.markedActionGroups || []);
+  return { passed: !missingFamilies.length && !missingObjects.length && !missingEntities.length && !missingConditional && !missingBindings.length && !missingConstraints.length && !missingDecisionAlternatives.length && !missingDecisionCriteria.length && !violatedExclusions.length && !missingMarkedActions.length, missingFamilies, missingObjects, missingEntities, missingConditional, missingBindings, missingConstraints, missingDecisionAlternatives, missingDecisionCriteria, violatedExclusions, missingMarkedActions };
+}
+
+function markedActionTaskTreeScore(group = {}, task = {}) {
+  const lines = flattenTaskPlan([task]).map((item) => singleLine(item.content || "")).filter(Boolean);
+  if (!lines.length || !lines.some((line) => markedActionFamily(line) === group.family)) return 0;
+  const requestedTokens = markedActionObjectTokens(group.action);
+  const treeTokens = taskDedupeTokenSet(lines.join(" "));
+  const shared = tokenIntersection(requestedTokens, treeTokens).length;
+  if (!shared) return 0;
+  const overlap = shared / Math.max(1, Math.min(requestedTokens.size, treeTokens.size));
+  const scopeConflict = lines.every((line) => conflictingIntraBatchTaskScopes({ content: group.action }, { content: line }));
+  if (scopeConflict) return 0;
+  if (requestedTokens.size > 2 && shared < 2 && overlap < 0.7) return 0;
+  return shared * 10 + overlap;
+}
+
+function taskRequestMissingMarkedActions(tasks = [], groups = []) {
+  if (!groups.length) return [];
+  const candidates = [];
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+      const score = markedActionTaskTreeScore(groups[groupIndex], tasks[taskIndex]);
+      if (score > 0) candidates.push({ groupIndex, taskIndex, score });
+    }
+  }
+  candidates.sort((left, right) => right.score - left.score);
+  const coveredGroups = new Set();
+  const usedTasks = new Set();
+  for (const candidate of candidates) {
+    if (coveredGroups.has(candidate.groupIndex) || usedTasks.has(candidate.taskIndex)) continue;
+    coveredGroups.add(candidate.groupIndex);
+    usedTasks.add(candidate.taskIndex);
+  }
+  return groups.filter((_, index) => !coveredGroups.has(index)).map((group) => group.action);
+}
+
+function supplementMarkedActionTaskTrees(originalTasks = [], repairedTasks = [], missingMarkedActions = [], mainTaskLimit = 0) {
+  const supplemented = (originalTasks || []).slice();
+  const groups = (missingMarkedActions || []).map((missing) => {
+    if (typeof missing === "string") return { action: missing, family: markedActionFamily(missing) };
+    return { ...missing, family: missing.family || markedActionFamily(missing.action || "") };
+  }).filter((group) => group.action && group.family);
+  const limit = Number(mainTaskLimit);
+  if (!Number.isFinite(limit) || limit <= 0) return supplemented;
+  const coveredGroups = new Set();
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    if (supplemented.some((task) => markedActionTaskTreeScore(groups[groupIndex], task) > 0)) coveredGroups.add(groupIndex);
+  }
+  const appendedTrees = new Set();
+  const mainTaskCount = () => supplemented.filter((task) => !task?.isSubtask).length;
+  for (const repairedTask of repairedTasks || []) {
+    if (mainTaskCount() >= limit) break;
+    if (!repairedTask || repairedTask.isSubtask) continue;
+    const key = JSON.stringify(repairedTask);
+    if (appendedTrees.has(key)) continue;
+    const matchingGroups = groups.filter((group, groupIndex) => !coveredGroups.has(groupIndex) && markedActionTaskTreeScore(group, repairedTask) > 0);
+    if (!matchingGroups.length) continue;
+    supplemented.push(repairedTask);
+    appendedTrees.add(key);
+    groups.forEach((group, groupIndex) => {
+      if (matchingGroups.includes(group)) coveredGroups.add(groupIndex);
+    });
+  }
+  return supplemented;
 }
 
 function taskRequestExclusionViolations(tasks = [], exclusions = []) {
@@ -13966,25 +14180,62 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes, query = "", setti
   return notes;
 }
 
+function taskMarkedActionSourceWindow(sourceText = "", markedGroup = null, query = "", settings = DEFAULT_SETTINGS, maxChars = 900) {
+  if (!markedGroup?.references?.length) return "";
+  const lines = String(sourceText || "").split("\n");
+  const allMarkers = explicitNoteActionMarkers(sourceText, settings);
+  const startLine = Math.max(1, Math.min(...markedGroup.references.map((reference) => Number(reference.line) || 1)));
+  const nextMarkerLine = allMarkers.map((marker) => Number(marker.line) || 0).filter((line) => line > startLine).sort((left, right) => left - right)[0] || lines.length + 1;
+  const anchors = generatedTaskObjectTerms(query);
+  const selected = [];
+  let previous = markedGroup.action || "";
+  for (let lineNumber = startLine; lineNumber < nextMarkerLine && lineNumber <= lines.length; lineNumber += 1) {
+    const raw = lines[lineNumber - 1] || "";
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      if (selected.length) selected.push("");
+      continue;
+    }
+    if (lineNumber > startLine && /^#{1,6}\s/.test(trimmed)) break;
+    const anchorHits = taskEvidenceAnchorHitCount(trimmed, anchors);
+    const referential = /^(?:[-*]\s*)?(?:it|this|that|these|those|they|he|she|the same|also|then|because|before|after|once|until|if|when)\b/i.test(trimmed);
+    const cohesive = lineNumber === startLine || anchorHits > 0 || referential || taskEvidenceNeighborIsCohesive(trimmed, previous);
+    if (!cohesive) break;
+    selected.push(trimmed);
+    previous = trimmed;
+  }
+  return truncateAtWord(selected.join(" ").replace(/\s{2,}/g, " "), maxChars);
+}
+
 function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", context = [], sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
-  const queries = (tasks || []).map((task) => [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" "));
+  const markedGroups = groupMarkedActions(explicitNoteActionMarkers(sourceSummary, settings));
+  const matchingMarkedGroups = (tasks || []).map((task) => markedGroups
+    .map((group) => ({ group, score: markedActionTaskTreeScore(group, task) }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score)[0]?.group || null);
+  const queries = (tasks || []).map((task, index) => [task.content, matchingMarkedGroups[index]?.action, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" "));
   return (tasks || []).map((task, index) => {
     const query = queries[index];
+    const markedGroup = matchingMarkedGroups[index];
+    const markedEvidence = markedGroup ? uniqueValues((markedGroup.references || []).map((item) => item.action)).join(" ") : "";
     const exclusiveAnchors = taskExclusiveEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
     const competingAnchors = taskCompetingEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
-    const sourceEvidence = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors });
+    const markedWindow = taskMarkedActionSourceWindow(sourceSummary, markedGroup, query, settings, 900);
+    const sourceExcerpt = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors });
+    const sourceEvidence = uniqueValues([markedEvidence, markedWindow, sourceExcerpt].filter(Boolean)).join("\n");
     const sourceEvidenceTokens = taskDedupeTokenSet(canonicalTaskMatchTitle(sourceEvidence));
     const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3, {
       requiredAnchors: exclusiveAnchors,
       excludedNeighborAnchors: competingAnchors
-    });
+    }).filter((chunk) => taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`, generatedTaskObjectTerms(query)) > 0);
     const contextEvidenceEntries = contextChunks.map((chunk) => {
       const source = sourceReference(chunk, citationState.basePath || "");
       const citationNumber = source ? citationState.citationMap?.get(source) : null;
       const anchorTerms = generatedTaskObjectTerms(query);
       const anchorHits = taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`, anchorTerms);
       const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchorTerms);
-      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors }) || (semanticEligible ? truncateAtWord(stripTaskAndMetadataLines(chunk.text || ""), 520) : "");
+      if (!semanticEligible || anchorHits < 1) return null;
+      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors }) || truncateAtWord(stripTaskAndMetadataLines(chunk.text || ""), 520);
       if (!excerpt) return null;
       const contextTokens = taskDedupeTokenSet(canonicalTaskMatchTitle(excerpt));
       if (sourceEvidenceTokens.size && contextTokens.size && tokenDiceScore(sourceEvidenceTokens, contextTokens) >= 0.9) return null;
@@ -13999,13 +14250,13 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
       };
     }).filter(Boolean);
     const contextEvidence = contextEvidenceEntries.map((entry) => entry.prompt);
-    const sourceContextGap = sourceDescriptionContextGap(sourceEvidence);
-    const needsSupportingContext = Boolean(contextEvidence.length && (sourceContextGap || sourceEvidence.length < 320));
+    const hasRelevantSupportingContext = Boolean(contextEvidence.length);
     const prompt = [
       `Task ${index}: ${task.content || "Untitled task"}`,
+      markedEvidence ? `Exact marked action for scope (do not quote or refer to this label): ${markedEvidence}` : "",
       "Primary source evidence:",
       sourceEvidence || "No task-specific primary-source excerpt was found.",
-      needsSupportingContext ? "Context guidance: The primary source is sparse or signals missing context. Use only the matching supporting-note facts below to fill those gaps." : "",
+      hasRelevantSupportingContext ? "Context guidance: Use the matching supporting-note facts below when they materially add current task-specific intent, state, artifact, audience/reviewer needs, criteria, constraints, dependencies, timing, or links. The primary source remains authoritative for current direction; exclude stale, unrelated, or neighboring-task details." : "",
       contextEvidence.length ? "Supporting context evidence:" : "",
       contextEvidence.join("\n")
     ].filter(Boolean).join("\n");
@@ -14015,7 +14266,8 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
       corpus: [sourceEvidence, ...contextEvidenceEntries.map((entry) => entry.evidence)].filter(Boolean).join("\n\n"),
       contextChunks,
       contextEvidenceEntries,
-      needsSupportingContext
+      hasRelevantSupportingContext,
+      requiredMarkedAction: markedEvidence
     };
   });
 }
@@ -14041,8 +14293,9 @@ function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_S
   const anchors = generatedTaskObjectTerms(query);
   if (!anchors.length) return summarizeSourceForTaskContext(cleaned, query, maxChars, settings, { strictQuery: true });
   const sentences = cleaned
-    .split(/\n+/)
-    .flatMap((line, paragraphIndex) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()).map((sentence) => ({ text: singleLine(sentence), paragraphIndex })))
+    .split(/\n{2,}/)
+    .flatMap((paragraph, paragraphIndex) => paragraph.split(/\n+/)
+      .flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()).map((sentence) => ({ text: singleLine(sentence), paragraphIndex }))))
     .filter((item) => item.text.length >= 18);
   const minimumHits = taskEvidenceMinimumAnchorHits(anchors);
   const requiredAnchors = options.requiredAnchors || [];
@@ -14072,8 +14325,10 @@ function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_S
 }
 
 function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
-  const anchorTerms = new Set(generatedTaskObjectTerms(anchor));
-  if (generatedTaskObjectTerms(candidate).some((term) => anchorTerms.has(term))) return true;
+  const anchorTerms = new Set(generatedTaskObjectTerms(anchor).filter((term) => !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term)));
+  const stakeholderTerms = taskDescriptionStakeholderTerms(anchor);
+  if (generatedTaskObjectTerms(candidate).some((term) => anchorTerms.has(term) && !stakeholderTerms.has(term))) return true;
+  if (/^(?:owner|recipient|to|from|deadline|due|timing|depends?|dependency|constraint|criteria|decision|deliverable|handoff|document|link|status)\s*[:=-]/i.test(singleLine(candidate))) return true;
   const referentialStart = /^(?:it|this|that|these|those|they|he|she)\b/i.test(singleLine(candidate));
   const dependencyContinuation = /\b(?:must|should|cannot|can't|depends?|dependency|requires?|required|needed|approv(?:e|al|ed)|before|after|once|until)\b/i.test(candidate);
   const namedDependencyOwner = /^(?!Before\b|After\b|Once\b|When\b|This\b|That\b)[A-Z][A-Za-z'-]{2,}\b/.test(singleLine(candidate));
@@ -14082,7 +14337,9 @@ function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
 
 function taskEvidenceAnchorHitCount(text = "", anchors = []) {
   const counts = termCounts(text);
-  return (anchors || []).filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
+  const specificAnchors = (anchors || []).filter((term) => !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term));
+  const effectiveAnchors = specificAnchors.length ? specificAnchors : anchors || [];
+  return effectiveAnchors.filter((term) => contextAnchorVariants(term).some((variant) => counts[variant])).length;
 }
 
 function taskEvidenceMinimumAnchorHits(anchors = []) {
@@ -14096,6 +14353,7 @@ function taskSemanticEvidenceEligible(chunk = {}, anchorHits = 0, anchors = []) 
   const matchScore = Number(chunk.matchScore || 0);
   const scopeCoverage = Number(chunk.retrievalScopeCoverage || 0);
   if (chunk.retrievalScopeMatch === true && scopeCoverage >= 0.5 && semanticScore >= 0.4 && matchScore >= 0.4) return true;
+  if (anchorHits >= taskEvidenceMinimumAnchorHits(anchors) && (semanticScore >= 0.45 || matchScore >= 0.65 || (semanticScore === 0 && matchScore === 0 && (anchors || []).length >= 2))) return true;
   return Boolean(anchorHits >= 1 && semanticScore >= 0.62 && matchScore >= 0.5 && (anchors || []).length >= 2);
 }
 
@@ -14166,11 +14424,15 @@ function taskDescriptionKnowledgeCoverageReason(value = "", task = {}, evidence 
 }
 
 function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  const styleReason = taskDescriptionStyleReason(value);
+  if (styleReason) return styleReason;
   if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
   const corpus = String(evidence?.corpus || "");
   if (!corpus.trim()) return "missing task-specific evidence";
   const unsupportedFact = taskDescriptionUnsupportedFactReason(value, evidence, settings);
   if (unsupportedFact) return unsupportedFact;
+  const scopeReason = taskDescriptionTaskScopeReason(value, task);
+  if (scopeReason) return scopeReason;
   const descriptionTerms = generatedTaskObjectTerms(value);
   const corpusCounts = termCounts(corpus);
   const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
@@ -14180,12 +14442,38 @@ function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, s
   return "passed";
 }
 
+function taskDescriptionTaskScopeReason(value = "", task = {}) {
+  const sentences = splitDescriptionSentences(String(value || ""))
+    .map(singleLine)
+    .filter((sentence) => sentence && !/^Use\s+\[[^\]]+\]\([^)]*\)\s+as the working document\.?$/i.test(sentence));
+  if (!sentences.length) return "description has no task-focused narrative";
+  const anchors = taskDescriptionScopeAnchors(task);
+  if (!anchors.length) return "";
+  const focused = sentences.filter((sentence) => taskEvidenceAnchorHitCount(sentence, anchors) > 0).length;
+  const required = Math.max(1, Math.ceil(sentences.length * 0.75));
+  return focused >= required ? "" : `description mixes unrelated context (${focused}/${required} task-focused sentences)`;
+}
+
+function taskDescriptionStakeholderTerms(value = "") {
+  const names = [];
+  for (const match of String(value || "").matchAll(/\b(?:with|to|from|by)\s+(?:the\s+)?([A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2})/g)) names.push(match[1]);
+  for (const match of String(value || "").matchAll(/\b([A-Z][A-Za-z'-]+)[’']s\b/g)) names.push(match[1]);
+  return new Set(names.flatMap((name) => Array.from(taskDedupeTokenSet(name))));
+}
+
+function taskDescriptionScopeAnchors(task = {}) {
+  const stakeholderTerms = taskDescriptionStakeholderTerms(task.content || "");
+  return generatedTaskObjectTerms(task.content || "").filter((term) => !stakeholderTerms.has(term) && !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term));
+}
+
 function taskDescriptionEvidenceDetailReason(value = "", task = {}, evidence = null) {
   const corpus = String(evidence?.corpus || "");
   if (corpus.length < 120) return "";
   const titleCounts = termCounts(task.content || "");
   const descriptionCounts = termCounts(value);
-  const detailTerms = generatedTaskObjectTerms(corpus).filter((term) => (
+  const scopeAnchors = taskDescriptionScopeAnchors(task);
+  const focusedCorpus = splitDescriptionSentences(corpus).filter((sentence) => !scopeAnchors.length || taskEvidenceAnchorHitCount(sentence, scopeAnchors) > 0).join(" ") || corpus;
+  const detailTerms = generatedTaskObjectTerms(focusedCorpus).filter((term) => (
     !titleCounts[term] &&
     !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term) &&
     !/^\d+$/.test(term)
@@ -14206,13 +14494,22 @@ function taskDescriptionUnsupportedFactReason(value = "", evidence = null, setti
   const unsupportedState = unsupportedDescriptionWorkflowState(value, corpus);
   if (unsupportedState) return unsupportedState;
   const entityText = String(value || "").replace(/\[[^\]\n]+\]\([^)\n]+\)/g, "");
-  const people = uniqueValues([...extractPeopleCandidates(entityText, 12), ...descriptionSpecificEntities(entityText)]);
+  const people = uniqueValues([...extractPeopleCandidates(entityText, 12), ...descriptionSpecificEntities(entityText)].map(normalizeDescriptionEntityCandidate).filter(Boolean));
   const unsupportedPerson = people.find((person) => !descriptionEntitySupportedByCorpus(person, corpusLower));
   if (unsupportedPerson) return `unsupported person or entity: ${unsupportedPerson}`;
   const links = extractDescriptionLinkRecords(value, settings);
   const unsupportedLink = links.find((link) => !corpus.includes(link.url));
   if (unsupportedLink) return "unsupported link";
   return "";
+}
+
+function normalizeDescriptionEntityCandidate(value = "") {
+  const cleaned = singleLine(value)
+    .replace(/^(?:Apply|Approve|Check|Circulate|Confirm|Coordinate|Develop|Draft|Edit|Finalize|Follow|Forward|Prepare|Provide|Review|Send|Share|Submit|Update|Use|Validate|Verify)\s+/i, "")
+    .replace(/[-\s](?:based|derived|related)$/i, "")
+    .trim();
+  if (/^(?:Apply|Approve|Check|Circulate|Confirm|Coordinate|Develop|Draft|Edit|Finalize|Follow|Forward|Prepare|Provide|Review|Send|Share|Submit|Update|Use|Validate|Verify)$/i.test(cleaned)) return "";
+  return cleaned;
 }
 
 const DESCRIPTION_WORKFLOW_STATE_RE = /\b(?:(?:already|currently|still|previously|earlier)\s+(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:is|are|was|were|has been|have been|had been)\s+(?:already\s+|currently\s+|still\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|blocked|waiting|pending|overdue|rejected|accepted|resolved|closed|assigned|reviewing|drafting|preparing|working)|(?:has|have|had)\s+(?:already\s+|previously\s+)?(approved|confirmed|sent|submitted|completed|finali[sz]ed|rejected|accepted|resolved|closed|assigned)|(?:is|are|was|were)\s+being\s+(reviewed|drafted|prepared|finali[sz]ed))\b/i;
@@ -14241,9 +14538,9 @@ function descriptionEntitySupportedByCorpus(entity = "", corpusLower = "") {
   const variants = uniqueValues([
     normalized,
     normalized.replace(/[’']s\b/g, ""),
-    normalized.replace(/[-\s]related\b/g, ""),
+    normalized.replace(/[-\s](?:based|derived|related)\b/g, ""),
     normalized.replace(/s\b/g, ""),
-    normalized.replace(/[-\s]related\b/g, "").replace(/[’']s\b/g, "").replace(/s\b/g, "")
+    normalized.replace(/[-\s](?:based|derived|related)\b/g, "").replace(/[’']s\b/g, "").replace(/s\b/g, "")
   ].map((value) => value.trim()).filter(Boolean));
   return variants.some((variant) => corpusLower.includes(variant));
 }
@@ -14261,8 +14558,44 @@ function taskDescriptionPromptBoilerplateReason(value = "") {
   return patterns.find(([pattern]) => pattern.test(text))?.[1] || "";
 }
 
+function taskDescriptionStyleReason(value = "") {
+  const text = singleLine(value || "");
+  const crossTaskPatterns = [
+    [/\bseparate(?:ly)?\s+from\s+(?:the\s+)?(?:other|today'?s|next|previous|prior|preceding|following)\s+task\b/i, "references a separate or ordered task"],
+    [/\b(?:another|the\s+other|a\s+different|separate)\s+task\b/i, "references another task"],
+    [/\b(?:today'?s|next|previous|prior|preceding|following|above|below)\s+task\b/i, "references task order"],
+    [/\bthe\s+task\s+(?:above|below|before|after|earlier|later)\b/i, "references task position"],
+    [/\btask\s*(?:#|number\s*)?\d+\b/i, "compares an explicit task number"],
+    [/\b(?:first|second|third|next|previous|prior|following)\s+task\b/i, "references task order"]
+  ];
+  const crossTaskReason = crossTaskPatterns.find(([pattern]) => pattern.test(text))?.[1];
+  if (crossTaskReason) return `cross-task or workflow reference: ${crossTaskReason}`;
+  const sentences = String(value || "").split(/(?<=[.!?])\s+|\n+/).map(singleLine).filter(Boolean);
+  const mechanicsPatterns = [
+    [/^(?:the\s+)?(?:delivery|handoff)\s+(?:depends\s+on|follows)\s+(?:(?:the\s+)?(?:completion|finalization)(?:\s+of)?|completing|finalizing)\s+(?:the\s+)?(?:document|note|draft|artifact|concept\s+note|it|this)\s*[.!?]?$/i, "narrates obvious completion-before-handoff mechanics"],
+    [/^keep\s+(?:the\s+)?handoff\b[^.!?]{0,100}\btied\s+to\s+(?:the\s+)?(?:complete|completed|finali[sz]ed|ready)\s+(?:document|note|draft|artifact|concept\s+note)\s*[.!?]?$/i, "narrates obvious completion-before-handoff mechanics"],
+    [/^(?:send|deliver|hand\s+off)\s+(?:it|this|the\s+(?:document|note|draft|artifact|concept\s+note))\s+(?:once|after|when)\s+(?:it|this)\s+(?:is|has\s+been)\s+(?:complete|completed|finali[sz]ed|ready)\s*[.!?]?$/i, "narrates obvious completion-before-handoff mechanics"]
+  ];
+  const mechanicsReason = sentences.map((sentence) => mechanicsPatterns.find(([pattern]) => pattern.test(sentence))?.[1]).find(Boolean);
+  if (mechanicsReason) return `meta completion/result framing: ${mechanicsReason}`;
+  const metaPatterns = [
+    [/^(?:the\s+)?completion\s+(?:is|means|requires?|will\s+be|should\s+be)\b/i, "completion is framed as metadata"],
+    [/^(?:complete|completed)\s+when\b/i, "completion is framed as a condition"],
+    [/^done\s+when\b/i, "completion is framed as a condition"],
+    [/^(?:the\s+)?expected\s+outcome\s+(?:is|means|will\s+be|should\s+be)\b/i, "expected outcome is framed as metadata"],
+    [/^(?:the\s+)?(?:immediate\s+)?result\s+(?:is|means|will\s+be|should\s+be)\b/i, "result is framed as metadata"],
+    [/^(?:the\s+)?outcome\s+(?:is|means|will\s+be|should\s+be)\b/i, "outcome is framed as metadata"],
+    [/^(?:the|this)\s+(?:task|work|request)\s+(?:is|will\s+be|should\s+be)\s+(?:complete|completed|done|finished|ready|delivered|submitted|finali[sz]ed)\b/i, "task status is framed as metadata"],
+    [/^(?:the|this)\s+(?:review|draft|document|deliverable|response|artifact|process|work\s+item|item)\s+(?:is|has\s+been|was)\s+(?:complete|completed|done|finished|ready|delivered|submitted|finali[sz]ed)\b/i, "artifact status is framed as metadata"]
+  ];
+  const metaReason = sentences.map((sentence) => metaPatterns.find(([pattern]) => pattern.test(sentence))?.[1]).find(Boolean);
+  return metaReason ? `meta completion/result framing: ${metaReason}` : "";
+}
+
 function taskDescriptionClarityReason(value = "", task = {}, settings = DEFAULT_SETTINGS) {
   const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
+  const styleReason = taskDescriptionStyleReason(value);
+  if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
   const title = singleLine(task.content || "").toLowerCase();
@@ -14288,8 +14621,7 @@ function taskDescriptionClarityReason(value = "", task = {}, settings = DEFAULT_
   const historicalOutcome = /\b(?:was|were|had been|already|previously|earlier)\s+(?:approved|confirmed|verified|identified|documented|sent|submitted|resolved|closed|finali[sz]ed|completed|published|released)\b/i.test(finalSentence);
   const observableOutcome = /\b(?:complete when|done when|expected outcome|result(?:ing)?|deliverable|ready for|will|would|can|should|must|needs? to|is to|are to|to be|so that|so the|before|after|once|when|if)\b/i.test(finalSentence);
   if (historicalOutcome && !observableOutcome) return "ends with historical status instead of current task context";
-  const taskTreeText = [task.content, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ");
-  const hasConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending)\b/i.test(taskTreeText);
+  const hasConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending)\b/i.test(task.content || "");
   const preservesConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending|requires?|required)\b/i.test(text);
   if (hasConditionalHandoff && !preservesConditionalHandoff) return "missing conditional dependency or handoff requirement";
   return "passed";
@@ -14330,16 +14662,21 @@ function taskDescriptionActionAlignmentReason(value = "", task = {}) {
   const titleFamilies = detectFamilies(title);
   if (!titleFamilies.length) return "passed";
   const sentences = splitDescriptionSentences(value || "");
-  const intentSentence = sentences.find((sentence) => detectFamilies(sentence).length > 0 && !/^Use\s+\[[^\]]+\]\([^)]+\)\s+as the working document\.?$/i.test(singleLine(sentence))) || "";
-  const intentFamilies = detectFamilies(intentSentence);
-  if (!intentFamilies.length) return "description intent does not state the task title's action";
-  if (titleFamilies.some((family) => intentFamilies.includes(family))) return "passed";
   const compatibleGroups = [
     ["review", "comparison", "accuracy", "gaps", "confirmation"],
     ["drafting", "revisions"],
     ["send", "response"],
     ["approval", "decision", "confirmation"]
   ];
+  const compatibleWithTitle = (intentFamilies) => titleFamilies.some((family) => intentFamilies.includes(family))
+    || compatibleGroups.some((group) => group.some((family) => titleFamilies.includes(family)) && group.some((family) => intentFamilies.includes(family)));
+  const intentSentence = sentences.find((sentence) => compatibleWithTitle(detectFamilies(sentence)) && !/^Use\s+\[[^\]]+\]\([^)]+\)\s+as the working document\.?$/i.test(singleLine(sentence))) || "";
+  const intentFamilies = detectFamilies(intentSentence);
+  if (!intentFamilies.length) {
+    const otherIntent = sentences.map(detectFamilies).find((detected) => detected.length > 0);
+    return otherIntent ? "description intent action does not align with the task title" : "description intent does not state the task title's action";
+  }
+  if (titleFamilies.some((family) => intentFamilies.includes(family))) return "passed";
   const compatible = compatibleGroups.some((group) => group.some((family) => titleFamilies.includes(family)) && group.some((family) => intentFamilies.includes(family)));
   return compatible ? "passed" : "description intent action does not align with the task title";
 }
@@ -14378,6 +14715,7 @@ function mainTaskClarityReason(task = {}) {
   const words = canonicalTaskMatchTitle(text).split(/\s+/).filter(Boolean);
   if (words.length < 3) return "main task title is too short to identify its action and scope";
   if (/^(?:it|this|that|these|those|them)\b/i.test(text)) return "main task title starts with an unexplained pronoun";
+  if (/^(?:use|send)\s+(?:start\s+)?(?:to\s+)?(?:finali[sz](?:e|ing)|develop|review|prepare|draft)\b/i.test(text)) return "main task title stacks unrelated action prefixes";
   if (!taskStructureLeadingAction(text)) return "main task title does not start with a concrete user action";
   if (/^(?:apply|approve|check|circulate|confirm|deliver|edit|finalize|forward|incorporate|prepare|provide|publish|review|revise|send|share|submit|update|upload|use|validate|verify)\s+(?:it|this|that|them|these|those)(?:\s+(?:to|with|for|after|before|once|if|when)\b|$)/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its object or deliverable";
   if (/\b(?:about|on|regarding)\s+(?:it|this|that|them|these|those)\b/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its topic or decision";
@@ -14783,6 +15121,7 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
   const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false);
   const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, plan.sourceSummary || sourceContext.text || "", context, options.sourceTitle || sourceContext.title || "", settings, citationState);
   const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+  const requestSignals = plan.requestedActionSignals || taskRequestedActionSignals(sourceContext.text || plan.sourceSummary || "", options.source || "note", settings);
   const seenTitles = new Set();
   let subtaskCount = 0;
   let labelCount = 0;
@@ -14802,6 +15141,8 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     if (descriptionReason === "passed" && clarityReason !== "passed") addIssue("ungrounded-main-description", index, true, clarityReason);
     const linkReason = taskDescriptionLinkIntegrityReason(splitDescription.summary, task, evidenceBundles[index], settings);
     if (linkReason !== "passed") addIssue("invalid-main-description-link", index, true, linkReason);
+    const requestFactReason = taskDescriptionRequestCoverageReason(splitDescription.summary, task, requestSignals);
+    if (requestFactReason) addIssue("missing-description-request-fact", index, true, requestFactReason);
     if (options.citeContextNotes !== false && !splitDescription.sourceList) addIssue("missing-source-list", index);
     if (task.due_date && !validDate(task.due_date)) addIssue("invalid-due-date", index);
     if (task.deadline_date && !validDate(task.deadline_date)) addIssue("invalid-deadline-date", index);
@@ -14837,7 +15178,6 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     for (const issue of generatedEmailOwnershipIssues(tasks, sourceEvidence, plan.sourceSummary || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
   }
   for (const issue of generatedTaskStructureIssues(tasks)) addIssue(issue.code, issue.taskIndex, TASK_PLAN_REPAIRABLE_STRUCTURE_CODES.has(issue.code), JSON.stringify(issue));
-  const requestSignals = plan.requestedActionSignals || taskRequestedActionSignals(sourceContext.text || plan.sourceSummary || "", options.source || "note");
   const requestCoverage = taskRequestCoverageReport(tasks, requestSignals);
   if (!requestCoverage.passed) addIssue("missing-requested-outcome", 0, true, JSON.stringify(requestCoverage));
   const blockingIssues = issues.filter((issue) => issue.blocking).length;
@@ -14855,174 +15195,6 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     aiCalls: 0,
     elapsedMs: Math.max(0, Date.now() - startedAt)
   };
-}
-
-function enforceDeterministicDescriptionFallbacks(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
-  const sourceContext = options.sourceContext || {};
-  const sourceTitle = options.sourceTitle || sourceContext.title || "";
-  const sourceSummary = plan.sourceSummary || sourceContext.text || "";
-  const context = plan.semanticContext || options.semanticContext || [];
-  const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
-  hydrateContextCitationEvidence(citationState, context, sourceContext.path || options.path || "");
-  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
-  let applied = 0;
-  for (let index = 0; index < (tasks || []).length; index += 1) {
-    const task = tasks[index] || {};
-    const split = splitDescriptionSourceListBlock(task.description || "");
-    if (taskDescriptionGroundingReason(split.summary, task, evidenceBundles[index], settings) === "passed") continue;
-    const fallback = deterministicTaskFallbackDescription(task, settings, evidenceBundles[index]);
-    if (!fallback || taskDescriptionGroundingReason(fallback, task, evidenceBundles[index], settings) !== "passed") continue;
-    task.description = taskDescriptionWithSources(fallback, task.content || "", split.sourceList, settings, sourceTitle, citationState, [sourceSummary, ...context.map((chunk) => chunk.text || "")].filter(Boolean).join("\n\n"));
-    applied += 1;
-  }
-  return applied;
-}
-
-const TASK_TITLE_REPAIR_ACTIONS = {
-  review: "Review",
-  comparison: "Compare",
-  drafting: "Draft",
-  accuracy: "Review",
-  gaps: "Review",
-  feedback: "Review",
-  revisions: "Update",
-  incorporation: "Incorporate",
-  finalization: "Finalize",
-  documentation: "Document",
-  recommendation: "Prepare",
-  highlighted: "Review",
-  approval: "Approve",
-  confirmation: "Confirm",
-  response: "Respond to",
-  send: "Send",
-  decision: "Decide on"
-};
-
-const RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES = new Set([
-  "ungrounded-main-description", "invalid-main-description-link", "missing-source-list"
-]);
-
-function salvageGeneratedTaskBatch(tasks = [], plan = {}, options = {}, settings = DEFAULT_SETTINGS) {
-  const sourceContext = options.sourceContext || {};
-  const sourceTitle = options.sourceTitle || sourceContext.title || "";
-  const sourceSummary = plan.sourceSummary || sourceContext.text || "";
-  const context = plan.semanticContext || options.semanticContext || [];
-  const groundingEvidence = [sourceTitle, sourceContext.title, sourceSummary, sourceContext.text, ...context.map((chunk) => `${chunk.title || chunk.path || ""}\n${chunk.text || ""}`)].filter(Boolean).join("\n\n");
-  const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
-  hydrateContextCitationEvidence(citationState, context, sourceContext.path || options.path || "");
-  let evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
-  const linkContext = [sourceSummary, ...context.map((chunk) => chunk.text || "")].filter(Boolean).join("\n\n");
-  const localCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
-    labelInstructions: plan.labelInstructions || "",
-    priorityInstructions: plan.priorityInstructions || "",
-    sourceEvidence: [sourceTitle, sourceSummary, sourceContext.text || ""].filter(Boolean).join("\n"),
-    settings
-  });
-  let repairedTitles = 0;
-  let repairedDescriptions = 0;
-  for (let index = 0; index < tasks.length; index += 1) {
-    const task = tasks[index] || {};
-    if (mainTaskClarityReason(task) !== "passed") {
-      const subtaskAction = (task.subtasks || []).map((subtask) => taskStructureLeadingAction(subtask.content || "")).find(Boolean);
-      const descriptionAction = splitDescriptionSentences(splitDescriptionSourceListBlock(task.description || "").summary).map(taskStructureLeadingAction).find(Boolean);
-      const signalActions = uniqueValues((plan.requestedActionSignals?.families || []).map((family) => TASK_TITLE_REPAIR_ACTIONS[family]).filter(Boolean));
-      const signalAction = signalActions.length === 1 ? signalActions[0] : "";
-      const action = subtaskAction ? capitalizeSentenceStart(subtaskAction) : descriptionAction ? capitalizeSentenceStart(descriptionAction) : signalAction || "";
-      const candidate = action ? singleLine(`${action} ${task.content || ""}`) : "";
-      if (candidate && mainTaskClarityReason(Object.assign({}, task, { content: candidate })) === "passed" && generatedTaskMatchesPrimarySource(Object.assign({}, task, { content: candidate }), groundingEvidence)) {
-        task.content = truncateAtWord(candidate, 250);
-        if ((task.subtasks || []).length === 1 && taskStructureTitleOverlap(task.content, task.subtasks[0].content || "") >= 0.78) task.subtasks = [];
-        repairedTitles += 1;
-      }
-    }
-  }
-  if (repairedTitles) evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, settings, citationState);
-  for (let index = 0; index < tasks.length; index += 1) {
-    const task = tasks[index] || {};
-    const evidence = evidenceBundles[index] || null;
-    const split = splitDescriptionSourceListBlock(task.description || "");
-    if (taskDescriptionGroundingReason(split.summary, task, evidence, settings) === "passed") continue;
-    const supportedSummary = splitDescriptionSentences(split.summary)
-      .filter((sentence) => !taskDescriptionUnsupportedFactReason(sentence, evidence, settings))
-      .join(" ");
-    const candidates = [
-      supportedSummary,
-      fallbackActionSummary(task, sourceSummary, evidence?.contextChunks || [], sourceTitle, settings, evidence),
-      taskEvidenceNarrativeFallbackDescription(task, evidence, settings),
-      deterministicTaskFallbackDescription(task, settings, evidence)
-    ].map((value) => singleLine(value)).filter(Boolean);
-    const replacement = candidates.find((value) => taskDescriptionGroundingReason(value, task, evidence, settings) === "passed") || "";
-    if (!replacement) continue;
-    task.description = taskDescriptionWithSources(replacement, task.content || "", split.sourceList, settings, sourceTitle, citationState, linkContext);
-    repairedDescriptions += 1;
-  }
-  let repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
-  const blockingIssuesByTask = new Map();
-  for (const issue of repairedQuality.issues.filter((item) => item.blocking && item.code !== "missing-requested-outcome")) {
-    if (!blockingIssuesByTask.has(issue.taskIndex)) blockingIssuesByTask.set(issue.taskIndex, []);
-    blockingIssuesByTask.get(issue.taskIndex).push(issue);
-  }
-  const degradedDescriptionTaskKeys = [];
-  const retainedDescriptionTaskKeys = [];
-  for (const [index, issues] of blockingIssuesByTask.entries()) {
-    const task = tasks[index] || {};
-    if (!issues.length || issues.some((issue) => !RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code))) continue;
-    if (mainTaskClarityReason(task) !== "passed" || !generatedTaskMatchesPrimarySource(task, groundingEvidence)) continue;
-    const split = splitDescriptionSourceListBlock(task.description || "");
-    if (taskDescriptionNarrativeSafetyReason(split.summary, task, evidenceBundles[index] || null, settings) === "passed") {
-      retainedDescriptionTaskKeys.push(canonicalTaskMatchTitle(task.content || ""));
-      continue;
-    }
-    const attribution = taskScopedDescriptionAttribution(
-      split.summary,
-      { title: sourceTitle, path: sourceContext.path || options.path || "", text: sourceSummary },
-      citationState,
-      options.basePath || "",
-      options.citeContextNotes !== false
-    );
-    const verifiedSources = split.sourceList || attribution.sources;
-    task.description = verifiedSources;
-    degradedDescriptionTaskKeys.push(canonicalTaskMatchTitle(task.content || ""));
-  }
-  if (degradedDescriptionTaskKeys.length) repairedQuality = generatedTaskWorkflowQualityReport(tasks, plan, options, settings);
-  const degradedDescriptionTaskKeySet = new Set(degradedDescriptionTaskKeys);
-  const invalidIndexes = new Set(repairedQuality.issues
-    .filter((issue) => {
-      if (!issue.blocking || issue.code === "missing-requested-outcome") return false;
-      const taskKey = canonicalTaskMatchTitle(tasks[issue.taskIndex]?.content || "");
-      return !(degradedDescriptionTaskKeySet.has(taskKey) && RETAINABLE_TASK_DESCRIPTION_ISSUE_CODES.has(issue.code));
-    })
-    .map((issue) => issue.taskIndex)
-    .filter((index) => Number.isInteger(index) && index >= 0 && index < tasks.length));
-  const removedTasks = [];
-  if (invalidIndexes.size && invalidIndexes.size < tasks.length) {
-    for (const index of Array.from(invalidIndexes).sort((left, right) => right - left)) {
-      const [removed] = tasks.splice(index, 1);
-      if (removed) removedTasks.unshift({ content: removed.content || "", issueCodes: repairedQuality.issues.filter((issue) => issue.taskIndex === index && issue.blocking).map((issue) => issue.code) });
-    }
-  }
-  return { localCorrections, repairedTitles, repairedDescriptions, retainedDescriptionTaskKeys, degradedDescriptionTaskKeys, removedTasks };
-}
-
-function taskDescriptionNarrativeSafetyReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
-  if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
-  const unsupported = taskDescriptionUnsupportedFactReason(value, evidence, settings);
-  if (unsupported) return unsupported;
-  const clarity = taskDescriptionClarityReason(value, task, settings);
-  if (clarity !== "passed") return clarity;
-  const link = taskDescriptionLinkIntegrityReason(value, task, evidence, settings);
-  return link === "passed" ? "passed" : link;
-}
-
-function taskEvidenceNarrativeFallbackDescription(task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
-  const corpus = String(evidence?.corpus || "");
-  if (!corpus.trim()) return "";
-  const excerpt = taskSpecificEvidenceExcerpt(corpus, task.content || "", settings, 900);
-  const summary = conciseDescriptionSummary([
-    removeTitleEcho(cleanGeneratedDescriptionSummary(excerpt, settings), task.content || "")
-  ], settings);
-  if (!summary || taskDescriptionNarrativeSafetyReason(summary, task, evidence, settings) !== "passed") return "";
-  return taskDescriptionEvidenceDetailReason(summary, task, evidence) ? "" : truncateAtWord(summary, 1200);
 }
 
 function descriptionSpecificEntities(value = "") {
@@ -15049,9 +15221,7 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
     const task = tasks[index] || {};
     const evidence = evidenceBundles[index] || null;
     const relevantContext = evidence?.contextChunks || [];
-    const parentSummary = isUsefulDescriptionSummary(task.description, task.content, settings)
-      ? task.description
-      : (fallbackActionSummary(task, active?.text || "", relevantContext, active?.title || "", settings, evidence) || task.description || "");
+    const parentSummary = task.description || "";
     const attribution = taskScopedDescriptionAttribution(parentSummary, active, citationState, basePath, includeSourceList);
     const linkContext = [
       active?.text || "",
@@ -15168,6 +15338,8 @@ function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SE
 function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
   const text = removeTitleEcho(cleanGeneratedDescriptionSummary(value || "", settings), taskTitle);
   if (text.length < 80) return `too short (${text.length} characters)`;
+  const styleReason = taskDescriptionStyleReason(value);
+  if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
   if (/^use the source material to complete this task\.?$/i.test(text)) return "generic source-material instruction";
@@ -16087,11 +16259,12 @@ function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
 function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
   const sourceTitle = singleLine(source.title || "");
   const intent = summarizeSourceForTaskContext(sourceSummary, sourceTitle, 1200, settings);
+  const markerPattern = noteActionMarkerRegex(settings);
   const explicitActions = String(sourceSummary || "")
     .split(/\n+/)
     .map((line) => singleLine(line))
-    .filter((line) => /#todo\b|\b(?:please|need(?:s|ed)? to|must|should|action|follow[-\s]?up|review|verify|confirm|send|prepare|draft|finalize|respond|reply|complete|update|coordinate|decide|approve)\b/i.test(line))
-    .slice(0, 8)
+    .filter((line) => markerPattern.test(line) || /\b(?:please|need(?:s|ed)? to|must|should|action|follow[-\s]?up|review|verify|confirm|send|prepare|draft|finalize|respond|reply|complete|update|coordinate|decide|approve)\b/i.test(line))
+    .slice(0, 12)
     .join("\n");
   const contextGaps = String(sourceSummary || "")
     .split(/\n+/)
@@ -16100,6 +16273,56 @@ function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = 
     .slice(0, 4)
     .join("\n");
   return [sourceTitle, explicitActions, contextGaps, intent].filter(Boolean).join("\n");
+}
+
+function taskWorkflowContextBundle(options = {}) {
+  const settings = options.settings || DEFAULT_SETTINGS;
+  const sourceSummary = String(options.sourceSummary || "").trim();
+  const sourceType = options.sourceType || options.source?.type || "note";
+  const sourceTitle = singleLine(options.sourceTitle || options.source?.title || "");
+  const sourcePath = options.sourcePath || options.source?.path || "";
+  const maxChars = Math.min(18000, Math.max(7000, Number(settings.maxContextChars || 12000)));
+  const sourceLimit = Math.min(9000, Math.floor(maxChars * 0.52));
+  const adaptiveLimit = Math.min(4200, Math.floor(maxChars * 0.25));
+  const semanticLimit = Math.min(5200, Math.floor(maxChars * 0.3));
+  const markers = explicitNoteActionMarkers(sourceSummary, settings);
+  const markedActionScopes = groupMarkedActions(markers).map((group) => ({
+    action: group.action,
+    family: group.family,
+    references: (group.references || []).map((reference) => ({ tag: reference.tag, action: reference.action, line: reference.line }))
+  }));
+  const adaptiveTaskContext = truncateMarkdownAtWord(options.adaptivePack?.text || options.taskContext || "", adaptiveLimit);
+  const semanticIndexContext = truncateMarkdownAtWord(
+    formatContext(options.semanticContext || [], semanticLimit, settings, [sourceTitle, sourceSummary].filter(Boolean).join("\n")) || "",
+    semanticLimit
+  );
+  const promptCachePrefix = truncateMarkdownAtWord([
+    "Semantic Todoist Sync task workflow context (shared exact prefix):",
+    `Source type: ${sourceType}`,
+    `Source title: ${sourceTitle}`,
+    sourcePath ? `Source path: ${sourcePath}` : "",
+    "Primary source:",
+    truncateMarkdownAtWord(sourceSummary, sourceLimit),
+    "Marked action scopes (line numbers are source-local):",
+    JSON.stringify(markedActionScopes),
+    "Adaptive task, meeting, project, and portfolio context:",
+    adaptiveTaskContext || "No adaptive task context found.",
+    "Relevant semantic-index context:",
+    semanticIndexContext || "No relevant semantic-index context found."
+  ].filter(Boolean).join("\n"), maxChars);
+  return {
+    version: 1,
+    sourceType,
+    sourceTitle,
+    sourcePath,
+    primarySource: sourceSummary,
+    markedActionScopes,
+    adaptiveTaskContext,
+    semanticIndexContext,
+    taskContext: options.taskContext || "",
+    semanticContext: options.semanticContext || [],
+    promptCachePrefix
+  };
 }
 
 function explicitReviewRequestFallbackTask(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {

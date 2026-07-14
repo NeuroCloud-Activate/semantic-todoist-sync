@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.39
+
+- Added configurable required-action hashtags for notes, defaulting to `#todo`, with one task tree required for every distinct marked action while repeated references to the same action can be grouped.
+- Kept required-action hashtags as minimum coverage rather than an exclusive task list, so the full note and relevant semantic-index context still surface subtly phrased user-owned work.
+- Improved first-pass task and description prompts with exact marked-action scope and task-specific semantic evidence, preventing neighboring same-note topics and internal evidence labels from leaking into descriptions.
+- Redesigned generation as a context-first workflow: one bounded source/marked-action/adaptive/semantic context bundle is retained after task structure, then section-title and one batched description call run concurrently.
+- Shared one strict workflow schema, stable system instruction, explicit GPT-5.6 cached-prefix breakpoint, and `semantic-todoist-task-workflow` cache key across the three phases; Medium reasoning is the baseline and Gemini remains provider-compatible without OpenAI cache controls.
+- Made every blocking description issue fatal before Todoist mutation: missing or duplicate indexes, empty/short/malformed, ungrounded, action-misaligned, incomplete, and cross-topic descriptions no longer trigger AI repair or deterministic fabrication.
+- Recast descriptions as standalone, detailed execution briefs that preserve current state, audience/reviewer needs, criteria, dependencies, timing, and supported links without cross-task or meta completion/result narration.
+- Allowed directly relevant current semantic-index evidence to enrich non-sparse sources while preserving primary-source authority and task isolation, with deterministic fatal checks for forbidden description style.
+- Added regressions for custom hashtags, repeated and distinct marked actions, subtle unmarked actions, same-note evidence isolation, malformed title prefixes, nonfatal description checks, and a single generated action-items heading.
+
 ## 0.6.38
 
 - Made generated task titles preserve the source-supported document, program, person, decision, deliverable, review focus, or current stage needed to distinguish and act on the work.
@@ -16,7 +28,7 @@
 - Added task-title identity checks, conflicting program-identifier detection, and sequential-action separation so BEAP, ESTMTA, GFP/PDF, Performance Goals delivery, and meeting-booking work remain distinct.
 - Recognized `Book`, `Develop`, and other common concrete verbs as valid leading task actions, preventing malformed local repairs such as `Send Develop ...`.
 - Preserved grounded task titles when only their descriptions fail local validation; unsafe narrative text is removed and verified source links are retained instead of dropping the task.
-- Added the July 9 multi-topic touchbase as a generic regression fixture and verified all five main tasks plus the ESTMTA subtask continue without same-batch flags, merges, or AI duplicate calls.
+- Added the July 9 multi-topic touchbase as a generic regression fixture and verified all six main tasks, including the Aditi funding-opportunities-page review and Sophie handoff, plus the ESTMTA subtask continue without same-batch flags, merges, or AI duplicate calls.
 
 ## 0.6.36
 

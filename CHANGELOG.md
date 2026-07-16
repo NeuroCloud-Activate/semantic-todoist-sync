@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.3
+
+- Republished the 0.7.2 code with correct Obsidian GitHub Release packaging and verified `main.js`, `manifest.json`, and `styles.css` assets; no runtime behavior changed.
+
 ## 0.7.2
 
 - Kept device-local display times consistent across task, scheduler, and activity views.

@@ -24,9 +24,13 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.7.2
+## What's New In 0.7.3
 
-1. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
+1. **0.7.3 - Correct Obsidian release packaging**
+
+   The 0.7.2 code is republished with version-matched GitHub Release packaging and verified `main.js`, `manifest.json`, and `styles.css` assets. No runtime behavior changed.
+
+2. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
 
    Device-local display times now stay consistent across task, scheduler, and
    activity views. Desktop and mobile settings are organized into six focused
@@ -38,7 +42,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
    repeated context serialization, and GPT-5.6 Terra at Medium remains the
    primary OpenAI model with GPT-5.6 Luna at Medium as the same-provider fallback.
 
-2. **0.7.1 - Semantic Index Optimization**
+3. **0.7.1 - Semantic Index Optimization**
 
    The task-generation backend has been redesigned around the semantic index so
    task titles and descriptions are selected from precise, source-grounded
@@ -58,10 +62,6 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
    source grounding. This release also introduces GPT-5.6 Terra at Medium as the
    default OpenAI model, with GPT-5.6 Luna at Medium as its same-provider
    fallback, while preserving custom model and reasoning settings.
-
-3. **0.6.39 - Complete note actions with faster, safer generation**
-
-   Notes can use configurable required-action hashtags, with `#todo` as the default. Every distinct marked action requires a task tree, repeated references to the same action can be grouped, and the full note plus semantic index still supplies subtly phrased unmarked work. Generated descriptions are standalone, source-grounded execution briefs with current artifact, audience or reviewer, criteria, dependencies, timing, and supported links when available.
 
 ## What It Uses
 

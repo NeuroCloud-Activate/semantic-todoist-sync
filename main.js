@@ -245,8 +245,6 @@ const DEFAULT_SETTINGS = {
   searchIncludeActiveNote: true,
   maxChatContextChunks: 12,
   maxTaskContextChunks: 10,
-  maxContextChars: 12000,
-  maxActiveNoteContextChars: 2500,
   embeddingBatchSize: 16,
   semanticIndexMaxChunkChars: 1100,
   // Keep uninterrupted list evidence semantically coherent without allowing
@@ -334,7 +332,6 @@ const DEFAULT_SETTINGS = {
   emailPollIntervalSeconds: MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS,
   lastEmailPollAt: "",
   localLog: [],
-  maxEmailChars: 18000,
   maxNoteChars: 22000,
   maxGeneratedMainTasks: 10,
   maxGeneratedSubtasksPerMainTask: 4,
@@ -560,7 +557,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceIntegrity = null;
     this.taskReferenceRepairTimer = null;
     this.taskReferenceRepairInProgress = false;
+    this.taskReferenceRepairFollowUp = false;
     this.taskReferenceRepairRevision = 0;
+    this.isUnloading = false;
     this.schedulerMemory = emptySchedulerMemory();
     this.schedulerMemoryDirty = false;
     this.schedulerMemorySaveTimer = null;
@@ -632,6 +631,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    this.isUnloading = true;
     await this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings flush failed", error));
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
@@ -648,11 +648,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
-  async saveSettings() {
+  async saveSettings(options = {}) {
     window.clearTimeout(this.settingsSaveTimer);
     this.settingsSaveTimer = null;
     this.settingsSaveQueued = false;
-    await this.flushTaskReferenceSnapshotIfDirty();
+    if (!options.skipTaskReferenceSnapshot) await this.flushTaskReferenceSnapshotIfDirty();
     await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
   }
 
@@ -908,21 +908,60 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   scheduleSemanticTaskReferenceRepair(reason = "integrity") {
+    const prompt = reason === "snapshot-write" || reason === "snapshot-fingerprint-mismatch" || reason === "incremental-integrity";
+    if (this.isUnloading) return false;
+    const snapshotFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || "";
+    const persistedMeta = this.settings.semanticIndexMeta || {};
+    const compatibility = semanticEmbeddingIndexCompatibility(this.settings, persistedMeta);
+    const hasPersistedIndex = (this.hasUsableSemanticIndex?.() || Number(persistedMeta.chunks || 0) > 0) && !compatibility.migrationRequired;
+    if (prompt && (!hasPersistedIndex || (snapshotFingerprint && persistedMeta.taskReferenceSnapshotFingerprint === snapshotFingerprint))) return false;
+    if (this.taskReferenceRepairInProgress || this.semanticIndexInProgress) {
+      this.taskReferenceRepairFollowUp = true;
+      this.lastTaskReferenceRepairReason = String(reason || "integrity");
+      return true;
+    }
     window.clearTimeout(this.taskReferenceRepairTimer);
     this.taskReferenceRepairTimer = window.setTimeout(() => {
       this.taskReferenceRepairTimer = null;
+      if (this.isUnloading) return;
+      if (this.taskReferenceRepairInProgress) {
+        this.taskReferenceRepairFollowUp = true;
+        return;
+      }
       this.runSemanticTaskReferenceRepair({ reason }).catch((error) => this.logLocal("Task-reference repair failed", { reason, error: error.message || String(error) }));
-    }, Math.max(1000, Number(this.settings.referenceRebuildIntervalMinutes || 1) * 60 * 1000));
+    }, prompt ? 1000 : Math.max(1000, Number(this.settings.referenceRebuildIntervalMinutes || 1) * 60 * 1000));
     this.lastTaskReferenceRepairReason = String(reason || "integrity");
     return true;
   }
 
+  queueSemanticTaskReferenceAlignment(reason = "snapshot-write") {
+    return this.scheduleSemanticTaskReferenceRepair(reason);
+  }
+
   async runSemanticTaskReferenceRepair(options = {}) {
-    if (this.taskReferenceRepairInProgress) return false;
+    if (this.isUnloading) return false;
+    if (this.taskReferenceRepairInProgress || this.semanticIndexInProgress) {
+      this.taskReferenceRepairFollowUp = true;
+      return false;
+    }
     if (semanticEmbeddingIndexCompatibility(this.settings, this.settings.semanticIndexMeta || {}).migrationRequired) {
       this.logLocal("Task-reference repair deferred", { reason: "embedding-dimension-migration-required" });
       return false;
     }
+    const targetFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || taskReferencePayloadFingerprint(this.settings);
+    if (targetFingerprint && this.settings.semanticIndexMeta?.taskReferenceSnapshotFingerprint === targetFingerprint) return false;
+    if (Number(this.settings.semanticIndexMeta?.chunks || 0) > 0 && !this.hasUsableSemanticIndex()) {
+      try {
+        await this.ensureSemanticIndexLoaded("task-reference alignment");
+      } catch (error) {
+        this.logLocal("Task-reference alignment deferred", { reason: "semantic-index-load-failed", error: error.message || String(error) });
+      }
+      if (!this.hasUsableSemanticIndex()) {
+        this.taskReferenceRepairFollowUp = true;
+        return false;
+      }
+    }
+    const repairStartRevision = this.taskReferenceStateRevision;
     this.taskReferenceRepairInProgress = true;
     const previousIndex = this.semanticIndex || [];
     const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
@@ -953,9 +992,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndex = candidate;
       this.taskReferenceIntegrity = candidateIntegrity;
       this.taskReferenceRepairRevision += 1;
-      this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidate, candidateIntegrity.graph));
+      this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidate, candidateIntegrity.graph), {
+        taskReferenceSnapshotFingerprint: targetFingerprint,
+        taskReferenceSnapshotUpdatedAt: this.settings.taskReferenceSnapshotMeta?.updatedAt || previousMeta.taskReferenceSnapshotUpdatedAt || "",
+        taskReferenceSnapshotAlignedAt: deviceTimestamp()
+      });
       await this.saveSemanticIndex();
-      await this.saveSettings();
+      await this.saveSettings({ skipTaskReferenceSnapshot: true });
+      if (repairStartRevision !== this.taskReferenceStateRevision || this.taskReferenceSnapshotFingerprint !== targetFingerprint) this.taskReferenceRepairFollowUp = true;
       return true;
     } catch (error) {
       this.semanticIndex = previousIndex;
@@ -965,6 +1009,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return false;
     } finally {
       this.taskReferenceRepairInProgress = false;
+      const followUp = this.taskReferenceRepairFollowUp;
+      this.taskReferenceRepairFollowUp = false;
+      if (followUp && !this.isUnloading) this.queueSemanticTaskReferenceAlignment("snapshot-fingerprint-mismatch");
     }
   }
 
@@ -1009,6 +1056,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceSnapshotFingerprint = fingerprint;
     this.taskReferenceSnapshotDirty = false;
     await this.writeExternalMcpExport(false);
+    if (!this.isUnloading) this.queueSemanticTaskReferenceAlignment("snapshot-write");
     return true;
   }
 
@@ -1035,7 +1083,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const retrievalDefaults = [
       ["maxChatContextChunks", 8, DEFAULT_SETTINGS.maxChatContextChunks],
       ["maxTaskContextChunks", 6, DEFAULT_SETTINGS.maxTaskContextChunks],
-      ["maxContextChars", 7000, DEFAULT_SETTINGS.maxContextChars],
       ["semanticIndexMaxChunkChars", 900, DEFAULT_SETTINGS.semanticIndexMaxChunkChars],
       ["semanticIndexMaxChunksPerNote", 12, DEFAULT_SETTINGS.semanticIndexMaxChunksPerNote],
       ["semanticIndexEmbeddingPrecision", 3, DEFAULT_SETTINGS.semanticIndexEmbeddingPrecision]
@@ -1059,20 +1106,37 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       changed = true;
     }
-    const legacyDefaultOpenAiPair = (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4-mini")
-      || (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4-mini" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4");
+    const normalizedPrimaryModel = normalizeOpenAIModelId(this.settings.chatModel).toLowerCase();
+    const normalizedFallbackModel = normalizeOpenAIModelId(this.settings.chatFallbackModel).toLowerCase();
+    const legacyDefaultOpenAiPair = (normalizedPrimaryModel === "gpt-5.4" && normalizedFallbackModel === "gpt-5.4-mini")
+      || (normalizedPrimaryModel === "gpt-5.4-mini" && normalizedFallbackModel === "gpt-5.4");
+    const partiallyMigratedOpenAiPair = (normalizedPrimaryModel === "gpt-5.6-terra" && normalizedFallbackModel === "gpt-5.4-mini")
+      || (normalizedPrimaryModel === "gpt-5.4-mini" && normalizedFallbackModel === "gpt-5.6-terra");
+    const normalizedPrimaryReasoning = normalizeReasoningEffort(this.settings.chatReasoningEffort, DEFAULT_REASONING_EFFORT);
+    const normalizedFallbackReasoning = normalizeReasoningEffort(this.settings.chatFallbackReasoningEffort, DEFAULT_REASONING_EFFORT);
+    const legacyReasoningValue = (value) => normalizeReasoningEffort(value, DEFAULT_REASONING_EFFORT) === DEFAULT_REASONING_EFFORT;
     if (legacyDefaultOpenAiPair) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
-      if (this.settings.chatReasoningEffort === DEFAULT_REASONING_EFFORT) {
+      if (legacyReasoningValue(normalizedPrimaryReasoning)) {
         this.settings.chatReasoningEffort = DEFAULT_SETTINGS.chatReasoningEffort;
       }
-      if (this.settings.chatFallbackReasoningEffort === DEFAULT_REASONING_EFFORT) {
+      if (legacyReasoningValue(normalizedFallbackReasoning)) {
         this.settings.chatFallbackReasoningEffort = DEFAULT_SETTINGS.chatFallbackReasoningEffort;
       }
       changed = true;
     }
-    if (Array.isArray(this.settings.availableChatModels) && ["gpt-5.4|gpt-5.4-mini", "gpt-5.4-mini|gpt-5.4"].includes(this.settings.availableChatModels.join("|"))) {
+    if (partiallyMigratedOpenAiPair) {
+      this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
+      this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
+      if (legacyReasoningValue(normalizedPrimaryReasoning)) this.settings.chatReasoningEffort = DEFAULT_SETTINGS.chatReasoningEffort;
+      if (legacyReasoningValue(normalizedFallbackReasoning)) this.settings.chatFallbackReasoningEffort = DEFAULT_SETTINGS.chatFallbackReasoningEffort;
+      changed = true;
+    }
+    const normalizedAvailableChatModels = Array.isArray(this.settings.availableChatModels)
+      ? this.settings.availableChatModels.map((model) => normalizeOpenAIModelId(model).toLowerCase()).join("|")
+      : "";
+    if (["gpt-5.4|gpt-5.4-mini", "gpt-5.4-mini|gpt-5.4"].includes(normalizedAvailableChatModels)) {
       this.settings.availableChatModels = DEFAULT_SETTINGS.availableChatModels.slice();
       changed = true;
     }
@@ -1433,6 +1497,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path), requireChunks: true }
       );
       if (!this.taskReferenceIntegrity.ok) this.scheduleSemanticTaskReferenceRepair("index-load-integrity");
+      const snapshotFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || "";
+      const indexSnapshotFingerprint = this.settings.semanticIndexMeta?.taskReferenceSnapshotFingerprint || "";
+      const loadedCompatibility = semanticEmbeddingIndexCompatibility(this.settings, this.settings.semanticIndexMeta || {});
+      if (this.semanticIndex.length && snapshotFingerprint && indexSnapshotFingerprint !== snapshotFingerprint && !loadedCompatibility.migrationRequired) {
+        this.scheduleSemanticTaskReferenceRepair("snapshot-fingerprint-mismatch");
+      }
       await this.saveSemanticIndexPathMetaSnapshot();
       if (settingsChanged) await this.saveSettings();
     } finally {
@@ -2225,6 +2295,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       this.setSidebarStatus("Preparing task reference chunks...");
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      await this.flushTaskReferenceSnapshotIfDirty();
+      const taskReferenceSnapshotFingerprint = this.taskReferenceSnapshotFingerprint || taskReferencePayloadFingerprint(this.settings);
       const taskReferenceChunks = this.semanticTaskReferenceChunks("", taskReferenceLocationIndex);
       chunks.push(...taskReferenceChunks);
       if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
@@ -2272,6 +2344,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           deduplicatedInputs: embedded.deduplicatedInputs,
           reused: embedded.reused
         },
+        taskReferenceSnapshotFingerprint,
+        taskReferenceSnapshotUpdatedAt: this.settings.taskReferenceSnapshotMeta?.updatedAt || "",
+        taskReferenceSnapshotAlignedAt: deviceTimestamp(),
         ...semanticIndexMetadata(indexed, taskReferenceChunks.taskReferenceHealth),
         chunkSelectionTelemetry: chunks.reduce((summary, chunk) => {
           const telemetry = chunk?.selectionTelemetry;
@@ -2300,6 +2375,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndexInProgress = false;
       this.setSidebarStatus("Ready");
       this.refreshSidebarStatus();
+      if (this.taskReferenceRepairFollowUp && !this.isUnloading) {
+        this.taskReferenceRepairFollowUp = false;
+        this.queueSemanticTaskReferenceAlignment("snapshot-fingerprint-mismatch");
+      }
     }
   }
 
@@ -2663,8 +2742,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const nextChunksById = new Map(allChunks.map((chunk) => [String(chunk.sourceId || ""), chunk]));
     const refreshIds = Array.from(changedIds).slice(0, 64);
     const refreshChunks = refreshIds.map((sourceId) => nextChunksById.get(sourceId)).filter(Boolean);
+    const previousIndex = this.semanticIndex || [];
+    const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
     try {
-      const previousIndex = this.semanticIndex || [];
       const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, this.settings.semanticIndexMeta || {});
       const embedded = refreshChunks.length ? await this.embedSemanticChunks(refreshChunks, reuseMap, "task-reference refresh") : { indexed: [], embedded: 0, reused: 0 };
       const indexed = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
@@ -2682,11 +2762,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.scheduleSemanticTaskReferenceRepair("incremental-integrity");
       return false;
     }
-    this.semanticIndex = candidateIndex;
-    this.taskReferenceIntegrity = candidateIntegrity;
+      this.semanticIndex = candidateIndex;
+      this.taskReferenceIntegrity = candidateIntegrity;
       this.invalidateSemanticRetrievalCache();
       this.semanticChunkTermCache?.clear?.();
       this.refreshSemanticIndexPathMeta();
+      const taskReferenceSnapshotFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || taskReferencePayloadFingerprint(this.settings);
+      this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidateIndex, candidateIntegrity.graph), {
+        taskReferenceSnapshotFingerprint,
+        taskReferenceSnapshotUpdatedAt: this.settings.taskReferenceSnapshotMeta?.updatedAt || previousMeta.taskReferenceSnapshotUpdatedAt || "",
+        taskReferenceSnapshotAlignedAt: deviceTimestamp()
+      });
       await this.saveSemanticIndex();
       result.completed = refreshChunks.length;
       if (refreshIds.length < changedIds.size) result.degradedReason = "task-reference-refresh-bounded";
@@ -2694,6 +2780,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         taskReferenceRefresh: { changedCount: changedIds.size, queued: result.queued, completed: result.completed, degradedReason: result.degradedReason }
       });
     } catch (error) {
+      this.semanticIndex = previousIndex;
+      this.settings.semanticIndexMeta = previousMeta;
       result.degradedReason = "task-reference-refresh-failed";
       this.logLocal("Task-reference semantic refresh deferred", { error: error.message || String(error), changedCount: changedIds.size });
     }
@@ -4391,8 +4479,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       background: false
     }));
     const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
-      retrievalTelemetry: context.semanticRetrieval?.telemetry,
-      maxChars: 5000
+      retrievalTelemetry: context.semanticRetrieval?.telemetry
     });
     response = citationResult.answer;
     this.lastChatCitationTelemetry = citationResult.telemetry;
@@ -5703,7 +5790,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const context = schedulerSemantic.context || [];
       const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, schedulerSemantic.bundles, scheduleConfig);
       const memoryMatches = this.applySchedulerMemoryToCandidates(candidates);
-      const taskContext = formatSchedulerSemanticBundles(schedulerSemantic.bundles, Math.min(8000, this.settings.maxContextChars || 8000));
+      const taskContext = formatSchedulerSemanticBundles(schedulerSemantic.bundles);
       const adaptivePack = this.buildAdaptiveContextPack({
         mode: "schedule",
         prompt: schedulerPrompt,
@@ -5831,7 +5918,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           JSON.stringify(compactTasks),
           "",
           "Per-candidate semantic evidence bundles (never merge evidence between candidates):",
-          formatSchedulerSemanticBundles(options.semanticBundles || [], Math.min(6000, this.settings.maxContextChars || 6000)) || "No semantic evidence bundle available.",
+          formatSchedulerSemanticBundles(options.semanticBundles || []) || "No semantic evidence bundle available.",
           "",
           "Adaptive task, meeting, project, and local reference context:",
           taskContext || "No matching local task context found."
@@ -6155,8 +6242,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       type: "email",
       title: subject,
       text: emailSourceText,
-      sectionName: fallbackSectionName,
-      maxChars: this.settings.maxEmailChars
+      sectionName: fallbackSectionName
     });
     let sectionName = plan.sectionName || fallbackSectionName;
     const tasks = plan.tasks || [];
@@ -6222,7 +6308,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const lines = [
       "# Cloudflare Email-To-Todoist Setup",
       "",
-      `Updated: ${deviceTimestamp()}`,
+      `Updated: ${formatDeviceDateTime()}`,
       "",
       "Use this checklist when setting up Email-To-Todoist for your own Cloudflare account, domain, Worker, and forwarding address.",
       "",
@@ -6527,7 +6613,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             attemptPrompt,
             "",
             "Relevant local semantic-index context:",
-            formatContext(plan.semanticContext || [], Number.POSITIVE_INFINITY, this.settings, options.sourceTitle || plan.sourceSummary || "") || "No additional semantic context."
+            formatContext(plan.semanticContext || [], this.settings, options.sourceTitle || plan.sourceSummary || "") || "No additional semantic context."
           ].join("\n")
         }));
         const parsed = JSON.parse(json);
@@ -9244,17 +9330,24 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.activeTab = "Setup";
   }
 
+  goTo(tab) {
+    this.activeTab = tab;
+    this.display();
+  }
+
   display() {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
+    const tabNames = ["Setup", "AI & Search", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"];
     let activeButton = null;
-    for (const tab of ["Setup", "Basic", "API Access", "Email-To-Todoist", "Notes-To-Todoist", "Daily Scheduler", "Task Deduplication", "References", "Activity"]) {
-      const button = tabs.createEl("button", { text: tab });
+    for (const tab of tabNames) {
+      const button = tabs.createEl("button", { text: tab, attr: { type: "button", "aria-label": `Open ${tab} settings` } });
       if (this.activeTab === tab) {
         button.addClass("is-active");
+        button.setAttribute("aria-current", "page");
         activeButton = button;
       }
       button.onclick = () => {
@@ -9263,15 +9356,15 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
         this.display();
       };
     }
-    if (this.activeTab === "Setup") this.renderSetup(containerEl);
-    if (this.activeTab === "Basic") this.renderBasic(containerEl);
-    if (this.activeTab === "API Access") this.renderApi(containerEl);
-    if (this.activeTab === "Email-To-Todoist") this.renderEmail(containerEl);
-    if (this.activeTab === "Notes-To-Todoist") this.renderNotes(containerEl);
-    if (this.activeTab === "Daily Scheduler") this.renderScheduleToday(containerEl);
-    if (this.activeTab === "Task Deduplication") this.renderTaskDeduplication(containerEl);
-    if (this.activeTab === "References") this.renderReferences(containerEl);
-    if (this.activeTab === "Activity") this.renderActivity(containerEl);
+    const renderers = {
+      Setup: "renderSetup",
+      "AI & Search": "renderAiSearch",
+      "Task Workflows": "renderTaskWorkflows",
+      "Daily Scheduler": "renderScheduleToday",
+      "Task Integrity": "renderTaskIntegrity",
+      Activity: "renderActivity"
+    };
+    this[renderers[this.activeTab] || "renderSetup"](containerEl);
     tabs.scrollLeft = Number(this.tabScrollLeft || 0);
     if (activeButton) {
       const alignActiveTab = () => activeButton.scrollIntoView({ block: "nearest", inline: "center" });
@@ -9281,316 +9374,172 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 
   renderSetup(containerEl) {
-    settingsHeading(containerEl, "Quick Setup", "Follow these steps in order. AI credentials and Todoist access are required for both workflows. Cloudflare is optional and only needed for Email-To-Todoist.");
-    settingsHeading(containerEl, "Step 1 - AI Provider", "Create a provider key in your browser, paste it below, then validate. OpenAI is the default provider; Gemini remains optional.");
-    setupStatusSetting(containerEl, "Open provider key pages", aiSetupSummary(this.plugin.settings), [
-      ["Gemini API keys", () => this.plugin.openSetupUrl("https://aistudio.google.com/app/apikey")],
-      ["Gemini instructions", () => this.plugin.openSetupUrl("https://ai.google.dev/gemini-api/docs/api-key")],
-      ["OpenAI API keys", () => this.plugin.openSetupUrl("https://platform.openai.com/api-keys")]
+    settingsHeading(containerEl, "Setup", "Check your connections here, then use the buttons to open the one place where each setting lives.");
+    setupStatusSetting(containerEl, "AI provider", aiSetupSummary(this.plugin.settings), [
+      ["Configure AI & Search", () => this.goTo("AI & Search")],
+      ["Validate AI", async () => { try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${error.message || error}`); } }]
     ]);
-    secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
-    secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
+    setupStatusSetting(containerEl, "Todoist", todoistSetupSummary(this.plugin.settings), [
+      ["Configure Task Workflows", () => this.goTo("Task Workflows")],
+      ["Validate Todoist", async () => { try { await this.plugin.validateTodoistSetup(true); this.display(); } catch (error) { new Notice(`Todoist setup check failed: ${error.message || error}`); } }]
+    ]);
+    setupStatusSetting(containerEl, "Notes workflow", notesSetupSummary(this.plugin.settings), [
+      ["Open Task Workflows", () => this.goTo("Task Workflows")],
+      ["Validate notes", async () => { try { await this.plugin.validateNotesWorkflowSetup(true); this.display(); } catch (error) { new Notice(`Notes setup check failed: ${error.message || error}`); } }]
+    ]);
+    setupStatusSetting(containerEl, "Email workflow (optional)", emailSetupSummary(this.plugin.settings), [
+      ["Open Task Workflows", () => this.goTo("Task Workflows")],
+      ["Validate email", async () => { try { await this.plugin.validateEmailSetup(true); this.display(); } catch (error) { new Notice(`Email setup check failed: ${error.message || error}`); } }]
+    ]);
+    setupStatusSetting(containerEl, "Overall setup", "Run a bounded check for services that have credentials saved. No note content is sent by this check.", [
+      ["Check setup", async () => { await this.plugin.validateConfiguredSetup(true); this.display(); }]
+    ]);
+    settingsHeading(containerEl, "Next steps", "AI & Search holds provider keys, models, search, and sidebar behavior. Task Workflows holds Todoist, note, and email settings. Daily Scheduler and Task Integrity hold their own workflow controls.");
+  }
+
+  renderAiSearch(containerEl) {
+    settingsHeading(containerEl, "Provider and access", "Choose one preferred provider. Keys are stored locally and sent only to the provider operations you run.");
     aiProviderSetting(containerEl, this.plugin, () => this.display());
-    settingsHeading(containerEl, "AI Models", "Choose the primary chat model, one same-provider fallback, and the embedding model used for semantic vault indexing.");
-    new Setting(containerEl).setName("Configured AI models").setDesc(configuredAiModelSummary(this.plugin));
-    modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels", () => this.display());
-    reasoningEffortSetting(containerEl, "Primary reasoning effort", "Controls reasoning for the selected primary model. Provider default preserves the model provider's default behavior.", this.plugin, "chatReasoningEffort", this.plugin.settings.chatModel);
-    modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
-    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
-    toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
+    secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
+    secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
+    settingsHeading(containerEl, "Chat and fallback models", "Choose the primary model, one same-provider fallback, and their reasoning levels.");
+    new Setting(containerEl).setName("Configured models").setDesc(configuredAiModelSummary(this.plugin));
+    modelDropdownSetting(containerEl, "Primary chat model", "Used for chat, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels", () => this.display());
+    reasoningEffortSetting(containerEl, "Primary reasoning", "Controls the primary model's reasoning level.", this.plugin, "chatReasoningEffort", this.plugin.settings.chatModel);
+    toggleSetting(containerEl, "Use same-provider fallback", "Retry temporary model failures with a compatible model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin, () => this.display());
     const fallbackModel = this.plugin.settings.chatFallbackModel || this.plugin.sameProviderFallbackModels(this.plugin.settings.chatModel)[0] || this.plugin.settings.chatModel;
-    reasoningEffortSetting(containerEl, "Fallback reasoning effort", "Controls reasoning for the selected fallback model. Provider default preserves the model provider's default behavior.", this.plugin, "chatFallbackReasoningEffort", fallbackModel);
-    toggleSetting(containerEl, "Optimize structured AI token use", "Keep the selected reasoning effort for chat, task extraction, and descriptions, but cap simple scheduler and policy calls at low reasoning. AI duplicate checks use their own reasoning setting. Disable this to use the selected global reasoning effort for calls without a dedicated setting.", this.plugin, "optimizeStructuredAiUsage");
-    toggleSetting(containerEl, "Use OpenAI prompt caching", "Enabled by default. For GPT 5.6 and newer OpenAI models, cache only stable schemas and system instructions with an explicit breakpoint. Changing note, email, vault, and task content stays outside the cached prefix. Turning this off disables cache reads and billable cache writes for these models. Cache activity is included in local token diagnostics.", this.plugin, "enableOpenAiPromptCaching");
-    toggleSetting(containerEl, "Show fallback model in chat", "When a sidebar answer uses the fallback model, append a short note at the bottom of the response.", this.plugin, "showAiFallbackNotice");
-    new Setting(containerEl).setName("Available AI models").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
-      try {
-        await this.plugin.refreshOpenAIModels(true);
-        this.display();
-      } catch (error) {
-        new Notice(`Could not load AI models: ${error.message || error}`);
-      }
+    reasoningEffortSetting(containerEl, "Fallback reasoning", "Controls the fallback model's reasoning level.", this.plugin, "chatFallbackReasoningEffort", fallbackModel);
+    toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
+    toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls; keep your selected level for chat, tasks, and descriptions.", this.plugin, "optimizeStructuredAiUsage");
+    toggleSetting(containerEl, "Use OpenAI prompt caching", "Cache stable instructions for supported OpenAI models. Note, email, and vault content stays outside the cached portion.", this.plugin, "enableOpenAiPromptCaching");
+    new Setting(containerEl).setName("Refresh model lists").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
+      try { await this.plugin.refreshOpenAIModels(true); this.display(); } catch (error) { new Notice(`Could not load AI models: ${error.message || error}`); }
     }));
-    new Setting(containerEl).setName("Validate AI access").setDesc("Tests the saved provider key by loading available chat and embedding models.").addButton((button) => button.setButtonText("Test AI").setCta().onClick(async () => {
-      try {
-        await this.plugin.validateAiSetup(true);
-        this.display();
-      } catch (error) {
-        new Notice(`AI setup check failed: ${error.message || error}`);
-      }
+    new Setting(containerEl).setName("Validate AI access").setDesc("Loads the available models with the saved provider key.").addButton((button) => button.setButtonText("Test AI").setCta().onClick(async () => {
+      try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${error.message || error}`); }
     }));
-    settingsHeading(containerEl, "Step 2 - Todoist", "Open Todoist in a browser, copy your personal API token from Settings > Integrations > Developer, paste it below, then validate.");
-    setupStatusSetting(containerEl, "Open Todoist token pages", todoistSetupSummary(this.plugin.settings), [
-      ["Token instructions", () => this.plugin.openSetupUrl("https://todoist.com/help/articles/find-your-api-token-Jpzx9IIlB")],
-      ["Todoist web settings", () => this.plugin.openSetupUrl("https://todoist.com/app/settings/integrations/developer")]
-    ]);
+
+    settingsHeading(containerEl, "Embeddings and semantic search", "The local semantic index uses the selected embedding model and configured vault scope. Rebuild after changing the model or dimension.");
+    modelDropdownSetting(containerEl, "Embedding model", "Used to build and search the local semantic index.", this.plugin, "embeddingModel", "availableEmbeddingModels");
+    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
+    textSetting(containerEl, "Indexed folders", "Comma-separated folders. Leave blank to index the whole vault.", this.plugin, "indexedFolders");
+    folderListSetting(containerEl, "Excluded folders", "Folders ignored by semantic search and indexing.", this.plugin, "excludedFolders");
+    textSetting(containerEl, "Excluded link domains", "Comma-separated web domains omitted from prompts and descriptions.", this.plugin, "excludedLinkDomains");
+    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
+    numberSetting(containerEl, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
+    numberSetting(containerEl, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
+    numberSetting(containerEl, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
+    toggleSetting(containerEl, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
+    toggleSetting(containerEl, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
+    numberSetting(containerEl, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
+    new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true))).addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
+
+    settingsHeading(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.");
+    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
+    dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
+    numberSetting(containerEl, "Chat font size", this.plugin, "chatFontSizePx");
+    toggleSetting(containerEl, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
+    toggleSetting(containerEl, "Include active note in search", "Include the active note alongside semantic search by default.", this.plugin, "searchIncludeActiveNote");
+    numberSetting(containerEl, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
+    numberSetting(containerEl, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
+    textSetting(containerEl, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
+    taskGenerationPromptTemplateSetting(containerEl, this.plugin);
+    new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
+    new Setting(containerEl).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
+
+    settingsHeading(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.");
+    toggleSetting(containerEl, "Publish MCP bridge manifest", "Point an external read-only bridge at existing plugin databases without copying them.", this.plugin, "externalMcpExportEnabled");
+    textSetting(containerEl, "MCP bridge folder", "Vault folder for the discoverable bridge manifest.", this.plugin, "externalMcpExportFolder");
+    setupStatusSetting(containerEl, "MCP bridge status", externalMcpExportSummary(this.plugin), [["Refresh bridge", async () => { try { await this.plugin.writeExternalMcpExport(true); this.display(); } catch (error) { new Notice(`Could not refresh external MCP bridge: ${error.message || error}`); } }]]);
+  }
+
+  renderTaskWorkflows(containerEl) {
+    settingsHeading(containerEl, "Todoist", "Todoist is the write target for note and email workflows. Choose the project once here.");
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
-    new Setting(containerEl).setName("Validate Todoist access").setDesc("Tests the saved Todoist token and refreshes available projects.").addButton((button) => button.setButtonText("Test Todoist").setCta().onClick(async () => {
-      try {
-        await this.plugin.validateTodoistSetup(true);
-        this.display();
-      } catch (error) {
-        new Notice(`Todoist setup check failed: ${error.message || error}`);
-      }
-    }));
-    settingsHeading(containerEl, "Step 3 - Notes-To-Todoist", "Enable the Notes-to-Todoist workflow in Semantic Todoist Sync after AI and Todoist both validate. Cloudflare is not required for note tasks.");
-    setupStatusSetting(containerEl, "Notes-To-Todoist", notesSetupSummary(this.plugin.settings), [
-      ["Enable", async () => {
-        try {
-          await this.plugin.validateNotesWorkflowSetup(false);
-          this.plugin.settings.notesAutoSync = true;
-          await this.plugin.saveSettings();
+    settingsHeading(containerEl, "Shared task generation", "These limits and formatting rules apply to both note and email task generation.");
+    numberSetting(containerEl, "Maximum main tasks", this.plugin, "maxGeneratedMainTasks");
+    numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
+    numberSetting(containerEl, "Maximum Todoist description characters", this.plugin, "todoistDescriptionMaxChars");
+    subtaskCriteriaSettings(containerEl, this.plugin);
+    toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// links when task references are shown in the sidebar.", this.plugin, "linksAppURI");
+    numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
+
+    settingsHeading(containerEl, "Notes-To-Todoist", "Create and sync tasks from notes or selected text. Required-action markers remain mandatory coverage anchors.");
+    textSetting(containerEl, "Required-action hashtags", "Comma-separated markers such as #todo that require a relevant generated task.", this.plugin, "noteActionMarkerTags");
+    textSetting(containerEl, "Main sync tag", "Marker used on main task lines.", this.plugin, "syncTag");
+    textSetting(containerEl, "Subtask sync tag", "Marker used on indented subtask lines.", this.plugin, "subtaskSyncTag");
+    toggleSetting(containerEl, "Keep sync markers out of labels", "Do not send internal marker tags to Todoist labels.", this.plugin, "excludeSyncTagsFromLabels");
+    toggleSetting(containerEl, "Automatic note sync", "Sync changed note task lines while Obsidian is open.", this.plugin, "notesAutoSync");
+    numberSetting(containerEl, "Note sync interval seconds", this.plugin, "syncIntervalSeconds");
+    numberSetting(containerEl, "Note sync workers", this.plugin, "syncWorkerCount");
+    numberSetting(containerEl, "Maximum note source characters", this.plugin, "maxNoteChars");
+    toggleSetting(containerEl, "Add source citations to note descriptions", "Include source references and context-note citations in note-created Todoist descriptions.", this.plugin, "noteIncludeSourceListInDescriptions");
+    taskInstructionSettings(containerEl, this.plugin, "Note task instructions", "note");
+    new Setting(containerEl).setName("Sync note tasks").addButton((button) => button.setButtonText("Sync").setCta().onClick(() => this.plugin.syncNoteTasks()));
+
+    const legacyMode = this.plugin.settings.legacyTodoistIdMode === "convert" ? "convert" : "preserve";
+    new Setting(containerEl)
+      .setName("Existing Todoist IDs")
+      .setDesc(legacyTodoistIdModeSummary(this.plugin.settings))
+      .addDropdown((dropdown) => {
+        dropdown.addOption("preserve", "Preserve existing IDs");
+        dropdown.addOption("convert", "Convert compatible IDs to OIDs");
+        dropdown.setValue(legacyMode).onChange(async (value) => {
+          await this.plugin.setLegacyTodoistIdMode(value);
           this.display();
-        } catch (error) {
-          new Notice(`Notes-To-Todoist setup is incomplete: ${error.message || error}`);
-        }
-      }],
-      ["Validate", async () => {
-        try {
-          await this.plugin.validateNotesWorkflowSetup(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Notes-To-Todoist setup check failed: ${error.message || error}`);
-        }
-      }],
-      ["Sync now", () => this.plugin.syncNoteTasks(true)]
-    ]);
-    settingsHeading(containerEl, "Existing Note Tasks", "Choose how Semantic Todoist Sync should handle tasks that already contain Todoist IDs from another plugin or an older workflow.");
-    setupStatusSetting(containerEl, "Todoist ID migration", legacyTodoistIdModeSummary(this.plugin.settings), [
-      ["Start with OIDs now", async () => {
-        await this.plugin.setLegacyTodoistIdMode("preserve");
-        new Notice("Existing Todoist ID task lines will be left alone. New Semantic Todoist Sync tasks will use OIDs.");
-        this.display();
-      }],
-      ["Convert existing IDs", async () => {
-        try {
-          await this.plugin.setLegacyTodoistIdMode("convert");
-          await this.plugin.rebuildTodoistReferenceTable(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Could not convert existing Todoist IDs: ${error.message || error}`);
-        }
-      }],
-      ["Recover Todoist IDs", async () => {
-        try {
-          await this.plugin.recoverTodoistIdsFromTaskNames(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Could not recover Todoist IDs: ${error.message || error}`);
-        }
-      }]
-    ]);
-    settingsHeading(containerEl, "Step 4 - Email-To-Todoist Optional", "Use this only if you want forwarded emails processed through your own Cloudflare Worker. The compatible Worker keeps a small KV queue state key so empty pending checks avoid KV list usage. The Worker token below is a local shared secret generated by this plugin, not a Cloudflare account API token.");
-    setupStatusSetting(containerEl, "Open Cloudflare setup pages", `${emailSetupSummary(this.plugin.settings)} Use Email Routing for inbound email. Automatic polling is clamped to at least 420 seconds to protect Cloudflare KV Free limits. Use Cloudflare API Tokens only for advanced deployment tooling; this plugin does not need your Cloudflare account API token during normal use.`, [
-      ["Email Routing", () => this.plugin.openSetupUrl("https://dash.cloudflare.com/?to=/:account/:zone/email/routing")],
-      ["API tokens advanced", () => this.plugin.openSetupUrl("https://dash.cloudflare.com/profile/api-tokens")],
-      ["Email Routing docs", () => this.plugin.openSetupUrl("https://developers.cloudflare.com/email-routing/")],
-      ["Workers docs", () => this.plugin.openSetupUrl("https://developers.cloudflare.com/workers/")]
-    ]);
-    textSetting(containerEl, "Cloudflare Worker URL", "Paste the HTTPS URL for your deployed email queue Worker.", this.plugin, "workerUrl");
+        });
+      })
+      .addButton((button) => button.setButtonText("Recover IDs").onClick(async () => {
+        try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {}
+      }));
+
+    settingsHeading(containerEl, "Email-To-Todoist", "Process forwarded email through your own Cloudflare Worker. This workflow has no user-facing character cap; use the source and task rules below to shape generated tasks.");
+    textSetting(containerEl, "Cloudflare Worker URL", "HTTPS queue endpoint.", this.plugin, "workerUrl");
     secretSetting(containerEl, "Cloudflare Worker token", this.plugin, "workerToken");
-    setupStatusSetting(containerEl, "Worker shared secret", "Click Generate token, then copy this token into your Cloudflare Worker as the shared authorization secret expected by the Worker. This is separate from Cloudflare API tokens.", [
-      ["Generate token", async () => {
-        try {
-          await this.plugin.generateWorkerToken(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Could not generate Worker token: ${error.message || error}`);
-        }
-      }],
+    toggleSetting(containerEl, "Automatically process new email", "Poll the Worker queue while Obsidian is open.", this.plugin, "autoProcessEmails");
+    numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
+    textSetting(containerEl, "Email log folder", "Vault folder for the plain-language processing log.", this.plugin, "emailLogFolder");
+    toggleSetting(containerEl, "Add source citations to email descriptions", "Include source references and context-note citations in email-created Todoist descriptions.", this.plugin, "emailIncludeSourceListInDescriptions");
+    new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
+    taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
+    setupStatusSetting(containerEl, "Cloudflare setup", emailSetupSummary(this.plugin.settings), [
+      ["Generate token", async () => { try { await this.plugin.generateWorkerToken(true); this.display(); } catch (error) { new Notice(`Could not generate Worker token: ${error.message || error}`); } }],
       ["Copy token", async () => {
         try {
-          if (!this.plugin.settings.workerToken) await this.plugin.generateWorkerToken(false);
-          await navigator.clipboard.writeText(this.plugin.settings.workerToken);
+          const token = this.plugin.settings.workerToken || await this.plugin.generateWorkerToken(false);
+          if (!globalThis.navigator?.clipboard?.writeText) throw new Error("Clipboard is unavailable; select the token field to copy it.");
+          await globalThis.navigator.clipboard.writeText(token);
           new Notice("Worker token copied.");
         } catch (error) {
           new Notice(`Could not copy Worker token: ${error.message || error}`);
         }
       }],
-      ["Setup note", async () => {
-        try {
-          await this.plugin.createCloudflareSetupNote(true);
-        } catch (error) {
-          new Notice(`Could not create setup note: ${error.message || error}`);
-        }
-      }],
-      ["Enable email", async () => {
-        try {
-          this.plugin.requireAiAccess();
-          this.plugin.requireTodoistAccess();
-          this.plugin.requireEmailWorkerAccess();
-          this.plugin.settings.autoProcessEmails = true;
-          await this.plugin.saveSettings();
-          this.display();
-        } catch (error) {
-          new Notice(`Email setup is incomplete: ${error.message || error}`);
-        }
-      }],
-      ["Validate", async () => {
-        try {
-          await this.plugin.validateEmailSetup(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Email setup check failed: ${error.message || error}`);
-        }
-      }]
+      ["Create setup note", async () => { try { await this.plugin.createCloudflareSetupNote(true); } catch (error) { new Notice(`Could not create setup note: ${error.message || error}`); } }],
+      ["Validate email", async () => { try { await this.plugin.validateEmailSetup(true); this.display(); } catch (error) { new Notice(`Email setup check failed: ${error.message || error}`); } }]
     ]);
-    new Setting(containerEl).setName("Validate configured setup").setDesc("Checks only the services with credentials saved in settings. It does not send vault notes unless you rebuild the semantic index or run task creation.").addButton((button) => button.setButtonText("Check setup").setCta().onClick(async () => {
-      await this.plugin.validateConfiguredSetup(true);
-      this.display();
-    }));
-    settingsHeading(containerEl, "Privacy Basics", "API keys stay in this plugin's local Obsidian settings. Vault note content is sent to the selected AI provider only for chat, semantic indexing, task extraction, and task description generation. Todoist receives only task data. Cloudflare receives forwarded email content only when Email-To-Todoist is configured and used.");
-  }
-
-  renderBasic(containerEl) {
-    settingsHeading(containerEl, "Sidebar And Prompts", "Controls how the sidebar behaves and where prompt templates are loaded from. AI model selection now lives in Setup.");
-    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic vault search and active-note context for sourced answers. Chat is a lighter general conversation mode. Task Creation is for prompts that generate Todoist-ready tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
-    dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
-    numberSetting(containerEl, "Chat font size px", this.plugin, "chatFontSizePx");
-    toggleSetting(containerEl, "Auto-add active content to context", "Include active note content in sidebar chat.", this.plugin, "autoAddActiveContentToContext");
-    toggleSetting(containerEl, "Include active note in sidebar search by default", "The sidebar switch can still be changed per session.", this.plugin, "searchIncludeActiveNote");
-    numberSetting(containerEl, "Max chat context chunks", this.plugin, "maxChatContextChunks");
-    numberSetting(containerEl, "Max active-note context characters", this.plugin, "maxActiveNoteContextChars");
-    settingsHeading(containerEl, "Prompts");
-    textSetting(containerEl, "Prompts folder", "Markdown files in this folder appear as prompt actions. Use action: schedule-today for the scheduler prompt; scheduler settings still control the actual rules.", this.plugin, "promptTemplatesFolder");
-    taskGenerationPromptTemplateSetting(containerEl, this.plugin);
-    new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
-    new Setting(containerEl).setName("Run prompts").setDesc("Runs custom prompts. Prompts can insert plain AI responses or create task lists when createTasks is true.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
-  }
-
-  renderApi(containerEl) {
-    settingsHeading(containerEl, "API Keys");
-    secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
-    secretSetting(containerEl, "Google API key", this.plugin, "googleApiKey");
-    secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
-    todoistProjectSetting(containerEl, this.plugin, () => this.display());
-    settingsHeading(containerEl, "Cloudflare");
-    textSetting(containerEl, "Cloudflare Worker URL", "Email queue endpoint.", this.plugin, "workerUrl");
-    secretSetting(containerEl, "Cloudflare Worker token", this.plugin, "workerToken");
-    new Setting(containerEl).setName("Cloudflare email setup").setDesc("Create or refresh a plain-language setup checklist for a new Cloudflare account, domain, worker, or forwarding address. This does not change the working email processor.").addButton((button) => button.setButtonText("Create setup note").onClick(async () => {
-      try {
-        await this.plugin.createCloudflareSetupNote(true);
-      } catch (error) {
-        new Notice(`Could not create setup note: ${error.message || error}`);
-      }
-    }));
-    settingsHeading(containerEl, "Semantic Index");
-    textSetting(containerEl, "Indexed folders", "Comma-separated. Leave blank for whole vault.", this.plugin, "indexedFolders");
-    folderListSetting(containerEl, "Excluded folders", "Folders ignored by search and semantic indexing. Note sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist.", this.plugin, "excludedFolders");
-    textSetting(containerEl, "Excluded link domains", "Comma-separated domains omitted from AI task prompts and Todoist descriptions. Subdomains are included. Example: internal.example.com.", this.plugin, "excludedLinkDomains");
-    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
-    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
-    numberSetting(containerEl, "Index chunk size characters", this.plugin, "semanticIndexMaxChunkChars");
-    numberSetting(containerEl, "Max index chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
-    numberSetting(containerEl, "Index embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
-    toggleSetting(containerEl, "Use note created time in semantic ranking", "Recommended. Add frontmatter such as created: [\"2026-05-20 13:43\"] to each Markdown note so semantic search can prefer the most current meeting guidance. This value is stored in the semantic index and used for context ranking. If this is off, or if the note has no created value, the plugin uses file metadata instead: created time for freshness and modified time for note updates.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
-    toggleSetting(containerEl, "Automatically update semantic index", "Re-index created or modified notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
-    numberSetting(containerEl, "Semantic index delay seconds", this.plugin, "semanticIndexDelaySeconds");
-    new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin))
-      .addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)))
-      .addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
-    settingsHeading(containerEl, "External MCP Bridge", "Optional compatibility manifest for a separate Obsidian MCP server plugin such as MCPVault. This plugin does not start an MCP server.");
-    toggleSetting(containerEl, "Publish MCP bridge manifest", "When enabled, write a small vault-readable manifest that points an external MCP server to the existing Semantic Todoist Sync databases. It does not copy or rebuild the semantic index, shards, Todoist cache, or reference table.", this.plugin, "externalMcpExportEnabled");
-    textSetting(containerEl, "MCP bridge folder", "Vault folder where the bridge manifest is written. Keep it outside hidden folders such as .obsidian so file-based MCP tools can discover it.", this.plugin, "externalMcpExportFolder");
-    setupStatusSetting(containerEl, "External MCP bridge", externalMcpExportSummary(this.plugin), [
-      ["Refresh bridge", async () => {
-        try {
-          await this.plugin.writeExternalMcpExport(true);
-          this.display();
-        } catch (error) {
-          new Notice(`Could not refresh external MCP bridge: ${error.message || error}`);
-        }
-      }]
-    ]);
-  }
-
-  renderEmail(containerEl) {
-    settingsHeading(containerEl, "Automation");
-    toggleSetting(containerEl, "Automatically process new emails", "Poll Cloudflare for pending email tasks while Obsidian is open. Compatible Workers use a KV queue state key so empty checks avoid KV list operations.", this.plugin, "autoProcessEmails");
-    numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
-    new Setting(containerEl).setName("Last email poll").setDesc(this.plugin.settings.lastEmailPollAt || "Not yet polled.");
-    new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
-    settingsHeading(containerEl, "Email Content");
-    numberSetting(containerEl, "Maximum email characters", this.plugin, "maxEmailChars");
-    textSetting(containerEl, "Email log folder", "Plain-language processing log folder.", this.plugin, "emailLogFolder");
-    toggleSetting(containerEl, "Add source list and citations to Todoist descriptions", "Append source references and add context note numbers like (1) beside email description sentences primarily supported by context notes.", this.plugin, "emailIncludeSourceListInDescriptions");
-    settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
-    numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
-    numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
-    subtaskCriteriaSettings(containerEl, this.plugin);
-    taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
-  }
-
-  renderNotes(containerEl) {
-    settingsHeading(containerEl, "Marker Tags", "Tags used in note task lines to mark main tasks and subtasks for Todoist sync.");
-    textSetting(containerEl, "Required-action hashtags", "Comma-separated hashtags that require at least one relevant generated task for each marked topic or item. Repeated references to the same action may become one task. Default: #todo.", this.plugin, "noteActionMarkerTags");
-    textSetting(containerEl, "Main sync tag", "Semantic Todoist Sync main task marker. Default: #STsync.", this.plugin, "syncTag");
-    textSetting(containerEl, "Subtask sync tag", "Indented subtask marker. Default: #STSubSync.", this.plugin, "subtaskSyncTag");
-    toggleSetting(containerEl, "Do not sync marker tags as Todoist labels", "", this.plugin, "excludeSyncTagsFromLabels");
-    settingsHeading(containerEl, "Automatic Sync");
-    toggleSetting(containerEl, "Automatic note sync", "Sync changed note task lines automatically.", this.plugin, "notesAutoSync");
-    numberSetting(containerEl, "Automatic sync interval seconds", this.plugin, "syncIntervalSeconds");
-    numberSetting(containerEl, "Sync worker count", this.plugin, "syncWorkerCount");
-    settingsHeading(containerEl, "Note Task Formatting");
-    toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// task links instead of web links when the AI references tasks from the local OID table.", this.plugin, "linksAppURI");
-    numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
-    subtaskCriteriaSettings(containerEl, this.plugin);
-    settingsHeading(containerEl, "Task Generation Limits", "Hard caps applied to AI-created tasks before anything is inserted or synced.");
-    numberSetting(containerEl, "Maximum main tasks per email or note", this.plugin, "maxGeneratedMainTasks");
-    numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
-    numberSetting(containerEl, "Maximum note characters for task extraction", this.plugin, "maxNoteChars");
-    numberSetting(containerEl, "Maximum Todoist description characters", this.plugin, "todoistDescriptionMaxChars");
-    toggleSetting(containerEl, "Add source list and citations to Todoist descriptions", "Append source references and add context note numbers like (1) beside note description sentences primarily supported by context notes.", this.plugin, "noteIncludeSourceListInDescriptions");
-    new Setting(containerEl).setName("Sync note tasks").addButton((button) => button.setButtonText("Sync").setCta().onClick(() => this.plugin.syncNoteTasks()));
-    taskInstructionSettings(containerEl, this.plugin, "Note task instructions", "note");
-  }
-
-  renderActivity(containerEl) {
-    containerEl.createEl("h3", { text: "Plugin Activity" });
-    settingsHeading(containerEl, "AI And Semantic Index", "Current model and local semantic index status. Available model counts are shown as supporting detail.");
-    activitySetting(containerEl, "Active AI models", activeModelSummary(this.plugin.settings));
-    activitySetting(containerEl, "Semantic index", indexSummary(this.plugin));
-    activitySetting(containerEl, "Index files", indexFilesSummary(this.plugin));
-    activitySetting(containerEl, "Available models", availableModelSummary(this.plugin.settings));
-    settingsHeading(containerEl, "Workflow Activity");
-    activitySetting(containerEl, "Tracking timezone", `${deviceTimeZone()} using device-local timestamps.`);
-    activitySetting(containerEl, "Todoist", `${this.plugin.settings.availableTodoistProjects?.length || 0} projects loaded. ${Object.keys(this.plugin.settings.taskCache || {}).length} synced task references.`);
-    activitySetting(containerEl, "Task deduplication", `${this.plugin.settings.enableTaskDeduplication === false ? "Off" : "On"}. Last run: ${this.plugin.settings.taskDeduplicationLastRunSummary || "not yet checked"}.`);
-    activitySetting(containerEl, "Reference rebuild", `Last rebuild: ${this.plugin.settings.lastReferenceRebuildAt || "Not yet rebuilt"}. Auto-rebuild: ${this.plugin.settings.autoRebuildReferences ? "on" : "off"}. Workers: ${referenceRebuildWorkerCount(this.plugin.settings)}. Last local candidates: ${this.plugin.settings.lastReferenceRebuildCandidateCount || 0}. OID-only tasks can recover Todoist IDs by exact task-name matching.`);
-    activitySetting(containerEl, "Cloudflare email", `Last poll: ${this.plugin.settings.lastEmailPollAt || "Not yet polled"}. Auto-processing: ${this.plugin.settings.autoProcessEmails ? "on" : "off"}.`);
-    activitySetting(containerEl, "Notes sync", `Last sync: ${this.plugin.settings.lastNoteAutoSyncAt || "Not yet synced"}. Auto-sync: ${this.plugin.settings.notesAutoSync ? "on" : "off"}. Workers: ${syncWorkerCount(this.plugin.settings)}.`);
-    new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
-    settingsHeading(containerEl, "Activity Log Console", "Selectable local workflow log. Progress ticks stay in the status bar; starts, completions, failures, and notable skips are kept here.");
-    const log = containerEl.createEl("pre", { cls: "semantic-todoist-activity-log" });
-    log.setAttribute("tabindex", "0");
-    log.setAttribute("aria-label", "Semantic Todoist Sync activity log");
-    log.setText(activityLogText(this.plugin.settings));
   }
 
   renderScheduleToday(containerEl) {
-    settingsHeading(containerEl, "Schedule Today's Tasks", "Plan today's highest-priority Todoist work into compact time blocks. Todoist remains the source of scheduled task times and durations.");
-    toggleSetting(containerEl, "Enable scheduler", "Shows the Schedule Today's Tasks prompt action in the sidebar chooser and command palette.", this.plugin, "scheduleTodayEnabled");
-    new Setting(containerEl).setName("Run scheduler preview").setDesc("Builds a preview only. Todoist is not updated until Apply is selected.").addButton((button) => button.setButtonText("Preview").setCta().onClick(() => this.plugin.openScheduleTodayPreview()));
-
-    settingsHeading(containerEl, "Workday", "Controls the default time window and protected lunch block used for today's schedule.");
-    timeSetting(containerEl, "Start time", "Start of the schedulable workday.", this.plugin, "scheduleTodayStartTime");
-    timeSetting(containerEl, "End time", "End of the schedulable workday.", this.plugin, "scheduleTodayEndTime");
-    timeSetting(containerEl, "Lunch starts", "Default lunch block start. The preview can manually override it.", this.plugin, "scheduleTodayLunchStartTime");
+    settingsHeading(containerEl, "Schedule Today's Tasks", "Preview open Todoist work in a realistic workday. Todoist is not changed until you choose Apply in the preview.");
+    toggleSetting(containerEl, "Enable scheduler", "Show the scheduler in the sidebar and command palette.", this.plugin, "scheduleTodayEnabled");
+    new Setting(containerEl).setName("Run scheduler preview").setDesc("Builds a reviewable preview only.").addButton((button) => button.setButtonText("Preview").setCta().onClick(() => this.plugin.openScheduleTodayPreview()));
+    settingsHeading(containerEl, "Workday", "Set the default work window and lunch block.");
+    timeSetting(containerEl, "Start time", "Start of the workday.", this.plugin, "scheduleTodayStartTime");
+    timeSetting(containerEl, "End time", "End of the workday.", this.plugin, "scheduleTodayEndTime");
+    timeSetting(containerEl, "Lunch starts", "Start of the protected lunch block.", this.plugin, "scheduleTodayLunchStartTime");
     numberSetting(containerEl, "Lunch length minutes", this.plugin, "scheduleTodayLunchMinutes");
     numberSetting(containerEl, "Minimum task block minutes", this.plugin, "scheduleTodayMinBlockMinutes");
     numberSetting(containerEl, "Maximum task block minutes", this.plugin, "scheduleTodayMaxBlockMinutes");
-    numberSetting(containerEl, "Add-in flex minutes", this.plugin, "scheduleTodayAddWindowMinutes");
-
-    settingsHeading(containerEl, "Task Selection", "Chooses which open Todoist tasks are considered before the deterministic scheduler picks what fits today.");
-    toggleSetting(containerEl, "Include overdue tasks", "Include open tasks due before today.", this.plugin, "scheduleTodayIncludeOverdue");
+    numberSetting(containerEl, "Flexible window minutes", this.plugin, "scheduleTodayAddWindowMinutes");
+    settingsHeading(containerEl, "Task selection", "Choose which open tasks enter the preview.");
+    toggleSetting(containerEl, "Include overdue tasks", "Include open overdue tasks.", this.plugin, "scheduleTodayIncludeOverdue");
     numberSetting(containerEl, "Due window days", this.plugin, "scheduleTodayDueWindowDays");
-    toggleSetting(containerEl, "Include subtasks", "Allow subtasks to be scheduled directly.", this.plugin, "scheduleTodayIncludeSubtasks");
-    toggleSetting(containerEl, "Independent subtasks", "Allow subtasks such as reviews and follow-ups to move independently from the parent.", this.plugin, "scheduleTodayAllowIndependentSubtasks");
+    toggleSetting(containerEl, "Include subtasks", "Allow open subtasks to be scheduled directly.", this.plugin, "scheduleTodayIncludeSubtasks");
+    toggleSetting(containerEl, "Move independent subtasks", "Allow review and follow-up subtasks to move independently.", this.plugin, "scheduleTodayAllowIndependentSubtasks");
     textSetting(containerEl, "Excluded labels", "Comma-separated Todoist labels skipped by the scheduler.", this.plugin, "scheduleTodayExcludedLabels");
-
-    settingsHeading(containerEl, "Scheduling Weights", "Simple importance controls for how the deterministic scheduler ranks eligible tasks.");
+    settingsHeading(containerEl, "Scheduling weights", "Adjust how the deterministic scheduler ranks eligible tasks.");
     scheduleWeightSetting(containerEl, "Todoist priority", this.plugin, "scheduleTodayWeightTodoistPriority");
     scheduleWeightSetting(containerEl, "Deadline proximity", this.plugin, "scheduleTodayWeightDeadlineProximity");
     scheduleWeightSetting(containerEl, "Overdue status", this.plugin, "scheduleTodayWeightOverdue");
@@ -9598,92 +9547,64 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     scheduleWeightSetting(containerEl, "Semantic urgency", this.plugin, "scheduleTodayWeightSemanticUrgency");
     scheduleWeightSetting(containerEl, "Note recency", this.plugin, "scheduleTodayWeightNoteRecency");
     scheduleWeightSetting(containerEl, "Parent/subtask dependency", this.plugin, "scheduleTodayWeightParentDependency");
-
-    settingsHeading(containerEl, "Safety", "Existing timed tasks stay fixed by default. Deadlines are preserved. The last applied schedule can be undone.");
-    new Setting(containerEl).setName("Undo last applied schedule").setDesc(this.plugin.settings.scheduleTodayLastUndo?.at ? `Last applied: ${this.plugin.settings.scheduleTodayLastUndo.at}` : "No applied schedule to undo.").addButton((button) => button.setButtonText("Undo").onClick(() => this.plugin.undoLastScheduleToday(true)));
+    new Setting(containerEl).setName("Undo last applied schedule").setDesc(this.plugin.settings.scheduleTodayLastUndo?.at ? `Applied ${formatDeviceDateTime(this.plugin.settings.scheduleTodayLastUndo.at)}` : "No applied schedule to undo.").addButton((button) => button.setButtonText("Undo").onClick(() => this.plugin.undoLastScheduleToday(true)));
   }
 
-  renderTaskDeduplication(containerEl) {
-    settingsHeading(containerEl, "Task Deduplication", "Checks generated note and email tasks against the local Todoist reference table before creating anything new.");
-    toggleSetting(containerEl, "Enable task deduplication", "Enabled by default. Fast local scoring resolves confirmed matches and posts credible ambiguous candidates to chat with [dup?] for manual review. The marker is never sent to Todoist.", this.plugin, "enableTaskDeduplication");
+  renderTaskIntegrity(containerEl) {
+    settingsHeading(containerEl, "Task deduplication", "Check generated tasks against open local references before creating anything new.");
+    toggleSetting(containerEl, "Enable task deduplication", "Use conservative local matching and keep ambiguous candidates for review.", this.plugin, "enableTaskDeduplication");
     taskDeduplicationStrictnessSetting(containerEl, this.plugin);
-    toggleSetting(containerEl, "Merge labels additively", "Keep existing Todoist labels and add newly generated labels. Turn off only if newer generated task labels should replace the existing label set.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
-    toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Only omit a previously linked subtask when newer source text clearly says it is obsolete, no longer needed, or should be removed.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
-
-    settingsHeading(containerEl, "AI-Mediated Duplicate Detection", "Local matching resolves conclusive duplicates and flags credible ambiguous pairs in chat. The selected dedupe model is reserved for stronger unresolved candidates and cannot rewrite task fields. Confirmed pairs use regular task generation only when consolidation is needed.");
-    toggleSetting(containerEl, "Enable AI-mediated deduplication", "Enabled by default. When off, local merge decisions still proceed through regular task generation. When on, the selected model confirms only strong matches that local scoring cannot settle; ambiguous candidates remain a local chat review.", this.plugin, "enableAiAmbiguousTaskDeduplication");
+    toggleSetting(containerEl, "Merge labels additively", "Keep existing labels and add new labels.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
+    toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Remove a linked subtask only when newer source text clearly says it is obsolete.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
+    toggleSetting(containerEl, "Use AI for unresolved duplicates", "Ask the selected dedupe model only about strong unresolved candidates; it never rewrites task fields.", this.plugin, "enableAiAmbiguousTaskDeduplication");
     taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
     taskDeduplicationAiModelSetting(containerEl, this.plugin);
-    reasoningEffortSetting(containerEl, "AI deduplication reasoning effort", "Controls reasoning only for AI duplicate verdicts. Medium is the default for accurate last-resort checks; task descriptions and confirmed-task updates continue using the primary model reasoning setting.", this.plugin, "taskDeduplicationAiReasoningEffort", taskDeduplicationAiModel(this.plugin.settings));
-
-    settingsHeading(containerEl, "Deduplication Policy", "Plain-language rules used by local candidate matching and AI duplicate confirmation. You can also update this from the chat sidebar with an explicit dedupe policy request.");
+    reasoningEffortSetting(containerEl, "Deduplication reasoning", "Reasoning used only for AI duplicate verdicts.", this.plugin, "taskDeduplicationAiReasoningEffort", taskDeduplicationAiModel(this.plugin.settings));
     textAreaSetting(containerEl, "Deduplication policy", this.plugin, "taskDeduplicationPolicy", { compact: true });
     activitySetting(containerEl, "Policy impact", taskDeduplicationPolicyImpactText(this.plugin.settings));
     const updates = this.plugin.settings.taskDeduplicationPolicyUpdates || [];
-    activitySetting(containerEl, "Recent chat policy updates", updates.length ? updates.map((entry) => `${entry.at}: ${entry.instruction}`).join("\n") : "No chat policy updates yet.");
-    activitySetting(containerEl, "Last task deduplication run", this.plugin.settings.taskDeduplicationLastRunSummary || "No task generation run has checked duplicates yet.");
-    new Setting(containerEl).setName("Reset policy").setDesc("Restores the default conservative duplicate-detection policy.").addButton((button) => button.setButtonText("Reset").onClick(async () => {
-      this.plugin.settings.taskDeduplicationPolicy = DEFAULT_TASK_DEDUPLICATION_POLICY;
-      this.plugin.recordTaskDeduplicationPolicyUpdate("Reset from settings.");
-      await this.plugin.saveSettings();
-      this.display();
-    }));
-  }
+    activitySetting(containerEl, "Recent policy updates", updates.length ? updates.map((entry) => `${formatDeviceDateTime(entry.at)}: ${entry.instruction}`).join("\n") : "No chat policy updates yet.");
+    new Setting(containerEl).setName("Reset policy").setDesc("Restore the conservative default policy.").addButton((button) => button.setButtonText("Reset").onClick(async () => { this.plugin.settings.taskDeduplicationPolicy = DEFAULT_TASK_DEDUPLICATION_POLICY; this.plugin.recordTaskDeduplicationPolicyUpdate("Reset from settings."); await this.plugin.saveSettings(); this.display(); }));
 
-  renderReferences(containerEl) {
-    containerEl.createEl("h3", { text: "Todoist References" });
-    containerEl.createDiv({ text: "Local OID table used to connect Obsidian task lines to Todoist tasks. Todoist IDs are stored here only, not in note text." });
-    settingsHeading(containerEl, "Automatic Rebuild", "Low-frequency read-only reconciliation for the local OID table. The local vault is scanned first, and Todoist is only read when references changed or a manual rebuild is run.");
-    toggleSetting(containerEl, "Automatically rebuild reference table", "Runs separately from note task syncing while Obsidian is open.", this.plugin, "autoRebuildReferences");
+    settingsHeading(containerEl, "Local references", "Keep the OID table that connects note task lines to Todoist tasks. Rebuild is read-only.");
+    toggleSetting(containerEl, "Rebuild references automatically", "Run low-frequency local reconciliation while Obsidian is open.", this.plugin, "autoRebuildReferences");
     numberSetting(containerEl, "Reference rebuild interval minutes", this.plugin, "referenceRebuildIntervalMinutes");
-    numberSetting(containerEl, "Reference rebuild worker count", this.plugin, "referenceRebuildWorkerCount");
+    numberSetting(containerEl, "Reference rebuild workers", this.plugin, "referenceRebuildWorkerCount");
     numberSetting(containerEl, "Todoist snapshot cache minutes", this.plugin, "todoistSnapshotCacheMinutes");
-    new Setting(containerEl).setName("Last automatic rebuild").setDesc(this.plugin.settings.lastReferenceRebuildAt || "Not yet rebuilt.");
-    const rebuildSetting = new Setting(containerEl).setName("Rebuild local reference table").setDesc("Read-only Todoist reconciliation. Scans vault task references, rebuilds the local OID table from Todoist, and recovers missing Todoist IDs for OID-only note tasks by exact task-name matching. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => {
-      try {
-        await this.plugin.rebuildTodoistReferenceTable(true);
-        this.display();
-      } catch {}
-    })).addButton((button) => button.setButtonText("Recover IDs").onClick(async () => {
-      try {
-        await this.plugin.recoverTodoistIdsFromTaskNames(true);
-        this.display();
-      } catch {}
-    }));
+    const rebuildSetting = new Setting(containerEl).setName("Rebuild local references").setDesc("Reads vault references and Todoist to refresh local mappings. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => { try { await this.plugin.rebuildTodoistReferenceTable(true); this.display(); } catch {} })).addButton((button) => button.setButtonText("Recover IDs").onClick(async () => { try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {} }));
     rebuildSetting.settingEl.addClass("semantic-todoist-reference-action-setting");
-    new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
     const rows = referenceRows(this.plugin.settings);
     containerEl.createDiv({ text: `${rows.length} local reference${rows.length === 1 ? "" : "s"}.` });
     const wrapper = containerEl.createDiv({ cls: "semantic-todoist-reference-table-wrap" });
     const table = wrapper.createEl("table", { cls: "semantic-todoist-reference-table" });
-    const thead = table.createEl("thead");
-    const header = thead.createEl("tr");
-    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Scheduled", "Duration", "Deadline", "Project", "Project ID", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) {
-      header.createEl("th", { text: label });
-    }
+    const header = table.createEl("thead").createEl("tr");
+    for (const label of ["OID", "Todoist ID", "Task", "Priority", "Date", "Scheduled", "Duration", "Deadline", "Project", "Project ID", "Section", "Section ID", "Parent OID", "Parent Todoist ID", "Parent Task", "Note References", "Description", "Path", "Status"]) header.createEl("th", { text: label });
     const tbody = table.createEl("tbody");
     for (const row of rows) {
       const tr = tbody.createEl("tr");
-      tr.createEl("td", { text: row.oid });
-      tr.createEl("td", { text: row.todoistId });
-      tr.createEl("td", { text: row.task });
-      tr.createEl("td", { text: row.priority });
-      tr.createEl("td", { text: row.date });
-      tr.createEl("td", { text: row.scheduled });
-      tr.createEl("td", { text: row.duration });
-      tr.createEl("td", { text: row.deadline });
-      tr.createEl("td", { text: row.project });
-      tr.createEl("td", { text: row.projectId });
-      tr.createEl("td", { text: row.section });
-      tr.createEl("td", { text: row.sectionId });
-      tr.createEl("td", { text: row.parentOid });
-      tr.createEl("td", { text: row.parentTodoistId });
-      tr.createEl("td", { text: row.parentTask });
-      tr.createEl("td", { text: row.noteRefs });
-      tr.createEl("td", { text: row.description });
-      tr.createEl("td", { text: row.path });
-      tr.createEl("td", { text: row.status });
+      const values = [row.oid, row.todoistId, row.task, row.priority, formatDeviceDate(row.date), formatDeviceDateTime(row.scheduled), row.duration, formatDeviceDate(row.deadline), row.project, row.projectId, row.section, row.sectionId, row.parentOid, row.parentTodoistId, row.parentTask, row.noteRefs, row.description, row.path, row.status];
+      for (const value of values) tr.createEl("td", { text: value || "" });
     }
+    new Setting(containerEl).setName("Refresh references").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
+  }
+
+  renderActivity(containerEl) {
+    settingsHeading(containerEl, "Activity", "Status and timestamps are shown in your device's local format.");
+    activitySetting(containerEl, "Configured AI", `${activeModelSummary(this.plugin.settings)} ${configuredAiModelSummary(this.plugin)}`);
+    activitySetting(containerEl, "Semantic index", indexSummary(this.plugin));
+    activitySetting(containerEl, "Index files", indexFilesSummary(this.plugin));
+    activitySetting(containerEl, "Available models", availableModelSummary(this.plugin.settings));
+    activitySetting(containerEl, "Todoist", `${this.plugin.settings.availableTodoistProjects?.length || 0} projects loaded. ${Object.keys(this.plugin.settings.taskCache || {}).length} synced task references.`);
+    activitySetting(containerEl, "Task deduplication", `${this.plugin.settings.enableTaskDeduplication === false ? "Off" : "On"}. ${this.plugin.settings.taskDeduplicationLastRunSummary || "No run recorded."}`);
+    activitySetting(containerEl, "Reference rebuild", `Last rebuild: ${formatDeviceDateTime(this.plugin.settings.lastReferenceRebuildAt) || "Not yet rebuilt"}. Automatic rebuild: ${this.plugin.settings.autoRebuildReferences ? "on" : "off"}. ${this.plugin.settings.lastReferenceRebuildCandidateCount || 0} local candidates.`);
+    activitySetting(containerEl, "Email", `Last poll: ${formatDeviceDateTime(this.plugin.settings.lastEmailPollAt) || "Not yet polled"}. Automatic processing: ${this.plugin.settings.autoProcessEmails ? "on" : "off"}.`);
+    activitySetting(containerEl, "Notes sync", `Last sync: ${formatDeviceDateTime(this.plugin.settings.lastNoteAutoSyncAt) || "Not yet synced"}. Automatic sync: ${this.plugin.settings.notesAutoSync ? "on" : "off"}.`);
+    new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
+    settingsHeading(containerEl, "Activity log", "Local workflow events. Secrets and raw provider payloads are not shown.");
+    const log = containerEl.createEl("pre", { cls: "semantic-todoist-activity-log" });
+    log.setAttribute("tabindex", "0");
+    log.setAttribute("aria-label", "Semantic Todoist Sync activity log");
+    log.setText((this.plugin.settings.localLog || []).length ? (this.plugin.settings.localLog || []).map((entry) => `${formatDeviceDateTime(entry.at) || "Unknown time"}  ${entry.message}  ${activityLogDataText(entry.data || {})}`).join("\n") : "No local activity logged yet.");
   }
 }
 
@@ -9721,7 +9642,7 @@ class ScheduleTodayModal extends Modal {
     refreshScheduleSuggestions(this.preview);
     const header = contentEl.createDiv({ cls: "semantic-todoist-schedule-header" });
     header.createEl("h2", { text: "Schedule Today's Tasks" });
-    header.createDiv({ text: `${config.today} | ${minutesToClock(config.startMinutes)}-${minutesToClock(config.endMinutes)} | ${config.chunkMinutes} min chunks` });
+    header.createDiv({ text: `${formatDeviceDate(config.today)} | ${formatDeviceTime(minutesToClock(config.startMinutes))}-${formatDeviceTime(minutesToClock(config.endMinutes))} | ${config.chunkMinutes} min chunks` });
     if (this.preview.message) contentEl.createDiv({ cls: "semantic-todoist-schedule-empty", text: this.preview.message });
     const summary = contentEl.createDiv({ cls: "semantic-todoist-schedule-summary" });
     const removedItems = removedScheduleItems(this.preview);
@@ -9740,7 +9661,7 @@ class ScheduleTodayModal extends Modal {
       const row = timeline.createDiv({ cls: "semantic-todoist-schedule-slot" });
       row.style.top = `${slot * this.slotHeight}px`;
       row.dataset.minutes = String(slotStart);
-      row.createSpan({ cls: "semantic-todoist-schedule-time", text: minutesToClock(slotStart) });
+      row.createSpan({ cls: "semantic-todoist-schedule-time", text: formatDeviceTime(minutesToClock(slotStart)) });
       if (rangesOverlap(slotStart, slotStart + config.chunkMinutes, config.lunchStartMinutes, config.lunchEndMinutes)) row.addClass("is-lunch");
       row.addEventListener("dragover", (event) => {
         if (this.readDragPayload(event).id) event.preventDefault();
@@ -9770,7 +9691,7 @@ class ScheduleTodayModal extends Modal {
       const split = contentEl.createDiv({ cls: "semantic-todoist-schedule-list" });
       split.createEl("h3", { text: "Next-workday continuations" });
       for (const item of this.preview.splitSubtasks) {
-        split.createDiv({ text: `${item.content} - ${item.durationMinutes} min on ${datePart(item.scheduledDateTime)}` });
+        split.createDiv({ text: `${item.content} - ${item.durationMinutes} min on ${formatDeviceDate(item.scheduledDateTime)}` });
       }
     }
     const actions = contentEl.createDiv({ cls: "semantic-todoist-schedule-actions" });
@@ -9990,7 +9911,7 @@ class ScheduleTodayModal extends Modal {
       startMinutes: null,
       endMinutes: null,
       scheduledDateTime: "",
-      rationale: `Swapped out from ${minutesToClock(bumped.startMinutes)}-${minutesToClock(bumped.endMinutes)} for ${shortTitle(suggestion.content || "task", 42)}.`
+      rationale: `Swapped out from ${formatDeviceTime(minutesToClock(bumped.startMinutes))}-${formatDeviceTime(minutesToClock(bumped.endMinutes))} for ${shortTitle(suggestion.content || "task", 42)}.`
     });
     this.preview.bumped = (this.preview.bumped || []).filter((item) => String(item.id) !== String(bumped.id));
     this.preview.removed = (this.preview.removed || []).filter((item) => String(item.id) !== String(bumped.id));
@@ -10043,7 +9964,7 @@ class ScheduleTodayModal extends Modal {
       startMinutes: null,
       endMinutes: null,
       scheduledDateTime: "",
-      rationale: `Removed from ${minutesToClock(item.startMinutes)}-${minutesToClock(item.endMinutes)}. This leaves that time open unless you restore or move another task there.`
+      rationale: `Removed from ${formatDeviceTime(minutesToClock(item.startMinutes))}-${formatDeviceTime(minutesToClock(item.endMinutes))}. This leaves that time open unless you restore or move another task there.`
     });
     this.preview.removed = (this.preview.removed || []).filter((removed) => String(removed.id) !== String(item.id));
     this.preview.removed.push(removedItem);
@@ -10112,7 +10033,7 @@ class ScheduleTodayModal extends Modal {
     });
     const main = block.createDiv({ cls: "semantic-todoist-schedule-block-main" });
     const dependentText = item.dependentSubtasks?.length ? ` | +${item.dependentSubtasks.length} subtask${item.dependentSubtasks.length === 1 ? "" : "s"}` : "";
-    const metaText = `${minutesToClock(item.startMinutes)}-${minutesToClock(item.endMinutes)} | ${item.durationMinutes} min${item.fixed ? " | fixed" : ""}${dependentText}`;
+    const metaText = `${formatDeviceTime(minutesToClock(item.startMinutes))}-${formatDeviceTime(minutesToClock(item.endMinutes))} | ${item.durationMinutes} min${item.fixed ? " | fixed" : ""}${dependentText}`;
     const title = main.createDiv({ cls: "semantic-todoist-schedule-block-title", text: item.content });
     title.title = `${item.content} | ${metaText}`;
     main.createDiv({ cls: "semantic-todoist-schedule-block-meta", text: metaText });
@@ -10502,7 +10423,7 @@ const SETTING_DESCRIPTIONS = {
   chatFontSizePx: "Controls only the sidebar chat text size.",
   searchIncludeActiveNote: "Default for whether sidebar chat queries include the active note alongside semantic vault search.",
   maxChatContextChunks: "Maximum number of semantic search results sent to the AI for vault Q&A.",
-  maxActiveNoteContextChars: "Maximum active-note characters sent to the AI for normal chat. Task creation can use a separate note limit.",
+  maxTaskContextChunks: "Maximum semantic search results used for note and email task descriptions; this is a result count, not a character limit.",
   promptTemplatesFolder: "Markdown files in this folder become reusable prompt actions. Frontmatter can set createTasks, insertResponse, syncTasks, and action: schedule-today.",
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
@@ -10532,7 +10453,7 @@ const SETTING_DESCRIPTIONS = {
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
   autoProcessEmails: "When enabled, Obsidian polls your Cloudflare Worker for forwarded emails while the app is open.",
   emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled. To protect the Cloudflare KV Free list limit, automatic polling is clamped to at least 420 seconds.",
-  maxEmailChars: "Maximum email text sent to the AI for task extraction.",
+  maxNoteChars: "Maximum characters read from a note as a task source. This is a note-ingestion bound, not a model-context display limit.",
   emailLogFolder: "Folder where plain-language email processing logs are stored.",
   maxGeneratedMainTasks: "Hard cap on main tasks the AI may create from one note or email.",
   maxGeneratedSubtasksPerMainTask: "Hard cap on subtasks below each AI-created main task.",
@@ -10549,7 +10470,6 @@ const SETTING_DESCRIPTIONS = {
   subtaskIncludePriority: "Allow priority markers and Todoist priority on subtasks.",
   subtaskIncludeDueDate: "Allow due dates on subtasks.",
   subtaskIncludeDeadline: "Allow deadline dates on subtasks.",
-  maxNoteChars: "Maximum note text sent to the AI for task extraction.",
   todoistDescriptionMaxChars: "Maximum generated description characters before the source list is added.",
   emailIncludeSourceListInDescriptions: "When enabled, email-created Todoist descriptions include plugin-generated source references and context-note citations like (1).",
   noteIncludeSourceListInDescriptions: "When enabled, note-created Todoist descriptions include plugin-generated source references and context-note citations like (1).",
@@ -11037,6 +10957,20 @@ function activitySetting(containerEl, name, desc) {
   new Setting(containerEl).setName(name).setDesc(desc || "");
 }
 
+function activityLogDataText(value, key = "") {
+  if (value == null) return "";
+  if (typeof value === "string") {
+    return /(?:^|_)(?:at|timestamp|date|time)$/i.test(String(key || "")) ? (formatDeviceDateTime(value) || value) : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => activityLogDataText(item, key)).join(", ");
+  if (typeof value === "object") {
+    const normalized = {};
+    for (const [childKey, childValue] of Object.entries(value)) normalized[childKey] = activityLogDataText(childValue, childKey);
+    return JSON.stringify(normalized);
+  }
+  return String(value);
+}
+
 function setupStatusSetting(containerEl, name, desc, buttons = []) {
   const setting = new Setting(containerEl).setName(name).setDesc(desc || "");
   setting.settingEl.addClass("semantic-todoist-setup-step");
@@ -11504,10 +11438,10 @@ function indexFilesSummary(pluginOrSettings) {
 function modelSummary(settings) {
   const active = `Active: ${modelDisplayName(settings.chatModel)}. Embeddings: ${modelDisplayName(settings.embeddingModel)}.`;
   const openai = settings.modelsFetchedAt
-    ? `${settings.availableChatModels?.length || 0} OpenAI chat and ${settings.availableEmbeddingModels?.length || 0} OpenAI embedding models loaded at ${settings.modelsFetchedAt}`
+    ? `${settings.availableChatModels?.length || 0} OpenAI chat and ${settings.availableEmbeddingModels?.length || 0} OpenAI embedding models loaded at ${formatDeviceDateTime(settings.modelsFetchedAt)}`
     : "OpenAI models not loaded";
   const gemini = settings.geminiModelsFetchedAt
-    ? `${settings.availableGeminiModels?.length || 0} Gemini chat and ${settings.availableGeminiEmbeddingModels?.length || 0} Gemini embedding models loaded at ${settings.geminiModelsFetchedAt}`
+    ? `${settings.availableGeminiModels?.length || 0} Gemini chat and ${settings.availableGeminiEmbeddingModels?.length || 0} Gemini embedding models loaded at ${formatDeviceDateTime(settings.geminiModelsFetchedAt)}`
     : `${settings.availableGeminiModels?.length || 0} default Gemini chat model(s) available`;
   return `${active} ${openai}. ${gemini}.`;
 }
@@ -11533,13 +11467,13 @@ function modelProviderSummaries(settings) {
     {
       name: "Gemini models",
       desc: settings.geminiModelsFetchedAt
-        ? `${settings.availableGeminiModels?.length || 0} chat and ${settings.availableGeminiEmbeddingModels?.length || 0} embedding models loaded at ${settings.geminiModelsFetchedAt}.`
+        ? `${settings.availableGeminiModels?.length || 0} chat and ${settings.availableGeminiEmbeddingModels?.length || 0} embedding models loaded at ${formatDeviceDateTime(settings.geminiModelsFetchedAt)}.`
         : `${settings.availableGeminiModels?.length || 0} default chat model(s) and ${settings.availableGeminiEmbeddingModels?.length || 0} default embedding model(s) available.`
     },
     {
       name: "OpenAI models",
       desc: settings.modelsFetchedAt
-        ? `${settings.availableChatModels?.length || 0} chat and ${settings.availableEmbeddingModels?.length || 0} embedding models loaded at ${settings.modelsFetchedAt}.`
+        ? `${settings.availableChatModels?.length || 0} chat and ${settings.availableEmbeddingModels?.length || 0} embedding models loaded at ${formatDeviceDateTime(settings.modelsFetchedAt)}.`
         : "OpenAI models not loaded."
     }
   ];
@@ -11551,10 +11485,10 @@ function activeModelSummary(settings) {
 
 function availableModelSummary(settings) {
   const gemini = settings.geminiModelsFetchedAt
-    ? `Gemini: ${settings.availableGeminiModels?.length || 0} chat, ${settings.availableGeminiEmbeddingModels?.length || 0} embedding; loaded ${settings.geminiModelsFetchedAt}.`
+    ? `Gemini: ${settings.availableGeminiModels?.length || 0} chat, ${settings.availableGeminiEmbeddingModels?.length || 0} embedding; loaded ${formatDeviceDateTime(settings.geminiModelsFetchedAt)}.`
     : `Gemini: ${settings.availableGeminiModels?.length || 0} default chat, ${settings.availableGeminiEmbeddingModels?.length || 0} default embedding.`;
   const openai = settings.modelsFetchedAt
-    ? `OpenAI: ${settings.availableChatModels?.length || 0} chat, ${settings.availableEmbeddingModels?.length || 0} embedding; loaded ${settings.modelsFetchedAt}.`
+    ? `OpenAI: ${settings.availableChatModels?.length || 0} chat, ${settings.availableEmbeddingModels?.length || 0} embedding; loaded ${formatDeviceDateTime(settings.modelsFetchedAt)}.`
     : "OpenAI: not loaded.";
   return `${gemini} ${openai}`;
 }
@@ -11562,7 +11496,7 @@ function availableModelSummary(settings) {
 function activityLogText(settings) {
   const entries = settings.localLog || [];
   if (!entries.length) return "No local activity logged yet.";
-  return entries.map((entry) => `${entry.at}  ${entry.message}  ${JSON.stringify(entry.data || {})}`).join("\n");
+  return entries.map((entry) => `${formatDeviceDateTime(entry.at)}  ${entry.message}  ${activityLogDataText(entry.data || {})}`).join("\n");
 }
 
 function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS) {
@@ -12591,7 +12525,7 @@ function schedulerSemanticBundlePaths(bundle = {}) {
   return uniqueValues((bundle.chunks || []).map((chunk) => chunk.path).filter(Boolean)).slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_PATHS);
 }
 
-function formatSchedulerSemanticBundles(bundles = [], maxChars = 8000) {
+function formatSchedulerSemanticBundles(bundles = []) {
   const sections = [];
   for (const bundle of bundles || []) {
     const identity = [
@@ -12620,7 +12554,7 @@ function formatSchedulerSemanticBundles(bundles = [], maxChars = 8000) {
     ].join(" | "));
     sections.push([`[scheduler candidate] ${identity}`, `state=${bundle.indexState || "ready"} degraded_reason=${bundle.degradedReason || ""}`, evidence.length ? evidence.join("\n") : "evidence=none"].join("\n"));
   }
-  return truncateMarkdownAtWord(sections.join("\n\n"), Math.max(1000, Number(maxChars || 8000)));
+  return sections.join("\n\n");
 }
 
 function schedulerMemoryEntry(memory, task) {
@@ -15406,9 +15340,9 @@ function isSemanticNoiseChunk(chunk = "") {
   return todoistPlaceholder && text.length < 500;
 }
 
-function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = "", options = {}) {
+function formatContext(chunks, settings = DEFAULT_SETTINGS, query = "", options = {}) {
   const hasCitationMap = options.citationMap instanceof Map;
-  return clamp(chunks.map((chunk, index) => {
+  return chunks.map((chunk, index) => {
     const source = sourceReference(chunk, options.basePath || "");
     const citationNumber = source ? options.citationMap?.get(source) : null;
     const heading = citationNumber
@@ -15423,7 +15357,7 @@ function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = ""
       "Ranked relevant excerpt:",
       rankedContextExcerpt(chunk.text || "", query, settings)
     ].filter(Boolean).join("\n");
-  }).join("\n\n---\n\n"), maxChars);
+  }).join("\n\n---\n\n");
 }
 
 function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, options = {}) {
@@ -15567,21 +15501,6 @@ function finalizeStructuredChatSentence(value = "") {
   return /[.!?](?:["'’”»›)\]}]+)?$/.test(text) ? text : `${text}.`;
 }
 
-function truncateStructuredChatClaims(lines = [], maxChars = 5000) {
-  const limit = Math.max(1, Number(maxChars) || 5000);
-  const kept = [];
-  let used = 0;
-  for (const line of lines || []) {
-    const text = String(line || "").trim();
-    if (!text) continue;
-    const extra = kept.length ? 1 : 0;
-    if (used + extra + text.length > limit) break;
-    kept.push(text);
-    used += extra + text.length;
-  }
-  return kept.join("\n");
-}
-
 function renderStructuredChatEvidenceResponse(value = "", ledger = [], options = {}) {
   const parsed = parseChatEvidenceResponse(value);
   const entries = Array.isArray(ledger) ? ledger.filter((entry) => entry?.url && entry?.evidenceId) : [];
@@ -15692,7 +15611,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
     sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
   };
-  return { answer: truncateStructuredChatClaims(renderedClaims, Number(options.maxChars || 5000)), telemetry };
+  return { answer: renderedClaims.join("\n"), telemetry };
 }
 
 function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
@@ -15756,7 +15675,7 @@ function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
     selectedEvidenceIds: entries.map((entry) => entry.evidenceId).filter(Boolean).slice(0, 32),
     sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
   };
-  return { answer: truncateAtWord(text, Number(options.maxChars || 5000)), telemetry };
+  return { answer: text, telemetry };
 }
 
 function splitChatAnswerSentences(value = "") {
@@ -15777,7 +15696,7 @@ function formatChatHistory(messages) {
   const lines = (messages || [])
     .filter((message) => message.role !== "assistant" || message.text !== "Thinking...")
     .slice(-8)
-    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${clamp(singleLine(message.text), 700)}`);
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${singleLine(message.text)}`);
   return lines.length ? lines.join("\n") : "No recent chat.";
 }
 
@@ -17623,8 +17542,7 @@ function semanticRetrievalRequestMetadata(query = "", limit = 0, plan = {}, sett
     },
     bounds: {
       requestedLimit: Math.max(1, Number(limit || 1)),
-      maxItems: Math.max(1, Number(limit || 1)),
-      maxChars: Number(settings.maxContextChars || 0)
+      maxItems: Math.max(1, Number(limit || 1))
     }
   };
 }
@@ -19526,7 +19444,8 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
 
 function taskDescriptionPromptTask(item = {}) {
   const rich = item.taskLocalEvidence || {};
-  return Object.assign({}, item, {
+  const { evidence_ids, fact_refs, fact_bindings, ...task } = item;
+  return Object.assign({}, task, {
     primarySourceEvidence: undefined,
     supportingSemanticEvidence: undefined,
     immutableEvidenceBundle: undefined,
@@ -23083,7 +23002,7 @@ function normalizeDescriptionLinks(value, sourceText = "", settings = DEFAULT_SE
   return converted.replace(/__TODOIST_DESCRIPTION_LINK_(\d+)__/g, (_, index) => protectedLinks[Number(index)] || "");
 }
 
-function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
+function compressForTaskPrompt(text, settings = DEFAULT_SETTINGS) {
   const sourceText = stripExcludedLinks(String(text || ""), settings);
   const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
   const links = extractDescriptionLinkRecords(cleaned, settings).slice(0, 20);
@@ -23125,7 +23044,7 @@ function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
     const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
     return cleaned;
   }
-  return compressForTaskPrompt(source.text, Number.POSITIVE_INFINITY, settings);
+  return compressForTaskPrompt(source.text, settings);
 }
 
 function sourceContractSourceText(source = {}, settings = DEFAULT_SETTINGS) {
@@ -26239,9 +26158,9 @@ function validDate(value) {
 }
 function deviceTimeZone() {
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "America/Toronto";
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
   } catch {
-    return "America/Toronto";
+    return "";
   }
 }
 function deviceTimestamp(date = new Date()) {
@@ -26254,49 +26173,85 @@ function deviceTimestamp(date = new Date()) {
   const minutes = pad(Math.abs(offsetMinutes) % 60);
   return `${safeDate.getFullYear()}-${pad(safeDate.getMonth() + 1)}-${pad(safeDate.getDate())}T${pad(safeDate.getHours())}:${pad(safeDate.getMinutes())}:${pad(safeDate.getSeconds())}.${pad(safeDate.getMilliseconds(), 3)}${sign}${hours}:${minutes}`;
 }
-function deviceTimeZoneAbbreviation(date = new Date()) {
-  const value = date instanceof Date ? date : new Date(date);
-  const safeDate = Number.isFinite(value.getTime()) ? value : new Date();
+function deviceDisplayDate(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
+  const text = String(value || "").trim();
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (dateOnly) {
+    const year = Number(dateOnly[1]);
+    const month = Number(dateOnly[2]);
+    const day = Number(dateOnly[3]);
+    const date = new Date(year, month - 1, day);
+    return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day ? date : null;
+  }
+  const timeOnly = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(text);
+  if (timeOnly) {
+    const hour = Number(timeOnly[1]);
+    const minute = Number(timeOnly[2]);
+    const second = Number(timeOnly[3] || 0);
+    if (hour > 23 || minute > 59 || second > 59) return null;
+    const date = new Date();
+    date.setHours(hour, minute, second, 0);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+function formatDeviceDateTime(value) {
+  const date = deviceDisplayDate(arguments.length ? value : new Date());
+  if (!date) return singleLine(value);
+  const timeZone = deviceTimeZone();
   try {
-    const parts = Intl.DateTimeFormat(undefined, { timeZone: deviceTimeZone(), timeZoneName: "short" }).formatToParts(safeDate);
-    const value = parts.find((part) => part.type === "timeZoneName")?.value || "";
-    return (value.match(/[A-Za-z]+/g) || []).join("").toUpperCase();
+    return Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      ...(timeZone ? { timeZone, timeZoneName: "short" } : {})
+    }).format(date);
   } catch {
-    return "";
+    return date.toLocaleString();
+  }
+}
+function formatDeviceDate(value) {
+  const date = deviceDisplayDate(arguments.length ? value : new Date());
+  if (!date) return singleLine(value);
+  const timeZone = deviceTimeZone();
+  try {
+    return Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      ...(timeZone ? { timeZone } : {})
+    }).format(date);
+  } catch {
+    return date.toLocaleDateString();
+  }
+}
+function formatDeviceTime(value) {
+  const date = deviceDisplayDate(arguments.length ? value : new Date());
+  if (!date) return singleLine(value);
+  const timeZone = deviceTimeZone();
+  try {
+    return Intl.DateTimeFormat(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+      ...(timeZone ? { timeZone, timeZoneName: "short" } : {})
+    }).format(date);
+  } catch {
+    return date.toLocaleTimeString();
   }
 }
 function deviceTimestampWithZone(date = new Date()) {
-  const value = date instanceof Date ? date : new Date(date);
-  const safeDate = Number.isFinite(value.getTime()) ? value : new Date();
-  const pad = (number) => String(Math.trunc(Math.abs(number))).padStart(2, "0");
-  const parts = { year: "", month: "", day: "", hour: "", minute: "", second: "" };
-  try {
-    for (const part of Intl.DateTimeFormat("en-CA", {
-      timeZone: deviceTimeZone(),
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23"
-    }).formatToParts(safeDate)) {
-      if (part.type in parts) parts[part.type] = part.value;
-    }
-  } catch {}
-  const year = parts.year || String(safeDate.getFullYear());
-  const month = parts.month || pad(safeDate.getMonth() + 1);
-  const day = parts.day || pad(safeDate.getDate());
-  const hour = parts.hour || pad(safeDate.getHours());
-  const minute = parts.minute || pad(safeDate.getMinutes());
-  const second = parts.second || pad(safeDate.getSeconds());
-  const abbreviation = deviceTimeZoneAbbreviation(safeDate) || "UTC";
-  return `${year}-${month}-${day} - ${hour}:${minute}:${second} (${abbreviation})`;
+  return formatDeviceDateTime(date);
 }
 function formatEmailWorkflowTimestamp(value) {
   if (!value) return "";
   const date = value instanceof Date ? value : new Date(value);
-  return Number.isFinite(date.getTime()) ? deviceTimestampWithZone(date) : singleLine(value);
+  return Number.isFinite(date.getTime()) ? formatDeviceDateTime(date) : singleLine(value);
 }
 function deviceDateString(date = new Date()) {
   const value = date instanceof Date ? date : new Date(date);

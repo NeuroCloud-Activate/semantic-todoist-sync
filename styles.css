@@ -1471,3 +1471,91 @@
   font-size: var(--font-ui-small);
   font-weight: 600;
 }
+
+/* Settings IA: keep the six groups readable on desktop and usable on touch. */
+.semantic-todoist-settings {
+  max-width: 100%;
+  padding-inline: max(8px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-right));
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+.semantic-todoist-settings .semantic-todoist-tabs {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+.semantic-todoist-settings .setting-item-control {
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .setting-item-control input,
+.semantic-todoist-settings .setting-item-control select,
+.semantic-todoist-settings .setting-item-control textarea,
+.semantic-todoist-settings .setting-item-control button {
+  max-width: 100%;
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-settings .semantic-todoist-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 8px;
+  }
+
+  .semantic-todoist-settings .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .semantic-todoist-settings .setting-item-info,
+  .semantic-todoist-settings .setting-item-control {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .semantic-todoist-settings .setting-item-control {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+@media (orientation: portrait), (orientation: landscape) {
+  .semantic-todoist-settings .semantic-todoist-settings-heading {
+    max-width: 72ch;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .semantic-todoist-settings .semantic-todoist-tabs button,
+  .semantic-todoist-settings button,
+  .semantic-todoist-view button,
+  .semantic-todoist-view .clickable-icon {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  .semantic-todoist-settings input,
+  .semantic-todoist-settings select,
+  .semantic-todoist-settings textarea,
+  .semantic-todoist-view input,
+  .semantic-todoist-view select,
+  .semantic-todoist-view textarea {
+    min-height: 44px;
+    font-size: max(16px, var(--font-ui-small));
+  }
+}
+
+.is-mobile .semantic-todoist-settings .semantic-todoist-tabs {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding-inline: 2px;
+}
+
+.is-mobile .semantic-todoist-settings button,
+.is-mobile .semantic-todoist-view button,
+.is-mobile .semantic-todoist-view .clickable-icon {
+  min-height: 44px;
+}

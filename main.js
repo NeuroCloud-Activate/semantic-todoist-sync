@@ -3529,14 +3529,86 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const fusedAdmissible = deduplicateTaskSemanticCandidates(laneCoverage.fused.filter(semanticCandidateIsAdmissible));
       const scoreDistribution = taskRelativeSemanticScoreDistribution(fusedAdmissible, taskItemLimit);
       const semanticAdmissionPool = laneCoverage.selected;
-      const selectedCandidates = semanticAdmissionPool;
+      let selectedCandidates = semanticAdmissionPool;
+      let noteThreadExpansion = null;
+      const selectedHistoricalNotes = selectedCandidates.filter((item) => {
+        const chunk = item.chunk || item;
+        return semanticChunkSourceKind(chunk) === "note"
+          && (item.temporalRelation || semanticTemporalRelation(chunk, profile)) === "historical"
+          && vaultRelativePath(chunk.path || "");
+      });
+      if (selectedHistoricalNotes.length) {
+        const sourceTimestamp = semanticSourceRelativeTimestamp(Object.assign({}, source || {}, sourceContract || {}));
+        const selectedPaths = new Map();
+        for (const item of selectedHistoricalNotes) {
+          const chunk = item.chunk || item;
+          const path = vaultRelativePath(chunk.path || "");
+          const timestamp = semanticSourceRelativeTimestamp(chunk);
+          const semanticScore = Number(item.semantic ?? item.semanticScore ?? 0);
+          const previous = selectedPaths.get(path);
+          if (!previous || semanticScore > previous.semanticScore || (!previous.timestamp && timestamp)) selectedPaths.set(path, { path, timestamp, semanticScore });
+        }
+        const selectedPath = Array.from(selectedPaths.values()).sort((left, right) => {
+          const leftBefore = sourceTimestamp > 0 && left.timestamp > 0 && left.timestamp <= sourceTimestamp ? 0 : 1;
+          const rightBefore = sourceTimestamp > 0 && right.timestamp > 0 && right.timestamp <= sourceTimestamp ? 0 : 1;
+          const leftDistance = sourceTimestamp > 0 && left.timestamp > 0 ? Math.abs(sourceTimestamp - left.timestamp) : Number.POSITIVE_INFINITY;
+          const rightDistance = sourceTimestamp > 0 && right.timestamp > 0 ? Math.abs(sourceTimestamp - right.timestamp) : Number.POSITIVE_INFINITY;
+          return leftBefore - rightBefore
+            || leftDistance - rightDistance
+            || right.semanticScore - left.semanticScore
+            || left.path.localeCompare(right.path);
+        })[0]?.path || "";
+        const mandatoryLaneEmbeddings = laneData.lanes
+          .filter((lane) => lane.name === "action" || lane.mandatory === true)
+          .map((lane) => lane.embedding)
+          .filter((embedding) => Array.isArray(embedding) && embedding.length);
+        if (selectedPath && mandatoryLaneEmbeddings.length) {
+          const siblings = usableIndex
+            .filter((chunk) => semanticChunkSourceKind(chunk) === "note" && vaultRelativePath(chunk.path || "") === selectedPath)
+            .sort((left, right) => Number(left.lineStart || 0) - Number(right.lineStart || 0)
+              || Number(left.lineEnd || 0) - Number(right.lineEnd || 0)
+              || String(left.evidenceId || left.id || "").localeCompare(String(right.evidenceId || right.id || "")))
+            .map((chunk) => {
+              const semanticScore = Math.max(...mandatoryLaneEmbeddings.map((embedding) => cosine(embedding, chunk.embedding || [])));
+              return {
+                chunk,
+                semantic: semanticScore,
+                semanticScore,
+                lexical: 0,
+                title: 0,
+                semanticOnly: true,
+                ...contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk)),
+                taskId: key,
+                scopeId: laneData.scopeId,
+                queryId: laneData.queryId,
+                lane: "historical-note-thread",
+                sourceKind: semanticChunkSourceKind(chunk),
+                temporalRelation: semanticTemporalRelation(chunk, profile),
+                selectionReasonCode: "task-semantic-note-thread-expansion"
+              };
+            });
+          const availableSiblingSlots = Math.max(0, taskItemLimit - selectedCandidates.length);
+          const admittedSiblings = availableSiblingSlots > 0
+            ? taskRelativeSemanticAdmissionPool(siblings, availableSiblingSlots)
+            : [];
+          const seenKeys = new Set(selectedCandidates.map((item) => semanticTaskCandidateStableKey(item)));
+          const additions = admittedSiblings.filter((item) => {
+            const candidateKey = semanticTaskCandidateStableKey(item);
+            if (seenKeys.has(candidateKey)) return false;
+            seenKeys.add(candidateKey);
+            return true;
+          });
+          selectedCandidates = selectedCandidates.concat(additions);
+          noteThreadExpansion = { path: selectedPath, count: additions.length };
+        }
+      }
       const selected = selectedCandidates.map((item) => {
         const reservationReason = laneCoverage.reservedReasonByKey?.[semanticTaskCandidateStableKey(item)] || "";
-        const selectionReasonCode = reservationReason === "exact-current-open-identity"
+        const selectionReasonCode = item.selectionReasonCode || (reservationReason === "exact-current-open-identity"
           ? "task-semantic-exact-current-open-identity"
           : reservationReason === "continuity-reserved"
             ? "task-semantic-continuity-reserved"
-            : "task-semantic-lane-coverage-selected";
+            : "task-semantic-lane-coverage-selected");
         return Object.assign(annotateContextChunk(item, profile), {
           selectionReasonCode,
           taskId: key,
@@ -3601,6 +3673,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           laneAlignment: laneCoverage.laneAlignment,
           referenceAdmissionReasons: laneCoverage.referenceAdmissionReasons
         },
+        noteThreadExpansion,
         laneTelemetry: telemetry.laneTelemetryByTask[key],
         scoreDistribution: {
           candidatePoolCount: scoreDistribution.pool.length,
@@ -5573,7 +5646,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           contextCitationInstructions(citeContextNotes),
           "",
           structuredEvidence ? "Respect the schema's 1200-character upper bound; there is no hard character, word, or sentence minimum. Concise must not mean thin: include every materially useful task-local fact. Use one complete sentence only when the entire task-local bundle supports no additional material execution detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Keep every description at or below 1200 characters; there is no hard character, word, or sentence minimum. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, timing, useful history or handoffs, and remaining action when supplied. Concise must not mean thin: include every materially useful task-local fact and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
-          "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). Resolve taskLocalEvidence.evidenceIds and citationLedgerByTask entries through evidenceById. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
+          "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). citationLedgerByTask[index] is the task's closed evidence set; resolve those entries through evidenceById. taskLocalEvidence.factRefs is the task's closed fact set, and each factsById map key is its factId. Copy response fact_bindings from those factsById rows using the keyed factId plus type, role, evidenceId, and scopeId. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
           JSON.stringify(sharedTaskEvidence),
           "Main tasks and their structured task-specific evidence:",
           JSON.stringify(promptMainTasks)
@@ -16041,6 +16114,18 @@ function taskSemanticStructuredStatements(values = []) {
   return statements;
 }
 
+function taskSemanticQuotedTerms(value = "") {
+  const terms = [];
+  const seen = new Set();
+  for (const match of String(value || "").matchAll(/(?:[“"]([^“”"]+)[”"]|‘([^‘’]+)’)/g)) {
+    const term = singleLine(match[1] || match[2] || "").trim();
+    if (!term || seen.has(term)) continue;
+    seen.add(term);
+    terms.push(term);
+  }
+  return terms;
+}
+
 function buildTaskSemanticQuerySet(task = {}, source = {}, sourceContract = null, options = {}) {
   const title = singleLine(source?.title || sourceContract?.title || "");
   const action = singleLine(task?.semanticQuery || task?.content || task?.title || "");
@@ -16065,7 +16150,10 @@ function buildTaskSemanticQuerySet(task = {}, source = {}, sourceContract = null
     ...(Array.isArray(sourceContract?.primaryContextFactIds) ? sourceContract.primaryContextFactIds : [])
   ]
     .map((value) => String(value?.factId || value?.fact_id || value || "")).filter(Boolean));
-  const statementEntries = [];
+  const mandatoryStatementEntries = [];
+  const mandatoryTerminologyEntries = [];
+  const optionalPrimaryStatementEntries = [];
+  const otherStatementEntries = [];
   for (const fact of facts) {
     const value = singleLine(fact?.sourceSurface || fact?.value || fact?.text || "");
     if (!value) continue;
@@ -16075,22 +16163,39 @@ function buildTaskSemanticQuerySet(task = {}, source = {}, sourceContract = null
     const mandatoryForTask = mandatoryFor.map((value) => String(value || "").trim().toLowerCase()).some((value) => ["task", "task-generation", "task_generation", "marked-action", "marked_action", String(task?.id || task?.taskId || "").toLowerCase()].includes(value));
     const markedAction = Boolean(fact?.markedAction || fact?.marked_action || fact?.actionRequired || fact?.action_required || fact?.mandatory || fact?.required || fact?.isAction || fact?.is_action || ["action", "marked-action", "marked_action", "mandatory", "required", "current-action", "current_action"].includes(kind));
     const mandatory = markedAction || mandatoryForTask || mandatoryFactIds.has(factId);
+    const currentMandatory = mandatory
+      && fact?.current !== false
+      && !["rejected", "conflict", "conflicted"].includes(String(fact?.authorityState || "").trim().toLowerCase())
+      && !["conflict", "conflicted"].includes(String(fact?.conflictState || "").trim().toLowerCase());
+    const quotedTerms = currentMandatory ? taskSemanticQuotedTerms(value) : [];
+    if (quotedTerms.length) mandatoryTerminologyEntries.push({ factId, terms: quotedTerms });
     for (const statement of taskSemanticStructuredStatements([value])) {
       const optionalPrimary = optionalPrimaryFactIds.has(factId) && !mandatory;
-      statementEntries.push({ statement, factId, mandatory, optional: optionalPrimary, origin: optionalPrimary ? "primary-context" : "source-statement" });
-      if (statementEntries.length >= 3) break;
+      const entry = { statement, factId, mandatory, optional: optionalPrimary, origin: optionalPrimary ? "primary-context" : "source-statement" };
+      if (mandatory) mandatoryStatementEntries.push(entry);
+      else if (optionalPrimary) optionalPrimaryStatementEntries.push(entry);
+      else otherStatementEntries.push(entry);
     }
-    if (statementEntries.length >= 3) break;
   }
+  const statementEntries = [...mandatoryStatementEntries, ...optionalPrimaryStatementEntries, ...otherStatementEntries];
   const baseParts = [title, action, subtasks].filter(Boolean);
   const lanes = [{ name: "action", origin: "action", mandatory: true, text: ["Current task action and exact source wording:", ...baseParts].filter(Boolean).join("\n") }];
-  statementEntries.forEach((entry, index) => lanes.push({
-    name: `source-statement-${index + 1}`,
-    origin: entry.origin,
-    mandatory: entry.mandatory,
-    factIds: entry.factId ? [entry.factId] : [],
-    text: [entry.mandatory ? "Same-scope authoritative source statement:" : "Optional same-scope primary context:", title, entry.statement].filter(Boolean).join("\n")
-  }));
+  let sourceLaneIndex = 0;
+  let terminologyLaneIndex = 0;
+  const laneEntries = [...mandatoryStatementEntries, ...mandatoryTerminologyEntries, ...optionalPrimaryStatementEntries, ...otherStatementEntries];
+  laneEntries.forEach((entry) => {
+    const terminology = Array.isArray(entry.terms);
+    const label = terminology
+      ? "Exact terminology and naming direction (preserve quoted terms):"
+      : entry.mandatory ? "Same-scope authoritative source statement:" : "Optional same-scope primary context:";
+    lanes.push({
+      name: terminology ? `terminology-${++terminologyLaneIndex}` : `source-statement-${++sourceLaneIndex}`,
+      origin: terminology ? "terminology" : entry.origin,
+      mandatory: terminology ? true : entry.mandatory,
+      factIds: entry.factId ? [entry.factId] : [],
+      text: [label, title, terminology ? entry.terms.map((term) => `\"${term}\"`).join(", ") : entry.statement].filter(Boolean).join("\n")
+    });
+  });
   if (lanes.length < 4) {
     const historyText = ["Task-local execution and prior context for the same artifact, people, review feedback, edits, decisions, conflicts, and unresolved state:", title, action, subtasks, statementEntries.map((entry) => entry.statement).join("\n")].filter(Boolean).join("\n");
     if (historyText && !lanes.some((lane) => lane.text === historyText)) lanes.push({ name: "history", origin: "history", mandatory: false, text: historyText });
@@ -16105,7 +16210,6 @@ function buildTaskSemanticQuerySet(task = {}, source = {}, sourceContract = null
     if (!text || seenText.has(text)) continue;
     seenText.add(text);
     unique.push(Object.assign({}, lane, { text }));
-    if (unique.length >= 5) break;
   }
   return unique;
 }
@@ -16356,11 +16460,16 @@ function taskSemanticLaneSupport(item = {}, laneMetaByName = new Map()) {
   const laneScores = item?.laneScores || {};
   const positiveLanes = Object.entries(laneScores).filter(([, score]) => Number(score) > 0).map(([lane]) => lane);
   const actionSupported = positiveLanes.some((lane) => lane === "action" || laneMetaByName.get(lane)?.origin === "action");
+  const mandatorySourceLanes = uniqueValues(positiveLanes.filter((lane) => {
+    const metadata = laneMetaByName.get(lane) || {};
+    const origin = metadata.origin || (lane.startsWith("source-statement-") ? "source-statement" : lane);
+    return metadata.mandatory === true && ["source-statement", "terminology"].includes(origin);
+  }));
   const sourceOrHistorySupported = positiveLanes.some((lane) => {
     const origin = laneMetaByName.get(lane)?.origin || (lane.startsWith("source-statement-") ? "source-statement" : lane);
-    return origin === "source-statement" || origin === "history";
+    return origin === "source-statement" || origin === "terminology" || origin === "history";
   });
-  return { positiveLanes, actionSupported, sourceOrHistorySupported };
+  return { positiveLanes, actionSupported, sourceOrHistorySupported, mandatorySourceLanes, mandatorySourceSupportCount: mandatorySourceLanes.length };
 }
 
 function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode = "top-two", options = {}) {
@@ -16402,6 +16511,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
   const allLanePools = alignedResults.map((result) => ({ lane: result.lane, candidates: result.admitted || [] }));
   const allFused = fuseTaskSemanticCandidates(allLanePools, "max").filter(semanticCandidateIsAdmissible);
   const allowHistoricalTaskReferences = options.allowHistoricalTaskReferences === true;
+  const allowExplicitTaskReferenceExpansion = options.task?.expandTaskReferences === true;
   const referenceAdmissionReasons = {};
   const allowedReferenceKeys = new Set();
   for (const item of allFused) {
@@ -16411,7 +16521,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     const state = taskSemanticReferenceState(item);
     const exactCurrentOpenIdentity = taskSemanticExactCurrentOpenIdentity(item, options);
     const historyOnlyAllowed = allowHistoricalTaskReferences && support.sourceOrHistorySupported && !state.currentOpen;
-    const eligible = exactCurrentOpenIdentity || (support.actionSupported && support.sourceOrHistorySupported && (state.currentOpen || historyOnlyAllowed));
+    const eligible = exactCurrentOpenIdentity || (support.actionSupported && ((state.currentOpen && allowExplicitTaskReferenceExpansion && support.mandatorySourceSupportCount >= 2) || historyOnlyAllowed));
     if (eligible) {
       allowedReferenceKeys.add(key);
       referenceAdmissionReasons[key] = exactCurrentOpenIdentity
@@ -16424,36 +16534,37 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
           ? "task-reference-missing-source-history-support"
           : state.completed
             ? "task-reference-completed-unless-history-expansion"
+            : state.current && support.mandatorySourceSupportCount < 2
+              ? "task-reference-missing-multi-clause-source-support"
             : state.current
               ? "task-reference-not-current-open"
               : "task-reference-not-current";
     }
   }
   const filteredFused = allFused.filter((item) => !semanticTaskReferenceChunkSelected(item.chunk || item) || allowedReferenceKeys.has(semanticTaskCandidateStableKey(item)));
+  const continuityCandidateKeys = new Set(filteredFused
+    .filter((item) => semanticTaskReferenceChunkSelected(item.chunk || item))
+    .filter((item) => Object.prototype.hasOwnProperty.call(item.laneScores || {}, "continuity"))
+    .map((item) => semanticTaskCandidateStableKey(item)));
   const supportedContinuityKeys = new Set(filteredFused
     .filter((item) => semanticTaskReferenceChunkSelected(item.chunk || item))
     .filter((item) => {
-      const support = taskSemanticLaneSupport(item, laneMetaByName);
-      const state = taskSemanticReferenceState(item);
-      return taskSemanticExactCurrentOpenIdentity(item, options)
-        || (support.actionSupported && support.sourceOrHistorySupported && state.currentOpen);
+      return taskSemanticExactCurrentOpenIdentity(item, options);
     })
     .filter((item) => Object.prototype.hasOwnProperty.call(item.laneScores || {}, "continuity"))
     .map((item) => semanticTaskCandidateStableKey(item)));
   const continuityHasSupported = supportedContinuityKeys.size > 0;
-  // A continuity reference is focused evidence when it is the exact current,
-  // open structured task identity for the same scope, or when action plus an
-  // independent source-statement/history view supports it.
-  const continuityEligible = Boolean(continuityResult && continuityTopScore > 0 && continuityHasSupported);
+  // Continuity remains in ordinary fused competition for every admitted
+  // current/open reference, but only exact structured identity can reserve a
+  // forced continuity slot.
+  const continuityEligible = Boolean(continuityResult && continuityTopScore > 0 && continuityCandidateKeys.size > 0);
   const lanePools = alignedResults.map((result) => ({
     lane: result.lane,
     candidates: result.lane === "history"
       ? (historyEligible ? (result.admitted || []) : [])
       : result.lane === "continuity"
         ? (continuityEligible
-          ? (continuityHasSupported
-            ? (result.admitted || []).filter((item) => supportedContinuityKeys.has(semanticTaskCandidateStableKey(item)))
-            : (result.admitted || []))
+          ? (result.admitted || [])
           : [])
         : (result.admitted || [])
   }));
@@ -16463,37 +16574,67 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
   }));
   const fused = fuseTaskSemanticCandidates(filteredLanePools, fusionMode).filter(semanticCandidateIsAdmissible);
 
-  // Keep the genuinely supported continuity reservation bounded to one item;
-  // all remaining slots are filled from fused semantic rank with the embedding
-  // and content-aware redundancy penalty. Distinct chunks from one source are
-  // allowed when they are not duplicates.
+  // Reserve the strongest admissible non-task-reference fused evidence
+  // supported by mandatory source-statement lanes before filling remaining
+  // slots from fused semantic rank. This protects independent current-source
+  // clauses without reserving one first-lane result per clause.
+  const fusedSemanticOrder = (candidates = []) => deduplicateTaskSemanticCandidates(candidates).sort((left, right) =>
+    Number(right.semantic ?? right.semanticScore ?? 0) - Number(left.semantic ?? left.semanticScore ?? 0)
+    || semanticTaskCandidateStableKey(left).localeCompare(semanticTaskCandidateStableKey(right)));
+  const structuralReservationCandidates = fused.filter((item) => {
+    if (semanticTaskReferenceChunkSelected(item.chunk || item)) return false;
+    return Object.keys(item.laneScores || {}).some((lane) => {
+      const laneMeta = laneMetaByName.get(String(lane));
+      return laneMeta?.mandatory === true && ["source-statement", "terminology"].includes(laneMeta.origin);
+    });
+  });
+  const structuralReservations = fusedSemanticOrder(structuralReservationCandidates).slice(0, maxItems);
   const continuityReservation = continuityEligible
-    ? rankTaskSemanticCandidates(fused.filter((item) => {
+    ? fusedSemanticOrder(fused.filter((item) => {
       const key = semanticTaskCandidateStableKey(item);
       const laneSupport = Object.keys(item.laneScores || {});
       return semanticTaskReferenceChunkSelected(item.chunk || item)
         && laneSupport.includes("continuity")
-        && (continuityHasSupported ? supportedContinuityKeys.has(key) : true);
+        && supportedContinuityKeys.has(key);
     }))[0] || null
     : null;
-  const reserved = continuityReservation ? [continuityReservation] : [];
-  const reservedKeys = new Set(reserved.map((item) => semanticTaskCandidateStableKey(item)));
+  const reservedKeys = new Set();
+  const reserved = [];
+  if (continuityReservation) {
+    const key = semanticTaskCandidateStableKey(continuityReservation);
+    if (!reservedKeys.has(key) && reserved.length < maxItems) {
+      reserved.push(continuityReservation);
+      reservedKeys.add(key);
+    }
+  }
+  for (const item of structuralReservations) {
+    const key = semanticTaskCandidateStableKey(item);
+    if (reservedKeys.has(key) || reserved.length >= maxItems) continue;
+    reserved.push(item);
+    reservedKeys.add(key);
+  }
   const reservedReasonByKey = Object.fromEntries(reserved.map((item) => {
     const key = semanticTaskCandidateStableKey(item);
     const reason = referenceAdmissionReasons[key] === "exact-current-open-identity"
       ? "exact-current-open-identity"
-      : "continuity-reserved";
+      : structuralReservations.some((candidate) => semanticTaskCandidateStableKey(candidate) === key)
+        ? "mandatory-source-statement-reserved"
+        : "continuity-reserved";
     return [key, reason];
   }));
   const ordered = rankTaskSemanticCandidates(fused.filter((item) => !reservedKeys.has(semanticTaskCandidateStableKey(item))));
-  const remaining = diversifyTaskSemanticCandidates(ordered, Math.max(0, maxItems - reserved.length));
-  const selected = [...reserved, ...remaining].slice(0, maxItems);
+  const remainingSlots = Math.max(0, maxItems - reserved.length);
+  const remaining = remainingSlots > 0
+    ? diversifyTaskSemanticCandidates(ordered, remainingSlots)
+    : [];
+  const selected = [...reserved, ...remaining];
   return {
     selected,
     fused,
     reservedKeys,
     reservedLaneCount: reserved.length,
-    continuityReservedCount: reserved.length,
+    continuityReservedCount: continuityReservation ? 1 : 0,
+    mandatorySourceReservedCount: reserved.filter((item) => structuralReservations.some((candidate) => semanticTaskCandidateStableKey(candidate) === semanticTaskCandidateStableKey(item))).length,
     reservedReasonByKey,
     exactSupportKeys,
     continuityEligible,
@@ -18840,12 +18981,14 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
         ...sharedPrimaryFacts.map((fact) => fact.factId),
         ...usableExplicitFactRefs
       ]);
-      const selectedSemanticEvidence = semanticEvidence.filter((entry) => {
-        if (!isUsableSemanticEntry(entry, task, taskScopeId)) return false;
-        if (usableExplicitEvidenceIds.includes(entry.evidenceId)) return true;
-        if (entry.factRefs.some((factRef) => usableExplicitFactRefs.includes(String(factRef)))) return true;
-        return false;
-      });
+      const factRefMatchedEvidenceIds = semanticEvidence
+        .filter((entry) => usableExplicitFactRefs.some((factRef) => entry.factRefs.includes(factRef))
+          && isUsableSemanticEntry(entry, task, taskScopeId))
+        .map((entry) => entry.evidenceId);
+      const selectedSemanticEvidence = uniqueValues([
+        ...usableExplicitEvidenceIds,
+        ...factRefMatchedEvidenceIds
+      ]).map((evidenceId) => semanticEvidenceById.get(evidenceId)).filter(Boolean);
       evidenceIds = uniqueValues([...
         evidenceIds,
         ...selectedSemanticEvidence.map((entry) => entry.evidenceId)
@@ -19217,9 +19360,15 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     && String(fact.scopeId || "") === taskScopeId
     && ["task", "description", "identity"].some((target) => fact.mandatoryFor.includes(target)))
     .map((fact) => fact.factId);
-  const selectedSupportingEvidenceIds = supporting
+  const orderedSupporting = supporting
     .filter((item) => item.authorityState !== "rejected" && !["conflict", "conflicted", "rejected"].includes(item.conflictState))
-    .slice(0, 2)
+    .map((item) => Object.assign({}, item, { semantic: Number(item.semanticScore || 0) }));
+  const adaptiveSupporting = taskRelativeSemanticAdmissionPool(
+    orderedSupporting,
+    orderedSupporting.length
+  );
+  const selectedSupportingEvidenceIds = orderedSupporting
+    .slice(0, adaptiveSupporting.length)
     .map((item) => item.evidenceId);
   const selectedSupportingFactRefs = selectedSupportingEvidenceIds.flatMap((evidenceId) => facts
     .filter((fact) => String(fact.evidenceId || "") === String(evidenceId)
@@ -19470,36 +19619,39 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
 function taskDescriptionPromptTask(item = {}) {
   const rich = item.taskLocalEvidence || {};
   const { evidence_ids, fact_refs, fact_bindings, ...task } = item;
+  const taskLocalEvidence = {
+    taskId: rich.taskId || "",
+    oid: rich.oid || "",
+    scopeId: rich.scopeId || item.scope_id || "",
+    narrativeDescription: rich.narrativeDescription || "",
+    currentState: rich.currentState || "",
+    people: rich.people || [],
+    owner: rich.owner || "",
+    person: rich.person || "",
+    recipient: rich.recipient || "",
+    reviewer: rich.reviewer || "",
+    deliverable: rich.deliverable || "",
+    dependency: rich.dependency || "",
+    nextStep: rich.nextStep || "",
+    timing: rich.timing || "",
+    criteria: rich.criteria || "",
+    project: rich.project || "",
+    section: rich.section || "",
+    hierarchy: rich.hierarchy || {},
+    factRefs: rich.factRefs || item.fact_refs || [],
+    priorityFactRefs: rich.priorityFactRefs || [],
+    requiredFactTypes: rich.requiredFactTypes || []
+  };
+  for (const [key, value] of Object.entries(taskLocalEvidence)) {
+    if (value === "" || (Array.isArray(value) && value.length === 0) || (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0)) {
+      delete taskLocalEvidence[key];
+    }
+  }
   return Object.assign({}, task, {
     primarySourceEvidence: undefined,
     supportingSemanticEvidence: undefined,
     immutableEvidenceBundle: undefined,
-    taskLocalEvidence: {
-      taskId: rich.taskId || "",
-      oid: rich.oid || "",
-      scopeId: rich.scopeId || item.scope_id || "",
-      title: rich.title || item.title || "",
-      narrativeDescription: rich.narrativeDescription || "",
-      currentState: rich.currentState || "",
-      people: rich.people || [],
-      owner: rich.owner || "",
-      person: rich.person || "",
-      recipient: rich.recipient || "",
-      reviewer: rich.reviewer || "",
-      deliverable: rich.deliverable || "",
-      dependency: rich.dependency || "",
-      nextStep: rich.nextStep || "",
-      timing: rich.timing || "",
-      criteria: rich.criteria || "",
-      project: rich.project || "",
-      section: rich.section || "",
-      hierarchy: rich.hierarchy || {},
-      evidenceIds: rich.evidenceIds || item.evidence_ids || [],
-      factRefs: rich.factRefs || item.fact_refs || [],
-      priorityFactRefs: rich.priorityFactRefs || [],
-      factBindings: rich.factBindings || item.fact_bindings || [],
-      requiredFactTypes: rich.requiredFactTypes || []
-    }
+    taskLocalEvidence
   });
 }
 

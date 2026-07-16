@@ -70,14 +70,10 @@
   min-width: 0;
 }
 
-.semantic-todoist-settings .setting-item-control:has(select) {
+.semantic-todoist-settings .setting-item-control select {
   flex: 0 1 min(100%, 360px);
+  max-width: 100%;
   min-width: min(220px, 100%);
-}
-
-.semantic-todoist-settings .setting-item-control:has(select) select {
-  max-width: none;
-  min-width: 0;
   width: 100%;
 }
 
@@ -199,9 +195,11 @@
     overflow-y: hidden;
   }
 
-  .semantic-todoist-settings .setting-item-control:has(select) {
+  .semantic-todoist-settings .setting-item-control select {
     flex: 1 1 auto;
     min-width: 0;
+    max-width: 100%;
+    width: 100%;
   }
 
   .semantic-todoist-project-setting {
@@ -533,9 +531,8 @@
 .semantic-todoist-message-text a {
   color: var(--link-color);
   font-weight: 600;
-  text-decoration-line: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.14em;
+  border-bottom: 1px solid currentColor;
+  text-decoration: none;
 }
 
 .theme-dark .semantic-todoist-message-assistant .semantic-todoist-message-text a {
@@ -549,7 +546,7 @@
 
 .semantic-todoist-message-user .semantic-todoist-message-text a {
   color: var(--text-on-accent);
-  text-decoration-color: var(--text-on-accent);
+  border-bottom-color: var(--text-on-accent);
 }
 
 .semantic-todoist-message-text ul,

@@ -24,13 +24,9 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.7.3
+## What's New
 
-1. **0.7.3 - Correct Obsidian release packaging**
-
-   The 0.7.2 code is republished with version-matched GitHub Release packaging and verified `main.js`, `manifest.json`, and `styles.css` assets. No runtime behavior changed.
-
-2. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
+1. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
 
    Device-local display times now stay consistent across task, scheduler, and
    activity views. Desktop and mobile settings are organized into six focused
@@ -42,7 +38,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
    repeated context serialization, and GPT-5.6 Terra at Medium remains the
    primary OpenAI model with GPT-5.6 Luna at Medium as the same-provider fallback.
 
-3. **0.7.1 - Semantic Index Optimization**
+2. **0.7.1 - Semantic Index Optimization**
 
    The task-generation backend has been redesigned around the semantic index so
    task titles and descriptions are selected from precise, source-grounded
@@ -62,6 +58,14 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
    source grounding. This release also introduces GPT-5.6 Terra at Medium as the
    default OpenAI model, with GPT-5.6 Luna at Medium as its same-provider
    fallback, while preserving custom model and reasoning settings.
+
+3. **0.6.39 - Required action coverage and grounded execution briefs**
+
+   Required-action hashtags such as `#todo` now anchor task coverage without
+   excluding other relevant work. Context-first generation keeps marked actions,
+   source direction, semantic evidence, and task-specific descriptions aligned,
+   with standalone execution briefs that preserve criteria, audience, timing,
+   dependencies, and supported links.
 
 ## What It Uses
 

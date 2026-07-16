@@ -24,23 +24,40 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
    Build a preview of today's work from overdue tasks and tasks due soon. The preview keeps existing Todoist times fixed, estimates missing durations, lets you adjust or swap tasks before applying, and writes only the approved due times and durations back to Todoist.
 
-## What's New In 0.6.39
+## What's New In 0.7.1
 
-1. **0.6.39 - Complete note actions with faster, safer generation**
+1. **0.7.1 - Semantic Index Optimization**
 
-   Notes can use configurable required-action hashtags, with `#todo` as the default. Every distinct marked action requires a task tree, repeated references to the same action can be grouped, and the full note plus semantic index still supplies subtly phrased unmarked work. Generated descriptions are standalone, source-grounded execution briefs with current artifact, audience/reviewer, criteria, dependencies, timing, and supported links when available; directly relevant semantic-index context can enrich detailed sources while unrelated or stale context stays out. They never narrate other tasks or meta completion/result status. Task structure is generated first from one bounded retained context bundle; section naming and one batched main-task description call then run concurrently. GPT-5.6 phases share one strict schema, stable system prefix, explicit cached context breakpoint, and `semantic-todoist-task-workflow` cache key. Every blocking description issue stops the batch before Todoist; there is no post-description AI repair or deterministic fabrication.
+   The task-generation backend has been redesigned around the semantic index so
+   task titles and descriptions are selected from precise, source-grounded
+   meaning instead of depending on lexical heuristics that could confuse shared
+   words with shared intent. The current source remains authoritative while
+   relevant task history, open-work continuity, recency, and supporting evidence
+   stay connected through exact stable IDs. Complete task-local evidence remains
+   available across generation phases without stale context overriding newer
+   direction, unrelated matches leaking into descriptions, or a global record
+   cap discarding useful context.
 
-2. **0.6.38 - Richer task context without source-list noise**
+   The same redesign improves precision throughout duplicate detection,
+   same-title subtask reconciliation, task-local failure handling, citations,
+   and repeated semantic retrieval. Evidence is serialized once and reused by
+   stable ID, reducing estimated task-generation input by 51.7% and description
+   input by about 60.0% in a six-task live-vault A/B while retaining complete
+   source grounding. This release also introduces GPT-5.6 Terra at Medium as the
+   default OpenAI model, with GPT-5.6 Luna at Medium as its same-provider
+   fallback, while preserving custom model and reasoning settings.
 
-   Generated task titles now retain the document, program, person, decision, review focus, or current stage needed to distinguish the work. Descriptions preserve useful source-supported status, rationale, criteria, stakeholder input, and dependencies when available, while each source list includes only the primary note and context notes whose facts were actually used.
+2. **0.6.39 - Complete note actions with faster, safer generation**
 
-3. **0.6.37 - Accurate same-batch duplicate screening**
+   Notes can use configurable required-action hashtags, with `#todo` as the default. Every distinct marked action requires a task tree, repeated references to the same action can be grouped, and the full note plus semantic index still supplies subtly phrased unmarked work. Generated descriptions are standalone, source-grounded execution briefs with current artifact, audience or reviewer, criteria, dependencies, timing, and supported links when available.
 
-   Tasks generated from one multi-topic note no longer look like duplicates merely because they share the same people, Inbox section, labels, or note context. Same-batch comparisons now require real title and task-scope identity, separate conflicting program identifiers and sequential actions, preserve valid `Book` and `Develop` titles, and keep grounded tasks even when an unsafe description must be reduced to verified source links.
+3. **0.6.38 - Richer task context without source-list noise**
+
+   Generated task titles retain the document, program, person, decision, review focus, or current stage needed to distinguish the work. Descriptions preserve useful source-supported status, rationale, criteria, stakeholder input, and dependencies, while each source list includes only the primary note and context notes whose facts were actually used.
 
 ## What It Uses
 
-- OpenAI by default through the user's own API key, with GPT 5.4 as the primary model and GPT 5.4 Mini as the same-provider fallback.
+- OpenAI by default through the user's own API key, with GPT 5.6 Terra at Medium reasoning as the primary model and GPT 5.6 Luna at Medium reasoning as the same-provider fallback.
 - Gemini through Google AI Studio, with Gemini 3.5 Flash as the primary model and Gemini 3.1 Flash Lite as the same-provider fallback when Gemini is selected as the preferred provider.
 - A local semantic index for vault search, context-aware task descriptions, and compact task-reference retrieval.
 - Todoist API access for task creation, updates, and reference reconciliation.

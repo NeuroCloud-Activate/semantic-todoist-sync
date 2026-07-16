@@ -22,7 +22,6 @@ const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
 const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
 const SCHEDULER_MEMORY_FILE = "scheduler-memory.json";
 const SCHEDULER_MEMORY_MAX_ENTRIES = 500;
-const SCHEDULER_MEMORY_MAX_CONTEXT_TERMS = 24;
 const SCHEDULER_MEMORY_MAX_CONTEXT_PATHS = 12;
 const SCHEDULE_PREVIEW_SUGGESTION_LIMIT = 10;
 const SCHEDULE_AI_DURATION_MAX_TASKS = 18;
@@ -41,6 +40,16 @@ const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
 const SEMANTIC_EMBEDDING_CONTENT_VERSION = 2;
+const SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION = 1;
+const SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION = 2;
+const SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND = "task-reference-parent-stub";
+const SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX = "@todoist/task/";
+const SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX = "@todoist/parent-stub/";
+const SEMANTIC_TASK_REFERENCE_INTEGRITY_SCHEMA_VERSION = 1;
+const SEMANTIC_RETRIEVAL_CACHE_MAX_ENTRIES = 32;
+const SEMANTIC_RETRIEVAL_CACHE_TTL_MS = 5 * 60 * 1000;
+const SEMANTIC_RETRIEVAL_SCHEMA_VERSION = 1;
+const SEMANTIC_RETRIEVAL_MAX_REJECTED = 32;
 const GEMINI_EMBEDDING_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
@@ -58,14 +67,13 @@ const DEFAULT_SCHEDULER_POLICY_TEXT = {
 };
 const DEFAULT_TASK_DEDUPLICATION_POLICY = [
   "Match only open, incomplete tasks. Completed tasks never satisfy a newly generated action item.",
-  "Prefer conservative local matching using task title, intent, rationale, people, project/topic overlap, parent/subtask relationship, due/deadline support, labels, and note references.",
+  "Prefer conservative local matching using semantic-index evidence, structured action/deliverable/ownership/progress identity, parent/subtask relationship, due/deadline support, labels, and note references.",
   "When an open existing task is confidently matched, link the new note line to the existing Todoist task with a new local OID, then update Todoist with newer title, due date, deadline, priority, description, and added labels.",
   "Merge labels additively by default. Do not delete existing labels unless that setting is disabled.",
   "Subtasks can match across notes and can be added or updated under the matched parent. Remove an existing subtask only when the newer source clearly says it is obsolete, no longer needed, or should be removed.",
   "Ignore email-routing boilerplate such as reply-to aliases, tracking mailbox wording, ticket-like intake wording, or generic instructions to copy a mailbox; these are not duplicate-task evidence.",
   "Treat same-project tasks as duplicates when one is a richer, poorer, broader, or more concise expression of the same action and the existing task would be satisfied by merging the newer details.",
   "Treat parent and subtask records as duplicates when the subtask merely restates the parent action or the parent only adds context around the same single action; hierarchy alone is not a reason to keep duplicate task records.",
-  "Treat identical or near-identical task titles as duplicate candidates even when they sit under different parent tasks, unless parent context clearly changes the object, person, deliverable, or next step.",
   "Do not merge similar tasks across different concrete Todoist projects. Treat Inbox as generic, but two named non-Inbox projects are separate work contexts unless the user explicitly moves or links the task across projects.",
   "Do not merge a distinct component subtask into a broader parent task when the parent contains multiple decisions, questions, recipients, documents, or steps and the subtask represents only one separable piece.",
   "Do not merge a newer specific progress task, such as reviewing a named person's edits, approvals, returned comments, or current status update, into an older broader project task unless both records require the same immediate next action.",
@@ -75,6 +83,12 @@ const TASK_DEDUPLICATION_POLICY_UPDATE_LIMIT = 8;
 const TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD = 88;
 const TASK_DEDUPLICATION_AI_AMBIGUOUS_BAND = 8;
 const TASK_DUPLICATE_CANDIDATE_MARKER = "[dup?]";
+const TASK_DESCRIPTION_FAILURE_MARKER = "descriptionGenerationFailure";
+const TASK_DESCRIPTION_FAILURE_CHAT_MARKER = "[description-failure]";
+const TASK_SUBTASK_STABLE_IDENTITY_FIELDS = [
+  "id", "oid", "todoistId", "tempId", "path", "lineNumber", "parentId", "parentOid", "parentLineNumber",
+  "noteRefs", "references", "reference", "taskReference", "deduplication"
+];
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
@@ -92,10 +106,10 @@ const ADAPTIVE_CONTEXT_TIERS = [
   "Portfolio context"
 ];
 const ADAPTIVE_CONTEXT_MODE_BUDGETS = {
-  chat: { defaultDepth: 4, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 24, maxChars: 10000, maxNotes: 7, maxTasks: 12, maxProjects: 5 },
-  "task-generation": { defaultDepth: 6, maxDepth: 6, retrievalMultiplier: 2, maxRetrieval: 20, maxChars: 11000, maxNotes: 7, maxTasks: 10, maxProjects: 4 },
-  description: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 3, maxRetrieval: 28, maxChars: 14000, maxNotes: 8, maxTasks: 14, maxProjects: 6 },
-  schedule: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 18, maxChars: 8000, maxNotes: 6, maxTasks: 16, maxProjects: 6 }
+  chat: { defaultDepth: 4, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 24, maxNotes: 7, maxTasks: 12, maxProjects: 5 },
+  "task-generation": { defaultDepth: 6, maxDepth: 6, retrievalMultiplier: 2, maxRetrieval: 20, maxNotes: 7, maxTasks: 10, maxProjects: 4 },
+  description: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 3, maxRetrieval: 28, maxNotes: 8, maxTasks: 14, maxProjects: 6 },
+  schedule: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 18, maxNotes: 6, maxTasks: 16, maxProjects: 6 }
 };
 const BROAD_CONTEXT_QUERY_RE = /\b(across|all|overall|portfolio|project|projects|priorit(?:y|ies|ize)|important|most important|top|rank|compare|status|where things stand|everything|whole vault|all notes)\b/i;
 const TASK_ACTION_CONTEXT_RE = /\b(tasks?|todo|actions?|next steps?|what should i do|complete|finish|work on|how do i|schedule|plan|deadline|due|follow[-\s]?up)\b/i;
@@ -107,6 +121,7 @@ const CONTEXT_QUERY_SCOPE_STOP_WORDS = new Set([
 ]);
 const STRONG_MODEL_ESCALATION_THRESHOLD = 95;
 const STRONG_MODEL_HARD_ESCALATION_THRESHOLD = 99;
+const CHAT_RESPONSE_MAX_CLAIMS = 24;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
     filename: "Generate Todoist task list.md",
@@ -148,6 +163,59 @@ const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", 
 
 const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a concise grounded brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
 
+// This state is intentionally limited to aggregate load facts. It is safe to
+// expose in diagnostics because it never contains vault paths, note text, or
+// shard names. `mode` distinguishes the startup-deferred path from a forced
+// first-query load while the manifest/path metadata flags prove the order.
+function emptySemanticIndexLoadTelemetry() {
+  return {
+    state: "idle",
+    mode: "idle",
+    manifestFirst: false,
+    pathMetaAttempted: false,
+    pathMetaLoaded: false,
+    manifestRead: false,
+    deferred: false,
+    forced: false,
+    shardCount: 0,
+    shardsLoaded: 0,
+    totalBytes: 0,
+    largestBytes: 0,
+    elapsedMs: 0,
+    yields: 0,
+    reads: 0,
+    pathMetaReads: 0,
+    completed: false,
+    error: ""
+  };
+}
+
+function semanticIndexLoadTelemetrySnapshot(value = {}) {
+  const base = emptySemanticIndexLoadTelemetry();
+  const text = (input, max = 32) => singleLine(input || "").slice(0, max);
+  const number = (input) => Math.max(0, Math.round(Number(input) || 0));
+  return {
+    state: text(value.state || base.state),
+    mode: text(value.mode || base.mode),
+    manifestFirst: Boolean(value.manifestFirst),
+    pathMetaAttempted: Boolean(value.pathMetaAttempted),
+    pathMetaLoaded: Boolean(value.pathMetaLoaded),
+    manifestRead: Boolean(value.manifestRead),
+    deferred: Boolean(value.deferred),
+    forced: Boolean(value.forced),
+    shardCount: number(value.shardCount),
+    shardsLoaded: number(value.shardsLoaded),
+    totalBytes: number(value.totalBytes),
+    largestBytes: number(value.largestBytes),
+    elapsedMs: number(value.elapsedMs),
+    yields: number(value.yields),
+    reads: number(value.reads),
+    pathMetaReads: number(value.pathMetaReads),
+    completed: Boolean(value.completed),
+    error: text(value.error, 240)
+  };
+}
+
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
   googleApiKey: "",
@@ -155,17 +223,18 @@ const DEFAULT_SETTINGS = {
   workerUrl: "",
   workerToken: "",
   aiModelProvider: "openai",
-  chatModel: "gpt-5.4",
-  chatReasoningEffort: DEFAULT_REASONING_EFFORT,
-  chatFallbackModel: "gpt-5.4-mini",
-  chatFallbackReasoningEffort: DEFAULT_REASONING_EFFORT,
+  chatModel: "gpt-5.6-terra",
+  chatReasoningEffort: "medium",
+  chatFallbackModel: "gpt-5.6-luna",
+  chatFallbackReasoningEffort: "medium",
   optimizeStructuredAiUsage: true,
   enableOpenAiPromptCaching: true,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
   embeddingModel: "text-embedding-3-large",
-  availableChatModels: ["gpt-5.4", "gpt-5.4-mini"],
+  openAiEmbeddingDimensions: 1024,
+  availableChatModels: ["gpt-5.6-terra", "gpt-5.6-luna"],
   availableEmbeddingModels: ["text-embedding-3-large"],
   availableGeminiModels: ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
   availableGeminiEmbeddingModels: ["gemini-embedding-2", "gemini-embedding-001"],
@@ -180,6 +249,10 @@ const DEFAULT_SETTINGS = {
   maxActiveNoteContextChars: 2500,
   embeddingBatchSize: 16,
   semanticIndexMaxChunkChars: 1100,
+  // Keep uninterrupted list evidence semantically coherent without allowing
+  // long multi-topic meeting lists to dilute a single item. This is a
+  // structural/resource bound; no source text is discarded or truncated.
+  semanticIndexListGroupMaxItems: 2,
   semanticIndexMaxChunksPerNote: 20,
   semanticIndexEmbeddingPrecision: 4,
   useNoteCreatedTimeForSemanticIndex: true,
@@ -405,24 +478,71 @@ function taskWorkflowSystemInstruction() {
     "Return only JSON matching the supplied strict structured-output schema.",
     "Use only the retained workflow context and the phase-specific task data supplied after it.",
     "Never invent people, documents, links, dates, dependencies, ownership, status, decisions, or outcomes.",
-    "Keep each task scope isolated from neighboring topics and preserve explicit source action facts."
+    "Keep each task scope isolated from neighboring topics and preserve explicit source action facts.",
+    "Treat action/requested-action facts as mandatory current-source requirements. Primary-context facts are optional same-scope summaries from adjacent source structure; use them only when they materially clarify intent, state, timing, recipient, or criteria. Keep distinct timing statements attached to their own source facts; never merge or reassign them.",
+    "Use clear professional task titles: expand informal shorthand or abbreviations and correct obvious capitalization, spelling, and grammar (for example, write vacation instead of Vaca) while preserving the source's exact action, people, object, conditions, and temporal attachment. Do not add or remove scope.",
+    "Preserve exact proper names, quoted terms, organization names, document names, and product names. A source warning that a term is grammatically incorrect in context is not a blanket prohibition on that term. An instruction to avoid a named phrase or object applies only to that exact phrase or object; do not generalize it to a shorter word, related name, or broader concept.",
+    "Preserve epistemic state exactly in task and description wording. A source statement such as is going to or plans to must not become scheduled, confirmed, approved, or otherwise stronger unless a supplied bound fact says so. Keep distinct action and supporting facts clear, even in one sentence, and never invent calendar mechanics.",
+    "Use materially relevant current or historical task-local semantic evidence when it changes how the task should be executed. Preserve who reviewed what, what they found or changed, what remains unresolved, reviewer expectations, and actor-specific handoffs when supported. Distinguish history from current direction, never treat fine as formal approval, and never reduce a named person checking with another person to a generic instruction to address or resolve an issue.",
+    "For every task and subtask, use only supplied scope_id, evidence_ids, fact_refs, and fact_bindings from the current source contract and bounded evidence catalog. Each fact_binding is {factId,type,role,evidenceId,scopeId} and must exactly match the immutable catalog fact metadata. Main tasks must include current-source evidence and at least one current-source fact; subtasks inherit only their parent scope when the supplied contract permits it.",
+    "For every description object, use evidence_ids, fact_refs, and fact_bindings that are unique and members of that task's immutable bundle. Description narratives may use numbered (n) citations only when they match the supplied task-local citation ledger; never emit foreign IDs or citation numbers. Section-title and other non-task phases must return empty tasks and descriptions arrays."
   ].join(" ");
 }
 
-function openAiMaxOutputTokensForOperation(operation = "chat") {
+function openAiMaxOutputTokensForOperation(operation = "chat", taskCount = 0) {
   if (operation === "task-generation") return 2500;
-  if (operation === "description") return 1800;
+  if (operation === "description") return Math.min(7200, Math.max(1800, 1200 + Math.max(1, Number(taskCount || 1)) * 900));
   return 0;
+}
+
+function openAiTerminalResponseDiagnostic(response = {}) {
+  const status = singleLine(response.status || "unknown").toLowerCase();
+  const detail = response.error || response.incomplete_details || {};
+  const code = singleLine(detail.code || detail.type || detail.reason || status || "provider-error").slice(0, 120);
+  const usage = response.usage || {};
+  return {
+    status,
+    code,
+    responseIdHash: response.id ? shortHash(String(response.id)) : "",
+    incompleteReason: singleLine(response.incomplete_details?.reason || "").slice(0, 120),
+    message: singleLine(redactSecrets(detail.message || response.incomplete_details?.reason || "")).slice(0, 500),
+    usage: {
+      inputTokens: Number(usage.input_tokens || 0),
+      cachedInputTokens: Number(usage.input_tokens_details?.cached_tokens || 0),
+      outputTokens: Number(usage.output_tokens || 0),
+      reasoningTokens: Number(usage.output_tokens_details?.reasoning_tokens || 0),
+      totalTokens: Number(usage.total_tokens || 0)
+    }
+  };
+}
+
+function openAiHttpResponseDiagnostic(response = {}, phase = "request") {
+  const detail = response.json?.error || {};
+  return {
+    status: `http-${Number(response.status || 0) || "error"}`,
+    code: singleLine(detail.code || detail.type || `http-${Number(response.status || 0) || "error"}`).slice(0, 120),
+    responseIdHash: response.json?.id ? shortHash(String(response.json.id)) : "",
+    incompleteReason: "",
+    message: singleLine(redactSecrets(detail.message || `${phase} returned HTTP ${Number(response.status || 0) || "error"}`)).slice(0, 500),
+    usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+  };
 }
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.queryEmbeddingCache = new Map();
+    this.taskDeduplicationEmbeddingCache = new Map();
+    this.semanticRetrievalCache = new Map();
+    this.semanticIndexRevision = 0;
+    this.lastSemanticRetrievalTelemetry = null;
     this.semanticChunkTermCache = new Map();
     this.semanticIndexPathMeta = new Map();
     this.semanticIndexKnownShardFiles = [];
     this.semanticIndexStorageFingerprint = "";
+    this.semanticIndexLoadTelemetry = emptySemanticIndexLoadTelemetry();
+    this.semanticIndexLoadStartedAt = 0;
+    this.semanticIndexPendingLoadMode = "";
     this.semanticIndexLoaded = false;
     this.semanticIndexLoadInProgress = false;
     this.semanticIndexLoadPromise = null;
@@ -437,6 +557,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceIndexRevision = -1;
     this.taskReferenceSnapshotFingerprint = "";
     this.taskReferenceSnapshotDirty = true;
+    this.taskReferenceIntegrity = null;
+    this.taskReferenceRepairTimer = null;
+    this.taskReferenceRepairInProgress = false;
+    this.taskReferenceRepairRevision = 0;
     this.schedulerMemory = emptySchedulerMemory();
     this.schedulerMemoryDirty = false;
     this.schedulerMemorySaveTimer = null;
@@ -453,6 +577,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     await this.migrateSettings();
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
+    const startupTaskReferenceLocationIndex = await this.buildSemanticTaskReferenceLocationIndex();
+    this.taskReferenceIntegrity = semanticTaskReferenceCorpusIntegrity(
+      semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), startupTaskReferenceLocationIndex),
+      [],
+      { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path) }
+    );
+    if (!this.taskReferenceIntegrity.ok) this.scheduleSemanticTaskReferenceRepair("startup-integrity");
     this.semanticIndexStartupQuietUntil = Date.now() + SEMANTIC_INDEX_STARTUP_QUIET_MS;
     await this.loadSemanticIndexPathMetaSnapshot();
     const compatibleIndexLoaded = await this.ensureCompatibleEmbeddingForChatModel({ loadIndex: false });
@@ -508,6 +639,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexReshardTimer = null;
     window.clearTimeout(this.taskReferenceSnapshotTimer);
     this.taskReferenceSnapshotTimer = null;
+    window.clearTimeout(this.taskReferenceRepairTimer);
+    this.taskReferenceRepairTimer = null;
     window.clearTimeout(this.schedulerMemorySaveTimer);
     this.schedulerMemorySaveTimer = null;
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
@@ -596,7 +729,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         candidate.durationSource = `${memory.exact ? "scheduler memory" : "similar scheduler memory"}${adjusted < rounded ? "; capped for follow-up" : ""}`;
       }
       candidate.score += schedulerMemoryScoreAdjustment(memory);
-      candidate.searchText = [candidate.searchText, schedulerMemoryContextText(memory)].filter(Boolean).join("\n");
     }
     return matched;
   }
@@ -624,7 +756,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   recordSchedulerPreviewMemory(candidates, context = []) {
     let changed = false;
-    const contextPaths = (context || []).map((chunk) => chunk.path).filter(Boolean).slice(0, 8);
     for (const candidate of candidates || []) {
       const entry = schedulerMemoryEntry(this.schedulerMemory, candidate);
       if (!entry) continue;
@@ -635,7 +766,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         durationMinutes: candidate.durationMinutes,
         scheduledDateTime: candidate.scheduledDueDateTime || candidate.dueDate || "",
         scheduledDate: candidate.dueDay || datePart(candidate.dueDate),
-        contextPaths,
+        contextPaths: schedulerSemanticBundlePaths(candidate.schedulerSemanticBundle),
         outcome: "candidate"
       });
       if (JSON.stringify(entry) !== before) changed = true;
@@ -647,7 +778,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   recordSchedulerApplyMemory(preview, scheduled, created = []) {
     const config = preview?.config || scheduleTodayConfig(this.settings);
     const ordered = (scheduled || []).slice().sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
-    const contextPaths = (preview?.context || []).map((chunk) => chunk.path).filter(Boolean).slice(0, 8);
     let changed = false;
     ordered.forEach((item, index) => {
       const entry = schedulerMemoryEntry(this.schedulerMemory, item);
@@ -659,7 +789,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         durationMinutes: item.durationMinutes,
         scheduledDateTime: item.scheduledDateTime,
         scheduledDate: config.today,
-        contextPaths,
+        contextPaths: schedulerSemanticBundlePaths(item.schedulerSemanticBundle),
         orderIndex: index,
         orderTotal: ordered.length,
         startMinutes: item.startMinutes,
@@ -679,7 +809,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         observedAt: deviceTimestamp(),
         durationMinutes: item.durationMinutes,
         scheduledDate: config.today,
-        contextPaths,
+        contextPaths: schedulerSemanticBundlePaths(item.schedulerSemanticBundle),
         outcome: "bumped",
         score: item.score
       });
@@ -695,7 +825,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         durationMinutes: item.durationMinutes,
         scheduledDateTime: item.scheduledDateTime,
         scheduledDate: datePart(item.scheduledDateTime),
-        contextPaths,
+        contextPaths: schedulerSemanticBundlePaths(item.schedulerSemanticBundle),
         outcome: "created-continuation"
       });
       if (JSON.stringify(entry) !== before) changed = true;
@@ -763,6 +893,79 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return this.refreshTaskReferenceIndex();
     }
     return this.taskReferenceIndex;
+  }
+
+  async buildSemanticTaskReferenceLocationIndex() {
+    const index = emptyTaskReferenceLocationIndex();
+    const files = this.orderSemanticIndexFiles(this.getIndexableFiles());
+    for (let indexNumber = 0; indexNumber < files.length; indexNumber += 1) {
+      const file = files[indexNumber];
+      const text = await this.app.vault.cachedRead(file);
+      addTaskReferenceLocationsFromMarkdown(index, text, file.path, this.settings, vaultBasePath(this.app), file.stat?.mtime || 0);
+      if (indexNumber && indexNumber % SEMANTIC_INDEX_FILE_YIELD_INTERVAL === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+    }
+    return index;
+  }
+
+  scheduleSemanticTaskReferenceRepair(reason = "integrity") {
+    window.clearTimeout(this.taskReferenceRepairTimer);
+    this.taskReferenceRepairTimer = window.setTimeout(() => {
+      this.taskReferenceRepairTimer = null;
+      this.runSemanticTaskReferenceRepair({ reason }).catch((error) => this.logLocal("Task-reference repair failed", { reason, error: error.message || String(error) }));
+    }, Math.max(1000, Number(this.settings.referenceRebuildIntervalMinutes || 1) * 60 * 1000));
+    this.lastTaskReferenceRepairReason = String(reason || "integrity");
+    return true;
+  }
+
+  async runSemanticTaskReferenceRepair(options = {}) {
+    if (this.taskReferenceRepairInProgress) return false;
+    if (semanticEmbeddingIndexCompatibility(this.settings, this.settings.semanticIndexMeta || {}).migrationRequired) {
+      this.logLocal("Task-reference repair deferred", { reason: "embedding-dimension-migration-required" });
+      return false;
+    }
+    this.taskReferenceRepairInProgress = true;
+    const previousIndex = this.semanticIndex || [];
+    const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
+    try {
+      const locationIndex = options.locationIndex || await this.buildSemanticTaskReferenceLocationIndex();
+      const repaired = repairSemanticTaskReferenceCorpus(this.settings, vaultBasePath(this.app), locationIndex, {
+        isIndexablePath: (path) => this.isIndexablePath(path),
+        pathFilter: ""
+      });
+      if (!repaired.integrity.ok) {
+        this.taskReferenceIntegrity = repaired.integrity;
+        return false;
+      }
+      this.requireAiAccess();
+      const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
+      const embedded = await this.embedSemanticChunks(repaired.chunks, reuseMap, "task-reference repair");
+      const indexedTaskChunks = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
+      const candidate = previousIndex.filter((chunk) => !semanticTaskReferenceChunkSelected(chunk)).concat(indexedTaskChunks);
+      const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(
+        repaired.records,
+        candidate,
+        { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path), requireChunks: true }
+      );
+      if (!candidateIntegrity.ok) {
+        this.taskReferenceIntegrity = candidateIntegrity;
+        return false;
+      }
+      this.semanticIndex = candidate;
+      this.taskReferenceIntegrity = candidateIntegrity;
+      this.taskReferenceRepairRevision += 1;
+      this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidate, candidateIntegrity.graph));
+      await this.saveSemanticIndex();
+      await this.saveSettings();
+      return true;
+    } catch (error) {
+      this.semanticIndex = previousIndex;
+      this.settings.semanticIndexMeta = previousMeta;
+      this.taskReferenceIntegrity = Object.assign({}, this.taskReferenceIntegrity || {}, { ok: false, reasonCodes: ["task-reference-repair-failed"] });
+      this.logLocal("Task-reference repair deferred", { reason: options.reason || "integrity", error: error.message || String(error) });
+      return false;
+    } finally {
+      this.taskReferenceRepairInProgress = false;
+    }
   }
 
   markTaskReferenceStateDirty() {
@@ -843,16 +1046,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         changed = true;
       }
     }
+    const normalizedEmbeddingDimensions = normalizeOpenAiEmbeddingDimensions(
+      this.settings.openAiEmbeddingDimensions,
+      this.settings.embeddingModel
+    );
+    if (supportsOpenAiEmbeddingDimensions(this.settings.embeddingModel)
+      && Number(this.settings.openAiEmbeddingDimensions) !== normalizedEmbeddingDimensions) {
+      this.settings.openAiEmbeddingDimensions = normalizedEmbeddingDimensions;
+      changed = true;
+    }
     if (!this.settings.chatModel) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       changed = true;
     }
-    if (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4-mini" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4") {
+    const legacyDefaultOpenAiPair = (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4-mini")
+      || (normalizeOpenAIModelId(this.settings.chatModel) === "gpt-5.4-mini" && normalizeOpenAIModelId(this.settings.chatFallbackModel) === "gpt-5.4");
+    if (legacyDefaultOpenAiPair) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
       this.settings.chatFallbackModel = DEFAULT_SETTINGS.chatFallbackModel;
+      if (this.settings.chatReasoningEffort === DEFAULT_REASONING_EFFORT) {
+        this.settings.chatReasoningEffort = DEFAULT_SETTINGS.chatReasoningEffort;
+      }
+      if (this.settings.chatFallbackReasoningEffort === DEFAULT_REASONING_EFFORT) {
+        this.settings.chatFallbackReasoningEffort = DEFAULT_SETTINGS.chatFallbackReasoningEffort;
+      }
       changed = true;
     }
-    if (Array.isArray(this.settings.availableChatModels) && this.settings.availableChatModels.join("|") === "gpt-5.4-mini|gpt-5.4") {
+    if (Array.isArray(this.settings.availableChatModels) && ["gpt-5.4|gpt-5.4-mini", "gpt-5.4-mini|gpt-5.4"].includes(this.settings.availableChatModels.join("|"))) {
       this.settings.availableChatModels = DEFAULT_SETTINGS.availableChatModels.slice();
       changed = true;
     }
@@ -1061,14 +1281,66 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (changed) await this.saveSettings();
   }
 
+  updateSemanticIndexLoadTelemetry(patch = {}) {
+    this.semanticIndexLoadTelemetry = semanticIndexLoadTelemetrySnapshot(Object.assign({}, this.semanticIndexLoadTelemetry || emptySemanticIndexLoadTelemetry(), patch));
+    return this.semanticIndexLoadTelemetry;
+  }
+
+  beginSemanticIndexLoadTelemetry(mode = "forced") {
+    const normalizedMode = mode === "deferred" ? "deferred" : "forced";
+    const previous = this.semanticIndexLoadTelemetry || emptySemanticIndexLoadTelemetry();
+    this.semanticIndexLoadStartedAt = Date.now();
+    this.semanticIndexLoadTelemetry = semanticIndexLoadTelemetrySnapshot(Object.assign(emptySemanticIndexLoadTelemetry(), {
+      state: "loading",
+      mode: normalizedMode,
+      manifestFirst: false,
+      pathMetaAttempted: Boolean(previous.pathMetaAttempted),
+      pathMetaLoaded: Boolean(previous.pathMetaLoaded),
+      pathMetaReads: Number(previous.pathMetaReads || 0),
+      deferred: normalizedMode === "deferred",
+      forced: normalizedMode === "forced"
+    }));
+  }
+
+  finishSemanticIndexLoadTelemetry(error = null) {
+    const stats = this.semanticIndexStats || {};
+    const current = this.semanticIndexLoadTelemetry || emptySemanticIndexLoadTelemetry();
+    const elapsedMs = this.semanticIndexLoadStartedAt ? Math.max(0, Date.now() - this.semanticIndexLoadStartedAt) : Number(current.elapsedMs || 0);
+    this.semanticIndexLoadStartedAt = 0;
+    this.semanticIndexLoadTelemetry = semanticIndexLoadTelemetrySnapshot(Object.assign({}, current, {
+      state: error ? "failed" : "ready",
+      completed: true,
+      elapsedMs,
+      shardCount: Number(stats.shards || current.shardCount || 0),
+      totalBytes: Number(stats.totalBytes || current.totalBytes || 0),
+      largestBytes: Number(stats.bytes || current.largestBytes || 0),
+      error: error?.message || error || ""
+    }));
+    return this.semanticIndexLoadTelemetry;
+  }
+
+  recordSemanticIndexLoadYield() {
+    if (this.semanticIndexLoadTelemetry?.state !== "loading") return;
+    this.updateSemanticIndexLoadTelemetry({ yields: Number(this.semanticIndexLoadTelemetry.yields || 0) + 1 });
+  }
+
   async loadSemanticIndex() {
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
     if (this.semanticIndexLoadPromise) return this.semanticIndexLoadPromise;
-    this.semanticIndexLoadPromise = this.loadSemanticIndexInternal();
+    const mode = this.semanticIndexPendingLoadMode || "forced";
+    this.semanticIndexPendingLoadMode = "";
+    this.beginSemanticIndexLoadTelemetry(mode);
+    const loadPromise = this.loadSemanticIndexInternal();
+    this.semanticIndexLoadPromise = loadPromise;
+    let loadError = null;
     try {
-      return await this.semanticIndexLoadPromise;
+      return await loadPromise;
+    } catch (error) {
+      loadError = error;
+      throw error;
     } finally {
+      this.finishSemanticIndexLoadTelemetry(loadError);
       this.semanticIndexLoadPromise = null;
     }
   }
@@ -1080,6 +1352,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticChunkTermCache?.clear?.();
       this.semanticIndexPathMeta?.clear?.();
       this.semanticIndex = [];
+      this.invalidateSemanticRetrievalCache();
       this.semanticIndexLoaded = false;
       const indexFile = this.semanticIndexFileName();
       this.semanticIndexStats = { bytes: 0, path: indexFile };
@@ -1092,8 +1365,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const parsed = loaded.parsed || {};
         this.setSidebarStatus("Preparing semantic index...");
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-        this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app);
-        const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, { chunks: this.semanticIndex.length, file });
+        this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app, this.semanticIndexRevision)
+          .map((chunk) => {
+            const pathMissing = chunk?.path && semanticChunkSourceKind(chunk) === "note" && !(this.app.vault.getAbstractFileByPath?.(chunk.path) instanceof TFile);
+            if (isLegacyGroupedTaskReferenceChunk(chunk) || pathMissing) {
+              return Object.assign({}, chunk, { stale: true, indexMetadata: Object.assign({}, chunk.indexMetadata || {}, { stale: true, quarantineReason: pathMissing ? "stale-note-path" : "legacy-grouped-task-reference" }) });
+            }
+            return chunk;
+          });
+        this.invalidateSemanticRetrievalCache();
+        const loadedDimension = Number(parsed.meta?.dimension || this.semanticIndex.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
+        const compatibility = semanticEmbeddingIndexCompatibility(this.settings, Object.assign({}, parsed.meta || {}, { dimension: loadedDimension }));
+        const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, {
+          chunks: this.semanticIndex.length,
+          file,
+          dimension: loadedDimension,
+          targetDimension: compatibility.targetDimension,
+          embeddingMigrationRequired: compatibility.migrationRequired
+        });
         if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
         this.settings.semanticIndexMeta = nextMeta;
         const loadedShardMaxBytes = Number(parsed.meta?.shardMaxBytes || 0);
@@ -1111,7 +1400,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           } catch {}
         }
         if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
-          this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app);
+          this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app, this.semanticIndexRevision);
+          this.invalidateSemanticRetrievalCache();
           delete this.settings.semanticIndex;
           settingsChanged = true;
           await this.saveSemanticIndex();
@@ -1121,6 +1411,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const nextMeta = {
           model: this.settings.embeddingModel,
           provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
+          dimension: semanticEmbeddingTargetDimension(this.settings),
+          targetDimension: semanticEmbeddingTargetDimension(this.settings),
+          embeddingMigrationRequired: false,
           file: indexFile,
           chunks: 0
         };
@@ -1133,6 +1426,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       if (shouldRewriteShardedIndex) this.queueSemanticIndexReshard();
       await this.refreshSemanticIndexPathMetaAsync();
+      const loadedTaskReferenceLocationIndex = await this.buildSemanticTaskReferenceLocationIndex();
+      this.taskReferenceIntegrity = semanticTaskReferenceCorpusIntegrity(
+        semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), loadedTaskReferenceLocationIndex),
+        (this.semanticIndex || []).filter((chunk) => semanticTaskReferenceChunkSelected(chunk)),
+        { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path), requireChunks: true }
+      );
+      if (!this.taskReferenceIntegrity.ok) this.scheduleSemanticTaskReferenceRepair("index-load-integrity");
       await this.saveSemanticIndexPathMetaSnapshot();
       if (settingsChanged) await this.saveSettings();
     } finally {
@@ -1144,6 +1444,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   queueSemanticIndexLoad(delayMs = STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS) {
     if (this.semanticIndexLoaded || this.semanticIndexLoadInProgress || this.semanticIndexLoadPromise) return;
+    this.semanticIndexPendingLoadMode = "deferred";
+    this.updateSemanticIndexLoadTelemetry({
+      state: "queued",
+      mode: "deferred",
+      deferred: true,
+      forced: false,
+      completed: false,
+      error: ""
+    });
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = window.setTimeout(() => {
       this.semanticIndexLoadTimer = null;
@@ -1158,6 +1467,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.queueSemanticIndexLoad(30000);
       return false;
     }
+    this.semanticIndexPendingLoadMode = this.semanticIndexPendingLoadMode || "deferred";
     await this.loadSemanticIndex();
     this.queueSemanticIndexWarmup();
     return true;
@@ -1168,6 +1478,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
     if (!this.semanticIndexLoaded) this.setSidebarStatus(`Loading ${reason}...`);
+    this.semanticIndexPendingLoadMode = "forced";
     await this.loadSemanticIndex();
     this.queueSemanticIndexWarmup();
     return Boolean((this.semanticIndex || []).length);
@@ -1181,11 +1492,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       rebuiltAt: meta.rebuiltAt || "",
       updatedAt: meta.updatedAt || "",
       shardCount: Number(meta.shardCount || 0),
-      shardBytes: Number(meta.shardBytes || 0)
+      shardBytes: Number(meta.shardBytes || 0),
+      dimension: Number(meta.dimension || 0),
+      targetDimension: Number(meta.targetDimension || semanticEmbeddingTargetDimension(this.settings) || 0)
     }));
   }
 
   async loadSemanticIndexPathMetaSnapshot() {
+    this.updateSemanticIndexLoadTelemetry({
+      pathMetaAttempted: true,
+      pathMetaReads: Number(this.semanticIndexLoadTelemetry?.pathMetaReads || 0) + 1
+    });
     try {
       const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${SEMANTIC_INDEX_PATH_META_FILE}`);
       const parsed = JSON.parse(raw);
@@ -1195,15 +1512,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndexPathMeta.clear();
       for (const entry of parsed.entries) {
         const path = vaultRelativePath(entry?.path || "", vaultBasePath(this.app));
-        if (!path) continue;
+        if (!path || isNonVaultTaskReferencePath(path)) continue;
         this.semanticIndexPathMeta.set(path, {
           chunks: Number(entry.chunks || 0),
           modifiedAt: Number(entry.modifiedAt || 0)
         });
       }
       this.semanticIndexPathMetaSnapshotFingerprint = expected;
+      this.updateSemanticIndexLoadTelemetry({ pathMetaLoaded: this.semanticIndexPathMeta.size > 0 });
       return this.semanticIndexPathMeta.size > 0;
     } catch {
+      this.updateSemanticIndexLoadTelemetry({ pathMetaLoaded: false });
       return false;
     }
   }
@@ -1221,6 +1540,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const body = JSON.stringify({
       metaFingerprint,
       model: this.settings.embeddingModel,
+      dimension: semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {}),
+      targetDimension: semanticEmbeddingTargetDimension(this.settings),
       indexFile: this.semanticIndexFileName(),
       savedAt: deviceTimestamp(),
       entries
@@ -1232,7 +1553,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async readSemanticIndexFile(indexFile) {
     this.setSidebarStatus("Loading semantic index manifest...");
+    this.recordSemanticIndexLoadYield();
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+    this.updateSemanticIndexLoadTelemetry({
+      manifestFirst: true,
+      reads: Number(this.semanticIndexLoadTelemetry?.reads || 0) + 1
+    });
     const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.shards) && parsed.shards.length) {
@@ -1240,14 +1566,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let totalBytes = utf8ByteLength(raw);
       let largestBytes = totalBytes;
       const shardFiles = (parsed.shards || []).map((shard) => shard.file || shard.path || "").filter(Boolean);
+      this.updateSemanticIndexLoadTelemetry({
+        manifestRead: true,
+        shardCount: shardFiles.length,
+        totalBytes,
+        largestBytes
+      });
       const shardReads = [];
       for (let index = 0; index < shardFiles.length; index += 1) {
         const shardFile = shardFiles[index];
         this.setSidebarStatus(`Loading semantic index shard ${index + 1}/${shardFiles.length}...`);
+        this.recordSemanticIndexLoadYield();
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+        this.updateSemanticIndexLoadTelemetry({ reads: Number(this.semanticIndexLoadTelemetry?.reads || 0) + 1 });
         const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
         const shardBytes = utf8ByteLength(shardRaw);
         shardReads[index] = { file: shardFile, hash: shortHash(shardRaw), bytes: shardBytes, parsed: JSON.parse(shardRaw) };
+        this.updateSemanticIndexLoadTelemetry({
+          shardsLoaded: index + 1,
+          totalBytes: Number(this.semanticIndexLoadTelemetry?.totalBytes || 0) + shardBytes,
+          largestBytes: Math.max(Number(this.semanticIndexLoadTelemetry?.largestBytes || 0), shardBytes)
+        });
+        this.recordSemanticIndexLoadYield();
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       }
       for (const shard of shardReads) {
@@ -1267,6 +1607,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
     }
     const bytes = utf8ByteLength(raw);
+    this.updateSemanticIndexLoadTelemetry({ manifestRead: true, shardCount: 0, totalBytes: bytes, largestBytes: bytes });
     return {
       parsed,
       chunks: parsed.chunks || [],
@@ -1278,9 +1619,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async saveSemanticIndex() {
     const indexFile = this.semanticIndexFileName();
+    const activeDimension = Number((this.semanticIndex || []).find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || semanticEmbeddingTargetDimension(this.settings) || 0);
+    const targetDimension = semanticEmbeddingTargetDimension(this.settings);
     const meta = Object.assign({}, this.settings.semanticIndexMeta || {}, {
         model: this.settings.embeddingModel,
         provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
+        dimension: activeDimension,
+        targetDimension,
+        embeddingMigrationRequired: Boolean(targetDimension && activeDimension && targetDimension !== activeDimension),
         file: indexFile,
         sharded: true,
         shardMaxBytes: SEMANTIC_INDEX_SHARD_MAX_BYTES
@@ -1337,8 +1683,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexPathMeta = this.semanticIndexPathMeta || new Map();
     this.semanticIndexPathMeta.clear();
     for (const chunk of this.semanticIndex || []) {
+      if (chunk?.stale === true || chunk?.tombstoned === true || chunk?.quarantined === true || chunk?.indexMetadata?.stale === true || chunk?.indexMetadata?.tombstoned === true || chunk?.indexMetadata?.quarantined === true) continue;
       const path = chunk.path || "";
-      if (!path) continue;
+      if (!path || isNonVaultTaskReferencePath(path)) continue;
       const existing = this.semanticIndexPathMeta.get(path) || { chunks: 0, modifiedAt: 0 };
       existing.chunks += 1;
       existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
@@ -1353,8 +1700,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (let index = 0; index < chunks.length; index += 1) {
       if (index && index % 100 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       const chunk = chunks[index];
+      if (chunk?.stale === true || chunk?.tombstoned === true || chunk?.quarantined === true || chunk?.indexMetadata?.stale === true || chunk?.indexMetadata?.tombstoned === true || chunk?.indexMetadata?.quarantined === true) continue;
       const path = chunk.path || "";
-      if (!path) continue;
+      if (!path || isNonVaultTaskReferencePath(path)) continue;
       const existing = this.semanticIndexPathMeta.get(path) || { chunks: 0, modifiedAt: 0 };
       existing.chunks += 1;
       existing.modifiedAt = Math.max(existing.modifiedAt || 0, Number(chunk.modifiedAt || 0));
@@ -1412,6 +1760,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await this.removeSemanticIndexFiles(indexFile);
     if (indexFile !== SEMANTIC_INDEX_FILE) await this.removeSemanticIndexFiles(SEMANTIC_INDEX_FILE);
     this.semanticIndex = [];
+    this.invalidateSemanticRetrievalCache();
     this.semanticChunkTermCache?.clear?.();
     this.contextQueryProfileCache?.clear?.();
     window.clearTimeout(this.semanticIndexWarmupTimer);
@@ -1420,6 +1769,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.semanticIndexMeta = {
       model: this.settings.embeddingModel,
       provider: usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai",
+      dimension: semanticEmbeddingTargetDimension(this.settings),
+      targetDimension: semanticEmbeddingTargetDimension(this.settings),
+      embeddingMigrationRequired: false,
       file: indexFile,
       chunks: 0,
       purgedAt: deviceTimestamp()
@@ -1479,6 +1831,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.queryEmbeddingCache?.clear?.();
       this.semanticIndexLoaded = false;
       this.semanticIndex = [];
+      this.invalidateSemanticRetrievalCache();
       this.semanticIndexPathMeta?.clear?.();
       this.semanticIndexPathMetaSnapshotFingerprint = "";
       if (loadIndex) await this.loadSemanticIndex();
@@ -1511,6 +1864,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.queryEmbeddingCache?.clear?.();
       this.semanticIndexLoaded = false;
       this.semanticIndex = [];
+      this.invalidateSemanticRetrievalCache();
       this.semanticIndexPathMeta?.clear?.();
       this.semanticIndexPathMetaSnapshotFingerprint = "";
       await this.loadSemanticIndex();
@@ -1528,9 +1882,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async setEmbeddingModel(value) {
     this.settings.embeddingModel = value;
+    if (supportsOpenAiEmbeddingDimensions(value)) {
+      this.settings.openAiEmbeddingDimensions = normalizeOpenAiEmbeddingDimensions(this.settings.openAiEmbeddingDimensions, value);
+    }
     this.queryEmbeddingCache?.clear?.();
+    this.taskDeduplicationEmbeddingCache?.clear?.();
+    this.invalidateSemanticRetrievalCache();
     await this.loadSemanticIndex();
     await this.saveSettings();
+  }
+
+  async setOpenAiEmbeddingDimensions(value) {
+    const next = normalizeOpenAiEmbeddingDimensions(value, this.settings.embeddingModel);
+    if (!next || Number(this.settings.openAiEmbeddingDimensions) === next) return false;
+    this.settings.openAiEmbeddingDimensions = next;
+    this.queryEmbeddingCache?.clear?.();
+    this.taskDeduplicationEmbeddingCache?.clear?.();
+    this.invalidateSemanticRetrievalCache();
+    this.semanticIndexPathMetaSnapshotFingerprint = "";
+    await this.saveSettings();
+    return true;
   }
 
   async setLegacyTodoistIdMode(value) {
@@ -1833,6 +2204,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const files = this.orderSemanticIndexFiles(this.getIndexableFiles());
       if (!files.length) throw new Error("No indexable Markdown notes were found. Check Indexed folders and Excluded folders in settings.");
       const chunks = [];
+      const taskReferenceLocationIndex = emptyTaskReferenceLocationIndex();
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
         const file = files[fileIndex];
@@ -1841,42 +2213,84 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         }
         const text = await this.app.vault.cachedRead(file);
+        addTaskReferenceLocationsFromMarkdown(taskReferenceLocationIndex, text, file.path, this.settings, vaultBasePath(this.app), file.stat?.mtime || 0);
         const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-        const fileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
-          .filter((chunk) => !isSemanticNoiseChunk(chunk));
+        const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems });
+        const fileChunks = selectedFileChunks.map((chunk, sourceIndex) => ({ chunk, sourceIndex })).filter((item) => !isSemanticNoiseChunk(item.chunk));
         for (let index = 0; index < fileChunks.length; index += 1) {
-          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: fileChunks[index], modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
+          const item = fileChunks[index];
+          const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
+          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
         }
       }
       this.setSidebarStatus("Preparing task reference chunks...");
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-      chunks.push(...this.semanticTaskReferenceChunks());
+      const taskReferenceChunks = this.semanticTaskReferenceChunks("", taskReferenceLocationIndex);
+      chunks.push(...taskReferenceChunks);
       if (!chunks.length) throw new Error("No indexable note text was found. The existing semantic index was left unchanged.");
+      const taskReferenceIntegrity = semanticTaskReferenceCorpusIntegrity(
+        taskReferenceChunks.taskReferenceRecords || semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex),
+        taskReferenceChunks,
+        { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path), requireChunks: true }
+      );
+      if (!taskReferenceIntegrity.ok) throw new Error(`Task-reference integrity failed: ${taskReferenceIntegrity.reasonCodes.join(",")}`);
+      this.taskReferenceIntegrity = taskReferenceIntegrity;
 
       const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
       const embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks");
-      const indexed = embedded.indexed;
+      const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
+      const indexedTaskReferenceChunks = indexed.filter((chunk) => semanticTaskReferenceChunkSelected(chunk));
+      const indexedTaskReferenceIntegrity = semanticTaskReferenceCorpusIntegrity(
+        taskReferenceChunks.taskReferenceRecords || [],
+        indexedTaskReferenceChunks,
+        { settings: this.settings, isIndexablePath: (path) => this.isIndexablePath(path), requireChunks: true }
+      );
+      if (!indexedTaskReferenceIntegrity.ok) throw new Error(`Indexed task-reference integrity failed: ${indexedTaskReferenceIntegrity.reasonCodes.join(",")}`);
+      this.taskReferenceIntegrity = indexedTaskReferenceIntegrity;
 
       this.semanticIndex = indexed;
+      this.invalidateSemanticRetrievalCache();
       this.semanticChunkTermCache?.clear?.();
       this.contextQueryProfileCache?.clear?.();
       this.queueSemanticIndexWarmup();
       this.settings.semanticIndexMeta = {
         model: this.settings.embeddingModel,
+        provider: aiProviderForModel(this.settings.embeddingModel),
         rebuiltAt: deviceTimestamp(),
         chunks: indexed.length,
+        dimension: Number(indexed.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
+        targetDimension: semanticEmbeddingTargetDimension(this.settings),
+        embeddingMigrationRequired: false,
+        contentSchemaVersion: 1,
         maxChunkChars: this.settings.semanticIndexMaxChunkChars,
         maxChunksPerNote: this.settings.semanticIndexMaxChunksPerNote,
         embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision,
-        embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
+        embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+        embeddingRequestTelemetry: {
+          inputRecords: embedded.inputRecords,
+          providerInputs: embedded.providerInputs,
+          deduplicatedInputs: embedded.deduplicatedInputs,
+          reused: embedded.reused
+        },
+        ...semanticIndexMetadata(indexed, taskReferenceChunks.taskReferenceHealth),
+        chunkSelectionTelemetry: chunks.reduce((summary, chunk) => {
+          const telemetry = chunk?.selectionTelemetry;
+          if (!telemetry) return summary;
+          summary.notes += 1;
+          summary.inputChunks += Number(telemetry.inputCount || 0);
+          summary.selectedChunks += Number(telemetry.selectedCount || 0);
+          summary.truncatedChunks += Number(telemetry.truncatedCount || 0);
+          return summary;
+        }, { strategy: "uniform-structural", notes: 0, inputChunks: 0, selectedChunks: 0, truncatedChunks: 0 })
       };
       await this.saveSemanticIndex();
       await this.saveSettings();
-      this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, embedded: embedded.embedded, reused: embedded.reused, ms: Date.now() - startedAt });
+      this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, embedded: embedded.embedded, providerInputs: embedded.providerInputs, deduplicatedInputs: embedded.deduplicatedInputs, reused: embedded.reused, ms: Date.now() - startedAt });
       if (showNotice) new Notice(`Semantic index rebuilt: ${indexed.length} chunks from ${files.length} notes.`);
       return true;
     } catch (error) {
       this.semanticIndex = previousIndex;
+      this.invalidateSemanticRetrievalCache();
       this.settings.semanticIndexMeta = previousMeta;
       await this.saveSettings();
       this.logLocal("Semantic index rebuild failed", { error: error.message || String(error) });
@@ -1929,7 +2343,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   hasUsableSemanticIndex() {
     const meta = this.settings.semanticIndexMeta || {};
-    return Boolean((this.semanticIndex || []).length && Number(meta.chunks || 0) > 0 && meta.rebuiltAt);
+    const compatibility = semanticEmbeddingIndexCompatibility(this.settings, meta);
+    return Boolean((this.semanticIndex || []).length && Number(meta.chunks || 0) > 0 && meta.rebuiltAt && compatibility.compatible);
   }
 
   getSyncableTaskFiles() {
@@ -1996,14 +2411,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.logLocal("Semantic index unchanged", { files: paths.length });
         return;
       }
+      const taskReferenceHealth = semanticTaskReferenceHealthFromChunks(this.semanticIndex || []);
       this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
         rebuiltAt: this.settings.semanticIndexMeta?.rebuiltAt || "",
         updatedAt: deviceTimestamp(),
         chunks: (this.semanticIndex || []).length,
         model: this.settings.embeddingModel,
+        provider: aiProviderForModel(this.settings.embeddingModel),
+        dimension: Number((this.semanticIndex || []).find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
+        targetDimension: semanticEmbeddingTargetDimension(this.settings),
+        embeddingMigrationRequired: false,
+        contentSchemaVersion: 1,
         maxChunkChars: this.settings.semanticIndexMaxChunkChars,
         maxChunksPerNote: this.settings.semanticIndexMaxChunksPerNote,
-        embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision
+        embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision,
+        embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+        ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
       });
       await this.saveSemanticIndex();
       await this.saveSettings();
@@ -2022,21 +2445,66 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!(file instanceof TFile) || !this.isIndexablePath(path)) return this.removePathFromSemanticIndex(path, false);
     this.requireAiAccess();
     const text = await this.app.vault.cachedRead(file);
+    const taskReferenceLocationIndex = await this.buildSemanticTaskReferenceLocationIndex();
     const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-    const chunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote)
-      .filter((chunk) => !isSemanticNoiseChunk(chunk))
-      .map((chunk, index) => ({ id: `${path}#${index}`, path, title: file.basename, text: chunk, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION }));
-    chunks.push(...this.semanticTaskReferenceChunks(path));
-    if (semanticPathChunksMatch(this.semanticIndex, path, chunks)) return this.refreshSemanticPathChunkMetadata(path, chunks);
+    const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems });
+    const chunks = selectedFileChunks
+      .map((chunk, sourceIndex) => ({ chunk, sourceIndex }))
+      .filter((item) => !isSemanticNoiseChunk(item.chunk))
+      .map((item, index) => {
+        const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
+        return { id: `${path}#${index}`, path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION };
+      });
+    chunks.push(...this.semanticTaskReferenceChunks(path, taskReferenceLocationIndex));
+    if (semanticPathChunksMatch(this.semanticIndex, path, chunks, this.settings)) return this.refreshSemanticPathChunkMetadata(path, chunks);
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
     const previousIndex = this.semanticIndex || [];
     const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, this.settings.semanticIndexMeta || {});
     const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`);
-    this.semanticIndex = previousIndex.filter((chunk) => chunk.path !== path).concat(embedded.indexed);
+    const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
+    const activeTaskReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex);
+    const activeTaskReferencePaths = new Map(activeTaskReferenceRecords.map((record) => [record.sourceId, record.path]));
+    const activeTaskReferenceIds = new Set(activeTaskReferencePaths.keys());
+    const replacementSourceIds = new Set(indexed
+      .filter((chunk) => chunk.sourceKind === "todoist-snapshot-reference-row" || chunk.sourceKind === "subtask-task-tree-record" || chunk.sourceKind === "note-task-reference-row" || chunk.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
+      .map((chunk) => String(chunk.sourceId || ""))
+      .filter(Boolean));
+    const replacementTaskReferenceIdentities = new Set(indexed
+      .filter((chunk) => chunk.sourceKind === "note-task-reference-row")
+      .flatMap((chunk) => [
+        chunk.oid ? `oid:${String(chunk.oid).toUpperCase()}` : "",
+        chunk.taskId ? `id:${String(chunk.taskId)}` : ""
+      ])
+      .filter(Boolean));
+    const candidateIndex = previousIndex.filter((chunk) => {
+      if (chunk.path === path) return false;
+      if (isLegacyGroupedTaskReferenceChunk(chunk)) return false;
+      if (chunk.sourceKind === "todoist-snapshot-reference-row" || chunk.sourceKind === "subtask-task-tree-record" || chunk.sourceKind === "note-task-reference-row" || chunk.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
+        if (replacementSourceIds.has(String(chunk.sourceId || ""))) return false;
+        if (chunk.sourceKind === "note-task-reference-row" && replacementTaskReferenceIdentities.has(`oid:${String(chunk.oid || chunk.taskReference?.oid || "").toUpperCase()}`)) return false;
+        if (chunk.sourceKind === "note-task-reference-row" && replacementTaskReferenceIdentities.has(`id:${String(chunk.taskId || chunk.taskReference?.taskId || "")}`)) return false;
+        const activePath = activeTaskReferencePaths.get(String(chunk.sourceId || ""));
+        if (!activeTaskReferenceIds.has(String(chunk.sourceId || "")) || activePath !== chunk.path) return false;
+      }
+      return true;
+    }).concat(indexed);
+    const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(
+      activeTaskReferenceRecords,
+      candidateIndex.filter((chunk) => semanticTaskReferenceChunkSelected(chunk)),
+      { settings: this.settings, isIndexablePath: (candidatePath) => this.isIndexablePath(candidatePath), requireChunks: true }
+    );
+    if (!candidateIntegrity.ok) {
+      this.taskReferenceIntegrity = candidateIntegrity;
+      this.scheduleSemanticTaskReferenceRepair("incremental-integrity");
+      return false;
+    }
+    this.semanticIndex = candidateIndex;
+    this.taskReferenceIntegrity = candidateIntegrity;
+    this.invalidateSemanticRetrievalCache();
     this.semanticChunkTermCache?.clear?.();
     this.contextQueryProfileCache?.clear?.();
     this.queueSemanticIndexWarmup();
-    this.logLocal("Semantic note index refreshed", { path, chunks: chunks.length, embedded: embedded.embedded, reused: embedded.reused });
+    this.logLocal("Semantic note index refreshed", { path, chunks: chunks.length, embedded: embedded.embedded, providerInputs: embedded.providerInputs, deduplicatedInputs: embedded.deduplicatedInputs, reused: embedded.reused });
     return true;
   }
 
@@ -2046,7 +2514,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let reused = 0;
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index];
-      const reusedChunk = reusedSemanticChunk(chunk, reuseMap);
+      const reusedChunk = reusedSemanticChunk(chunk, reuseMap, this.settings);
       if (reusedChunk) {
         indexed[index] = reusedChunk;
         reused += 1;
@@ -2054,21 +2522,66 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         pending.push({ chunk, index });
       }
     }
+    const pendingGroups = [];
+    const pendingByKey = new Map();
+    for (const item of pending) {
+      const requestKey = semanticChunkEmbeddingRequestKey(item.chunk);
+      const existing = pendingByKey.get(requestKey);
+      if (existing) {
+        existing.items.push(item);
+      } else {
+        const group = { requestKey, chunk: item.chunk, items: [item] };
+        pendingByKey.set(requestKey, group);
+        pendingGroups.push(group);
+      }
+    }
     const batchSize = semanticEmbeddingBatchSize(this.settings);
     let embedded = 0;
-    if (!pending.length) this.setSidebarStatus(`Reusing ${reused} unchanged ${label}...`);
-    for (let i = 0; i < pending.length; i += batchSize) {
-      const batch = pending.slice(i, i + batchSize);
-      this.setSidebarStatus(`Embedding ${label} ${Math.min(embedded + batch.length, pending.length)}/${pending.length}${reused ? `; reused ${reused}` : ""}...`);
-      const embeddings = await this.embedTexts(batch.map((item) => semanticChunkEmbeddingInput(item.chunk)), "document");
+    let providerInputs = 0;
+    if (!pendingGroups.length) this.setSidebarStatus(`Reusing ${reused} unchanged ${label}...`);
+    for (let i = 0; i < pendingGroups.length; i += batchSize) {
+      const batch = pendingGroups.slice(i, i + batchSize);
+      this.setSidebarStatus(`Embedding ${label} ${Math.min(providerInputs + batch.length, pendingGroups.length)}/${pendingGroups.length}${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
+      const embeddings = await this.embedTexts(batch.map((group) => group.items.length > 1
+        ? semanticChunkSharedEmbeddingInput(group.chunk)
+        : semanticChunkEmbeddingInput(group.chunk)), "document");
       for (let j = 0; j < batch.length; j += 1) {
-        const item = batch[j];
-        indexed[item.index] = Object.assign({}, item.chunk, { embedding: compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision), embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
+        const group = batch[j];
+        const embedding = compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision);
+        const projectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(group.chunk);
+        for (const item of group.items) {
+          indexed[item.index] = Object.assign({}, item.chunk, {
+            embedding,
+            embeddingProvider: aiProviderForModel(this.settings.embeddingModel),
+            embeddingModel: this.settings.embeddingModel,
+            embeddingDimension: embedding.length,
+            embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+            embeddingRequestFingerprint: group.requestKey,
+            ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {}),
+            indexMetadata: {
+              schemaVersion: 1,
+              contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+              provider: aiProviderForModel(this.settings.embeddingModel),
+              model: this.settings.embeddingModel,
+              dimension: embedding.length,
+              requestFingerprint: group.requestKey,
+              ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {})
+            }
+          });
+          embedded += 1;
+        }
       }
-      embedded += batch.length;
+      providerInputs += batch.length;
       await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
     }
-    return { indexed, embedded, reused };
+    return {
+      indexed,
+      embedded,
+      reused,
+      providerInputs,
+      deduplicatedInputs: Math.max(0, pending.length - pendingGroups.length),
+      inputRecords: pending.length
+    };
   }
 
   refreshSemanticPathChunkMetadata(path, nextChunks) {
@@ -2094,8 +2607,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         current.createdAtSource = nextCreatedAtSource;
         changed = true;
       }
+      for (const key of ["lineStart", "lineEnd"]) {
+        const value = Number(next[key] || 0);
+        if (Number(current[key] || 0) !== value) {
+          current[key] = value;
+          changed = true;
+        }
+      }
+      for (const key of ["section", "semanticUnitKind"]) {
+        const value = String(next[key] || "");
+        if (String(current[key] || "") !== value) {
+          current[key] = value;
+          changed = true;
+        }
+      }
     }
-    if (changed) this.refreshSemanticIndexPathMeta();
+    if (changed) {
+      this.invalidateSemanticRetrievalCache();
+      this.refreshSemanticIndexPathMeta();
+    }
     return changed;
   }
 
@@ -2106,42 +2636,259 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.queueSemanticIndexUpdate(notePath, "task-reference");
   }
 
-  semanticTaskReferenceChunks(pathFilter = "") {
+  async refreshTaskReferenceSemanticIndex(previousRecords = [], nextRecords = [], options = {}) {
+    const previousById = new Map((previousRecords || []).map((record) => [String(record.sourceId || ""), record]));
+    const nextById = new Map((nextRecords || []).map((record) => [String(record.sourceId || ""), record]));
+    const changedIds = new Set();
+    for (const [sourceId, previous] of previousById) {
+      const next = nextById.get(sourceId);
+      if (!next || shortHash(JSON.stringify({ path: previous.path, task: previous.task, sourceKind: previous.sourceKind })) !== shortHash(JSON.stringify({ path: next.path, task: next.task, sourceKind: next.sourceKind }))) changedIds.add(sourceId);
+    }
+    for (const sourceId of nextById.keys()) if (!previousById.has(sourceId)) changedIds.add(sourceId);
+    this.invalidateSemanticRetrievalCache();
+    const paths = uniqueValues(Array.from(changedIds).flatMap((sourceId) => [previousById.get(sourceId)?.path || "", nextById.get(sourceId)?.path || ""]).filter(Boolean));
+    for (const path of paths.slice(0, 32)) this.queueTaskReferenceIndexUpdate(path);
+    const result = { queued: Math.min(paths.length, 32), completed: 0, invalidated: changedIds.size, degradedReason: "" };
+    if (!changedIds.size) return result;
+    if (!this.hasUsableSemanticIndex() || this.semanticIndexInProgress) {
+      result.degradedReason = this.semanticIndexInProgress ? "semantic-index-busy" : "semantic-index-unavailable";
+      this.lastSemanticRetrievalTelemetry = Object.assign({}, this.lastSemanticRetrievalTelemetry || {}, {
+        taskReferenceRefresh: { changedCount: changedIds.size, queued: result.queued, completed: 0, degradedReason: result.degradedReason }
+      });
+      return result;
+    }
+    const locationIndex = options.locationIndex || await this.buildSemanticTaskReferenceLocationIndex();
+    const activeTaskReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), locationIndex);
+    const allChunks = this.semanticTaskReferenceChunks("", locationIndex);
+    const nextChunksById = new Map(allChunks.map((chunk) => [String(chunk.sourceId || ""), chunk]));
+    const refreshIds = Array.from(changedIds).slice(0, 64);
+    const refreshChunks = refreshIds.map((sourceId) => nextChunksById.get(sourceId)).filter(Boolean);
+    try {
+      const previousIndex = this.semanticIndex || [];
+      const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, this.settings.semanticIndexMeta || {});
+      const embedded = refreshChunks.length ? await this.embedSemanticChunks(refreshChunks, reuseMap, "task-reference refresh") : { indexed: [], embedded: 0, reused: 0 };
+      const indexed = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
+    const candidateIndex = previousIndex.filter((chunk) => {
+        if (!semanticTaskReferenceChunkSelected(chunk)) return true;
+        return !changedIds.has(String(chunk.sourceId || ""));
+    }).concat(indexed);
+    const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(
+      activeTaskReferenceRecords,
+      candidateIndex.filter((chunk) => semanticTaskReferenceChunkSelected(chunk)),
+      { settings: this.settings, isIndexablePath: (candidatePath) => this.isIndexablePath(candidatePath), requireChunks: true }
+    );
+    if (!candidateIntegrity.ok) {
+      this.taskReferenceIntegrity = candidateIntegrity;
+      this.scheduleSemanticTaskReferenceRepair("incremental-integrity");
+      return false;
+    }
+    this.semanticIndex = candidateIndex;
+    this.taskReferenceIntegrity = candidateIntegrity;
+      this.invalidateSemanticRetrievalCache();
+      this.semanticChunkTermCache?.clear?.();
+      this.refreshSemanticIndexPathMeta();
+      await this.saveSemanticIndex();
+      result.completed = refreshChunks.length;
+      if (refreshIds.length < changedIds.size) result.degradedReason = "task-reference-refresh-bounded";
+      this.lastSemanticRetrievalTelemetry = Object.assign({}, this.lastSemanticRetrievalTelemetry || {}, {
+        taskReferenceRefresh: { changedCount: changedIds.size, queued: result.queued, completed: result.completed, degradedReason: result.degradedReason }
+      });
+    } catch (error) {
+      result.degradedReason = "task-reference-refresh-failed";
+      this.logLocal("Task-reference semantic refresh deferred", { error: error.message || String(error), changedCount: changedIds.size });
+    }
+    return result;
+  }
+
+  semanticTaskReferenceChunks(pathFilter = "", locationIndex = null) {
     const basePath = vaultBasePath(this.app);
-    const groups = new Map();
-    const referenceIndex = this.getTaskReferenceIndex();
-    const childTextByParentOid = referenceIndex.childTextByParentOid;
-    const addTask = (id, task, source) => {
-      const path = vaultRelativePath(task?.path || "", basePath);
-      if (!path || (pathFilter && path !== pathFilter) || !this.isIndexablePath(path)) return;
-      const row = semanticTaskReferenceText(id, task, this.settings, childTextByParentOid.get(String(task?.oid || "").toUpperCase()) || "");
-      if (!row) return;
-      const group = groups.get(path) || { path, rows: [], modifiedAt: 0 };
-      group.rows.push(row);
-      group.modifiedAt = Math.max(group.modifiedAt || 0, Date.parse(task?.cachedAt || "") || 0);
-      groups.set(path, group);
-    };
-    for (const [id, task] of referenceIndex.entries) addTask(id, task, "cache");
-    for (const reference of referenceIndex.pendingReferences) addTask("", reference, "pending");
+    const records = semanticTaskReferenceRecords(this.settings, basePath, locationIndex);
     const chunks = [];
-    for (const group of groups.values()) {
-      const file = this.app.vault.getAbstractFileByPath(group.path);
-      const title = file instanceof TFile ? `${file.basename} Todoist task references` : `${group.path.split("/").pop()?.replace(/\.md$/i, "") || group.path} Todoist task references`;
-      const textChunks = chunkTaskReferenceRows(group.path, group.rows, Math.max(1600, this.settings.semanticIndexMaxChunkChars || 1100));
-      for (let index = 0; index < textChunks.length; index += 1) {
-        chunks.push({
-          id: `${group.path}#todoist-reference-${index}`,
-          path: group.path,
-          title,
-          text: textChunks[index],
-          kind: "todoist-task-reference",
-          source: "local-reference-table",
-          modifiedAt: group.modifiedAt || (file instanceof TFile ? file.stat?.mtime || 0 : 0),
-          embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
-        });
+    for (const record of records) {
+      if (record?.task?.identityUnverified === true || record?.task?.identityAmbiguous === true) continue;
+      if (record.hierarchyIssue && !locationIndex) continue;
+      const resolution = resolveTaskReferenceLocation(locationIndex, record.task);
+      const currentLocation = resolution?.location || null;
+      const resolvedCurrentLocation = Boolean(currentLocation && !resolution?.ambiguous);
+      const snapshotRecord = isTaskReferenceSnapshotSourceKind(record.sourceKind);
+      const stubRecord = record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND;
+      const derivedRecord = record.sourceKind === "note-task-reference-row";
+      const currentLocations = resolvedCurrentLocation
+        ? (resolution.locations || [currentLocation]).map((ref) => Object.assign({}, ref))
+        : (Array.isArray(record.task.currentLocations) ? record.task.currentLocations.map((ref) => Object.assign({}, ref)) : []);
+      const historicalLocations = snapshotRecord || stubRecord
+        ? []
+        : (Array.isArray(record.task.historicalLocations) ? record.task.historicalLocations.map((ref) => Object.assign({}, ref)) : []);
+      const derivedFrom = Array.isArray(record.task.derivedFrom)
+        ? record.task.derivedFrom.map((ref) => Object.assign({}, ref))
+        : historicalLocations.map((ref) => Object.assign({}, ref));
+      const sourceRecords = Array.isArray(record.task.sourceRecords)
+        ? record.task.sourceRecords.map((sourceRecord) => Object.assign({}, sourceRecord, {
+          distinctFields: Object.assign({}, sourceRecord?.distinctFields || {})
+        }))
+        : [];
+      const sourceNoteRefs = snapshotRecord || stubRecord || derivedRecord ? currentLocations : historicalLocations;
+      const path = snapshotRecord || stubRecord
+        ? taskReferenceSyntheticPath(record.sourceId, record.sourceKind)
+        : (resolvedCurrentLocation ? currentLocation.path : record.path);
+      const snapshotPathMatches = snapshotRecord && currentLocations.some((location) => String(location?.path || "") === String(pathFilter));
+      if (pathFilter && (stubRecord || (!snapshotRecord && path !== pathFilter) || (snapshotRecord && !snapshotPathMatches))) continue;
+      if (!path || ((!snapshotRecord && !stubRecord) && !this.isIndexablePath(path))) continue;
+      const task = Object.assign({}, record.task, {
+        path,
+        lineNumber: snapshotRecord || stubRecord ? null : (resolvedCurrentLocation ? currentLocation.lineNumber : record.task.lineNumber),
+        parentLineNumber: snapshotRecord || stubRecord ? null : (resolvedCurrentLocation ? currentLocation.parentLineNumber : record.task.parentLineNumber),
+        currentLocations,
+        historicalLocations,
+        derivedFrom,
+        parentContent: record.parentRecord ? (record.parentRecord.task.content || record.task.parentContent || "") : record.task.parentContent || "",
+        rootTaskId: record.rootRecord?.task?.id || record.rootRecord?.task?.todoistId || record.rootRecord?.id || record.task.rootTaskId || (!record.task.isSubtask ? record.task.id || record.task.todoistId || record.id : ""),
+        rootOid: record.rootRecord?.task?.oid || record.task.rootOid || (!record.task.isSubtask ? record.task.oid : "") || "",
+        parentTaskId: record.task.parentTaskId || record.task.parentId || "",
+        childTaskIds: record.children.map((child) => String(child.task.id || child.task.todoistId || child.id || "")).filter(Boolean),
+        childOids: record.children.map((child) => String(child.task.oid || "")).filter(Boolean),
+        treeDepth: record.treeDepth,
+        treePath: Array.isArray(record.treePath) ? record.treePath.slice() : [],
+        siblingOrder: record.siblingOrder
+      });
+      const file = snapshotRecord || stubRecord ? null : this.app.vault.getAbstractFileByPath(path);
+      const staleNotePath = !snapshotRecord && !stubRecord && !(file instanceof TFile);
+      const title = stubRecord
+        ? "Todoist structural parent reference"
+        : snapshotRecord
+        ? "Todoist task snapshot"
+        : file instanceof TFile ? `${file.basename} Todoist task reference` : `${path.split("/").pop()?.replace(/\.md$/i, "") || path} Todoist task reference`;
+      const childSemanticText = semanticTaskReferenceChildSemanticText(record.children.map((child) => child.task));
+      const text = stubRecord
+        ? semanticTaskReferenceParentStubText(task, record.sourceId)
+        : semanticTaskReferenceText(record.id, task, this.settings, childSemanticText, {
+        sourceKind: record.sourceKind,
+        sourceId: record.sourceId,
+        childTasks: record.children.map((child) => child.task),
+        snapshotRevision: this.settings.taskReferenceSnapshotMeta?.revision || this.settings.taskReferenceSnapshotMeta?.fingerprint || ""
+      });
+      if (!text) continue;
+      const modifiedAt = [record.task.modifiedAt, record.task.updatedAt, record.task.cachedAt, record.task.observedAt, record.task.createdAt]
+        .map((value) => Date.parse(value || "") || Number(value) || 0)
+        .find((value) => value > 0) || (file instanceof TFile ? file.stat?.mtime || 0 : 0);
+      chunks.push({
+        id: `${path}#${record.sourceKind}-${shortHash(record.sourceId)}`,
+        path,
+        title,
+        text,
+        kind: "todoist-task-reference",
+        source: "local-reference-table",
+        sourceKind: record.sourceKind,
+        sourceId: record.sourceId,
+        canonicalTaskId: String(task.canonicalTaskId || task.id || task.todoistId || record.id || ""),
+        sameAsSourceKinds: Array.isArray(task.sameAsSourceKinds) ? Array.from(task.sameAsSourceKinds) : [],
+        sameAs: Array.isArray(task.sameAs) ? Array.from(task.sameAs) : [],
+        sourceRecords,
+        identityUnverified: task.identityUnverified === true,
+        derived: task.derived === true,
+        nonVaultSource: snapshotRecord || stubRecord,
+        sourceSurface: taskReferenceSourceSurface(record.sourceKind),
+        retrievalEligible: record.task.retrievalEligible !== false && !stubRecord,
+        authority: record.task.authority || (stubRecord ? "structural-relationship" : "todoist-snapshot"),
+        todoistSourceId: String(record.task.id || record.task.todoistId || record.id || ""),
+        todoistSourceOid: String(record.task.oid || ""),
+        taskReferenceSchemaVersion: SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION,
+        taskId: String(record.task.id || record.task.todoistId || record.id || ""),
+        todoistId: String(record.task.todoistId || record.task.id || record.id || ""),
+        oid: String(record.task.oid || ""),
+        rootId: String(record.rootRecord?.task?.id || record.rootRecord?.task?.todoistId || record.rootRecord?.id || record.task.rootTaskId || (!record.task.isSubtask ? record.task.id || record.task.todoistId || record.id : "")),
+        rootTaskId: String(record.rootRecord?.task?.id || record.rootRecord?.task?.todoistId || record.rootRecord?.id || record.task.rootTaskId || (!record.task.isSubtask ? record.task.id || record.task.todoistId || record.id : "")),
+        rootOid: String(record.rootRecord?.task?.oid || record.task.rootOid || (!record.task.isSubtask ? record.task.oid : "") || ""),
+        parentId: String(record.task.parentId || ""),
+        parentOid: String(record.task.parentOid || ""),
+        parentContent: String(record.task.parentContent || ""),
+        parentLineNumber: resolvedCurrentLocation ? currentLocation.parentLineNumber : (Number.isFinite(record.task.parentLineNumber) ? record.task.parentLineNumber : null),
+        parentTaskId: String(record.task.parentId || ""),
+        treeDepth: Number(record.treeDepth || 0),
+        treePath: Array.isArray(record.treePath) ? Array.from(record.treePath) : [],
+        siblingOrder: Number.isFinite(record.siblingOrder) ? record.siblingOrder : null,
+        hierarchyIssue: record.hierarchyIssue || "",
+        childTaskIds: record.children.map((child) => String(child.task.id || child.task.todoistId || child.id || "")).filter(Boolean),
+        childOids: record.children.map((child) => String(child.task.oid || "")).filter(Boolean),
+        childSemanticText,
+        projectId: String(record.task.projectId || ""),
+        projectName: String(record.task.projectName || ""),
+        section: String(record.task.section || ""),
+        sectionId: String(record.task.sectionId || ""),
+        sourceNoteRefs,
+        historicalLocations,
+        derivedFrom,
+        currentLocations,
+        snapshotRevision: String(this.settings.taskReferenceSnapshotMeta?.revision || this.settings.taskReferenceSnapshotMeta?.fingerprint || ""),
+        observedAt: String(record.task.observedAt || record.task.cachedAt || ""),
+        createdAt: Number(record.task.createdAt) || noteDateTimestamp(record.task.createdAt),
+        modifiedAt,
+        taskReference: {
+          taskId: String(record.task.id || record.task.todoistId || record.id || ""),
+          todoistId: String(record.task.todoistId || record.task.id || record.id || ""),
+          oid: String(record.task.oid || ""),
+          content: String(record.task.content || ""),
+          description: String(record.task.description || ""),
+          nonVaultSource: snapshotRecord || stubRecord,
+          sourceSurface: taskReferenceSourceSurface(record.sourceKind),
+          retrievalEligible: record.task.retrievalEligible !== false && !stubRecord,
+          authority: record.task.authority || (stubRecord ? "structural-relationship" : "todoist-snapshot"),
+          todoistSourceId: String(record.task.id || record.task.todoistId || record.id || ""),
+          todoistSourceOid: String(record.task.oid || ""),
+          rootTaskId: String(record.rootRecord?.task?.id || record.rootRecord?.task?.todoistId || record.rootRecord?.id || record.task.rootTaskId || (!record.task.isSubtask ? record.task.id || record.task.todoistId || record.id : "")),
+          rootOid: String(record.rootRecord?.task?.oid || record.task.rootOid || (!record.task.isSubtask ? record.task.oid : "") || ""),
+          parentTaskId: String(record.task.parentId || ""),
+          parentOid: String(record.task.parentOid || ""),
+          treeDepth: Number(record.treeDepth || 0),
+          treePath: Array.isArray(record.treePath) ? Array.from(record.treePath) : [],
+          siblingOrder: Number.isFinite(record.siblingOrder) ? record.siblingOrder : null,
+          childTaskIds: record.children.map((child) => String(child.task.id || child.task.todoistId || child.id || "")).filter(Boolean),
+          childOids: record.children.map((child) => String(child.task.oid || "")).filter(Boolean),
+          projectId: String(record.task.projectId || ""),
+          projectName: String(record.task.projectName || ""),
+          sectionId: String(record.task.sectionId || ""),
+          sectionName: String(record.task.section || ""),
+          status: record.task.isCompleted ? "completed" : "open",
+          completed: Boolean(record.task.isCompleted),
+          priority: record.task.priority || null,
+          labels: Array.isArray(record.task.labels) ? Array.from(record.task.labels) : [],
+          dueDate: record.task.due_date || null,
+          deadlineDate: record.task.deadline_date || null,
+          sourceNoteRefs,
+          historicalLocations,
+          derivedFrom,
+          currentLocations,
+          sourceRecords,
+          sameAsSourceKinds: Array.isArray(task.sameAsSourceKinds) ? Array.from(task.sameAsSourceKinds) : [],
+          sameAs: Array.isArray(task.sameAs) ? Array.from(task.sameAs) : [],
+          identityUnverified: task.identityUnverified === true,
+          derived: task.derived === true,
+          childSemanticText
+        },
+        taskReferenceEmbeddingProjectionVersion: SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION,
+        embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
+      });
+      const chunk = chunks[chunks.length - 1];
+      if (staleNotePath) {
+        chunk.stale = true;
+        chunk.indexMetadata = Object.assign({}, chunk.indexMetadata || {}, { schemaVersion: 1, contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION, stale: true, quarantineReason: "stale-note-path", provenance: "historical-task-reference" });
+        chunk.provenance = Object.assign({}, chunk.provenance || {}, { stale: true, quarantineReason: "stale-note-path", historical: true });
+      }
+      if (resolution?.ambiguous) {
+        chunk.quarantined = true;
+        chunk.indexMetadata = Object.assign({}, chunk.indexMetadata || {}, { quarantined: true, quarantineReason: "ambiguous-current-note-location" });
+        chunk.provenance = Object.assign({}, chunk.provenance || {}, { quarantined: true, quarantineReason: "ambiguous-current-note-location" });
+      }
+      if (record.hierarchyIssue) {
+        chunk.quarantined = true;
+        chunk.indexMetadata = Object.assign({}, chunk.indexMetadata || {}, { quarantined: true, quarantineReason: `task-reference-${record.hierarchyIssue}` });
+        chunk.provenance = Object.assign({}, chunk.provenance || {}, { quarantined: true, quarantineReason: `task-reference-${record.hierarchyIssue}` });
       }
     }
-    return chunks;
+    const decorated = decorateSemanticIndexChunks(chunks, this.semanticIndexRevision || 0);
+    Object.defineProperty(decorated, "taskReferenceHealth", { value: semanticTaskReferenceHealth(records), enumerable: false, configurable: true });
+    Object.defineProperty(decorated, "taskReferenceRecords", { value: records, enumerable: false, configurable: true });
+    return decorated;
   }
 
   async removePathFromSemanticIndex(path, save = true) {
@@ -2149,14 +2896,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndex = (this.semanticIndex || []).filter((chunk) => chunk.path !== path);
     const changed = before !== this.semanticIndex.length;
     if (changed) {
+      this.invalidateSemanticRetrievalCache();
       this.semanticChunkTermCache?.clear?.();
       this.contextQueryProfileCache?.clear?.();
       this.queueSemanticIndexWarmup();
+      try {
+        const locationIndex = await this.buildSemanticTaskReferenceLocationIndex();
+        const integrity = semanticTaskReferenceCorpusIntegrity(
+          semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), locationIndex),
+          this.semanticIndex.filter((chunk) => semanticTaskReferenceChunkSelected(chunk)),
+          { settings: this.settings, isIndexablePath: (candidatePath) => this.isIndexablePath(candidatePath), requireChunks: true }
+        );
+        this.taskReferenceIntegrity = integrity;
+        if (!integrity.ok) this.scheduleSemanticTaskReferenceRepair("path-removal-integrity");
+      } catch (error) {
+        this.taskReferenceIntegrity = { ok: false, state: "failed", reasonCodes: ["task-reference-path-removal-validation-failed"], error: error.message || String(error) };
+        this.scheduleSemanticTaskReferenceRepair("path-removal-integrity");
+      }
     }
     if (save && changed) {
+      const taskReferenceHealth = semanticTaskReferenceHealthFromChunks(this.semanticIndex || []);
       this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
         updatedAt: deviceTimestamp(),
-        chunks: this.semanticIndex.length
+        chunks: this.semanticIndex.length,
+        ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
       });
       await this.saveSemanticIndex();
       await this.saveSettings();
@@ -2169,6 +2932,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
       return this.geminiEmbedTexts(normalized, role);
     }
+    const dimensions = semanticEmbeddingRequestDimension(this.settings, role, this.settings.semanticIndexMeta || {});
+    const body = { model: this.settings.embeddingModel, input: normalized };
+    if (dimensions > 0) body.dimensions = dimensions;
     const response = await requestUrl({
       url: "https://api.openai.com/v1/embeddings",
       method: "POST",
@@ -2176,13 +2942,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         authorization: `Bearer ${this.settings.openaiApiKey}`,
         "content-type": "application/json"
       },
-      body: JSON.stringify({ model: this.settings.embeddingModel, input: normalized }),
+      body: JSON.stringify(body),
       throw: false
     });
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`OpenAI embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
     }
-    return response.json.data.map((item) => item.embedding);
+    const embeddings = response.json.data.map((item) => item.embedding);
+    if (dimensions > 0 && embeddings.some((embedding) => !Array.isArray(embedding) || embedding.length !== dimensions)) {
+      throw new Error(`OpenAI embeddings returned an unexpected dimension; expected ${dimensions}.`);
+    }
+    return embeddings;
   }
 
   async geminiEmbedTexts(texts, role = "document") {
@@ -2228,46 +2998,912 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async retrieveSemanticContext(query, limit, queryPlan = null) {
-    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
-      await this.ensureSemanticIndexLoaded("semantic search index");
-    }
-    const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const startedAt = Date.now();
     const plan = queryPlan || contextQueryPlan(query, "chat");
-    const profile = buildContextQueryProfile(this, index, plan);
-    if (!index.length) return this.retrieveLexicalContext(query, limit, profile);
-    const cacheKey = `${this.settings.embeddingModel}:${singleLine(query).slice(0, 500)}`;
-    let queryEmbedding = this.queryEmbeddingCache.get(cacheKey);
-    if (!queryEmbedding) {
-      [queryEmbedding] = await this.embedTexts([query || ""], "query");
-      this.queryEmbeddingCache.set(cacheKey, queryEmbedding);
-        if (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+    const request = semanticRetrievalRequestMetadata(query, limit, plan, this.settings);
+    const cacheKey = this.semanticRetrievalCacheKey(query, limit, plan);
+    const cached = this.getSemanticRetrievalCache(cacheKey);
+    if (cached) return cached;
+    let indexLoadError = null;
+    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+      try {
+        await this.ensureSemanticIndexLoaded("semantic search index");
+      } catch (error) {
+        indexLoadError = error;
+      }
     }
-    const queryTerms = termCounts(query);
-    const poolSize = Math.max(limit * 6, 40);
+    const rawIndex = (this.semanticIndex || [])
+      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const index = decorateSemanticIndexChunks(rawIndex, this.semanticIndexRevision || 0);
+    const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
+    const usableIndex = integrity.validChunks;
+    if (indexLoadError) {
+      const result = this.finalizeSemanticRetrievalContext([], request, {
+        indexState: "failed",
+        degradedReason: "index-load-failed",
+        candidateCount: 0,
+        indexHealth: integrity.health,
+        elapsedMs: Date.now() - startedAt
+      });
+      return this.setSemanticRetrievalCache(cacheKey, result);
+    }
+    if (!usableIndex.length) {
+      const result = this.finalizeSemanticRetrievalContext([], request, {
+        indexState: "degraded-source-only",
+        degradedReason: index.length ? "index-integrity-failed" : "semantic-index-empty",
+        candidateCount: 0,
+        indexHealth: integrity.health,
+        elapsedMs: Date.now() - startedAt
+      });
+      return this.setSemanticRetrievalCache(cacheKey, result);
+    }
+    const embeddingDimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const embeddingCacheKey = `${this.settings.embeddingModel}:${embeddingDimension || "native"}:${singleLine(query).slice(0, 500)}`;
+    let queryEmbedding = this.queryEmbeddingCache.get(embeddingCacheKey);
+    try {
+      if (!queryEmbedding) {
+        [queryEmbedding] = await this.embedTexts([query || ""], "query");
+        this.queryEmbeddingCache.set(embeddingCacheKey, queryEmbedding);
+        if (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+      }
+    } catch (error) {
+      this.logLocal("Semantic retrieval embedding failed", { error: error.message || String(error) });
+      const result = this.finalizeSemanticRetrievalContext([], request, {
+        indexState: "failed",
+        degradedReason: "query-embedding-failed",
+        candidateCount: usableIndex.length,
+        indexHealth: integrity.health,
+        elapsedMs: Date.now() - startedAt
+      });
+      return this.setSemanticRetrievalCache(cacheKey, result);
+    }
+    const requestedLimit = Math.max(1, Number(limit || 1));
+    const poolSize = Math.max(requestedLimit * 6, 40);
+    const profile = buildContextQueryProfile(this, usableIndex, plan);
     const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
-    const semanticRawCandidates = index
+    const semanticRawCandidates = usableIndex
       .map((chunk) => {
         const semantic = cosine(queryEmbedding, chunk.embedding);
-        const scores = this.contextLexicalScores(chunk, queryTerms);
-        const lexical = scores.lexical;
-        const title = scores.title;
-        return Object.assign({ chunk, semantic, lexical, title, useNoteCreatedTime, recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })) }, contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk)));
+        return {
+          chunk,
+          semantic,
+          lexical: 0,
+          title: 0,
+          semanticOnly: true,
+          useNoteCreatedTime,
+          recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })),
+          ...contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk))
+        };
       });
-    await this.hydrateCandidateCreatedTimes(semanticRawCandidates, Math.max(poolSize * 2, 60));
-    const semanticCandidates = rankContextCandidates(semanticRawCandidates)
-      .slice(0, poolSize);
-    const lexicalCandidates = this.lexicalContextCandidates(query, poolSize, profile);
-    const candidates = rankContextCandidates(filterContextCandidatesForPlan(mergeContextCandidates(semanticCandidates, lexicalCandidates), profile));
-    const uniqueCandidates = deduplicateContextCandidateBodies(candidates);
-    return selectContextCandidatesForPlan(uniqueCandidates, limit, profile).map((item) => annotateContextChunk(item, profile));
+    // Semantic index records already carry bounded temporal metadata; never scan vault files to hydrate relevance.
+    const scopedCandidates = filterContextCandidatesForPlan(semanticRawCandidates, profile);
+    const candidates = rankContextCandidates(scopedCandidates.filter(semanticCandidateIsAdmissible)).slice(0, poolSize);
+    const uniqueCandidates = deduplicateSemanticRetrievalCandidates(candidates);
+    const selected = selectContextCandidatesForPlan(uniqueCandidates, requestedLimit, plan).map((item) => annotateContextChunk(item, profile));
+    const integrityRejected = index.filter((chunk) => !usableIndex.includes(chunk)).map((chunk) => ({ chunk, semantic: 0, reasonCode: "integrity-quarantine" }));
+    const result = this.finalizeSemanticRetrievalContext(selected, request, {
+      indexState: "ready",
+      degradedReason: "",
+      candidates: uniqueCandidates,
+      rejectedCandidates: semanticRawCandidates.concat(integrityRejected),
+      candidateCount: usableIndex.length,
+      indexHealth: integrity.health,
+      elapsedMs: Date.now() - startedAt
+    });
+    return this.setSemanticRetrievalCache(cacheKey, result);
   }
 
-  async retrieveAdaptiveSemanticContext(query, mode = "chat", baseLimit = 8, prompt = "") {
+  finalizeSemanticRetrievalContext(context = [], request = {}, details = {}) {
+    const result = attachSemanticRetrievalMetadata(context, request, Object.assign({ indexRevision: this.semanticIndexRevision || 0 }, details));
+    this.lastSemanticRetrievalTelemetry = result.semanticRetrieval?.telemetry || null;
+    return result;
+  }
+
+  semanticRetrievalCacheKey(query = "", limit = 0, plan = {}) {
+    const settings = this.settings || DEFAULT_SETTINGS;
+    const request = semanticRetrievalRequestMetadata(query, limit, plan, settings);
+    const scope = {
+      mode: request.mode,
+      scopeId: request.scope.id,
+      scopeFingerprint: request.scopeFingerprint,
+      taskId: request.taskId,
+      sourceContractId: request.sourceContractId,
+      queryId: request.queryId,
+      intent: request.scope.intent,
+      broad: request.scope.broad,
+      history: request.scope.history,
+      tasks: request.scope.tasks,
+      portfolio: request.scope.portfolio,
+      strictScope: request.scope.strictScope,
+      anchorTerms: request.scope.anchorTerms
+    };
+    const settingsScope = {
+      provider: settings.aiModelProvider || aiProviderForModel(settings.chatModel),
+      chatModel: settings.chatModel || "",
+      embeddingModel: settings.embeddingModel || "",
+      embeddingDimension: semanticEmbeddingRequestDimension(settings, "query", settings.semanticIndexMeta || {}),
+      indexedFolders: settings.indexedFolders || "",
+      excludedFolders: settings.excludedFolders || "",
+      useNoteCreatedTimeForSemanticIndex: settings.useNoteCreatedTimeForSemanticIndex !== false,
+      maxChunkChars: settings.semanticIndexMaxChunkChars || 0,
+      maxChunksPerNote: settings.semanticIndexMaxChunksPerNote || 0,
+      embeddingPrecision: settings.semanticIndexEmbeddingPrecision || 0,
+      taskReferenceRevision: this.taskReferenceStateRevision || 0
+    };
+    return [
+      this.semanticIndexRevision || 0,
+      this.semanticIndexStorageFingerprint || "",
+      request.queryId,
+      Math.max(1, Number(limit || 1)),
+      JSON.stringify(scope),
+      JSON.stringify(settingsScope)
+    ].join("|");
+  }
+
+  getSemanticRetrievalCache(cacheKey = "") {
+    this.semanticRetrievalCache = this.semanticRetrievalCache || new Map();
+    const entry = this.semanticRetrievalCache.get(cacheKey);
+    if (!entry) return null;
+    if (Date.now() - entry.createdAt > SEMANTIC_RETRIEVAL_CACHE_TTL_MS) {
+      this.semanticRetrievalCache.delete(cacheKey);
+      return null;
+    }
+    const context = cloneSemanticRetrievalContext(entry.context);
+    this.lastSemanticRetrievalTelemetry = context.semanticRetrieval?.telemetry || null;
+    return context;
+  }
+
+  setSemanticRetrievalCache(cacheKey = "", context = []) {
+    this.semanticRetrievalCache = this.semanticRetrievalCache || new Map();
+    this.semanticRetrievalCache.set(cacheKey, { createdAt: Date.now(), context: cloneSemanticRetrievalContext(context) });
+    while (this.semanticRetrievalCache.size > SEMANTIC_RETRIEVAL_CACHE_MAX_ENTRIES) {
+      this.semanticRetrievalCache.delete(this.semanticRetrievalCache.keys().next().value);
+    }
+    const cloned = cloneSemanticRetrievalContext(context);
+    this.lastSemanticRetrievalTelemetry = cloned.semanticRetrieval?.telemetry || null;
+    return cloned;
+  }
+
+  invalidateSemanticRetrievalCache() {
+    this.semanticRetrievalCache?.clear?.();
+    this.taskSemanticContextCache?.clear?.();
+    this.semanticIndexRevision = (this.semanticIndexRevision || 0) + 1;
+  }
+
+  async retrieveAdaptiveSemanticContext(query, mode = "chat", baseLimit = 8, prompt = "", options = {}) {
     const plan = contextQueryPlan(prompt || query, mode);
+    if (options?.sourceContract?.id) {
+      plan.sourceContractId = options.sourceContract.id;
+      plan.sourceContract = options.sourceContract;
+    }
     return this.retrieveSemanticContext(query, adaptiveSemanticRetrievalLimit(this.settings, mode, baseLimit, prompt || query), plan);
   }
 
+  async retrieveTaskSemanticContexts(tasks = [], source = {}, sourceContract = null, options = {}) {
+    const startedAt = Date.now();
+    const flattened = flattenTaskPlanWithIndexes(tasks);
+    const limit = Math.max(1, Number(options.limit || this.settings.maxTaskContextChunks || 6));
+    const provider = aiProviderForModel(this.settings.embeddingModel);
+    const model = String(this.settings.embeddingModel || "");
+    const dimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const revision = Number(this.semanticIndexRevision || 0);
+    const byTask = {};
+    const taskKeyByIndex = {};
+    const telemetry = {
+      schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+      mode: options.mode || "task-generation",
+      sourceType: "semantic-index",
+      sourceContractId: sourceContract?.id || "",
+      provider,
+      model,
+      dimension,
+      indexRevision: revision,
+      taskCount: flattened.length,
+      embeddingBatchCount: 0,
+      embeddingCacheHits: 0,
+      embeddingCacheMisses: 0,
+      embeddingCalls: 0,
+      fusionVersion: TASK_SEMANTIC_FUSION_VERSION,
+      fusionMode: String(options.semanticFusionMode || this.settings.semanticFusionMode || "top-two"),
+      laneCount: 0,
+      laneNamesByTask: {},
+      laneEmbeddingCacheHits: 0,
+      laneEmbeddingCacheMisses: 0,
+      laneEmbeddingUniqueTexts: 0,
+      laneTelemetryByTask: {},
+      selectedEvidenceByTask: {},
+      rejectedEvidenceByTask: {},
+      degraded: false,
+      degradedReason: "",
+      elapsedMs: 0
+    };
+    const makeTaskKey = (task, index) => String(task?.taskId || task?.id || task?.oid || `task-${index}`);
+    if (!flattened.length) {
+      telemetry.elapsedMs = Date.now() - startedAt;
+      return { byTask, taskKeyByIndex, telemetry };
+    }
+    const resultCacheKey = taskWorkflowHash({
+      revision,
+      storageFingerprint: this.semanticIndexStorageFingerprint || "",
+      taskReferenceRevision: this.taskReferenceStateRevision || 0,
+      provider,
+      model,
+      dimension,
+      mode: options.mode || "task-generation",
+      limit,
+      sourceContractId: sourceContract?.id || "",
+      sourceContractFingerprint: sourceContract?.fingerprint || "",
+      sourcePath: vaultRelativePath(source?.path || ""),
+      tasks: flattened.map(([indexValue, task]) => ({
+        index: indexValue,
+        id: makeTaskKey(task, indexValue),
+        semanticQuery: task?.semanticQuery || "",
+        content: task?.content || "",
+        scopeId: task?.scope_id || task?.scopeId || "",
+        expandTaskReferences: task?.expandTaskReferences === true,
+        includeTaskReferences: task?.includeTaskReferences !== false,
+        expandTaskHistory: task?.expandTaskHistory === true,
+        requestedNoteDateKeys: task?.requestedNoteDateKeys || [],
+        semanticLaneText: buildTaskSemanticQuerySet(task, source, sourceContract, options).map((lane) => `${lane.name}:${shortHash(lane.text)}`)
+      }))
+    });
+    this.taskSemanticContextCache = this.taskSemanticContextCache || new Map();
+    const cachedResultEntry = this.taskSemanticContextCache.get(resultCacheKey);
+    if (cachedResultEntry && Date.now() - cachedResultEntry.createdAt <= SEMANTIC_RETRIEVAL_CACHE_TTL_MS) {
+      const cachedTelemetry = Object.assign({}, cachedResultEntry.result.telemetry, {
+        resultCacheHit: true,
+        embeddingBatchCount: 0,
+        embeddingCalls: 0,
+        embeddingCacheHits: flattened.length,
+        embeddingCacheMisses: 0,
+        elapsedMs: Date.now() - startedAt
+      });
+      const cachedResult = {
+        byTask: cachedResultEntry.result.byTask,
+        taskKeyByIndex: cachedResultEntry.result.taskKeyByIndex,
+        telemetry: cachedTelemetry
+      };
+      this.lastSemanticRetrievalTelemetry = cachedTelemetry;
+      return cachedResult;
+    }
+    if (cachedResultEntry) this.taskSemanticContextCache.delete(resultCacheKey);
+    let indexLoadError = null;
+    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+      try { await this.ensureSemanticIndexLoaded("task semantic search index"); } catch (error) { indexLoadError = error; }
+    }
+    const rawIndex = (this.semanticIndex || [])
+      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const index = decorateSemanticIndexChunks(rawIndex, revision);
+    const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
+    const usableIndex = integrity.validChunks;
+    const activeSourcePath = vaultRelativePath(source?.path || "");
+    const degraded = (reason) => {
+      telemetry.degraded = true;
+      telemetry.degradedReason = reason;
+      for (const [indexValue, task] of flattened) {
+        const key = makeTaskKey(task, indexValue);
+        taskKeyByIndex[String(indexValue)] = key;
+        byTask[key] = { queryId: taskSemanticQueryId(sourceContract, task, indexValue, revision), context: [], telemetry: { indexState: reason === "index-load-failed" ? "failed" : "degraded-source-only", degradedReason: reason, selected: [], rejected: [] } };
+        telemetry.rejectedEvidenceByTask[key] = [];
+      }
+      telemetry.elapsedMs = Date.now() - startedAt;
+      this.lastSemanticRetrievalTelemetry = telemetry;
+      return { byTask, taskKeyByIndex, telemetry };
+    };
+    if (indexLoadError) return degraded("index-load-failed");
+    if (!usableIndex.length) return degraded(index.length ? "index-integrity-failed" : "semantic-index-empty");
+
+    this.queryEmbeddingCache = this.queryEmbeddingCache || new Map();
+    const pending = [];
+    const pendingByText = new Map();
+    const laneDataByTask = new Map();
+    for (const [indexValue, task] of flattened) {
+      const key = makeTaskKey(task, indexValue);
+      taskKeyByIndex[String(indexValue)] = key;
+      const scopeId = String(task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || "");
+      const queryId = taskSemanticQueryId(sourceContract, task, indexValue, revision);
+      const lanes = buildTaskSemanticQuerySet(task, source, sourceContract, options).map((lane) => Object.assign({}, lane, { queryId: `${queryId}:${lane.name}`, scopeId, embedding: null }));
+      telemetry.laneCount += lanes.length;
+      telemetry.laneNamesByTask[key] = lanes.map((lane) => lane.name);
+      laneDataByTask.set(key, { key, queryId, scopeId, task, lanes });
+      for (const lane of lanes) {
+        const cacheKey = `${model}:${dimension || "native"}:${sourceContract?.fingerprint || ""}:${queryId}:${lane.name}:${shortHash(lane.text)}`;
+        lane.cacheKey = cacheKey;
+        const cached = this.queryEmbeddingCache.get(cacheKey);
+        if (Array.isArray(cached)) {
+          lane.embedding = cached;
+          telemetry.embeddingCacheHits += 1;
+          telemetry.laneEmbeddingCacheHits += 1;
+          continue;
+        }
+        telemetry.embeddingCacheMisses += 1;
+        telemetry.laneEmbeddingCacheMisses += 1;
+        let pendingItem = pendingByText.get(lane.text);
+        if (!pendingItem) {
+          pendingItem = { text: lane.text, assignments: [] };
+          pendingByText.set(lane.text, pendingItem);
+          pending.push(pendingItem);
+        }
+        pendingItem.assignments.push({ lane, cacheKey });
+      }
+    }
+    telemetry.laneEmbeddingUniqueTexts = pending.length;
+    if (pending.length) {
+      try {
+        const values = await this.embedTexts(pending.map((item) => item.text), "query");
+        telemetry.embeddingBatchCount = 1;
+        telemetry.embeddingCalls = 1;
+        pending.forEach((item, indexValue) => {
+          const embedding = Array.isArray(values[indexValue]) ? values[indexValue] : [];
+          for (const assignment of item.assignments) {
+            assignment.lane.embedding = embedding;
+            if (embedding.length) this.queryEmbeddingCache.set(assignment.cacheKey, embedding);
+          }
+        });
+        while (this.queryEmbeddingCache.size > 100) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+      } catch (error) {
+        telemetry.degraded = true;
+        telemetry.degradedReason = "query-embedding-failed";
+        telemetry.elapsedMs = Date.now() - startedAt;
+        this.logLocal("Task semantic retrieval embedding failed", { error: error.message || String(error), taskCount: flattened.length, laneCount: telemetry.laneCount });
+        return degraded("query-embedding-failed");
+      }
+    }
+    for (const [indexValue, task] of flattened) {
+      const key = taskKeyByIndex[String(indexValue)];
+      const laneData = laneDataByTask.get(key) || { key, queryId: taskSemanticQueryId(sourceContract, task, indexValue, revision), scopeId: String(task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || ""), lanes: [] };
+      const actionLane = laneData.lanes.find((lane) => lane.name === "action") || laneData.lanes[0] || { text: `${source?.title || ""}\n${task?.content || ""}`, embedding: [] };
+      const plan = contextQueryPlan(actionLane.text, options.mode || "task-generation");
+      Object.assign(plan, { sourceContractId: sourceContract?.id || "", sourceContract: sourceContract || null, task, taskId: key, queryId: laneData.queryId, scopeId: laneData.scopeId });
+      const profile = buildContextQueryProfile(this, usableIndex, plan);
+      const taskItemLimit = taskSemanticEvidenceItemLimit(limit, plan);
+      const retrievalMode = String(options.mode || "task-generation");
+      const supportingEvidenceOnly = retrievalMode.startsWith("task-generation") || retrievalMode === "description";
+      const laneResults = [];
+      for (const lane of laneData.lanes) {
+        const lanePlan = contextQueryPlan(lane.text, options.mode || "task-generation");
+        Object.assign(lanePlan, { sourceContractId: sourceContract?.id || "", sourceContract: sourceContract || null, task, taskId: key, queryId: lane.queryId, scopeId: lane.scopeId });
+        const laneProfile = buildContextQueryProfile(this, usableIndex, lanePlan);
+        const ranked = usableIndex.map((chunk) => ({
+          chunk,
+          semantic: cosine(lane.embedding || [], chunk.embedding),
+          lexical: 0,
+          title: 0,
+          semanticOnly: true,
+          ...contextCandidateScopeMetadata(chunk, laneProfile, this.semanticChunkTerms(chunk)),
+          taskId: key,
+          scopeId: lane.scopeId,
+          queryId: lane.queryId,
+          lane: lane.name,
+          sourceKind: semanticChunkSourceKind(chunk),
+          temporalRelation: semanticTemporalRelation(chunk, laneProfile)
+        }));
+        const scoped = filterContextCandidatesForPlan(ranked, laneProfile);
+        const laneRouted = lane.name === "continuity"
+          ? scoped.filter((item) => semanticTaskReferenceChunkSelected(item.chunk || item))
+          : lane.name === "history"
+            ? scoped.filter((item) => (task?.expandTaskHistory === true || !semanticTaskReferenceChunkSelected(item.chunk || item)) && semanticTemporalRelation(item.chunk || item, laneProfile) === "historical")
+            : scoped;
+        const admissible = rankTaskSemanticCandidates(laneRouted
+          .filter(semanticCandidateIsAdmissible)
+          .filter((item) => !(supportingEvidenceOnly && activeSourcePath && vaultRelativePath((item.chunk || item).path || "") === activeSourcePath))
+          .filter((item) => task?.includeTaskReferences !== false || !semanticTaskReferenceChunkSelected(item.chunk || item)));
+        const admitted = deduplicateTaskSemanticCandidates(taskRelativeSemanticAdmissionPool(admissible, taskItemLimit));
+        const candidateWindow = taskSemanticLaneCandidateWindow(admissible, taskItemLimit);
+        laneResults.push({ lane: lane.name, origin: lane.origin || lane.name, mandatory: lane.mandatory === true, factIds: Array.isArray(lane.factIds) ? lane.factIds.slice() : [], embedding: lane.embedding, queryId: lane.queryId, profile: laneProfile, ranked, admissible, elbowAdmitted: admitted, admitted: candidateWindow.candidates, candidateWindow: candidateWindow.candidates, candidateWindowFloor: candidateWindow.floor, candidateWindowPoolCount: candidateWindow.poolCount });
+      }
+      telemetry.laneTelemetryByTask[key] = laneResults.map((result) => {
+        const scores = result.admissible.map((item) => Number(item.semantic || 0)).filter(Number.isFinite).sort((left, right) => right - left);
+        return {
+          lane: result.lane,
+          origin: result.origin,
+          mandatory: result.mandatory,
+          alignment: result.alignment || null,
+          queryId: result.queryId,
+          candidateCount: result.ranked.length,
+          admissibleCount: result.admissible.length,
+          candidateWindowCount: result.candidateWindow.length,
+          candidateWindowFloor: Math.round(Number(result.candidateWindowFloor || 0) * 1000) / 1000,
+          candidateWindowPoolCount: result.candidateWindowPoolCount,
+          admittedCount: result.admitted.length,
+          elbowAdmittedCount: result.elbowAdmitted.length,
+          topScore: Math.round(Number(scores[0] || 0) * 1000) / 1000,
+          topRows: result.admissible.slice(0, 12).map((item, rank) => {
+            const chunk = item.chunk || item;
+            return {
+              rank: rank + 1,
+              evidenceId: String(chunk.evidenceId || chunk.id || ""),
+              sourceKind: semanticChunkSourceKind(chunk),
+              temporalRelation: semanticTemporalRelation(chunk, result.profile),
+              semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000,
+              pathHash: shortHash(String(chunk.path || ""))
+            };
+          }),
+          ...(options.includeLaneCandidateTelemetry ? {
+            candidateRows: result.admissible.map((item, rank) => ({
+              rank: rank + 1,
+              evidenceId: String((item.chunk || item).evidenceId || (item.chunk || item).id || ""),
+              semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000
+            }))
+          } : {})
+        };
+      });
+      const laneCandidatePools = laneResults.map((result) => ({ lane: result.lane, candidates: result.candidateWindow }));
+      const fusedAll = fuseTaskSemanticCandidates(laneCandidatePools, telemetry.fusionMode);
+      const laneCoverage = selectTaskSemanticLaneCoverage(laneResults, taskItemLimit, telemetry.fusionMode, {
+        allowHistoricalTaskReferences: task?.expandTaskHistory === true,
+        task,
+        taskId: key,
+        scopeId: laneData.scopeId
+      });
+      for (const laneTelemetry of telemetry.laneTelemetryByTask[key] || []) {
+        const alignment = laneCoverage.laneAlignment?.[laneTelemetry.lane];
+        if (alignment) laneTelemetry.alignment = alignment;
+      }
+      const fusedAdmissible = deduplicateTaskSemanticCandidates(laneCoverage.fused.filter(semanticCandidateIsAdmissible));
+      const scoreDistribution = taskRelativeSemanticScoreDistribution(fusedAdmissible, taskItemLimit);
+      const semanticAdmissionPool = laneCoverage.selected;
+      const selectedCandidates = semanticAdmissionPool;
+      const selected = selectedCandidates.map((item) => {
+        const reservationReason = laneCoverage.reservedReasonByKey?.[semanticTaskCandidateStableKey(item)] || "";
+        const selectionReasonCode = reservationReason === "exact-current-open-identity"
+          ? "task-semantic-exact-current-open-identity"
+          : reservationReason === "continuity-reserved"
+            ? "task-semantic-continuity-reserved"
+            : "task-semantic-lane-coverage-selected";
+        return Object.assign(annotateContextChunk(item, profile), {
+          selectionReasonCode,
+          taskId: key,
+          scopeId: laneData.scopeId,
+          queryId: laneData.queryId,
+          sourceContractId: sourceContract?.id || ""
+        });
+      });
+      const selectedIds = new Set(selected.map((chunk) => chunk.evidenceId));
+      const admissibleKeys = new Set(fusedAdmissible.map((item) => semanticTaskCandidateStableKey(item)));
+      const admittedKeys = new Set(semanticAdmissionPool.map((item) => semanticTaskCandidateStableKey(item)));
+      const rejected = fusedAll.filter((item) => !selectedIds.has((item.chunk || item).evidenceId)).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED).map((item) => {
+        const chunk = item.chunk || item;
+        const evidenceId = String(chunk.evidenceId || chunk.id || "");
+        const currentSourceExcluded = supportingEvidenceOnly && activeSourcePath && vaultRelativePath(chunk.path || "") === activeSourcePath;
+        const stableKey = semanticTaskCandidateStableKey(item);
+        const reasonCode = currentSourceExcluded
+          ? "current-source-already-supplied"
+          : item.scopeMatch === false || item.structuredScopeMatch === false
+            ? "exact-scope-mismatch"
+            : !semanticCandidateIsAdmissible(item)
+              ? Number(item.semantic || 0) <= 0 ? "semantic-zero-excluded" : "semantic-integrity-excluded"
+              : !admissibleKeys.has(stableKey)
+                ? "task-lane-coverage-excluded"
+                : !admittedKeys.has(stableKey)
+                  ? "task-relative-semantic-gap-excluded"
+                  : "semantic-item-ceiling-excluded";
+        return { evidenceId, reasonCode, taskId: key, scopeId: laneData.scopeId, queryId: laneData.queryId, sourceId: chunk.sourceId || "", sourceKind: semanticChunkSourceKind(chunk), temporalRelation: semanticTemporalRelation(chunk, profile), associationHits: (item.associationHits || []).slice(), associationScore: Math.round(Number(item.scopeScore || 0) * 1000) / 1000, semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000, winningLane: item.winningLane || "", secondLane: item.secondLane || "" };
+      });
+      const selectedRows = selected.map((chunk) => ({
+        evidenceId: chunk.evidenceId || "",
+        reasonCode: chunk.selectionReasonCode || "task-relative-semantic-fused-selected",
+        taskId: key,
+        scopeId: laneData.scopeId,
+        queryId: laneData.queryId,
+        sourceId: chunk.sourceId || chunk.provenance?.sourceId || "",
+        sourceKind: chunk.sourceKind || chunk.provenance?.sourceKind || "",
+        temporalRelation: chunk.temporalRelation || semanticTemporalRelation(chunk, profile),
+        associationHits: (chunk.associationHits || []).slice(),
+        associationScore: Math.round(Number(chunk.scopeScore || 0) * 1000) / 1000,
+        semanticScore: Math.round(Number(chunk.semanticScore || 0) * 1000) / 1000,
+        winningLane: chunk.winningLane || "",
+        winningLaneScore: Math.round(Number(chunk.winningLaneScore || 0) * 1000) / 1000,
+        secondLane: chunk.secondLane || "",
+        secondLaneScore: Math.round(Number(chunk.secondLaneScore || 0) * 1000) / 1000
+      })).filter((item) => item.evidenceId);
+      const localTelemetry = {
+        taskId: key,
+        scopeId: laneData.scopeId,
+        queryId: laneData.queryId,
+        selected: selectedRows.map((item) => item.evidenceId),
+        selectedRows,
+        rejected,
+        fusionMode: telemetry.fusionMode,
+        fusionOrderingMode: telemetry.fusionMode,
+        laneCoverage: {
+          reservedCount: laneCoverage.reservedKeys.size,
+          reservedLaneCount: laneCoverage.reservedLaneCount,
+          continuityReservedCount: laneCoverage.continuityReservedCount || 0,
+          reservedReasonByKey: Object.assign({}, laneCoverage.reservedReasonByKey || {}),
+          exactSupportCount: laneCoverage.exactSupportKeys.size,
+          laneAlignment: laneCoverage.laneAlignment,
+          referenceAdmissionReasons: laneCoverage.referenceAdmissionReasons
+        },
+        laneTelemetry: telemetry.laneTelemetryByTask[key],
+        scoreDistribution: {
+          candidatePoolCount: scoreDistribution.pool.length,
+          positiveScoreCount: scoreDistribution.scores.length,
+          acceptedCeiling: taskItemLimit,
+          topScore: Math.round(Number(scoreDistribution.scores[0] || 0) * 1000) / 1000,
+          medianScore: Math.round(Number(scoreDistribution.median || 0) * 1000) / 1000,
+          medianAbsoluteDeviation: Math.round(Number(scoreDistribution.deviation || 0) * 1000) / 1000,
+          distributionFloor: Math.round(Number(scoreDistribution.distributionFloor || 0) * 1000) / 1000,
+          gapMedian: Math.round(Number(scoreDistribution.gapMedian || 0) * 1000) / 1000,
+          gapMedianAbsoluteDeviation: Math.round(Number(scoreDistribution.gapDeviation || 0) * 1000) / 1000,
+          elbowIndex: scoreDistribution.elbowIndex,
+          elbowGap: Math.round(Number(scoreDistribution.elbowGap || 0) * 1000) / 1000
+        },
+        indexState: "ready",
+        degradedReason: ""
+      };
+      byTask[key] = { queryId: laneData.queryId, scopeId: laneData.scopeId, context: selected, telemetry: localTelemetry };
+      telemetry.selectedEvidenceByTask[key] = localTelemetry.selected;
+      telemetry.rejectedEvidenceByTask[key] = rejected;
+    }
+    if (false) {
+    for (const [indexValue, task] of flattened) {
+      const key = taskKeyByIndex[String(indexValue)];
+      const queryData = embeddings.get(key) || { embedding: [], queryId: taskSemanticQueryId(sourceContract, task, indexValue, revision), scopeId: String(task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || "") };
+      const plan = contextQueryPlan(queryData.query || `${source?.title || ""}\n${task?.content || ""}`, options.mode || "task-generation");
+      plan.sourceContractId = sourceContract?.id || "";
+      plan.sourceContract = sourceContract || null;
+      plan.taskId = key;
+      plan.queryId = queryData.queryId;
+      plan.scopeId = queryData.scopeId;
+      const profile = buildContextQueryProfile(this, usableIndex, plan);
+      const ranked = usableIndex.map((chunk) => ({
+        chunk,
+        semantic: cosine(queryData.embedding || [], chunk.embedding),
+        lexical: 0,
+        title: 0,
+        semanticOnly: true,
+        ...contextCandidateScopeMetadata(chunk, profile, this.semanticChunkTerms(chunk)),
+        taskId: key,
+        scopeId: queryData.scopeId,
+        queryId: queryData.queryId
+      }));
+      const scoped = filterContextCandidatesForPlan(ranked, profile);
+      const admissible = rankTaskSemanticCandidates(scoped.filter(semanticCandidateIsAdmissible));
+      const activeSourcePath = vaultRelativePath(source?.path || "");
+      const retrievalMode = String(options.mode || "task-generation");
+      const supportingEvidenceOnly = retrievalMode.startsWith("task-generation") || retrievalMode === "description";
+      const supportingAdmissible = supportingEvidenceOnly && activeSourcePath
+        ? admissible.filter((item) => vaultRelativePath((item.chunk || item).path || "") !== activeSourcePath)
+        : admissible;
+      const referenceScopedAdmissible = task?.includeTaskReferences === false
+        ? supportingAdmissible.filter((item) => !semanticTaskReferenceChunkSelected(item.chunk || item))
+        : supportingAdmissible;
+      const taskAdmissible = task?.expandTaskHistory === true
+        ? referenceScopedAdmissible.filter((item) => {
+          const chunk = item.chunk || item;
+          if (semanticTaskReferenceChunkSelected(chunk)) return true;
+          if (!supportingEvidenceOnly && activeSourcePath && vaultRelativePath(chunk.path || "") === activeSourcePath) return true;
+          return semanticTemporalRelation(chunk, profile) === "historical";
+        })
+        : referenceScopedAdmissible;
+      const taskItemLimit = taskSemanticEvidenceItemLimit(limit, plan);
+      const scoreDistribution = taskRelativeSemanticScoreDistribution(taskAdmissible, taskItemLimit);
+      const semanticAdmissionPool = taskRelativeSemanticAdmissionPool(taskAdmissible, taskItemLimit);
+      let selectedCandidates = selectContextCandidatesForPlan(semanticAdmissionPool, taskItemLimit, plan);
+      if (task?.expandTaskReferences === true) {
+        const taskReferenceCandidate = taskAdmissible.find((item) => semanticTaskReferenceChunkSelected(item.chunk || item));
+        const taskReferenceEmbedding = taskReferenceCandidate?.chunk?.embedding;
+        if (taskReferenceCandidate && Array.isArray(taskReferenceEmbedding) && taskReferenceEmbedding.length) {
+          const actionEmbedding = Array.isArray(queryData.embedding) ? queryData.embedding : [];
+          const expansionEmbedding = actionEmbedding.length === taskReferenceEmbedding.length
+            ? taskReferenceEmbedding.map((value, index) => (Number(value || 0) + Number(actionEmbedding[index] || 0)) / 2)
+            : taskReferenceEmbedding;
+          const expandedNotes = rankTaskSemanticCandidates(usableIndex
+            .filter((chunk) => !semanticTaskReferenceChunkSelected(chunk)
+              && (!activeSourcePath || vaultRelativePath(chunk.path || "") !== activeSourcePath)
+              && (task?.expandTaskHistory !== true || semanticTemporalRelation(chunk, profile) === "historical"))
+            .map((chunk) => ({
+              chunk,
+              semantic: Math.max(
+                cosine(expansionEmbedding, chunk.embedding),
+                cosine(actionEmbedding, chunk.embedding),
+                cosine(taskReferenceEmbedding, chunk.embedding)
+              ),
+              lexical: 0,
+              title: 0,
+              semanticOnly: true,
+              taskId: key,
+              scopeId: queryData.scopeId,
+              queryId: queryData.queryId
+            }))
+            .filter(semanticCandidateIsAdmissible));
+          const requestedNoteDateKeys = new Set((task.requestedNoteDateKeys || []).map(String).filter(Boolean));
+          const explicitlyRequestedDateCandidates = requestedNoteDateKeys.size
+            ? deduplicateSemanticRetrievalCandidates(expandedNotes.filter((item) => {
+              const chunk = item.chunk || item;
+              const dateKey = datePartFromText(`${chunk.title || ""} ${chunk.path || ""}`);
+              return requestedNoteDateKeys.has(dateKey);
+            })).slice(0, Math.min(3, Math.max(1, taskItemLimit - 1))).map((item) => Object.assign({}, item, { structuredTaskAssociation: true }))
+            : [];
+          const expandedCandidates = diversifyContextCandidates(taskRelativeSemanticAdmissionPool(expandedNotes, taskItemLimit), Math.min(2, Math.max(1, taskItemLimit - 1)));
+          const seenEvidenceIds = new Set();
+          const orderedTaskCandidates = [Object.assign({}, taskReferenceCandidate, { structuredTaskAssociation: true }), ...explicitlyRequestedDateCandidates, ...expandedCandidates, ...selectedCandidates, ...semanticAdmissionPool];
+          selectedCandidates = taskRelativeSemanticAdmissionPool(orderedTaskCandidates, taskItemLimit).filter((item) => {
+            const chunk = item.chunk || item;
+            const evidenceId = String(chunk.evidenceId || chunk.id || "");
+            if (!evidenceId || seenEvidenceIds.has(evidenceId)) return false;
+            seenEvidenceIds.add(evidenceId);
+            return true;
+          }).slice(0, taskItemLimit);
+        }
+      }
+      const selected = selectedCandidates
+        .map((item) => Object.assign(annotateContextChunk(item, profile), { selectionReasonCode: "task-relative-semantic-selected", taskId: key, scopeId: queryData.scopeId, queryId: queryData.queryId, sourceContractId: sourceContract?.id || "" }));
+      const selectedIds = new Set(selected.map((chunk) => chunk.evidenceId));
+      const admissibleIds = new Set(taskAdmissible.map((item) => String((item.chunk || item).evidenceId || (item.chunk || item).id || "")));
+      const admittedIds = new Set(semanticAdmissionPool.map((item) => String((item.chunk || item).evidenceId || (item.chunk || item).id || "")));
+      const rejected = rankTaskSemanticCandidates(ranked.filter((item) => !selectedIds.has(item.chunk.evidenceId))).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED).map((item) => {
+        const evidenceId = String(item.chunk.evidenceId || item.chunk.id || "");
+        const currentSourceExcluded = supportingEvidenceOnly && activeSourcePath && vaultRelativePath(item.chunk.path || "") === activeSourcePath;
+        const reasonCode = currentSourceExcluded
+          ? "current-source-already-supplied"
+          : item.scopeMatch === false || item.structuredScopeMatch === false
+            ? "exact-scope-mismatch"
+            : !semanticCandidateIsAdmissible(item)
+              ? Number(item.semantic || 0) <= 0 ? "semantic-zero-excluded" : "semantic-integrity-excluded"
+              : !admissibleIds.has(evidenceId)
+                ? "task-reference-policy-excluded"
+                : !admittedIds.has(evidenceId)
+                  ? "task-relative-semantic-gap-excluded"
+                  : "semantic-item-ceiling-excluded";
+        return {
+        evidenceId,
+        reasonCode,
+        taskId: key,
+        scopeId: queryData.scopeId,
+        queryId: queryData.queryId,
+        sourceId: item.chunk.sourceId || "",
+        sourceKind: semanticChunkSourceKind(item.chunk),
+        temporalRelation: semanticTemporalRelation(item.chunk, profile),
+        associationHits: (item.associationHits || []).slice(),
+        associationScore: Math.round(Number(item.scopeScore || 0) * 1000) / 1000,
+        semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000
+      };
+      });
+      const selectedRows = selected.map((chunk) => ({
+        evidenceId: chunk.evidenceId || "",
+        reasonCode: chunk.selectionReasonCode || "task-relative-semantic-selected",
+        taskId: key,
+        scopeId: queryData.scopeId,
+        queryId: queryData.queryId,
+        sourceId: chunk.sourceId || chunk.provenance?.sourceId || "",
+        sourceKind: chunk.sourceKind || chunk.provenance?.sourceKind || "",
+        temporalRelation: chunk.temporalRelation || semanticTemporalRelation(chunk, profile),
+        associationHits: (chunk.associationHits || []).slice(),
+        associationScore: Math.round(Number(chunk.scopeScore || 0) * 1000) / 1000,
+        semanticScore: Math.round(Number(chunk.semanticScore || 0) * 1000) / 1000
+      })).filter((item) => item.evidenceId);
+      const localTelemetry = {
+        taskId: key,
+        scopeId: queryData.scopeId,
+        queryId: queryData.queryId,
+        selected: selectedRows.map((item) => item.evidenceId),
+        selectedRows,
+        rejected,
+        scoreDistribution: {
+          candidatePoolCount: scoreDistribution.pool.length,
+          positiveScoreCount: scoreDistribution.scores.length,
+          acceptedCeiling: taskItemLimit,
+          topScore: Math.round(Number(scoreDistribution.scores[0] || 0) * 1000) / 1000,
+          medianScore: Math.round(Number(scoreDistribution.median || 0) * 1000) / 1000,
+          medianAbsoluteDeviation: Math.round(Number(scoreDistribution.deviation || 0) * 1000) / 1000,
+          distributionFloor: Math.round(Number(scoreDistribution.distributionFloor || 0) * 1000) / 1000,
+          gapMedian: Math.round(Number(scoreDistribution.gapMedian || 0) * 1000) / 1000,
+          gapMedianAbsoluteDeviation: Math.round(Number(scoreDistribution.gapDeviation || 0) * 1000) / 1000,
+          elbowIndex: scoreDistribution.elbowIndex,
+          elbowGap: Math.round(Number(scoreDistribution.elbowGap || 0) * 1000) / 1000
+        },
+        indexState: "ready",
+        degradedReason: ""
+      };
+      byTask[key] = { queryId: queryData.queryId, scopeId: queryData.scopeId, context: selected, telemetry: localTelemetry };
+      telemetry.selectedEvidenceByTask[key] = localTelemetry.selected;
+      telemetry.rejectedEvidenceByTask[key] = rejected;
+    }
+    }
+    telemetry.elapsedMs = Date.now() - startedAt;
+    telemetry.indexState = "ready";
+    telemetry.indexHealth = integrity.health;
+    telemetry.queryId = taskWorkflowHash({ sourceContractId: sourceContract?.id || "", tasks: Object.keys(byTask).map((key) => byTask[key].queryId) });
+    this.lastSemanticRetrievalTelemetry = telemetry;
+    const result = { byTask, taskKeyByIndex, telemetry };
+    this.taskSemanticContextCache.set(resultCacheKey, { createdAt: Date.now(), result });
+    while (this.taskSemanticContextCache.size > SEMANTIC_RETRIEVAL_CACHE_MAX_ENTRIES) {
+      this.taskSemanticContextCache.delete(this.taskSemanticContextCache.keys().next().value);
+    }
+    return result;
+  }
+
+  async retrieveSchedulerSemanticContext(candidates = [], options = {}) {
+    const startedAt = Date.now();
+    const list = (candidates || []).filter(Boolean);
+    const limit = Math.max(1, Number(options.limit || this.settings.maxTaskContextChunks || 6));
+    const provider = aiProviderForModel(this.settings.embeddingModel);
+    const model = String(this.settings.embeddingModel || "");
+    const dimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const revision = Number(this.semanticIndexRevision || 0);
+    const makeBundle = (candidate, patch = {}) => Object.assign({
+      candidateId: String(candidate?.id || ""),
+      candidateOid: String(candidate?.oid || ""),
+      rootTaskId: String(candidate?.rootTaskId || candidate?.rootId || (!candidate?.isSubtask ? candidate?.id || candidate?.todoistId || "" : "")),
+      rootOid: String(candidate?.rootOid || (!candidate?.isSubtask ? candidate?.oid || "" : "")),
+      parentTaskId: String(candidate?.parentId || ""),
+      parentOid: String(candidate?.parentOid || ""),
+      childTaskIds: Array.isArray(candidate?.childTaskIds) ? candidate.childTaskIds.slice() : [],
+      childOids: Array.isArray(candidate?.childOids) ? candidate.childOids.slice() : [],
+      treePath: Array.isArray(candidate?.treePath) ? candidate.treePath.slice() : [],
+      treeDepth: candidate?.treeDepth ?? null,
+      siblingOrder: candidate?.siblingOrder ?? null,
+      scopeId: schedulerSemanticScopeId(candidate),
+      indexRevision: revision,
+      provider,
+      model,
+      dimension,
+      queryId: schedulerSemanticQueryId(candidate, revision, provider, model, dimension),
+      chunks: [],
+      evidenceIds: [],
+      sourceIds: [],
+      queryEmbedding: [],
+      indexState: "ready",
+      degradedReason: ""
+    }, patch);
+    const emptyBundles = list.map((candidate) => makeBundle(candidate, {
+      indexState: "degraded-source-only",
+      degradedReason: "semantic-index-empty"
+    }));
+
+    let indexLoadError = null;
+    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
+      try {
+        await this.ensureSemanticIndexLoaded("scheduler semantic search index");
+      } catch (error) {
+        indexLoadError = error;
+      }
+    }
+    const rawIndex = (this.semanticIndex || [])
+      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+    const index = decorateSemanticIndexChunks(rawIndex, revision);
+    const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
+    const usableIndex = integrity.validChunks;
+    const telemetry = {
+      schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+      queryId: schedulerSemanticBatchQueryId(list, revision, provider, model, dimension),
+      mode: "schedule",
+      sourceType: "semantic-index",
+      indexRevision: revision,
+      provider,
+      model,
+      dimension,
+      candidateCount: usableIndex.length,
+      bundleCount: list.length,
+      taskIds: list.map((candidate) => String(candidate.id || "")).filter(Boolean),
+      scopeIds: list.map(schedulerSemanticScopeId).filter(Boolean),
+      selectedEvidenceByTask: {},
+      rejectedEvidenceByTask: {},
+      embeddingBatchCount: 0,
+      embeddingCacheHits: 0,
+      embeddingCacheMisses: 0,
+      embeddingCalls: 0,
+      indexHealth: integrity.health,
+      indexState: "ready",
+      degradedReason: "",
+      elapsedMs: 0
+    };
+    if (indexLoadError) {
+      telemetry.indexState = "failed";
+      telemetry.degradedReason = "index-load-failed";
+      telemetry.elapsedMs = Date.now() - startedAt;
+      this.lastSemanticRetrievalTelemetry = telemetry;
+      return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: "failed", degradedReason: "index-load-failed" })), telemetry };
+    }
+    if (!usableIndex.length) {
+      telemetry.indexState = "degraded-source-only";
+      telemetry.degradedReason = index.length ? "index-integrity-failed" : "semantic-index-empty";
+      telemetry.elapsedMs = Date.now() - startedAt;
+      this.lastSemanticRetrievalTelemetry = telemetry;
+      return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: telemetry.indexState, degradedReason: telemetry.degradedReason })), telemetry };
+    }
+
+    this.queryEmbeddingCache = this.queryEmbeddingCache || new Map();
+    const pending = [];
+    const embeddings = new Map();
+    for (const candidate of list) {
+      const query = schedulerSemanticCandidateQuery(candidate);
+      const scopeId = schedulerSemanticScopeId(candidate);
+      const cacheKey = schedulerSemanticEmbeddingCacheKey(candidate, query, scopeId, revision, provider, model, dimension);
+      const cached = this.queryEmbeddingCache.get(cacheKey);
+      if (cached) {
+        embeddings.set(candidate.id || candidate.oid || candidate.content, { embedding: cached, cacheKey });
+        telemetry.embeddingCacheHits += 1;
+      } else {
+        pending.push({ candidate, query, cacheKey });
+        telemetry.embeddingCacheMisses += 1;
+      }
+    }
+    if (pending.length) {
+      try {
+        const values = await this.embedTexts(pending.map((item) => item.query), "query");
+        telemetry.embeddingBatchCount = 1;
+        telemetry.embeddingCalls = 1;
+        pending.forEach((item, indexValue) => {
+          const embedding = values[indexValue] || [];
+          if (embedding.length) this.queryEmbeddingCache.set(item.cacheKey, embedding);
+          embeddings.set(item.candidate.id || item.candidate.oid || item.candidate.content, { embedding, cacheKey: item.cacheKey });
+        });
+        while (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+      } catch (error) {
+        telemetry.indexState = "failed";
+        telemetry.degradedReason = "query-embedding-failed";
+        telemetry.elapsedMs = Date.now() - startedAt;
+        this.logLocal("Scheduler semantic retrieval embedding failed", { error: error.message || String(error), candidates: list.length });
+        this.lastSemanticRetrievalTelemetry = telemetry;
+        return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: "failed", degradedReason: "query-embedding-failed" })), telemetry };
+      }
+    }
+
+    const flattened = [];
+    const flattenedByEvidence = new Map();
+    const bundles = [];
+    for (const candidate of list) {
+      const scopeId = schedulerSemanticScopeId(candidate);
+      const lookupKey = candidate.id || candidate.oid || candidate.content;
+      const queryData = embeddings.get(lookupKey) || { embedding: [] };
+      const queryEmbedding = queryData.embedding || [];
+      const ranked = usableIndex.map((chunk) => {
+        const identity = schedulerSemanticChunkIdentityMatch(candidate, chunk);
+        const semantic = identity ? 1 : cosine(queryEmbedding, chunk.embedding);
+        return { chunk, semantic, lexical: 0, title: 0, semanticOnly: true, scopeMatch: true, retrievalScopeMatch: true, taskId: String(candidate.id || candidate.oid || ""), scopeId, queryId: schedulerSemanticQueryId(candidate, revision, provider, model) };
+      }).filter((item) => semanticCandidateIsAdmissible(item));
+      ranked.sort((a, b) => b.semantic - a.semantic || String(a.chunk.evidenceId || "").localeCompare(String(b.chunk.evidenceId || "")));
+      const selected = ranked.slice(0, limit).map((item) => Object.assign(annotateContextChunk(item, { intent: "focused" }), {
+        taskId: String(item.chunk.taskId || item.chunk.task_id || candidate.id || candidate.oid || ""),
+        scopeId,
+        queryId: schedulerSemanticQueryId(candidate, revision, provider, model),
+        sourceAssociation: item.chunk.sourceId || item.chunk.provenance?.sourceId || ""
+      }));
+      const bundle = makeBundle(candidate, {
+        chunks: selected,
+        evidenceIds: selected.map((chunk) => chunk.evidenceId).filter(Boolean),
+        sourceIds: selected.map((chunk) => chunk.sourceId).filter(Boolean),
+        queryEmbedding: schedulerCompactSemanticEmbedding(queryEmbedding),
+        semanticScore: selected.length ? Math.max(...selected.map((chunk) => Number(chunk.semanticScore || chunk.matchScore || 0))) : 0
+      });
+      bundles.push(bundle);
+      telemetry.selectedEvidenceByTask[bundle.candidateId || bundle.candidateOid] = bundle.evidenceIds.slice();
+      telemetry.rejectedEvidenceByTask[bundle.candidateId || bundle.candidateOid] = ranked
+        .filter((item) => !bundle.evidenceIds.includes(item.chunk.evidenceId))
+        .slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED)
+        .map((item) => ({ evidenceId: item.chunk.evidenceId || "", reasonCode: "semantic-top-k-excluded", taskId: bundle.candidateId || bundle.candidateOid, scopeId: bundle.scopeId, queryId: bundle.queryId, sourceId: item.chunk.sourceId || "", semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000 }));
+      for (const chunk of selected) {
+        const existing = flattenedByEvidence.get(chunk.evidenceId);
+        if (existing) {
+          existing.schedulerCandidateIds = uniqueValues([...(existing.schedulerCandidateIds || []), bundle.candidateId || bundle.candidateOid]);
+          continue;
+        }
+        const copy = Object.assign({}, chunk, { schedulerCandidateIds: [bundle.candidateId || bundle.candidateOid] });
+        flattenedByEvidence.set(chunk.evidenceId, copy);
+        flattened.push(copy);
+      }
+    }
+    const request = semanticRetrievalRequestMetadata(telemetry.queryId, flattened.length, { mode: "schedule", queryId: telemetry.queryId }, this.settings);
+    const result = attachSemanticRetrievalMetadata(flattened, request, {
+      indexState: telemetry.indexState,
+      degradedReason: telemetry.degradedReason,
+      candidateCount: usableIndex.length,
+      candidates: flattened,
+      rejectedCandidates: [],
+      indexHealth: integrity.health,
+      elapsedMs: Date.now() - startedAt
+    });
+    Object.assign(result.semanticRetrieval.telemetry, telemetry, { selectedEvidenceIds: flattened.map((chunk) => chunk.evidenceId).filter(Boolean) });
+    this.lastSemanticRetrievalTelemetry = result.semanticRetrieval.telemetry;
+    return { context: result, bundles, telemetry: result.semanticRetrieval.telemetry };
+  }
+
   retrieveLexicalContext(query, limit, queryPlan = null) {
+    return [];
+    /* Lexical retrieval is retired; callers must use retrieveSemanticContext. */
     const index = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
     const profile = queryPlan?.anchorTerms ? queryPlan : buildContextQueryProfile(this, index, queryPlan || contextQueryPlan(query, "chat"));
     const candidates = rankContextCandidates(filterContextCandidatesForPlan(this.lexicalContextCandidates(query, Math.max(limit * 4, 24), profile), profile));
@@ -2275,6 +3911,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   lexicalContextCandidates(query, limit, queryPlan = null) {
+    return [];
+    /* Lexical admission is retired. */
     const chunks = (this.semanticIndex || []).filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
     const queryTerms = termCounts(query);
     const profile = queryPlan?.anchorTerms ? queryPlan : buildContextQueryProfile(this, chunks, queryPlan || contextQueryPlan(query, "chat"));
@@ -2291,6 +3929,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   contextLexicalScores(chunk, queryTerms) {
+    return { lexical: 0, title: 0 };
+    /* Lexical scores are not an admission signal. */
     const entry = this.semanticChunkTerms(chunk);
     return {
       lexical: lexicalScoreFromCounts(queryTerms, entry.allTerms),
@@ -2299,6 +3939,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async hydrateCandidateCreatedTimes(candidates, maxPaths = 80) {
+    return 0;
+    /* Exact index construction may retain timestamps; no vault scan fallback. */
     const ranked = rankContextCandidates(candidates || []);
     const paths = [];
     const seen = new Set();
@@ -2357,6 +3999,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async buildTaskContext(active, chunks, query = "") {
+    const hydrated = semanticTaskContextBundle(this, active, chunks, { query });
+    this.lastTaskContextHydration = hydrated.telemetry;
+    this.lastTaskContextHydrationTelemetry = hydrated.telemetry;
+    return hydrated.text;
+    /* Legacy lexical task-file admission is intentionally unreachable. */
     const queryText = [query, active?.title, active?.selection].filter(Boolean).join("\n");
     const queryTerms = taskSearchTermCounts(queryText);
     const contentQueryTerms = taskContentQueryTermCounts(queryText);
@@ -2437,22 +4084,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const depth = adaptiveContextDepth(mode, prompt);
     const budget = adaptiveContextBudget(mode);
     const queryPlan = options.queryPlan || contextQueryPlan(options.prompt || prompt, mode);
-    const retrievedScopeTerms = uniqueValues((options.context || []).flatMap((chunk) => chunk.retrievalScopeTerms || []));
-    if (retrievedScopeTerms.length) queryPlan.primaryAnchorTerms = retrievedScopeTerms;
+    if (options.sourceContract?.id && !queryPlan.sourceContractId) queryPlan.sourceContractId = options.sourceContract.id;
+    const structuredScope = structuredSemanticScopeMetadata(queryPlan);
+    if (Object.values(structuredScope.values).some(Boolean) || structuredScope.relationships.length) {
+      queryPlan.structuredScope = true;
+      queryPlan.strictScope = structuredScope.hasExactIdentity === true;
+      queryPlan.structuredScopeMetadata = structuredScope;
+    } else {
+      queryPlan.structuredScope = false;
+      queryPlan.strictScope = false;
+    }
     const basePath = vaultBasePath(this.app);
     const citationMap = options.citationMap instanceof Map ? options.citationMap : null;
     const query = [
       prompt,
       options.active?.title,
       options.active?.selection,
-      (options.tasks || []).map((task) => task.content || task.title || "").join("\n")
+      options.taskIsolated ? "" : (options.tasks || []).map((task) => task.content || task.title || "").join("\n")
     ].filter(Boolean).join("\n");
     const noteCards = adaptiveNoteCardsFromChunks(options.context || [], query, this.settings, {
       depth,
       maxCards: budget.maxNotes,
       basePath,
       citationMap,
-      queryPlan
+      queryPlan,
+      semanticOnly: true
     });
     const taskCards = this.adaptiveTaskCards({
       depth,
@@ -2481,11 +4137,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskContext: options.taskContext || "",
       queryPlan,
       settings: this.settings
-    }, Math.min(budget.maxChars, this.settings.maxContextChars ? Math.max(5000, this.settings.maxContextChars) : budget.maxChars));
-    return { depth, mode, queryPlan, noteCards, taskCards, projectCards, text };
+    });
+    const sourceContractId = String(options.sourceContract?.id || options.sourceContractId || queryPlan.sourceContractId || "");
+    const taskContextHydration = this.lastTaskContextHydrationTelemetry || null;
+    const contextBundleHash = String(options.contextBundleHash || taskContextHydration?.bundleHash || taskWorkflowHash({
+      sourceContractId,
+      evidenceIds: (options.context || []).map((chunk) => chunk?.evidenceId || chunk?.evidence_id || "").filter(Boolean),
+      sourceIds: (options.context || []).map((chunk) => chunk?.sourceId || "").filter(Boolean),
+      taskIds: taskContextHydration?.selectedTaskIds || []
+    }));
+    return { depth, mode, queryPlan, noteCards, taskCards, projectCards, text, taskContextHydration, sourceContractId, contextBundleHash, promptBundleId: contextBundleHash, validatorBundleId: contextBundleHash };
   }
 
   adaptiveTaskCards(options = {}) {
+    return semanticAdaptiveTaskCards(this, options);
+    /* Legacy lexical task-reference admission is intentionally unreachable. */
     const depth = Number(options.depth || 4);
     const query = options.query || "";
     const queryTerms = taskSearchTermCounts(query);
@@ -2540,6 +4206,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   taskFilesMatchingQuery(queryText, queryTerms, contextPaths = new Set(), limit = 8) {
+    return [];
+    /* Task files are never scanned for query relevance; selected semantic refs are hydrated by identity. */
     if (!Object.keys(queryTerms || {}).length) return [];
     const files = this.getSyncableTaskFiles();
     const requiredDateTokens = specificDateTokens(queryText);
@@ -2570,35 +4238,117 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.requireAiAccess();
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
-    const context = await this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt);
     const activeText = active?.text ? (active.selection || active.text) : "";
-    const sources = formatSourceLinks(active, context);
-    const taskContext = await this.buildTaskContext(active, context, prompt);
+    const source = active?.path ? { type: "note", title: active.title || "", path: active.path, text: activeText } : null;
+    const sourceContract = source ? buildTaskSourceContract(source, activeText, this.settings) : null;
+    const requestedTaskScopes = chatRequestedTaskScopeRecords(prompt, source, sourceContract, this.settings);
+    let context;
+    let reservedTaskEvidence = null;
+    if (requestedTaskScopes.length) {
+      const perScopeLimit = Math.max(1, Math.min(5, Math.floor(Math.max(1, Number(this.settings.maxChatContextChunks || 8)) / requestedTaskScopes.length)));
+      const taskScopeRetrieval = await this.retrieveTaskSemanticContexts(requestedTaskScopes.map((record) => {
+        const taskRequestPlan = contextQueryPlan(record.requestText || "", "chat");
+        const taskReferencesRequested = /\btodoist\b/i.test(record.requestText || "");
+        return {
+          id: record.taskId,
+          taskId: record.taskId,
+          content: record.action,
+          description: record.primaryExcerpt,
+          semanticQuery: [source?.title || "", record.action, record.requestText].filter(Boolean).join("\n"),
+          expandTaskReferences: taskReferencesRequested,
+          includeTaskReferences: taskReferencesRequested,
+          expandTaskHistory: taskRequestPlan.history,
+          requestedNoteDateKeys: chatRequestedNoteDateKeys(record.requestText, sourceContract),
+          scope_id: record.scopeId,
+          evidence_ids: [sourceContract?.primaryEvidenceId, record.fact?.evidenceId].filter(Boolean),
+          fact_refs: [record.factId, ...(record.primaryContextFactIds || [])].filter(Boolean),
+          subtasks: []
+        };
+      }), source || {}, sourceContract, { limit: perScopeLimit, mode: "chat" });
+      const taskSeparatedGroups = requestedTaskScopes.map((record, requestIndex) => {
+        const key = taskScopeRetrieval.taskKeyByIndex?.[String(requestIndex)] || record.taskId;
+        return taskScopeRetrieval.byTask?.[key]?.context || [];
+      });
+      reservedTaskEvidence = buildTaskReservedSemanticEvidenceBundle(requestedTaskScopes, taskSeparatedGroups, source, sourceContract, this.settings);
+      assertTaskReservedSemanticEvidenceDelivery(reservedTaskEvidence);
+      const taskSeparatedInterleaved = [];
+      const maxGroupLength = Math.max(0, ...taskSeparatedGroups.map((group) => group.length));
+      for (let itemIndex = 0; itemIndex < maxGroupLength; itemIndex += 1) {
+        for (const group of taskSeparatedGroups) if (group[itemIndex]) taskSeparatedInterleaved.push(group[itemIndex]);
+      }
+      const taskSeparatedChunks = uniqueSemanticEvidenceChunks(taskSeparatedInterleaved);
+      const taskSeparatedPlan = contextQueryPlan(prompt, "chat");
+      taskSeparatedPlan.sourceContractId = sourceContract?.id || "";
+      taskSeparatedPlan.sourceContract = sourceContract || null;
+      taskSeparatedPlan.queryId = taskScopeRetrieval.telemetry?.queryId || `query:${shortHash(query)}`;
+      const request = semanticRetrievalRequestMetadata(query, taskSeparatedChunks.length || perScopeLimit, taskSeparatedPlan, this.settings);
+      context = attachSemanticRetrievalMetadata(taskSeparatedChunks, request, {
+        indexState: taskScopeRetrieval.telemetry?.indexState || "ready",
+        degradedReason: taskScopeRetrieval.telemetry?.degradedReason || "",
+        indexRevision: taskScopeRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0,
+        candidateCount: taskScopeRetrieval.telemetry?.indexHealth?.validCount || (this.semanticIndex || []).length,
+        indexHealth: taskScopeRetrieval.telemetry?.indexHealth,
+        elapsedMs: taskScopeRetrieval.telemetry?.elapsedMs || 0
+      });
+      Object.assign(context.semanticRetrieval.telemetry, {
+        taskSeparated: true,
+        taskCount: requestedTaskScopes.length,
+        scopeIds: requestedTaskScopes.map((record) => record.scopeId),
+        embeddingBatchCount: taskScopeRetrieval.telemetry?.embeddingBatchCount || 0,
+        embeddingCalls: taskScopeRetrieval.telemetry?.embeddingCalls || 0,
+        embeddingCacheHits: taskScopeRetrieval.telemetry?.embeddingCacheHits || 0,
+        embeddingCacheMisses: taskScopeRetrieval.telemetry?.embeddingCacheMisses || 0,
+        selectedEvidenceByTask: taskScopeRetrieval.telemetry?.selectedEvidenceByTask || {},
+        rejectedEvidenceByTask: taskScopeRetrieval.telemetry?.rejectedEvidenceByTask || {},
+        reservedEvidenceDelivery: reservedTaskEvidence.telemetry
+      });
+      this.lastSemanticRetrievalTelemetry = context.semanticRetrieval.telemetry;
+    } else {
+      context = await this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt, { sourceContract });
+    }
+    const sourceLedger = chatSourceLedger(active, context, this.settings, sourceContract);
+    const sources = sourceLedger.map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || ""} title=${entry.title || ""} link=${entry.markdown}`).join("\n");
+    const promptSources = reservedTaskEvidence
+      ? sourceLedger.filter((entry) => entry.role === "Active note").map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || "note"} title=${entry.title || ""} link=${entry.markdown}`).join("\n")
+      : sources;
+    const taskContext = reservedTaskEvidence ? "" : await this.buildTaskContext(active, context, prompt);
     const adaptivePack = this.buildAdaptiveContextPack({
       mode: "chat",
       prompt,
       active,
       sourceTitle: active?.title || "",
       sourceSummary: activeText,
-      context,
-      taskContext
+      context: reservedTaskEvidence ? [] : context,
+      taskContext,
+      sourceContract,
+      contextBundleHash: reservedTaskEvidence?.bundleHash || ""
     });
     const modelChoice = this.aiModelForRequest("chat", { prompt, context, adaptivePack, taskContext });
     let response = await this.withAiActivity("Answering question", () => this.openaiResponse({
       operation: "chat",
       model: modelChoice.model,
+      jsonSchema: chatResponseSchema(),
       system: [
         "You are a concise Obsidian sidebar assistant.",
-        "Answer in plain language, usually in 3-6 short bullets or 1-3 short paragraphs.",
+        "Return only JSON matching the supplied chat evidence schema. Each claim must be one short factual sentence.",
+        "Answer in plain language, usually in 3-6 short claims.",
+        "Return exactly one category per claim. A claim with established=false must use category=unsupported, have no evidence_ids, and state only one missing or unestablished element; never combine a supported fact with unsupported details in one claim.",
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-        "Treat the active note as implied source context: cite it at most once in a response unless the user asks for line-by-line sourcing.",
-        "When using context from other vault notes, cite the relevant note directly from the supplied source list near the claim it supports.",
+        "Treat the active note as the primary supplied evidence. Set established=true only when the claim is supported by one or more supplied evidence_ids; otherwise set established=false and say that the element is not established.",
+        "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
         "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
+        "Preserve exact proper names and quoted terms from the evidence. For every supported claim, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
+        "Keep grammatical or contextual misuse distinct from avoidance or prohibition: a statement that a term's use has not been grammatically or contextually correct is a usage-quality warning, not an instruction to avoid or ban that term. Never rewrite that warning as avoidance. An instruction to avoid an exact phrase applies only to that phrase; never generalize it to a broader word, term, subject, or concept.",
         "For change-history questions, present supported changes in chronological order and separate historical state, later changes, and current state. For project-task questions, keep open tasks separate from completed work and omit tasks from other projects.",
-        "Use markdown links exactly as supplied, and do not invent sources.",
-        "When providing any link, use descriptive linked text in markdown form such as [task title](url) or [note title](url). Do not display full raw URLs in the visible answer.",
+        "For actionable or task questions, use the supplied task-local card details when established: current/open/completed state, owner/person, recipient, reviewer, deliverable, dependency, next step, timing, criteria, parent/root/child relationships, evidence IDs, fact refs, and eligible note locations. Do not infer missing details; explicitly say when a requested element is not established.",
+        "Keep the current typed source-contract facts in their separate authoritative/current lane; do not merge them with supporting task snapshots or historical context.",
+        "Keep reserved task lanes independent and resolve their evidence_refs through the shared evidence table; the separately supplied active note remains authoritative current context.",
+        "Describe supported task evidence as a compact execution narrative rather than a lexical keyword dump, and distinguish current state from historical or conflicting evidence.",
+        "Never upgrade planned, possible, requested, or suggested work into a confirmed booking, invitation, approval, contact, completion, or other proof unless that exact state is established by supplied evidence_ids.",
+        "Preserve the source's epistemic state exactly: `is going to` and `plans to` express intent, not a scheduled, confirmed, approved, or otherwise stronger status. Assert a stronger status only when an explicit supplied bound fact supports that exact state; otherwise mark that stronger status not established with category=unsupported and established=false, and do not assert it.",
+        "Use category=unsupported for missing facts, operational mechanics, or completion proof and set established=false; the plugin will render an explicit not-established cue.",
         "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
         "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes; task references should confirm or point to actions, not replace the note evidence.",
         "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
@@ -2615,22 +4365,49 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Active note context:",
         activeText || "No active note context.",
         "",
-        "Allowed source links:",
-        sources || "No source links available.",
+        "Current typed source-contract facts (authoritative/current):",
+        reservedTaskEvidence
+          ? `- Active source evidence_id=${sourceContract?.primaryEvidenceId || ""} source_id=${sourceContract?.sourceId || ""}; its exact current content is supplied once above.`
+          : formatCurrentSourceContractFacts(sourceContract),
+        "",
+        "Allowed evidence ledger (return evidence_ids only; never print links, numbered citations, or a source list):",
+        promptSources || "No source links available.",
+        "",
+        "Semantic retrieval state:",
+        context.semanticRetrieval?.telemetry?.degraded
+          ? `Degraded semantic index/evidence unavailable: ${context.semanticRetrieval.telemetry.degradedReason || "semantic-index-empty"}. Use only supplied current source evidence and state unsupported elements explicitly.`
+          : "Semantic index ready; use only the supplied selected evidence.",
+        "",
+        "Reserved per-task semantic evidence:",
+        reservedTaskEvidence?.serialized || "No reserved task evidence lanes were requested.",
         "",
         "Note-first vault context with secondary task pointers:",
-        adaptivePack.text || taskContext || "No adaptive context found.",
+        reservedTaskEvidence ? "Reserved lanes above are the complete selected context; no generic shared context was added." : (adaptivePack.text || taskContext || "No adaptive context found."),
         "",
         "User prompt:",
         prompt
       ].join("\n"),
-      appendFallbackNotice: this.settings.showAiFallbackNotice !== false,
+      appendFallbackNotice: false,
       background: false
     }));
-    if (modelChoice.useStrong && this.settings.showAiFallbackNotice !== false && modelIdentity(this.lastAiResponseModel) === modelIdentity(modelChoice.model)) {
-      response = `${String(response || "").trimEnd()}\n\nStronger AI model used: ${modelDisplayName(modelChoice.model)}`;
-    }
-    return { answer: response, context };
+    const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
+      retrievalTelemetry: context.semanticRetrieval?.telemetry,
+      maxChars: 5000
+    });
+    response = citationResult.answer;
+    this.lastChatCitationTelemetry = citationResult.telemetry;
+    return {
+      answer: response,
+      context,
+      citationValidation: citationResult.telemetry,
+      citationTelemetry: citationResult.telemetry,
+      taskContextHydration: this.lastTaskContextHydrationTelemetry || null,
+      sourceContractId: adaptivePack.sourceContractId || sourceContract?.id || "",
+      contextBundleHash: adaptivePack.contextBundleHash || "",
+      contextBundleId: adaptivePack.contextBundleHash || "",
+      promptBundleId: adaptivePack.promptBundleId || adaptivePack.contextBundleHash || "",
+      validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || ""
+    };
   }
 
   async tryUpdateSchedulerMemoryFromChat(prompt) {
@@ -2835,7 +4612,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "" }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0 }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -2850,7 +4627,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const reasoningConfig = modelReasoningConfig(candidateModel, effectiveEffort);
         const response = usesGeminiChatModel(candidateModel)
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation, promptCachePrefix })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey });
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey, maxOutputTokens });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -2890,7 +4667,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "" }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0 }) {
     const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
     const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
@@ -2916,8 +4693,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         { role: "user", content: userContent }
       ]
     };
-    const maxOutputTokens = openAiMaxOutputTokensForOperation(operation);
-    if (maxOutputTokens > 0) body.max_output_tokens = maxOutputTokens;
+    const outputTokenLimit = Math.max(0, Number(maxOutputTokens || openAiMaxOutputTokensForOperation(operation)));
+    if (outputTokenLimit > 0) body.max_output_tokens = outputTokenLimit;
     if (usePromptCache) {
       body.prompt_cache_options = { mode: "explicit" };
       if (promptCacheKey) body.prompt_cache_key = promptCacheKey;
@@ -2935,7 +4712,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       response = await this.openaiResponsesRequest("POST", "/responses", foregroundBody);
     }
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`OpenAI returned ${response.status}: ${redactSecrets(response.text)}`);
+      const diagnostic = openAiHttpResponseDiagnostic(response, "response create");
+      const error = new Error(`OpenAI returned ${response.status}: ${JSON.stringify(diagnostic)}`);
+      error.code = diagnostic.code;
+      error.providerDiagnostic = diagnostic;
+      throw error;
     }
     const completed = await this.waitForOpenAIResponse(response.json);
     this.recordAiTokenUsage(operation, model, completed.usage || {});
@@ -3033,13 +4814,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const status = current.status || "completed";
       if (status === "completed") return current;
       if (["failed", "cancelled", "canceled", "incomplete"].includes(status)) {
-        throw new Error(`OpenAI response ${status}: ${JSON.stringify(current.error || current.incomplete_details || {})}`);
+        const diagnostic = openAiTerminalResponseDiagnostic(current);
+        const error = new Error(`OpenAI response ${status}: ${JSON.stringify(diagnostic)}`);
+        error.code = diagnostic.code || `response-${status}`;
+        error.providerDiagnostic = diagnostic;
+        throw error;
       }
       if (!current.id) throw new Error(`OpenAI response did not return an id: ${JSON.stringify(current)}`);
       if (Date.now() - startedAt > maxWaitMs) throw new Error("OpenAI response did not complete within 4 minutes.");
       await delay(2500);
       const poll = await this.openaiResponsesRequest("GET", `/responses/${encodeURIComponent(current.id)}`);
-      if (poll.status < 200 || poll.status >= 300) throw new Error(`OpenAI poll returned ${poll.status}: ${redactSecrets(poll.text)}`);
+      if (poll.status < 200 || poll.status >= 300) {
+        const diagnostic = openAiHttpResponseDiagnostic(poll, "response poll");
+        const error = new Error(`OpenAI poll returned ${poll.status}: ${JSON.stringify(diagnostic)}`);
+        error.code = diagnostic.code;
+        error.providerDiagnostic = diagnostic;
+        throw error;
+      }
       current = poll.json || {};
     }
   }
@@ -3119,20 +4910,80 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
   }
 
+  async retrievePreStructureTaskScopeContexts(source = {}, sourceContract = null, sourceSummary = "", options = {}) {
+    const scopeRecords = taskWorkflowScopeRecords(source, sourceContract, sourceSummary, this.settings);
+    if (!scopeRecords.length) return { scopes: [], byScope: {}, chunks: [], telemetry: { scopeCount: 0, selectedEvidenceByScope: {}, degraded: true, degradedReason: "no-structured-source-scopes" } };
+    const scopeTasks = scopeRecords.map((record) => ({
+      id: record.taskId,
+      taskId: record.taskId,
+      content: record.action,
+      description: record.primaryExcerpt,
+      semanticQuery: record.semanticQuery,
+      scope_id: record.scopeId,
+      evidence_ids: [sourceContract?.primaryEvidenceId, record.fact?.evidenceId].filter(Boolean),
+      fact_refs: [record.factId, ...(record.primaryContextFactIds || [])].filter(Boolean),
+      subtasks: []
+    }));
+    const retrieval = await this.retrieveTaskSemanticContexts(scopeTasks, source, sourceContract, {
+      limit: options.limit || this.settings.maxTaskContextChunks,
+      mode: "task-generation-prestructure"
+    });
+    const byScope = {};
+    const chunks = [];
+    for (const record of scopeRecords) {
+      const key = retrieval.taskKeyByIndex?.[String(record.index)] || record.taskId;
+      const local = retrieval.byTask?.[key] || { context: [], telemetry: {} };
+      const context = uniqueSemanticEvidenceChunks(local.context || []);
+      byScope[record.scopeId] = {
+        scopeId: record.scopeId,
+        factId: record.factId,
+        action: record.action,
+        primaryExcerpt: record.primaryExcerpt,
+        primaryContextFactIds: record.primaryContextFactIds || [],
+        mandatoryTaskFactIds: record.mandatoryTaskFactIds || [],
+        mandatoryDescriptionFactIds: record.mandatoryDescriptionFactIds || [],
+        queryId: local.queryId || "",
+        evidenceIds: context.map((chunk) => chunk.evidenceId).filter(Boolean),
+        context,
+        telemetry: local.telemetry || {}
+      };
+      chunks.push(...context);
+    }
+    return {
+      scopes: scopeRecords,
+      byScope,
+      chunks: uniqueSemanticEvidenceChunks(chunks),
+      telemetry: Object.assign({}, retrieval.telemetry || {}, {
+        scopeCount: scopeRecords.length,
+        selectedEvidenceByScope: Object.fromEntries(Object.entries(byScope).map(([scopeId, bundle]) => [scopeId, bundle.evidenceIds]))
+      })
+    };
+  }
+
   async createTaskPlan(source) {
     await this.ensureCompatibleEmbeddingForChatModel();
     const sourceSummary = compressSourceForTaskPrompt(source, this.settings);
+    const sourceContractText = sourceContractSourceText(source, this.settings);
+    const sourceContract = buildTaskSourceContract(source, sourceContractText, this.settings);
     const taskQuery = `${source.title}\n${sourceSummary}`;
-    const retrievalPrompt = taskGenerationContextQuery(source, sourceSummary, this.settings);
+    const retrievalPrompt = taskGenerationContextQuery(source, sourceSummary, this.settings, sourceContract);
     const retrievalPlan = contextQueryPlan(retrievalPrompt, "task-generation");
-    const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt);
+    retrievalPlan.sourceContractId = sourceContract.id;
+    retrievalPlan.sourceContract = sourceContract;
+    const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt, { sourceContract });
+    const preStructureScopes = await this.retrievePreStructureTaskScopeContexts(source, sourceContract, sourceSummary, {
+      limit: this.settings.maxTaskContextChunks
+    });
+    const preStructureChunks = preStructureScopes.chunks || [];
+    const initialSemanticContext = uniqueSemanticEvidenceChunks([...(context || []), ...preStructureChunks]);
+    let evidenceCatalog = buildTaskEvidenceCatalog(sourceContract, initialSemanticContext, this.settings, { source, sourceSummary });
     const taskContext = await this.buildTaskContext(
       source.type === "note" ? { path: source.path || "", text: source.text || "" } : null,
-      context,
+      initialSemanticContext,
       taskQuery
     );
     const taskInstructions = this.taskInstructionsForSource(source.type);
-    const requestedActionSignals = taskRequestedActionSignals(sourceSummary, source.type, this.settings);
+    const requestedActionSignals = sourceContract?.requestedActionSignals || {};
     const maxMainTasks = generationMainTaskLimit(this.settings);
     const maxSubtasks = generationSubtaskLimit(this.settings);
     const instructions = [
@@ -3147,11 +4998,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       active: source.type === "note" ? { title: source.title, path: source.path || "", text: source.text || "" } : null,
       sourceTitle: source.title,
       sourceSummary,
-      context,
+      context: initialSemanticContext,
       taskContext,
+      sourceContract,
       queryPlan: retrievalPlan
     });
-    const workflowContext = taskWorkflowContextBundle({
+    let workflowContext = taskWorkflowContextBundle({
       source,
       sourceType: source.type,
       sourceTitle: source.title,
@@ -3159,12 +5011,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       sourceSummary,
       taskContext,
       adaptivePack,
-      semanticContext: context,
+      semanticContext: initialSemanticContext,
+      scopeSemanticEvidence: preStructureScopes.byScope,
+      scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry,
+      sourceContract,
+      evidenceCatalog,
+      taskContextHydration: this.lastTaskContextHydrationTelemetry,
       settings: this.settings
     });
+    const stablePromptCachePrefix = workflowContext.promptCachePrefix;
+    const stablePromptEvidenceIds = workflowContext.promptEvidenceIds;
+    const stablePromptEvidenceHash = workflowContext.promptEvidenceHash;
+    if (workflowContext.requiredPromptBlockError) {
+      const failure = {
+        code: "required-workflow-contract-block-overflow",
+        reason: workflowContext.requiredPromptBlockError,
+        chars: workflowContext.requiredPromptBlockChars,
+        hardCeiling: workflowContext.requiredPromptBlockHardCeiling
+      };
+      this.logLocal("Task workflow blocked before model call because the immutable contract block was incomplete", {
+        source: source.type || "",
+        ...failure
+      });
+      return {
+        tasks: [],
+        sectionName: cleanGeneratedSectionName(source.sectionName),
+        sourceSummary,
+        semanticContext: initialSemanticContext,
+        contextNotes: [],
+        sourceContract,
+        sourceContractId: sourceContract.id,
+        evidenceCatalog,
+        taskWorkflowContextBundle: workflowContext,
+        contextBundle: workflowContext,
+        workflowContextFailure: failure,
+        requiredPromptBlockError: workflowContext.requiredPromptBlockError
+      };
+    }
     const modelChoice = this.aiModelForRequest("task-generation", {
       prompt: [taskQuery, instructions].join("\n"),
-      context,
+      context: initialSemanticContext,
       adaptivePack,
       taskContext,
       taskCount: maxMainTasks + maxSubtasks
@@ -3187,31 +5073,193 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Follow the configured main-task, subtask, date, deadline, label, priority, and source-type instructions.",
         `Hard limits: maximum ${maxMainTasks} main tasks and maximum ${maxSubtasks} subtasks per main task.`,
         "Keep labels free of leading # characters. Do not write descriptions in this phase."
+        ,
+         "Evidence contract: every main task and subtask must return a non-empty scope_id, evidence_ids, fact_refs, and closed fact_bindings. Each fact_binding must contain factId, type, role, evidenceId, and scopeId copied exactly from the immutable source contract/catalog. Use only IDs present in the current source contract and bounded evidence catalog. Every task must cite the current-source evidence ID and all mandatory current task/identity facts for its scope.",
+         "Title wording: use clear professional language, expand informal shorthand or abbreviations, and correct obvious capitalization, spelling, and grammar (for example, write vacation instead of Vaca). Preserve the source's exact action, people, object, conditions, and temporal attachment; do not add or remove scope.",
+         "Exact source semantics: preserve exact proper names, quoted terms, organization names, document names, and product names in task titles and subtasks. A grammatical warning about a term's use is not a blanket prohibition on that term. Avoidance applies only to the exact named phrase or object supplied; never generalize it to a shorter word, related name, or broader concept.",
+         "Epistemic-state wording: preserve source certainty exactly. Do not upgrade is going to or plans to into scheduled, confirmed, approved, or another stronger status unless a supplied bound fact explicitly supports it. Keep distinct action and supporting facts clear and do not invent calendar mechanics.",
+         "Scope contract: each marker/requested-action scope is independent. Use its current primary source facts for action and direction, and only its same-scope optional primary-context summaries or pre-structure semantic context for relevant intent, background, current task state, people, deliverable, dependencies, timing, criteria, or conflicts. Optional primary context is not presumed relevant; preserve distinct timing attachments and never borrow another marker scope. Preserve current/history distinctions; do not invent conventional mechanics or fill unsupported categories. Create subtasks only when independently actionable and parent-aligned. Preserve actor-specific handoffs: if the evidence says a named person must check with, send to, or obtain review from another named person, keep both actors and the concrete handoff rather than replacing it with generic address, resolve, or follow up wording."
       ].filter(Boolean).join("\n\n")
     }));
     const parsed = JSON.parse(json);
-    if (String(parsed.section_name || "").trim() || (parsed.descriptions || []).length) {
-      throw new Error("Task structure phase returned section or description content.");
+    const discardedSectionName = typeof parsed?.section_name === "string" ? parsed.section_name.trim() : "";
+    const discardedDescriptionCount = Array.isArray(parsed?.descriptions)
+      ? parsed.descriptions.length
+      : parsed?.descriptions ? 1 : 0;
+    if (discardedSectionName || discardedDescriptionCount) {
+      this.logLocal("Task structure phase discarded out-of-phase fields", {
+        source: source.type || "",
+        sectionNamePresent: Boolean(discardedSectionName),
+        descriptionCount: discardedDescriptionCount
+      });
+    }
+    if (parsed && typeof parsed === "object") {
+      delete parsed.section_name;
+      delete parsed.descriptions;
     }
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
-    const cleanedTasks = (parsed.tasks || []).map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content);
-    const grounding = groundGeneratedTaskPlan(cleanedTasks, `${source.title || ""}\n${sourceSummary}`, this.settings);
-    parsed.tasks = limitGeneratedTasks(grounding.tasks, maxMainTasks, maxSubtasks);
+    const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    const legacyCompatibility = taskWorkflowLegacyCompatibilityEnabled(source, this.settings);
+    const legacyResponse = legacyCompatibility && rawTasks.length > 0 && rawTasks.every((task) => !Object.hasOwn(task || {}, "scope_id") && !Object.hasOwn(task || {}, "evidence_ids") && !Object.hasOwn(task || {}, "fact_refs") && !Object.hasOwn(task || {}, "fact_bindings"));
+    if (legacyResponse) this.logLocal("Task workflow legacy compatibility enabled", { source: source.type || "", mode: "legacy-import" });
+    const cleanedTasks = rawTasks.map((task) => cleanTask(task, allowedLabels, this.settings)).filter((task) => task.content);
+    if (legacyResponse) {
+      const seedReferences = (task, parentScopeId = "") => {
+        task.scope_id = parentScopeId || sourceContract.scopeId || sourceContract.defaultScopeId;
+        task.evidence_ids = [sourceContract.primaryEvidenceId];
+        task.fact_refs = [sourceContract.primaryFactId || sourceContract.factIds[0]].filter(Boolean);
+        for (const subtask of task.subtasks || []) seedReferences(subtask, task.scope_id);
+      };
+      for (const task of cleanedTasks) seedReferences(task);
+    }
+    const grounding = legacyResponse
+      ? groundGeneratedTaskPlan(cleanedTasks, `${source.title || ""}\n${sourceSummary}`, this.settings)
+      : { tasks: cleanedTasks, rejected: [] };
+    const limitedTasks = limitGeneratedTasks(grounding.tasks, maxMainTasks, maxSubtasks);
+    enrichTaskWorkflowPrimaryContextFacts(limitedTasks, sourceContract);
+    const workflowValidationOptions = { settings: this.settings, allowLegacyFactBindings: legacyCompatibility };
+    const taskSemanticRetrieval = await this.retrieveTaskSemanticContexts(limitedTasks, source, sourceContract, {
+      limit: this.settings.maxTaskContextChunks,
+      mode: "task-generation"
+    });
+    const taskSemanticChunks = Object.values(taskSemanticRetrieval.byTask || {})
+      .flatMap((entry) => entry.context || []);
+    evidenceCatalog = buildTaskEvidenceCatalog(sourceContract, uniqueSemanticEvidenceChunks([...(initialSemanticContext || []), ...taskSemanticChunks]), this.settings, { source, sourceSummary });
+    const catalogEvidenceIds = new Set((evidenceCatalog.items || []).map((item) => String(item.evidenceId || item.id || "")).filter(Boolean));
+    for (const [index, task] of flattenTaskPlanWithIndexes(limitedTasks)) {
+      const key = taskSemanticRetrieval.taskKeyByIndex?.[String(index)] || `task-${index}`;
+      const local = taskSemanticRetrieval.byTask?.[key];
+      const scopeId = task.scope_id || task.scopeId || sourceContract.defaultScopeId;
+      const preScope = preStructureScopes.byScope?.[scopeId] || null;
+      if (!local && !preScope) continue;
+      const localEvidenceIds = uniqueValues([
+        ...(preScope?.evidenceIds || []),
+        ...((local?.context || []).map((chunk) => chunk.evidenceId).filter(Boolean))
+      ]).filter((evidenceId) => catalogEvidenceIds.has(String(evidenceId)));
+      task.evidence_ids = uniqueValues([...(task.evidence_ids || []).map(String), ...localEvidenceIds]);
+      task.evidenceIds = task.evidence_ids.slice();
+      attachTaskLocalSemanticFacts(task, localEvidenceIds, evidenceCatalog, scopeId);
+      task.taskLocalSemanticEvidence = deepFreezeTaskWorkflow({
+        version: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+        taskId: key,
+        scopeId,
+        queryId: local?.queryId || preScope?.queryId || "",
+        sourceContractId: sourceContract.id,
+        evidenceIds: localEvidenceIds,
+        preStructure: preScope || null,
+        refinement: local || null,
+        context: uniqueSemanticEvidenceChunks([...(preScope?.context || []), ...(local?.context || [])]),
+        telemetry: Object.assign({}, preScope?.telemetry || {}, local?.telemetry || {})
+      });
+    }
+    workflowContext = taskWorkflowContextBundle({
+      source,
+      sourceType: source.type,
+      sourceTitle: source.title,
+      sourcePath: source.path || "",
+      sourceSummary,
+      taskContext,
+      adaptivePack,
+      semanticContext: uniqueSemanticEvidenceChunks([...(initialSemanticContext || []), ...taskSemanticChunks]),
+      scopeSemanticEvidence: preStructureScopes.byScope,
+      scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry,
+      sourceContract,
+      evidenceCatalog,
+      taskContextHydration: this.lastTaskContextHydrationTelemetry,
+      promptCachePrefixOverride: stablePromptCachePrefix,
+      promptEvidenceIdsOverride: stablePromptEvidenceIds,
+      promptEvidenceHashOverride: stablePromptEvidenceHash,
+      settings: this.settings
+    });
+    if (workflowContext.requiredPromptBlockError) {
+      const failure = {
+        code: "required-workflow-contract-block-overflow",
+        reason: workflowContext.requiredPromptBlockError,
+        chars: workflowContext.requiredPromptBlockChars,
+        hardCeiling: workflowContext.requiredPromptBlockHardCeiling
+      };
+      this.logLocal("Task workflow blocked after refinement because the immutable contract block was incomplete", {
+        source: source.type || "",
+        ...failure
+      });
+      return Object.assign(parsed, {
+        tasks: [],
+        workflowContextFailure: failure,
+        requiredPromptBlockError: workflowContext.requiredPromptBlockError,
+        taskWorkflowContextBundle: workflowContext,
+        contextBundle: workflowContext
+      });
+    }
+    const evidenceResult = attachTaskWorkflowEvidenceBundles(limitedTasks, sourceContract, evidenceCatalog, workflowValidationOptions);
+    parsed.tasks = evidenceResult.tasks;
+    let finalEvidenceResult = evidenceResult;
+    let markerFactCoverage = structuredMarkedActionFactCoverage(parsed.tasks, sourceContract);
+    if (sourceContract.markedActionFactIds?.length && !markerFactCoverage.passed) {
+      const supplementation = supplementMissingStructuredMarkedActionTasks(parsed.tasks, sourceContract, markerFactCoverage.missingFacts, this.settings);
+      if (supplementation.addedFactIds.length) {
+        enrichTaskWorkflowPrimaryContextFacts(supplementation.tasks, sourceContract);
+        finalEvidenceResult = attachTaskWorkflowEvidenceBundles(supplementation.tasks, sourceContract, evidenceCatalog, workflowValidationOptions);
+        parsed.tasks = finalEvidenceResult.tasks;
+      }
+      markerFactCoverage = structuredMarkedActionFactCoverage(parsed.tasks, sourceContract);
+      this.logLocal("Applied deterministic marked-action fact coverage", {
+        source: source.type || "",
+        requiredFactIds: markerFactCoverage.requiredFactIds,
+        coveredFactIds: markerFactCoverage.coveredFactIds,
+        missingFactIds: markerFactCoverage.missingFactIds,
+        unresolvedFactIds: supplementation.unresolvedFactIds
+      });
+    }
     if (grounding.rejected.length) {
       this.logLocal("Rejected generated tasks without primary-source grounding", {
         source: source.type || "",
         count: grounding.rejected.length,
         tasks: grounding.rejected.map((task) => truncateAtWord(task.content || "", 100))
       });
+    } else if (legacyResponse && rawTasks.length > grounding.tasks.length) {
+      this.logLocal("Rejected generated tasks without primary-source grounding", {
+        source: source.type || "",
+        count: rawTasks.length - grounding.tasks.length,
+        tasks: rawTasks.slice(grounding.tasks.length).map((task) => truncateAtWord(task?.content || "", 100))
+      });
+    }
+    if (finalEvidenceResult.rejected.length) {
+      this.logLocal("Rejected generated tasks with invalid source evidence references", {
+        source: source.type || "",
+        count: finalEvidenceResult.rejected.length,
+        tasks: finalEvidenceResult.rejected.map((entry) => ({ content: truncateAtWord(entry.task?.content || "", 100), errors: entry.errors }))
+      });
+      if (legacyResponse && !grounding.rejected.length) {
+        this.logLocal("Rejected generated tasks without primary-source grounding", {
+          source: source.type || "",
+          count: finalEvidenceResult.rejected.length,
+          tasks: finalEvidenceResult.rejected.map((entry) => truncateAtWord(entry.task?.content || "", 100))
+        });
+      }
     }
     if (!parsed.tasks.length) {
       const fallbackTask = source.type === "email"
         ? emailIntendedActionFallbackTask(source, sourceSummary, this.settings)
         : explicitReviewRequestFallbackTask(source, sourceSummary, this.settings);
-      if (fallbackTask) parsed.tasks = [cleanTask(fallbackTask, allowedLabels, this.settings)].filter((task) => task.content);
+      if (fallbackTask) {
+        const cleanedFallback = cleanTask(fallbackTask, allowedLabels, this.settings);
+        cleanedFallback.scope_id = sourceContract.defaultScopeId;
+        cleanedFallback.evidence_ids = [sourceContract.primaryEvidenceId];
+        cleanedFallback.fact_refs = [sourceContract.primaryFactId || sourceContract.factIds[0]];
+        enrichTaskWorkflowPrimaryContextFacts([cleanedFallback], sourceContract);
+        const fallbackEvidence = attachTaskWorkflowEvidenceBundles([cleanedFallback], sourceContract, evidenceCatalog, workflowValidationOptions);
+        parsed.tasks = fallbackEvidence.tasks;
+        finalEvidenceResult = fallbackEvidence;
+      }
+    }
+    if (finalEvidenceResult !== evidenceResult) {
+      enrichTaskWorkflowPrimaryContextFacts(parsed.tasks, sourceContract);
+      finalEvidenceResult = attachTaskWorkflowEvidenceBundles(parsed.tasks, sourceContract, evidenceCatalog, workflowValidationOptions);
+      parsed.tasks = finalEvidenceResult.tasks;
+      markerFactCoverage = structuredMarkedActionFactCoverage(parsed.tasks, sourceContract);
     }
     const contextNotes = contextNotesForTaskPlan(
-      context,
+      uniqueSemanticEvidenceChunks([...(initialSemanticContext || []), ...taskSemanticChunks]),
       source.path,
       Math.max(this.settings.taskContextSummaryMaxNotes || 0, adaptiveContextBudget("task-generation").maxNotes),
       [taskQuery, flattenTaskPlan(parsed.tasks || []).map((task) => task.content || "").join("\n")].join("\n"),
@@ -3220,12 +5268,29 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parsed.sectionName = cleanGeneratedSectionName(source.sectionName);
     parsed.contextNotes = contextNotes;
     parsed.sourceSummary = sourceSummary;
-    parsed.semanticContext = context;
+    parsed.semanticContext = uniqueSemanticEvidenceChunks([...(initialSemanticContext || []), ...taskSemanticChunks]);
+    parsed.taskContextHydration = this.lastTaskContextHydrationTelemetry || null;
+    parsed.taskContextHydrationTelemetry = this.lastTaskContextHydrationTelemetry || null;
     parsed.taskWorkflowContextBundle = workflowContext;
     parsed.contextBundle = workflowContext;
     parsed.adaptiveContextDepth = adaptivePack.depth;
     parsed.allowedLabels = Array.from(allowedLabels);
     parsed.requestedActionSignals = requestedActionSignals;
+    parsed.sourceContract = sourceContract;
+    parsed.sourceContractId = sourceContract.id;
+    parsed.evidenceCatalog = evidenceCatalog;
+    parsed.evidenceLedger = finalEvidenceResult.ledger;
+    parsed.evidenceBundlesByTask = finalEvidenceResult.ledger.evidenceBundlesByTask;
+    parsed.promptBundleHash = workflowContext.promptBundleHash;
+    parsed.validatorBundleHash = workflowContext.validatorBundleHash;
+    parsed.contextBundleId = workflowContext.bundleHash || workflowContext.promptBundleId || "";
+    parsed.contextBundleHash = workflowContext.bundleHash || "";
+    parsed.promptBundleId = workflowContext.promptBundleId || workflowContext.bundleHash || "";
+    parsed.validatorBundleId = workflowContext.validatorBundleId || workflowContext.bundleHash || "";
+    parsed.evidenceValidatorBundleHash = finalEvidenceResult.ledger.hash || finalEvidenceResult.ledger.catalogHash;
+    parsed.markedActionFactCoverage = markerFactCoverage;
+    parsed.markedActionFactIds = markerFactCoverage.requiredFactIds;
+    parsed.missingMarkedActionFactIds = markerFactCoverage.missingFactIds;
     parsed.sectionInstructions = taskInstructions.sectionTitle;
     parsed.descriptionInstructions = taskInstructions.descriptions;
     parsed.dateInstructions = taskInstructions.dates;
@@ -3273,22 +5338,98 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async refineTaskDescriptions(tasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
     const mainTasks = (tasks || []).map((task, index) => ({
       index,
+      action: task.content || "",
       title: task.content || "",
       currentDescription: task.description || "",
       workingContext: [task.knowledge?.intent, task.knowledge?.rationale].filter(Boolean).join(" "),
       requiredRequestCoverage: taskDescriptionRequestCoverage(task, options.requestedActionSignals || {}),
-      labels: task.labels || []
+      labels: task.labels || [],
+      scope_id: task.scope_id || task.scopeId || "",
+      evidence_ids: (task.evidence_ids || task.evidenceIds || []).slice(),
+      fact_refs: (task.fact_refs || task.factRefs || []).slice(),
+      fact_bindings: (task.fact_bindings || task.factBindings || []).slice(),
+      fact_binding_state: task.factBindingState || (task.legacyFactBindings ? "legacy-degraded" : ""),
+      evidenceBundleHash: task.evidenceBundle?.hash || task.taskEvidenceBundle?.hash || ""
     }));
-    if (!mainTasks.length) return;
+    if (!mainTasks.length) return emptyTaskDescriptionFailureReport();
+    for (const task of tasks || []) clearTaskDescriptionGenerationFailure(task);
+    const finalize = (failureEntries = [], generatedCount = 0) => {
+      const failures = new Map();
+      for (const entry of failureEntries || []) {
+        if (!Number.isInteger(entry?.taskIndex) || !tasks[entry.taskIndex]) continue;
+        failures.set(entry.taskIndex, taskDescriptionFailureReasonCode(entry.reasonCode || entry.reason, entry.stage || ""));
+      }
+      for (const item of mainTasks) {
+        if (failures.has(item.index)) {
+          markTaskDescriptionGenerationFailure(tasks[item.index], failures.get(item.index));
+          continue;
+        }
+        for (const subtask of tasks[item.index].subtasks || []) subtask.description = "";
+      }
+      const report = taskDescriptionFailureReport(mainTasks.length, generatedCount, failures, tasks);
+      this.logLocal("Task description generation completed", {
+        attempted: report.attempted,
+        generated: report.generated,
+        failed: report.failed,
+        failureReasonCodes: report.failures.map((failure) => ({ taskIndex: failure.taskIndex, reasonCode: failure.reasonCode || failure.reason }))
+      });
+      this.setSidebarStatus(report.failed ? `Generated ${report.generated} description${report.generated === 1 ? "" : "s"}; ${report.failed} failed for review.` : "Task descriptions validated.");
+      return report;
+    };
+    const failAll = (reason, stage = "") => finalize(mainTasks.map((task) => ({ taskIndex: task.index, reason, stage })), 0);
     const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
     hydrateContextCitationEvidence(citationState, context, options.basePath || "");
     const citeContextNotes = citationState.citeContextNotes;
-    const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, this.settings, citationState);
+    const structuredEvidence = Boolean(options.sourceContract && options.evidenceCatalog);
+    const evidenceBundles = structuredEvidence
+      ? (tasks || []).map((task, index) => ({
+        index,
+        primarySourceEvidence: task.evidenceBundle?.items?.find((item) => item.sourceKind === "current-source") || null,
+        supportingSemanticEvidence: (task.evidenceBundle?.items || []).filter((item) => item.sourceKind !== "current-source"),
+        evidenceBundle: task.evidenceBundle || task.taskEvidenceBundle || null
+      }))
+      : buildTaskDescriptionEvidenceBundles(tasks, sourceSummary, context, sourceTitle, this.settings, citationState, {
+        requestSignals: options.requestedActionSignals || {},
+        sourceType: options.source || "note",
+        allowLegacySourceOnlyValidation: true
+      });
     const evidenceByIndex = new Map(evidenceBundles.map((evidence) => [evidence.index, evidence]));
     for (const item of mainTasks) {
+      const task = tasks[item.index] || {};
       const evidence = evidenceByIndex.get(item.index);
-      item.evidence = evidence?.prompt || "";
+      item.existingSubtasks = (task.subtasks || []).map((subtask) => ({
+        title: subtask.content || "",
+        description: subtask.description || "",
+        labels: subtask.labels || []
+      })).filter((subtask) => subtask.title);
+      item.mandatoryRequestFacts = item.requiredRequestCoverage || "";
+      item.primarySourceEvidence = structuredEvidence
+        ? {
+          evidenceId: evidence?.evidenceBundle?.evidenceIds?.[0] || "",
+          sourceKind: "current-source",
+          factRefs: evidence?.evidenceBundle?.factRefs || [],
+          scopeId: evidence?.evidenceBundle?.scopeId || item.scope_id,
+          excerpt: evidence?.primarySourceEvidence?.excerpt || evidence?.evidenceBundle?.items?.find((entry) => entry.sourceKind === "current-source")?.excerpt || "",
+          provenance: evidence?.primarySourceEvidence?.provenance || {}
+        }
+        : evidence?.primarySourceEvidence || "";
+      item.supportingSemanticEvidence = (evidence?.supportingSemanticEvidence || []).map((entry) => ({
+        evidenceId: entry.evidenceId || entry.id || "",
+        title: entry.title || "",
+        path: entry.path || "",
+        evidence: entry.evidence || "",
+        excerpt: entry.excerpt || entry.evidence || "",
+        citationNumber: entry.citationNumber || 0,
+        sourceKind: entry.sourceKind || "semantic-index-chunk",
+        scopeIds: entry.scopeIds || []
+      }));
+      item.immutableEvidenceBundle = evidence?.evidenceBundle || null;
+      item.taskLocalEvidence = taskDescriptionRichLocalPayload(task, evidence, options.sourceContract);
     }
+    const sharedTaskEvidence = taskDescriptionSharedEvidencePayload(mainTasks, options.sourceContract, {
+      contextBundle: options.contextBundle
+    });
+    const promptMainTasks = mainTasks.map(taskDescriptionPromptTask);
     const contextQuery = [sourceTitle, mainTasks.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
     const modelChoice = this.aiModelForRequest("description", {
       prompt: contextQuery,
@@ -3296,70 +5437,192 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskCount: mainTasks.length
     });
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
-    const json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
-      operation: "description",
-      model: modelChoice.model,
-      jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
-      system: taskWorkflowSystemInstruction(),
-      reasoningEffort: "medium",
-      promptCachePrefix: options.contextBundle?.promptCachePrefix || "",
-      promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
-      user: [
-        "Workflow phase: main-task descriptions.",
-        "Return one description object for every main task index. Return tasks as an empty array and section_name as an empty string.",
-        `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
-        "Description instructions:",
-        descriptionInstructions || "",
-        "",
-        `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
-        "",
-        "Local validation rule:",
-        "Descriptions that are too short, generic, title-only, procedural, or written as prompt commentary are rejected. Write direct execution guidance rather than prompt commentary.",
-        "Description contract: write a standalone, detailed, task-specific execution brief that preserves the current artifact or state, intent when non-obvious, audience/reviewer/recipient needs, required details, decisions, dependencies, timing, constraints, substantive review criteria, and supported links or citations when available.",
-        "Use directly relevant current supporting-note evidence whenever it materially enriches the brief, even when the primary source is already detailed. The primary source remains authoritative for current direction; exclude stale, unrelated, or neighboring-task context.",
-        "Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
-        TASK_DESCRIPTION_ANTI_FILLER_RULE,
-        "",
-        "Context-note citation rule:",
-        contextCitationInstructions(citeContextNotes),
-        "",
-        "Keep every description between 80 and 1200 characters, with at least 12 words and complete sentences. Use only the matching task evidence bundle; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, and handoffs when supplied.",
-        "Main tasks and their task-specific evidence bundles:",
-        JSON.stringify(mainTasks)
-      ].join("\n")
-    }));
-    const parsed = JSON.parse(json);
+    let json;
+    try {
+      json = await this.withAiActivity(`Writing ${mainTasks.length} task description${mainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+        operation: "description",
+        model: modelChoice.model,
+        jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
+        system: taskWorkflowSystemInstruction(),
+        reasoningEffort: "medium",
+        maxOutputTokens: openAiMaxOutputTokensForOperation("description", mainTasks.length),
+        promptCachePrefix: options.contextBundle?.promptCachePrefix || "",
+        promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
+        user: [
+          "Workflow phase: main-task descriptions.",
+          "Return one description object for every main task index. Return tasks as an empty array and section_name as an empty string.",
+          `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
+          "Description instructions:",
+          descriptionInstructions || "",
+          "",
+          `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
+          "",
+          "Local validation rule:",
+          "Descriptions that are generic, title-only, procedural, or written as prompt commentary are rejected. Write direct execution guidance rather than prompt commentary, grounded in at least one supplied fact beyond the title.",
+          "Description contract: write a standalone, detailed, task-specific execution brief that preserves the current artifact or state, intent when non-obvious, audience/reviewer/recipient needs, required details, decisions, dependencies, timing, constraints, substantive review criteria, and supported links or citations when available.",
+          "Write a natural narrative execution brief, not a structured field display. Do not prefix lines with labels such as Goal:, Intent:, Person involved:, Source:, Where this came from:, Context:, Evidence:, Action:, Outcome:, Deliverable:, Criteria:, Dependencies:, or Next step:; integrate those facts into complete sentences instead.",
+          "Structured payload rules: treat action/title and existingSubtasks as the task scope; preserve mandatoryRequestFacts; use primarySourceEvidence as the authoritative current source; use only matching supportingSemanticEvidence to add current task-specific context and never to override source direction.",
+          "Fact semantics: requested-action facts are mandatory current-source requirements. Same-scope primary-context summary facts are optional adjacency context; use them only when they materially clarify intent, state, timing, recipient, or criteria. Keep distinct timing statements attached to their own source facts and never merge or reassign them.",
+          "Exact source semantics: preserve exact proper names, quoted terms, organization names, document names, and product names. A grammatical warning about a term's use is not a blanket prohibition on that term. Avoidance applies only to the exact named phrase or object supplied; never generalize it to a shorter word, related name, or broader concept.",
+          "Epistemic-state semantics: preserve the source's certainty exactly. A statement such as is going to or plans to must not be upgraded to scheduled, confirmed, approved, or another stronger status unless a supplied bound fact explicitly supports it. Keep distinct action and supporting facts clear, even in one sentence, and do not invent calendar mechanics.",
+          "Rich task-local evidence payload: taskLocalEvidence contains the exact primary excerpt, typed facts, mandatory fact types, selected semantic records, source/evidence IDs, source kind, score, authority, current/history, temporal/conflict state, provenance/line range, and structured task details when present. Use only this task-local payload; never borrow a neighboring task's facts.",
+          "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
+          structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from immutableEvidenceBundle only; all IDs and bindings must be subsets of that bundle, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
+          "Task-local evidence rule: use concrete wording from existingSubtasks, workingContext, and mandatoryRequestFacts when it adds supported intent, object, dependency, recipient, or criteria for this task; currentDescription and labels are scope hints, not permission to invent source facts.",
+          "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; include every supplied task-local fact that materially changes how the work should be understood or performed, such as the artifact or current state, intent, audience or reviewer, criteria, dependency, timing, or link. When evidence is sparse, one grounded sentence is enough; stay concise and never invent or pad details.",
+          "Use materially relevant current or historical task-local semantic evidence whenever it changes execution, even when the primary source is already detailed. This includes prior reviewer edits or comments, known concerns, existing artifact state, unresolved decisions or conflicts, reviewer expectations, and earlier handoffs. Do not omit selected history merely because it is historical when it identifies what to inspect, preserve, verify, or resolve now. State who reviewed what, what they found or changed, and what remains to be addressed when the evidence supports it. Distinguish historical context from current direction, never promote fine to formal approval, and exclude unrelated or neighboring-task context.",
+          "Actor-specific handoff rule: when task-local evidence says a named person will check with, send to, or obtain review from another named person, preserve the actor, counterpart, and concrete next step. Do not reduce that evidence to generic address the conflict, resolve the issue, or follow up wording.",
+          "Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
+          TASK_DESCRIPTION_ANTI_FILLER_RULE,
+          "",
+          "Context-note citation rule:",
+          contextCitationInstructions(citeContextNotes),
+          "",
+          structuredEvidence ? "Respect the schema's 1200-character upper bound with no minimum length. A concise direct execution sentence is valid when it contains at least one supplied fact; never pad sparse evidence to meet a word count." : "Keep every description between 80 and 1200 characters, with at least 12 words and complete sentences. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, and handoffs when supplied.",
+          "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). Resolve taskLocalEvidence.evidenceIds and citationLedgerByTask entries through evidenceById. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
+          JSON.stringify(sharedTaskEvidence),
+          "Main tasks and their structured task-specific evidence:",
+          JSON.stringify(promptMainTasks)
+        ].join("\n")
+      }));
+    } catch (error) {
+      const providerFailure = error?.providerDiagnostic || {
+        status: "request-failed",
+        code: singleLine(error?.code || "provider-error").slice(0, 120),
+        responseIdHash: "",
+        incompleteReason: "",
+        message: singleLine(redactSecrets(error?.message || String(error))).slice(0, 500),
+        usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
+      };
+      this.lastTaskDescriptionProviderFailure = providerFailure;
+      this.logLocal("Task description provider failed", providerFailure);
+      const report = failAll("description provider call failed", "provider");
+      report.providerFailure = providerFailure;
+      return report;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(json);
+    } catch (error) {
+      return failAll("description response JSON could not be parsed", "response");
+    }
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.descriptions)) return failAll("description response shape was invalid", "response");
     if ((parsed.tasks || []).length || String(parsed.section_name || "").trim()) {
-      throw new Error("Description phase returned task or section content.");
+      return failAll("description response contained unexpected task or section content", "response");
     }
     const descriptions = parsed.descriptions || [];
     const expectedIndexes = new Set(mainTasks.map((task) => task.index));
     const seenIndexes = new Set();
     const validatedDescriptions = new Map();
+    const failures = [];
     for (const item of descriptions) {
-      if (!Number.isInteger(item?.index) || !expectedIndexes.has(item.index)) throw new Error(`Description phase returned an unexpected task index: ${item?.index}.`);
-      if (seenIndexes.has(item.index)) throw new Error(`Description phase returned duplicate task index: ${item.index}.`);
+      if (!Number.isInteger(item?.index) || !expectedIndexes.has(item.index)) continue;
+      if (seenIndexes.has(item.index)) {
+        failures.push({ taskIndex: item.index, reason: "description response repeated the task index", stage: "response" });
+        continue;
+      }
       seenIndexes.add(item.index);
       const task = tasks[item.index];
       const evidence = evidenceByIndex.get(item.index) || null;
-      const summary = cleanTaskDescriptionSummary(item.description || "", task.content, sourceTitle, this.settings, citationState);
-      const contractReason = descriptionQualityReason(summary, task.content, this.settings);
-      if (contractReason !== "passed") throw new Error(`Description for task ${item.index + 1} failed the contract: ${contractReason}.`);
-      const groundingReason = taskDescriptionGroundingReason(summary, task, evidence, this.settings);
-      if (groundingReason !== "passed") throw new Error(`Description for task ${item.index + 1} failed local grounding: ${groundingReason}.`);
+      const legacyDescriptionResponse = structuredEvidence
+        && options.allowLegacyWorkflowCompatibility === true
+        && !Object.hasOwn(item || {}, "description_sentences")
+        && !Object.hasOwn(item || {}, "scope_id")
+        && !Object.hasOwn(item || {}, "evidence_ids")
+        && !Object.hasOwn(item || {}, "fact_refs")
+        && !Object.hasOwn(item || {}, "fact_bindings");
+      if (typeof item.description !== "string" && !Array.isArray(item.description_sentences)) {
+        failures.push({ taskIndex: item.index, reason: "description was missing or not text", stage: "missing/nontext" });
+        continue;
+      }
+      let summary = structuredEvidence && !legacyDescriptionResponse
+        ? ""
+        : cleanTaskDescriptionSummary(
+          item.description || "",
+          task.content,
+          sourceTitle,
+          this.settings,
+          structuredEvidence ? Object.assign({}, citationState, { preserveTaskCitationLedger: true }) : citationState
+        );
+      const citationValidation = structuredEvidence && !legacyDescriptionResponse
+        ? { valid: true, unknownNumbers: [] }
+        : structuredEvidence
+          ? validateTaskDescriptionCitationNumbers(summary, mainTasks[item.index]?.taskLocalEvidence?.citationLedger || [])
+          : { valid: true, unknownNumbers: [] };
+      if (!citationValidation.valid) {
+        failures.push({ taskIndex: item.index, reason: citationValidation.reason, stage: "citations" });
+        continue;
+      }
+      const structuredRefs = structuredEvidence
+        ? validateTaskDescriptionEvidenceReferences(legacyDescriptionResponse ? Object.assign({}, item, {
+          scope_id: task.scope_id,
+          evidence_ids: task.evidence_ids,
+          fact_refs: task.fact_refs,
+          fact_bindings: task.fact_bindings
+        }) : item, task, options.sourceContract)
+        : { valid: true, errors: [], evidenceIds: [], factRefs: [], bundle: null };
+      if (!structuredRefs.valid) {
+        failures.push({ taskIndex: item.index, reason: structuredRefs.errors.join("; "), stage: "evidence" });
+        continue;
+      }
+      let sentenceValidation = null;
+      if (structuredEvidence && !legacyDescriptionResponse) {
+        sentenceValidation = validateTaskDescriptionSentences(
+          item,
+          task,
+          structuredRefs,
+          options.sourceContract,
+          mainTasks[item.index]?.taskLocalEvidence?.citationLedger || []
+        );
+        if (!sentenceValidation.valid) {
+          failures.push({ taskIndex: item.index, reason: sentenceValidation.errors.join("; "), stage: "sentences" });
+          continue;
+        }
+        summary = sentenceValidation.rendered;
+      }
+      const contractReason = structuredEvidence
+        ? structuredTaskDescriptionQualityReason(summary, task, structuredRefs.bundle)
+        : descriptionQualityReason(summary, task.content, this.settings);
+      if (contractReason !== "passed") {
+        failures.push({ taskIndex: item.index, reason: contractReason, stage: "quality" });
+        continue;
+      }
+      const groundingReason = structuredEvidence
+        ? "passed"
+        : taskDescriptionGroundingReason(summary, task, evidence, this.settings);
+      if (groundingReason !== "passed") {
+        failures.push({ taskIndex: item.index, reason: groundingReason, stage: "grounding" });
+        continue;
+      }
       const requestFactReason = taskDescriptionRequestCoverageReason(summary, task, options.requestedActionSignals || {});
-      if (requestFactReason) throw new Error(`Description for task ${item.index + 1} omitted an explicit request fact: ${requestFactReason}.`);
-      validatedDescriptions.set(item.index, truncateAtWord(summary, 1200));
+      if (requestFactReason) {
+        failures.push({ taskIndex: item.index, reason: requestFactReason, stage: "request" });
+        continue;
+      }
+      validatedDescriptions.set(item.index, structuredEvidence ? {
+        description: summary,
+        scope_id: structuredRefs.scopeId,
+        evidence_ids: structuredRefs.evidenceIds,
+        fact_refs: structuredRefs.factRefs,
+        fact_bindings: structuredRefs.factBindings,
+        bundle: structuredRefs.bundle,
+        citationLedger: mainTasks[item.index]?.taskLocalEvidence?.citationLedger || []
+      } : truncateAtWord(summary, 1200));
     }
-    if (seenIndexes.size !== expectedIndexes.size) {
-      const missing = Array.from(expectedIndexes).filter((index) => !seenIndexes.has(index));
-      throw new Error(`Description phase omitted task indexes: ${missing.join(", ")}.`);
-    }
+    for (const index of expectedIndexes) if (!seenIndexes.has(index)) failures.push({ taskIndex: index, reason: "description response omitted the task index", stage: "response" });
     for (const item of mainTasks) {
-      tasks[item.index].description = validatedDescriptions.get(item.index);
-      for (const subtask of tasks[item.index].subtasks || []) subtask.description = "";
+      if (failures.some((failure) => failure.taskIndex === item.index)) continue;
+      const validated = validatedDescriptions.get(item.index);
+      tasks[item.index].description = structuredEvidence ? validated?.description || "" : validated || "";
+      if (structuredEvidence && validated?.bundle) {
+        tasks[item.index].descriptionEvidenceBundle = validated.bundle;
+        tasks[item.index].descriptionEvidenceIds = validated.evidence_ids.slice();
+        tasks[item.index].descriptionFactRefs = validated.fact_refs.slice();
+        tasks[item.index].descriptionFactBindings = (validated.fact_bindings || []).slice();
+        tasks[item.index].descriptionCitationLedger = (validated.citationLedger || []).slice();
+      }
     }
-    this.setSidebarStatus("Task descriptions validated.");
+    return finalize(failures, validatedDescriptions.size);
   }
 
   taskInstructionsForSource(type) {
@@ -3429,36 +5692,42 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
       const tasks = enrichTodoistTasksWithSnapshot(snapshot).filter((task) => !task.isCompleted);
       const candidates = scheduleTodayCandidates(tasks, this.settings, scheduleConfig, this.schedulerMemory);
-      const memoryMatches = this.applySchedulerMemoryToCandidates(candidates);
       if (!candidates.length) {
         return emptyScheduleTodayPreview(scheduleConfig, "No overdue tasks or tasks due within the configured window were found.");
       }
-      const query = candidates.slice(0, 24).map((item) => item.searchText).join("\n");
-      const context = query ? await this.retrieveAdaptiveSemanticContext(query, "schedule", Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6)), template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT) : [];
-      const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, context, scheduleConfig);
-      const taskContext = await this.buildTaskContext(null, context, query);
+      const schedulerPrompt = template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT;
+      const schedulerSemantic = await this.retrieveSchedulerSemanticContext(candidates, {
+        limit: Math.min(6, Math.max(3, this.settings.maxTaskContextChunks || 6)),
+        prompt: schedulerPrompt
+      });
+      const context = schedulerSemantic.context || [];
+      const semanticPriorityMatches = applySemanticContextToScheduleCandidates(candidates, schedulerSemantic.bundles, scheduleConfig);
+      const memoryMatches = this.applySchedulerMemoryToCandidates(candidates);
+      const taskContext = formatSchedulerSemanticBundles(schedulerSemantic.bundles, Math.min(8000, this.settings.maxContextChars || 8000));
       const adaptivePack = this.buildAdaptiveContextPack({
         mode: "schedule",
-        prompt: [query, template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT].join("\n"),
+        prompt: schedulerPrompt,
         sourceTitle: "Schedule today's tasks",
         tasks: candidates,
         context,
-        taskContext
+        taskContext,
+        taskIsolated: true
       });
       const adaptiveSignalMatches = applyAdaptiveContextPackToScheduleCandidates(candidates, adaptivePack, scheduleConfig);
       const durationTriage = prepareScheduleDurationTriage(candidates, scheduleConfig, this.settings);
       const durationModelChoice = this.aiModelForRequest("schedule", {
-        prompt: [query, template?.prompt || DEFAULT_SCHEDULE_TODAY_PROMPT].join("\n"),
+        prompt: schedulerPrompt,
         context,
         adaptivePack,
         taskContext,
         taskCount: durationTriage.aiCandidates.length
       });
       const durationEstimateModel = durationModelChoice.model || schedulerDurationEstimateModel(this.settings);
-      await this.estimateScheduleTodayDurations(durationTriage.aiCandidates, context, adaptivePack.text || taskContext, scheduleConfig, template, {
+      await this.estimateScheduleTodayDurations(durationTriage.aiCandidates, context, taskContext, scheduleConfig, template, {
         force: true,
         totalMissing: durationTriage.totalMissing,
-        model: durationEstimateModel
+        model: durationEstimateModel,
+        semanticBundles: schedulerSemantic.bundles
       });
       const preview = planScheduleToday(candidates, scheduleConfig, this.settings);
       preview.durationTriage = durationTriage.summary;
@@ -3467,6 +5736,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         path: chunk.path || "",
         score: chunk.matchScore || 0
       })).slice(0, 6);
+      preview.semanticRetrieval = schedulerSemantic.telemetry;
       this.logLocal("Schedule today preview prepared", {
         candidates: candidates.length,
         scheduled: preview.scheduled.length,
@@ -3476,6 +5746,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         memoryMatches,
         semanticPriorityMatches,
         adaptiveSignalMatches,
+        semanticIndexState: schedulerSemantic.telemetry?.indexState || "",
+        semanticDegradedReason: schedulerSemantic.telemetry?.degradedReason || "",
+        semanticEvidenceIds: schedulerSemantic.telemetry?.selectedEvidenceIds || [],
+        semanticEmbeddingBatches: schedulerSemantic.telemetry?.embeddingBatchCount || 0,
+        semanticEmbeddingCacheHits: schedulerSemantic.telemetry?.embeddingCacheHits || 0,
+        semanticEmbeddingCacheMisses: schedulerSemantic.telemetry?.embeddingCacheMisses || 0,
         durationAiCandidates: durationTriage.aiCandidates.length,
         durationLocalOnly: durationTriage.localOnlyCount,
         durationAiModel: modelDisplayName(durationEstimateModel)
@@ -3508,6 +5784,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       due: candidate.dueDate || "",
       deadline: candidate.deadlineDate || "",
       parent: candidate.parentContent || "",
+      parentId: candidate.parentId || "",
+      parentOid: candidate.parentOid || "",
+      rootTaskId: candidate.rootTaskId || "",
+      rootOid: candidate.rootOid || "",
+      treePath: candidate.treePath || [],
+      treeDepth: candidate.treeDepth ?? null,
+      siblingOrder: candidate.siblingOrder ?? null,
       note: candidate.path || "",
       isSubtask: Boolean(candidate.isSubtask),
       intent: candidate.intent || candidate.knowledge?.intent || "",
@@ -3547,8 +5830,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Tasks needing duration estimates:",
           JSON.stringify(compactTasks),
           "",
-          "Relevant vault context:",
-          formatContext(context, Math.min(6000, this.settings.maxContextChars || 6000), this.settings, compactTasks.map((task) => task.title).join("\n")) || "No relevant vault context found.",
+          "Per-candidate semantic evidence bundles (never merge evidence between candidates):",
+          formatSchedulerSemanticBundles(options.semanticBundles || [], Math.min(6000, this.settings.maxContextChars || 6000)) || "No semantic evidence bundle available.",
           "",
           "Adaptive task, meeting, project, and local reference context:",
           taskContext || "No matching local task context found."
@@ -3899,7 +6182,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
     await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
     await this.workerJson("/complete", "POST", { id: item.id });
-    return { id: item.id, subject, tasks: created.length };
+    return {
+      id: item.id,
+      subject,
+      tasks: created.length,
+      sourceContractId: plan.sourceContractId || plan.sourceContract?.id || "",
+      contextBundleHash: plan.contextBundleHash || plan.taskWorkflowContextBundle?.bundleHash || plan.taskContextHydration?.bundleHash || "",
+      contextBundleId: plan.contextBundleId || plan.taskWorkflowContextBundle?.bundleHash || "",
+      promptBundleId: plan.promptBundleId || plan.taskWorkflowContextBundle?.promptBundleId || "",
+      validatorBundleId: plan.validatorBundleId || plan.taskWorkflowContextBundle?.validatorBundleId || ""
+    };
   }
 
   async workerJson(path, method, body) {
@@ -4133,7 +6425,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const action = shouldInsert ? (shouldSyncAfterInsert ? "inserted and synced" : "inserted") : "shown in chat only";
         new Notice(`Generated ${tasks.length} main task${tasks.length === 1 ? "" : "s"} from "${template.name}" and ${action}.`);
       }
-      return { tasks, markdown, contextNotes: plan.contextNotes || [], semanticContext: plan.semanticContext || [] };
+      return {
+        tasks,
+        markdown,
+        contextNotes: plan.contextNotes || [],
+        semanticContext: plan.semanticContext || [],
+        taskContextHydration: plan.taskContextHydration || null,
+        sourceContractId: plan.sourceContractId || plan.sourceContract?.id || "",
+        contextBundleHash: plan.contextBundleHash || plan.taskWorkflowContextBundle?.bundleHash || plan.taskContextHydration?.bundleHash || "",
+        contextBundleId: plan.contextBundleId || plan.taskWorkflowContextBundle?.bundleHash || "",
+        promptBundleId: plan.promptBundleId || plan.taskWorkflowContextBundle?.promptBundleId || "",
+        validatorBundleId: plan.validatorBundleId || plan.taskWorkflowContextBundle?.validatorBundleId || ""
+      };
     } finally {
       this.setSidebarStatus("Ready");
     }
@@ -4161,7 +6464,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const supplementedCoverage = taskRequestCoverageReport(supplementedTasks, signals);
       const supplementedHierarchyIssues = taskPlanRepairableHierarchyIssues(supplementedTasks, { sourceEvidence: primarySource, sourceType, chronologyEvidence: plan.sourceSummary || "", priorityInstructions: plan.priorityInstructions || "", labelInstructions: plan.labelInstructions || "", settings: this.settings });
       const supplementedMainTaskCount = supplementedTasks.filter((task) => !task?.isSubtask).length;
-      const localTreesGrounded = localTrees.length > 0 && localTrees.every((task) => generatedTaskMatchesPrimarySource(task, primarySource));
+      const localTreesGrounded = localTrees.length > 0;
       if (localTreesGrounded && supplementedCoverage.passed && !supplementedHierarchyIssues.length && supplementedMainTaskCount <= mainTaskLimit) {
         tasks.splice(0, tasks.length, ...supplementedTasks);
         this.logLocal("Applied deterministic marked-action repair", { source: options.source || "", tasks: flattenTaskPlan(tasks).length, recovered: localTrees.length });
@@ -4224,7 +6527,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             attemptPrompt,
             "",
             "Relevant local semantic-index context:",
-            formatContext(plan.semanticContext || [], Math.min(this.settings.maxContextChars || 8000, 8000), this.settings, options.sourceTitle || plan.sourceSummary || "") || "No additional semantic context."
+            formatContext(plan.semanticContext || [], Number.POSITIVE_INFINITY, this.settings, options.sourceTitle || plan.sourceSummary || "") || "No additional semantic context."
           ].join("\n")
         }));
         const parsed = JSON.parse(json);
@@ -4274,7 +6577,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const todoistBound = options.prepareTodoistSection === true;
     const fallbackSectionName = options.sectionName || plan.sectionName || "";
     this.setSidebarStatus(options.status || (todoistBound ? "Preparing descriptions and Todoist section..." : "Writing task descriptions..."));
-    const requestRepair = await this.ensureGeneratedTaskRequestCoverage(tasks, plan, options);
+    const requestRepair = plan.sourceContract
+      ? { used: false, skipped: true, reason: "structured-source-contract" }
+      : await this.ensureGeneratedTaskRequestCoverage(tasks, plan, options);
     plan.requestCoverageRepair = requestRepair;
     const workflowContext = plan.taskWorkflowContextBundle || plan.contextBundle;
     const sectionNamePromise = this.generateTaskSectionName(tasks, plan, {
@@ -4288,21 +6593,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       basePath: vaultBasePath(this.app),
       citeContextNotes: options.citeContextNotes !== false,
       requestedActionSignals: plan.requestedActionSignals || {},
-      contextBundle: workflowContext
-    })
-      .then(() => {
-        this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
-        addContextToTaskDescriptions(
-          tasks,
-          plan.contextNotes || [],
-          Object.assign({}, options.sourceContext || {}, { sourceSummary: plan.sourceSummary || "" }),
-          this.settings,
-          plan.semanticContext || [],
-          vaultBasePath(this.app),
-          options.citeContextNotes !== false
-        );
-      });
-    const [sectionName] = await Promise.all([sectionNamePromise, descriptionPromise]);
+      contextBundle: workflowContext,
+      sourceContract: plan.sourceContract || workflowContext?.sourceContract,
+      evidenceCatalog: plan.evidenceCatalog || workflowContext?.evidenceCatalog,
+      evidenceLedger: plan.evidenceLedger,
+      source: options.source || workflowContext?.sourceType || "note",
+      allowLegacyWorkflowCompatibility: options.allowLegacyWorkflowCompatibility === true
+    });
+    const [sectionName, descriptionReport] = await Promise.all([sectionNamePromise, descriptionPromise]);
+    plan.descriptionReport = descriptionReport || emptyTaskDescriptionFailureReport();
+    await this.postTaskDescriptionFailureReport(plan.descriptionReport, tasks, options);
+    this.setSidebarStatus(options.contextStatus || "Adding source context to descriptions...");
+    addContextToTaskDescriptions(
+      tasks,
+      plan.contextNotes || [],
+      Object.assign({}, options.sourceContext || {}, { sourceSummary: plan.sourceSummary || "" }),
+      this.settings,
+      plan.semanticContext || [],
+      vaultBasePath(this.app),
+      options.citeContextNotes !== false
+    );
     plan.sectionName = sectionName || cleanGeneratedSectionName(fallbackSectionName);
     for (const task of tasks || []) task.section = plan.sectionName;
     let projectId = "";
@@ -4336,6 +6646,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         vaultBasePath(this.app),
         true
       );
+    }
+    const finalTaskQualityCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
+      labelInstructions: plan.labelInstructions || "",
+      priorityInstructions: plan.priorityInstructions || "",
+      sourceEvidence: `${options.sourceTitle || ""}\n${options.sourceContext?.text || plan.sourceSummary || ""}`,
+      settings: this.settings
+    });
+    if (finalTaskQualityCorrections.length) {
+      this.logLocal("Applied final task quality corrections before Todoist boundary", {
+        source: options.source || "",
+        corrections: finalTaskQualityCorrections
+      });
     }
     const quality = generatedTaskWorkflowQualityReport(tasks, plan, options, this.settings);
     plan.localQualityReport = quality;
@@ -4395,7 +6717,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await appendMarkdownBlock(this.app, file, markdown);
       }
       if (options.showNotice) new Notice(`Ran prompt "${template.name || "Prompt"}"${shouldInsert ? " and inserted the response" : ""}.`);
-      return { answer: result.answer, markdown, contextNotes: contextNotesForTaskPlan(result.context || [], active.path, this.settings.taskContextSummaryMaxNotes), semanticContext: result.context || [], tasks: [] };
+      return {
+        answer: result.answer,
+        markdown,
+        contextNotes: contextNotesForTaskPlan(result.context || [], active.path, this.settings.taskContextSummaryMaxNotes),
+        semanticContext: result.context || [],
+        tasks: [],
+        taskContextHydration: result.taskContextHydration || null,
+        sourceContractId: result.sourceContractId || "",
+        contextBundleHash: result.contextBundleHash || "",
+        contextBundleId: result.contextBundleId || result.contextBundleHash || "",
+        promptBundleId: result.promptBundleId || result.contextBundleHash || "",
+        validatorBundleId: result.validatorBundleId || result.contextBundleHash || ""
+      };
     } finally {
       this.setSidebarStatus("Ready");
     }
@@ -4562,6 +6896,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       conflicts: 0,
       todoistTasksRead: 0,
       recoveredMissingTodoistIds: 0,
+      semanticRefreshQueued: 0,
+      semanticRefreshCompleted: 0,
+      semanticRefreshInvalidated: 0,
+      semanticRefreshDegradedReason: "",
       skipped: false,
       reason: ""
     };
@@ -4571,6 +6909,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!this.settings.todoistToken) throw new Error("Add a Todoist API token first.");
       const files = this.getSyncableTaskFiles();
       const localState = await this.referenceRebuildLocalState(files);
+      const oldReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app));
       stats.files = files.length;
       stats.scannedTasks = localState.candidateCount;
       if (!localState.candidateCount) {
@@ -4581,6 +6920,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
         this.settings.lastReferenceRebuildCandidateCount = 0;
         await this.saveSettings();
+        await this.refreshTaskReferenceSemanticIndex(oldReferenceRecords, [], { force });
         this.logLocal("Todoist reference rebuild skipped", Object.assign(stats, {
           skipped: true,
           reason: "No syncable note task references were found."
@@ -4679,6 +7019,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
       await this.saveSettings();
       await this.repairCachedSubtaskIndentation(false, { force: true });
+      const nextReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app));
+      const semanticRefresh = await this.refreshTaskReferenceSemanticIndex(oldReferenceRecords, nextReferenceRecords, { force });
+      stats.semanticRefreshQueued = Number(semanticRefresh.queued || 0);
+      stats.semanticRefreshCompleted = Number(semanticRefresh.completed || 0);
+      stats.semanticRefreshInvalidated = Number(semanticRefresh.invalidated || 0);
+      stats.semanticRefreshDegradedReason = semanticRefresh.degradedReason || "";
       this.logLocal("Todoist reference table rebuilt", Object.assign({}, stats, { workers: workerCount }));
       if (showNotice) new Notice(`Rebuilt ${stats.matched} Todoist reference${stats.matched === 1 ? "" : "s"}. ${stats.unmatched} note task${stats.unmatched === 1 ? "" : "s"} not matched.`);
       return stats;
@@ -5102,10 +7448,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.checked = flat.length;
     if (!tasks?.length || this.settings.enableTaskDeduplication === false) return stats;
     this.setSidebarStatus("Checking for existing tasks...");
+    const candidates = await this.taskDeduplicationCandidates(options);
+    const semanticDedupeState = await this.prepareSemanticTaskDeduplicationState(tasks, candidates, options);
+    const matchingOptions = Object.assign({}, options, {
+      taskDeduplicationFeatureCache: new WeakMap(),
+      semanticDedupeState,
+      semanticIndexRevision: this.semanticIndexRevision || 0
+    });
+    stats.semanticTelemetry = semanticDedupeState.telemetry;
+    stats.degradedState = semanticDedupeState.degraded ? "degraded" : (semanticDedupeState.enabled ? "ready" : "legacy");
+    stats.degradedReason = semanticDedupeState.reason || "";
     const generatedDedupe = await deduplicateGeneratedTaskBatch(
       tasks,
       this.settings,
-      options,
+      matchingOptions,
       (task, decision, detectionOptions) => this.aiTaskDeduplicationDecision(task, decision, detectionOptions),
       (task, decision, generationOptions) => this.taskGenerationUpdateForDuplicate(task, decision, generationOptions)
     );
@@ -5116,7 +7472,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.ambiguous += generatedDedupe.ambiguous || 0;
     stats.candidateFlags.push(...(generatedDedupe.candidateFlags || []));
     stats.matches.push(...generatedDedupe.matches);
-    const candidates = await this.taskDeduplicationCandidates(options);
     if (!candidates.length) {
       stats.created = flattenTaskPlan(tasks).length;
       this.settings.taskDeduplicationLastRunSummary = taskDeduplicationRunSummary(stats);
@@ -5137,12 +7492,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.postTaskDeduplicationCandidateFlags(stats, options);
       return stats;
     }
-    const matchingOptions = Object.assign({}, options, { taskDeduplicationFeatureCache: new WeakMap() });
     for (const task of tasks) {
       const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, matchingOptions, { isSubtask: false }));
+      stats.candidateOutcomes.push({
+        taskId: String(task?.id || task?.oid || ""),
+        outcome: mainDecision.outcome || (mainDecision.decision === "merge" ? "merge" : mainDecision.decision === "ambiguous" ? "ambiguous-ai" : "create"),
+        candidateId: mainDecision.candidateId || mainDecision.id || mainDecision.candidate?.taskId || "",
+        confidence: Number(mainDecision.confidence || 0),
+        semanticScore: Number(mainDecision.semanticScore || 0),
+        basis: (mainDecision.basis || mainDecision.reasons || []).slice(0, 8),
+        evidence_ids: (mainDecision.evidence_ids || []).slice(0, 12),
+        fact_refs: (mainDecision.fact_refs || []).slice(0, 12),
+        telemetry: mainDecision.telemetry || null
+      });
       if (isAiMediatedTaskDeduplicationCandidate(mainDecision)) {
         const resolution = taskDeduplicationResolution(mainDecision, this.settings, matchingOptions);
         if (resolution === "none") {
+          if (mainDecision.candidate && (mainDecision.outcome === "ambiguous-ai" || mainDecision.decision === "ambiguous")) {
+            flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
+          }
           stats.created += 1;
           for (const subtask of task.subtasks || []) stats.created += 1;
           continue;
@@ -5158,15 +7526,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         } else {
           const aiDecision = await this.aiTaskDeduplicationDecision(task, mainDecision, matchingOptions);
           if (aiDecision?.used) stats.aiUsed += 1;
+          if (aiDecision?.telemetry) {
+            stats.semanticTelemetry = Object.assign({}, stats.semanticTelemetry, {
+              providerCalls: Number(stats.semanticTelemetry.providerCalls || 0) + Number(aiDecision.telemetry.providerCalls || 0),
+              escalation: true
+            });
+          }
+          const outcomeRecord = stats.candidateOutcomes[stats.candidateOutcomes.length - 1];
+          if (outcomeRecord && aiDecision) {
+            outcomeRecord.outcome = aiDecision.match === true ? "merge" : "create";
+            outcomeRecord.basis = uniqueValues([...(outcomeRecord.basis || []), ...(aiDecision.basis || [])]);
+            outcomeRecord.telemetry = aiDecision.telemetry || outcomeRecord.telemetry;
+          }
           if (aiDecision?.match !== true) {
             stats.created += 1;
             for (const subtask of task.subtasks || []) stats.created += 1;
             continue;
           }
         }
-        const generatedUpdate = await this.taskGenerationUpdateForDuplicate(task, mainDecision, matchingOptions);
+        const generatedUpdate = matchingOptions.semanticDedupeState?.enabled
+          ? { used: false, task }
+          : await this.taskGenerationUpdateForDuplicate(task, mainDecision, matchingOptions);
         if (!generatedUpdate?.task) {
           flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
+          countCreatedTaskTree(stats, task);
           continue;
         }
         if (generatedUpdate.used) {
@@ -5222,9 +7605,39 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  async postTaskDescriptionFailureReport(report = emptyTaskDescriptionFailureReport(), tasks = [], options = {}) {
+    if (!report.failed) return;
+    const message = taskDescriptionFailureChatMessage(report, options);
+    this.logLocal("Task description generation failure report", {
+      source: options.source || "",
+      path: options.path || "",
+      attempted: report.attempted,
+      generated: report.generated,
+      failed: report.failed
+    });
+    try {
+      if (!this.app?.workspace?.getLeavesOfType) return;
+      await this.openSidebar();
+      const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+      if (view && view instanceof SemanticTodoistView) view.addMessage("assistant", message);
+    } catch (error) {
+      this.logLocal("Task description failure chat report skipped", { error: error.message || String(error), failed: report.failed });
+    }
+  }
   async taskDeduplicationCandidates(options = {}) {
     const index = this.getTaskReferenceIndex();
     const semanticRanks = semanticTaskReferenceCandidateRanks(options.semanticContext || []);
+    const semanticChunks = (this.semanticIndex || []).filter((chunk) => {
+      const sourceKind = semanticChunkSourceKind(chunk);
+      return (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record") && Array.isArray(chunk.embedding) && chunk.embedding.length > 0;
+    });
+    const chunkByTaskId = new Map();
+    for (const chunk of semanticChunks) {
+      for (const key of [chunk.taskId, chunk.todoistId, chunk.id, chunk.oid, chunk.taskReference?.id, chunk.taskReference?.oid].filter(Boolean)) {
+        const normalized = String(key).toUpperCase();
+        if (!chunkByTaskId.has(normalized)) chunkByTaskId.set(normalized, chunk);
+      }
+    }
     const candidates = [];
     for (const [id, task] of index.entries || []) {
       if (!id || !task?.content || task.isCompleted) continue;
@@ -5233,7 +7646,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const enrichedTask = Object.assign({}, task, parentContext, { id: String(id), childText });
       const knowledge = enrichedTask.knowledge?.intent ? enrichedTask.knowledge : taskKnowledgeSnapshot(enrichedTask, this.settings, childText, enrichedTask.knowledge || null);
       const semanticIndexRank = semanticRanks.get(String(task.oid || "").toUpperCase()) || 0;
-      candidates.push({ id: String(id), task: Object.assign(enrichedTask, { knowledge }), semanticIndexRank });
+      const semanticChunk = chunkByTaskId.get(String(id).toUpperCase()) || chunkByTaskId.get(String(task.oid || "").toUpperCase()) || null;
+      candidates.push({ id: String(id), sourceId: semanticChunk?.sourceId || "", task: Object.assign(enrichedTask, { knowledge }), semanticChunk, semanticIndexRank });
+    }
+    const candidateIds = new Set(candidates.map((candidate) => String(candidate.id || candidate.task?.id || candidate.task?.oid || "").toUpperCase()).filter(Boolean));
+    for (const chunk of semanticChunks) {
+      const task = semanticTaskDedupeChunkIdentity(chunk);
+      const id = String(task.id || task.oid || chunk.sourceId || "");
+      if (!id || task.isCompleted || candidateIds.has(id.toUpperCase()) || !task.content) continue;
+      candidates.push({ id, sourceId: chunk.sourceId || "", task, semanticChunk: chunk, semanticIndexRank: 0 });
+      candidateIds.add(id.toUpperCase());
     }
     if (shouldUseLiveTodoistDeduplicationCandidates(options)) {
       candidates.push(...await this.liveTodoistTaskDeduplicationCandidates(candidates, options));
@@ -5243,6 +7665,102 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       candidate.semanticIndexRank = semanticRanks.get(String(candidate.task?.oid || "").toUpperCase()) || 0;
     }
     return candidates;
+  }
+
+  async prepareSemanticTaskDeduplicationState(tasks = [], candidates = [], options = {}) {
+    const firstIndexedDimension = Number((this.semanticIndex || []).find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || 0);
+    const activeDimension = Number(this.settings.semanticIndexMeta?.dimension || firstIndexedDimension || semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {}));
+    const typedChunks = (this.semanticIndex || []).filter((chunk) => {
+      const sourceKind = semanticChunkSourceKind(chunk);
+      return (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record")
+        && Array.isArray(chunk.embedding)
+        && chunk.embedding.length > 0;
+    });
+    const telemetry = {
+      candidateCount: typedChunks.length,
+      embeddingCacheHits: 0,
+      embeddingCalls: 0,
+      providerCalls: 0,
+      providerCost: 0,
+      elapsedMs: 0,
+      degraded: false,
+      degradedReason: "",
+      escalation: false,
+      dimension: activeDimension
+    };
+    const semanticIndexConfigured = Array.isArray(this.semanticIndex) || options.semanticIndexFirst === true || options.semanticIndexAvailable === false;
+    const state = { enabled: typedChunks.length > 0 || semanticIndexConfigured, degraded: false, reason: "", typedChunks, generatedEmbeddings: new Map(), generatedEmbeddingsByObject: new WeakMap(), cacheHits: 0, indexRevision: this.semanticIndexRevision || 0, telemetry };
+    const startedAt = Date.now();
+    if (!typedChunks.length) {
+      state.degraded = true;
+      state.reason = "semantic task-reference embeddings unavailable";
+      telemetry.degraded = true;
+      telemetry.degradedReason = state.reason;
+      telemetry.elapsedMs = Date.now() - startedAt;
+      return state;
+    }
+    if (!(this.taskDeduplicationEmbeddingCache instanceof Map)) this.taskDeduplicationEmbeddingCache = new Map();
+    const model = this.settings?.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+    const provider = this.settings?.aiModelProvider || "openai";
+    const pending = [];
+    const pendingByFingerprint = new Map();
+    const generatedTasks = [];
+    for (const task of tasks || []) {
+      if (task) generatedTasks.push(task);
+      for (const subtask of task?.subtasks || []) if (subtask) generatedTasks.push(subtask);
+    }
+    for (const task of generatedTasks) {
+      const fingerprint = taskTreeFingerprint(task, { provider, model, dimension: activeDimension, indexRevision: this.semanticIndexRevision || 0 });
+      const cacheKey = `${provider}:${model}:${activeDimension || "native"}:${this.semanticIndexRevision || 0}:${fingerprint}`;
+      const cached = this.taskDeduplicationEmbeddingCache.get(cacheKey);
+      if (Array.isArray(cached) && cached.length) {
+        state.generatedEmbeddings.set(fingerprint, cached);
+        state.generatedEmbeddingsByObject.set(task, cached);
+        state.cacheHits += 1;
+        telemetry.embeddingCacheHits += 1;
+      } else if (!pendingByFingerprint.has(fingerprint)) {
+        pendingByFingerprint.set(fingerprint, { fingerprint, cacheKey, task });
+        pending.push(taskTreeEmbeddingText(task));
+      }
+    }
+    for (const candidate of candidates || []) {
+      const candidateTask = candidate?.task || candidate?.generatedTask || null;
+      if (!candidateTask || candidateTask.isCompleted) continue;
+      const fingerprint = taskTreeFingerprint(candidateTask, { provider, model, dimension: activeDimension, indexRevision: this.semanticIndexRevision || 0 });
+      const cacheKey = `${provider}:${model}:${activeDimension || "native"}:${this.semanticIndexRevision || 0}:${fingerprint}`;
+      const cached = this.taskDeduplicationEmbeddingCache.get(cacheKey);
+      if (Array.isArray(cached) && cached.length) {
+        state.generatedEmbeddings.set(fingerprint, cached);
+        state.generatedEmbeddingsByObject.set(candidateTask, cached);
+        state.cacheHits += 1;
+        telemetry.embeddingCacheHits += 1;
+      } else if (!pendingByFingerprint.has(fingerprint)) {
+        pendingByFingerprint.set(fingerprint, { fingerprint, cacheKey, task: candidateTask });
+        pending.push(taskTreeEmbeddingText(candidateTask));
+      }
+    }
+    if (pending.length) {
+      try {
+        const embeddings = await this.embedTexts(pending, "query");
+        telemetry.embeddingCalls += 1;
+        telemetry.providerCalls += 1;
+        Array.from(pendingByFingerprint.values()).forEach((item, index) => {
+          const embedding = Array.isArray(embeddings?.[index]) ? embeddings[index] : [];
+          if (!embedding.length) return;
+          this.taskDeduplicationEmbeddingCache.set(item.cacheKey, embedding);
+          state.generatedEmbeddings.set(item.fingerprint, embedding);
+          if (item.task && typeof item.task === "object") state.generatedEmbeddingsByObject.set(item.task, embedding);
+        });
+      } catch (error) {
+        state.degraded = true;
+        state.reason = `semantic query embedding unavailable: ${error.message || String(error)}`;
+        telemetry.degraded = true;
+        telemetry.degradedReason = state.reason;
+      }
+    }
+    state.telemetry = telemetry;
+    telemetry.elapsedMs = Date.now() - startedAt;
+    return state;
   }
 
   async liveTodoistTaskDeduplicationCandidates(existingCandidates = [], options = {}) {
@@ -5272,6 +7790,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async aiTaskDeduplicationDecision(task, localDecision, options = {}) {
     const candidate = localDecision.candidate;
     if (!candidate?.task) return null;
+    if (localDecision.hardConflict) return { used: false, match: false, outcome: "create", decision: "create", candidateId: localDecision.candidateId || localDecision.id || "", reason: "structured conflict gate" };
     const model = taskDeduplicationAiModel(this.settings);
     if (!hasChatCredentialForModel(this.settings, model)) return null;
     try {
@@ -5285,13 +7804,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Ignore email routing, reply-to aliases, mailbox-copy instructions, and ticket-tracking boilerplate unless that routing work is the actual requested action.",
           "Treat richer/poorer same-action records as duplicates when one record would be satisfied by completing the other.",
           "Treat parent/subtask pairs as duplicates when one merely restates the other or adds context around the same single next action.",
-          "Treat identical or near-identical titles under different parents as duplicates unless the parent context changes the person, object, deliverable, or next step.",
+          "Use only the supplied semantic evidence, structured action/deliverable/ownership/progress identity, and explicit hierarchy relationships to decide whether records represent the same actionable outcome. Wording similarity alone is not duplicate evidence.",
           "Treat different concrete non-Inbox Todoist projects as separate work contexts. Do not merge similar tasks across different named projects unless the source explicitly says the task moved or spans both projects.",
           "Return match false when one task is only a distinct component of a broader parent task with multiple decisions, questions, recipients, documents, or steps.",
           "Return match false when a newer task reflects specific progress, such as reviewing a named person's edits, approvals, returned comments, or a current status update, and the older task is a broader project/status task.",
-          "Return only match, confidence, and reason. Do not rewrite, merge, summarize, or propose any task title, description, date, priority, label, or subtask."
+          "Return only match, confidence, and reason. Do not rewrite, merge, summarize, or propose any task title, description, date, priority, label, or subtask.",
+          options.semanticDedupeState?.enabled ? "This is a bounded semantic-index review. Never infer a merge across a structured conflict gate." : ""
         ].join(" "),
-        user: [
+        user: options.semanticDedupeState?.enabled ? [
+          "Bounded candidate card (exactly one candidate):",
+          JSON.stringify({
+            generated: taskTreeRepresentation(task),
+            candidate: taskTreeRepresentation(candidate.task),
+            candidateId: localDecision.candidateId || localDecision.id || candidate.taskId || candidate.id || "",
+            sourceId: candidate.sourceId || "",
+            semanticScore: localDecision.semanticScore || candidate.semanticScore || 0,
+            evidence_ids: localDecision.evidence_ids || candidate.evidence_ids || [],
+            fact_refs: localDecision.fact_refs || candidate.fact_refs || [],
+            basis: localDecision.basis || localDecision.reasons || []
+          })
+        ].join("\n") : [
           "Deduplication policy:",
           taskDeduplicationPolicyText(this.settings),
           "",
@@ -5314,7 +7846,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         used: true,
         match: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD,
         confidence,
-        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160)
+        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160),
+        outcome: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD ? "merge" : "create",
+        decision: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD ? "merge" : "create",
+        candidateId: localDecision.candidateId || localDecision.id || candidate.taskId || candidate.id || "",
+        sourceId: candidate.sourceId || "",
+        evidence_ids: localDecision.evidence_ids || candidate.evidence_ids || [],
+        fact_refs: localDecision.fact_refs || candidate.fact_refs || [],
+        basis: uniqueValues(["bounded AI review", ...(localDecision.basis || [])]),
+        telemetry: Object.assign({}, localDecision.telemetry || {}, { providerCalls: 1, escalation: true })
       };
     } catch (error) {
       this.logLocal("Task deduplication AI duplicate detection skipped", { error: error.message || String(error) });
@@ -5361,6 +7901,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const parsed = JSON.parse(json);
       const allowedLabels = new Set(uniqueValues([...(task.labels || []), ...(existing.labels || [])]).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
       const generated = cleanTask(parsed?.tasks?.[0] || {}, allowedLabels, this.settings);
+      if (options.intraBatch) {
+        const sourceSubtasks = [...(task.subtasks || []), ...(existing.subtasks || [])].filter((subtask) => subtask?.content);
+        const mergedSubtasks = [];
+        const seenSubtaskIdentities = new Set();
+        for (const subtask of [...sourceSubtasks, ...(generated.subtasks || [])]) {
+          const identity = stableTaskTreeIdentity(subtask);
+          if (identity && seenSubtaskIdentities.has(identity)) continue;
+          if (identity) seenSubtaskIdentities.add(identity);
+          mergedSubtasks.push(subtask);
+        }
+        generated.subtasks = mergedSubtasks;
+      }
       const hierarchyIssues = taskPlanRepairableHierarchyIssues([generated]);
       const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
       const priorityEvidence = [taskDeduplicationSourceContextText(options), taskDeduplicationContextText(task), taskDeduplicationContextText(existing)].filter(Boolean).join("\n\n");
@@ -6744,6 +9296,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     modelDropdownSetting(containerEl, "Primary AI model", "Used for sidebar chat, vault question-answering, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels", () => this.display());
     reasoningEffortSetting(containerEl, "Primary reasoning effort", "Controls reasoning for the selected primary model. Provider default preserves the model provider's default behavior.", this.plugin, "chatReasoningEffort", this.plugin.settings.chatModel);
     modelDropdownSetting(containerEl, "Embedding model", "Used for semantic vault indexing. The plugin keeps this on the same provider as the selected AI model by default.", this.plugin, "embeddingModel", "availableEmbeddingModels");
+    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Automatic same-provider fallback", "When the selected AI model is temporarily overloaded or rate-limited, retry once with another available model from the same provider.", this.plugin, "enableAiModelFallback");
     aiFallbackModelSetting(containerEl, this.plugin, () => this.display());
     const fallbackModel = this.plugin.settings.chatFallbackModel || this.plugin.sameProviderFallbackModels(this.plugin.settings.chatModel)[0] || this.plugin.settings.chatModel;
@@ -6928,6 +9481,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     folderListSetting(containerEl, "Excluded folders", "Folders ignored by search and semantic indexing. Note sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist.", this.plugin, "excludedFolders");
     textSetting(containerEl, "Excluded link domains", "Comma-separated domains omitted from AI task prompts and Todoist descriptions. Subdomains are included. Example: internal.example.com.", this.plugin, "excludedLinkDomains");
     numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
+    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
     numberSetting(containerEl, "Index chunk size characters", this.plugin, "semanticIndexMaxChunkChars");
     numberSetting(containerEl, "Max index chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
     numberSetting(containerEl, "Index embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
@@ -7962,6 +10516,7 @@ const SETTING_DESCRIPTIONS = {
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
+  openAiEmbeddingDimensions: "Stored and queried dimensions for OpenAI text-embedding-3 indexes. The mobile-safe default is 1024. Changing this value requires a semantic-index rebuild; unsupported embedding models keep their native dimensions.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
   workerToken: "Required only for Email-To-Todoist. This shared secret authorizes Obsidian to read queued emails from your Worker.",
@@ -7970,7 +10525,7 @@ const SETTING_DESCRIPTIONS = {
   excludedLinkDomains: "Comma-separated web domains omitted from AI prompts and Todoist descriptions.",
   embeddingBatchSize: "How many note chunks are embedded per API batch. Larger values can be faster but heavier.",
   semanticIndexMaxChunkChars: "Approximate size of each note chunk before embedding.",
-  semanticIndexMaxChunksPerNote: "Caps how much of a single note can enter the semantic index.",
+  semanticIndexMaxChunksPerNote: "Sets the observable coherent-unit target per note. Safe same-section coalescing controls count; explicit actions and lossless long-unit splits may exceed the target, and source content is not dropped to meet it.",
   semanticIndexEmbeddingPrecision: "Number of decimal places retained in stored embeddings. Lower is smaller; higher is more precise.",
   useNoteCreatedTimeForSemanticIndex: "Uses a note frontmatter created value, for example created: [\"2026-05-20 13:43\"], as the meeting/date signal in semantic ranking. When disabled, only file metadata is used.",
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
@@ -8278,6 +10833,29 @@ function numberSetting(containerEl, name, plugin, key) {
       await plugin.saveSettings();
     });
   });
+}
+
+function openAiEmbeddingDimensionSetting(containerEl, plugin) {
+  const model = plugin.settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  if (!supportsOpenAiEmbeddingDimensions(model)) return;
+  const nativeDimension = openAiEmbeddingNativeDimension(model);
+  const current = normalizeOpenAiEmbeddingDimensions(plugin.settings.openAiEmbeddingDimensions, model);
+  const compatibility = semanticEmbeddingIndexCompatibility(plugin.settings, plugin.settings.semanticIndexMeta || {});
+  const suffix = compatibility.migrationRequired
+    ? ` The current index is ${compatibility.indexedDimension}d and remains available until a ${current}d rebuild succeeds.`
+    : "";
+  new Setting(containerEl)
+    .setName("OpenAI embedding dimensions")
+    .setDesc(`${SETTING_DESCRIPTIONS.openAiEmbeddingDimensions} Valid range for ${model}: 256-${nativeDimension}.${suffix}`)
+    .addText((text) => {
+      text.inputEl.type = "number";
+      text.inputEl.min = "256";
+      text.inputEl.max = String(nativeDimension);
+      text.inputEl.step = "1";
+      text.setValue(String(current)).onChange(async (value) => {
+        await plugin.setOpenAiEmbeddingDimensions(value);
+      });
+    });
 }
 
 function timeSetting(containerEl, name, desc, plugin, key) {
@@ -8911,12 +11489,16 @@ function indexSummary(pluginOrSettings) {
 
 function indexFilesSummary(pluginOrSettings) {
   const stats = pluginOrSettings.semanticIndexStats || {};
+  const load = pluginOrSettings.semanticIndexLoadTelemetry || {};
+  const loadSummary = load.mode && load.mode !== "idle"
+    ? ` Load: ${load.mode}, ${Number(load.shardsLoaded || 0)}/${Number(load.shardCount || 0)} shards, ${Number(load.elapsedMs || 0)} ms, ${Number(load.yields || 0)} yields.`
+    : "";
   const path = stats.path || pluginOrSettings.settings?.semanticIndexMeta?.file || SEMANTIC_INDEX_FILE;
-  if (!stats.bytes && !stats.totalBytes) return `${path}. No index file loaded.`;
+  if (!stats.bytes && !stats.totalBytes) return `${path}. No index file loaded.${loadSummary}`;
   if (stats.shards) {
-    return `Manifest: ${path}. Shards: ${stats.shards}. Largest file: ${formatBytes(stats.bytes || 0)}. Total: ${formatBytes(stats.totalBytes || stats.bytes || 0)} across ${stats.files || stats.shards + 1} files.`;
+    return `Manifest: ${path}. Shards: ${stats.shards}. Largest file: ${formatBytes(stats.bytes || 0)}. Total: ${formatBytes(stats.totalBytes || stats.bytes || 0)} across ${stats.files || stats.shards + 1} files.${loadSummary}`;
   }
-  return `${path}. Single index file: ${formatBytes(stats.bytes || 0)}.`;
+  return `${path}. Single index file: ${formatBytes(stats.bytes || 0)}.${loadSummary}`;
 }
 
 function modelSummary(settings) {
@@ -9338,6 +11920,35 @@ function formatBytes(bytes) {
   return `${value} B`;
 }
 
+function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      claims: {
+        type: "array",
+        maxItems: Math.max(1, Math.min(48, Number(maxClaims) || CHAT_RESPONSE_MAX_CLAIMS)),
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            text: { type: "string", minLength: 1, description: "One short sentence for one category only; do not combine supported and unsupported details." },
+            established: { type: "boolean", description: "True only when the claim is supported by every listed evidence_id; false only for one missing or unestablished element." },
+            evidence_ids: { type: "array", items: { type: "string" }, description: "Exact supplied IDs for an established claim; empty for category=unsupported." },
+            category: {
+              type: "string",
+              enum: ["fact", "intent", "current-state", "history", "owner", "recipient", "deliverable", "dependency", "next-step", "timing", "criteria", "hierarchy", "unsupported"],
+              description: "Exactly one category; use unsupported only for a single missing or unestablished element."
+            }
+          },
+          required: ["text", "established", "evidence_ids", "category"]
+        }
+      }
+    },
+    required: ["claims"]
+  };
+}
+
 function taskSchema() {
   const task = {
     type: "object",
@@ -9374,6 +11985,7 @@ function taskSchema() {
 function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTasks, maxSubtasks = DEFAULT_SETTINGS.maxGeneratedSubtasksPerMainTask) {
   const mainLimit = generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks });
   const subtaskLimit = generationSubtaskLimit({ maxGeneratedSubtasksPerMainTask: maxSubtasks });
+  const factBinding = Object.assign({}, TASK_WORKFLOW_FACT_BINDING_SCHEMA);
   const task = {
     type: "object",
     additionalProperties: false,
@@ -9382,9 +11994,13 @@ function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGenerated
       due_date: { type: ["string", "null"], pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
       deadline_date: { type: ["string", "null"], pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
       priority: { type: "integer", minimum: 1, maximum: 4 },
-      labels: { type: "array", items: { type: "string" } }
+      labels: { type: "array", items: { type: "string" } },
+      scope_id: { type: "string", minLength: 1 },
+      evidence_ids: { type: "array", items: { type: "string" }, minItems: 1 },
+      fact_refs: { type: "array", items: { type: "string" }, minItems: 1 },
+      fact_bindings: { type: "array", minItems: 1, items: factBinding }
     },
-    required: ["content", "due_date", "deadline_date", "priority", "labels"]
+    required: ["content", "due_date", "deadline_date", "priority", "labels", "scope_id", "evidence_ids", "fact_refs", "fact_bindings"]
   };
   return {
     type: "object",
@@ -9409,9 +12025,26 @@ function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGenerated
           additionalProperties: false,
           properties: {
             index: { type: "integer", minimum: 0 },
-            description: { type: "string", minLength: 80, maxLength: 1200 }
+            description_sentences: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  text: { type: "string", minLength: 1 },
+                  evidence_ids: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+                  fact_refs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } }
+                },
+                required: ["text", "evidence_ids", "fact_refs"]
+              }
+            },
+            scope_id: { type: "string", minLength: 1 },
+            evidence_ids: { type: "array", items: { type: "string" }, minItems: 1 },
+            fact_refs: { type: "array", items: { type: "string" }, minItems: 1 },
+            fact_bindings: { type: "array", minItems: 1, items: factBinding }
           },
-          required: ["index", "description"]
+          required: ["index", "description_sentences", "scope_id", "evidence_ids", "fact_refs", "fact_bindings"]
         }
       }
     },
@@ -9447,13 +12080,13 @@ function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT
   const grounded = [];
   const rejected = [];
   for (const task of tasks || []) {
-    if (!generatedTaskMatchesPrimarySource(task, sourceText)) {
+    if (mainTaskClarityReason(task) !== "passed") {
       rejected.push(task);
       continue;
     }
     const subtasks = [];
     for (const subtask of task.subtasks || []) {
-      if (generatedTaskMatchesPrimarySource(subtask, `${sourceText}\n${task.content || ""}`) && subtaskClarityReason(subtask, task) === "passed") subtasks.push(subtask);
+      if (subtaskClarityReason(subtask, task) === "passed") subtasks.push(subtask);
       else rejected.push(subtask);
     }
     grounded.push(Object.assign({}, task, { subtasks }));
@@ -9463,15 +12096,7 @@ function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT
 
 function generatedTaskMatchesPrimarySource(task = {}, sourceText = "") {
   const title = singleLine(task.content || "");
-  if (!title) return false;
-  const sourceCounts = termCounts(sourceText);
-  const objectTerms = generatedTaskObjectTerms(title);
-  if (!objectTerms.length) return false;
-  const matches = objectTerms.filter((term) => contextAnchorVariants(term).some((variant) => sourceCounts[variant]));
-  if (matches.length) return true;
-  const normalizedTitle = canonicalTaskMatchTitle(title);
-  const normalizedSource = canonicalTaskMatchTitle(sourceText);
-  return normalizedTitle.length >= 12 && normalizedSource.includes(normalizedTitle);
+  return Boolean(title) && mainTaskClarityReason(task) === "passed";
 }
 
 function generatedTaskObjectTerms(value = "") {
@@ -9554,7 +12179,11 @@ function normalizeSchedulerMemoryEntry(value, fallbackKey = "") {
     sections: uniqueValues(value.sections || []).slice(0, 8),
     labels: uniqueValues(value.labels || []).slice(0, 16),
     contextPaths: uniqueValues(value.contextPaths || []).slice(-SCHEDULER_MEMORY_MAX_CONTEXT_PATHS),
-    contextTerms: uniqueValues(value.contextTerms || []).slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS),
+    semanticEvidenceIds: uniqueValues(value.semanticEvidenceIds || []).slice(-32),
+    semanticSourceIds: uniqueValues(value.semanticSourceIds || []).slice(-32),
+    semanticScopeId: String(value.semanticScopeId || ""),
+    semanticIndexRevision: Number(value.semanticIndexRevision || 0),
+    semanticQueryEmbedding: schedulerCompactSemanticEmbedding(value.semanticQueryEmbedding || [], 128),
     priority: Object.assign({ last: 1, max: 1, samples: 0 }, value.priority || {}),
     duration: Object.assign({ last: 0, average: 0, samples: 0, source: "" }, value.duration || {}),
     order: Object.assign({
@@ -9835,7 +12464,7 @@ function calibratedTaskDeduplicationPolicyText(value = "") {
   const additions = [
     "Treat same-project tasks as duplicates when one is a richer, poorer, broader, or more concise expression of the same action and the existing task would be satisfied by merging the newer details.",
     "Treat parent and subtask records as duplicates when the subtask merely restates the parent action or the parent only adds context around the same single action; hierarchy alone is not a reason to keep duplicate task records.",
-    "Treat identical or near-identical task titles as duplicate candidates even when they sit under different parent tasks, unless parent context clearly changes the object, person, deliverable, or next step.",
+    "Use only semantic evidence, structured action/deliverable/ownership/progress identity, and explicit hierarchy relationships for duplicate decisions; title or wording similarity alone is not evidence.",
     "Do not merge similar tasks across different concrete Todoist projects. Treat Inbox as generic, but two named non-Inbox projects are separate work contexts unless the user explicitly moves or links the task across projects.",
     "Do not merge a distinct component subtask into a broader parent task when the parent contains multiple decisions, questions, recipients, documents, or steps and the subtask represents only one separable piece.",
     "Do not merge a newer specific progress task, such as reviewing a named person's edits, approvals, returned comments, or current status update, into an older broader project task unless both records require the same immediate next action."
@@ -9900,6 +12529,100 @@ function mergeSchedulerMemoryChatCommands(local = {}, ai = {}) {
   return merged;
 }
 
+function schedulerSemanticScopeId(candidate = {}) {
+  const root = candidate.rootTaskId || candidate.rootId || (!candidate.isSubtask ? candidate.id || candidate.todoistId || "" : "") || candidate.rootOid || "";
+  return `task:${String(candidate.id || candidate.oid || "")}|root:${String(root)}|parent:${String(candidate.parentId || candidate.parentOid || "")}|path:${String(candidate.path || "")}`;
+}
+
+function schedulerSemanticQueryId(candidate = {}, revision = 0, provider = "", model = "", dimension = 0) {
+  return `scheduler:${shortHash([candidate.id || candidate.oid || "", schedulerSemanticScopeId(candidate), revision, provider, model, dimension || "native", schedulerSemanticCandidateQuery(candidate)].join("\u0000"))}`;
+}
+
+function schedulerSemanticBatchQueryId(candidates = [], revision = 0, provider = "", model = "", dimension = 0) {
+  return `scheduler-batch:${shortHash([revision, provider, model, dimension || "native", ...candidates.map((candidate) => schedulerSemanticQueryId(candidate, revision, provider, model, dimension))].join("\u0000"))}`;
+}
+
+function schedulerSemanticCandidateQuery(candidate = {}) {
+  return [
+    `task_id:${candidate.id || ""}`,
+    `oid:${candidate.oid || ""}`,
+    `title:${candidate.content || ""}`,
+    `description:${candidate.description || ""}`,
+    `intent:${candidate.intent || candidate.knowledge?.intent || ""}`,
+    `rationale:${candidate.rationale || candidate.knowledge?.rationale || ""}`,
+    `project:${candidate.projectName || candidate.projectId || ""}`,
+    `section:${candidate.section || candidate.sectionId || ""}`,
+    `parent_id:${candidate.parentId || ""}`,
+    `parent_oid:${candidate.parentOid || ""}`,
+    `root_id:${candidate.rootTaskId || ""}`,
+    `root_oid:${candidate.rootOid || ""}`,
+    `path:${candidate.path || ""}`,
+    `labels:${(candidate.labels || []).join(",")}`
+  ].filter((value) => value.split(":").slice(1).join(":").trim()).join("\n");
+}
+
+function schedulerSemanticEmbeddingCacheKey(candidate = {}, query = "", scopeId = "", revision = 0, provider = "", model = "", dimension = 0) {
+  return ["scheduler", candidate.id || candidate.oid || "", scopeId, revision, provider, model, dimension || "native", shortHash(query)].join("|");
+}
+
+function schedulerCompactSemanticEmbedding(embedding = [], dimensions = 128) {
+  if (!Array.isArray(embedding) || !embedding.length) return [];
+  const target = Math.min(Math.max(8, Number(dimensions || 128)), embedding.length);
+  if (target === embedding.length) return embedding.map((value) => Math.round(Number(value || 0) * 100000) / 100000);
+  const result = new Array(target).fill(0);
+  const counts = new Array(target).fill(0);
+  embedding.forEach((value, index) => {
+    const bucket = index % target;
+    result[bucket] += Number(value || 0);
+    counts[bucket] += 1;
+  });
+  return result.map((value, index) => Math.round((value / Math.max(1, counts[index])) * 100000) / 100000);
+}
+
+function schedulerSemanticChunkIdentityMatch(candidate = {}, chunk = {}) {
+  const candidateIds = new Set([candidate.id, candidate.oid].filter(Boolean).map((value) => String(value).toLowerCase()));
+  const chunkIds = [chunk.taskId, chunk.todoistId, chunk.oid, chunk.sourceId]
+    .filter(Boolean).map((value) => String(value).toLowerCase());
+  if (!candidateIds.size || !chunkIds.length) return false;
+  return chunkIds.some((value) => candidateIds.has(value));
+}
+
+function schedulerSemanticBundlePaths(bundle = {}) {
+  return uniqueValues((bundle.chunks || []).map((chunk) => chunk.path).filter(Boolean)).slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_PATHS);
+}
+
+function formatSchedulerSemanticBundles(bundles = [], maxChars = 8000) {
+  const sections = [];
+  for (const bundle of bundles || []) {
+    const identity = [
+      `candidate_id=${bundle.candidateId || ""}`,
+      `candidate_oid=${bundle.candidateOid || ""}`,
+      `root_task_id=${bundle.rootTaskId || ""}`,
+      `root_oid=${bundle.rootOid || ""}`,
+      `parent_task_id=${bundle.parentTaskId || ""}`,
+      `parent_oid=${bundle.parentOid || ""}`,
+      `child_task_ids=${(bundle.childTaskIds || []).join(",")}`,
+      `child_oids=${(bundle.childOids || []).join(",")}`,
+      `tree_path=${(bundle.treePath || []).join(",")}`,
+      `tree_depth=${bundle.treeDepth ?? ""}`,
+      `sibling_order=${bundle.siblingOrder ?? ""}`,
+      `scope_id=${bundle.scopeId || ""}`
+    ].join(" ");
+    const evidence = (bundle.chunks || []).map((chunk) => [
+      `evidence_id=${chunk.evidenceId || ""}`,
+      `source_id=${chunk.sourceId || ""}`,
+      `source_kind=${chunk.sourceKind || ""}`,
+      `semantic_score=${Number(chunk.semanticScore || chunk.matchScore || 0).toFixed(3)}`,
+      `task_id=${chunk.taskId || chunk.taskReference?.taskId || ""}`,
+      `parent_task_id=${chunk.parentTaskId || chunk.taskReference?.parentTaskId || ""}`,
+      `root_task_id=${chunk.rootTaskId || chunk.taskReference?.rootTaskId || ""}`,
+      `text=${singleLine(chunk.text || "")}`
+    ].join(" | "));
+    sections.push([`[scheduler candidate] ${identity}`, `state=${bundle.indexState || "ready"} degraded_reason=${bundle.degradedReason || ""}`, evidence.length ? evidence.join("\n") : "evidence=none"].join("\n"));
+  }
+  return truncateMarkdownAtWord(sections.join("\n\n"), Math.max(1000, Number(maxChars || 8000)));
+}
+
 function schedulerMemoryEntry(memory, task) {
   if (!memory || !task) return null;
   memory.entries = memory.entries || {};
@@ -9916,15 +12639,14 @@ function schedulerMemoryForCandidate(memory, candidate) {
   if (!memory?.entries || !candidate) return null;
   const exact = schedulerMemoryExactMatch(memory, candidate);
   if (exact?.entry) return Object.assign({}, exact.entry, { exact: true });
-  const candidateTerms = new Set(schedulerContextTokens(candidate));
-  const candidatePaths = new Set(schedulerTaskPaths(candidate));
-  const candidateLabels = new Set(cleanTodoistLabels(candidate.labels || []).map((label) => label.toLowerCase()));
+  const bundle = candidate.schedulerSemanticBundle;
+  if (!bundle || bundle.degradedReason) return null;
   let best = null;
   for (const entry of Object.values(memory.entries || {})) {
-    const score = schedulerMemorySimilarity(entry, candidate, candidateTerms, candidatePaths, candidateLabels);
+    const score = schedulerMemorySemanticSimilarity(entry, bundle);
     if (!best || score > best.score) best = { entry, score };
   }
-  if (!best || best.score < 0.55) return null;
+  if (!best || best.score < 0.62) return null;
   return Object.assign({}, best.entry, { exact: false, similarity: best.score });
 }
 
@@ -9933,11 +12655,9 @@ function schedulerMemoryExactMatch(memory, task) {
   if (key && memory.entries?.[key]) return { entry: memory.entries[key], key };
   const id = String(task?.id || "").trim();
   const oid = String(task?.oid || "").trim();
-  const contentHash = schedulerTaskContentHash(task);
   for (const entry of Object.values(memory.entries || {})) {
     if (id && (entry.ids || []).includes(id)) return { entry, key: entry.key };
     if (oid && (entry.oids || []).includes(oid)) return { entry, key: entry.key };
-    if (contentHash && entry.contentHash === contentHash && schedulerTaskPaths(task).some((path) => (entry.paths || []).includes(path))) return { entry, key: entry.key };
   }
   return null;
 }
@@ -9947,8 +12667,7 @@ function schedulerMemoryKey(task) {
   if (oid) return `oid:${oid}`;
   const id = String(task?.id || "").trim();
   if (id) return `todoist:${id}`;
-  const contentHash = schedulerTaskContentHash(task);
-  return contentHash ? `sig:${contentHash}` : "";
+  return "";
 }
 
 function schedulerTaskContentHash(task) {
@@ -9975,37 +12694,18 @@ function schedulerTaskPaths(task, observation = {}) {
   return uniqueValues(paths.map((path) => String(path || "").trim()).filter(Boolean));
 }
 
-function schedulerContextTokens(task) {
-  const text = [
-    task?.content,
-    task?.description,
-    task?.parentContent,
-    task?.projectName,
-    task?.section,
-    task?.path,
-    ...(task?.labels || [])
-  ].filter(Boolean).join(" ");
-  return Object.entries(termCounts(text))
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS)
-    .map(([term]) => term);
-}
-
-function schedulerMemorySimilarity(entry, candidate, candidateTerms, candidatePaths, candidateLabels) {
-  let score = 0;
-  const entryTerms = new Set(entry.contextTerms || []);
-  const entryPaths = new Set([...(entry.paths || []), ...(entry.contextPaths || [])]);
-  const entryLabels = new Set((entry.labels || []).map((label) => label.toLowerCase()));
-  const termOverlap = [...candidateTerms].filter((term) => entryTerms.has(term)).length;
-  const pathOverlap = [...candidatePaths].filter((path) => entryPaths.has(path)).length;
-  const labelOverlap = [...candidateLabels].filter((label) => entryLabels.has(label)).length;
-  if (entry.contentHash && entry.contentHash === schedulerTaskContentHash(candidate)) score += 0.35;
-  if (pathOverlap) score += Math.min(0.35, 0.2 + pathOverlap * 0.08);
-  if (String(candidate.projectId || "") && (entry.projectIds || []).includes(String(candidate.projectId))) score += 0.12;
-  if (String(candidate.projectName || "") && (entry.projectNames || []).includes(String(candidate.projectName))) score += 0.08;
-  if (labelOverlap) score += Math.min(0.15, labelOverlap * 0.05);
-  if (termOverlap) score += Math.min(0.35, termOverlap / Math.max(8, candidateTerms.size || 1));
-  return score;
+function schedulerMemorySemanticSimilarity(entry, bundle = {}) {
+  const entryEvidence = new Set(entry?.semanticEvidenceIds || []);
+  const candidateEvidence = new Set(bundle?.evidenceIds || []);
+  const overlap = [...candidateEvidence].filter((evidenceId) => entryEvidence.has(evidenceId)).length;
+  let score = overlap ? Math.min(0.78, 0.62 + overlap * 0.04) : 0;
+  const entryEmbedding = entry?.semanticQueryEmbedding || [];
+  const candidateEmbedding = bundle?.queryEmbedding || [];
+  if (entryEmbedding.length && candidateEmbedding.length) {
+    const semantic = cosine(entryEmbedding, candidateEmbedding);
+    if (semantic > 0) score = Math.max(score, Math.min(1, semantic));
+  }
+  return Math.round(score * 1000) / 1000;
 }
 
 function learnedSchedulerDurationMinutes(entry) {
@@ -10031,22 +12731,13 @@ function schedulerMemoryScoreAdjustment(entry) {
 }
 
 function schedulerMemoryContextText(entry) {
-  if (!entry) return "";
-  return [
-    entry.title,
-    entry.parentContent,
-    ...(entry.labels || []),
-    ...(entry.contextTerms || []).slice(0, 12),
-    ...(entry.paths || []).slice(-3),
-    ...(entry.contextPaths || []).slice(-3)
-  ].filter(Boolean).join(" ");
+  return entry?.semanticEvidenceIds?.slice?.(0, 8).join(" ") || "";
 }
 
 function updateSchedulerMemoryEntry(entry, task, observation = {}) {
   if (!entry || !task) return entry;
   const timestamp = observation.observedAt || deviceTimestamp();
   const paths = schedulerTaskPaths(task, observation);
-  const contextTerms = schedulerContextTokens(task);
   const labels = cleanTodoistLabels(task.labels || []);
   const priority = normalizePriority(task.priority);
   entry.title = singleLine(task.content || task.title || entry.title || "");
@@ -10061,7 +12752,14 @@ function updateSchedulerMemoryEntry(entry, task, observation = {}) {
   entry.sections = schedulerAppendUnique(entry.sections, [task.section], 8);
   entry.labels = schedulerAppendUnique(entry.labels, labels, 16);
   entry.contextPaths = schedulerAppendUnique(entry.contextPaths, observation.contextPaths || [], SCHEDULER_MEMORY_MAX_CONTEXT_PATHS);
-  entry.contextTerms = schedulerAppendUnique(entry.contextTerms, contextTerms, SCHEDULER_MEMORY_MAX_CONTEXT_TERMS);
+  const bundle = task.schedulerSemanticBundle || observation.semanticBundle || null;
+  if (bundle) {
+    entry.semanticEvidenceIds = schedulerAppendUnique(entry.semanticEvidenceIds, bundle.evidenceIds || [], 32);
+    entry.semanticSourceIds = schedulerAppendUnique(entry.semanticSourceIds, bundle.sourceIds || [], 32);
+    entry.semanticScopeId = String(bundle.scopeId || entry.semanticScopeId || "");
+    entry.semanticIndexRevision = Number(bundle.indexRevision || entry.semanticIndexRevision || 0);
+    entry.semanticQueryEmbedding = schedulerCompactSemanticEmbedding(bundle.queryEmbedding || [], 128);
+  }
   entry.priority = entry.priority || { last: 1, max: 1, samples: 0 };
   entry.priority.last = priority;
   entry.priority.max = Math.max(normalizePriority(entry.priority.max), priority);
@@ -10205,7 +12903,14 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
         deadlineDay: datePart(deadlineDate),
         isSubtask: Boolean(task.parentId || cached.isSubtask),
         parentId: task.parentId || cached.parentId || "",
-        parentOid: cached.parentOid || "",
+        parentOid: task.parentOid || cached.parentOid || "",
+        rootTaskId: task.rootTaskId || cached.rootTaskId || cached.rootId || "",
+        rootOid: task.rootOid || cached.rootOid || "",
+        childTaskIds: Array.isArray(task.childTaskIds || cached.childTaskIds) ? (task.childTaskIds || cached.childTaskIds).slice() : [],
+        childOids: Array.isArray(task.childOids || cached.childOids) ? (task.childOids || cached.childOids).slice() : [],
+        treePath: Array.isArray(task.treePath || cached.treePath) ? (task.treePath || cached.treePath).slice() : [],
+        treeDepth: task.treeDepth ?? cached.treeDepth ?? null,
+        siblingOrder: task.siblingOrder ?? cached.siblingOrder ?? null,
         parentContent: parent.content || cached.parentContent || "",
         parentLineNumber: cached.parentLineNumber ?? null,
         section: task.section || cached.section || "",
@@ -10255,10 +12960,13 @@ function scheduleTodayCandidates(tasks, settings = DEFAULT_SETTINGS, config = sc
     .map(({ candidate }) => candidate);
 }
 
-function applySemanticContextToScheduleCandidates(candidates, context = [], config = scheduleTodayConfig(DEFAULT_SETTINGS)) {
+function applySemanticContextToScheduleCandidates(candidates, bundles = [], config = scheduleTodayConfig(DEFAULT_SETTINGS)) {
   let matches = 0;
+  const bundleById = new Map((bundles || []).map((bundle) => [String(bundle.candidateId || bundle.candidateOid || ""), bundle]));
   for (const candidate of candidates || []) {
-    const semanticScore = scheduleSemanticContextScore(candidate, context);
+    const bundle = bundleById.get(String(candidate.id || candidate.oid || "")) || null;
+    candidate.schedulerSemanticBundle = bundle;
+    const semanticScore = scheduleSemanticContextScore(candidate, bundle);
     candidate.semanticContextScore = semanticScore;
     if (semanticScore > 0) {
       matches += 1;
@@ -10272,32 +12980,20 @@ function applySemanticContextToScheduleCandidates(candidates, context = [], conf
 function applyAdaptiveContextPackToScheduleCandidates(candidates, pack = {}, config = scheduleTodayConfig(DEFAULT_SETTINGS)) {
   let matches = 0;
   const taskCards = pack.taskCards || [];
-  const projectCards = pack.projectCards || [];
   const noteCards = pack.noteCards || [];
   for (const candidate of candidates || []) {
     if (!candidate) continue;
-    const candidateText = singleLine([
-      candidate.id,
-      candidate.oid,
-      candidate.content,
-      candidate.description,
-      candidate.parentContent,
-      candidate.projectName,
-      candidate.section,
-      candidate.path,
-      ...(candidate.labels || [])
-    ].filter(Boolean).join(" ")).toLowerCase();
+    const bundle = candidate.schedulerSemanticBundle || {};
+    const evidenceIds = new Set(bundle.evidenceIds || []);
     const taskMatch = taskCards.find((card) => {
       if (card.id && String(card.id) === String(candidate.id)) return true;
-      if (card.path && candidate.path && card.path === candidate.path && card.title && candidate.content && singleLine(card.title).toLowerCase() === singleLine(candidate.content).toLowerCase()) return true;
+      if (card.oid && candidate.oid && String(card.oid) === String(candidate.oid)) return true;
+      if ((card.evidence_ids || []).some((evidenceId) => evidenceIds.has(String(evidenceId)))) return true;
+      if (card.selectedSemanticEvidence && evidenceIds.has(String(card.selectedSemanticEvidence))) return true;
       return false;
     });
-    const projectMatch = projectCards.find((card) => {
-      const name = singleLine(card.name || "").toLowerCase();
-      return name && candidateText.includes(name.toLowerCase());
-    });
     const noteMatch = noteCards.find((card) => card.path && candidate.path && card.path === candidate.path);
-    const signal = (taskMatch ? 0.35 : 0) + (projectMatch ? 0.18 : 0) + (noteMatch ? 0.22 : 0);
+    const signal = (taskMatch ? 0.35 : 0) + (noteMatch ? 0.22 : 0);
     if (signal <= 0) continue;
     matches += 1;
     const knowledge = taskMatch?.knowledge || candidate.knowledge || {};
@@ -10312,34 +13008,10 @@ function applyAdaptiveContextPackToScheduleCandidates(candidates, pack = {}, con
 }
 
 function scheduleSemanticContextScore(candidate, context = []) {
-  if (!candidate || !Array.isArray(context) || !context.length) return 0;
-  const candidateTerms = termCounts([
-    candidate.content,
-    candidate.description,
-    candidate.parentContent,
-    candidate.projectName,
-    candidate.section,
-    candidate.path,
-    ...(candidate.labels || [])
-  ].filter(Boolean).join(" "));
-  const genericTerms = new Set(["project", "projects", "task", "tasks", "todoist", "note", "notes", "meeting", "meetings"]);
-  const terms = Object.keys(candidateTerms).filter((term) => term.length > 2 && !genericTerms.has(term));
-  if (!terms.length && !candidate.path) return 0;
-  let best = 0;
-  for (const chunk of context) {
-    const chunkText = `${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`;
-    const chunkCounts = termCounts(chunkText);
-    const overlap = terms.filter((term) => chunkCounts[term]).length;
-    const lexical = terms.length ? Math.min(1, overlap / Math.max(5, Math.min(terms.length, 18))) : 0;
-    const pathBoost = candidate.path && chunk.path && candidate.path === chunk.path ? 0.55 : 0;
-    const titleBoost = singleLine(candidate.content || "").toLowerCase() &&
-      singleLine(chunkText).toLowerCase().includes(singleLine(candidate.content || "").toLowerCase().slice(0, 48)) ? 0.25 : 0;
-    if (!pathBoost && !titleBoost && lexical <= 0.2) continue;
-    const matchScore = Math.max(0, Math.min(1, Number(chunk.matchScore || 0)));
-    const contextStrength = Math.max(pathBoost, Math.min(1, (matchScore * 0.45) + (lexical * 0.45) + titleBoost));
-    best = Math.max(best, contextStrength);
-  }
-  return Math.max(0, Math.min(1, Math.round(best * 1000) / 1000));
+  if (!candidate || !context) return 0;
+  const chunks = Array.isArray(context) ? context : (context.chunks || []);
+  if (!chunks.length) return 0;
+  return Math.max(0, Math.min(1, Math.round(Math.max(...chunks.map((chunk) => Number(chunk.semanticScore || chunk.matchScore || 0))) * 1000) / 1000));
 }
 
 function scheduleCandidateScore(candidate, config) {
@@ -10390,9 +13062,6 @@ function scheduleRelatedGroupingBoost(previous, candidate, config = {}) {
   const previousLabels = new Set(cleanTodoistLabels(previous.labels || []).map((label) => label.toLowerCase()));
   const sharedLabels = cleanTodoistLabels(candidate.labels || []).filter((label) => previousLabels.has(label.toLowerCase()));
   if (sharedLabels.length) score += Math.min(0.55, sharedLabels.length * 0.18);
-  const previousTerms = new Set(schedulerContextTokens(previous));
-  const sharedTerms = schedulerContextTokens(candidate).filter((term) => previousTerms.has(term));
-  if (sharedTerms.length) score += Math.min(0.5, sharedTerms.length * 0.08);
   const maxBoost = Math.max(0, Number(policy.boost || 0.45));
   return Math.min(maxBoost, score * 0.2);
 }
@@ -10774,6 +13443,12 @@ function scheduleContinuationSubtask(candidate, remainderMinutes, config, settin
     content: truncateAtWord(title, 220),
     parentId,
     parentOid,
+    rootTaskId: candidate.rootTaskId || parentId,
+    rootOid: candidate.rootOid || parentOid,
+    treePath: Array.isArray(candidate.treePath) ? candidate.treePath.concat([candidate.id || ""]) : [],
+    treeDepth: Number.isFinite(Number(candidate.treeDepth)) ? Number(candidate.treeDepth) + 1 : null,
+    siblingOrder: null,
+    schedulerSemanticBundle: candidate.schedulerSemanticBundle || null,
     parentContent: candidate.isSubtask ? candidate.parentContent : candidate.content,
     parentLineNumber: candidate.isSubtask ? candidate.parentLineNumber : candidate.lineNumber,
     path: candidate.path || "",
@@ -11060,6 +13735,18 @@ function cleanTaskWithRole(task, allowedLabels = null, isSubtask = false, settin
     deadline_date: isSubtask && !settings.subtaskIncludeDeadline ? null : validDate(task.deadline_date) ? task.deadline_date : null,
     priority: isSubtask && !settings.subtaskIncludePriority ? 1 : normalizePriority(task.priority),
     labels,
+    scope_id: singleLine(task.scope_id || task.scopeId || ""),
+    evidence_ids: uniqueValues((task.evidence_ids || task.evidenceIds || []).map((value) => String(value)).filter(Boolean)),
+    fact_refs: uniqueValues((task.fact_refs || task.factRefs || []).map((value) => String(value)).filter(Boolean)),
+    fact_bindings: (Array.isArray(task.fact_bindings || task.factBindings) ? (task.fact_bindings || task.factBindings) : []).map((binding) => ({
+      factId: String(binding?.factId || binding?.fact_id || ""),
+      type: String(binding?.type || ""),
+      role: String(binding?.role || ""),
+      evidenceId: String(binding?.evidenceId || binding?.evidence_id || ""),
+      scopeId: String(binding?.scopeId || binding?.scope_id || task.scope_id || "")
+    })).filter((binding) => binding.factId && binding.type && binding.role && binding.evidenceId && binding.scopeId),
+    factBindingState: task.factBindingState || (task.legacyFactBindings ? "legacy-degraded" : ""),
+    legacyFactBindings: Boolean(task.legacyFactBindings),
     subtasks: (task.subtasks || []).map((subtask) => cleanTaskWithRole(subtask, allowedLabels, true, settings)).filter((subtask) => subtask.content)
   };
 }
@@ -11074,6 +13761,31 @@ function todoistTaskArgs(task, location, settings = DEFAULT_SETTINGS) {
   if (!location?.parent_id && isRichTodoistDescription(task.description)) args.description = formatTodoistDescription(task.description, settings);
   if (task.due_date && (!isSubtask || settings.subtaskIncludeDueDate)) args.due = { date: task.due_date };
   if (task.deadline_date && (!isSubtask || settings.subtaskIncludeDeadline)) args.deadline = { date: task.deadline_date };
+  delete args.scope_id;
+  delete args.scopeId;
+  delete args.evidence_ids;
+  delete args.evidenceIds;
+  delete args.fact_refs;
+  delete args.factRefs;
+  delete args.fact_bindings;
+  delete args.factBindings;
+  delete args.factBindingState;
+  delete args.legacyFactBindings;
+  delete args.evidenceBundle;
+  delete args.taskEvidenceBundle;
+  delete args.descriptionEvidenceBundle;
+  delete args.descriptionEvidenceIds;
+  delete args.descriptionFactRefs;
+  delete args.evidenceLedger;
+  delete args.evidenceBundlesByTask;
+  delete args.sourceContract;
+  delete args.evidenceCatalog;
+  delete args.taskWorkflowContextBundle;
+  delete args.contextBundle;
+  delete args.promptBundleHash;
+  delete args.validatorBundleHash;
+  delete args.promptBundleId;
+  delete args.validatorBundleId;
   return args;
 }
 
@@ -11825,6 +14537,7 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
   if (!isSyncTask) return null;
   const oid = getTaskOid(line);
   const id = getTodoistId(line, settings);
+  const explicitTodoistId = getLegacyTodoistId(line);
   const isSubtask = hasSubtaskSyncMarker(normalizedLine, settings);
   const parentReference = parentReferenceForLine(lineNumber, allLines, settings, isSubtask);
   const scheduleMarker = extractScheduleMarker(line);
@@ -11834,6 +14547,7 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
   });
   return {
     id,
+    todoistIdExplicit: Boolean(explicitTodoistId),
     oid,
     line,
     lineNumber,
@@ -11860,6 +14574,150 @@ function parseTaskLine(line, lineNumber, path, allLines, settings) {
   };
 }
 
+function emptyTaskReferenceLocationIndex() {
+  return {
+    byOid: new Map(),
+    byTodoistId: new Map(),
+    ambiguousOids: new Set(),
+    ambiguousTodoistIds: new Set()
+  };
+}
+
+function taskReferenceLocationFromParsedTask(task = {}, basePath = "", modifiedAt = 0) {
+  return {
+    path: vaultRelativePath(task.path || "", basePath),
+    lineNumber: Number.isFinite(task.lineNumber) ? task.lineNumber : null,
+    parentOid: String(task.parentOid || ""),
+    parentId: String(task.parentId || ""),
+    parentLineNumber: Number.isFinite(task.parentLineNumber) ? task.parentLineNumber : null,
+    isSubtask: Boolean(task.isSubtask),
+    modifiedAt: Number(task.modifiedAt || modifiedAt || 0)
+  };
+}
+
+function taskReferenceParsedTask(task = {}) {
+  const parsed = Object.assign({}, task);
+  delete parsed.allLines;
+  return parsed;
+}
+
+function sameTaskReferenceLocation(left = null, right = null) {
+  return Boolean(left && right && String(left.path || "") === String(right.path || "") && Number(left.lineNumber) === Number(right.lineNumber));
+}
+
+function taskReferenceLocationEntries(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value.slice() : [value];
+}
+
+function taskReferenceIdentityConflict(entries, identity) {
+  const values = new Set();
+  for (const entry of entries || []) {
+    const task = entry?.task || {};
+    const value = identity === "oid"
+      ? String(task.id || task.todoistId || "").trim()
+      : String(task.oid || "").trim().toUpperCase();
+    if (value) values.add(value);
+  }
+  return values.size > 1;
+}
+
+function addTaskReferenceLocationIdentity(map, ambiguous, key, entry, identity = "oid") {
+  const location = entry?.location || entry;
+  if (!key || !location?.path) return;
+  const entries = taskReferenceLocationEntries(map.get(key));
+  if (!entries.some((existing) => sameTaskReferenceLocation(existing?.location || existing, location))) entries.push(entry);
+  map.set(key, entries);
+  if (taskReferenceIdentityConflict(entries, identity)) ambiguous.add(key);
+}
+
+function addTaskReferenceLocation(index, parsedTask, basePath = "", modifiedAt = 0) {
+  if (!index || !parsedTask) return index;
+  const location = taskReferenceLocationFromParsedTask(parsedTask, basePath, modifiedAt);
+  if (!location.path || !Number.isFinite(location.lineNumber)) return index;
+  const entry = { location, task: taskReferenceParsedTask(parsedTask) };
+  const oid = String(parsedTask.oid || "").trim().toUpperCase();
+  const todoistId = String(parsedTask.id || "").trim();
+  if (oid) addTaskReferenceLocationIdentity(index.byOid, index.ambiguousOids, oid, entry, "oid");
+  if (todoistId) addTaskReferenceLocationIdentity(index.byTodoistId, index.ambiguousTodoistIds, todoistId, entry, "todoist-id");
+  return index;
+}
+
+function addTaskReferenceLocationsFromMarkdown(index, text, path, settings = DEFAULT_SETTINGS, basePath = "", modifiedAt = 0) {
+  const target = index || emptyTaskReferenceLocationIndex();
+  const lines = String(text || "").split(/\r?\n/);
+  for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
+    const line = lines[lineNumber];
+    let parsed = parseTaskLine(line, lineNumber, path, lines, settings);
+    if (!parsed) {
+      const fallback = parseTaskReferenceLine(line, lineNumber, path, settings);
+      if (fallback && (fallback.oid || fallback.id)) parsed = fallback;
+    }
+    if (parsed) addTaskReferenceLocation(target, parsed, basePath, modifiedAt);
+  }
+  return target;
+}
+
+function taskReferenceKnownLocationRefs(task = {}) {
+  return [
+    ...(Array.isArray(task.currentLocations) ? task.currentLocations : []),
+    ...(Array.isArray(task.sourceNoteRefs) ? task.sourceNoteRefs : []),
+    ...(Array.isArray(task.noteRefs) ? task.noteRefs : []),
+    task.path ? { path: task.path, lineNumber: task.lineNumber } : null
+  ].filter(Boolean);
+}
+
+function taskReferenceLocationMatchesKnown(entry, refs) {
+  const location = entry?.location || entry || {};
+  return (refs || []).some((ref) => String(ref?.path || "") === String(location.path || "") && (ref?.lineNumber == null || Number(ref.lineNumber) === Number(location.lineNumber)));
+}
+
+function canonicalTaskReferenceLocation(entries, task = {}) {
+  const list = taskReferenceLocationEntries(entries);
+  if (!list.length) return null;
+  const refs = taskReferenceKnownLocationRefs(task);
+  return list.slice().sort((left, right) => {
+    const leftKnown = taskReferenceLocationMatchesKnown(left, refs) ? 1 : 0;
+    const rightKnown = taskReferenceLocationMatchesKnown(right, refs) ? 1 : 0;
+    if (leftKnown !== rightKnown) return rightKnown - leftKnown;
+    const leftModified = Number(left?.location?.modifiedAt || 0);
+    const rightModified = Number(right?.location?.modifiedAt || 0);
+    if (leftModified !== rightModified) return rightModified - leftModified;
+    const pathOrder = String(left?.location?.path || "").localeCompare(String(right?.location?.path || ""));
+    if (pathOrder) return pathOrder;
+    return Number(left?.location?.lineNumber || 0) - Number(right?.location?.lineNumber || 0);
+  })[0] || null;
+}
+
+function resolveTaskReferenceLocation(index, task = {}) {
+  if (!index) return null;
+  const oid = String(task.oid || "").trim().toUpperCase();
+  if (oid) {
+    if (index.ambiguousOids?.has(oid)) return { ambiguous: true, identity: "oid", key: oid };
+    const entries = taskReferenceLocationEntries(index.byOid?.get(oid));
+    const canonical = canonicalTaskReferenceLocation(entries, task);
+    return canonical ? {
+      location: Object.assign({}, canonical.location || canonical),
+      locations: entries.map((entry) => Object.assign({}, entry.location || entry)),
+      parsedTask: canonical.task || canonical.parsedTask || null,
+      identity: "oid",
+      key: oid
+    } : null;
+  }
+  const todoistId = String(task.todoistId || task.id || "").trim();
+  if (!todoistId) return null;
+  if (index.ambiguousTodoistIds?.has(todoistId)) return { ambiguous: true, identity: "todoist-id", key: todoistId };
+  const entries = taskReferenceLocationEntries(index.byTodoistId?.get(todoistId));
+  const canonical = canonicalTaskReferenceLocation(entries, task);
+  return canonical ? {
+    location: Object.assign({}, canonical.location || canonical),
+    locations: entries.map((entry) => Object.assign({}, entry.location || entry)),
+    parsedTask: canonical.task || canonical.parsedTask || null,
+    identity: "todoist-id",
+    key: todoistId
+  } : null;
+}
+
 function parseTaskReferenceLine(line, lineNumber, path, settings) {
   if (!/^\s*[-*]\s+\[[ xX]\]/.test(line)) return null;
   const scheduleMarker = extractScheduleMarker(line);
@@ -11870,6 +14728,7 @@ function parseTaskReferenceLine(line, lineNumber, path, settings) {
   return {
     oid: getTaskOid(line),
     id: getTodoistId(line, settings),
+    todoistIdExplicit: Boolean(getLegacyTodoistId(line)),
     line,
     lineNumber,
     path,
@@ -12259,72 +15118,246 @@ function semanticIndexSourceText(text = "") {
     if (generatedHeading) {
       skipping = true;
       skipLevel = generatedHeading[1].trim().length;
+      output.push("");
       continue;
     }
     if (skipping) {
       const heading = /^(\s*#{1,6})\s+/.exec(line);
       if (heading && heading[1].trim().length <= skipLevel) skipping = false;
-      else continue;
+      else {
+        output.push("");
+        continue;
+      }
     }
     output.push(line);
   }
-  return output.join("\n").trim();
+  return output.join("\n");
 }
 
-function chunkMarkdown(text, maxChars = 900, maxChunks = 12) {
-  const cleaned = text.replace(/```[\s\S]*?```/g, " ").replace(/\n{3,}/g, "\n\n");
-  const pieces = [];
-  let currentHeading = "";
-  for (const rawBlock of cleaned.split(/\n(?=#{1,6}\s)|\n\n/)) {
-    const block = rawBlock.trim();
-    if (!block) continue;
-    const heading = block.match(/^(#{1,6}\s+[^\n]+)/)?.[1] || "";
-    if (heading) currentHeading = heading;
-    pieces.push(...splitSemanticMarkdownBlock(block, maxChars, heading || currentHeading));
-  }
+function chunkMarkdown(text, maxChars = 900, maxChunks = 12, options = {}) {
+  const atomicUnits = semanticMarkdownCoherentUnits(text);
+  const units = coalesceSemanticIndexUnits(atomicUnits, maxChars, options);
+  const selectedUnits = selectSemanticIndexUnits(units, maxChunks);
   const chunks = [];
-  let current = "";
-  for (const piece of pieces) {
-    if ((current + "\n\n" + piece).length > maxChars && current.trim()) {
-      chunks.push(current.trim());
-      current = piece;
-    } else current = current ? `${current}\n\n${piece}` : piece;
+  const sourceLineRanges = [];
+  const sourceSections = [];
+  const semanticUnitKinds = [];
+  for (const unit of selectedUnits) {
+    const parts = splitSemanticMarkdownBlock(unit.text, maxChars, unit.headingContext);
+    for (const part of parts) {
+      chunks.push(part);
+      sourceLineRanges.push({ lineStart: unit.lineStart, lineEnd: unit.lineEnd });
+      sourceSections.push(unit.headingContext || "");
+      semanticUnitKinds.push(unit.kind || "paragraph");
+    }
   }
-  if (current.trim()) chunks.push(current.trim());
-  return selectSemanticIndexChunks(chunks, maxChunks);
+  const telemetry = Object.assign({}, selectedUnits.selectionTelemetry || {}, {
+    atomicUnitCount: atomicUnits.length,
+    coalescedUnitCount: units.length,
+    outputChunkCount: chunks.length,
+    adaptiveOverflowCount: Math.max(0, chunks.length - Math.max(1, Number(maxChunks || 1)))
+  });
+  Object.defineProperties(chunks, {
+    sourceLineRanges: { value: sourceLineRanges, enumerable: false, configurable: true },
+    sourceSections: { value: sourceSections, enumerable: false, configurable: true },
+    semanticUnitKinds: { value: semanticUnitKinds, enumerable: false, configurable: true },
+    selectionTelemetry: { value: telemetry, enumerable: false, configurable: true }
+  });
+  return chunks;
+}
+
+function semanticMarkdownCoherentUnits(text = "") {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const headings = [];
+  const units = [];
+  let pending = null;
+  let blankRun = 0;
+  let listGroup = 0;
+  let sectionGroup = 0;
+  let previousKind = "";
+  const headingContext = () => headings.filter(Boolean).join("\n");
+  const appendUnit = (value, lineStart, lineEnd, kind = "paragraph", metadata = {}) => {
+    const normalized = String(value || "").trim();
+    if (!normalized) return;
+    units.push(Object.assign({ text: normalized, lineStart, lineEnd, kind, headingContext: headingContext(), mandatory: kind === "action", atomicUnitCount: 1 }, metadata));
+    previousKind = kind;
+  };
+  const flushPending = () => {
+    if (!pending) return;
+    appendUnit(pending.lines.join("\n"), pending.lineStart, pending.lineEnd, pending.kind, pending.metadata);
+    pending = null;
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
+    const trimmed = rawLine.trim();
+    const lineNumber = index + 1;
+    const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(trimmed);
+    if (heading) {
+      flushPending();
+      const level = heading[1].length;
+      headings.length = level;
+      headings[level - 1] = `${heading[1]} ${heading[2]}`;
+      sectionGroup += 1;
+      listGroup += 1;
+      blankRun = 0;
+      previousKind = "heading";
+      continue;
+    }
+    if (!trimmed) {
+      flushPending();
+      blankRun += 1;
+      if (blankRun === 2) {
+        sectionGroup += 1;
+        listGroup += 1;
+      }
+      continue;
+    }
+    if (/^([-*_])(?:\s*\1){2,}$/.test(trimmed)) {
+      flushPending();
+      sectionGroup += 1;
+      listGroup += 1;
+      blankRun = 2;
+      previousKind = "boundary";
+      continue;
+    }
+    const listItem = /^\s*(?:[-*+]|\d+[.)])\s+/.test(rawLine);
+    const explicitAction = /(?:^|\s)#todo\b/i.test(rawLine) || /^\s*(?:[-*+]\s+)?\[[ xX]\]\s+/.test(rawLine) || /^\s*(?:[-*+]\s+)?(?:action|todo|next step)\s*:/i.test(rawLine);
+    if (listItem) {
+      flushPending();
+      if (previousKind !== "list-item" || blankRun > 0 || explicitAction) listGroup += 1;
+      pending = {
+        lines: [rawLine.trim()], lineStart: lineNumber, lineEnd: lineNumber, kind: explicitAction ? "action" : "list-item",
+        metadata: { listGroup, sectionGroup, blankBefore: blankRun }
+      };
+      previousKind = explicitAction ? "action" : "list-item";
+      blankRun = 0;
+      continue;
+    }
+    if (pending?.kind === "list-item" || pending?.kind === "action") {
+      if (/^\s{2,}\S/.test(rawLine)) {
+        pending.lines.push(rawLine.trim());
+        pending.lineEnd = lineNumber;
+        continue;
+      }
+      flushPending();
+    }
+    if (explicitAction) {
+      flushPending();
+      appendUnit(trimmed, lineNumber, lineNumber, "action", { sectionGroup, blankBefore: blankRun });
+      listGroup += 1;
+      blankRun = 0;
+      continue;
+    }
+    if (!pending) pending = { lines: [], lineStart: lineNumber, lineEnd: lineNumber, kind: "paragraph", metadata: { sectionGroup, blankBefore: blankRun } };
+    pending.lines.push(trimmed);
+    pending.lineEnd = lineNumber;
+    previousKind = "paragraph";
+    blankRun = 0;
+  }
+  flushPending();
+  return units;
+}
+
+function coalesceSemanticIndexUnits(units = [], maxChars = 900, options = {}) {
+  const coalesced = [];
+  const maxListItems = Math.max(1, Number(options.maxListItems || DEFAULT_SETTINGS.semanticIndexListGroupMaxItems || 2));
+  for (const sourceUnit of units || []) {
+    const unit = Object.assign({}, sourceUnit);
+    if (unit.kind === "list-item") unit.listItemCount = 1;
+    const previous = coalesced[coalesced.length - 1];
+    const sameHeading = previous && String(previous.headingContext || "") === String(unit.headingContext || "");
+    const listCompatible = sameHeading
+      && (previous.kind === "list-item" || previous.kind === "list-group")
+      && unit.kind === "list-item"
+      && Number(previous.listGroup || 0) === Number(unit.listGroup || 0)
+      && Number(previous.listItemCount || previous.atomicUnitCount || 1) < maxListItems
+      && Number(unit.lineStart || 0) === Number(previous.lineEnd || 0) + 1;
+    const paragraphCompatible = sameHeading
+      && (previous.kind === "paragraph" || previous.kind === "paragraph-group")
+      && unit.kind === "paragraph"
+      && Number(previous.sectionGroup || 0) === Number(unit.sectionGroup || 0)
+      && Number(unit.blankBefore || 0) <= 1
+      && Number(unit.lineStart || 0) <= Number(previous.lineEnd || 0) + 2;
+    const joiner = listCompatible ? "\n" : paragraphCompatible ? "\n\n" : "";
+    if (joiner) {
+      const prefixLength = String(unit.headingContext || "").trim().length;
+      const available = Math.max(40, Number(maxChars || 900) - (prefixLength ? prefixLength + 2 : 0));
+      const combined = `${previous.text}${joiner}${unit.text}`;
+      if (singleLine(combined).length <= available) {
+        previous.text = combined;
+        previous.lineEnd = unit.lineEnd;
+        previous.kind = listCompatible ? "list-group" : "paragraph-group";
+        previous.atomicUnitCount = Number(previous.atomicUnitCount || 1) + Number(unit.atomicUnitCount || 1);
+        if (listCompatible) previous.listItemCount = Number(previous.listItemCount || 1) + Number(unit.listItemCount || 1);
+        continue;
+      }
+    }
+    coalesced.push(unit);
+  }
+  return coalesced;
 }
 
 function splitSemanticMarkdownBlock(block = "", maxChars = 900, heading = "") {
   const value = String(block || "").trim();
   if (!value) return [];
-  if (value.length <= maxChars) return [value];
-  const ownHeading = value.match(/^(#{1,6}\s+[^\n]+)/)?.[1] || "";
-  const prefix = ownHeading || heading || "";
-  const body = ownHeading ? value.slice(ownHeading.length).trim() : value;
-  const available = Math.max(180, maxChars - (prefix ? prefix.length + 2 : 0));
-  const segments = body
-    .split(/\n+/)
-    .flatMap((line) => splitDescriptionSentences(line).length ? splitDescriptionSentences(line) : [line])
-    .map((line) => singleLine(line))
+  const prefix = String(heading || "").trim();
+  const available = Math.max(40, Number(maxChars || 900) - (prefix ? prefix.length + 2 : 0));
+  const segments = splitSemanticSourceStatements(value)
+    .flatMap((statement) => splitSemanticTextSegment(statement, available))
     .filter(Boolean);
   const windows = [];
   let current = "";
   for (const segment of segments) {
-    for (const part of splitSemanticTextSegment(segment, available)) {
-      const next = current ? `${current} ${part}` : part;
-      if (next.length > available && current) {
-        windows.push(current);
-        current = part;
-      } else current = next;
-    }
+    const next = current ? `${current} ${segment}` : segment;
+    if (next.length > available && current) {
+      windows.push(current);
+      current = segment;
+    } else current = next;
   }
   if (current) windows.push(current);
   return windows.map((windowText) => prefix ? `${prefix}\n${windowText}` : windowText);
 }
 
+function splitSemanticSourceStatements(text = "") {
+  const value = singleLine(text);
+  if (!value) return [];
+  const statements = [];
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!/[.!?;]/.test(value[index])) continue;
+    let end = index + 1;
+    while (end < value.length && /[.!?;"'”’\])]/.test(value[end])) end += 1;
+    if (end < value.length && !/\s/.test(value[end])) continue;
+    const statement = value.slice(start, end).trim();
+    if (statement) statements.push(statement);
+    while (end < value.length && /\s/.test(value[end])) end += 1;
+    start = end;
+    index = end - 1;
+  }
+  const tail = value.slice(start).trim();
+  if (tail) statements.push(tail);
+  return statements;
+}
+
 function splitSemanticTextSegment(segment = "", maxChars = 700) {
-  const words = String(segment || "").split(/\s+/).filter(Boolean);
-  if (!words.length) return [];
+  const value = singleLine(segment);
+  if (!value) return [];
+  if (value.length <= maxChars) return [value];
+  const clauses = value.split(/(?<=[,:—–])\s+/).map((clause) => clause.trim()).filter(Boolean);
+  if (clauses.length > 1) {
+    const grouped = [];
+    let currentClause = "";
+    for (const clause of clauses) {
+      const next = currentClause ? `${currentClause} ${clause}` : clause;
+      if (next.length > maxChars && currentClause) {
+        grouped.push(currentClause);
+        currentClause = clause;
+      } else currentClause = next;
+    }
+    if (currentClause) grouped.push(currentClause);
+    if (grouped.every((clause) => clause.length <= maxChars)) return grouped;
+  }
+  const words = value.split(/\s+/).filter(Boolean);
   const parts = [];
   let current = "";
   for (const word of words) {
@@ -12338,43 +15371,35 @@ function splitSemanticTextSegment(segment = "", maxChars = 700) {
   return parts;
 }
 
-function selectSemanticIndexChunks(chunks = [], maxChunks = 12) {
+function selectSemanticIndexUnits(units = [], maxChunks = 12) {
   const limit = Math.max(1, Number(maxChunks || 1));
-  if (chunks.length <= limit) return chunks;
-  const ranked = chunks.map((text, index) => ({
-    text,
-    index,
-    score: semanticIndexChunkPriority(text) + (index === 0 || index === chunks.length - 1 ? 2 : 0)
-  }));
-  const selected = new Map();
-  const add = (item) => { if (item && selected.size < limit) selected.set(item.index, item.text); };
-  add(ranked[0]);
-  add(ranked[ranked.length - 1]);
-  const prioritySlots = Math.max(2, limit - Math.max(2, Math.ceil(limit * 0.25)));
-  for (const item of ranked.slice().sort((a, b) => b.score - a.score || a.index - b.index)) {
-    if (selected.size >= prioritySlots) break;
-    add(item);
-  }
-  for (let slot = 0; slot < limit; slot += 1) {
-    add(ranked[Math.round(slot * (ranked.length - 1) / Math.max(1, limit - 1))]);
-  }
-  for (const item of ranked) add(item);
-  return Array.from(selected.entries()).sort((a, b) => a[0] - b[0]).map(([, text]) => text);
+  const inputCount = Array.isArray(units) ? units.length : 0;
+  const mandatoryIndices = units.map((unit, index) => unit?.mandatory ? index : -1).filter((index) => index >= 0);
+  const selectedIndices = units.map((_, index) => index);
+  const selected = selectedIndices.map((index) => units[index]).filter(Boolean);
+  const telemetry = {
+    strategy: "lossless-structural-coalescing",
+    inputCount,
+    selectedCount: selected.length,
+    truncatedCount: 0,
+    selectedIndices: selectedIndices.slice(),
+    mandatoryCount: mandatoryIndices.length,
+    targetCount: limit,
+    targetOverflowCount: Math.max(0, selected.length - limit),
+    bounded: selected.length > limit
+  };
+  Object.defineProperty(selected, "selectionTelemetry", { value: telemetry, enumerable: false, configurable: true });
+  return selected;
 }
 
 function semanticIndexChunkPriority(text = "") {
-  const value = String(text || "");
-  let score = 0;
-  if (/\b(todo|action|next step|follow[-\s]?up|review|send|confirm|complete|finalize|prepare|draft|update|respond|reply|decide|approve|deadline|due|owner|assigned)\b/i.test(value)) score += 5;
-  if (/\b(decided|decision|agreed|approved|confirmed|changed|superseded|current guidance|outcome|resolved|blocked|dependency|risk|issue)\b/i.test(value)) score += 4;
-  if (/^#{1,6}\s+/m.test(value)) score += 1;
-  if (/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b/i.test(value)) score += 1;
-  return score;
+  // Retained for compatibility; selection must never depend on chunk words.
+  return 0;
 }
 
 function isSemanticNoiseChunk(chunk = "") {
   const text = singleLine(typeof chunk === "string" ? chunk : chunk?.text || "").toLowerCase();
-  if (!text || text.length < 18) return true;
+  if (!text) return true;
   const todoistPlaceholder = text.includes("action items") &&
     text.includes("tasks & projects completed, processed or delegated") &&
     text.includes("current todoist list");
@@ -12403,6 +15428,9 @@ function formatContext(chunks, maxChars, settings = DEFAULT_SETTINGS, query = ""
 
 function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, options = {}) {
   const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
+  // Semantic retrieval already selected this evidence record; only bound/format text here.
+  return cleaned;
+  /* Legacy lexical excerpt ranking is intentionally unreachable. */
   const queryTerms = termCounts(query);
   const anchorTerms = uniqueValues((options.anchorTerms || []).map(normalizeContextAnchorTerm).filter(Boolean));
   const segments = cleaned
@@ -12436,21 +15464,314 @@ function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, opt
   return clamp(excerpt, 1400);
 }
 
-function formatSourceLinks(active, chunks) {
-  const sources = [];
-  if (active?.path) sources.push({ path: active.path, title: active.title || active.path, role: "Active note" });
-  for (const chunk of chunks || []) sources.push({ path: chunk.path, title: chunk.title || chunk.path, role: "Relevant note" });
-  const seen = new Set();
-  return sources
-    .filter((source) => {
-      if (!source.path || seen.has(source.path)) return false;
-      seen.add(source.path);
-      return true;
-    })
-    .slice(0, 10)
-    .map((source) => `- ${source.role}: [${source.title}](obsidian://open?file=${encodeURIComponent(source.path)})`)
+function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTINGS, sourceContract = null) {
+  const entries = [];
+  const add = (entry = {}) => {
+    const sourceKind = String(entry.sourceKind || "note");
+    if (sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND || entry.retrievalEligible === false) return;
+    const task = entry.taskReference || entry.task || {};
+    const taskId = String(task.todoistId || task.taskId || task.id || entry.todoistId || entry.taskId || "");
+    const path = vaultRelativePath(entry.path || entry.provenance?.path || "");
+    const isTask = sourceKind === "todoist-snapshot-reference-row"
+      || sourceKind === "subtask-task-tree-record"
+      || sourceKind === "todoist-task-reference"
+      || entry.source === "local-reference-table"
+      || Boolean(taskId && (!path || path.startsWith("@todoist/")));
+    const syntheticPath = path.startsWith(SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX)
+      || path.startsWith(SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX)
+      || Boolean(entry.nonVaultSource);
+    const kind = isTask || syntheticPath ? "todoist-task" : "vault-note";
+    if (kind === "todoist-task" && !taskId) return;
+    if (kind === "vault-note" && !path) return;
+    const evidenceId = String(entry.evidenceId || entry.evidence_id || "");
+    const sourceId = String(entry.sourceId || entry.provenance?.sourceId || "");
+    const key = sourceId || evidenceId || (kind === "todoist-task" ? `todoist:${taskId}` : `note:${path}`);
+    if (entries.some((item) => item.key === key)) return;
+    const title = singleLine(entry.title || task.content || task.title || path || taskId);
+    const url = kind === "todoist-task"
+      ? todoistTaskUrl(taskId, settings)
+      : `obsidian://open?file=${encodeURIComponent(path)}`;
+    if (!url) return;
+    entries.push({
+      key,
+      sourceId,
+      evidenceId,
+      sourceKind,
+      taskId,
+      path: kind === "vault-note" ? path : "",
+      title,
+      role: entry.role || (kind === "todoist-task" ? "Todoist task" : "Vault note"),
+      evidenceText: String(entry.text || entry.excerpt || entry.evidence || ""),
+      url,
+      markdown: `[${markdownLinkText(title)}](${url})`
+    });
+  };
+  if (active?.path) add({
+    path: active.path,
+    title: active.title || active.path,
+    sourceKind: "note",
+    sourceId: sourceContract?.sourceId || active.path,
+    evidenceId: sourceContract?.primaryEvidenceId || "",
+    text: active.text || active.selection || "",
+    role: "Active note"
+  });
+  for (const chunk of chunks || []) add(chunk);
+  return entries.slice(0, 16);
+}
+
+function formatSourceLinks(active, chunks, settings = DEFAULT_SETTINGS) {
+  return chatSourceLedger(active, chunks, settings)
+    .map((source) => `- ${source.role}: ${source.markdown}`)
     .join("\n");
 }
+
+function formatCurrentSourceContractFacts(sourceContract = null) {
+  const facts = (sourceContract?.facts || [])
+    .filter((fact) => fact && fact.factId && fact.current !== false && String(fact.authority || "current") !== "historical")
+    .slice(0, 48);
+  if (!facts.length) return "- No typed current source-contract facts were established.";
+  return facts.map((fact) => {
+    const value = truncateAtWord(singleLine(fact.value || fact.text || fact.sourceSurface || ""), 360);
+    const type = fact.type || fact.kind || "fact";
+    return `- ${fact.factId} [${type}]${value ? `: ${value}` : ""}`;
+  }).join("\n");
+}
+
+function parseChatEvidenceResponse(value = "") {
+  const payload = extractJsonPayload(value);
+  try {
+    const parsed = JSON.parse(payload);
+    return parsed && Array.isArray(parsed.claims) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function chatClaimBody(value = "") {
+  return String(value || "")
+    .replace(/\[([^\]\n]+)\]\([^)]*\)/g, "$1")
+    .replace(/\s*\(\s*\d+\s*\)/g, "")
+    .replace(/^\s*(?:[-*]\s+|\d+[.)]\s+)/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chatClaimSentences(value = "") {
+  const body = chatClaimBody(value);
+  return splitChatAnswerSentences(body).length ? splitChatAnswerSentences(body) : (body ? [body] : []);
+}
+
+function finalizeStructuredChatSentence(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return /[.!?](?:["'’”»›)\]}]+)?$/.test(text) ? text : `${text}.`;
+}
+
+function truncateStructuredChatClaims(lines = [], maxChars = 5000) {
+  const limit = Math.max(1, Number(maxChars) || 5000);
+  const kept = [];
+  let used = 0;
+  for (const line of lines || []) {
+    const text = String(line || "").trim();
+    if (!text) continue;
+    const extra = kept.length ? 1 : 0;
+    if (used + extra + text.length > limit) break;
+    kept.push(text);
+    used += extra + text.length;
+  }
+  return kept.join("\n");
+}
+
+function renderStructuredChatEvidenceResponse(value = "", ledger = [], options = {}) {
+  const parsed = parseChatEvidenceResponse(value);
+  const entries = Array.isArray(ledger) ? ledger.filter((entry) => entry?.url && entry?.evidenceId) : [];
+  const byEvidenceId = new Map(entries.map((entry) => [String(entry.evidenceId), entry]));
+  const reasonCodes = [];
+  const renderedClaims = [];
+  let invalidClaimCount = 0;
+  let unsupportedClaimCount = 0;
+  let usedSourceCount = 0;
+  const sourceUrlsUsed = new Set();
+  if (!parsed) {
+    return {
+      answer: "Not established from supplied evidence: the assistant did not return a structured evidence response.",
+      telemetry: {
+        schemaVersion: 2,
+        responseSchema: "chat-evidence-v1",
+        allowedSourceCount: entries.length,
+        allowedEvidenceCount: entries.length,
+        usedSourceCount: 0,
+        missingSourceCount: entries.length,
+        removedInventedLinkCount: 0,
+        removedLinkCount: 0,
+        claimCount: 0,
+        supportedClaimCount: 0,
+        unsupportedClaimCount: 1,
+        invalidEvidenceClaimCount: 0,
+        missingSentenceCitationCount: 1,
+        unsupportedSentenceCount: 1,
+        reasonCodes: ["structured-response-invalid"],
+        repairCallCount: 0,
+        degraded: Boolean(options.degraded || options.retrievalTelemetry?.degraded),
+        degradedReason: options.retrievalTelemetry?.degradedReason || "",
+        sourceOnly: Boolean(options.degraded || options.retrievalTelemetry?.degraded),
+        selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
+        sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
+      }
+    };
+  }
+  for (const claim of parsed.claims.slice(0, CHAT_RESPONSE_MAX_CLAIMS)) {
+    const sentences = chatClaimSentences(claim?.text);
+    if (!sentences.length) continue;
+    const evidenceIds = uniqueValues((Array.isArray(claim?.evidence_ids) ? claim.evidence_ids : []).map(String).filter(Boolean));
+    const validEntries = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
+    const allEvidenceValid = evidenceIds.length > 0 && validEntries.length === evidenceIds.length;
+    const category = String(claim?.category || "");
+    const categoryShapeValid = claim?.established === true
+      ? category !== "unsupported"
+      : category === "unsupported" && evidenceIds.length === 0;
+    const established = claim?.established === true && categoryShapeValid && allEvidenceValid;
+    if (!categoryShapeValid) reasonCodes.push("claim-category-shape-invalid");
+    if (claim?.established === true && !established) {
+      invalidClaimCount += 1;
+      if (!evidenceIds.length) reasonCodes.push("established-claim-missing-evidence");
+      else if (!allEvidenceValid) reasonCodes.push("invalid-evidence-id");
+    }
+    if (claim?.established !== true && !categoryShapeValid) invalidClaimCount += 1;
+    if (!established) unsupportedClaimCount += 1;
+    if (established) {
+      const links = validEntries.map((entry) => entry.markdown).filter(Boolean);
+      links.forEach((link) => {
+        const url = String(link).match(/\]\(([^)]+)\)$/)?.[1] || "";
+        if (url) sourceUrlsUsed.add(url);
+      });
+      for (const sentence of sentences) {
+        const clean = finalizeStructuredChatSentence(sentence);
+        if (!clean) continue;
+        renderedClaims.push(`- ${clean} ${links.join(" ")}`.trim());
+      }
+    } else {
+      for (const sentence of sentences) {
+        const clean = finalizeStructuredChatSentence(sentence);
+        if (!clean) continue;
+        const prefix = /^(?:not established|not supported|unknown|unavailable)\b/i.test(clean) ? "" : "Not established from supplied evidence: ";
+        renderedClaims.push(`- ${prefix}${clean}`.trim());
+      }
+    }
+  }
+  if (!renderedClaims.length) {
+    renderedClaims.push("- Not established from supplied evidence: no supported claims were returned.");
+    unsupportedClaimCount += 1;
+    reasonCodes.push("structured-response-empty");
+  }
+  usedSourceCount = sourceUrlsUsed.size;
+  const retrievalTelemetry = options.retrievalTelemetry || {};
+  const degraded = Boolean(options.degraded || retrievalTelemetry.degraded || retrievalTelemetry.indexState === "degraded-source-only" || retrievalTelemetry.indexState === "failed");
+  if (degraded) reasonCodes.push("degraded-source-only");
+  if (!reasonCodes.length) reasonCodes.push("structured-claims-rendered");
+  const telemetry = {
+    schemaVersion: 2,
+    responseSchema: "chat-evidence-v1",
+    allowedSourceCount: entries.length,
+    allowedEvidenceCount: entries.length,
+    usedSourceCount,
+    missingSourceCount: Math.max(0, entries.length - usedSourceCount),
+    removedInventedLinkCount: 0,
+    removedLinkCount: 0,
+    claimCount: parsed.claims.length,
+    supportedClaimCount: parsed.claims.filter((claim) => claim?.established === true && Array.isArray(claim?.evidence_ids) && claim.evidence_ids.length > 0).length - invalidClaimCount,
+    unsupportedClaimCount,
+    invalidEvidenceClaimCount: invalidClaimCount,
+    missingSentenceCitationCount: unsupportedClaimCount,
+    unsupportedSentenceCount: unsupportedClaimCount,
+    reasonCodes: uniqueValues(reasonCodes),
+    repairCallCount: 0,
+    degraded,
+    degradedReason: retrievalTelemetry.degradedReason || (degraded ? "semantic-evidence-unavailable" : ""),
+    sourceOnly: degraded,
+    selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
+    sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
+  };
+  return { answer: truncateStructuredChatClaims(renderedClaims, Number(options.maxChars || 5000)), telemetry };
+}
+
+function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
+  if (parseChatEvidenceResponse(answer)) return renderStructuredChatEvidenceResponse(answer, ledger, options);
+  const entries = Array.isArray(ledger) ? ledger.filter((entry) => entry?.url) : [];
+  const allowed = new Map(entries.map((entry) => [normalizeDescriptionLinkUrl(entry.url), entry]));
+  const reasonCodes = [];
+  let removedInventedLinkCount = 0;
+  let usedSourceCount = 0;
+  const sourceUrlsUsed = new Set();
+  let text = String(answer || "").trim();
+  text = text.replace(/\n\s*(?:Source List|Sources|Available evidence)\s*:\s*[\s\S]*$/i, "").trim();
+  text = text.replace(/\s*\(\s*\d+\s*\)/g, "");
+  if (/\b(?:Source List|Available evidence)\s*:/i.test(String(answer || ""))) reasonCodes.push("chat-source-list-removed");
+  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+(?:\s+[^)]*)?)\)/g, (match, label, rawUrl) => {
+    const url = normalizeDescriptionLinkUrl(rawUrl.split(/\s+/)[0]);
+    const entry = allowed.get(url);
+    if (!entry) {
+      removedInventedLinkCount += 1;
+      if (!reasonCodes.includes("invented-link-removed")) reasonCodes.push("invented-link-removed");
+      return label;
+    }
+    sourceUrlsUsed.add(url);
+    return `[${markdownLinkText(entry.title || label)}](${url})`;
+  });
+  const sentenceParts = splitChatAnswerSentences(text);
+  const renderedParts = [];
+  let missingSentenceCitationCount = 0;
+  for (const part of sentenceParts) {
+    const sentence = String(part || "").trim();
+    if (!sentence) continue;
+    if (chatSentenceAlreadyEndsWithAllowedLink(sentence, allowed)) {
+      renderedParts.push(sentence);
+      continue;
+    }
+    missingSentenceCitationCount += 1;
+    renderedParts.push(sentence.replace(/\[([^\]\n]+)\]\(([^)\s]+(?:\s+[^)]*)?)\)/g, "$1").replace(/\s{2,}/g, " ").trim());
+  }
+  text = renderedParts.join(" ").trim();
+  usedSourceCount = sourceUrlsUsed.size;
+  if (missingSentenceCitationCount) reasonCodes.push("missing-sentence-end-citation");
+  const retrievalTelemetry = options.retrievalTelemetry || {};
+  const degraded = Boolean(options.degraded || retrievalTelemetry.degraded || retrievalTelemetry.indexState === "degraded-source-only" || retrievalTelemetry.indexState === "failed");
+  if (degraded && !reasonCodes.includes("degraded-source-only")) reasonCodes.push("degraded-source-only");
+  if (!reasonCodes.length) reasonCodes.push("sentence-citations-valid");
+  const telemetry = {
+    schemaVersion: 1,
+    allowedSourceCount: entries.length,
+    allowedEvidenceCount: entries.filter((entry) => entry.evidenceId).length,
+    usedSourceCount,
+    missingSourceCount: Math.max(0, entries.length - usedSourceCount),
+    removedInventedLinkCount,
+    removedLinkCount: removedInventedLinkCount,
+    missingSentenceCitationCount,
+    unsupportedSentenceCount: 0,
+    reasonCodes,
+    repairCallCount: 0,
+    degraded,
+    degradedReason: retrievalTelemetry.degradedReason || (degraded ? "semantic-evidence-unavailable" : ""),
+    sourceOnly: degraded,
+    selectedEvidenceIds: entries.map((entry) => entry.evidenceId).filter(Boolean).slice(0, 32),
+    sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
+  };
+  return { answer: truncateAtWord(text, Number(options.maxChars || 5000)), telemetry };
+}
+
+function splitChatAnswerSentences(value = "") {
+  return String(value || "")
+    .split(/(?<=[.!?])\s+(?=(?:[-*]\s+)?[A-Z0-9\[])/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+}
+
+function chatSentenceAlreadyEndsWithAllowedLink(sentence = "", allowed = new Map()) {
+  const match = String(sentence || "").match(/\[([^\]\n]+)\]\(([^)\s]+(?:\s+[^)]*)?)\)(?:[.!?])?\s*$/);
+  if (!match) return false;
+  return allowed.has(normalizeDescriptionLinkUrl(match[2].split(/\s+/)[0]));
+}
+
 
 function formatChatHistory(messages) {
   const lines = (messages || [])
@@ -12502,9 +15823,53 @@ function contextQueryPlan(prompt = "", mode = "chat") {
     tasks,
     scoped,
     portfolio: broad && !scoped,
-    strictScope: ["chat", "task-generation", "description"].includes(mode) && scoped,
+    // Natural-language anchors are descriptive telemetry only. They must never
+    // become a hard admission filter for semantic retrieval.
+    strictScope: false,
+    structuredScope: false,
     anchorTerms,
     prompt: text
+  };
+}
+
+function structuredSemanticScopeMetadata(plan = {}) {
+  const sourceContract = plan.sourceContract || {};
+  const scope = plan.scope && typeof plan.scope === "object" ? plan.scope : {};
+  const task = plan.task && typeof plan.task === "object" ? plan.task : {};
+  const explicitIdentity = plan.exactIdentity && typeof plan.exactIdentity === "object"
+    ? plan.exactIdentity
+    : plan.existingRecordIdentity && typeof plan.existingRecordIdentity === "object"
+      ? plan.existingRecordIdentity
+      : {};
+  const associations = {
+    taskId: String(plan.taskId || plan.todoistId || plan.task?.id || plan.task?.todoistId || ""),
+    oid: String(plan.oid || plan.task?.oid || "").toUpperCase(),
+    scopeId: String(plan.scopeId || scope.id || plan.task?.scopeId || plan.task?.scope_id || ""),
+    sourceContractId: String(plan.sourceContractId || sourceContract.id || sourceContract.sourceContractId || ""),
+    sourceId: String(plan.sourceId || plan.source_id || sourceContract.sourceId || sourceContract.source_id || "")
+  };
+  const identity = {
+    taskId: String(explicitIdentity.taskId || explicitIdentity.todoistId || plan.existingTaskId || ""),
+    todoistId: String(explicitIdentity.todoistId || plan.todoistId || task.todoistId || ""),
+    oid: String(explicitIdentity.oid || plan.oid || task.oid || "").toUpperCase()
+  };
+  if (plan.requireExactIdentity === true && !identity.taskId) identity.taskId = identity.todoistId;
+  const relationships = [
+    ...(Array.isArray(plan.derivedFrom) ? plan.derivedFrom : []),
+    ...(Array.isArray(plan.derived_from) ? plan.derived_from : []),
+    ...(Array.isArray(plan.sameAs) ? plan.sameAs : []),
+    ...(Array.isArray(plan.same_as) ? plan.same_as : [])
+  ].map((value) => String(value || "")).filter(Boolean);
+  if (plan.derivedFrom && !Array.isArray(plan.derivedFrom)) relationships.push(String(plan.derivedFrom));
+  if (plan.derived_from && !Array.isArray(plan.derived_from)) relationships.push(String(plan.derived_from));
+  if (plan.sameAs && !Array.isArray(plan.sameAs)) relationships.push(String(plan.sameAs));
+  if (plan.same_as && !Array.isArray(plan.same_as)) relationships.push(String(plan.same_as));
+  return {
+    values: associations,
+    associations,
+    identity,
+    hasExactIdentity: Object.values(identity).some(Boolean),
+    relationships: uniqueValues(relationships)
   };
 }
 
@@ -12540,59 +15905,80 @@ function contextTextMatchesQueryScope(text = "", plan = {}) {
 }
 
 function buildContextQueryProfile(plugin, index = [], plan = {}) {
-  const anchors = Array.isArray(plan.anchorTerms) ? plan.anchorTerms : [];
-  if (!anchors.length) return Object.assign({}, plan, { anchorTerms: [], anchorFrequencies: {}, primaryAnchorTerms: [] });
-  const cacheKey = `${(index || []).length}:${anchors.join("|")}`;
-  plugin.contextQueryProfileCache = plugin.contextQueryProfileCache || new Map();
-  const cached = plugin.contextQueryProfileCache.get(cacheKey);
-  if (cached) return Object.assign({}, plan, cached);
-  const frequencies = Object.fromEntries(anchors.map((term) => [term, 0]));
-  for (const chunk of index || []) {
-    const entry = plugin.semanticChunkTerms(chunk);
-    for (const term of anchors) if (contextTermEntryHas(entry, term)) frequencies[term] += 1;
+  const structuredScope = structuredSemanticScopeMetadata(plan);
+  const hasAssociation = Object.values(structuredScope.associations || structuredScope.values || {}).some(Boolean) || structuredScope.relationships.length > 0;
+  if (!hasAssociation) {
+    return Object.assign({}, plan, {
+      anchorFrequencies: {},
+      primaryAnchorTerms: [],
+      requiredAnchorTerms: [],
+      strictScope: false,
+      structuredScope: false,
+      structuredScopeMetadata: structuredScope
+    });
   }
-  const found = anchors.filter((term) => frequencies[term] > 0);
-  const ordered = found.sort((left, right) => frequencies[left] - frequencies[right] || left.localeCompare(right));
-  const primary = ordered.filter((term) => frequencies[term] / Math.max(1, index.length) <= 0.35);
-  const lowestFrequency = ordered.length ? frequencies[ordered[0]] : 0;
-  const required = ordered.filter((term) => frequencies[term] <= Math.max(lowestFrequency * 3, lowestFrequency + 2)).slice(0, 3);
-  const profile = {
-    anchorTerms: anchors,
-    anchorFrequencies: frequencies,
-    primaryAnchorTerms: (primary.length ? primary : ordered).slice(0, 5),
-    requiredAnchorTerms: (required.length ? required : ordered.slice(0, 1))
-  };
-  plugin.contextQueryProfileCache.set(cacheKey, profile);
-  if (plugin.contextQueryProfileCache.size > 50) plugin.contextQueryProfileCache.delete(plugin.contextQueryProfileCache.keys().next().value);
-  return Object.assign({}, plan, profile);
+  return Object.assign({}, plan, {
+    anchorFrequencies: {},
+    primaryAnchorTerms: [],
+    requiredAnchorTerms: [],
+    strictScope: structuredScope.hasExactIdentity === true,
+    structuredScope: true,
+    structuredScopeMetadata: structuredScope
+  });
 }
 
 function contextCandidateScopeMetadata(chunk = {}, profile = {}, entry = {}) {
-  const anchors = profile.primaryAnchorTerms || [];
-  if (!anchors.length) return { scopeMatch: !profile.strictScope, scopeScore: 0, scopeHits: 0, scopeCoverage: 0 };
-  const matched = anchors.filter((term) => contextTermEntryHas(entry, term));
-  const titleHits = matched.filter((term) => contextTermEntryHas(entry, term, "titleTerms")).length;
-  const rarity = matched.reduce((sum, term) => {
-    const frequency = Number(profile.anchorFrequencies?.[term] || 0);
-    return sum + (frequency ? 1 / Math.sqrt(frequency) : 0);
-  }, 0);
-  const coverage = matched.length / Math.max(1, anchors.length);
-  const required = profile.requiredAnchorTerms || anchors.slice(0, 1);
-  const requiredMatches = required.filter((term) => contextTermEntryHas(entry, term));
+  const metadata = profile.structuredScopeMetadata || structuredSemanticScopeMetadata(profile);
+  const associations = metadata.associations || metadata.values || {};
+  const identity = metadata.identity || {};
+  const nested = chunk.taskReference || chunk.task || {};
+  const candidateValues = {
+    taskId: String(chunk.taskId || chunk.todoistId || nested.taskId || nested.todoistId || nested.id || ""),
+    todoistId: String(chunk.todoistId || nested.todoistId || nested.id || chunk.taskId || ""),
+    oid: String(chunk.oid || nested.oid || "").toUpperCase(),
+    scopeId: String(chunk.scopeId || chunk.scope_id || nested.scopeId || nested.scope_id || ""),
+    sourceContractId: String(chunk.sourceContractId || chunk.source_contract_id || nested.sourceContractId || ""),
+    sourceId: String(chunk.sourceId || nested.sourceId || "")
+  };
+  const exactFields = Object.keys(identity).filter((field) => identity[field]);
+  const mismatches = exactFields.filter((field) => candidateValues[field] && candidateValues[field] !== identity[field]);
+  const missingIdentityFields = exactFields.filter((field) => !candidateValues[field]);
+  const associationFields = Object.keys(associations).filter((field) => associations[field]);
+  const associationHits = associationFields.filter((field) => candidateValues[field] && candidateValues[field] === associations[field]);
+  const associationMismatches = associationFields.filter((field) => candidateValues[field] && candidateValues[field] !== associations[field]);
+  const candidateRelationships = [
+    ...(Array.isArray(chunk.derivedFrom) ? chunk.derivedFrom : []),
+    ...(Array.isArray(chunk.derived_from) ? chunk.derived_from : []),
+    ...(Array.isArray(chunk.sameAs) ? chunk.sameAs : []),
+    ...(Array.isArray(chunk.same_as) ? chunk.same_as : [])
+  ].map((value) => String(value || "")).filter(Boolean);
+  const hasRelationshipMismatch = metadata.hasExactIdentity === true && metadata.relationships?.length && candidateRelationships.length
+    ? !metadata.relationships.some((value) => candidateRelationships.includes(value))
+    : false;
+  // A note chunk may not carry task-local identity fields even though it is
+  // relevant historical/shared evidence. Treat that as unknown rather than a
+  // foreign-scope mismatch; explicit identity conflicts remain hard rejects.
+  const scopeMatch = !mismatches.length && !hasRelationshipMismatch;
   return {
-    scopeMatch: requiredMatches.length > 0,
-    scopeScore: Math.min(0.42, coverage * 0.24 + titleHits * 0.08 + rarity * 0.05),
-    scopeHits: matched.length,
-    scopeCoverage: coverage,
-    matchedScopeTerms: matched,
-    matchedRequiredScopeTerms: requiredMatches
+    scopeMatch,
+    structuredScopeMatch: scopeMatch,
+    scopeUnknown: missingIdentityFields.length > 0,
+    scopeMismatchReason: mismatches.length ? `exact-${mismatches[0]}-mismatch` : hasRelationshipMismatch ? "exact-relationship-mismatch" : missingIdentityFields.length ? `exact-${missingIdentityFields[0]}-unknown` : "",
+    exactIdentityMatch: metadata.hasExactIdentity === true && scopeMatch,
+    associationMatch: associationHits.length > 0,
+    associationHits,
+    associationMismatches,
+    scopeScore: associationHits.length ? Math.min(0.42, associationHits.length * 0.1) : 0,
+    scopeHits: associationHits.length,
+    scopeCoverage: associationFields.length ? associationHits.length / associationFields.length : 0,
+    matchedScopeTerms: [],
+    matchedRequiredScopeTerms: []
   };
 }
 
 function filterContextCandidatesForPlan(candidates = [], profile = {}) {
-  if (!profile.strictScope) return candidates;
-  if ((profile.anchorTerms || []).length && !(profile.primaryAnchorTerms || []).length) return [];
-  return (candidates || []).filter((item) => item.scopeMatch === true);
+  if (!profile.strictScope || !profile.structuredScope) return candidates;
+  return (candidates || []).filter((item) => item.structuredScopeMatch !== false && item.scopeMatch !== false);
 }
 
 function deduplicateContextCandidateBodies(candidates = []) {
@@ -12626,6 +16012,645 @@ function selectContextCandidatesForPlan(candidates = [], limit = 8, profile = {}
   if (profile.history) return temporalContextCandidates(candidates, limit);
   if (profile.portfolio) return diversifyProjectContextCandidates(candidates, limit);
   return diversifyContextCandidates(candidates, limit);
+}
+
+function taskSemanticEvidenceItemLimit(maxItems = 6, profile = {}) {
+  const ceiling = Math.max(1, Number(maxItems || 1));
+  // The configured item ceiling is a resource bound. Semantic admission and
+  // lane alignment decide relevance; focused mode must not pre-shrink it.
+  void profile;
+  return ceiling;
+}
+
+function taskSemanticCandidateRankScore(item = {}) {
+  const semantic = Number(item.semantic ?? item.semanticScore ?? item.matchScore ?? 0);
+  const association = Math.min(0.08, Math.max(0, Number(item.scopeScore || 0)));
+  const laneSupport = Object.keys(item?.laneScores || {}).filter(Boolean).length;
+  // A candidate supported by multiple independent semantic query views is
+  // stronger than a single-lane peak. Keep this bonus bounded so semantic
+  // score remains primary while fused support can outrank an unrelated
+  // single-lane result.
+  const supportBonus = Math.min(0.2, Math.max(0, laneSupport - 1) * 0.1);
+  return (Number.isFinite(semantic) ? semantic : 0) + association + supportBonus;
+}
+
+function rankTaskSemanticCandidates(candidates = []) {
+  return (candidates || []).map((item) => Object.assign({}, item)).sort((left, right) =>
+    taskSemanticCandidateRankScore(right) - taskSemanticCandidateRankScore(left)
+    || Number(right.semantic || 0) - Number(left.semantic || 0)
+    || String((left.chunk || left).evidenceId || (left.chunk || left).id || "").localeCompare(String((right.chunk || right).evidenceId || (right.chunk || right).id || "")));
+}
+
+// Task-local semantic retrieval uses several independent views of the same
+// action.  These helpers deliberately operate on source structure and
+// embeddings only; they do not inspect candidate text with lexical/title/path
+// heuristics.  The lane names are telemetry and prompt-shaping metadata, not
+// admission rules.
+const TASK_SEMANTIC_LANE_ORDER = Object.freeze(["action", "source", "history", "continuity"]);
+const TASK_SEMANTIC_FUSION_VERSION = "task-lanes-fused-support-v2";
+// Ordinary same-topic evidence often has a high cosine score without being
+// duplicate content. Apply MMR only to the narrow near-duplicate tail and
+// scale the penalty by the amount above the threshold.
+const TASK_SEMANTIC_NEAR_DUPLICATE_EMBEDDING_THRESHOLD = 0.92;
+
+function taskSemanticSubtaskText(task = {}) {
+  const output = [];
+  const visit = (items = [], depth = 0) => {
+    for (const item of Array.isArray(items) ? items : []) {
+      const content = singleLine(item?.content || item?.title || item?.action || "");
+      if (content) output.push(`${"  ".repeat(Math.min(3, depth))}${content}`);
+      visit(item?.subtasks || item?.children || [], depth + 1);
+    }
+  };
+  visit(task.subtasks || task.children || []);
+  return output.join("\n");
+}
+
+function taskSemanticSourceFacts(task = {}, sourceContract = null) {
+  const contract = sourceContract || {};
+  const facts = Array.isArray(contract.facts) ? contract.facts : [];
+  const scopeId = String(task?.scope_id || task?.scopeId || contract.defaultScopeId || contract.sourceScopeId || "");
+  const requested = new Set([
+    ...(Array.isArray(task?.fact_refs) ? task.fact_refs : []),
+    ...(Array.isArray(task?.factRefs) ? task.factRefs : []),
+    ...(Array.isArray(task?.primaryContextFactIds) ? task.primaryContextFactIds : []),
+    ...(Array.isArray(task?.mandatoryTaskFactIds) ? task.mandatoryTaskFactIds : []),
+    ...(Array.isArray(task?.mandatoryDescriptionFactIds) ? task.mandatoryDescriptionFactIds : [])
+  ].map((value) => String(value?.factId || value?.fact_id || value || "")).filter(Boolean));
+  const scope = (contract.scopes || []).find((entry) => String(entry?.scopeId || entry?.id || "") === scopeId) || {};
+  const scopeFactIds = new Set((scope.factIds || []).map(String));
+  const selected = facts.filter((fact) => {
+    const factScope = String(fact?.scopeId || fact?.scope_id || "");
+    const factId = String(fact?.factId || fact?.id || "");
+    if (requested.has(factId)) return !scopeId || !factScope || factScope === scopeId;
+    return (!scopeId || !factScope || factScope === scopeId || scopeFactIds.has(factId))
+      && fact?.current !== false
+      && !["rejected", "blocked", "conflicted"].includes(String(fact?.authorityState || "").toLowerCase())
+      && String(fact?.conflictState || "none").toLowerCase() !== "conflicted";
+  });
+  const seen = new Set();
+  return selected.filter((fact) => {
+    const value = singleLine(fact?.sourceSurface || fact?.value || fact?.text || "");
+    if (!value || seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
+function taskSemanticStructuredStatements(values = []) {
+  const statements = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const parts = String(value || "")
+      .split(/\n+|(?<=[.!?;:])\s+/)
+      .map((part) => singleLine(part).trim())
+      .filter(Boolean);
+    for (const part of parts) {
+      const key = part.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      statements.push(part);
+    }
+  }
+  return statements;
+}
+
+function buildTaskSemanticQuerySet(task = {}, source = {}, sourceContract = null, options = {}) {
+  const title = singleLine(source?.title || sourceContract?.title || "");
+  const action = singleLine(task?.semanticQuery || task?.content || task?.title || "");
+  const subtasks = taskSemanticSubtaskText(task);
+  const facts = taskSemanticSourceFacts(task, sourceContract);
+  const taskScopeId = String(task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || sourceContract?.sourceScopeId || "");
+  const matchingScope = (sourceContract?.scopes || []).find((scope) => String(scope?.scopeId || scope?.id || "") === taskScopeId) || {};
+  const mandatoryFactIds = new Set([
+    ...(Array.isArray(task?.mandatoryTaskFactIds) ? task.mandatoryTaskFactIds : []),
+    ...(Array.isArray(task?.markedActionFactIds) ? task.markedActionFactIds : []),
+    ...(Array.isArray(task?.requiredFactIds) ? task.requiredFactIds : []),
+    ...(Array.isArray(matchingScope?.mandatoryTaskFactIds) ? matchingScope.mandatoryTaskFactIds : []),
+    ...(Array.isArray(matchingScope?.markedActionFactIds) ? matchingScope.markedActionFactIds : []),
+    ...(Array.isArray(matchingScope?.requiredFactIds) ? matchingScope.requiredFactIds : []),
+    ...(Array.isArray(sourceContract?.mandatoryTaskFactIds) ? sourceContract.mandatoryTaskFactIds : []),
+    ...(Array.isArray(sourceContract?.markedActionFactIds) ? sourceContract.markedActionFactIds : [])
+  ].map((value) => String(value?.factId || value?.fact_id || value || "")).filter(Boolean));
+  const optionalPrimaryFactIds = new Set([
+    ...(Array.isArray(task?.primaryContextFactIds) ? task.primaryContextFactIds : []),
+    ...(Array.isArray(matchingScope?.primaryContextFactIds) ? matchingScope.primaryContextFactIds : []),
+    ...(Array.isArray(matchingScope?.primary_context_fact_ids) ? matchingScope.primary_context_fact_ids : []),
+    ...(Array.isArray(sourceContract?.primaryContextFactIds) ? sourceContract.primaryContextFactIds : [])
+  ]
+    .map((value) => String(value?.factId || value?.fact_id || value || "")).filter(Boolean));
+  const statementEntries = [];
+  for (const fact of facts) {
+    const value = singleLine(fact?.sourceSurface || fact?.value || fact?.text || "");
+    if (!value) continue;
+    const factId = String(fact?.factId || fact?.id || "");
+    const kind = String(fact?.kind || fact?.type || fact?.role || "").trim().toLowerCase();
+    const mandatoryFor = Array.isArray(fact?.mandatoryFor || fact?.mandatory_for) ? (fact.mandatoryFor || fact.mandatory_for) : [fact?.mandatoryFor || fact?.mandatory_for];
+    const mandatoryForTask = mandatoryFor.map((value) => String(value || "").trim().toLowerCase()).some((value) => ["task", "task-generation", "task_generation", "marked-action", "marked_action", String(task?.id || task?.taskId || "").toLowerCase()].includes(value));
+    const markedAction = Boolean(fact?.markedAction || fact?.marked_action || fact?.actionRequired || fact?.action_required || fact?.mandatory || fact?.required || fact?.isAction || fact?.is_action || ["action", "marked-action", "marked_action", "mandatory", "required", "current-action", "current_action"].includes(kind));
+    const mandatory = markedAction || mandatoryForTask || mandatoryFactIds.has(factId);
+    for (const statement of taskSemanticStructuredStatements([value])) {
+      const optionalPrimary = optionalPrimaryFactIds.has(factId) && !mandatory;
+      statementEntries.push({ statement, factId, mandatory, optional: optionalPrimary, origin: optionalPrimary ? "primary-context" : "source-statement" });
+      if (statementEntries.length >= 3) break;
+    }
+    if (statementEntries.length >= 3) break;
+  }
+  const baseParts = [title, action, subtasks].filter(Boolean);
+  const lanes = [{ name: "action", origin: "action", mandatory: true, text: ["Current task action and exact source wording:", ...baseParts].filter(Boolean).join("\n") }];
+  statementEntries.forEach((entry, index) => lanes.push({
+    name: `source-statement-${index + 1}`,
+    origin: entry.origin,
+    mandatory: entry.mandatory,
+    factIds: entry.factId ? [entry.factId] : [],
+    text: [entry.mandatory ? "Same-scope authoritative source statement:" : "Optional same-scope primary context:", title, entry.statement].filter(Boolean).join("\n")
+  }));
+  if (lanes.length < 4) {
+    const historyText = ["Task-local execution and prior context for the same artifact, people, review feedback, edits, decisions, conflicts, and unresolved state:", title, action, subtasks, statementEntries.map((entry) => entry.statement).join("\n")].filter(Boolean).join("\n");
+    if (historyText && !lanes.some((lane) => lane.text === historyText)) lanes.push({ name: "history", origin: "history", mandatory: false, text: historyText });
+  }
+  if (task?.includeTaskReferences !== false || task?.expandTaskReferences === true) {
+    lanes.push({ name: "continuity", origin: "continuity", mandatory: false, text: ["Task continuity and existing open-task references:", title, action, subtasks].filter(Boolean).join("\n") });
+  }
+  const seenText = new Set();
+  const unique = [];
+  for (const lane of lanes) {
+    const text = String(lane.text || "").trim();
+    if (!text || seenText.has(text)) continue;
+    seenText.add(text);
+    unique.push(Object.assign({}, lane, { text }));
+    if (unique.length >= 5) break;
+  }
+  return unique;
+}
+
+function semanticLaneFusionScore(scores = [], mode = "top-two") {
+  const values = (Array.isArray(scores) ? scores : Object.values(scores || {}))
+    .map((value) => Number(value))
+    .filter(Number.isFinite)
+    .sort((left, right) => right - left);
+  if (!values.length) return 0;
+  if (String(mode || "top-two") === "max" || values.length === 1) return values[0];
+  return values[0] * 0.75 + values[1] * 0.25;
+}
+
+function semanticTaskCandidateStableKey(item = {}) {
+  const chunk = item?.chunk || item || {};
+  const reference = chunk.taskReference || chunk.task || {};
+  if (semanticTaskReferenceChunkSelected(chunk)) {
+    const canonical = [
+      chunk.canonicalTaskId, reference.canonicalTaskId, chunk.todoistId, reference.todoistId,
+      chunk.taskId, reference.taskId, chunk.oid, reference.oid,
+      ...(Array.isArray(chunk.sameAs) ? chunk.sameAs : []), ...(Array.isArray(reference.sameAs) ? reference.sameAs : [])
+    ].map((value) => String(value || "").trim().toUpperCase()).filter(Boolean);
+    if (canonical.length) return `task:${canonical[0]}`;
+  }
+  const body = semanticChunkContentFingerprint(chunk.text || chunk.content || "");
+  if (body) return `content:${body}`;
+  const evidence = String(chunk.evidenceId || chunk.id || "");
+  return `evidence:${evidence || `${vaultRelativePath(chunk.path || "")}:empty`}`;
+}
+
+function deduplicateTaskSemanticCandidates(candidates = []) {
+  const byKey = new Map();
+  for (const item of candidates || []) {
+    const key = semanticTaskCandidateStableKey(item);
+    const previous = byKey.get(key);
+    if (!previous || taskSemanticCandidateRankScore(item) > taskSemanticCandidateRankScore(previous)) byKey.set(key, item);
+  }
+  return Array.from(byKey.values());
+}
+
+function fuseTaskSemanticCandidates(laneCandidates = [], mode = "top-two") {
+  const byKey = new Map();
+  for (const laneResult of laneCandidates || []) {
+    const lane = String(laneResult?.lane || "action");
+    for (const item of laneResult?.candidates || []) {
+      const key = semanticTaskCandidateStableKey(item);
+      const entry = byKey.get(key) || {
+        ...item,
+        laneScores: {},
+        laneEvidence: {},
+        stableCandidateKey: key
+      };
+      const score = Number(item.semantic ?? item.semanticScore ?? item.matchScore ?? 0);
+      entry.laneScores[lane] = Math.max(Number(entry.laneScores[lane] || 0), Number.isFinite(score) ? score : 0);
+      entry.laneEvidence[lane] = item;
+      const bestCurrent = Math.max(...Object.values(entry.laneScores).map(Number));
+      if (score >= bestCurrent) Object.assign(entry, item);
+      byKey.set(key, entry);
+    }
+  }
+  return rankTaskSemanticCandidates(Array.from(byKey.values()).map((item) => {
+    const laneScores = item.laneScores || {};
+    const ordered = Object.entries(laneScores).sort((left, right) => Number(right[1]) - Number(left[1]));
+    const fused = semanticLaneFusionScore(Object.values(laneScores), mode);
+    return Object.assign({}, item, {
+      semantic: fused,
+      semanticScore: fused,
+      semanticOnly: true,
+      winningLane: ordered[0]?.[0] || "",
+      winningLaneScore: Number(ordered[0]?.[1] || 0),
+      secondLane: ordered[1]?.[0] || "",
+      secondLaneScore: Number(ordered[1]?.[1] || 0),
+      fusionMode: String(mode || "top-two")
+    });
+  }));
+}
+
+function diversifyTaskSemanticCandidates(candidates = [], limit = 6) {
+  const maxItems = Math.max(1, Number(limit || 1));
+  const pool = rankTaskSemanticCandidates(deduplicateTaskSemanticCandidates(candidates));
+  const selected = [];
+  const selectedKeys = new Set();
+  while (selected.length < maxItems && selected.length < pool.length) {
+    let best = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const item of pool) {
+      const key = semanticTaskCandidateStableKey(item);
+      if (selectedKeys.has(key)) continue;
+      const base = taskSemanticCandidateRankScore(item);
+      const similarityPenalty = selected.reduce((highest, previous) => Math.max(highest, taskSemanticCandidateSimilarity(item, previous)), 0);
+      const score = base - similarityPenalty * 0.22;
+      if (score > bestScore || (score === bestScore && key < semanticTaskCandidateStableKey(best))) {
+        best = item;
+        bestScore = score;
+      }
+    }
+    if (!best) break;
+    selected.push(best);
+    selectedKeys.add(semanticTaskCandidateStableKey(best));
+  }
+  return selected;
+}
+
+function taskSemanticCandidateSimilarity(left = {}, right = {}) {
+  if (semanticTaskCandidateStableKey(left) === semanticTaskCandidateStableKey(right)) return 1;
+  const leftChunk = left.chunk || left;
+  const rightChunk = right.chunk || right;
+  const leftEmbedding = Array.isArray(leftChunk.embedding) ? leftChunk.embedding : [];
+  const rightEmbedding = Array.isArray(rightChunk.embedding) ? rightChunk.embedding : [];
+  const embeddingSimilarity = leftEmbedding.length > 0 && leftEmbedding.length === rightEmbedding.length
+    ? cosine(leftEmbedding, rightEmbedding)
+    : 0;
+  const leftContent = semanticChunkContentFingerprint(leftChunk.text || leftChunk.content || "");
+  const rightContent = semanticChunkContentFingerprint(rightChunk.text || rightChunk.content || "");
+  const contentSimilarity = leftContent && leftContent === rightContent ? 1 : 0;
+  if (contentSimilarity >= 1) return 1;
+  const boundedEmbeddingSimilarity = Math.min(1, Math.max(0, Number(embeddingSimilarity) || 0));
+  const redundancySimilarity = boundedEmbeddingSimilarity >= TASK_SEMANTIC_NEAR_DUPLICATE_EMBEDDING_THRESHOLD
+    ? (boundedEmbeddingSimilarity - TASK_SEMANTIC_NEAR_DUPLICATE_EMBEDDING_THRESHOLD)
+      / (1 - TASK_SEMANTIC_NEAR_DUPLICATE_EMBEDDING_THRESHOLD)
+    : 0;
+  // Path/source/time are weak tie-break signals only. They must not create a
+  // near-ban on distinct, semantically relevant chunks from one note.
+  const leftPath = vaultRelativePath(leftChunk.path || "");
+  const rightPath = vaultRelativePath(rightChunk.path || "");
+  const leftKind = String(left.sourceKind || leftChunk.sourceKind || semanticChunkSourceKind(leftChunk));
+  const rightKind = String(right.sourceKind || rightChunk.sourceKind || semanticChunkSourceKind(rightChunk));
+  const leftTemporal = String(left.temporalRelation || leftChunk.temporalRelation || semanticTemporalRelation(leftChunk, left.profile || {}));
+  const rightTemporal = String(right.temporalRelation || rightChunk.temporalRelation || semanticTemporalRelation(rightChunk, right.profile || {}));
+  let tieBreak = 0;
+  if (leftPath && leftPath === rightPath) tieBreak += 0.03;
+  if (leftKind === rightKind) tieBreak += 0.01;
+  if (leftTemporal === rightTemporal) tieBreak += 0.01;
+  return Math.min(1, redundancySimilarity + tieBreak);
+}
+
+function taskSemanticLaneOrigin(result = {}) {
+  const explicit = String(result?.origin || result?.laneOrigin || "").trim().toLowerCase();
+  if (explicit) return explicit;
+  const lane = String(result?.lane || "").trim().toLowerCase();
+  if (lane === "action") return "action";
+  if (lane.startsWith("source-statement-")) return "source-statement";
+  if (lane === "history") return "history";
+  if (lane === "continuity") return "continuity";
+  return "adjacent";
+}
+
+function taskSemanticLaneIsMandatory(result = {}) {
+  if (result?.mandatory !== undefined) return Boolean(result.mandatory);
+  const origin = taskSemanticLaneOrigin(result);
+  return origin === "action" || origin === "source-statement";
+}
+
+function taskSemanticLaneAlignment(actionResult = null, laneResult = {}, laneResults = []) {
+  const actionTopScore = Number(actionResult?.admitted?.[0]?.semantic || 0);
+  const laneTopScore = Number(laneResult?.admitted?.[0]?.semantic || 0);
+  const relativeScore = actionTopScore > 0 ? Math.max(0, laneTopScore / actionTopScore) : 0;
+  const actionEmbedding = Array.isArray(actionResult?.embedding) ? actionResult.embedding : [];
+  const laneEmbedding = Array.isArray(laneResult?.embedding) ? laneResult.embedding : [];
+  const embeddingAlignment = actionEmbedding.length > 0 && actionEmbedding.length === laneEmbedding.length
+    ? Math.min(1, Math.max(-1, Number(cosine(actionEmbedding, laneEmbedding)) || 0))
+    : null;
+  const actionStrength = Math.min(1, Math.max(0, actionTopScore));
+  const threshold = Math.max(0.62, Math.min(0.86, 0.48 + actionStrength * 0.3));
+  const scoreAligned = relativeScore >= Math.max(0.5, threshold * 0.8);
+  const origin = taskSemanticLaneOrigin(laneResult);
+  const optionalAdjacent = origin === "primary-context" || (laneResult?.mandatory === false && !["history", "continuity"].includes(origin));
+  const aligned = embeddingAlignment === null
+    ? (optionalAdjacent ? false : scoreAligned)
+    : embeddingAlignment >= threshold && scoreAligned;
+  const reason = embeddingAlignment === null
+    ? (optionalAdjacent ? "optional-lane-missing-action-embedding" : (aligned ? "relative-semantic-score-aligned" : "relative-semantic-score-misaligned"))
+    : (aligned ? "action-query-embedding-aligned" : "action-query-embedding-misaligned");
+  void laneResults;
+  return {
+    aligned,
+    reason,
+    embeddingAlignment,
+    relativeScore,
+    threshold
+  };
+}
+
+function taskSemanticReferenceState(item = {}) {
+  const chunk = item?.chunk || item || {};
+  const reference = chunk.taskReference || chunk.task || {};
+  const state = String(reference.currentState || reference.current_state || reference.status || chunk.currentState || chunk.current_state || chunk.status || (reference.isCompleted || reference.completed || chunk.isCompleted || chunk.completed ? "completed" : "open")).trim().toLowerCase();
+  const current = reference.current ?? reference.isCurrent ?? reference.is_current ?? chunk.current ?? chunk.isCurrent ?? chunk.is_current;
+  const temporal = String(reference.temporalRelation || reference.temporal_relation || chunk.temporalRelation || chunk.temporal_relation || "").trim().toLowerCase();
+  const completed = reference.isCompleted === true || reference.completed === true || chunk.isCompleted === true || chunk.completed === true || ["completed", "complete", "done", "closed", "cancelled", "canceled", "archived", "obsolete"].includes(state);
+  return {
+    state,
+    current: current !== false,
+    temporal,
+    completed,
+    currentOpen: !completed && current !== false && temporal !== "historical"
+  };
+}
+
+function taskSemanticStructuredIdentityValues(value = {}, additions = []) {
+  const nested = value.taskReference || value.task || {};
+  const verifiedSameAs = value.identityUnverified !== true && nested.identityUnverified !== true
+    ? [
+      ...(Array.isArray(value.sameAs) ? value.sameAs : []),
+      ...(Array.isArray(nested.sameAs) ? nested.sameAs : [])
+    ]
+    : [];
+  const normalize = (candidate) => {
+    if (candidate && typeof candidate === "object") {
+      candidate = candidate.canonicalTaskId || candidate.todoistId || candidate.taskId || candidate.id || candidate.oid || "";
+    }
+    return String(candidate || "").trim().toUpperCase();
+  };
+  return new Set([
+    value.canonicalTaskId, value.todoistId, value.taskId, semanticTaskReferenceChunkSelected(value) ? "" : value.id, value.oid,
+    nested.canonicalTaskId, nested.todoistId, nested.taskId, nested.id, nested.oid,
+    ...verifiedSameAs,
+    ...additions
+  ].map(normalize).filter(Boolean));
+}
+
+function taskSemanticStructuredScopeValues(value = {}, additions = []) {
+  const nested = value.taskReference || value.task || {};
+  return new Set([
+    value.scopeId, value.scope_id, nested.scopeId, nested.scope_id,
+    ...(Array.isArray(value.scopeIds) ? value.scopeIds : []),
+    ...(Array.isArray(nested.scopeIds) ? nested.scopeIds : []),
+    ...additions
+  ].map((candidate) => String(candidate || "").trim()).filter(Boolean));
+}
+
+function taskSemanticExactCurrentOpenIdentity(item = {}, options = {}) {
+  const chunk = item?.chunk || item || {};
+  const task = options.task && typeof options.task === "object" ? options.task : {};
+  const queryIdentities = taskSemanticStructuredIdentityValues(task, [options.canonicalTaskId, options.todoistId, options.taskId, options.oid]);
+  const candidateIdentities = taskSemanticStructuredIdentityValues(chunk);
+  const queryScopes = taskSemanticStructuredScopeValues(task, [options.scopeId]);
+  const candidateScopes = taskSemanticStructuredScopeValues(chunk);
+  const exactIdentity = queryIdentities.size > 0 && candidateIdentities.size > 0
+    && Array.from(queryIdentities).some((identity) => candidateIdentities.has(identity));
+  const exactScope = queryScopes.size > 0 && candidateScopes.size > 0
+    && Array.from(queryScopes).some((scopeId) => candidateScopes.has(scopeId));
+  return exactIdentity && exactScope && taskSemanticReferenceState(item).currentOpen;
+}
+
+function taskSemanticLaneSupport(item = {}, laneMetaByName = new Map()) {
+  const laneScores = item?.laneScores || {};
+  const positiveLanes = Object.entries(laneScores).filter(([, score]) => Number(score) > 0).map(([lane]) => lane);
+  const actionSupported = positiveLanes.some((lane) => lane === "action" || laneMetaByName.get(lane)?.origin === "action");
+  const sourceOrHistorySupported = positiveLanes.some((lane) => {
+    const origin = laneMetaByName.get(lane)?.origin || (lane.startsWith("source-statement-") ? "source-statement" : lane);
+    return origin === "source-statement" || origin === "history";
+  });
+  return { positiveLanes, actionSupported, sourceOrHistorySupported };
+}
+
+function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode = "top-two", options = {}) {
+  const maxItems = Math.max(1, Number(limit || 1));
+  const normalizedResults = (laneResults || []).map((result) => Object.assign({}, result, {
+    origin: taskSemanticLaneOrigin(result),
+    mandatory: taskSemanticLaneIsMandatory(result)
+  }));
+  const actionResult = normalizedResults.find((result) => result?.origin === "action" || result?.lane === "action");
+  const alignmentByLane = new Map();
+  for (const result of normalizedResults) {
+    alignmentByLane.set(String(result.lane || result.origin), taskSemanticLaneAlignment(actionResult, result, normalizedResults));
+  }
+  const alignedResults = normalizedResults.map((result) => {
+    const laneKey = String(result.lane || result.origin);
+    const alignment = alignmentByLane.get(laneKey) || taskSemanticLaneAlignment(actionResult, result, normalizedResults);
+    const keepCandidates = result.mandatory || result.origin === "action" || alignment.aligned;
+    return Object.assign({}, result, {
+      alignment,
+      admitted: keepCandidates ? (result.admitted || []) : [],
+      candidateWindow: keepCandidates ? (result.candidateWindow || result.admitted || []) : []
+    });
+  });
+  const structuralResults = alignedResults.filter((result) => result.origin === "source-statement");
+  const historyResult = alignedResults.find((result) => result.origin === "history" || result.lane === "history");
+  const continuityResult = alignedResults.find((result) => result.origin === "continuity" || result.lane === "continuity");
+  const exactSupportKeys = new Set([
+    ...(actionResult?.admitted || []),
+    ...structuralResults.flatMap((result) => result.admitted || [])
+  ].map((item) => semanticTaskCandidateStableKey(item)));
+  const actionTopScore = Number(actionResult?.admitted?.[0]?.semantic || 0);
+  const structuralTopScore = Math.max(0, ...structuralResults.map((result) => Number(result?.admitted?.[0]?.semantic || 0)));
+  const historyTopScore = Number(historyResult?.admitted?.[0]?.semantic || 0);
+  const continuityTopScore = Number(continuityResult?.admitted?.[0]?.semantic || 0);
+  const historyBaseline = Math.max(actionTopScore, structuralTopScore);
+  const historyEligible = Boolean(historyResult && historyTopScore > 0 && (!historyBaseline || historyTopScore >= historyBaseline * 0.55));
+
+  const laneMetaByName = new Map(alignedResults.map((result) => [String(result.lane || result.origin), result]));
+  const allLanePools = alignedResults.map((result) => ({ lane: result.lane, candidates: result.admitted || [] }));
+  const allFused = fuseTaskSemanticCandidates(allLanePools, "max").filter(semanticCandidateIsAdmissible);
+  const allowHistoricalTaskReferences = options.allowHistoricalTaskReferences === true;
+  const referenceAdmissionReasons = {};
+  const allowedReferenceKeys = new Set();
+  for (const item of allFused) {
+    const key = semanticTaskCandidateStableKey(item);
+    if (!semanticTaskReferenceChunkSelected(item.chunk || item)) continue;
+    const support = taskSemanticLaneSupport(item, laneMetaByName);
+    const state = taskSemanticReferenceState(item);
+    const exactCurrentOpenIdentity = taskSemanticExactCurrentOpenIdentity(item, options);
+    const historyOnlyAllowed = allowHistoricalTaskReferences && support.sourceOrHistorySupported && !state.currentOpen;
+    const eligible = exactCurrentOpenIdentity || (support.actionSupported && support.sourceOrHistorySupported && (state.currentOpen || historyOnlyAllowed));
+    if (eligible) {
+      allowedReferenceKeys.add(key);
+      referenceAdmissionReasons[key] = exactCurrentOpenIdentity
+        ? "exact-current-open-identity"
+        : historyOnlyAllowed ? "explicit-history-expansion" : "current-open-action-source-history-support";
+    } else {
+      referenceAdmissionReasons[key] = !support.actionSupported
+        ? "task-reference-missing-action-lane-support"
+        : !support.sourceOrHistorySupported
+          ? "task-reference-missing-source-history-support"
+          : state.completed
+            ? "task-reference-completed-unless-history-expansion"
+            : state.current
+              ? "task-reference-not-current-open"
+              : "task-reference-not-current";
+    }
+  }
+  const filteredFused = allFused.filter((item) => !semanticTaskReferenceChunkSelected(item.chunk || item) || allowedReferenceKeys.has(semanticTaskCandidateStableKey(item)));
+  const supportedContinuityKeys = new Set(filteredFused
+    .filter((item) => semanticTaskReferenceChunkSelected(item.chunk || item))
+    .filter((item) => {
+      const support = taskSemanticLaneSupport(item, laneMetaByName);
+      const state = taskSemanticReferenceState(item);
+      return taskSemanticExactCurrentOpenIdentity(item, options)
+        || (support.actionSupported && support.sourceOrHistorySupported && state.currentOpen);
+    })
+    .filter((item) => Object.prototype.hasOwnProperty.call(item.laneScores || {}, "continuity"))
+    .map((item) => semanticTaskCandidateStableKey(item)));
+  const continuityHasSupported = supportedContinuityKeys.size > 0;
+  // A continuity reference is focused evidence when it is the exact current,
+  // open structured task identity for the same scope, or when action plus an
+  // independent source-statement/history view supports it.
+  const continuityEligible = Boolean(continuityResult && continuityTopScore > 0 && continuityHasSupported);
+  const lanePools = alignedResults.map((result) => ({
+    lane: result.lane,
+    candidates: result.lane === "history"
+      ? (historyEligible ? (result.admitted || []) : [])
+      : result.lane === "continuity"
+        ? (continuityEligible
+          ? (continuityHasSupported
+            ? (result.admitted || []).filter((item) => supportedContinuityKeys.has(semanticTaskCandidateStableKey(item)))
+            : (result.admitted || []))
+          : [])
+        : (result.admitted || [])
+  }));
+  const filteredLanePools = lanePools.map((pool) => ({
+    lane: pool.lane,
+    candidates: pool.candidates.filter((item) => !semanticTaskReferenceChunkSelected(item.chunk || item) || allowedReferenceKeys.has(semanticTaskCandidateStableKey(item)))
+  }));
+  const fused = fuseTaskSemanticCandidates(filteredLanePools, fusionMode).filter(semanticCandidateIsAdmissible);
+
+  // Keep the genuinely supported continuity reservation bounded to one item;
+  // all remaining slots are filled from fused semantic rank with the embedding
+  // and content-aware redundancy penalty. Distinct chunks from one source are
+  // allowed when they are not duplicates.
+  const continuityReservation = continuityEligible
+    ? rankTaskSemanticCandidates(fused.filter((item) => {
+      const key = semanticTaskCandidateStableKey(item);
+      const laneSupport = Object.keys(item.laneScores || {});
+      return semanticTaskReferenceChunkSelected(item.chunk || item)
+        && laneSupport.includes("continuity")
+        && (continuityHasSupported ? supportedContinuityKeys.has(key) : true);
+    }))[0] || null
+    : null;
+  const reserved = continuityReservation ? [continuityReservation] : [];
+  const reservedKeys = new Set(reserved.map((item) => semanticTaskCandidateStableKey(item)));
+  const reservedReasonByKey = Object.fromEntries(reserved.map((item) => {
+    const key = semanticTaskCandidateStableKey(item);
+    const reason = referenceAdmissionReasons[key] === "exact-current-open-identity"
+      ? "exact-current-open-identity"
+      : "continuity-reserved";
+    return [key, reason];
+  }));
+  const ordered = rankTaskSemanticCandidates(fused.filter((item) => !reservedKeys.has(semanticTaskCandidateStableKey(item))));
+  const remaining = diversifyTaskSemanticCandidates(ordered, Math.max(0, maxItems - reserved.length));
+  const selected = [...reserved, ...remaining].slice(0, maxItems);
+  return {
+    selected,
+    fused,
+    reservedKeys,
+    reservedLaneCount: reserved.length,
+    continuityReservedCount: reserved.length,
+    reservedReasonByKey,
+    exactSupportKeys,
+    continuityEligible,
+    historyEligible,
+    continuityHasSupported,
+    laneAlignment: Object.fromEntries(alignedResults.map((result) => [String(result.lane || result.origin), Object.assign({}, result.alignment, { origin: result.origin, mandatory: result.mandatory })])),
+    referenceAdmissionReasons,
+    allowedReferenceKeys
+  };
+}
+
+function numericMedian(values = []) {
+  const sorted = values.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function taskRelativeSemanticScoreDistribution(candidates = [], acceptedCeiling = 6) {
+  const maxItems = Math.max(1, Number(acceptedCeiling || 1));
+  const pool = deduplicateSemanticRetrievalCandidates(candidates).sort((left, right) =>
+    Number(right.semantic ?? right.semanticScore ?? right.matchScore ?? 0) - Number(left.semantic ?? left.semanticScore ?? left.matchScore ?? 0)
+    || taskSemanticCandidateRankScore(right) - taskSemanticCandidateRankScore(left)).slice(0, Math.max(12, maxItems * 4));
+  const scores = pool.map((item) => Number(item.semantic ?? item.semanticScore ?? item.matchScore ?? 0)).filter((score) => Number.isFinite(score) && score > 0);
+  if (!scores.length) return { pool, scores: [], median: 0, deviation: 0, gapMedian: 0, gapDeviation: 0, distributionFloor: 0, elbowIndex: -1, elbowGap: 0 };
+  const median = numericMedian(scores);
+  const deviations = scores.map((score) => Math.abs(score - median));
+  const deviation = numericMedian(deviations);
+  const orderedScores = scores.slice().sort((a, b) => b - a);
+  const gaps = orderedScores.slice(1).map((score, index) => Math.max(0, orderedScores[index] - score));
+  const gapMedian = numericMedian(gaps);
+  const gapDeviation = numericMedian(gaps.map((gap) => Math.abs(gap - gapMedian)));
+  const distributionFloor = median - deviation * 2;
+  const meaningfulGapFloor = gapMedian + gapDeviation * 2;
+  const elbowSearchLimit = Math.min(gaps.length, Math.max(1, maxItems - 1));
+  let elbowIndex = -1;
+  let elbowGap = 0;
+  for (let index = 0; index < elbowSearchLimit; index += 1) {
+    const gap = gaps[index];
+    if (gap > meaningfulGapFloor && gap > elbowGap) {
+      elbowIndex = index;
+      elbowGap = gap;
+    }
+  }
+  return { pool, scores: orderedScores, median, deviation, gapMedian, gapDeviation, distributionFloor, elbowIndex, elbowGap };
+}
+
+function taskRelativeSemanticAdmissionPool(candidates = [], acceptedCeiling = 6) {
+  const maxItems = Math.max(1, Number(acceptedCeiling || 1));
+  const distribution = taskRelativeSemanticScoreDistribution(candidates, maxItems);
+  const { pool, median, deviation, gapMedian, gapDeviation, distributionFloor, elbowIndex } = distribution;
+  if (!distribution.scores.length) return [];
+  const admitted = [];
+  let previousScore = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < pool.length && admitted.length < maxItems; index += 1) {
+    const item = pool[index];
+    const score = Number(item.semantic ?? item.semanticScore ?? item.matchScore ?? 0);
+    if (!Number.isFinite(score) || score <= 0) continue;
+    const marginalDrop = Number.isFinite(previousScore) ? Math.max(0, previousScore - score) : 0;
+    const marginalOutlier = score < distributionFloor && marginalDrop > gapMedian + gapDeviation * 2;
+    const afterElbow = elbowIndex >= 0 && index > elbowIndex;
+    if (afterElbow && admitted.length >= Math.min(2, maxItems)) break;
+    if (marginalOutlier && admitted.length >= Math.min(2, maxItems)) break;
+    admitted.push(item);
+    previousScore = score;
+  }
+  return rankTaskSemanticCandidates(admitted);
+}
+
+// Build a bounded semantic candidate window for lane fusion without letting an
+// early elbow in one lane hide evidence that is just below that lane's local
+// admission pool. The window is score-relative and lexical-free; the final
+// fused admission still applies the normal task-relative ceiling.
+function taskSemanticLaneCandidateWindow(candidates = [], acceptedCeiling = 6) {
+  const maxItems = Math.max(12, Math.max(1, Number(acceptedCeiling || 1)) * 32);
+  const ranked = rankTaskSemanticCandidates(deduplicateTaskSemanticCandidates(candidates));
+  if (!ranked.length) return { candidates: [], floor: 0, poolCount: 0 };
+  const distribution = taskRelativeSemanticScoreDistribution(ranked, maxItems);
+  const topScore = Number(distribution.scores[0] || ranked[0]?.semantic || 0);
+  const relativeFloor = topScore > 0 ? topScore * 0.65 : 0;
+  const floor = Math.max(0, Math.min(topScore, Math.max(Number(distribution.distributionFloor || 0), relativeFloor)));
+  const window = ranked.filter((item) => Number(item.semantic ?? item.semanticScore ?? item.matchScore ?? 0) >= floor).slice(0, maxItems);
+  return { candidates: window, floor, poolCount: ranked.length };
 }
 
 function temporalContextCandidates(candidates = [], limit = 8) {
@@ -12664,7 +16689,7 @@ function diversifyProjectContextCandidates(candidates = [], limit = 8) {
       const chunk = item.chunk || item;
       const key = chunk.id || `${chunk.path || ""}:${String(chunk.text || "").slice(0, 80)}`;
       if (selectedKeys.has(key)) continue;
-      const project = noteProjectKey(chunk.path || "", chunk.title || "");
+      const project = noteProjectKey(chunk.path || "", chunk.title || "", chunk);
       const count = perProject.get(project) || 0;
       if (count >= maxPerProject) continue;
       selected.push(item);
@@ -12783,6 +16808,7 @@ function datePartFromText(value = "") {
 }
 
 function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT_SETTINGS, options = {}) {
+  if (options.semanticOnly === true) return semanticAdaptiveNoteCardsFromChunks(chunks, settings, options);
   const queryPlan = options.queryPlan || contextQueryPlan(query, "chat");
   const retrievedScopeTerms = uniqueValues((chunks || []).flatMap((chunk) => chunk.retrievalScopeTerms || []));
   if (retrievedScopeTerms.length) queryPlan.primaryAnchorTerms = retrievedScopeTerms;
@@ -12838,10 +16864,44 @@ function adaptiveNoteCardsFromChunks(chunks = [], query = "", settings = DEFAULT
       nextSteps: signals.nextSteps,
       decisions: signals.decisions,
       topics: signals.topics,
-      evidence: truncateAtWord(excerpt, 950)
+      evidence: excerpt
     });
   }
   return selectAdaptiveNoteCards(cards, Math.max(1, options.maxCards || adaptiveContextBudget().maxNotes), queryPlan);
+}
+
+function semanticAdaptiveNoteCardsFromChunks(chunks = [], settings = DEFAULT_SETTINGS, options = {}) {
+  const grouped = new Map();
+  for (const chunk of chunks || []) {
+    if (!chunk?.path || semanticTaskReferenceChunkSelected(chunk)) continue;
+    const existing = grouped.get(chunk.path) || { path: chunk.path, source: sourceReference(chunk, options.basePath || ""), title: chunk.title || chunk.path, chunks: [], score: 0, createdAt: 0, modifiedAt: 0 };
+    existing.chunks.push(chunk);
+    existing.score = Math.max(existing.score, Number(chunk.matchScore || chunk.semanticScore || 0));
+    existing.createdAt = Math.max(existing.createdAt, Number(chunk.createdAt || 0));
+    existing.modifiedAt = Math.max(existing.modifiedAt, Number(chunk.modifiedAt || 0));
+    grouped.set(chunk.path, existing);
+  }
+  const cards = Array.from(grouped.values()).map((group) => {
+    const text = group.chunks.map((chunk) => `${chunk.title || group.title}\n${chunk.text || ""}`).join("\n\n");
+    const source = group.source;
+    const citationNumber = source && options.citationMap instanceof Map ? options.citationMap.get(source) : null;
+    return {
+      title: group.title,
+      path: group.path,
+      source,
+      citationNumber,
+      type: "vault note",
+      date: group.createdAt ? formatLocalDate(new Date(group.createdAt)) : datePartFromText(`${group.title} ${group.path}`),
+      scopeMatch: true,
+      score: group.score,
+      recency: group.createdAt || group.modifiedAt || 0,
+      people: [], outcomes: [], problems: [], dependencies: [], nextSteps: [], decisions: [], topics: [],
+      evidence: text,
+      evidenceIds: uniqueValues(group.chunks.map((chunk) => chunk.evidenceId || chunk.evidence_id).filter(Boolean)),
+      sourceIds: uniqueValues(group.chunks.map((chunk) => chunk.sourceId).filter(Boolean))
+    };
+  });
+  return cards.slice(0, Math.max(1, options.maxCards || adaptiveContextBudget().maxNotes));
 }
 
 function contextScopedEvidenceText(text = "", anchorTerms = []) {
@@ -12946,15 +17006,15 @@ function extractPeopleCandidates(text = "", limit = 8) {
 function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
   const groups = new Map();
   const add = (key, patch) => {
-    const cleanKey = singleLine(key || "").replace(/\.md$/i, "");
+    const cleanKey = singleLine(key || "");
     if (!cleanKey) return;
     const group = groups.get(cleanKey) || { name: cleanKey, score: 0, notes: [], tasks: [], people: new Set(), topics: new Set(), problems: 0, outcomes: 0, nextSteps: 0 };
     Object.assign(group, patch(group));
     groups.set(cleanKey, group);
   };
-  const scopedProject = options.queryPlan?.strictScope ? contextScopeLabel(options.queryPlan) : "";
+  const scopedProject = options.queryPlan?.strictScope && options.queryPlan?.structuredScope ? contextScopeLabel(options.queryPlan) : "";
   for (const card of noteCards || []) {
-    const project = scopedProject || noteProjectKey(card.path, card.title);
+    const project = scopedProject || noteProjectKey(card.path, card.title, card);
     add(project, (group) => {
       group.score += (card.score || 0) + recencyBoost(card.recency || 0);
       group.notes.push(card);
@@ -12967,7 +17027,7 @@ function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
     });
   }
   for (const card of taskCards || []) {
-    const project = scopedProject || card.project || noteProjectKey(card.path, card.title);
+    const project = scopedProject || (card.projectId ? `project:${card.projectId}` : noteProjectKey(card.path, card.title, card));
     add(project, (group) => {
       group.score += (card.score || 0) + (card.priority || 0) * 0.2;
       group.tasks.push(card);
@@ -12998,25 +17058,37 @@ function adaptiveProjectCards(noteCards = [], taskCards = [], options = {}) {
 }
 
 function contextScopeLabel(plan = {}) {
-  return (plan.primaryAnchorTerms || plan.anchorTerms || [])
-    .map((term) => term.charAt(0).toUpperCase() + term.slice(1))
-    .join(" ") || "Requested subject";
+  const metadata = plan.structuredScopeMetadata || structuredSemanticScopeMetadata(plan);
+  const values = metadata.values || {};
+  return [
+    values.taskId ? `Todoist task ${values.taskId}` : "",
+    values.oid ? `OID ${values.oid}` : "",
+    values.scopeId ? `scope ${values.scopeId}` : "",
+    values.sourceContractId ? `source contract ${values.sourceContractId}` : "",
+    values.sourceId ? `source ${values.sourceId}` : ""
+  ].filter(Boolean).join("; ") || "Requested structured scope";
 }
 
 function noteProjectKey(path = "", title = "") {
-  const parts = String(path || "").split("/").filter(Boolean);
-  if (parts.length >= 2) return parts.slice(0, Math.min(3, parts.length - 1)).join("/");
-  return parts[0]?.replace(/\.md$/i, "") || title || "Vault";
+  const identity = arguments.length > 2 ? arguments[2] || {} : {};
+  const projectId = identity.projectId || identity.project_id || identity.taskReference?.projectId || identity.project?.id || identity.project?.projectId || "";
+  if (projectId) return `project:${String(projectId)}`;
+  const sourceId = identity.sourceId || identity.source_id || identity.provenance?.sourceId || "";
+  if (sourceId && /^project[:/]/i.test(String(sourceId))) return `source:${String(sourceId)}`;
+  return "unassigned";
 }
 
 function uniqueAdaptiveTaskCards(cards = []) {
   const seen = new Set();
   const unique = [];
   for (const card of cards || []) {
-    const titleKey = singleLine(card.title).toLowerCase();
-    const pathTitleKey = `${card.path || ""}:${titleKey}`;
-    const keys = [card.id ? `id:${card.id}` : "", pathTitleKey !== ":" ? `path-title:${pathTitleKey}` : "", titleKey ? `title:${titleKey}` : ""].filter(Boolean);
-    if (!keys.length || keys.some((key) => seen.has(key))) continue;
+    const keys = [
+      card.taskId || card.todoistId || card.id ? `task:${card.taskId || card.todoistId || card.id}` : "",
+      card.oid ? `oid:${card.oid}` : "",
+      card.sourceId ? `source:${card.sourceId}` : "",
+      card.evidenceId ? `evidence:${card.evidenceId}` : ""
+    ].filter(Boolean);
+    if (keys.length && keys.some((key) => seen.has(key))) continue;
     for (const key of keys) seen.add(key);
     unique.push(card);
   }
@@ -13106,7 +17178,7 @@ function deriveTaskRationale(task = {}, signals = {}, intent = "") {
   return truncateAtWord(intent, 280);
 }
 
-function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
+function formatAdaptiveContextPack(pack = {}) {
   const depth = Math.max(1, Math.min(7, Number(pack.depth || 4)));
   const chatMode = pack.mode === "chat";
   const sections = [];
@@ -13128,17 +17200,17 @@ function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
     ].join("\n"));
   }
   if (chatMode) {
+    if (depth >= 2 && pack.taskCards?.length) {
+      sections.push(["Secondary Todoist task references - related existing actions only:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
+    }
     if (depth >= 4 && pack.noteCards?.length) {
       sections.push(["Primary vault evidence - origin meetings, outcomes, and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
     }
     if (depth >= 6 && pack.projectCards?.length) {
       sections.push(["Supporting project and portfolio context:"].concat(pack.projectCards.map(formatAdaptiveProjectCard)).join("\n"));
     }
-    if (depth >= 2 && pack.taskCards?.length) {
-      sections.push(["Secondary Todoist task references - related existing actions only:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
-    }
     if (depth >= 2 && pack.taskContext) {
-      sections.push(["Secondary existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
+      sections.push(["Secondary existing task context:", pack.taskContext].join("\n"));
     }
   } else {
     if (depth >= 6 && pack.projectCards?.length) {
@@ -13148,33 +17220,50 @@ function formatAdaptiveContextPack(pack = {}, maxChars = 10000) {
       sections.push(["Tier 2-3 - Task snapshots, intent, and rationale:"].concat(pack.taskCards.map(formatAdaptiveTaskCard)).join("\n"));
     }
     if (depth >= 2 && pack.taskContext) {
-      sections.push(["Tier 2 - Existing task context:", truncateAtWord(pack.taskContext, 1600)].join("\n"));
+      sections.push(["Tier 2 - Existing task context:", pack.taskContext].join("\n"));
     }
     if (depth >= 4 && pack.noteCards?.length) {
       sections.push(["Tier 4-5 - Origin meeting/outcome and related note thread:"].concat(pack.noteCards.map(formatAdaptiveNoteCard)).join("\n"));
     }
   }
-  return truncateMarkdownAtWord(sections.filter(Boolean).join("\n\n"), maxChars);
+  return sections.filter(Boolean).join("\n\n");
 }
 
 function formatAdaptiveTaskCard(card) {
   const meta = [
-    card.status,
+    card.status ? `status: ${card.status}` : "",
     card.project ? `project: ${card.project}` : "",
     card.section ? `section: ${card.section}` : "",
     card.priority ? `priority: ${card.priority}` : "",
     card.due ? `due: ${card.due}` : "",
     card.deadline ? `deadline: ${card.deadline}` : ""
   ].filter(Boolean).join("; ");
+  const details = card.details || {};
   const parts = [
     `- Task: ${card.todoistLink || card.title}${meta ? ` (${meta})` : ""}`,
-    card.parent ? `  Parent: ${card.parent}` : "",
+    `  Current state: ${card.currentState || card.status || "open"}`,
+    card.description ? `  Description: ${card.description}` : "",
+    details.owner ? `  Owner/person: ${details.owner}` : "",
+    details.recipient ? `  Recipient: ${details.recipient}` : "",
+    details.reviewer ? `  Reviewer: ${details.reviewer}` : "",
+    details.deliverable ? `  Deliverable: ${details.deliverable}` : "",
+    details.dependency ? `  Dependency: ${details.dependency}` : "",
+    details.nextStep ? `  Next step: ${details.nextStep}` : "",
+    details.timing ? `  Timing: ${details.timing}` : "",
+    details.criteria ? `  Criteria: ${details.criteria}` : "",
+    card.taskId ? `  Task identity: ${card.taskId}` : card.id ? `  Task identity: ${card.id}` : "",
+    card.oid ? `  Todoist OID: ${card.oid}` : "",
+    card.rootId ? `  Root task: ${card.rootId}` : "",
+    card.parentId ? `  Parent task: ${card.parentId}${card.parent ? ` (${card.parent})` : ""}` : card.parent ? `  Parent: ${card.parent}` : "",
+    card.childIds?.length ? `  Child tasks: ${card.childIds.join(", ")}` : "",
+    card.evidence_ids?.length ? `  Evidence IDs: ${card.evidence_ids.join(", ")}` : "",
+    card.fact_refs?.length ? `  Fact refs: ${card.fact_refs.join(", ")}` : "",
+    card.eligibleLocations?.length ? `  Eligible note locations: ${card.eligibleLocations.join(", ")}` : "",
     card.knowledge?.intent ? `  Intent: ${card.knowledge.intent}` : "",
     card.knowledge?.rationale ? `  Rationale: ${card.knowledge.rationale}` : "",
-    card.knowledge?.dependency ? `  Dependency/blocker: ${card.knowledge.dependency}` : "",
-    card.knowledge?.nextStep ? `  Next step signal: ${card.knowledge.nextStep}` : "",
     card.knowledge?.people?.length ? `  People: ${card.knowledge.people.join(", ")}` : "",
-    card.path ? `  Source note: [${card.path}](obsidian://open?file=${encodeURIComponent(card.path)})` : ""
+    card.sourceId ? `  Source ID: ${card.sourceId}` : "",
+    card.path && !card.path.startsWith("@todoist/") ? `  Source note: [${card.path}](obsidian://open?file=${encodeURIComponent(card.path)})` : ""
   ];
   return parts.filter(Boolean).join("\n");
 }
@@ -13341,6 +17430,7 @@ function rankContextCandidates(candidates = []) {
 }
 
 function contextCandidateRelevanceScore(item) {
+  if (item.semanticOnly) return (item.semantic || 0) * 0.92 + Math.min(0.42, item.scopeScore || 0);
   return (item.semantic || 0) * 0.72 +
     Math.min(0.22, (item.lexical || 0) * 0.018) +
     Math.min(0.08, (item.title || 0) * 0.025) +
@@ -13356,6 +17446,7 @@ function contextCandidateScore(item) {
 function contextCandidateFreshnessEligible(item, topRelevance = 0) {
   const relevance = contextCandidateRelevanceScore(item);
   if (relevance <= 0) return false;
+  if (item.semanticOnly) return relevance >= Math.max(0.18, topRelevance * 0.7);
   if ((item.lexical || 0) > 0 || (item.title || 0) > 0) return relevance >= Math.max(0.08, topRelevance * 0.45);
   return relevance >= Math.max(0.18, topRelevance * 0.7);
 }
@@ -13412,17 +17503,461 @@ function annotateContextChunk(item, profile = {}) {
   if (item.title) reasons.push("title/path match");
   if (item.relativeRecency) reasons.push("newer matching note");
   if (item.recency) reasons.push("recent note");
-  if (item.scopeMatch && (profile.primaryAnchorTerms || []).length) reasons.push(`subject match: ${(item.matchedScopeTerms || []).join(", ")}`);
+  if (item.structuredScopeMatch && profile.structuredScope) reasons.push("exact structured scope match");
+  const path = vaultRelativePath(chunk.path || "");
+  const contentFingerprint = chunk.evidenceContentFingerprint || semanticChunkContentFingerprint(chunk.text || "");
+  const rawChunkId = chunk.chunkId || chunk.rawChunkId || chunk.id || "";
+  const evidenceId = chunk.evidenceId || semanticChunkEvidenceId(path, contentFingerprint, 0);
+  const temporalRelation = semanticTemporalRelation(chunk, profile);
+  const evidenceTaskId = String(chunk.evidenceTaskId || chunk.taskId || chunk.task_id || chunk.taskReference?.taskId || chunk.taskReference?.id || "");
+  const evidenceScopeId = String(chunk.evidenceScopeId || chunk.scopeId || chunk.scope_id || chunk.taskReference?.scopeId || chunk.taskReference?.scope_id || "");
+  const queryTaskId = String(item.taskId || profile.taskId || "");
+  const queryScopeId = String(item.scopeId || profile.scopeId || profile.scope?.id || "");
+  const queryId = String(item.queryId || profile.queryId || chunk.queryId || "");
+  const querySourceContractId = String(item.sourceContractId || profile.sourceContractId || profile.sourceContract?.id || "");
+  const taskScopeAssociations = uniqueTaskScopeAssociations([
+    ...(Array.isArray(chunk.taskScopeAssociations) ? chunk.taskScopeAssociations : []),
+    { taskId: queryTaskId, scopeId: queryScopeId, queryId, sourceContractId: querySourceContractId }
+  ]);
   return Object.assign({}, chunk, {
+    evidenceId,
+    evidenceContentFingerprint: contentFingerprint,
+    chunkId: rawChunkId,
+    rawChunkId,
+    indexRevision: Number(chunk.indexRevision || 0),
+    provenance: semanticChunkProvenance(chunk, path, rawChunkId, chunk.indexRevision || 0),
+    temporalRelation,
+    authorityState: chunk.authorityState || "unknown",
+    sourceAuthority: chunk.sourceAuthority || "unknown",
+    conflictState: chunk.conflictState || "unresolved",
     matchScore: Math.round(score * 1000) / 1000,
     semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000,
     lexicalScore: Math.round(Number(item.lexical || 0) * 1000) / 1000,
-    matchRationale: reasons.join("; ") || "lexical fallback",
+    evidenceTaskId,
+    evidenceScopeId,
+    queryTaskId,
+    queryScopeId,
+    querySourceContractId,
+    taskId: queryTaskId || evidenceTaskId,
+    scopeId: queryScopeId || evidenceScopeId,
+    queryId,
+    taskScopeAssociations,
+    scopeIds: uniqueValues([...(chunk.scopeIds || []), ...taskScopeAssociations.map((association) => association.scopeId)].map(String).filter(Boolean)),
+    sourceAssociation: item.sourceAssociation || querySourceContractId || chunk.sourceId || chunk.provenance?.sourceId || "",
+    selectionReasonCode: item.selectionReasonCode || "semantic-top-k-selected",
+    matchRationale: reasons.join("; ") || "semantic retrieval",
     retrievalIntent: profile.intent || "focused",
-    retrievalScopeTerms: (profile.requiredAnchorTerms || profile.primaryAnchorTerms || []).slice(0, 5),
-    retrievalScopeMatch: item.scopeMatch === true,
+    retrievalScopeTerms: [],
+    retrievalScopeMatch: item.scopeMatch !== false,
     retrievalScopeCoverage: Math.round(Number(item.scopeCoverage || 0) * 1000) / 1000
   });
+}
+
+function semanticIndexedOpenTaskSnapshot(chunk = {}) {
+  const sourceKind = semanticChunkSourceKind(chunk);
+  if (sourceKind !== "todoist-snapshot-reference-row") return false;
+  const task = chunk.taskReference || chunk.task || {};
+  const state = String(chunk.currentState || chunk.current_state || chunk.state || task.currentState || task.current_state || task.state || "").toLowerCase();
+  if (["open", "active", "pending", "in-progress", "current"].includes(state)) return true;
+  return chunk.isCompleted === false || task.isCompleted === false;
+}
+
+function semanticSourceRelativeTimestamp(value = {}) {
+  const explicit = Number(value.sourceTimestamp || value.source_timestamp || value.noteTimestamp || value.note_timestamp || 0);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const noteDated = noteDateTimestamp(value.sourceDate, value.source_date, value.noteDate, value.note_date, value.title, value.path);
+  if (noteDated) return noteDated;
+  const created = Number(value.createdAt || value.created_at || 0);
+  if (Number.isFinite(created) && created > 0) return created;
+  return noteDateTimestamp(value.createdAt, value.created_at);
+}
+
+function semanticTemporalRelation(chunk = {}, profile = {}) {
+  const explicit = String(chunk.temporalRelation || "").toLowerCase();
+  const sourceContract = profile.sourceContract || {};
+  const sourceId = String(sourceContract.sourceId || sourceContract.source_id || profile.sourceId || profile.source_id || "");
+  const sourcePath = vaultRelativePath(sourceContract.path || profile.sourcePath || "");
+  const chunkSourceId = String(chunk.sourceId || chunk.provenance?.sourceId || "");
+  const chunkPath = vaultRelativePath(chunk.path || chunk.provenance?.path || "");
+  if ((sourceId && chunkSourceId && sourceId === chunkSourceId) || (sourcePath && chunkPath && sourcePath === chunkPath)) return "current";
+  if (explicit === "historical") return "historical";
+  if (semanticIndexedOpenTaskSnapshot(chunk)) return "current";
+  const sourceTimestamp = semanticSourceRelativeTimestamp(sourceContract);
+  const chunkTimestamp = semanticSourceRelativeTimestamp(chunk);
+  if (sourceTimestamp && chunkTimestamp) return chunkTimestamp < sourceTimestamp ? "historical" : "current";
+  if (["current", "undated"].includes(explicit)) return explicit;
+  return "undated";
+}
+
+function semanticRetrievalRequestMetadata(query = "", limit = 0, plan = {}, settings = DEFAULT_SETTINGS) {
+  const mode = String(plan.mode || "chat");
+  const taskId = String(plan.taskId || plan.task?.id || plan.task?.oid || "");
+  const sourceContractId = String(plan.sourceContractId || plan.sourceContract?.id || plan.sourceContract?.sourceId || "");
+  const scopeValue = plan.scope && typeof plan.scope === "object"
+    ? JSON.stringify({ id: plan.scope.id || "", path: plan.scope.path || "", sourceType: plan.scope.sourceType || "", kind: plan.scope.kind || "" })
+    : String(plan.scope || "");
+  const scopeId = String(plan.scopeId || plan.scope?.id || (scopeValue ? `scope:${shortHash(scopeValue)}` : ""));
+  const queryText = singleLine(query || "");
+  const queryIdentity = String(plan.queryId || plan.queryIdentity || `query:${shortHash([mode, taskId, sourceContractId, scopeId, queryText].join("\u0000"))}`);
+  return {
+    schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+    queryId: queryIdentity,
+    mode,
+    taskId,
+    sourceContractId,
+    scopeFingerprint: scopeValue.slice(0, 500),
+    sourceType: String(plan.sourceType || plan.sourceContract?.type || "semantic-index"),
+    provider: aiProviderForModel(settings.embeddingModel),
+    model: String(settings.embeddingModel || ""),
+    dimension: semanticEmbeddingRequestDimension(settings, "query", settings.semanticIndexMeta || {}),
+    scope: {
+      id: scopeId,
+      mode,
+      intent: plan.intent || "focused",
+      broad: Boolean(plan.broad),
+      history: Boolean(plan.history),
+      tasks: Boolean(plan.tasks),
+      portfolio: Boolean(plan.portfolio),
+      strictScope: Boolean(plan.strictScope),
+      anchorTerms: (plan.anchorTerms || []).slice(0, 8)
+    },
+    bounds: {
+      requestedLimit: Math.max(1, Number(limit || 1)),
+      maxItems: Math.max(1, Number(limit || 1)),
+      maxChars: Number(settings.maxContextChars || 0)
+    }
+  };
+}
+
+function deduplicateSemanticRetrievalCandidates(candidates = []) {
+  const seen = new Set();
+  const seenContent = new Set();
+  return (candidates || []).filter((item) => {
+    const chunk = item.chunk || item;
+    const key = chunk.evidenceId || chunk.chunkId || chunk.id || `${chunk.path || ""}:${semanticChunkContentFingerprint(chunk.text || "")}`;
+    const contentFingerprint = chunk.evidenceContentFingerprint || semanticChunkContentFingerprint(chunk.text || "");
+    if (!key || seen.has(key) || (contentFingerprint && seenContent.has(contentFingerprint))) return false;
+    seen.add(key);
+    if (contentFingerprint) seenContent.add(contentFingerprint);
+    return true;
+  });
+}
+
+function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_SETTINGS) {
+  const totalCount = (chunks || []).length;
+  const sourceKindCounts = {};
+  const rawEvidenceIds = new Map();
+  for (const raw of rawChunks || []) {
+    if (!raw?.evidenceId) continue;
+    const list = rawEvidenceIds.get(String(raw.evidenceId)) || [];
+    list.push(raw);
+    rawEvidenceIds.set(String(raw.evidenceId), list);
+  }
+  const duplicateEvidenceIdCount = Array.from(rawEvidenceIds.values()).filter((list) => list.length > 1).length;
+  const conflictingEvidenceIdCount = Array.from(rawEvidenceIds.values()).filter((list) => {
+    if (list.length < 2) return false;
+    const identities = new Set(list.map((chunk) => `${chunk.path || ""}\u0000${semanticChunkContentFingerprint(chunk.text || "")}`));
+    return identities.size > 1;
+  }).length;
+  const dimensions = (chunks || []).map((chunk) => Number(chunk.indexMetadata?.dimension || chunk.embeddingDimension || (Array.isArray(chunk.embedding) ? chunk.embedding.length : 0))).filter((value) => value > 0);
+  const expectedDimension = Number(settings.semanticIndexMeta?.dimension || dimensions[0] || 0);
+  const expectedProvider = String(settings.semanticIndexMeta?.provider || aiProviderForModel(settings.embeddingModel));
+  const expectedModel = String(settings.semanticIndexMeta?.model || settings.embeddingModel || "");
+  const embeddingCompatibility = semanticEmbeddingIndexCompatibility(settings, Object.assign({}, settings.semanticIndexMeta || {}, { dimension: expectedDimension }));
+  const hierarchy = semanticTaskChunkHierarchyHealth(chunks);
+  let missingIdentityCount = 0;
+  let invalidDimensionCount = 0;
+  let invalidEmbeddingIdentityCount = 0;
+  let staleCount = 0;
+  let tombstonedCount = 0;
+  let orphanCount = 0;
+  const invalidIndices = new Set();
+  const validChunks = [];
+  for (let index = 0; index < totalCount; index += 1) {
+    const chunk = chunks[index] || {};
+    const sourceKind = chunk.sourceKind || "";
+    sourceKindCounts[sourceKind] = (sourceKindCounts[sourceKind] || 0) + 1;
+    const raw = rawChunks[index] || {};
+    const missingIdentity = !chunk.path || !chunk.text || !chunk.evidenceId || !sourceKind ||
+      (Object.prototype.hasOwnProperty.call(raw, "sourceId") && !raw.sourceId) ||
+      (Object.prototype.hasOwnProperty.call(raw, "sourceKind") && !raw.sourceKind);
+    const actualDimension = Array.isArray(chunk.embedding) ? chunk.embedding.length : 0;
+    const dimension = Number(chunk.indexMetadata?.dimension || chunk.embeddingDimension || actualDimension);
+    const invalidDimension = !actualDimension || !dimension || dimension !== actualDimension || (expectedDimension > 0 && actualDimension !== expectedDimension);
+    const chunkProvider = String(chunk.indexMetadata?.provider || chunk.embeddingProvider || "");
+    const chunkModel = String(chunk.indexMetadata?.model || chunk.embeddingModel || "");
+    const providerKnown = chunkProvider && chunkProvider !== "unknown";
+    const modelKnown = chunkModel && chunkModel !== "unknown";
+    const invalidEmbeddingIdentity = Boolean((providerKnown && expectedProvider && chunkProvider !== expectedProvider)
+      || (modelKnown && expectedModel && modelIdentity(chunkModel) !== modelIdentity(expectedModel)));
+    const duplicateEvidence = raw.evidenceId && (rawEvidenceIds.get(String(raw.evidenceId)) || []).length > 1;
+    if (missingIdentity) missingIdentityCount += 1;
+    if (invalidDimension) invalidDimensionCount += 1;
+    if (invalidEmbeddingIdentity) invalidEmbeddingIdentityCount += 1;
+    if (chunk.stale === true || chunk.indexMetadata?.stale === true) staleCount += 1;
+    if (chunk.tombstoned === true || chunk.indexMetadata?.tombstoned === true) tombstonedCount += 1;
+    const hierarchyIssue = hierarchy.issueBySourceId?.[String(chunk.sourceId || "")] || "";
+    if (chunk.orphan === true || chunk.indexMetadata?.orphan === true || hierarchyIssue) orphanCount += 1;
+    if (missingIdentity || invalidDimension || invalidEmbeddingIdentity || duplicateEvidence || hierarchyIssue) {
+      invalidIndices.add(index);
+      continue;
+    }
+    validChunks.push(chunk);
+  }
+  const invalidCount = totalCount - validChunks.length;
+  const health = {
+    state: validChunks.length ? (invalidCount ? "quarantined" : "clean") : (totalCount ? "failed" : "clean"),
+    totalCount,
+    validCount: validChunks.length,
+    invalidCount,
+    missingIdentityCount,
+    invalidDimensionCount,
+    invalidEmbeddingIdentityCount,
+    duplicateEvidenceIdCount,
+    conflictingEvidenceIdCount,
+    sourceKindCounts,
+    staleCount,
+    tombstonedCount,
+    orphanCount,
+    taskReferenceHealth: hierarchy,
+    expectedDimension,
+    targetDimension: embeddingCompatibility.targetDimension,
+    embeddingMigrationRequired: embeddingCompatibility.migrationRequired,
+    quarantinedIndices: Array.from(invalidIndices).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED)
+  };
+  return { validChunks, health };
+}
+
+function semanticTaskChunkHierarchyHealth(chunks = []) {
+  const taskChunks = (chunks || []).filter((chunk) => {
+    const kind = semanticChunkSourceKind(chunk || {});
+    return kind === "todoist-snapshot-reference-row" || kind === "subtask-task-tree-record" || kind === "note-task-reference-row" || kind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND;
+  });
+  const indexByChunk = new Map(taskChunks.map((chunk, index) => [chunk, index]));
+  const byId = new Map();
+  const byOid = new Map();
+  const issueByIndex = {};
+  const duplicateIdentityCount = { taskId: 0, oid: 0 };
+  const addIssue = (index, issue) => {
+    if (index == null || !issue) return;
+    issueByIndex[index] = issueByIndex[index] ? `${issueByIndex[index]},${issue}` : issue;
+  };
+  for (const [index, chunk] of taskChunks.entries()) {
+    const task = chunk.taskReference || chunk.task || {};
+    const id = String(chunk.taskId || chunk.todoistId || task.taskId || task.todoistId || task.id || "");
+    const oid = String(chunk.oid || task.oid || "").toUpperCase();
+    if (id) {
+      const list = byId.get(id) || [];
+      list.push(index);
+      byId.set(id, list);
+    }
+    if (oid) {
+      const list = byOid.get(oid) || [];
+      list.push(index);
+      byOid.set(oid, list);
+    }
+  }
+  for (const list of byId.values()) if (list.length > 1) { duplicateIdentityCount.taskId += list.length - 1; list.forEach((index) => addIssue(index, "duplicate-task-id")); }
+  for (const list of byOid.values()) if (list.length > 1) { duplicateIdentityCount.oid += list.length - 1; list.forEach((index) => addIssue(index, "duplicate-oid")); }
+  const parentByIndex = new Map();
+  const edgeKeys = new Set();
+  const parentEdgeKeys = new Set();
+  const childEdgeKeys = new Set();
+  let duplicateEdgeCount = 0;
+  let childParentMismatchCount = 0;
+  const resolve = (id, oid) => {
+    const idMatches = id ? byId.get(id) || [] : [];
+    const oidMatches = oid ? byOid.get(oid) || [] : [];
+    const idIndex = idMatches[0];
+    const oidIndex = oidMatches[0];
+    if (idIndex != null && oidIndex != null && idIndex !== oidIndex) return { mismatch: true };
+    return { index: idIndex != null ? idIndex : oidIndex };
+  };
+  for (const [index, chunk] of taskChunks.entries()) {
+    const task = chunk.taskReference || chunk.task || {};
+    const parentId = String(chunk.parentTaskId || chunk.parentId || task.parentTaskId || task.parentId || "");
+    const parentOid = String(chunk.parentOid || task.parentOid || "").toUpperCase();
+    const parentResolution = resolve(parentId, parentOid);
+    if (parentResolution.mismatch) addIssue(index, "parent-id-oid-mismatch");
+    if ((parentId || parentOid) && parentResolution.index == null) addIssue(index, "orphan-parent");
+    if (parentResolution.index != null) {
+      parentByIndex.set(index, parentResolution.index);
+      const edge = `${parentResolution.index}:${index}`;
+      if (parentEdgeKeys.has(edge)) duplicateEdgeCount += 1;
+      parentEdgeKeys.add(edge);
+      edgeKeys.add(edge);
+    }
+    const childIds = Array.isArray(chunk.childTaskIds || task.childTaskIds) ? (chunk.childTaskIds || task.childTaskIds) : [];
+    const childOids = Array.isArray(chunk.childOids || task.childOids) ? (chunk.childOids || task.childOids) : [];
+    for (let childIndex = 0; childIndex < Math.max(childIds.length, childOids.length); childIndex += 1) {
+      const childId = String(childIds[childIndex] || "");
+      const childOid = String(childOids[childIndex] || "").toUpperCase();
+      const childResolution = resolve(childId, childOid);
+      if (childResolution.mismatch) addIssue(index, "child-id-oid-mismatch");
+      if ((childId || childOid) && childResolution.index == null) { addIssue(index, "orphan-child"); continue; }
+      if (childResolution.index == null) continue;
+      const edge = `${index}:${childResolution.index}`;
+      if (childEdgeKeys.has(edge)) duplicateEdgeCount += 1;
+      childEdgeKeys.add(edge);
+      edgeKeys.add(edge);
+      const childParent = parentByIndex.get(childResolution.index);
+      if (childParent != null && childParent !== index) addIssue(index, "child-parent-mismatch");
+    }
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (index) => {
+    if (visiting.has(index)) { addIssue(index, "cycle"); return; }
+    if (visited.has(index)) return;
+    visiting.add(index);
+    const parent = parentByIndex.get(index);
+    if (parent != null) visit(parent);
+    visiting.delete(index);
+    visited.add(index);
+  };
+  for (const index of parentByIndex.keys()) visit(index);
+  for (const [index, chunk] of taskChunks.entries()) {
+    const task = chunk.taskReference || chunk.task || {};
+    let root = index;
+    const seen = new Set();
+    while (parentByIndex.has(root) && !seen.has(root)) { seen.add(root); root = parentByIndex.get(root); }
+    if (seen.has(root)) addIssue(index, "cycle");
+    const rootId = String(chunk.rootTaskId || task.rootTaskId || "");
+    const rootOid = String(chunk.rootOid || task.rootOid || "").toUpperCase();
+    const expectedRoot = resolve(rootId, rootOid);
+    if ((rootId || rootOid) && expectedRoot.mismatch) addIssue(index, "root-id-oid-mismatch");
+    if ((rootId || rootOid) && expectedRoot.index == null) addIssue(index, "orphan-root");
+    if (expectedRoot.index != null && expectedRoot.index !== root) addIssue(index, "inconsistent-root");
+  }
+  const invalidNodeCount = Object.keys(issueByIndex).length;
+  const roots = taskChunks.filter((_, index) => !parentByIndex.has(index)).length;
+  const issueBySourceId = {};
+  for (const [index, issue] of Object.entries(issueByIndex)) {
+    const sourceId = String(taskChunks[Number(index)]?.sourceId || "");
+    if (sourceId) issueBySourceId[sourceId] = issue;
+  }
+  return {
+    state: invalidNodeCount ? (invalidNodeCount < taskChunks.length ? "quarantined" : "failed") : "clean",
+    totalNodes: taskChunks.length,
+    rootCount: roots,
+    subtaskCount: taskChunks.length - roots,
+    edgeCount: edgeKeys.size,
+    orphanParentCount: Object.values(issueByIndex).filter((value) => value.includes("orphan-parent")).length,
+    orphanRootCount: Object.values(issueByIndex).filter((value) => value.includes("orphan-root")).length,
+    cycleCount: Object.values(issueByIndex).filter((value) => value.includes("cycle")).length,
+    duplicateEdgeCount,
+    duplicateIdentityCount,
+    inconsistentRootCount: Object.values(issueByIndex).filter((value) => value.includes("inconsistent-root")).length,
+    invalidNodeCount,
+    issueByIndex,
+    issueBySourceId,
+    quarantinedSourceIds: Object.keys(issueByIndex).map((index) => taskChunks[Number(index)]?.sourceId).filter(Boolean).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED)
+  };
+}
+
+function semanticCandidateIsAdmissible(item = {}) {
+  const chunk = item.chunk || item;
+  if (!Number.isFinite(Number(item.semantic)) || Number(item.semantic) <= 0) return false;
+  if (semanticChunkSourceKind(chunk) === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND || chunk.retrievalEligible === false || chunk.taskReference?.retrievalEligible === false) return false;
+  if (item.scopeMatch === false || chunk.scopeMatch === false || item.structuredScopeMatch === false) return false;
+  if (chunk.stale === true || chunk.tombstoned === true || chunk.quarantined === true || chunk.indexMetadata?.stale === true || chunk.indexMetadata?.tombstoned === true || chunk.indexMetadata?.quarantined === true || chunk.orphan === true || isLegacyGroupedTaskReferenceChunk(chunk)) return false;
+  if (["rejected", "blocked", "conflicted"].includes(String(chunk.authorityState || "").toLowerCase())) return false;
+  return true;
+}
+
+function attachSemanticRetrievalMetadata(context = [], request = {}, details = {}) {
+  const result = Array.isArray(context) ? context : [];
+  const selected = result.map((chunk) => ({
+    evidenceId: chunk.evidenceId || "",
+    semanticScore: Number(chunk.semanticScore || 0),
+    reasonCode: chunk.selectionReasonCode || "semantic-top-k-selected",
+    taskId: String(chunk.taskId || chunk.task_id || ""),
+    scopeId: String(chunk.scopeId || chunk.scope_id || ""),
+    queryId: String(chunk.queryId || request.queryId || ""),
+    sourceId: String(chunk.sourceId || chunk.provenance?.sourceId || ""),
+    sourceKind: String(chunk.sourceKind || chunk.provenance?.sourceKind || ""),
+    sourceAssociation: chunk.sourceAssociation || (chunk.sourceId || chunk.provenance?.sourceId || ""),
+    provenance: chunk.provenance || semanticChunkProvenance(chunk, chunk.path || "", chunk.chunkId || chunk.id || "", chunk.indexRevision || 0),
+    temporalRelation: chunk.temporalRelation || semanticTemporalRelation(chunk),
+    authorityState: chunk.authorityState || "unknown",
+    conflictState: chunk.conflictState || "unresolved"
+  })).filter((item) => item.evidenceId);
+  const selectedIds = new Set(selected.map((item) => item.evidenceId));
+  const rejected = [];
+  for (const item of details.rejectedCandidates || details.candidates || []) {
+    const chunk = item.chunk || item;
+    const evidenceId = chunk.evidenceId || "";
+    if (!evidenceId || selectedIds.has(evidenceId)) continue;
+    const reasonCode = item.reasonCode || item.rejectionReasonCode || (chunk.stale === true || chunk.tombstoned === true || chunk.quarantined === true || chunk.indexMetadata?.stale === true || chunk.indexMetadata?.tombstoned === true || chunk.indexMetadata?.quarantined === true
+      ? "integrity-quarantine"
+      : item.scopeMatch === false || item.structuredScopeMatch === false ? "exact-scope-mismatch" : item.diversificationRejected ? "semantic-diversification-excluded" : "semantic-top-k-excluded");
+    rejected.push({
+      evidenceId,
+      reasonCode,
+      reason: reasonCode,
+      taskId: String(item.taskId || item.task_id || request.taskId || ""),
+      scopeId: String(item.scopeId || item.scope_id || request.scope?.scopeId || ""),
+      queryId: String(item.queryId || request.queryId || ""),
+      sourceId: String(chunk.sourceId || chunk.provenance?.sourceId || ""),
+      sourceKind: String(chunk.sourceKind || chunk.provenance?.sourceKind || ""),
+      sourceAssociation: chunk.sourceId || chunk.provenance?.sourceId || "",
+      semanticScore: Math.round(Number(item.semantic || 0) * 1000) / 1000,
+      provenance: chunk.provenance || semanticChunkProvenance(chunk, chunk.path || "", chunk.chunkId || chunk.id || "", chunk.indexRevision || 0)
+    });
+    if (rejected.length >= SEMANTIC_RETRIEVAL_MAX_REJECTED) break;
+  }
+  const resultHash = shortHash(JSON.stringify(selected.map((item) => [item.evidenceId, item.semanticScore])));
+  const telemetry = {
+    schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+    queryId: request.queryId || "",
+    mode: request.mode || "chat",
+    taskId: request.taskId || "",
+    sourceContractId: request.sourceContractId || "",
+    scope: request.scope || {},
+    sourceType: request.sourceType || "semantic-index",
+    indexState: details.indexState || "ready",
+    degradedReason: details.degradedReason || "",
+    degraded: Boolean(details.degraded || details.indexState === "degraded-source-only" || details.indexState === "failed" || details.degradedReason),
+    indexRevision: Number(details.indexRevision || request.indexRevision || 0),
+    provider: request.provider || "",
+    model: request.model || "",
+    dimension: Number(request.dimension || 0),
+    candidateCount: Number(details.candidateCount || (details.candidates || []).length || 0),
+    selectedEvidenceIds: selected.map((item) => item.evidenceId),
+    rejectedEvidenceIds: rejected.map((item) => item.evidenceId),
+    selected,
+    rejected,
+    bounds: request.bounds || {},
+    elapsedMs: Math.max(0, Number(details.elapsedMs || 0)),
+    resultHash,
+    bundleHash: resultHash
+  };
+  telemetry.indexHealth = details.indexHealth || {
+    state: "clean",
+    totalCount: telemetry.candidateCount,
+    validCount: telemetry.candidateCount,
+    invalidCount: 0,
+    missingIdentityCount: 0,
+    invalidDimensionCount: 0,
+    duplicateEvidenceIdCount: 0,
+    conflictingEvidenceIdCount: 0,
+    sourceKindCounts: {},
+    staleCount: 0,
+    tombstonedCount: 0,
+    orphanCount: 0
+  };
+  Object.defineProperty(result, "semanticRetrieval", { value: { telemetry }, enumerable: false, configurable: true });
+  Object.defineProperty(result, "telemetry", { value: telemetry, enumerable: false, configurable: true });
+  return result;
+}
+
+function cloneSemanticRetrievalContext(context = []) {
+  const cloned = typeof structuredClone === "function" ? structuredClone(context) : JSON.parse(JSON.stringify(context || []));
+  const metadata = context?.semanticRetrieval;
+  const telemetry = context?.telemetry;
+  if (metadata) Object.defineProperty(cloned, "semanticRetrieval", { value: typeof structuredClone === "function" ? structuredClone(metadata) : JSON.parse(JSON.stringify(metadata)), enumerable: false, configurable: true });
+  if (telemetry) Object.defineProperty(cloned, "telemetry", { value: typeof structuredClone === "function" ? structuredClone(telemetry) : JSON.parse(JSON.stringify(telemetry)), enumerable: false, configurable: true });
+  return cloned;
 }
 
 function mergeStrings(...groups) {
@@ -13593,7 +18128,7 @@ function normalizeMarkedActionText(value = "") {
 
 function normalizeMarkedActionTitle(value = "") {
   const title = normalizeMarkedActionText(value);
-  if (!title || taskStructureActionClauses(title).length > 1) return "";
+  if (!title) return "";
   const normalized = capitalizeSentenceStart(title);
   return mainTaskClarityReason({ content: normalized }) === "passed" ? normalized : "";
 }
@@ -13605,7 +18140,7 @@ function deterministicMarkedActionTaskTrees(groups = [], sourceText = "", settin
     const content = normalizeMarkedActionTitle(group?.action || "");
     if (!content) return null;
     const task = { content, description: "", subtasks: [] };
-    return generatedTaskMatchesPrimarySource(task, source) ? task : null;
+    return task;
   }).filter(Boolean);
 }
 
@@ -13635,6 +18170,41 @@ function explicitNoteActionMarkers(sourceText = "", settings = DEFAULT_SETTINGS)
     }
   }
   return markers;
+}
+
+function structuredMarkedActionSignals(markers = [], settings = DEFAULT_SETTINGS) {
+  const records = (markers || []).map((marker, index) => Object.assign({}, marker, {
+    markerIndex: index,
+    markerRecordId: `marker-${index + 1}`,
+    scopeId: marker.scopeId || "",
+    factId: marker.factId || ""
+  }));
+  const groups = records.map((record) => ({
+    action: record.action,
+    references: [record],
+    markerIndex: record.markerIndex,
+    markerRecordId: record.markerRecordId,
+    scopeId: record.scopeId,
+    factIds: record.factId ? [record.factId] : [],
+    structured: true
+  }));
+  return {
+    sentences: records.map((record) => singleLine(record.action)).filter(Boolean),
+    families: [],
+    objects: [],
+    entities: [],
+    conditional: false,
+    bindings: [],
+    constraints: [],
+    exclusions: [],
+    decisionAlternatives: [],
+    decisionCriteria: [],
+    markedActions: records.map((record) => record.action).filter(Boolean),
+    markedActionRecords: records,
+    markedActionGroups: groups,
+    markedActionFactRecords: records.filter((record) => record.factId),
+    markerTags: noteActionMarkerTags(settings)
+  };
 }
 
 const MARKED_ACTION_FAMILY_PATTERNS = [
@@ -13703,7 +18273,11 @@ function taskRequestedActionSignals(sourceText = "", sourceType = "note", settin
   const noteImperative = /^(?:review|assess|compare|verify|confirm|identify|draft|prepare|send|submit|provide|update|finali[sz]e|decide|respond|follow[- ]?up)\b/i;
   const completedStatus = /\b(?:already|has|have|had|was|were)\s+(?:reviewed|completed|finished|sent|submitted|finali[sz]ed|approved|adjusted)\b|^(?:quickly\s+)?reviewed\b/i;
   const passiveRequest = (sentence) => Object.keys(TASK_REQUEST_PASSIVE_FAMILY_TERMS).some((family) => taskRequestPassiveFamilyPresent(sentence, family));
-  const requestedSentences = sentences.filter((sentence) => !completedStatus.test(sentence) && (directRequest.test(sentence) || passiveRequest(sentence) || (sourceType !== "email" && noteImperative.test(sentence))));
+  const markerSentences = sourceType === "note" ? markedActions.map((item) => singleLine(item.action)).filter(Boolean) : [];
+  const requestedSentences = uniqueValues([
+    ...sentences.filter((sentence) => !completedStatus.test(sentence) && (directRequest.test(sentence) || passiveRequest(sentence) || (sourceType !== "email" && noteImperative.test(sentence)))),
+    ...markerSentences
+  ]).slice(0, 8);
   const rawRequestText = requestedSentences.join(". ");
   const exclusions = taskRequestExplicitExclusions(rawRequestText);
   const positiveSentences = requestedSentences.map((sentence) => exclusions.reduce((value, exclusion) => value.replace(exclusion.phrase, " "), sentence)).map(singleLine).filter(Boolean);
@@ -13927,7 +18501,12 @@ function taskRequestBindingFamilyPresent(clause = "", family = "") {
 function taskRequestSignalInstructions(signals = {}) {
   const parts = [];
   const markedGroups = signals.markedActionGroups || [];
+  const structuredMarkers = (signals.markedActionFactRecords || []).filter((record) => record?.factId && record?.scopeId);
   const markerLabel = (signals.markerTags || ["#todo"]).join("/");
+  if (structuredMarkers.length) {
+    const markerLines = structuredMarkers.map((record, index) => `${index + 1}. scope_id=${record.scopeId}; fact_ref=${record.factId}; source action: ${singleLine(record.action)}`).join("\n");
+    return `Explicit request coverage checklist:\n${structuredMarkers.length} explicit ${markerLabel} marker records (each marker is an independent source scope; do not group or infer action families):\n${markerLines}\n- Cover every listed marker fact_ref across the returned main-task and subtask fact_refs. Repeated references may be cited together only by returning all of their fact_refs on the same task tree.\n- Preserve each marker scope_id on the task or task tree that cites its fact_ref.\n- The source action text is authoritative; do not replace it with a vocabulary-derived action or use title/token overlap as a coverage test.\n- Verify marker fact coverage before returning JSON; descriptions do not substitute for missing marker fact_refs.`;
+  }
   if (signals.families?.length) parts.push(`requested outcomes: ${signals.families.join(", ")}`);
   if (signals.objects?.length) parts.push(`named work objects: ${signals.objects.join(", ")}`);
   if (signals.entities?.length) parts.push(`named recipients or stakeholders: ${signals.entities.join(", ")}`);
@@ -13945,15 +18524,21 @@ function taskRequestSignalInstructions(signals = {}) {
     : "Explicit request coverage:\n- No additional direct-request criteria were extracted locally; follow the source-specific actionability rules without inventing work.";
 }
 
+function taskRequestBindingMatchesTask(taskText = "", taskCounts = {}, binding = {}) {
+  const normalized = singleLine(taskText || "").toLowerCase();
+  const objectMatch = (binding.objects || []).some((object) => taskRequestObjectPresent(normalized, taskCounts, object));
+  const entityMatch = (binding.entities || []).some((entity) => normalized.includes(singleLine(entity).toLowerCase()));
+  const familyMatch = !binding.family || taskRequestFamilyPresent(normalized, binding.family);
+  if (!familyMatch) return false;
+  const hasScopedTerms = Boolean((binding.objects || []).length || (binding.entities || []).length);
+  return hasScopedTerms ? objectMatch || entityMatch : familyMatch;
+}
+
 function taskDescriptionRequestCoverage(task = {}, signals = {}) {
   const taskText = [task.content, ...(task.subtasks || []).map((subtask) => subtask.content)].filter(Boolean).join(" ");
   const normalized = singleLine(taskText).toLowerCase();
   const counts = termCounts(normalized);
-  const bindings = (signals.bindings || []).filter((binding) => {
-    const objectMatch = (binding.objects || []).some((object) => taskRequestObjectPresent(normalized, counts, object));
-    const entityMatch = (binding.entities || []).some((entity) => normalized.includes(singleLine(entity).toLowerCase()));
-    return objectMatch || entityMatch || taskRequestFamilyPresent(normalized, binding.family);
-  });
+  const bindings = (signals.bindings || []).filter((binding) => taskRequestBindingMatchesTask(normalized, counts, binding));
   const decisionTask = taskRequestFamilyPresent(normalized, "decision");
   const parts = [];
   if (bindings.length) parts.push(bindings.map((binding) => `${binding.family} -> ${(binding.objects || []).join("/") || "named work"}${binding.entities?.length ? ` with ${(binding.entities || []).join("/")}` : ""}${binding.conditionType ? ` (${binding.conditionType})` : ""}`).join("; "));
@@ -13971,11 +18556,7 @@ function taskDescriptionRequestCoverageReason(value = "", task = {}, signals = {
     const terms = generatedTaskObjectTerms(detail).filter((term) => !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term));
     return terms.length > 0 && terms.every((term) => contextAnchorVariants(term).some((variant) => descriptionCounts[variant]));
   };
-  const relevantBindings = (signals.bindings || []).filter((binding) => (
-    taskRequestFamilyPresent(taskText, binding.family)
-    || (binding.objects || []).some((object) => taskRequestObjectPresent(taskText, taskCounts, object))
-    || (binding.entities || []).some((entity) => taskText.includes(singleLine(entity).toLowerCase()))
-  ));
+  const relevantBindings = (signals.bindings || []).filter((binding) => taskRequestBindingMatchesTask(taskText, taskCounts, binding));
   for (const binding of relevantBindings) {
     for (const entity of binding.entities || []) {
       if (!description.includes(singleLine(entity).toLowerCase())) return `missing recipient or stakeholder: ${entity}`;
@@ -14001,6 +18582,25 @@ function taskDescriptionRequestCoverageReason(value = "", task = {}, signals = {
 
 function taskRequestCoverageReport(tasks = [], signals = {}) {
   const flatTasks = flattenTaskPlan(tasks || []);
+  const structuredMarkers = (signals.markedActionFactRecords || []).filter((record) => record?.factId);
+  if (structuredMarkers.length) {
+    const coveredFactIds = new Set(flatTasks.flatMap((task) => (task.fact_refs || task.factRefs || []).map(String)));
+    const missingFacts = structuredMarkers.filter((record) => !coveredFactIds.has(String(record.factId)));
+    return {
+      passed: missingFacts.length === 0,
+      missingFamilies: [],
+      missingObjects: [],
+      missingEntities: [],
+      missingConditional: false,
+      missingBindings: [],
+      missingConstraints: [],
+      missingDecisionAlternatives: [],
+      missingDecisionCriteria: [],
+      violatedExclusions: [],
+      missingMarkedActions: missingFacts.map((record) => record.action),
+      missingMarkedActionFactIds: missingFacts.map((record) => String(record.factId))
+    };
+  }
   const text = flatTasks.map((task) => `${task.content || ""} ${task.description || ""}`).join("; ");
   const normalized = singleLine(text).toLowerCase();
   const missingFamilies = (signals.families || []).filter((family) => !taskRequestFamilyPresent(normalized, family));
@@ -14159,6 +18759,22 @@ function subtaskCriteriaInstructions(settings = DEFAULT_SETTINGS) {
 }
 
 function contextNotesForTaskPlan(chunks, activePath, maxNotes, query = "", settings = DEFAULT_SETTINGS) {
+  const selected = [];
+  const selectedPaths = new Set();
+  for (const chunk of chunks || []) {
+    if (!chunk?.path || chunk.path === activePath || semanticTaskReferenceChunkSelected(chunk) || selectedPaths.has(chunk.path)) continue;
+    selectedPaths.add(chunk.path);
+    selected.push({
+      path: chunk.path,
+      title: chunk.title || chunk.path.split("/").pop()?.replace(/\.md$/i, "") || chunk.path,
+      summary: rankedContextExcerpt(chunk.text || "", "", settings),
+      evidenceId: chunk.evidenceId || "",
+      sourceId: chunk.sourceId || ""
+    });
+    if (selected.length >= Math.max(1, maxNotes || 5)) break;
+  }
+  return selected.filter((note) => note.summary);
+  /* Legacy lexical note admission is intentionally unreachable. */
   const seen = new Set();
   const notes = [];
   for (const chunk of chunks || []) {
@@ -14173,7 +18789,7 @@ function contextNotesForTaskPlan(chunks, activePath, maxNotes, query = "", setti
     notes.push({
       path: chunk.path,
       title: chunk.title || chunk.path.split("/").pop()?.replace(/\.md$/i, "") || chunk.path,
-      summary: truncateAtWord(singleLine(summary), 240)
+      summary: singleLine(summary)
     });
     if (notes.length >= Math.max(1, maxNotes || 5)) break;
   }
@@ -14204,52 +18820,232 @@ function taskMarkedActionSourceWindow(sourceText = "", markedGroup = null, query
     selected.push(trimmed);
     previous = trimmed;
   }
-  return truncateAtWord(selected.join(" ").replace(/\s{2,}/g, " "), maxChars);
+  return selected.join(" ").replace(/\s{2,}/g, " ");
 }
 
-function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", context = [], sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
+function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", context = [], sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}, options = {}) {
+  if (!options.sourceContract && options.allowLegacySourceOnlyValidation !== true) {
+    return (tasks || []).map((task, index) => {
+      const bundleId = `bundle-${shortHash(`legacy:${task.id || task.oid || index}:${sourceTitle}`)}`;
+      const identity = taskWorkflowIdentitySnapshot(task, index, null, options);
+      return deepFreezeTaskWorkflow({
+        version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+        index,
+        taskId: task.id || task.oid || `task-${index}`,
+        scope_id: "",
+        evidence_ids: [],
+        fact_refs: [],
+        sourceContract: null,
+        immutable: false,
+        degraded: true,
+        degradedState: "source-only-degraded",
+        degradedReason: "source-contract-unavailable",
+        promptBundleId: bundleId,
+        validatorBundleId: bundleId,
+        promptBundleHash: taskWorkflowHash({ bundleId, sourceTitle, sourceSummary: singleLine(sourceSummary) }),
+        validatorBundleHash: taskWorkflowHash({ bundleId, sourceTitle, sourceSummary: singleLine(sourceSummary) }),
+        ...identity,
+        sourceId: identity.sourceId,
+        sourceContractId: "",
+        queryId: identity.queryId,
+        queryHash: identity.queryHash,
+        corpus: String(sourceSummary || ""),
+        groundedCorpus: String(sourceSummary || ""),
+        primarySourceEvidence: String(sourceSummary || ""),
+        supportingSemanticEvidence: [],
+        contextChunks: []
+      });
+    });
+  }
+  if (options.sourceContract) {
+    const rawContract = options.sourceContract || {};
+    const primaryEvidenceId = rawContract.primaryEvidenceId || rawContract.primary_evidence_id || `evidence-${shortHash(`${rawContract.id || rawContract.source_id || sourceTitle}:primary` )}`;
+    const sharedPrimaryEvidenceIds = uniqueValues([
+      primaryEvidenceId,
+      ...(rawContract.primaryEvidenceIds || rawContract.primary_evidence_ids || [])
+    ].map(String).filter(Boolean));
+    const sourceContract = {
+      id: rawContract.id || rawContract.sourceContractId || rawContract.source_contract_id || "",
+      sourceId: rawContract.sourceId || rawContract.source_id || "",
+      sourceType: rawContract.sourceType || rawContract.source_type || "note",
+      authority: rawContract.authority || "current",
+      sourceScopeId: rawContract.sourceScopeId || rawContract.source_scope_id || rawContract.scopeId || rawContract.scope_id || "",
+      scopeId: rawContract.scopeId || rawContract.scope_id || "",
+      scopeIds: Array.isArray(rawContract.scopeIds) ? rawContract.scopeIds.map(String).filter(Boolean) : [],
+      primaryEvidenceId,
+      primaryFactId: rawContract.primaryFactId || rawContract.primary_fact_id || "",
+      markerFactIds: Array.isArray(rawContract.markedActionFactIds) ? rawContract.markedActionFactIds.map(String).filter(Boolean) : [],
+      facts: rawContract.facts || (rawContract.fact_refs || []).map((fact) => ({ factId: fact.factId || fact.fact_id, evidenceId: fact.evidenceId || fact.evidence_id, value: fact.value || fact.text || "", kind: fact.kind || "source-fact", current: true, authorityState: "authoritative" }))
+    };
+    const sourceFacts = sourceContract.facts.filter((fact) => fact.factId);
+    const semanticEvidence = uniqueSemanticEvidenceChunks(context || []).slice(0, 16).map((chunk) => ({
+      evidenceId: chunk.evidenceId || chunk.evidence_id || chunk.id || `evidence-${shortHash(`${chunk.path || ""}:${chunk.text || ""}`)}`,
+      sourceKind: chunk.sourceKind || "semantic-index-chunk",
+      provenance: { path: chunk.path || "", title: chunk.title || chunk.path || "", sourceId: chunk.sourceId || "" },
+      factRefs: (chunk.fact_refs || chunk.factRefs || []).map((fact) => fact.factId || fact.fact_id || fact).filter(Boolean),
+      scopeIds: evidenceScopeIdsForChunk(chunk),
+      taskId: String(chunk.taskId || chunk.task_id || chunk.taskReference?.id || ""),
+      taskScopeAssociations: uniqueTaskScopeAssociations(chunk.taskScopeAssociations || []),
+      authorityState: chunk.authorityState || "supporting",
+      conflictState: chunk.conflictState || "none",
+      text: chunk.text || chunk.content || "",
+      chunk
+    }));
+    const semanticEvidenceById = new Map(semanticEvidence.map((entry) => [entry.evidenceId, entry]));
+    const primaryFactId = sourceContract.primaryFactId || sourceFacts.find((fact) => fact.kind !== "marked-action")?.factId || sourceFacts[0]?.factId || "";
+    const sharedPrimaryFacts = sourceFacts.filter((fact) => fact.factId === primaryFactId);
+    const isUsableSemanticEntry = (entry, task, taskScopeId) => {
+      if (!entry || entry.authorityState === "rejected" || entry.conflictState === "conflicted" || entry.conflictState === "conflict") return false;
+      if (taskScopeId && entry.scopeIds.length && !entry.scopeIds.includes(taskScopeId)) return false;
+      if (entry.taskScopeAssociations.length && !entry.taskScopeAssociations.some((association) => (!taskScopeId || association.scopeId === taskScopeId) && (!task.id || !association.taskId || association.taskId === String(task.id)))) return false;
+      return true;
+    };
+    return (tasks || []).map((task, index) => {
+      const explicitEvidenceIds = uniqueValues((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean));
+      const explicitFactRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
+      const taskScopeId = String(task.scope_id || task.scopeId || "");
+      const usableExplicitEvidenceIds = explicitEvidenceIds.filter((evidenceId) => isUsableSemanticEntry(semanticEvidenceById.get(evidenceId), task, taskScopeId));
+      let evidenceIds = uniqueValues([...sharedPrimaryEvidenceIds, ...usableExplicitEvidenceIds]);
+      const usableExplicitFactRefs = explicitFactRefs.filter((factRef) => {
+        if (sharedPrimaryFacts.some((fact) => fact.factId === factRef)) return true;
+        if (sourceFacts.some((fact) => fact.factId === factRef)) return true;
+        return semanticEvidence.some((entry) => entry.factRefs.includes(factRef) && isUsableSemanticEntry(entry, task, taskScopeId));
+      });
+      const factRefs = uniqueValues([
+        ...sharedPrimaryFacts.map((fact) => fact.factId),
+        ...usableExplicitFactRefs
+      ]);
+      const selectedSemanticEvidence = semanticEvidence.filter((entry) => {
+        if (!isUsableSemanticEntry(entry, task, taskScopeId)) return false;
+        if (usableExplicitEvidenceIds.includes(entry.evidenceId)) return true;
+        if (entry.factRefs.some((factRef) => usableExplicitFactRefs.includes(String(factRef)))) return true;
+        return false;
+      });
+      evidenceIds = uniqueValues([...
+        evidenceIds,
+        ...selectedSemanticEvidence.map((entry) => entry.evidenceId)
+      ]);
+      const acceptedEvidenceIds = evidenceIds.slice();
+      const acceptedFactRefs = factRefs.slice();
+      const scopeId = task.scope_id || task.scopeId || sourceContract.sourceScopeId || sourceContract.scopeId || `scope-${shortHash(`${sourceContract.id || sourceTitle}:source`)}`;
+      const primaryFact = sharedPrimaryFacts[0] || null;
+      const localFactsById = new Map(sourceFacts.map((fact) => [String(fact.factId), normalizeTaskWorkflowFactRecord(fact, {
+        scopeId: fact.scopeId || scopeId,
+        evidenceId: fact.evidenceId || primaryEvidenceId,
+        sourceId: fact.sourceId || sourceContract.sourceId || "source-contract",
+        sourceSurface: fact.sourceSurface || fact.value || sourceSummary
+      })]).filter((entry) => entry[1]));
+      for (const entry of selectedSemanticEvidence) for (const fact of entry.chunk?.structuredFacts || []) {
+        const normalized = normalizeTaskWorkflowFactRecord(fact, {
+          factId: fact.factId || fact.fact_id || fact.id,
+          scopeId: fact.scopeId || fact.scope_id || entry.scopeIds?.[0] || scopeId,
+          evidenceId: fact.evidenceId || fact.evidence_id || entry.evidenceId,
+          sourceId: fact.sourceId || fact.source_id || entry.provenance?.sourceId || sourceContract.sourceId || "semantic-evidence",
+          sourceSurface: fact.sourceSurface || fact.source_surface || fact.value || fact.text || entry.text
+        });
+        if (normalized && !localFactsById.has(normalized.factId)) localFactsById.set(normalized.factId, normalized);
+      }
+      const factBindings = acceptedFactRefs.map((factId) => taskWorkflowFactBindingFromFact(localFactsById.get(String(factId)), semanticEvidenceById.get(String(localFactsById.get(String(factId))?.evidenceId)), scopeId)).filter(Boolean);
+      const bundleId = `bundle-${shortHash(`${options.taskId || task.id || `task-${index}`}:${scopeId}:${evidenceIds.join(",")}:${factRefs.join(",")}`)}`;
+      const bundle = {
+        version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+        taskId: options.taskId || task.id || `task-${index}`,
+        task_id: options.taskId || task.id || `task-${index}`,
+        scope_id: scopeId,
+        scopeId,
+        evidence_ids: evidenceIds,
+        evidenceIds,
+        fact_refs: factRefs,
+        factRefs,
+        fact_bindings: factBindings,
+        factBindings,
+        sourceContract,
+        primaryEvidenceId,
+        primaryFactId: primaryFact?.factId || "",
+        acceptedEvidenceIds,
+        acceptedFactRefs,
+        immutable: true,
+        promptBundleId: bundleId,
+        validatorBundleId: bundleId
+      };
+      bundle.promptBundleHash = taskWorkflowHash(bundle);
+      bundle.validatorBundleHash = bundle.promptBundleHash;
+      const corpus = [sourceSummary, ...selectedSemanticEvidence.map((entry) => entry.text)].filter(Boolean).join("\n\n");
+      return deepFreezeTaskWorkflow(Object.assign(bundle, {
+        index,
+        corpus,
+        groundedCorpus: corpus,
+        primarySourceEvidence: sourceSummary,
+        supportingSemanticEvidence: selectedSemanticEvidence.map((entry) => ({ evidenceId: entry.evidenceId, path: entry.provenance.path, title: entry.provenance.title, evidence: entry.text || "", fact_refs: entry.factRefs }))
+      }));
+    });
+  }
   const markedGroups = groupMarkedActions(explicitNoteActionMarkers(sourceSummary, settings));
-  const matchingMarkedGroups = (tasks || []).map((task) => markedGroups
-    .map((group) => ({ group, score: markedActionTaskTreeScore(group, task) }))
-    .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score)[0]?.group || null);
-  const queries = (tasks || []).map((task, index) => [task.content, matchingMarkedGroups[index]?.action, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" "));
+  const requestSignals = options.requestSignals || taskRequestedActionSignals(sourceSummary, options.sourceType || "note", settings);
+  const queries = (tasks || []).map((task) => [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" "));
+  const matchingMarkedGroups = (tasks || []).map((task, index) => {
+    const competingQueries = queries.filter((_, queryIndex) => queryIndex !== index);
+    const exclusiveAnchors = taskExclusiveEvidenceAnchors(queries[index], competingQueries);
+    return markedGroups
+      .map((group) => {
+        const groupText = [group.action, ...(group.references || []).map((reference) => reference.action)].filter(Boolean).join(" ");
+        const score = markedActionTaskTreeScore(group, task);
+        const exclusiveHits = taskEvidenceAnchorHitCount(groupText, exclusiveAnchors);
+        return { group, score, exclusiveHits };
+      })
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score || right.exclusiveHits - left.exclusiveHits)[0]?.group || null;
+  });
+  for (let index = 0; index < queries.length; index += 1) {
+    queries[index] = [queries[index], matchingMarkedGroups[index]?.action].filter(Boolean).join(" ");
+  }
   return (tasks || []).map((task, index) => {
     const query = queries[index];
     const markedGroup = matchingMarkedGroups[index];
     const markedEvidence = markedGroup ? uniqueValues((markedGroup.references || []).map((item) => item.action)).join(" ") : "";
     const exclusiveAnchors = taskExclusiveEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
-    const competingAnchors = taskCompetingEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index));
+    const markedExclusiveAnchors = markedGroup
+      ? taskExclusiveEvidenceAnchors(markedGroup.action || "", markedGroups.filter((group) => group !== markedGroup).map((group) => group.action || ""))
+      : [];
+    const requiredEvidenceAnchors = taskEvidenceScopeAnchors([...exclusiveAnchors, ...markedExclusiveAnchors]);
+    const competingAnchors = taskEvidenceScopeAnchors(taskCompetingEvidenceAnchors(query, queries.filter((_, queryIndex) => queryIndex !== index)));
     const markedWindow = taskMarkedActionSourceWindow(sourceSummary, markedGroup, query, settings, 900);
-    const sourceExcerpt = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors });
-    const sourceEvidence = uniqueValues([markedEvidence, markedWindow, sourceExcerpt].filter(Boolean)).join("\n");
-    const sourceEvidenceTokens = taskDedupeTokenSet(canonicalTaskMatchTitle(sourceEvidence));
+    const allowedMarkedActionLines = markedGroup?.references?.length
+      ? new Set(markedGroup.references.map((reference) => Number(reference.line) || 0))
+      : null;
+    const sourceExcerpt = taskSpecificEvidenceExcerpt(sourceSummary, query, settings, 900, { requiredAnchors: requiredEvidenceAnchors, excludedNeighborAnchors: competingAnchors, allowedMarkedActionLines });
+    const sourceEvidence = uniqueValues([markedEvidence, markedWindow, markedGroup ? "" : sourceExcerpt].filter(Boolean)).join("\n");
     const contextChunks = taskRelevantDescriptionContext(task, context, settings, 3, {
-      requiredAnchors: exclusiveAnchors,
-      excludedNeighborAnchors: competingAnchors
-    }).filter((chunk) => taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`, generatedTaskObjectTerms(query)) > 0);
+      requiredAnchors: requiredEvidenceAnchors,
+      excludedNeighborAnchors: competingAnchors,
+      allowLegacySourceOnlyValidation: options.allowLegacySourceOnlyValidation === true
+    });
     const contextEvidenceEntries = contextChunks.map((chunk) => {
       const source = sourceReference(chunk, citationState.basePath || "");
       const citationNumber = source ? citationState.citationMap?.get(source) : null;
-      const anchorTerms = generatedTaskObjectTerms(query);
-      const anchorHits = taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${chunk.text || ""}`, anchorTerms);
-      const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchorTerms);
-      if (!semanticEligible || anchorHits < 1) return null;
-      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors }) || truncateAtWord(stripTaskAndMetadataLines(chunk.text || ""), 520);
+      const relevance = {
+        selected: true,
+        tier: "semantic-selected",
+        reason: "selected semantic evidence bundle entry",
+        provenance: chunk.provenance || chunk.createdAtSource || "semantic-index context",
+        temporalRelation: chunk.temporalRelation || semanticTemporalRelation(chunk)
+      };
+      const excerpt = taskSpecificEvidenceExcerpt(chunk.text || "", query, settings, 520, { requiredAnchors: exclusiveAnchors, excludedNeighborAnchors: competingAnchors }) || stripTaskAndMetadataLines(chunk.text || "");
       if (!excerpt) return null;
-      const contextTokens = taskDedupeTokenSet(canonicalTaskMatchTitle(excerpt));
-      if (sourceEvidenceTokens.size && contextTokens.size && tokenDiceScore(sourceEvidenceTokens, contextTokens) >= 0.9) return null;
       const label = citationNumber ? `Context Note (${citationNumber})` : "Supporting note";
-      const evidence = truncateAtWord(excerpt, 520);
+      const evidence = excerpt;
       return {
         prompt: `${label}: ${chunk.title || chunk.path || "Vault note"}\nEvidence: ${evidence}`,
         evidence,
         source,
         citationNumber: citationNumber || 0,
+        relevance,
         chunk
       };
     }).filter(Boolean);
     const contextEvidence = contextEvidenceEntries.map((entry) => entry.prompt);
+    const taskLocalEvidence = taskDescriptionStructuredEvidence(task, requestSignals);
+    const groundedCorpus = [sourceEvidence, ...contextEvidenceEntries.map((entry) => [entry.chunk?.title || entry.chunk?.path || "", entry.chunk?.path || "", entry.evidence].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n");
     const hasRelevantSupportingContext = Boolean(contextEvidence.length);
     const prompt = [
       `Task ${index}: ${task.content || "Untitled task"}`,
@@ -14262,8 +19058,23 @@ function buildTaskDescriptionEvidenceBundles(tasks = [], sourceSummary = "", con
     ].filter(Boolean).join("\n");
     return {
       index,
-      prompt: truncateMarkdownAtWord(prompt, 2200),
-      corpus: [sourceEvidence, ...contextEvidenceEntries.map((entry) => entry.evidence)].filter(Boolean).join("\n\n"),
+      scope_id: task.scope_id || task.scopeId || "",
+      evidence_ids: uniqueValues((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean)),
+      fact_refs: uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean)),
+      immutable: Boolean(task.evidenceBundle || task.taskEvidenceBundle),
+      evidenceBundle: task.evidenceBundle || task.taskEvidenceBundle || null,
+      prompt,
+      primarySourceEvidence: sourceEvidence,
+      supportingSemanticEvidence: contextEvidenceEntries.map((entry) => ({
+        title: entry.chunk?.title || entry.chunk?.path || "Vault note",
+        path: entry.chunk?.path || "",
+        evidence: entry.evidence || "",
+        source: entry.source || "",
+        citationNumber: entry.citationNumber || 0
+      })),
+      corpus: [groundedCorpus, taskLocalEvidence].filter(Boolean).join("\n\n"),
+      groundedCorpus,
+      taskLocalEvidence,
       contextChunks,
       contextEvidenceEntries,
       hasRelevantSupportingContext,
@@ -14283,6 +19094,59 @@ function taskExclusiveEvidenceAnchors(query = "", competingQueries = []) {
   return generatedTaskObjectTerms(query).filter((term) => !competing.has(term));
 }
 
+const TASK_EVIDENCE_WEAK_SCOPE_TERMS = new Set(["after", "before", "during", "following", "once", "until", "when"]);
+
+function taskEvidenceScopeAnchors(anchors = []) {
+  return uniqueValues(anchors).filter((term) => !TASK_EVIDENCE_WEAK_SCOPE_TERMS.has(term));
+}
+
+const TASK_CONTEXT_MATERIAL_DETAIL_TERMS = new Set([
+  "agenda", "approved", "artifact", "criteria", "current", "decision", "deliverable", "dependency", "direction", "measure", "measures", "purpose", "rationale", "recipient", "reviewer", "scope", "wording"
+]);
+const TASK_CONTEXT_ADMIN_NOISE_TERMS = new Set(["administrative", "attendance", "calendar", "coordination", "logistics", "room", "status", "tracking", "updates"]);
+
+function taskContextMaterialDetailHits(text = "") {
+  return generatedTaskObjectTerms(text).filter((term) => TASK_CONTEXT_MATERIAL_DETAIL_TERMS.has(term));
+}
+
+function taskContextRelevance(task = {}, chunk = {}, options = {}) {
+  const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
+  const anchors = options.anchors || generatedTaskObjectTerms(query);
+  const body = String(chunk.text || "");
+  const bodyAnchorHits = taskEvidenceAnchorHitCount(body, anchors);
+  const materialDetailHits = taskContextMaterialDetailHits(body);
+  const adminNoiseHits = generatedTaskObjectTerms(body).filter((term) => TASK_CONTEXT_ADMIN_NOISE_TERMS.has(term));
+  const requiredAnchorHits = taskEvidenceAnchorHitCount(`${chunk.title || ""} ${chunk.path || ""} ${body}`, options.requiredAnchors || []);
+  const scopeTerms = chunk.retrievalScopeTerms || [];
+  const scopeAnchorHits = taskEvidenceAnchorHitCount(scopeTerms.join(" "), anchors);
+  const scopeTokenCount = generatedTaskObjectTerms(scopeTerms.join(" ")).length;
+  const scopeCoverage = scopeTokenCount ? scopeAnchorHits / scopeTokenCount : 1;
+  const provenance = chunk.provenance || chunk.createdAtSource || "semantic-index context";
+  const temporalToken = /\b(?:january|february|march|april|may|june|july|august|september|october|november|december|20\d{2})\b/i;
+  const taskTemporal = singleLine(task.content || "").match(temporalToken)?.[0]?.toLowerCase() || "";
+  const chunkTemporal = `${chunk.title || ""} ${body}`.match(temporalToken)?.[0]?.toLowerCase() || "";
+  const temporalRelation = chunkTemporal ? (taskTemporal && chunkTemporal === taskTemporal ? "current-window" : taskTemporal ? "historical" : "dated") : "undated";
+  if (scopeTerms.length && chunk.retrievalScopeMatch !== true && scopeCoverage < 0.6) {
+    return { selected: false, tier: "scope-conflict", reason: "semantic retrieval scope conflicts with the task's concrete project or entity scope", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  if (adminNoiseHits.length && !materialDetailHits.length) {
+    return { selected: false, tier: "noise", reason: "same-topic administrative/status noise without material task detail", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  if (!bodyAnchorHits) {
+    return { selected: false, tier: "noise", reason: "title/path overlap without task-object evidence", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  if (temporalRelation === "current-window" && (Number(chunk.semanticScore || 0) >= 0.4 || Number(chunk.matchScore || 0) >= 0.6)) {
+    return { selected: true, tier: "current-or-explicit", reason: "current-window semantic match with task-object evidence", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  if (requiredAnchorHits > 0) {
+    return { selected: true, tier: "current-or-explicit", reason: "task-exclusive scope anchor plus task-object evidence", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  if (materialDetailHits.length) {
+    return { selected: true, tier: temporalRelation === "historical" ? "historical-support" : "task-support", reason: temporalRelation === "historical" ? "historical context adds current direction, criteria, or artifact detail" : "task-object evidence adds material execution detail", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+  }
+  return { selected: false, tier: "weak", reason: "task-object overlap lacks material intent, criteria, dependency, or artifact detail", provenance, temporalRelation, bodyAnchorHits, materialDetailHits, requiredAnchorHits, scopeCoverage };
+}
+
 function taskCompetingEvidenceAnchors(query = "", competingQueries = []) {
   const current = new Set(generatedTaskObjectTerms(query));
   return uniqueValues((competingQueries || []).flatMap((item) => generatedTaskObjectTerms(item))).filter((term) => !current.has(term));
@@ -14291,18 +19155,25 @@ function taskCompetingEvidenceAnchors(query = "", competingQueries = []) {
 function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_SETTINGS, maxChars = 700, options = {}) {
   const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
   const anchors = generatedTaskObjectTerms(query);
-  if (!anchors.length) return summarizeSourceForTaskContext(cleaned, query, maxChars, settings, { strictQuery: true });
+  if (!anchors.length) return cleaned;
+  let lineOffset = 0;
   const sentences = cleaned
     .split(/\n{2,}/)
-    .flatMap((paragraph, paragraphIndex) => paragraph.split(/\n+/)
-      .flatMap((line) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()).map((sentence) => ({ text: singleLine(sentence), paragraphIndex }))))
+    .flatMap((paragraph, paragraphIndex) => {
+      const lines = paragraph.split(/\n+/);
+      const result = lines.flatMap((line, lineIndex) => splitDescriptionSentences(line.replace(/^[-*]\s+/, "").trim()).map((sentence) => ({ text: singleLine(sentence), paragraphIndex, lineNumber: lineOffset + lineIndex })));
+      lineOffset += lines.length + 1;
+      return result;
+    })
     .filter((item) => item.text.length >= 18);
   const minimumHits = taskEvidenceMinimumAnchorHits(anchors);
   const requiredAnchors = options.requiredAnchors || [];
   const excludedNeighborAnchors = options.excludedNeighborAnchors || [];
+  const allowedMarkedActionLines = options.allowedMarkedActionLines;
   const requireExclusiveAnchor = requiredAnchors.length > 0 && sentences.some((item) => taskEvidenceAnchorHitCount(item.text, requiredAnchors) > 0);
   const selected = new Set();
   for (let index = 0; index < sentences.length; index += 1) {
+    if (allowedMarkedActionLines && noteActionMarkerRegex(settings, true).test(sentences[index].text) && !allowedMarkedActionLines.has(sentences[index].lineNumber + 1)) continue;
     const anchorHits = taskEvidenceAnchorHitCount(sentences[index].text, anchors);
     if (anchorHits < minimumHits) continue;
     if (requireExclusiveAnchor && taskEvidenceAnchorHitCount(sentences[index].text, requiredAnchors) < 1) {
@@ -14321,7 +19192,7 @@ function taskSpecificEvidenceExcerpt(text = "", query = "", settings = DEFAULT_S
     }
   }
   const excerpt = Array.from(selected).sort((left, right) => left - right).map((index) => sentences[index].text).join(" ");
-  return truncateAtWord(excerpt, maxChars);
+  return excerpt;
 }
 
 function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
@@ -14333,6 +19204,358 @@ function taskEvidenceNeighborIsCohesive(candidate = "", anchor = "") {
   const dependencyContinuation = /\b(?:must|should|cannot|can't|depends?|dependency|requires?|required|needed|approv(?:e|al|ed)|before|after|once|until)\b/i.test(candidate);
   const namedDependencyOwner = /^(?!Before\b|After\b|Once\b|When\b|This\b|That\b)[A-Z][A-Za-z'-]{2,}\b/.test(singleLine(candidate));
   return dependencyContinuation && (referentialStart || namedDependencyOwner);
+}
+
+function taskDescriptionStructuredEvidence(task = {}, requestSignals = {}) {
+  const fields = [];
+  const addField = (label, value) => {
+    const text = String(value || "").trim();
+    if (text) fields.push(`${label}: ${text}`);
+  };
+  addField("Task action", task.content);
+  addField("Task intent", task.knowledge?.intent);
+  addField("Task rationale", task.knowledge?.rationale || task.knowledge?.purpose);
+  addField("Task dependency", task.knowledge?.dependency);
+  addField("Task labels", (task.labels || []).join(", "));
+  for (const subtask of task.subtasks || []) {
+    if (!subtask?.content) continue;
+    addField("Required subtask", [subtask.content, subtask.description].filter(Boolean).join(" — "));
+  }
+  const requestCoverage = taskDescriptionRequestCoverage(task, requestSignals);
+  if (requestCoverage) addField("Mandatory request facts", requestCoverage);
+  return fields.join("\n");
+}
+
+function taskDescriptionEvidenceCurrentState(item = {}) {
+  return singleLine(
+    item.currentState
+    || item.current_state
+    || item.state
+    || item.status
+    || item.taskReference?.currentState
+    || item.taskReference?.current_state
+    || item.taskReference?.state
+    || item.taskReference?.status
+    || item.provenance?.currentState
+    || item.provenance?.state
+    || ""
+  ).toLowerCase();
+}
+
+function taskDescriptionTaskReferenceSourceKind(sourceKind = "") {
+  return isTaskReferenceSnapshotSourceKind(sourceKind) || sourceKind === "note-task-reference-row";
+}
+
+function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContract = null) {
+  const bundle = evidence?.evidenceBundle || task.evidenceBundle || task.taskEvidenceBundle || {};
+  const facts = (bundle.facts || []).map((fact) => ({
+    factId: fact.factId || "",
+    type: fact.type || fact.kind || "",
+    kind: fact.kind || "",
+    role: fact.role || "",
+    value: fact.value || fact.sourceSurface || "",
+    sourceSurface: fact.sourceSurface || fact.value || "",
+    evidenceId: fact.evidenceId || "",
+    scopeId: fact.scopeId || "",
+    current: fact.current === true,
+    temporalRelation: fact.temporalRelation || "",
+    authorityState: fact.authorityState || "",
+    conflictState: fact.conflictState || "",
+    mandatoryFor: Array.isArray(fact.mandatoryFor) ? fact.mandatoryFor.slice() : [],
+    optional: fact.kind === "primary-context" && !(fact.mandatoryFor || []).length
+  })).filter((fact) => fact.factId);
+  const primary = (bundle.items || []).find((item) => item.sourceKind === "current-source") || {};
+  const supporting = (bundle.items || []).filter((item) => item.sourceKind !== "current-source").map((item) => ({
+    evidenceId: item.evidenceId || "",
+    sourceId: item.provenance?.sourceId || item.sourceId || "",
+    sourceKind: item.sourceKind || "",
+    semanticScore: Number(item.semanticScore || 0),
+    title: item.provenance?.title || item.title || "",
+    path: item.provenance?.path || item.path || "",
+    excerpt: item.excerpt || item.text || "",
+    authorityState: item.authorityState || item.provenance?.authority || "",
+    current: item.current === true || item.temporalRelation === "current",
+    temporalRelation: item.temporalRelation || "",
+    conflictState: item.conflictState || "none",
+    currentState: taskDescriptionEvidenceCurrentState(item),
+    createdAt: item.createdAt || item.provenance?.createdAt || "",
+    modifiedAt: item.modifiedAt || item.updatedAt || item.provenance?.modifiedAt || item.provenance?.updatedAt || "",
+    observedAt: item.observedAt || item.provenance?.observedAt || "",
+    lineStart: Number(item.provenance?.lineStart || item.lineStart || 0),
+    lineEnd: Number(item.provenance?.lineEnd || item.lineEnd || 0),
+    taskId: item.taskId || ""
+  })).filter((item) => item.evidenceId);
+  const citationLedger = [
+    primary.evidenceId ? {
+      number: 1,
+      section: "Sources",
+      evidenceId: primary.evidenceId,
+      sourceId: primary.provenance?.sourceId || primary.sourceId || sourceContract?.sourceId || "",
+      title: primary.provenance?.title || sourceContract?.title || "Primary source",
+      path: primary.provenance?.path || sourceContract?.path || "",
+      sourceKind: primary.sourceKind || "current-source"
+    } : null,
+    ...supporting.map((entry, index) => Object.assign({}, entry, { number: index + 2, section: "Context" }))
+  ].filter(Boolean);
+  const value = (field, aliases = []) => {
+    for (const key of [field, ...aliases]) {
+      const candidate = singleLine(task[key] || "");
+      if (candidate) return candidate;
+    }
+    return "";
+  };
+  return {
+    taskId: String(task.id || task.taskId || ""),
+    oid: String(task.oid || ""),
+    scopeId: String(task.scope_id || task.scopeId || bundle.scopeId || ""),
+    title: task.content || "",
+    narrativeDescription: String(task.description || "").trim(),
+    currentState: singleLine(task.currentState || task.current_state || task.state || (task.isCompleted ? "completed" : "open")),
+    people: Array.isArray(task.people) ? task.people.slice(0, 12) : [],
+    owner: value("owner", ["assignee"]),
+    person: value("person"),
+    recipient: value("recipient", ["audience"]),
+    reviewer: value("reviewer", ["approver"]),
+    deliverable: value("deliverable", ["artifact", "output"]),
+    dependency: value("dependency", ["blocker", "dependsOn"]),
+    nextStep: value("nextStep", ["next_step", "next"]),
+    timing: value("timing", ["timingRequirement", "schedule"]) || String(task.due_date || task.deadline_date || ""),
+    criteria: value("criteria", ["successCriteria", "acceptanceCriteria", "reviewCriteria"]),
+    project: task.projectName || task.project || "",
+    section: task.section || "",
+    hierarchy: {
+      parentId: task.parentId || task.parentTaskId || "",
+      parentContent: task.parentContent || "",
+      rootId: task.rootTaskId || task.rootId || "",
+      childIds: Array.isArray(task.childTaskIds) ? task.childTaskIds.slice() : [],
+      childOids: Array.isArray(task.childOids) ? task.childOids.slice() : [],
+      treePath: Array.isArray(task.treePath) ? task.treePath.slice() : []
+    },
+    primarySourceEvidence: {
+      evidenceId: primary.evidenceId || bundle.evidenceIds?.[0] || "",
+      sourceId: primary.provenance?.sourceId || primary.sourceId || sourceContract?.sourceId || "",
+      sourceKind: primary.sourceKind || "current-source",
+      excerpt: primary.excerpt || sourceContract?.facts?.map((fact) => fact.sourceSurface || fact.value || "").filter(Boolean).join(" ") || "",
+      authorityState: primary.authorityState || "authoritative",
+      current: true,
+      temporalRelation: primary.temporalRelation || "current",
+      conflictState: primary.conflictState || "none",
+      provenance: primary.provenance || {}
+    },
+    supportingSemanticEvidence: supporting,
+    citationLedger,
+    evidenceIds: (bundle.evidenceIds || bundle.evidence_ids || []).slice(),
+    factRefs: (bundle.factRefs || bundle.fact_refs || []).slice(),
+    factBindings: (bundle.fact_bindings || bundle.factBindings || []).slice(),
+    requiredFactTypes: facts.filter((fact) => fact.current && ["task", "description", "identity"].some((target) => (sourceContract?.facts || []).find((candidate) => candidate.factId === fact.factId)?.mandatoryFor?.includes(target))).map((fact) => fact.type),
+    typedFacts: facts
+  };
+}
+
+function validateTaskDescriptionCitationNumbers(value = "", citationLedger = []) {
+  const allowed = new Set((citationLedger || []).map((entry) => Number(entry.number)).filter(Number.isFinite));
+  const used = Array.from(String(value || "").matchAll(/\((\d+)\)/g)).map((match) => Number(match[1]));
+  const unknown = uniqueValues(used.filter((number) => !allowed.has(number)).map(String));
+  return {
+    valid: unknown.length === 0,
+    usedNumbers: uniqueValues(used.map(String)),
+    unknownNumbers: unknown,
+    reason: unknown.length ? "description citation number was not present in the task-local ledger" : ""
+  };
+}
+
+function taskDescriptionSentenceText(value = "") {
+  return String(value || "")
+    .replace(/\s*\(\s*\d+\s*\)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function renderTaskDescriptionSentences(sentences = [], citationLedger = []) {
+  const numbersByEvidenceId = new Map((citationLedger || [])
+    .filter((entry) => entry?.evidenceId && Number.isFinite(Number(entry.number)))
+    .map((entry) => [String(entry.evidenceId), Number(entry.number)]));
+  return (sentences || []).map((sentence) => {
+    const text = taskDescriptionSentenceText(sentence?.text || "");
+    const citations = uniqueValues((sentence?.evidence_ids || []).map(String))
+      .map((evidenceId) => numbersByEvidenceId.get(evidenceId))
+      .filter((number) => Number.isFinite(number));
+    const narrative = /[.!?]$/.test(text) ? text : `${text}.`;
+    return `${narrative}${citations.length ? ` ${citations.map((number) => `(${number})`).join(" ")}` : ""}`;
+  }).join(" ").trim();
+}
+
+function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs = {}, sourceContract = null, citationLedger = []) {
+  const errors = [];
+  const rawSentences = Array.isArray(item.description_sentences) ? item.description_sentences : [];
+  if (!rawSentences.length) return { valid: false, errors: ["description-sentence-missing"], sentences: [], rendered: "" };
+  const bundle = structuredRefs.bundle || task.evidenceBundle || task.taskEvidenceBundle || null;
+  const allowedEvidence = new Set((structuredRefs.evidenceIds || []).map(String));
+  const allowedFacts = new Set((structuredRefs.factRefs || []).map(String));
+  const ledgerByEvidenceId = new Map((citationLedger || []).filter((entry) => entry?.evidenceId).map((entry) => [String(entry.evidenceId), entry]));
+  const factsById = new Map((bundle?.facts || []).map((fact) => [String(fact.factId), fact]));
+  const itemsByEvidenceId = new Map((bundle?.items || []).map((entry) => [String(entry.evidenceId), entry]));
+  const coveredMandatoryFacts = new Set();
+  const sentences = [];
+  for (let index = 0; index < rawSentences.length; index += 1) {
+    const raw = rawSentences[index] || {};
+    const text = taskDescriptionSentenceText(raw.text || "");
+    if (!text) {
+      errors.push(`description-sentence-empty:${index}`);
+      continue;
+    }
+    const evidenceIds = uniqueValues((raw.evidence_ids || []).map(String).filter(Boolean));
+    const factRefs = uniqueValues((raw.fact_refs || []).map(String).filter(Boolean));
+    if (!evidenceIds.length) errors.push(`description-sentence-evidence-missing:${index}`);
+    if (!factRefs.length) errors.push(`description-sentence-fact-missing:${index}`);
+    for (const evidenceId of evidenceIds) {
+      if (!allowedEvidence.has(evidenceId)) errors.push(`description-sentence-foreign-evidence:${index}:${evidenceId}`);
+      const ledgerEntry = ledgerByEvidenceId.get(evidenceId);
+      if (!ledgerEntry) errors.push(`description-sentence-citation-ledger-missing:${index}:${evidenceId}`);
+      const evidence = itemsByEvidenceId.get(evidenceId);
+      if (evidence && (evidence.authorityState === "rejected" || evidence.authorityState === "conflict" || evidence.conflictState === "conflict" || evidence.conflictState === "conflicted")) errors.push(`description-sentence-evidence-unusable:${index}:${evidenceId}`);
+    }
+    for (const factId of factRefs) {
+      if (!allowedFacts.has(factId)) {
+        errors.push(`description-sentence-foreign-fact:${index}:${factId}`);
+        continue;
+      }
+      const fact = factsById.get(factId);
+      if (!fact) {
+        errors.push(`description-sentence-foreign-fact:${index}:${factId}`);
+        continue;
+      }
+      if (!evidenceIds.includes(String(fact.evidenceId))) errors.push(`description-sentence-fact-evidence-mismatch:${index}:${factId}`);
+      if (fact.authorityState === "rejected" || fact.authorityState === "conflict" || fact.conflictState === "conflict" || fact.conflictState === "conflicted") errors.push(`description-sentence-fact-unusable:${index}:${factId}`);
+      if (Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description")) coveredMandatoryFacts.add(factId);
+    }
+    sentences.push({ text, evidence_ids: evidenceIds, fact_refs: factRefs });
+  }
+  for (const fact of bundle?.facts || []) {
+    if (Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description") && !coveredMandatoryFacts.has(String(fact.factId))) {
+      errors.push(`description-sentence-mandatory-fact-omitted:${fact.factId}`);
+    }
+  }
+  const uniqueErrors = uniqueValues(errors);
+  return {
+    valid: uniqueErrors.length === 0,
+    errors: uniqueErrors,
+    sentences,
+    rendered: uniqueErrors.length ? "" : renderTaskDescriptionSentences(sentences, citationLedger)
+  };
+}
+
+function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = null, options = {}) {
+  const factsById = new Map();
+  const evidenceById = new Map();
+  const evidenceTextById = new Map();
+  const citationLedgerByTask = {};
+  const contextBundle = options.contextBundle || null;
+  const promptEvidenceIds = new Set((contextBundle?.promptEvidenceIds || []).map(String));
+  const addEvidence = (entry = {}) => {
+    const evidenceId = String(entry.evidenceId || "");
+    if (!evidenceId || evidenceById.has(evidenceId)) return;
+    const excerpt = entry.excerpt || entry.text || entry.evidence || "";
+    if (excerpt) evidenceTextById.set(evidenceId, excerpt);
+    const completeEntry = {
+      evidenceId,
+      sourceId: String(entry.sourceId || entry.provenance?.sourceId || ""),
+      sourceKind: String(entry.sourceKind || ""),
+      title: entry.title || entry.provenance?.title || "",
+      path: entry.path || entry.provenance?.path || "",
+      excerpt,
+      semanticScore: Number(entry.semanticScore || 0),
+      authorityState: entry.authorityState || entry.provenance?.authority || "",
+      current: entry.current === true,
+      temporalRelation: entry.temporalRelation || "",
+      conflictState: entry.conflictState || "none",
+      currentState: taskDescriptionEvidenceCurrentState(entry),
+      createdAt: entry.createdAt || entry.provenance?.createdAt || "",
+      modifiedAt: entry.modifiedAt || entry.updatedAt || entry.provenance?.modifiedAt || entry.provenance?.updatedAt || "",
+      observedAt: entry.observedAt || entry.provenance?.observedAt || "",
+      lineStart: Number(entry.lineStart || entry.provenance?.lineStart || 0),
+      lineEnd: Number(entry.lineEnd || entry.provenance?.lineEnd || 0),
+      taskId: String(entry.taskId || "")
+    };
+    if (!promptEvidenceIds.has(evidenceId)) {
+      evidenceById.set(evidenceId, completeEntry);
+      return;
+    }
+    evidenceById.set(evidenceId, {
+      evidenceId,
+      prefixEvidenceRef: true,
+      semanticScore: completeEntry.semanticScore,
+      currentState: completeEntry.currentState,
+      createdAt: completeEntry.createdAt,
+      modifiedAt: completeEntry.modifiedAt,
+      observedAt: completeEntry.observedAt,
+      taskId: completeEntry.taskId
+    });
+  };
+  for (const item of mainTasks || []) {
+    const rich = item.taskLocalEvidence || {};
+    addEvidence(rich.primarySourceEvidence || {});
+    for (const entry of rich.supportingSemanticEvidence || []) addEvidence(entry);
+    citationLedgerByTask[String(item.index)] = (rich.citationLedger || []).map((entry) => ({
+      number: Number(entry.number || 0),
+      section: String(entry.section || ""),
+      evidenceId: String(entry.evidenceId || "")
+    })).filter((entry) => entry.evidenceId);
+    for (const fact of rich.typedFacts || []) {
+      if (!fact?.factId) continue;
+      const normalizedFact = Object.assign({}, fact);
+      if (normalizedFact.sourceSurface === normalizedFact.value) delete normalizedFact.sourceSurface;
+      const evidenceId = String(normalizedFact.evidenceId || "");
+      if (normalizedFact.value && normalizedFact.value === evidenceTextById.get(evidenceId)) {
+        delete normalizedFact.value;
+        if (normalizedFact.sourceSurface === evidenceTextById.get(evidenceId)) delete normalizedFact.sourceSurface;
+        normalizedFact.valueEvidenceId = evidenceId;
+      }
+      factsById.set(String(fact.factId), normalizedFact);
+    }
+  }
+  return {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    sourceContractId: String(sourceContract?.id || sourceContract?.sourceContractId || ""),
+    promptEvidenceHash: String(contextBundle?.promptEvidenceHash || ""),
+    factsById: Object.fromEntries(factsById),
+    evidenceById: Object.fromEntries(evidenceById),
+    citationLedgerByTask
+  };
+}
+
+function taskDescriptionPromptTask(item = {}) {
+  const rich = item.taskLocalEvidence || {};
+  return Object.assign({}, item, {
+    primarySourceEvidence: undefined,
+    supportingSemanticEvidence: undefined,
+    immutableEvidenceBundle: undefined,
+    taskLocalEvidence: {
+      taskId: rich.taskId || "",
+      oid: rich.oid || "",
+      scopeId: rich.scopeId || item.scope_id || "",
+      title: rich.title || item.title || "",
+      narrativeDescription: rich.narrativeDescription || "",
+      currentState: rich.currentState || "",
+      people: rich.people || [],
+      owner: rich.owner || "",
+      person: rich.person || "",
+      recipient: rich.recipient || "",
+      reviewer: rich.reviewer || "",
+      deliverable: rich.deliverable || "",
+      dependency: rich.dependency || "",
+      nextStep: rich.nextStep || "",
+      timing: rich.timing || "",
+      criteria: rich.criteria || "",
+      project: rich.project || "",
+      section: rich.section || "",
+      hierarchy: rich.hierarchy || {},
+      evidenceIds: rich.evidenceIds || item.evidence_ids || [],
+      factRefs: rich.factRefs || item.fact_refs || [],
+      factBindings: rich.factBindings || item.fact_bindings || [],
+      requiredFactTypes: rich.requiredFactTypes || []
+    }
+  });
 }
 
 function taskEvidenceAnchorHitCount(text = "", anchors = []) {
@@ -14358,6 +19581,40 @@ function taskSemanticEvidenceEligible(chunk = {}, anchorHits = 0, anchors = []) 
 }
 
 function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFAULT_SETTINGS, limit = 3, options = {}) {
+  if (options.sourceContract) {
+    const selected = [];
+    const seen = new Set();
+    for (const chunk of context || []) {
+      if (!chunk?.path || semanticTaskReferenceChunkSelected(chunk) || seen.has(chunk.path)) continue;
+      const evidenceId = chunk.evidenceId || chunk.evidence_id || "";
+      if (!evidenceId && options.requireEvidence !== false) continue;
+      seen.add(chunk.path);
+      selected.push(chunk);
+      if (selected.length >= Math.max(0, limit)) break;
+    }
+    return selected;
+  }
+  if (options.allowLegacySourceOnlyValidation !== true) {
+    /* Admit only already-selected typed semantic evidence; never rank or scan legacy context here. */
+    const taskId = String(task.id || task.taskId || "");
+    const taskScopeId = String(task.scope_id || task.scopeId || "");
+    return (context || []).filter((chunk) => {
+      if (!chunk?.path || semanticTaskReferenceChunkSelected(chunk)) return false;
+      const evidenceId = chunk.evidenceId || chunk.evidence_id || "";
+      if (!evidenceId) return false;
+      if (chunk.retrievalScopeMatch === false) return false;
+      if (taskId && (chunk.taskId || chunk.task_id) && String(chunk.taskId || chunk.task_id) !== taskId) return false;
+      const scopeIds = evidenceScopeIdsForChunk(chunk);
+      if (taskScopeId && scopeIds.length && !scopeIds.includes(taskScopeId)) return false;
+      const semanticScore = Number(chunk.semanticScore || 0);
+      const matchScore = Number(chunk.matchScore || 0);
+      const scored = Object.hasOwn(chunk, "semanticScore") || Object.hasOwn(chunk, "matchScore");
+      return scored
+        ? (semanticScore >= 0.35 || matchScore >= 0.4 || chunk.semanticOnly === true)
+        : Boolean(chunk.task_id || chunk.taskId);
+    }).slice(0, Math.max(0, limit));
+  }
+  /* Legacy lexical task-specific evidence filtering is gated to explicit validation only. */
   const query = [task.content, (task.labels || []).join(" "), (task.subtasks || []).map((subtask) => subtask.content).join(" ")].filter(Boolean).join(" ");
   const queryTerms = termCounts(query);
   const anchors = generatedTaskObjectTerms(query);
@@ -14372,16 +19629,19 @@ function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFA
       const score = lexicalScore(queryTerms, text) + anchorHits * 3 + requiredAnchorHits * 4 - competingAnchorHits * 2 + Number(chunk.matchScore || 0);
       const scopeMismatch = Boolean((chunk.retrievalScopeTerms || []).length && chunk.retrievalScopeMatch !== true);
       const semanticEligible = taskSemanticEvidenceEligible(chunk, anchorHits, anchors);
-      return { chunk, score, anchorHits, requiredAnchorHits, competingAnchorHits, scopeMismatch, semanticEligible };
+      const relevance = taskContextRelevance(task, chunk, { anchors, requiredAnchors });
+      return { chunk, score, anchorHits, requiredAnchorHits, competingAnchorHits, scopeMismatch, semanticEligible, relevance };
     });
   const requireExclusiveAnchor = requiredAnchors.length > 0 && candidates.some((item) => item.requiredAnchorHits > 0);
   return uniqueChunksByPath(candidates
     .filter((item) => {
-      if (item.scopeMismatch || item.score <= 0) return false;
+      if ((item.scopeMismatch && !item.relevance.selected) || item.score <= 0) return false;
       const generallyRelevant = item.anchorHits >= taskEvidenceMinimumAnchorHits(anchors) || item.semanticEligible;
       if (!generallyRelevant) return false;
-      if (!requireExclusiveAnchor || item.requiredAnchorHits > 0) return true;
-      return item.competingAnchorHits === 0 && item.anchorHits >= Math.max(2, taskEvidenceMinimumAnchorHits(anchors) + 1);
+      if (item.semanticEligible && !item.scopeMismatch) return true;
+      if (item.relevance.selected) return true;
+      if (requireExclusiveAnchor && item.requiredAnchorHits > 0) return true;
+      return !item.scopeMismatch && item.competingAnchorHits === 0 && item.anchorHits >= Math.max(2, taskEvidenceMinimumAnchorHits(anchors) + 1);
     })
     .sort((left, right) => right.score - left.score || Number(right.chunk.createdAt || right.chunk.modifiedAt || 0) - Number(left.chunk.createdAt || left.chunk.modifiedAt || 0))
     .map((item) => item.chunk))
@@ -14389,12 +19649,23 @@ function taskRelevantDescriptionContext(task = {}, context = [], settings = DEFA
 }
 
 function taskDescriptionGroundingReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
+  if (evidence?.degradedState) return evidence.degradedState;
+  if (evidence?.immutable || evidence?.sourceContract || (Array.isArray(evidence?.evidence_ids) && evidence.evidence_ids.length > 0 && Object.hasOwn(evidence, "scope_id"))) {
+    const evidenceIds = Array.isArray(evidence.evidence_ids) ? evidence.evidence_ids.map(String) : [];
+    const factRefs = Array.isArray(evidence.fact_refs) ? evidence.fact_refs.map(String) : [];
+    const allowedEvidence = new Set((evidence.acceptedEvidenceIds || evidence.evidence_ids || []).map(String));
+    const allowedFacts = new Set((evidence.acceptedFactRefs || evidence.fact_refs || []).map(String));
+    if (!evidenceIds.length || !factRefs.length) return "missing task-specific evidence references";
+    if (evidenceIds.some((id) => !allowedEvidence.has(id)) || factRefs.some((id) => !allowedFacts.has(id))) return "foreign task evidence reference";
+    if (evidence.primaryEvidenceId && !evidenceIds.includes(evidence.primaryEvidenceId)) return "missing current-source evidence";
+    if (evidence.primaryFactId && !factRefs.includes(evidence.primaryFactId)) return "missing current-source fact";
+    if (!singleLine(value)) return "description has no task-focused narrative";
+    return "passed";
+  }
   const evidenceReason = taskDescriptionEvidenceReason(value, task, evidence, settings);
   if (evidenceReason !== "passed") return evidenceReason;
   const clarityReason = taskDescriptionClarityReason(value, task, settings);
   if (clarityReason !== "passed") return clarityReason;
-  const knowledgeReason = taskDescriptionKnowledgeCoverageReason(value, task, evidence);
-  if (knowledgeReason !== "passed") return knowledgeReason;
   return "passed";
 }
 
@@ -14427,18 +19698,8 @@ function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, s
   const styleReason = taskDescriptionStyleReason(value);
   if (styleReason) return styleReason;
   if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
-  const corpus = String(evidence?.corpus || "");
-  if (!corpus.trim()) return "missing task-specific evidence";
   const unsupportedFact = taskDescriptionUnsupportedFactReason(value, evidence, settings);
   if (unsupportedFact) return unsupportedFact;
-  const scopeReason = taskDescriptionTaskScopeReason(value, task);
-  if (scopeReason) return scopeReason;
-  const descriptionTerms = generatedTaskObjectTerms(value);
-  const corpusCounts = termCounts(corpus);
-  const supportedTerms = descriptionTerms.filter((term) => contextAnchorVariants(term).some((variant) => corpusCounts[variant]));
-  if (descriptionTerms.length >= 3 && !supportedTerms.length) return "description has no specific overlap with its evidence";
-  const detailReason = taskDescriptionEvidenceDetailReason(value, task, evidence);
-  if (detailReason) return detailReason;
   return "passed";
 }
 
@@ -14467,7 +19728,7 @@ function taskDescriptionScopeAnchors(task = {}) {
 }
 
 function taskDescriptionEvidenceDetailReason(value = "", task = {}, evidence = null) {
-  const corpus = String(evidence?.corpus || "");
+  const corpus = String(evidence?.groundedCorpus || evidence?.corpus || "");
   if (corpus.length < 120) return "";
   const titleCounts = termCounts(task.content || "");
   const descriptionCounts = termCounts(value);
@@ -14485,7 +19746,17 @@ function taskDescriptionEvidenceDetailReason(value = "", task = {}, evidence = n
 }
 
 function taskDescriptionUnsupportedFactReason(value = "", evidence = null, settings = DEFAULT_SETTINGS) {
-  const corpus = String(evidence?.corpus || "");
+  const bundle = evidence?.evidenceBundle || evidence?.bundle || evidence || {};
+  const explicitCorpus = [evidence?.corpus, evidence?.groundedCorpus, bundle?.corpus, bundle?.groundedCorpus]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const boundFacts = Array.isArray(evidence?.facts) ? evidence.facts : (Array.isArray(bundle?.facts) ? bundle.facts : []);
+  const boundItems = Array.isArray(evidence?.items) ? evidence.items : (Array.isArray(bundle?.items) ? bundle.items : []);
+  const structuredCorpus = [
+    ...boundFacts.map((fact) => fact?.sourceSurface || fact?.value || ""),
+    ...boundItems.map((item) => item?.excerpt || item?.text || "")
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const corpus = uniqueValues([...explicitCorpus, ...structuredCorpus]).join("\n\n");
   if (!corpus.trim()) return "missing task-specific evidence";
   const corpusLower = corpus.toLowerCase();
   const dates = uniqueValues(String(value || "").match(/\b20\d{2}-\d{2}-\d{2}\b|\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*20\d{2})?\b/gi) || []);
@@ -14560,6 +19831,8 @@ function taskDescriptionPromptBoilerplateReason(value = "") {
 
 function taskDescriptionStyleReason(value = "") {
   const text = singleLine(value || "");
+  const structuredHeading = /(?:^|\n)\s*(?:goal|intent|person(?:\s+involved)?|source|where\s+this\s+came\s+from|context|evidence|action|outcome|deliverable|recipient|owner|criteria|dependencies?|rationale|next\s+step|notes?)\s*:/i;
+  if (structuredHeading.test(String(value || ""))) return "uses structured field headings instead of a narrative execution brief";
   const crossTaskPatterns = [
     [/\bseparate(?:ly)?\s+from\s+(?:the\s+)?(?:other|today'?s|next|previous|prior|preceding|following)\s+task\b/i, "references a separate or ordered task"],
     [/\b(?:another|the\s+other|a\s+different|separate)\s+task\b/i, "references another task"],
@@ -14598,32 +19871,8 @@ function taskDescriptionClarityReason(value = "", task = {}, settings = DEFAULT_
   if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
-  const title = singleLine(task.content || "").toLowerCase();
-  if (title && singleLine(cleaned).toLowerCase().startsWith(title)) return "starts by repeating the task title";
-  const text = removeTitleEcho(cleaned, task.content || "");
-  if (/^subject\s*:/i.test(text)) return "starts with a pasted subject line";
-  if (/(?:^|[.!?]\s+)[a-z][^.!?]{12,}(?:[.!?]|$)/.test(text)) return "contains a sentence fragment";
-  if ((text.match(/;/g) || []).length >= 2) return "contains a semicolon-delimited excerpt fragment";
-  const sentences = splitDescriptionSentences(text);
-  const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
-  if (words.length < 12) return "missing enough task-specific narrative detail";
-  const intentText = sentences[0] || text;
-  const intentSignal = /\b(?:review|compare|draft|confirm|send|prepare|identify|finali[sz]e|coordinate|verify|update|complete|decide|assess|provide|resolve|clarify|determine|check|summari[sz]e|respond|apply|incorporate|use)\b/i.test(text) || /\b(?:needs?|should|must|is|are)\s+(?:to\s+)?be\s+(?:reviewed|compared|drafted|confirmed|sent|prepared|identified|finali[sz]ed|coordinated|verified|updated|completed|decided|assessed|provided|resolved|clarified|determined|checked|summari[sz]ed|applied|incorporated|used)\b/i.test(text);
-  if (!intentSignal) return "missing clear task intent";
-  const actionAlignment = taskDescriptionActionAlignmentReason(text, task);
-  if (actionAlignment !== "passed") return actionAlignment;
-  const titleScopeReason = taskDescriptionTitleScopeReason(text, task);
-  if (titleScopeReason !== "passed") return titleScopeReason;
-  if (/\b(?:so (?:that )?)?(?:the |this )?(?:task|work|process|project|request)\s+(?:can|may|will|should)\s+(?:proceed|continue|move forward|advance|be completed)\b/i.test(text)) return "task purpose is generic";
-  const finalSentence = sentences[sentences.length - 1] || text;
-  if (circularDescriptionOutcome(finalSentence)) return "completion wording is circular or non-specific";
-  if (/\b(?:ready for (?:the )?(?:next steps?|further action)|successful completion|completion of (?:the |this )?(?:task|work|request)|(?:task|work|request) (?:is )?(?:completed|done|finished))\b/i.test(finalSentence)) return "completion wording is generic";
-  const historicalOutcome = /\b(?:was|were|had been|already|previously|earlier)\s+(?:approved|confirmed|verified|identified|documented|sent|submitted|resolved|closed|finali[sz]ed|completed|published|released)\b/i.test(finalSentence);
-  const observableOutcome = /\b(?:complete when|done when|expected outcome|result(?:ing)?|deliverable|ready for|will|would|can|should|must|needs? to|is to|are to|to be|so that|so the|before|after|once|when|if)\b/i.test(finalSentence);
-  if (historicalOutcome && !observableOutcome) return "ends with historical status instead of current task context";
-  const hasConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending)\b/i.test(task.content || "");
-  const preservesConditionalHandoff = /\b(?:if|unless|once|after|before|when|subject to|depending on|pending|requires?|required)\b/i.test(text);
-  if (hasConditionalHandoff && !preservesConditionalHandoff) return "missing conditional dependency or handoff requirement";
+  if (!singleLine(cleaned)) return "description has no task-focused narrative";
+  if (/^(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(cleaned)) return "description contained prompt-injection text";
   return "passed";
 }
 
@@ -14692,37 +19941,16 @@ const SUBTASK_VAGUE_OBJECT_WORDS = new Set([
 function subtaskClarityReason(subtask = {}, parentTask = {}) {
   const text = singleLine(subtask.content || "");
   if (!text) return "missing subtask title";
-  const words = canonicalTaskMatchTitle(text).split(/\s+/).filter(Boolean);
-  if (words.length < 3) return "subtask is too short to identify a checkable step";
-  const conditionalAction = text.match(/^(?:if|unless|once|after|before|when)\b[^,]{3,},\s*(.+)$/i)?.[1] || "";
-  const actionText = conditionalAction || text;
-  if (/^(?:it|this|that|these|those|them)\b/i.test(actionText)) return "subtask starts with an unexplained pronoun";
-  if (!taskStructureLeadingAction(actionText)) return "subtask does not start with a concrete user action";
-  if (/^(?:apply|approve|check|circulate|confirm|deliver|edit|finalize|forward|incorporate|prepare|provide|publish|review|revise|send|share|submit|update|upload|use|validate|verify)\s+(?:it|this|that|them|these|those)(?:\s+(?:to|with|for|after|before|once|if|when)\b|$)/i.test(actionText)) return "subtask uses an unexplained pronoun instead of naming its object or deliverable";
-  if (/\b(?:about|on|regarding)\s+(?:it|this|that|them|these|those)\b/i.test(actionText)) return "subtask uses an unexplained pronoun instead of naming its topic or decision";
-  if (/^(?:check|confirm|follow\s+up)\s+with\s+\S+(?:\s+\S+)?[.!?]?$/i.test(actionText)) return "subtask names a recipient but not what must be checked or confirmed";
-  const objectTokens = Array.from(taskStructureObjectTokens(actionText)).filter((word) => !SUBTASK_VAGUE_OBJECT_WORDS.has(word));
-  if (!objectTokens.length) return "subtask does not name a concrete object, recipient, decision, or deliverable";
-  if (/^(?:check|confirm|follow(?:\s+up)?|review|update)\s+(?:it|this|that|them|these|those|details?|information|status|next steps?)\.?$/i.test(actionText)) return "subtask is a generic follow-up without actionable scope";
-  const parentKey = canonicalTaskMatchTitle(parentTask.content || "");
-  if (parentKey && canonicalTaskMatchTitle(text) === parentKey) return "subtask repeats the parent task";
+  if (text.length > 250) return "subtask title exceeded 250 characters";
+  if (/^(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "subtask title contained prompt-injection text";
   return "passed";
 }
 
 function mainTaskClarityReason(task = {}) {
   const text = singleLine(task.content || "");
   if (!text) return "missing main task title";
-  const words = canonicalTaskMatchTitle(text).split(/\s+/).filter(Boolean);
-  if (words.length < 3) return "main task title is too short to identify its action and scope";
-  if (/^(?:it|this|that|these|those|them)\b/i.test(text)) return "main task title starts with an unexplained pronoun";
-  if (/^(?:use|send)\s+(?:start\s+)?(?:to\s+)?(?:finali[sz](?:e|ing)|develop|review|prepare|draft)\b/i.test(text)) return "main task title stacks unrelated action prefixes";
-  if (!taskStructureLeadingAction(text)) return "main task title does not start with a concrete user action";
-  if (/^(?:apply|approve|check|circulate|confirm|deliver|edit|finalize|forward|incorporate|prepare|provide|publish|review|revise|send|share|submit|update|upload|use|validate|verify)\s+(?:it|this|that|them|these|those)(?:\s+(?:to|with|for|after|before|once|if|when)\b|$)/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its object or deliverable";
-  if (/\b(?:about|on|regarding)\s+(?:it|this|that|them|these|those)\b/i.test(text)) return "main task title uses an unexplained pronoun instead of naming its topic or decision";
-  if (/^(?:check|confirm|follow\s+up)\s+with\s+\S+(?:\s+\S+)?[.!?]?$/i.test(text)) return "main task title names a recipient but not what must be checked or confirmed";
-  const objectTokens = Array.from(taskStructureObjectTokens(text)).filter((word) => !SUBTASK_VAGUE_OBJECT_WORDS.has(word));
-  if (!objectTokens.length) return "main task title does not name a concrete object, recipient, decision, or deliverable";
-  if (/^(?:check|confirm|follow(?:\s+up)?|review|update)\s+(?:it|this|that|them|these|those|details?|information|status|next steps?)\.?$/i.test(text)) return "main task title is a generic follow-up without actionable scope";
+  if (text.length > 250) return "main task title exceeded 250 characters";
+  if (/^(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "main task title contained prompt-injection text";
   return "passed";
 }
 
@@ -14815,8 +20043,25 @@ function taskStructureSafetySnapshot(tasks = []) {
 
 function restoreTaskStructureAfterDedupeRegression(tasks = [], snapshot = []) {
   const issues = taskPlanRepairableHierarchyIssues(tasks);
-  if (!issues.length) return 0;
   const snapshotByKey = new Map((snapshot || []).map((item) => [item.key, item]));
+  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
+    const task = tasks[taskIndex] || {};
+    const key = task.oid ? `oid:${task.oid}` : `index:${taskIndex}`;
+    const previous = snapshotByKey.get(key);
+    if (!previous) continue;
+    const previousSubtasks = previous.subtasks || [];
+    const currentSubtasks = task.subtasks || [];
+    const regressed = currentSubtasks.some((currentSubtask, index) => {
+      const previousSubtask = (currentSubtask?.oid
+        ? previousSubtasks.find((candidate) => candidate?.oid === currentSubtask.oid)
+        : null) || previousSubtasks[index];
+      return Boolean(previousSubtask?.content)
+        && singleLine(previousSubtask.content) !== singleLine(previous.content)
+        && singleLine(currentSubtask?.content || "") === singleLine(task.content || "")
+        && singleLine(currentSubtask?.content || "") !== singleLine(previousSubtask.content);
+    });
+    if (regressed) issues.push({ code: "dedupe-content-regression", taskIndex, blocking: false });
+  }
   const restored = new Set();
   for (const issue of issues) {
     const task = tasks[issue.taskIndex];
@@ -14824,11 +20069,10 @@ function restoreTaskStructureAfterDedupeRegression(tasks = [], snapshot = []) {
     const key = task.oid ? `oid:${task.oid}` : `index:${issue.taskIndex}`;
     const previous = snapshotByKey.get(key);
     if (!previous || previous.initialIssueCodes.includes(issue.code) || restored.has(key)) continue;
-    const currentSubtasks = task.subtasks || [];
-    task.content = previous.content;
-    task.subtasks = previous.subtasks.map((subtask, index) => {
-      const current = currentSubtasks.find((candidate) => candidate.oid && subtask.oid && candidate.oid === subtask.oid)
-        || currentSubtasks.find((candidate) => canonicalTaskMatchTitle(candidate.content || "") === canonicalTaskMatchTitle(subtask.content || ""))
+      const currentSubtasks = task.subtasks || [];
+      task.content = previous.content;
+      task.subtasks = previous.subtasks.map((subtask, index) => {
+        const current = currentSubtasks.find((candidate) => candidate.oid && subtask.oid && candidate.oid === subtask.oid)
         || currentSubtasks[index]
         || {};
       return Object.assign({}, subtask, {
@@ -14848,7 +20092,7 @@ function restoreTaskStructureAfterDedupeRegression(tasks = [], snapshot = []) {
 const TASK_PLAN_REPAIRABLE_STRUCTURE_CODES = new Set(["bundled-main-actions", "overloaded-main-title", "subtask-restates-parent", "subtask-mismatched-parent", "overlapping-subtasks", "overlapping-main-tasks"]);
 
 function taskPlanRepairableHierarchyIssues(tasks = [], options = {}) {
-  const issues = generatedTaskStructureIssues(tasks).filter((issue) => TASK_PLAN_REPAIRABLE_STRUCTURE_CODES.has(issue.code));
+  const issues = [];
   for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
     const reason = mainTaskClarityReason(tasks[taskIndex] || {});
     if (reason !== "passed") issues.push({ code: "unclear-main-title", taskIndex, blocking: true, reason });
@@ -14907,6 +20151,13 @@ function applyLocalGeneratedTaskQualityCorrections(tasks = [], options = {}) {
     const before = task.labels || [];
     task.labels = before.filter((label) => cleanLabel(label).toLowerCase() !== cleanLabel(issue.label).toLowerCase());
     if (task.labels.length !== before.length) corrections.push(`removed unsupported #${cleanLabel(issue.label)} label from task ${issue.taskIndex + 1}`);
+  }
+  for (const issue of generatedTaskTemporalIssues(tasks, options.sourceEvidence || "")) {
+    if (!/^implausible-(?:due|deadline)-date$/.test(issue.code)) continue;
+    const task = taskForIssue(issue);
+    if (!task || !Object.prototype.hasOwnProperty.call(task, issue.field)) continue;
+    task[issue.field] = null;
+    corrections.push(`removed unsupported inferred ${issue.field} from task ${issue.taskIndex + 1}`);
   }
   for (const issue of generatedTaskPriorityIssues(tasks, options.sourceEvidence || "", options.priorityInstructions || "", options.settings || DEFAULT_SETTINGS)) {
     const task = taskForIssue(issue);
@@ -15119,31 +20370,45 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
   const contextEvidence = context.map((chunk) => `${chunk.title || chunk.path || ""}\n${chunk.text || ""}`).join("\n\n");
   const groundingEvidence = [sourceEvidence, contextEvidence].filter(Boolean).join("\n\n");
   const citationState = contextCitationState(plan.contextNotes || [], sourceContext.path || options.path || "", options.citeContextNotes !== false);
-  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, plan.sourceSummary || sourceContext.text || "", context, options.sourceTitle || sourceContext.title || "", settings, citationState);
-  const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
   const requestSignals = plan.requestedActionSignals || taskRequestedActionSignals(sourceContext.text || plan.sourceSummary || "", options.source || "note", settings);
+  const structuredEvidence = Boolean(plan.sourceContract && plan.evidenceCatalog);
+  const evidenceBundles = structuredEvidence
+    ? (tasks || []).map((task, index) => ({ index, evidenceBundle: task.evidenceBundle || task.taskEvidenceBundle, scope_id: task.scope_id, evidence_ids: task.evidence_ids || [], fact_refs: task.fact_refs || [] }))
+    : buildTaskDescriptionEvidenceBundles(tasks, plan.sourceSummary || sourceContext.text || "", context, options.sourceTitle || sourceContext.title || "", settings, citationState, {
+    requestSignals,
+    sourceType: options.source || "note"
+  });
+  const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
   const seenTitles = new Set();
   let subtaskCount = 0;
   let labelCount = 0;
   for (let index = 0; index < (tasks || []).length; index += 1) {
     const task = tasks[index] || {};
-    const titleKey = canonicalTaskMatchTitle(task.content || "");
+    if (structuredEvidence) {
+      const evidenceValidation = validateTaskWorkflowEvidenceReferences(task, index, plan.sourceContract, plan.evidenceCatalog, { settings });
+      if (!evidenceValidation.valid) addIssue("invalid-task-evidence-references", index, true, evidenceValidation.errors.join("; "));
+    }
+    const titleKey = singleLine(task.content || "");
     if (!titleKey) addIssue("missing-main-title", index);
-    else if (seenTitles.has(titleKey) && !task.possibleDuplicate) addIssue("duplicate-main-title", index);
-    else seenTitles.add(titleKey);
+    const stableTaskIdentity = String(task.todoistId || task.id || task.oid || "");
+    if (stableTaskIdentity && seenTitles.has(`identity:${stableTaskIdentity}`) && !task.possibleDuplicate) addIssue("duplicate-main-identity", index);
+    if (stableTaskIdentity) seenTitles.add(`identity:${stableTaskIdentity}`);
     const mainTitleClarity = mainTaskClarityReason(task);
     if (mainTitleClarity !== "passed") addIssue("unclear-main-title", index, true, mainTitleClarity);
-    if (task.content && !generatedTaskMatchesPrimarySource(task, groundingEvidence)) addIssue("ungrounded-main-title", index);
+    const descriptionFailure = Boolean(taskDescriptionGenerationFailure(task));
+    if (descriptionFailure) addIssue("description-generation-failed", index, false, taskDescriptionGenerationFailure(task).reason);
     const splitDescription = splitDescriptionSourceListBlock(task.description || "");
-    const descriptionReason = taskDescriptionEvidenceReason(splitDescription.summary, task, evidenceBundles[index], settings);
-    if (descriptionReason !== "passed") addIssue("ungrounded-main-description", index, true, descriptionReason);
-    const clarityReason = taskDescriptionClarityReason(splitDescription.summary, task, settings);
-    if (descriptionReason === "passed" && clarityReason !== "passed") addIssue("ungrounded-main-description", index, true, clarityReason);
-    const linkReason = taskDescriptionLinkIntegrityReason(splitDescription.summary, task, evidenceBundles[index], settings);
-    if (linkReason !== "passed") addIssue("invalid-main-description-link", index, true, linkReason);
+    const descriptionReason = structuredEvidence
+      ? structuredTaskDescriptionQualityReason(splitDescription.summary, task, evidenceBundles[index]?.evidenceBundle)
+      : taskDescriptionEvidenceReason(splitDescription.summary, task, evidenceBundles[index], settings);
+    if (descriptionReason !== "passed") addIssue("ungrounded-main-description", index, !taskDescriptionFailureIsAdvisory(task, "ungrounded-main-description"), descriptionReason);
+    const clarityReason = structuredEvidence ? "passed" : taskDescriptionClarityReason(splitDescription.summary, task, settings);
+    if (descriptionReason === "passed" && clarityReason !== "passed") addIssue("ungrounded-main-description", index, !taskDescriptionFailureIsAdvisory(task, "ungrounded-main-description"), clarityReason);
+    const linkReason = structuredEvidence ? "passed" : taskDescriptionLinkIntegrityReason(splitDescription.summary, task, evidenceBundles[index], settings);
+    if (linkReason !== "passed") addIssue("invalid-main-description-link", index, !taskDescriptionFailureIsAdvisory(task, "invalid-main-description-link"), linkReason);
     const requestFactReason = taskDescriptionRequestCoverageReason(splitDescription.summary, task, requestSignals);
-    if (requestFactReason) addIssue("missing-description-request-fact", index, true, requestFactReason);
-    if (options.citeContextNotes !== false && !splitDescription.sourceList) addIssue("missing-source-list", index);
+    if (requestFactReason) addIssue("missing-description-request-fact", index, !taskDescriptionFailureIsAdvisory(task, "missing-description-request-fact"), requestFactReason);
+    if (options.citeContextNotes !== false && !splitDescription.sourceList) addIssue("missing-source-list", index, !taskDescriptionFailureIsAdvisory(task, "missing-source-list"));
     if (task.due_date && !validDate(task.due_date)) addIssue("invalid-due-date", index);
     if (task.deadline_date && !validDate(task.deadline_date)) addIssue("invalid-deadline-date", index);
     if (normalizePriority(task.priority) !== Number(task.priority || 1)) addIssue("invalid-priority", index);
@@ -15152,17 +20417,19 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     if (new Set(taskLabels.map((label) => label.toLowerCase())).size !== taskLabels.length) addIssue("duplicate-label", index);
     if (!task.id && taskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("label-not-allowed", index);
     const seenSubtasks = new Set();
-    for (const subtask of task.subtasks || []) {
+    for (const [subtaskIndex, subtask] of (task.subtasks || []).entries()) {
       subtaskCount += 1;
-      const subtaskKey = canonicalTaskMatchTitle(subtask.content || "");
+      const subtaskKey = singleLine(subtask.content || "");
       if (!subtaskKey) addIssue("missing-subtask-title", index);
-      else if (subtaskKey === titleKey) addIssue("subtask-restates-parent", index);
-      else if (seenSubtasks.has(subtaskKey)) addIssue("duplicate-subtask-title", index);
-      else seenSubtasks.add(subtaskKey);
-      const subtaskEvidence = [groundingEvidence, task.content, splitDescription.summary].filter(Boolean).join("\n");
-      if (subtask.content && !generatedTaskMatchesPrimarySource(subtask, subtaskEvidence)) addIssue("ungrounded-subtask", index);
+      const stableSubtaskIdentity = String(subtask.todoistId || subtask.id || subtask.oid || "");
+      if (stableSubtaskIdentity && seenSubtasks.has(`identity:${stableSubtaskIdentity}`)) addIssue("duplicate-subtask-identity", index);
+      if (stableSubtaskIdentity) seenSubtasks.add(`identity:${stableSubtaskIdentity}`);
       const subtaskClarity = subtaskClarityReason(subtask, task);
       if (subtaskClarity !== "passed") addIssue("unclear-subtask", index, true, subtaskClarity);
+      if (structuredEvidence) {
+        const subtaskValidation = validateTaskWorkflowEvidenceReferences(subtask, `${index}.${subtaskIndex}`, plan.sourceContract, plan.evidenceCatalog, { settings });
+        if (!subtaskValidation.valid) addIssue("invalid-subtask-evidence-references", index, true, subtaskValidation.errors.join("; "));
+      }
       const subtaskLabels = (subtask.labels || []).map(cleanLabel).filter(Boolean);
       labelCount += subtaskLabels.length;
       if (!subtask.id && subtaskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("subtask-label-not-allowed", index);
@@ -15177,7 +20444,6 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     for (const issue of generatedEmailChronologyIssues(tasks, plan.sourceSummary || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
     for (const issue of generatedEmailOwnershipIssues(tasks, sourceEvidence, plan.sourceSummary || "")) addIssue(issue.code, issue.taskIndex, true, JSON.stringify(issue));
   }
-  for (const issue of generatedTaskStructureIssues(tasks)) addIssue(issue.code, issue.taskIndex, TASK_PLAN_REPAIRABLE_STRUCTURE_CODES.has(issue.code), JSON.stringify(issue));
   const requestCoverage = taskRequestCoverageReport(tasks, requestSignals);
   if (!requestCoverage.passed) addIssue("missing-requested-outcome", 0, true, JSON.stringify(requestCoverage));
   const blockingIssues = issues.filter((issue) => issue.blocking).length;
@@ -15197,6 +20463,156 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
   };
 }
 
+function emptyTaskDescriptionFailureReport() {
+  return { attempted: 0, generated: 0, failed: 0, failures: [] };
+}
+
+const TASK_DESCRIPTION_FAILURE_REASON_CODES = new Set([
+  "omitted-index",
+  "missing-or-nontext",
+  "cleaned-empty-or-title-echo",
+  "grounding-failure",
+  "grounding-missing-evidence",
+  "grounding-unsupported-date",
+  "grounding-unsupported-entity",
+  "grounding-unsupported-state",
+  "grounding-scope",
+  "grounding-overlap",
+  "grounding-detail",
+  "grounding-knowledge",
+  "request-fact-failure",
+  "provider-failure",
+  "response-parse-failure",
+  "response-shape-failure",
+  "description-sentence-missing",
+  "description-sentence-empty",
+  "description-sentence-evidence-missing",
+  "description-sentence-fact-missing",
+  "description-sentence-foreign-evidence",
+  "description-sentence-foreign-fact",
+  "description-sentence-citation-ledger-missing",
+  "description-sentence-evidence-unusable",
+  "description-sentence-fact-evidence-mismatch",
+  "description-sentence-fact-unusable",
+  "description-sentence-mandatory-fact-omitted",
+  "quality-too-short",
+  "quality-fragment",
+  "quality-generic",
+  "quality-prompt-commentary",
+  "quality-missing-intent",
+  "quality-completion-framing",
+  "quality-scope",
+  "quality-other"
+]);
+
+function taskDescriptionFailureReasonCode(reason = "", stage = "") {
+  const text = singleLine(reason || "").toLowerCase();
+  if (TASK_DESCRIPTION_FAILURE_REASON_CODES.has(String(reason || ""))) return String(reason);
+  if (stage === "response" || /(?:omitted|repeated).*index/.test(text)) {
+    return /parse/.test(text) ? "response-parse-failure" : /shape|unexpected/.test(text) ? "response-shape-failure" : "omitted-index";
+  }
+  if (stage === "missing/nontext" || /missing or not text/.test(text)) return "missing-or-nontext";
+  if (stage === "provider" || /provider call failed/.test(text)) return "provider-failure";
+  if (stage === "sentences" || /description-sentence-/.test(text)) {
+    const code = text.match(/description-sentence-(?:missing|empty|evidence-missing|fact-missing|foreign-evidence|foreign-fact|citation-ledger-missing|evidence-unusable|fact-evidence-mismatch|fact-unusable|mandatory-fact-omitted)/)?.[0];
+    return code || "description-sentence-missing";
+  }
+  if (/json could not be parsed/.test(text)) return "response-parse-failure";
+  if (/response shape was invalid|unexpected task or section/.test(text)) return "response-shape-failure";
+  if (stage === "request" || /missing (?:recipient|requested object|condition|decision (?:alternative|criterion))|request(?:ed)? fact/.test(text)) return "request-fact-failure";
+  if (stage === "evidence" || /(?:unknown|foreign|rejected|conflict|missing|required).*\b(?:evidence|fact|ref)/.test(text)) return "evidence-ref-failure";
+  if (stage === "grounding" || /ground|evidence|unsupported|cross-task|task-specific/.test(text)) {
+    if (/missing task-specific evidence/.test(text)) return "grounding-missing-evidence";
+    if (/unsupported date/.test(text)) return "grounding-unsupported-date";
+    if (/unsupported (?:person or entity|link)/.test(text)) return "grounding-unsupported-entity";
+    if (/unsupported workflow state/.test(text)) return "grounding-unsupported-state";
+    if (/mixes unrelated context|cross-task|task scope|task-focused/.test(text)) return "grounding-scope";
+    if (/no specific overlap/.test(text)) return "grounding-overlap";
+    if (/missing source-grounded action context|useful details/.test(text)) return "grounding-detail";
+    if (/missing source-grounded (?:rationale|dependency) detail/.test(text)) return "grounding-knowledge";
+    return "grounding-failure";
+  }
+  if (/too short \(0 characters\)|starts by repeating the task title|title-only|cleaned?.*empty|empty.*cleaned/.test(text)) return "cleaned-empty-or-title-echo";
+  if (/too short/.test(text)) return "quality-too-short";
+  if (/fragment/.test(text)) return "quality-fragment";
+  if (/generic/.test(text)) return "quality-generic";
+  if (/prompt|commentary/.test(text)) return "quality-prompt-commentary";
+  if (/intent/.test(text)) return "quality-missing-intent";
+  if (/completion|result|outcome/.test(text)) return "quality-completion-framing";
+  if (/scope/.test(text)) return "quality-scope";
+  return "quality-other";
+}
+
+function sanitizeTaskDescriptionFailure(reason = "") {
+  return taskDescriptionFailureReasonCode(reason);
+}
+
+function taskDescriptionFailureReport(attempted = 0, generated = 0, failures = new Map(), tasks = []) {
+  const entries = Array.from(failures.entries())
+    .sort((left, right) => left[0] - right[0])
+    .map(([taskIndex, reason]) => ({
+      taskIndex,
+      taskNumber: taskIndex + 1,
+      task: truncateAtWord(singleLine(tasks[taskIndex]?.content || "Untitled task"), 140),
+      reasonCode: sanitizeTaskDescriptionFailure(reason),
+      reason: sanitizeTaskDescriptionFailure(reason)
+    }));
+  return {
+    attempted,
+    generated: Math.max(0, Math.min(generated, attempted - entries.length)),
+    failed: entries.length,
+    failures: entries
+  };
+}
+
+function clearTaskDescriptionGenerationFailure(task = {}) {
+  if (task && Object.prototype.hasOwnProperty.call(task, TASK_DESCRIPTION_FAILURE_MARKER)) delete task[TASK_DESCRIPTION_FAILURE_MARKER];
+  return task;
+}
+
+function markTaskDescriptionGenerationFailure(task = {}, reason = "") {
+  if (!task) return task;
+  task.description = "";
+  for (const subtask of task.subtasks || []) subtask.description = "";
+  Object.defineProperty(task, TASK_DESCRIPTION_FAILURE_MARKER, {
+    value: { reason: sanitizeTaskDescriptionFailure(reason) },
+    configurable: true,
+    enumerable: false,
+    writable: true
+  });
+  return task;
+}
+
+function taskDescriptionGenerationFailure(task = {}) {
+  return task?.[TASK_DESCRIPTION_FAILURE_MARKER] || null;
+}
+
+function taskDescriptionFailureIsAdvisory(task = {}, code = "") {
+  if (!taskDescriptionGenerationFailure(task)) return false;
+  return new Set([
+    "description-generation-failed",
+    "ungrounded-main-description",
+    "invalid-main-description-link",
+    "missing-description-request-fact",
+    "missing-source-list"
+  ]).has(code);
+}
+
+function taskDescriptionFailureChatMessage(report = {}, options = {}) {
+  const source = options.source ? ` from ${singleLine(options.source)}` : "";
+  const path = options.path ? `\nSource: ${singleLine(options.path)}` : "";
+  const lines = [
+    `${TASK_DESCRIPTION_FAILURE_CHAT_MARKER} Task description generation report${source}.`,
+    "Descriptions are validated independently per task; generation is one cached batched call.",
+    path,
+    ""
+  ].filter((line) => line !== "");
+  for (const failure of report.failures || []) {
+    lines.push(`${failure.taskNumber}. ${failure.task || "Untitled task"}`);
+    lines.push(`   Reason: ${failure.reason}`);
+  }
+  return lines.join("\n");
+}
 function descriptionSpecificEntities(value = "") {
   const ignored = new Set([
     "The", "This", "That", "These", "Those", "A", "An", "Before", "After", "Once", "Then", "Earlier", "Later",
@@ -15213,12 +20629,87 @@ function descriptionSpecificEntities(value = "") {
   }).filter((entity) => entity && !/^(January|February|March|April|May|June|July|August|September|October|November|December)$/i.test(entity))).slice(0, 12);
 }
 
+function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", includeSourceList = true) {
+  if (!includeSourceList) return "";
+  const bundle = task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle;
+  if (!bundle) return "";
+  const lines = ["Source List:"];
+  const seen = new Set();
+  const add = (label, path) => {
+    const cleanPath = singleLine(path || "");
+    if (!cleanPath || seen.has(cleanPath)) return;
+    seen.add(cleanPath);
+    lines.push(`${label}: ${cleanPath}`);
+  };
+  const currentPath = bundle.items.find((item) => item.sourceKind === "current-source")?.provenance?.path || active?.path || "";
+  add("Primary Source", vaultRelativePath(currentPath, basePath));
+  const acceptedEvidenceIds = new Set((bundle.acceptedEvidenceIds || bundle.evidenceIds || bundle.evidence_ids || []).map(String));
+  for (const item of bundle.items || []) {
+    if (item.sourceKind === "current-source") continue;
+    if (acceptedEvidenceIds.size && !acceptedEvidenceIds.has(String(item.evidenceId))) continue;
+    add("Supporting Source", vaultRelativePath(item.provenance?.path || "", basePath));
+  }
+  const ledger = (task.descriptionCitationLedger || task.taskLocalEvidence?.citationLedger || [])
+    .filter((entry) => entry && Number.isInteger(Number(entry.number)) && entry.evidenceId)
+    .filter((entry) => entry.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
+    .filter((entry) => entry.path || entry.taskId || entry.sourceId || entry.title);
+  if (ledger.length) {
+    const renderedCitation = (entry) => {
+      const path = singleLine(entry.path || "");
+      const taskId = String(entry.taskId || (path.match(/^@todoist\/task\/([^/]+)/i) || [])[1] || "");
+      if (taskId || /^@todoist\/(?:task|parent-stub)\//i.test(path) || /task[-_ ]reference|todoist/i.test(entry.sourceKind || "")) {
+        return todoistTaskMarkdownLink(taskId, DEFAULT_SETTINGS, entry.title || `Todoist task ${taskId}`) || singleLine(entry.title || taskId || entry.sourceId);
+      }
+      if (path) {
+        const relative = vaultRelativePath(path, basePath);
+        return relative ? `[${markdownLinkText(relative)}](obsidian://open?file=${encodeURIComponent(relative)})` : singleLine(entry.title || entry.sourceId);
+      }
+      return singleLine(entry.title || entry.sourceId);
+    };
+    const primaryEntries = ledger.filter((entry) => entry.section === "Sources" || entry.sourceKind === "current-source");
+    const contextEntries = ledger.filter((entry) => !primaryEntries.includes(entry));
+    lines.push("", "Sources:");
+    for (const entry of primaryEntries) lines.push(`${Number(entry.number)}. ${renderedCitation(entry)}`);
+    if (contextEntries.length) {
+      lines.push("", "Context:");
+      for (const entry of contextEntries) lines.push(`${Number(entry.number)}. ${renderedCitation(entry)}`);
+    }
+  }
+  return lines.length > 1 ? lines.join("\n") : "";
+}
+
+function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFAULT_SETTINGS, basePath = "", includeSourceList = true) {
+  const bundle = task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle;
+  if (!bundle) return "";
+  const selectedEvidence = new Set(bundle.evidenceIds || bundle.evidence_ids || []);
+  const selectedFacts = new Set(bundle.factRefs || bundle.fact_refs || []);
+  const linkContext = (bundle.facts || []).filter((fact) => selectedFacts.has(fact.factId) && fact.kind === "source-link").map((fact) => fact.value).join("\n");
+  const summary = normalizeDescriptionLinks(cleanGeneratedDescriptionSummary(task.description || "", settings), linkContext, settings);
+  const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList);
+  const parts = [summary, sourceList].filter(Boolean);
+  if (!selectedEvidence.size || !selectedFacts.size) return "";
+  return formatTodoistDescription(parts.join("\n\n"), settings);
+}
+
 function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
   const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
   hydrateContextCitationEvidence(citationState, contextChunks, basePath);
-  const evidenceBundles = buildTaskDescriptionEvidenceBundles(tasks, active?.sourceSummary || active?.text || "", contextChunks, active?.title || "", settings, citationState);
+  const hasStructuredEvidence = (tasks || []).some((task) => task?.descriptionEvidenceBundle || task?.evidenceBundle || task?.taskEvidenceBundle);
+  const evidenceBundles = hasStructuredEvidence
+    ? []
+    : buildTaskDescriptionEvidenceBundles(tasks, active?.sourceSummary || active?.text || "", contextChunks, active?.title || "", settings, citationState);
   for (let index = 0; index < (tasks || []).length; index += 1) {
     const task = tasks[index] || {};
+    if (taskDescriptionGenerationFailure(task)) {
+      task.description = "";
+      for (const subtask of task.subtasks || []) subtask.description = "";
+      continue;
+    }
+    if (task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle) {
+      task.description = renderStructuredTaskDescription(task, active, settings, basePath, includeSourceList);
+      for (const subtask of task.subtasks || []) subtask.description = "";
+      continue;
+    }
     const evidence = evidenceBundles[index] || null;
     const relevantContext = evidence?.contextChunks || [];
     const parentSummary = task.description || "";
@@ -15318,6 +20809,9 @@ function taskDescriptionLinkIntegrityReason(value = "", task = {}, evidence = nu
 function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", settings = DEFAULT_SETTINGS, citationState = {}) {
   const splitSummary = splitDescriptionSourceListBlock(value);
   const cleaned = cleanGeneratedDescriptionSummary(splitSummary.summary || "", settings);
+  if (citationState.preserveTaskCitationLedger === true) {
+    return removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle);
+  }
   return ensureContextCitation(
     sanitizeContextCitations(removeSourceLeadIn(removeTitleEcho(cleaned, taskTitle), sourceTitle), citationState),
     taskTitle,
@@ -15326,26 +20820,18 @@ function cleanTaskDescriptionSummary(value, taskTitle = "", sourceTitle = "", se
 }
 
 function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
-  const text = removeTitleEcho(cleanGeneratedDescriptionSummary(value || "", settings), taskTitle);
-  if (text.length < 80) return false;
-  if (taskDescriptionPromptBoilerplateReason(value)) return false;
-  if (/^use the source material to complete this task\.?$/i.test(text)) return false;
-  if (/^(review|complete|action)\s+(the\s+)?(source|task|material)\b/i.test(text) && text.length < 140) return false;
-  const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
-  return words.length >= 12;
+  return descriptionQualityReason(value, taskTitle, settings) === "passed";
 }
 
 function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
-  const text = removeTitleEcho(cleanGeneratedDescriptionSummary(value || "", settings), taskTitle);
-  if (text.length < 80) return `too short (${text.length} characters)`;
+  const text = singleLine(cleanGeneratedDescriptionSummary(value || "", settings));
+  if (!text) return "description has no task-focused narrative";
+  if (text.length > 1200) return "description exceeded 1200 characters";
   const styleReason = taskDescriptionStyleReason(value);
   if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
-  if (/^use the source material to complete this task\.?$/i.test(text)) return "generic source-material instruction";
-  if (/^(review|complete|action)\s+(the\s+)?(source|task|material)\b/i.test(text) && text.length < 140) return "generic source/task wording";
-  const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
-  if (words.length < 12) return `too few words (${words.length})`;
+  if (/\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "description contained prompt-injection text";
   return "passed";
 }
 
@@ -15456,20 +20942,6 @@ function removeSourceLeadIn(summary, sourceTitle = "") {
     new RegExp(`^(?:according\\s+to|based\\s+on|from)\\s+(?:${genericLead}${titlePattern ? `|${titlePattern}(?:\\.md)?` : ""})\\s*,?\\s*`, "i")
   ].filter(Boolean);
   for (const pattern of patterns) text = text.replace(pattern, "");
-  if (aliases.length) {
-    const canonicalAliases = new Set(aliases.map((alias) => canonicalTaskMatchTitle(alias)).filter(Boolean));
-    const aliasTokenSets = aliases.map((alias) => taskDedupeTokenSet(canonicalTaskMatchTitle(alias)));
-    text = splitDescriptionSentences(text)
-      .filter((sentence) => {
-        const normalized = canonicalTaskMatchTitle(sentence.replace(/\s*\(\d+\)\s*[.!?]?$/, ""));
-        if (canonicalAliases.has(normalized)) return false;
-        const sentenceTokens = taskDedupeTokenSet(normalized);
-        const nearTitle = aliasTokenSets.some((tokens) => tokenDiceScore(sentenceTokens, tokens) >= 0.82);
-        const actionSentence = /\b(?:review|compare|draft|confirm|send|prepare|identify|finali[sz]e|verify|update|complete|decide|resolve)\b/i.test(sentence);
-        return !nearTitle || actionSentence;
-      })
-      .join(" ");
-  }
   return capitalizeSentenceStart(text.trim().replace(/^[,;:\-–—]\s*/, ""));
 }
 
@@ -15533,7 +21005,9 @@ function normalizeDescriptionSourceList(value) {
 function restoreSourceListLineBreaks(value) {
   const restored = String(value || "")
     .replace(/\r\n/g, "\n")
-    .replace(/\s*((?:source list|sources?)\s*:)\s*/i, "Source List:\n")
+    .replace(/\s*(source list\s*:)\s*/i, "Source List:\n")
+    .replace(/\s*(sources\s*:)\s*/i, "\n\nSources:\n")
+    .replace(/\s*(^|\n)(context\s*:)\s*/im, "$1\nContext:\n")
     .replace(/\s*(primary note\s*:)\s*/i, "\nPrimary Note: ")
     .replace(/\s*(context notes?\s*:)\s*/i, "\n\nContext Notes:\n")
     .replace(/\s+(\d{1,2}\.\s+)/g, "\n$1")
@@ -15544,6 +21018,8 @@ function restoreSourceListLineBreaks(value) {
   return restored
     .replace(/^Source List:\n+/i, "Source List:\n")
     .replace(/^Source List:\n+Primary Note:/i, "Source List:\nPrimary Note:")
+    .replace(/\n+Sources:\n+/i, "\n\nSources:\n")
+    .replace(/\n+Context:\n+/i, "\n\nContext:\n")
     .replace(/\n+Context Notes:\n+/i, "\n\nContext Notes:\n");
 }
 
@@ -15571,7 +21047,9 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
       number,
       source: notePath,
       title: note.title || note.basename || notePath,
-      text: note.text || note.excerpt || note.summary || ""
+      text: note.text || note.excerpt || note.summary || "",
+      evidenceIds: uniqueValues(note.evidenceIds || note.evidence_ids || (note.evidenceId ? [note.evidenceId] : [])),
+      sourceIds: uniqueValues(note.sourceIds || note.source_ids || (note.sourceId ? [note.sourceId] : []))
     });
   }
   return {
@@ -15586,12 +21064,16 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
 
 function hydrateContextCitationEvidence(citationState = {}, contextChunks = [], basePath = "") {
   const notes = Array.isArray(citationState.contextCitationNotes) ? citationState.contextCitationNotes : [];
+  citationState.selectedEvidenceIds = uniqueValues((contextChunks || []).map((chunk) => chunk.evidenceId || chunk.evidence_id).filter(Boolean));
   for (const note of notes) {
     const matchingText = (contextChunks || [])
       .filter((chunk) => sourceReference(chunk, basePath) === note.source)
       .map((chunk) => chunk.text || "")
       .filter(Boolean);
     note.text = uniqueValues([note.text, ...matchingText].filter(Boolean)).join("\n\n");
+    const matchingChunks = (contextChunks || []).filter((chunk) => sourceReference(chunk, basePath) === note.source);
+    note.evidenceIds = uniqueValues([...(note.evidenceIds || []), ...matchingChunks.map((chunk) => chunk.evidenceId || chunk.evidence_id).filter(Boolean)]);
+    note.sourceIds = uniqueValues([...(note.sourceIds || []), ...matchingChunks.map((chunk) => chunk.sourceId).filter(Boolean)]);
   }
   return citationState;
 }
@@ -15656,44 +21138,18 @@ function reconcileSentenceContextCitation(sentence = "", taskTitle = "", notes =
   const plain = clean.replace(/\s*\(\d{1,3}\)(?=([.!?;,)]|$))/g, "").replace(/\s+([.!?,;:])/g, "$1").trim();
   const existingNote = notes.find((note) => Number(note.number) === existingNumber);
   if (existingNote && contextCitationSupportsSentence(plain, existingNote, citationState)) return appendContextCitation(plain, existingNote.number);
-  const bestNumber = bestContextCitationNumber(plain, taskTitle, notes);
-  const bestNote = notes.find((note) => Number(note.number) === Number(bestNumber));
-  return bestNote && contextCitationSupportsSentence(plain, bestNote, citationState) ? appendContextCitation(plain, bestNote.number) : plain;
+  return plain;
 }
 
 function contextCitationSupportsSentence(sentence = "", note = {}, citationState = {}) {
-  const noteText = [note.title, note.source, note.text].filter(Boolean).join("\n");
-  const primaryText = String(citationState.primaryText || "");
-  const queryTerms = termCounts(sentence);
-  const noteScore = lexicalScore(queryTerms, noteText);
-  if (noteScore < 1.5) return false;
-  if (!primaryText.trim()) return true;
-  const primaryScore = lexicalScore(queryTerms, primaryText);
-  const sentenceTerms = generatedTaskObjectTerms(sentence);
-  const noteCounts = termCounts(noteText);
-  const primaryCounts = termCounts(primaryText);
-  const primarySupportedTerms = sentenceTerms.filter((term) => contextAnchorVariants(term).some((variant) => primaryCounts[variant]));
-  const contextExclusiveTerms = sentenceTerms.filter((term) => contextAnchorVariants(term).some((variant) => noteCounts[variant]) && !contextAnchorVariants(term).some((variant) => primaryCounts[variant]));
-  if (!contextExclusiveTerms.length && primarySupportedTerms.length >= Math.max(1, Math.ceil(sentenceTerms.length * 0.5))) return false;
-  if (contextExclusiveTerms.length >= 2) return true;
-  if (contextExclusiveTerms.length >= 1 && (primaryScore < 1.5 || noteScore > primaryScore * 1.05)) return true;
-  return noteScore > Math.max(1.5, primaryScore * 1.25);
+  const allowed = citationState.allowedContextCitations instanceof Set ? citationState.allowedContextCitations : null;
+  const evidenceIds = note.evidenceIds || note.evidence_ids || [];
+  const selectedEvidence = citationState.selectedEvidenceIds || citationState.acceptedEvidenceIds || [];
+  return Boolean(citationState.citeContextNotes && allowed?.has(Number(note.number)) && evidenceIds.length && (!selectedEvidence.length || evidenceIds.some((id) => selectedEvidence.includes(id))));
 }
 
 function bestContextCitationNumber(text, taskTitle = "", notes = []) {
-  const queryTerms = termCounts([text, taskTitle].filter(Boolean).join(" "));
-  let bestNumber = 0;
-  let bestScore = 0;
-  for (const note of notes) {
-    const candidate = [note.title, note.source, note.text].filter(Boolean).join("\n");
-    const score = lexicalScore(queryTerms, candidate);
-    if (score > bestScore) {
-      bestScore = score;
-      bestNumber = note.number;
-    }
-  }
-  if (!bestNumber || bestScore < 1.5) return 0;
-  return bestNumber;
+  return 0;
 }
 
 function appendContextCitation(text, number) {
@@ -15947,32 +21403,1134 @@ function formatCachedTaskReference(id, task, settings = DEFAULT_SETTINGS) {
   return `- ${status}: ${title}.${due}${labels}${intent} Todoist: ${todoistTaskMarkdownLink(id, settings, title)}. OID: ${task.oid || "unknown"}.${source}`;
 }
 
-function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childText = "") {
+const SEMANTIC_TASK_REFERENCE_CANONICAL_FIELDS = [
+  "content", "description", "labels", "priority", "due_date", "deadline_date", "scheduledDueDateTime", "duration",
+  "isCompleted", "isSubtask", "parentId", "parentOid", "parentContent", "parentLineNumber", "rootTaskId", "rootOid", "rootId",
+  "childTaskIds", "childOids", "section", "sectionId", "projectId", "projectName", "createdAt", "modifiedAt", "updatedAt",
+  "observedAt", "cachedAt", "rebuiltAt"
+];
+
+function semanticTaskReferenceCanonicalIdentity(task = {}, record = {}) {
+  const id = String(task.todoistId || task.id || record.id || "").trim();
+  const oid = String(task.oid || "").trim().toUpperCase();
+  return {
+    id,
+    oid,
+    key: oid ? `oid:${oid}` : id ? `id:${id}` : ""
+  };
+}
+
+function semanticTaskReferenceCanonicalValue(value, field = "") {
+  if (Array.isArray(value)) {
+    return value.map((item) => typeof item === "object" ? JSON.stringify(item) : String(item || "").trim().toLowerCase()).filter(Boolean).sort();
+  }
+  if (value && typeof value === "object") return JSON.stringify(value);
+  if (field === "oid") return String(value || "").trim().toUpperCase();
+  if (field === "isCompleted" || field === "isSubtask") return Boolean(value);
+  if (field === "priority") return normalizePriority(value);
+  return String(value ?? "").trim();
+}
+
+function semanticTaskReferenceCanonicalFieldPresent(task = {}, field = "") {
+  if (field === "isCompleted" || field === "isSubtask") return typeof task[field] === "boolean";
+  if (Array.isArray(task[field])) return task[field].length > 0;
+  return task[field] !== undefined && task[field] !== null && String(task[field]).trim() !== "";
+}
+
+function semanticTaskReferenceLocalCoversSnapshot(localTask = {}, snapshotTask = {}) {
+  const snapshotIdentity = semanticTaskReferenceCanonicalIdentity(snapshotTask);
+  const localIdentity = semanticTaskReferenceCanonicalIdentity(localTask);
+  if (!snapshotIdentity.id || !localIdentity.id) return { covered: false, reason: "missing-todoist-id" };
+  if (localTask.todoistIdExplicit === false) return { covered: false, reason: "todoist-id-inferred-from-oid" };
+  if (snapshotIdentity.id !== localIdentity.id) return { covered: false, reason: "todoist-id-mismatch" };
+  if (snapshotIdentity.oid && !localIdentity.oid) return { covered: false, reason: "missing-oid" };
+  if (snapshotIdentity.oid && snapshotIdentity.oid !== localIdentity.oid) return { covered: false, reason: "oid-mismatch" };
+  if (!localTask.path || !Number.isFinite(localTask.lineNumber)) return { covered: false, reason: "missing-current-location" };
+  for (const field of SEMANTIC_TASK_REFERENCE_CANONICAL_FIELDS) {
+    if (!semanticTaskReferenceCanonicalFieldPresent(snapshotTask, field)) continue;
+    if (!semanticTaskReferenceCanonicalFieldPresent(localTask, field)) return { covered: false, reason: `missing-${field}` };
+    const expected = semanticTaskReferenceCanonicalValue(snapshotTask[field], field);
+    const actual = semanticTaskReferenceCanonicalValue(localTask[field], field);
+    if (Array.isArray(expected) || Array.isArray(actual)) {
+      if (JSON.stringify(expected) !== JSON.stringify(actual)) return { covered: false, reason: `${field}-mismatch` };
+    } else if (expected !== actual) return { covered: false, reason: `${field}-mismatch` };
+  }
+  return { covered: true, reason: "complete" };
+}
+
+const SEMANTIC_TASK_REFERENCE_DISTINCT_FIELD_EXCLUSIONS = new Set([
+  "id", "todoistId", "oid", "tempId", "path", "lineNumber", "parentLineNumber", "line", "allLines", "indent",
+  "noteRefs", "sourceNoteRefs", "currentLocations", "historicalLocations", "sourceRecords", "derivedFrom", "sameAs",
+  "sameAsSourceKinds", "sourceKind", "sourceId", "sourceSurface", "authority", "canonicalTaskId", "todoistSourceId",
+  "todoistSourceOid", "retrievalEligible", "nonVaultSource", "todoistIdExplicit", "canonicalizationReason", "identityUnverified",
+  "isSyncTask", "signature"
+]);
+
+function semanticTaskReferenceExactIdentity(localTask = {}, snapshotTask = {}) {
+  const snapshotIdentity = semanticTaskReferenceCanonicalIdentity(snapshotTask);
+  const localIdentity = semanticTaskReferenceCanonicalIdentity(localTask);
+  if (!snapshotIdentity.id || !snapshotIdentity.oid || !localIdentity.id || !localIdentity.oid) return false;
+  if (localTask.todoistIdExplicit === false) return false;
+  return snapshotIdentity.id === localIdentity.id && snapshotIdentity.oid === localIdentity.oid;
+}
+
+function semanticTaskReferenceValuePopulated(value) {
+  if (value === undefined || value === null || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+function semanticTaskReferenceValuesEqual(left, right, field = "") {
+  return JSON.stringify(semanticTaskReferenceCanonicalValue(left, field)) === JSON.stringify(semanticTaskReferenceCanonicalValue(right, field));
+}
+
+function semanticTaskReferenceDistinctLocalFields(localTask = {}, authoritativeTask = {}) {
+  const distinctFields = {};
+  for (const [field, value] of Object.entries(localTask || {})) {
+    if (SEMANTIC_TASK_REFERENCE_DISTINCT_FIELD_EXCLUSIONS.has(field) || /(?:hash|fingerprint)$/i.test(field)) continue;
+    if (!semanticTaskReferenceValuePopulated(value)) continue;
+    if (Object.prototype.hasOwnProperty.call(authoritativeTask || {}, field) && semanticTaskReferenceValuesEqual(value, authoritativeTask[field], field)) continue;
+    if (Array.isArray(value)) distinctFields[field] = value.map((item) => item && typeof item === "object" ? Object.assign({}, item) : item);
+    else if (value && typeof value === "object") distinctFields[field] = Object.assign({}, value);
+    else distinctFields[field] = value;
+  }
+  return distinctFields;
+}
+
+function semanticTaskReferenceLocalEntries(locationIndex = null, snapshotTask = {}) {
+  if (!locationIndex) return [];
+  const identity = semanticTaskReferenceCanonicalIdentity(snapshotTask);
+  const rawEntries = [];
+  if (identity.oid) rawEntries.push(...taskReferenceLocationEntries(locationIndex.byOid?.get(identity.oid)));
+  if (identity.id) rawEntries.push(...taskReferenceLocationEntries(locationIndex.byTodoistId?.get(identity.id)));
+  const seen = new Set();
+  const entries = [];
+  for (const raw of rawEntries) {
+    const location = Object.assign({}, raw?.location || raw || {});
+    const task = Object.assign({}, raw?.task || raw?.parsedTask || {});
+    const localIdentity = semanticTaskReferenceCanonicalIdentity(task);
+    const key = [location.path || task.path || "", Number.isFinite(location.lineNumber) ? location.lineNumber : task.lineNumber ?? "", localIdentity.id, localIdentity.oid].join("\u0000");
+    if (!location.path || seen.has(key)) continue;
+    seen.add(key);
+    entries.push({ location, task });
+  }
+  return entries;
+}
+
+function semanticTaskReferenceLocalSourceId(task = {}, location = {}, relation = "local-reference") {
+  const identity = semanticTaskReferenceCanonicalIdentity(task);
+  return `note-task:${shortHash([relation, identity.id, identity.oid, location.path || task.path || "", Number.isFinite(location.lineNumber) ? location.lineNumber : task.lineNumber ?? ""].join("\u0000"))}`;
+}
+
+function semanticTaskReferenceSourceRecord(task = {}, location = {}, authoritativeTask = {}, options = {}) {
+  const identity = semanticTaskReferenceCanonicalIdentity(task);
+  const path = vaultRelativePath(location.path || task.path || "");
+  const lineNumber = Number.isFinite(location.lineNumber) ? location.lineNumber : Number.isFinite(task.lineNumber) ? task.lineNumber : null;
+  return {
+    sourceKind: options.sourceKind || "note-task-reference-row",
+    sourceId: options.sourceId || semanticTaskReferenceLocalSourceId(task, { path, lineNumber }, options.relation || "local-reference"),
+    relation: options.relation || "local-reference",
+    authority: options.authority || "local-reference-table",
+    path,
+    lineNumber,
+    todoistId: identity.id,
+    oid: identity.oid,
+    coverageReason: options.coverageReason || "",
+    distinctFields: options.distinctFields || semanticTaskReferenceDistinctLocalFields(task, authoritativeTask),
+    ...(options.identityUnverified ? { identityUnverified: true, identityAmbiguous: Boolean(options.identityAmbiguous) } : {})
+  };
+}
+
+function semanticTaskReferenceUniqueSourceRecords(records = []) {
+  const seen = new Set();
+  return (records || []).filter((record) => {
+    const key = [record?.sourceKind || "", record?.sourceId || "", record?.path || "", Number.isFinite(record?.lineNumber) ? record.lineNumber : ""].join("\u0000");
+    if (!record?.sourceId || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function semanticTaskReferenceCanonicalMerge(snapshotTask = {}, localTask = {}, resolution = null, options = {}) {
+  const snapshotIdentity = semanticTaskReferenceCanonicalIdentity(snapshotTask);
+  const snapshotSourceKind = options.snapshotSourceKind || "todoist-snapshot-reference-row";
+  const snapshotSourceId = options.snapshotSourceId || semanticTaskReferenceSourceId(snapshotIdentity.id, snapshotTask, snapshotSourceKind);
+  const locations = Array.isArray(resolution?.locations)
+    ? resolution.locations.map((entry) => Object.assign({}, entry))
+    : resolution?.location ? [Object.assign({}, resolution.location)] : [];
+  const merged = Object.assign({}, snapshotTask, localTask);
+  for (const field of ["labels", "noteRefs", "sourceNoteRefs", "currentLocations", "historicalLocations", "childTaskIds", "childOids"]) {
+    const values = [...(Array.isArray(snapshotTask[field]) ? snapshotTask[field] : []), ...(Array.isArray(localTask[field]) ? localTask[field] : [])];
+    if (values.length) merged[field] = uniqueValues(values.map((value) => typeof value === "object" ? JSON.stringify(value) : value)).map((value) => {
+      if (typeof value !== "string") return value;
+      try { return JSON.parse(value); } catch { return value; }
+    });
+  }
+  if (snapshotIdentity.id) {
+    merged.id = snapshotTask.id || snapshotTask.todoistId || snapshotIdentity.id;
+    merged.todoistId = snapshotTask.todoistId || snapshotTask.id || snapshotIdentity.id;
+  }
+  if (snapshotIdentity.oid) merged.oid = snapshotIdentity.oid;
+  if (locations.length) {
+    merged.path = locations[0].path || merged.path || "";
+    merged.lineNumber = Number.isFinite(locations[0].lineNumber) ? locations[0].lineNumber : merged.lineNumber;
+    merged.currentLocations = locations;
+    merged.sourceNoteRefs = locations;
+  }
+  merged.isSubtask = Boolean(snapshotTask.isSubtask || localTask.isSubtask);
+  merged.parentId = snapshotTask.parentId || localTask.parentId || "";
+  merged.parentOid = snapshotTask.parentOid || localTask.parentOid || "";
+  merged.parentContent = snapshotTask.parentContent || localTask.parentContent || "";
+  merged.sameAsSourceKinds = uniqueValues([
+    ...(Array.isArray(snapshotTask.sameAsSourceKinds) ? snapshotTask.sameAsSourceKinds : []),
+    ...(Array.isArray(localTask.sameAsSourceKinds) ? localTask.sameAsSourceKinds : []),
+    snapshotSourceKind
+  ]);
+  merged.sameAs = uniqueValues([
+    ...(Array.isArray(snapshotTask.sameAs) ? snapshotTask.sameAs : []),
+    ...(Array.isArray(localTask.sameAs) ? localTask.sameAs : []),
+    snapshotSourceId,
+    `${snapshotSourceKind}:${snapshotSourceId}`
+  ]);
+  merged.derivedFrom = [
+    ...(Array.isArray(snapshotTask.derivedFrom) ? snapshotTask.derivedFrom : []),
+    ...(Array.isArray(localTask.derivedFrom) ? localTask.derivedFrom : []),
+    { sourceKind: snapshotSourceKind, sourceId: snapshotSourceId, relation: "canonicalized" }
+  ];
+  merged.canonicalTaskId = snapshotIdentity.id || snapshotIdentity.oid;
+  merged.authority = "local-reference-table";
+  merged.nonVaultSource = false;
+  merged.sourceSurface = taskReferenceSourceSurface("note-task-reference-row");
+  merged.retrievalEligible = snapshotTask.retrievalEligible !== false && localTask.retrievalEligible !== false;
+  merged.sourceRecords = semanticTaskReferenceUniqueSourceRecords(options.sourceRecords || []);
+  return merged;
+}
+
+function semanticTaskReferenceCanonicalizeRecords(records = [], locationIndex = null) {
+  const telemetry = {
+    beforeRecords: records.length,
+    canonicalizedCount: 0,
+    snapshotOnlyCount: 0,
+    incompleteLocalReferenceCount: 0,
+    sourceRecordCount: 0,
+    unverifiedSourceRecordCount: 0,
+    ambiguousSourceRecordCount: 0,
+    unverifiedLocalRecordCount: 0,
+    topLevelUnverifiedRecordCount: 0,
+    ambiguousCount: 0,
+    identityCount: 0,
+    estimatedStorageBytesBefore: 0,
+    estimatedStorageBytesAfter: 0,
+    estimatedStorageBytesSaved: 0,
+    reasons: {}
+  };
+  if (!locationIndex) {
+    telemetry.snapshotOnlyCount = records.filter((record) => isTaskReferenceSnapshotSourceKind(record.sourceKind)).length;
+    telemetry.topLevelUnverifiedRecordCount = records.filter((record) => record?.task?.identityUnverified === true).length;
+    telemetry.identityCount = new Set(records.map((record) => semanticTaskReferenceCanonicalIdentity(record.task, record).key).filter(Boolean)).size;
+    return telemetry;
+  }
+  const initialRecordCount = records.length;
+  for (let index = 0; index < initialRecordCount; index += 1) {
+    const record = records[index];
+    if (!isTaskReferenceSnapshotSourceKind(record.sourceKind)) continue;
+    const resolution = resolveTaskReferenceLocation(locationIndex, record.task);
+    const localEntries = semanticTaskReferenceLocalEntries(locationIndex, record.task);
+    if (!localEntries.length) {
+      telemetry.snapshotOnlyCount += 1;
+      const identity = semanticTaskReferenceCanonicalIdentity(record.task, record);
+      if (!record.task.canonicalTaskId && (identity.id || identity.oid)) {
+        records[index] = Object.assign({}, record, {
+          task: Object.assign({}, record.task, { canonicalTaskId: identity.id || identity.oid })
+        });
+      }
+      continue;
+    }
+    if (resolution?.ambiguous) {
+      telemetry.snapshotOnlyCount += 1;
+      telemetry.ambiguousCount += 1;
+      telemetry.reasons["ambiguous-identity"] = (telemetry.reasons["ambiguous-identity"] || 0) + 1;
+      const sourceRecords = localEntries.map((entry, ordinal) => semanticTaskReferenceSourceRecord(entry.task, entry.location, record.task, {
+        relation: "ambiguous-identity",
+        authority: "local-reference-table-unverified",
+        coverageReason: "ambiguous-identity",
+        sourceId: semanticTaskReferenceLocalSourceId(entry.task, entry.location, `ambiguous-identity:${ordinal}`),
+        identityUnverified: true,
+        identityAmbiguous: true
+      }));
+      const snapshotTask = Object.assign({}, record.task, {
+        canonicalTaskId: String(record.task.canonicalTaskId || semanticTaskReferenceCanonicalIdentity(record.task, record).id || semanticTaskReferenceCanonicalIdentity(record.task, record).oid || ""),
+        sourceRecords: semanticTaskReferenceUniqueSourceRecords([...(Array.isArray(record.task.sourceRecords) ? record.task.sourceRecords : []), ...sourceRecords])
+      });
+      telemetry.sourceRecordCount += sourceRecords.length;
+      telemetry.unverifiedSourceRecordCount += sourceRecords.length;
+      telemetry.ambiguousSourceRecordCount += sourceRecords.length;
+      records[index] = Object.assign({}, record, { task: snapshotTask });
+      continue;
+    }
+    const localTask = Object.assign({}, resolution?.parsedTask || localEntries[0].task || {});
+    if (!semanticTaskReferenceExactIdentity(localTask, record.task)) {
+      const identityReason = localTask.todoistIdExplicit === false ? "todoist-id-inferred-from-oid" : "unverified-identity";
+      telemetry.snapshotOnlyCount += 1;
+      telemetry.reasons[identityReason] = (telemetry.reasons[identityReason] || 0) + 1;
+      const sourceRecords = localEntries.map((entry, ordinal) => semanticTaskReferenceSourceRecord(entry.task, entry.location, record.task, {
+        relation: identityReason,
+        authority: "local-reference-table-unverified",
+        coverageReason: identityReason,
+        sourceId: semanticTaskReferenceLocalSourceId(entry.task, entry.location, `${identityReason}:${ordinal}`),
+        identityUnverified: true,
+        identityAmbiguous: false
+      }));
+      const identity = semanticTaskReferenceCanonicalIdentity(record.task, record);
+      const snapshotTask = Object.assign({}, record.task, {
+        canonicalTaskId: String(record.task.canonicalTaskId || identity.id || identity.oid || ""),
+        sourceRecords: semanticTaskReferenceUniqueSourceRecords([...(Array.isArray(record.task.sourceRecords) ? record.task.sourceRecords : []), ...sourceRecords])
+      });
+      telemetry.sourceRecordCount += sourceRecords.length;
+      telemetry.unverifiedSourceRecordCount += sourceRecords.length;
+      records[index] = Object.assign({}, record, { task: snapshotTask });
+      continue;
+    }
+    const coverage = semanticTaskReferenceLocalCoversSnapshot(localTask, record.task);
+    const localSourceRecords = localEntries.map((entry) => semanticTaskReferenceSourceRecord(entry.task, entry.location, record.task, {
+      relation: coverage.covered ? "canonical-local-source" : "incomplete-exact-identity",
+      authority: "local-reference-table",
+      coverageReason: coverage.reason
+    }));
+    if (!coverage.covered) {
+      telemetry.snapshotOnlyCount += 1;
+      telemetry.incompleteLocalReferenceCount += 1;
+      telemetry.sourceRecordCount += localSourceRecords.length;
+      telemetry.reasons[coverage.reason] = (telemetry.reasons[coverage.reason] || 0) + 1;
+      const locations = localEntries.map((entry) => Object.assign({}, entry.location));
+      const snapshotIdentity = semanticTaskReferenceCanonicalIdentity(record.task, record);
+      const attached = Object.assign({}, record.task, {
+        currentLocations: locations,
+        sourceNoteRefs: locations,
+        sourceRecords: semanticTaskReferenceUniqueSourceRecords([...(Array.isArray(record.task.sourceRecords) ? record.task.sourceRecords : []), ...localSourceRecords]),
+        canonicalTaskId: snapshotIdentity.id,
+        authority: record.task.authority || "todoist-snapshot",
+        sameAsSourceKinds: uniqueValues([...(Array.isArray(record.task.sameAsSourceKinds) ? record.task.sameAsSourceKinds : []), "note-task-reference-row"]),
+        sameAs: uniqueValues([...(Array.isArray(record.task.sameAs) ? record.task.sameAs : []), ...localSourceRecords.map((source) => source.sourceId)]),
+        derivedFrom: [
+          ...(Array.isArray(record.task.derivedFrom) ? record.task.derivedFrom : []),
+          ...localSourceRecords.map((source) => ({ sourceKind: source.sourceKind, sourceId: source.sourceId, relation: "incomplete-exact-identity" }))
+        ]
+      });
+      records[index] = Object.assign({}, record, { task: attached });
+      continue;
+    }
+    const snapshotSourceRecord = semanticTaskReferenceSourceRecord(record.task, {}, record.task, {
+      sourceKind: record.sourceKind,
+      sourceId: record.sourceId,
+      relation: "canonicalized-snapshot-source",
+      authority: record.task.authority || "todoist-snapshot",
+      coverageReason: "complete",
+      distinctFields: {}
+    });
+    const merged = semanticTaskReferenceCanonicalMerge(record.task, localTask, resolution, {
+      snapshotSourceKind: record.sourceKind,
+      snapshotSourceId: record.sourceId,
+      sourceRecords: [snapshotSourceRecord, ...localSourceRecords]
+    });
+    const beforeBytes = utf8ByteLength(JSON.stringify(record.task || {}));
+    const afterBytes = utf8ByteLength(JSON.stringify(merged));
+    telemetry.estimatedStorageBytesBefore += beforeBytes;
+    telemetry.estimatedStorageBytesAfter += afterBytes;
+    telemetry.canonicalizedCount += 1;
+    telemetry.sourceRecordCount += 1 + localSourceRecords.length;
+    records[index] = Object.assign({}, record, {
+      path: merged.path || resolution.location?.path || record.path,
+      task: merged,
+      source: "canonical-local-reference",
+      sourceKind: "note-task-reference-row"
+    });
+  }
+  telemetry.topLevelUnverifiedRecordCount = records.filter((record) => record?.task?.identityUnverified === true).length;
+  telemetry.unverifiedLocalRecordCount = telemetry.topLevelUnverifiedRecordCount;
+  telemetry.identityCount = new Set(records.map((record) => semanticTaskReferenceCanonicalIdentity(record.task, record).key).filter(Boolean)).size;
+  telemetry.afterRecords = records.length;
+  telemetry.estimatedStorageBytesSaved = Math.max(0, telemetry.estimatedStorageBytesBefore - telemetry.estimatedStorageBytesAfter);
+  return telemetry;
+}
+
+function semanticTaskReferenceRecords(settings = DEFAULT_SETTINGS, basePath = "", locationIndex = null) {
+  const records = [];
+  const seenSourceIds = new Set();
+  const add = (id, task, source) => {
+    if (!task || typeof task !== "object") return;
+    const normalized = normalizeStoredTaskReferencePaths(Object.assign({}, task), basePath);
+    const sourceKind = normalized.isSubtask ? "subtask-task-tree-record" : "todoist-snapshot-reference-row";
+    const sourceId = semanticTaskReferenceSourceId(id, normalized, sourceKind);
+    if (!sourceId || seenSourceIds.has(sourceId)) return;
+    seenSourceIds.add(sourceId);
+    const indexedFolders = splitList(settings.indexedFolders).map(trimSlashes);
+    const excludedFolders = splitList(settings.excludedFolders).map(trimSlashes);
+    const persistedLocations = Array.isArray(normalized.currentLocations) && normalized.currentLocations.length
+      ? normalized.currentLocations
+      : (Array.isArray(normalized.sourceNoteRefs) && normalized.sourceNoteRefs.length
+        ? normalized.sourceNoteRefs
+        : (normalized.path ? [{ path: normalized.path, lineNumber: normalized.lineNumber, oid: normalized.oid, todoistId: normalized.todoistId || normalized.id }] : []));
+    const eligiblePersistedLocations = persistedLocations
+      .map((location) => Object.assign({}, location, { path: vaultRelativePath(location?.path || "", basePath) }))
+      .filter((location) => {
+        const path = String(location.path || "");
+        if (!path || isEmailLogPath(path, settings)) return false;
+        if (indexedFolders.length && !indexedFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
+        return !isFolderExcluded(path, excludedFolders);
+      });
+    const snapshotTask = Object.assign({}, normalized, {
+      path: taskReferenceSyntheticPath(sourceId, sourceKind),
+      canonicalTaskId: String(normalized.canonicalTaskId || normalized.id || normalized.todoistId || normalized.oid || id || ""),
+      nonVaultSource: true,
+      sourceSurface: taskReferenceSourceSurface(sourceKind),
+      retrievalEligible: true,
+      todoistSourceId: String(normalized.id || normalized.todoistId || id || ""),
+      todoistSourceOid: String(normalized.oid || ""),
+      sourceNoteRefs: locationIndex ? [] : eligiblePersistedLocations,
+      currentLocations: locationIndex ? [] : eligiblePersistedLocations,
+      historicalLocations: []
+    });
+    records.push({ id: String(id || normalized.id || ""), path: snapshotTask.path, task: snapshotTask, source, sourceKind, sourceId, children: [], parentRecord: null, rootRecord: null, treeDepth: 0, treePath: [], siblingOrder: Number.isFinite(snapshotTask.siblingOrder) ? snapshotTask.siblingOrder : null, hierarchyIssue: "" });
+  };
+  for (const [id, task] of Object.entries(settings.taskCache || {})) add(id, task, "cache");
+  for (const reference of Object.values(settings.pendingTaskReferences || {})) add(reference?.id || "", reference, "pending");
+  if (locationIndex) {
+    const snapshotIdentities = new Set();
+    for (const record of records) {
+      if (record.task.oid) snapshotIdentities.add(`oid:${String(record.task.oid).toUpperCase()}`);
+      if (record.task.id || record.id) snapshotIdentities.add(`id:${String(record.task.id || record.id)}`);
+    }
+    const missingParents = new Map();
+    for (const record of records) {
+      if (!record.task.isSubtask) continue;
+      const parentOid = String(record.task.parentOid || "").trim().toUpperCase();
+      const parentId = String(record.task.parentId || "").trim();
+      if (parentOid && !snapshotIdentities.has(`oid:${parentOid}`)) missingParents.set(`oid:${parentOid}`, { oid: parentOid, id: parentId });
+      else if (parentId && !snapshotIdentities.has(`id:${parentId}`)) missingParents.set(`id:${parentId}`, { oid: "", id: parentId });
+    }
+    for (const parent of missingParents.values()) {
+      let resolution = resolveTaskReferenceLocation(locationIndex, parent);
+      if (!resolution && parent.id) resolution = resolveTaskReferenceLocation(locationIndex, { id: parent.id });
+      const parsedTask = resolution?.parsedTask;
+      const location = resolution?.location;
+      const locations = Array.isArray(resolution?.locations) ? resolution.locations : location ? [location] : [];
+      const recoverable = Boolean(!resolution?.ambiguous && parsedTask && location && !parsedTask.isSubtask && Number(parsedTask.indent || 0) <= 0);
+      if (recoverable) {
+        const derivedTask = Object.assign({}, parsedTask, {
+          id: parsedTask.id || parent.id || "",
+          todoistId: parsedTask.todoistId || parsedTask.id || parent.id || "",
+          oid: parsedTask.oid || parent.oid || "",
+          path: location.path,
+          lineNumber: location.lineNumber,
+          parentId: "",
+          parentOid: "",
+          parentLineNumber: null,
+          isSubtask: false,
+          sourceNoteRefs: locations.map((entry) => Object.assign({}, entry)),
+          currentLocations: locations.map((entry) => Object.assign({}, entry)),
+          historicalLocations: [],
+          derivedFrom: [{ sourceKind: "todoist-snapshot-reference-row", parentId: parent.id || "", parentOid: parent.oid || "", locationCount: locations.length }],
+          derived: true,
+          nonVaultSource: false,
+          sourceSurface: taskReferenceSourceSurface("note-task-reference-row"),
+          retrievalEligible: true
+        });
+        const sourceId = semanticDerivedTaskReferenceSourceId(derivedTask, location);
+        if (!sourceId || seenSourceIds.has(sourceId)) continue;
+        seenSourceIds.add(sourceId);
+        records.push({
+          id: String(derivedTask.id || parent.id || ""),
+          path: location.path,
+          task: derivedTask,
+          source: "derived-note",
+          sourceKind: "note-task-reference-row",
+          sourceId,
+          children: [],
+          parentRecord: null,
+          rootRecord: null,
+          treeDepth: 0,
+          treePath: [],
+          siblingOrder: null,
+          hierarchyIssue: ""
+        });
+      } else {
+        if (resolution?.ambiguous) continue;
+        const sourceId = taskReferenceParentStubSourceId(parent);
+        if (!sourceId || seenSourceIds.has(sourceId)) continue;
+        seenSourceIds.add(sourceId);
+        const stubTask = {
+          id: String(parent.id || ""),
+          todoistId: String(parent.id || ""),
+          oid: String(parent.oid || ""),
+          content: "",
+          description: "",
+          isSubtask: false,
+          path: taskReferenceSyntheticPath(sourceId, SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND),
+          lineNumber: null,
+          parentId: "",
+          parentOid: "",
+          parentLineNumber: null,
+          rootTaskId: String(parent.id || ""),
+          rootOid: String(parent.oid || ""),
+          sourceNoteRefs: [],
+          currentLocations: [],
+          historicalLocations: [],
+          derivedFrom: [{ sourceKind: "todoist-snapshot-reference-row", parentId: parent.id || "", parentOid: parent.oid || "" }],
+          nonVaultSource: true,
+          sourceSurface: taskReferenceSourceSurface(SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND),
+          retrievalEligible: false,
+          authority: "structural-relationship",
+          structuralStub: true
+        };
+        records.push({
+          id: String(parent.id || sourceId),
+          path: stubTask.path,
+          task: stubTask,
+          source: "structural-stub",
+          sourceKind: SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND,
+          sourceId,
+          children: [],
+          parentRecord: null,
+          rootRecord: null,
+          treeDepth: 0,
+          treePath: [],
+          siblingOrder: null,
+          hierarchyIssue: ""
+        });
+      }
+    }
+  }
+  const canonicalizationTelemetry = semanticTaskReferenceCanonicalizeRecords(records, locationIndex);
+  Object.defineProperty(records, "canonicalizationTelemetry", { value: canonicalizationTelemetry, enumerable: false, configurable: true });
+  const childrenByParent = new Map();
+  const addChildParentKey = (key, record) => {
+    if (!key) return;
+    const children = childrenByParent.get(key) || [];
+    children.push(record);
+    childrenByParent.set(key, children);
+  };
+  const byIdentity = new Map();
+  const duplicateIdentityRecords = new Map();
+  for (const record of records) {
+    const task = record.task;
+    if (task.identityUnverified === true) continue;
+    const oid = String(task.oid || "").toUpperCase();
+    const id = String(task.id || record.id || "");
+    if (oid) {
+      const duplicates = duplicateIdentityRecords.get(`oid:${oid}`) || [];
+      duplicates.push(record);
+      duplicateIdentityRecords.set(`oid:${oid}`, duplicates);
+      if (!byIdentity.has(`oid:${oid}`) || !record.task.isSubtask) byIdentity.set(`oid:${oid}`, record);
+    }
+    if (id) {
+      const duplicates = duplicateIdentityRecords.get(`id:${id}`) || [];
+      duplicates.push(record);
+      duplicateIdentityRecords.set(`id:${id}`, duplicates);
+      if (!byIdentity.has(`id:${id}`) || !record.task.isSubtask) byIdentity.set(`id:${id}`, record);
+    }
+    if (record.task.isSubtask) {
+      if (task.parentOid) addChildParentKey(`oid:${String(task.parentOid).toUpperCase()}`, record);
+      if (task.parentId) addChildParentKey(`id:${String(task.parentId)}`, record);
+    }
+  }
+  for (const duplicates of duplicateIdentityRecords.values()) {
+    if (duplicates.length < 2) continue;
+    for (const record of duplicates) if (!record.hierarchyIssue) record.hierarchyIssue = "duplicate-identity";
+  }
+  for (const record of records) {
+    const task = record.task;
+    if (task.identityUnverified === true) {
+      record.children = [];
+      record.parentRecord = null;
+      continue;
+    }
+    const ownKeys = [
+      task.oid ? `oid:${String(task.oid).toUpperCase()}` : "",
+      task.id || record.id ? `id:${String(task.id || record.id)}` : ""
+    ].filter(Boolean);
+    const children = [];
+    for (const key of ownKeys) {
+      for (const child of childrenByParent.get(key) || []) {
+        if (child !== record && child.task.isSubtask && !children.includes(child)) children.push(child);
+      }
+    }
+    record.children = children.filter((child) => child.task.isSubtask);
+    if (record.task.isSubtask) {
+      const parentKey = record.task.parentOid ? `oid:${String(record.task.parentOid).toUpperCase()}` : record.task.parentId ? `id:${String(record.task.parentId)}` : "";
+      record.parentRecord = parentKey ? byIdentity.get(parentKey) || null : null;
+      if (!record.parentRecord) record.hierarchyIssue = "orphan-parent";
+      else if (record.parentRecord === record) record.hierarchyIssue = "cycle";
+    }
+  }
+  const visit = (record, stack = new Set()) => {
+    if (!record || stack.has(record)) {
+      if (record) record.hierarchyIssue = "cycle";
+      return;
+    }
+    if (record.rootRecord || record.treePath.length) return;
+    const nextStack = new Set(stack);
+    nextStack.add(record);
+    if (record.parentRecord) {
+      visit(record.parentRecord, nextStack);
+      if (record.parentRecord.hierarchyIssue === "cycle") record.hierarchyIssue = "cycle";
+      record.rootRecord = record.parentRecord.rootRecord || record.parentRecord;
+      record.treeDepth = Number(record.parentRecord.treeDepth || 0) + 1;
+      record.treePath = [...(record.parentRecord.treePath || []), record.sourceId];
+    } else {
+      record.rootRecord = record;
+      record.treeDepth = 0;
+      record.treePath = [record.sourceId];
+    }
+  };
+  for (const record of records) visit(record);
+  for (const record of records) {
+    if (record.task.identityUnverified === true) continue;
+    const root = record.rootRecord;
+    const explicitRootOid = String(record.task.rootOid || "").toUpperCase();
+    const explicitRootId = String(record.task.rootTaskId || "");
+    const explicitRootKnown = (explicitRootOid && byIdentity.has(`oid:${explicitRootOid}`)) || (explicitRootId && byIdentity.has(`id:${explicitRootId}`));
+    if ((explicitRootOid || explicitRootId) && !explicitRootKnown) {
+      record.hierarchyIssue = "orphan-root";
+    } else if (!record.hierarchyIssue && root && record.parentRecord?.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND && ((explicitRootOid && explicitRootOid !== String(root.task.oid || "").toUpperCase()) || (explicitRootId && explicitRootId !== String(root.task.id || root.id || "")))) {
+      record.hierarchyIssue = "inconsistent-root";
+    }
+  }
+  for (const record of records) {
+    record.children.sort((a, b) => String(a.task.content || "").localeCompare(String(b.task.content || "")) || String(a.sourceId).localeCompare(String(b.sourceId)));
+    record.children.forEach((child, index) => { if (!Number.isFinite(child.siblingOrder)) child.siblingOrder = index; });
+  }
+  return records;
+}
+
+function semanticTaskReferenceCanonicalSnapshotKinds(value = {}) {
+  const task = value?.task || value?.taskReference || value || {};
+  return uniqueValues([
+    ...(Array.isArray(value?.sameAsSourceKinds) ? value.sameAsSourceKinds : []),
+    ...(Array.isArray(task?.sameAsSourceKinds) ? task.sameAsSourceKinds : [])
+  ]).filter((sourceKind) => isTaskReferenceSnapshotSourceKind(sourceKind));
+}
+
+function semanticTaskReferenceRecordRepresentsSnapshot(record = {}) {
+  return isTaskReferenceSnapshotSourceKind(record?.sourceKind) || semanticTaskReferenceCanonicalSnapshotKinds(record).length > 0;
+}
+
+function semanticTaskReferenceDerivedNoteRecord(record = {}) {
+  return record?.sourceKind === "note-task-reference-row"
+    && (record?.source === "derived-note" || record?.task?.derived === true);
+}
+
+function semanticTaskReferenceDerivedNoteChunk(chunk = {}) {
+  return chunk?.sourceKind === "note-task-reference-row"
+    && (chunk?.derived === true || chunk?.taskReference?.derived === true);
+}
+
+function semanticTaskReferenceHealth(records = []) {
+  const rootCount = records.filter((record) => record.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND && !record.task?.isSubtask).length;
+  const subtaskCount = records.filter((record) => record.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND && Boolean(record.task?.isSubtask)).length;
+  const snapshotRowCount = records.filter(semanticTaskReferenceRecordRepresentsSnapshot).length;
+  const derivedParentCount = records.filter(semanticTaskReferenceDerivedNoteRecord).length;
+  const parentStubCount = records.filter((record) => record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND).length;
+  const sourceKindCounts = records.reduce((counts, record) => {
+    counts[record.sourceKind] = (counts[record.sourceKind] || 0) + 1;
+    return counts;
+  }, {});
+  const edgeKeys = new Set();
+  let duplicateEdgeCount = 0;
+  let childParentMismatchCount = 0;
+  let missingChildEdgeCount = 0;
+  const identityToSourceId = new Map();
+  for (const record of records) {
+    if (record.task.identityUnverified === true) continue;
+    const taskId = String(record.task.id || record.task.todoistId || record.id || "");
+    const oid = String(record.task.oid || "").toUpperCase();
+    if (taskId) identityToSourceId.set(`id:${taskId}`, record.sourceId);
+    if (oid) identityToSourceId.set(`oid:${oid}`, record.sourceId);
+  }
+  for (const record of records) {
+    for (const child of record.children || []) edgeKeys.add(`${record.sourceId}\u0000${child.sourceId}`);
+    const declared = [];
+    const childIds = Array.isArray(record.task.childTaskIds) ? record.task.childTaskIds : [];
+    const childOids = Array.isArray(record.task.childOids) ? record.task.childOids : [];
+    const count = Math.max(childIds.length, childOids.length);
+    for (let index = 0; index < count; index += 1) {
+      const childId = String(childIds[index] || "");
+      const childOid = String(childOids[index] || "").toUpperCase();
+      const childSourceId = identityToSourceId.get(`id:${childId}`) || identityToSourceId.get(`oid:${childOid}`) || `${childId}\u0000${childOid}`;
+      const key = `${record.sourceId}\u0000${childSourceId}`;
+      if (!key.endsWith("\u0000\u0000")) declared.push(key);
+      const childRecord = records.find((candidate) => candidate.sourceId === childSourceId);
+      if (childRecord && !(record.children || []).includes(childRecord)) {
+        missingChildEdgeCount += 1;
+        if (!record.hierarchyIssue) record.hierarchyIssue = "missing-child-edge";
+      }
+      if (childRecord?.parentRecord && childRecord.parentRecord !== record) {
+        childParentMismatchCount += 1;
+        if (!record.hierarchyIssue) record.hierarchyIssue = "child-parent-mismatch";
+      }
+    }
+    duplicateEdgeCount += declared.length - new Set(declared).size;
+    for (const key of declared) edgeKeys.add(key);
+  }
+  const edgeCount = edgeKeys.size;
+  const orphanParentCount = records.filter((record) => record.hierarchyIssue === "orphan-parent").length;
+  const orphanRootCount = records.filter((record) => record.hierarchyIssue === "orphan-root").length;
+  const cycleCount = records.filter((record) => record.hierarchyIssue === "cycle").length;
+  const inconsistentRootCount = records.filter((record) => record.hierarchyIssue === "inconsistent-root").length;
+  const duplicateIdentityCount = records.filter((record) => record.hierarchyIssue === "duplicate-identity").length;
+  const invalidRecords = records.filter((record) => record.hierarchyIssue);
+  return {
+    state: invalidRecords.length ? (invalidRecords.length < records.length ? "quarantined" : "failed") : "clean",
+    totalNodes: records.length,
+    rootCount,
+    subtaskCount,
+    snapshotRowCount,
+    derivedParentCount,
+    parentStubCount,
+    sourceKindCounts,
+    edgeCount,
+    orphanParentCount,
+    orphanRootCount,
+    cycleCount,
+    duplicateEdgeCount,
+    childParentMismatchCount,
+    missingChildEdgeCount,
+    inconsistentRootCount,
+    duplicateIdentityCount,
+    invalidNodeCount: invalidRecords.length,
+    quarantinedSourceIds: invalidRecords.map((record) => record.sourceId).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED)
+  };
+}
+
+function semanticTaskReferenceRelationshipFingerprint(settings = DEFAULT_SETTINGS) {
+  const rows = Object.entries(settings.taskCache || {})
+    .map(([id, task = {}]) => ({
+      id: String(id || ""),
+      taskId: String(task.id || task.todoistId || id || ""),
+      oid: String(task.oid || "").toUpperCase(),
+      parentId: String(task.parentId || ""),
+      parentOid: String(task.parentOid || "").toUpperCase(),
+      isSubtask: Boolean(task.isSubtask)
+    }))
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  return shortHash(JSON.stringify(rows));
+}
+
+function semanticTaskReferenceExpectedSnapshotIds(settings = DEFAULT_SETTINGS) {
+  return new Set(Object.entries(settings.taskCache || {}).map(([id, task]) => {
+    const sourceKind = task?.isSubtask ? "subtask-task-tree-record" : "todoist-snapshot-reference-row";
+    return semanticTaskReferenceSourceId(id, task, sourceKind);
+  }).filter(Boolean));
+}
+
+function semanticTaskReferenceRecordSourceSurfaceValid(record = {}) {
+  const task = record.task || {};
+  if (isTaskReferenceSnapshotSourceKind(record.sourceKind)) {
+    return task.nonVaultSource === true && isNonVaultTaskReferencePath(record.path || task.path) && task.sourceSurface === taskReferenceSourceSurface(record.sourceKind) && task.retrievalEligible !== false;
+  }
+  if (record.sourceKind === "note-task-reference-row") {
+    const retrievalStateValid = task.identityUnverified === true ? task.retrievalEligible === false : task.retrievalEligible !== false;
+    return task.nonVaultSource !== true && !isNonVaultTaskReferencePath(record.path || task.path) && task.sourceSurface === taskReferenceSourceSurface(record.sourceKind) && retrievalStateValid;
+  }
+  if (record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
+    return task.nonVaultSource === true && isNonVaultTaskReferencePath(record.path || task.path) && task.sourceSurface === "structural-relationship" && task.retrievalEligible === false && !task.content && !task.description;
+  }
+  return false;
+}
+
+function semanticTaskReferenceRecordPrivacyLeaks(record = {}, options = {}) {
+  const task = record.task || {};
+  const isEligiblePath = typeof options.isIndexablePath === "function" ? options.isIndexablePath : () => true;
+  const excludedPaths = (options.excludedPaths || []).map((value) => String(value || "")).filter(Boolean);
+  const excludedTexts = (options.excludedTexts || []).map((value) => String(value || "")).filter(Boolean);
+  let count = 0;
+  if (isTaskReferenceSnapshotSourceKind(record.sourceKind) || record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
+    if (!isNonVaultTaskReferencePath(record.path || task.path)) count += 1;
+    if ((task.sourceNoteRefs || []).length || (task.historicalLocations || []).length) count += 1;
+  }
+  for (const ref of [...(task.currentLocations || []), ...(task.sourceNoteRefs || [])]) {
+    if (ref?.path && (!isEligiblePath(ref.path) || excludedPaths.some((excluded) => ref.path === excluded || ref.path.startsWith(`${excluded}/`)))) count += 1;
+  }
+  for (const sourceRecord of (task.sourceRecords || [])) {
+    if (sourceRecord?.path && (!isEligiblePath(sourceRecord.path) || excludedPaths.some((excluded) => sourceRecord.path === excluded || sourceRecord.path.startsWith(`${excluded}/`)))) count += 1;
+    const distinctText = JSON.stringify(sourceRecord?.distinctFields || {});
+    if ([...excludedPaths, ...excludedTexts].some((excluded) => excluded && distinctText.includes(excluded))) count += 1;
+  }
+  const taskText = `${task.content || ""}\n${task.description || ""}`;
+  if ([...excludedPaths, ...excludedTexts].some((excluded) => excluded && taskText.includes(excluded))) count += 1;
+  return count;
+}
+
+function semanticTaskReferenceCorpusIntegrity(records = [], chunks = [], options = {}) {
+  const settings = options.settings || DEFAULT_SETTINGS;
+  const snapshotRecords = (records || []).filter((record) => isTaskReferenceSnapshotSourceKind(record?.sourceKind));
+  const canonicalizedRecords = (records || []).filter((record) => !isTaskReferenceSnapshotSourceKind(record?.sourceKind)
+    && semanticTaskReferenceCanonicalSnapshotKinds(record).length > 0);
+  const expectedSnapshotRowCount = Number(options.expectedSnapshotTaskCount ?? options.expectedTaskCount ?? options.expected?.snapshotTaskCount ?? Object.keys(settings.taskCache || {}).length);
+  const expectedSourceIds = semanticTaskReferenceExpectedSnapshotIds(settings);
+  const representedSnapshotRecords = [...snapshotRecords, ...canonicalizedRecords];
+  if (!expectedSourceIds.size && expectedSnapshotRowCount === representedSnapshotRecords.length) for (const record of representedSnapshotRecords) if (record.sourceId) expectedSourceIds.add(String(record.sourceId));
+  const actualSourceIds = new Set(representedSnapshotRecords.map((record) => String(record.sourceId || "")).filter(Boolean));
+  const missingSnapshotRows = expectedSourceIds.size ? Array.from(expectedSourceIds).filter((sourceId) => !actualSourceIds.has(sourceId)).length : Math.max(0, expectedSnapshotRowCount - representedSnapshotRecords.length);
+  const unexpectedSnapshotRows = expectedSourceIds.size ? Array.from(actualSourceIds).filter((sourceId) => !expectedSourceIds.has(sourceId)).length : Math.max(0, representedSnapshotRecords.length - expectedSnapshotRowCount);
+  const expectedParentEdgeCount = Number(options.expectedParentEdgeCount ?? options.expected?.parentEdgeCount ?? Object.values(settings.taskCache || {}).filter((task) => task?.parentId || task?.parentOid).length);
+  const graph = semanticTaskReferenceHealth(records);
+  const chunksBySourceId = new Map((chunks || []).map((chunk) => [String(chunk.sourceId || ""), chunk]));
+  const sourceRecordTelemetry = (records || []).reduce((counts, record) => {
+    for (const sourceRecord of record?.task?.sourceRecords || []) {
+      if (sourceRecord?.identityUnverified === true) counts.unverifiedSourceRecordCount += 1;
+      if (sourceRecord?.identityAmbiguous === true) counts.ambiguousSourceRecordCount += 1;
+    }
+    if (record?.task?.identityUnverified === true) counts.topLevelUnverifiedRecordCount += 1;
+    if (record?.task?.identityAmbiguous === true) counts.topLevelAmbiguousRecordCount += 1;
+    return counts;
+  }, { unverifiedSourceRecordCount: 0, ambiguousSourceRecordCount: 0, topLevelUnverifiedRecordCount: 0, topLevelAmbiguousRecordCount: 0 });
+  const unverifiedChunkCount = (chunks || []).filter((chunk) => chunk?.identityUnverified === true || chunk?.taskReference?.identityUnverified === true).length;
+  const ambiguousChunkCount = (chunks || []).filter((chunk) => chunk?.identityAmbiguous === true || chunk?.taskReference?.identityAmbiguous === true).length;
+  const missingSnapshotChunks = options.requireChunks === true
+    ? Array.from(expectedSourceIds).filter((sourceId) => !chunksBySourceId.has(sourceId)).length
+    : 0;
+  const sourceSurfaceInvalidCount = (records || []).filter((record) => !semanticTaskReferenceRecordSourceSurfaceValid(record)).length;
+  const chunkSourceSurfaceInvalidCount = (chunks || []).filter((chunk) => {
+    if (!semanticTaskReferenceChunkSelected(chunk)) return false;
+    const kind = String(chunk.sourceKind || "");
+    if (isTaskReferenceSnapshotSourceKind(kind)) return chunk.nonVaultSource !== true || !isNonVaultTaskReferencePath(chunk.path) || chunk.retrievalEligible === false;
+    if (kind === "note-task-reference-row") {
+      const retrievalStateInvalid = chunk.identityUnverified === true ? chunk.retrievalEligible !== false : chunk.retrievalEligible === false;
+      return chunk.nonVaultSource === true || isNonVaultTaskReferencePath(chunk.path) || retrievalStateInvalid;
+    }
+    if (kind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) return chunk.retrievalEligible !== false || !isNonVaultTaskReferencePath(chunk.path);
+    return false;
+  }).length;
+  const privacyLeakCount = (records || []).reduce((sum, record) => sum + semanticTaskReferenceRecordPrivacyLeaks(record, options), 0)
+    + (chunks || []).filter((chunk) => {
+      if (!semanticTaskReferenceChunkSelected(chunk)) return false;
+      const kind = String(chunk.sourceKind || "");
+      const excludedPaths = (options.excludedPaths || []).map((value) => String(value || "")).filter(Boolean);
+      const excludedTexts = (options.excludedTexts || []).map((value) => String(value || "")).filter(Boolean);
+      const chunkText = String(chunk.text || "");
+      const textLeak = [...excludedPaths, ...excludedTexts].some((excluded) => excluded && chunkText.includes(excluded));
+      if (textLeak) return true;
+      if (isTaskReferenceSnapshotSourceKind(kind) || kind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
+        const isEligiblePath = typeof options.isIndexablePath === "function" ? options.isIndexablePath : () => true;
+        const refs = [...(chunk.currentLocations || []), ...(chunk.sourceNoteRefs || []), ...(chunk.historicalLocations || [])];
+        const ineligibleRef = refs.some((ref) => ref?.path && (!isEligiblePath(ref.path) || excludedPaths.some((excluded) => ref.path === excluded || ref.path.startsWith(`${excluded}/`))));
+        return !isNonVaultTaskReferencePath(chunk.path) || ineligibleRef;
+      }
+      return false;
+    }).length;
+  const stubRetrievalEligibleCount = (records || []).filter((record) => record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND && record.task?.retrievalEligible !== false).length
+    + (chunks || []).filter((chunk) => chunk.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND && chunk.retrievalEligible !== false).length;
+  const reasonCodes = [];
+  if (missingSnapshotRows || actualSourceIds.size !== expectedSnapshotRowCount) reasonCodes.push("missing-snapshot-row");
+  if (unexpectedSnapshotRows) reasonCodes.push("unexpected-snapshot-row");
+  if (options.requireChunks === true && missingSnapshotChunks) reasonCodes.push("missing-snapshot-chunk");
+  if (sourceSurfaceInvalidCount || chunkSourceSurfaceInvalidCount) reasonCodes.push("task-record-source-invalid");
+  if (graph.edgeCount !== expectedParentEdgeCount) reasonCodes.push("task-reference-edge-count-mismatch");
+  if (graph.duplicateIdentityCount?.taskId || graph.duplicateIdentityCount?.oid) reasonCodes.push("task-reference-identity-collision");
+  if (graph.invalidNodeCount || graph.orphanParentCount || graph.cycleCount || graph.inconsistentRootCount || graph.missingChildEdgeCount) reasonCodes.push("task-reference-hierarchy-invalid");
+  if (graph.missingChildEdgeCount) reasonCodes.push("task-reference-child-edge-missing");
+  if (privacyLeakCount) reasonCodes.push("task-reference-privacy-leak");
+  if (stubRetrievalEligibleCount) reasonCodes.push("task-reference-stub-retrieval-eligible");
+  if (sourceRecordTelemetry.topLevelUnverifiedRecordCount || sourceRecordTelemetry.topLevelAmbiguousRecordCount) reasonCodes.push("task-reference-unverified-top-level-record");
+  if (unverifiedChunkCount || ambiguousChunkCount) reasonCodes.push("task-reference-unverified-chunk");
+  const state = reasonCodes.length ? "quarantined" : "clean";
+  return {
+    ok: reasonCodes.length === 0,
+    state,
+    reasonCodes: Array.from(new Set(reasonCodes)).sort(),
+    expected: {
+      snapshotRowCount: expectedSnapshotRowCount,
+      parentEdgeCount: expectedParentEdgeCount,
+      relationshipFingerprint: semanticTaskReferenceRelationshipFingerprint(settings)
+    },
+    actual: {
+      taskCount: actualSourceIds.size,
+      snapshotTaskCount: actualSourceIds.size,
+      snapshotRecordCount: representedSnapshotRecords.length,
+      snapshotChunkCount: (chunks || []).filter((chunk) => isTaskReferenceSnapshotSourceKind(chunk.sourceKind) || semanticTaskReferenceCanonicalSnapshotKinds(chunk).length > 0).length,
+      derivedParentCount: (records || []).filter(semanticTaskReferenceDerivedNoteRecord).length,
+      canonicalizedSnapshotCount: canonicalizedRecords.length,
+      parentStubCount: (records || []).filter((record) => record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND).length,
+      unverifiedSourceRecordCount: sourceRecordTelemetry.unverifiedSourceRecordCount,
+      ambiguousSourceRecordCount: sourceRecordTelemetry.ambiguousSourceRecordCount,
+      topLevelUnverifiedRecordCount: sourceRecordTelemetry.topLevelUnverifiedRecordCount,
+      topLevelAmbiguousRecordCount: sourceRecordTelemetry.topLevelAmbiguousRecordCount,
+      unverifiedChunkCount,
+      ambiguousChunkCount,
+      edgeCount: graph.edgeCount,
+      parentEdgeCount: graph.edgeCount,
+      sourceSurfaceInvalidCount,
+      chunkSourceSurfaceInvalidCount
+    },
+    graph,
+    privacy: { leakCount: privacyLeakCount },
+    retrieval: { stubRetrievalEligibleCount },
+    telemetry: {
+      missingSnapshotRows,
+      unexpectedSnapshotRows,
+      missingSnapshotChunks,
+      canonicalizedSnapshotCount: canonicalizedRecords.length,
+      unverifiedSourceRecordCount: sourceRecordTelemetry.unverifiedSourceRecordCount,
+      ambiguousSourceRecordCount: sourceRecordTelemetry.ambiguousSourceRecordCount,
+      topLevelUnverifiedRecordCount: sourceRecordTelemetry.topLevelUnverifiedRecordCount,
+      unverifiedChunkCount,
+      canonicalization: records.canonicalizationTelemetry || null
+    },
+    relationshipFingerprint: semanticTaskReferenceRelationshipFingerprint(settings)
+  };
+}
+
+function semanticTaskReferenceChunksForCorpus(records = [], settings = DEFAULT_SETTINGS, basePath = "", locationIndex = null, options = {}) {
+  const chunks = [];
+  const isIndexablePath = typeof options.isIndexablePath === "function" ? options.isIndexablePath : () => true;
+  const pathFilter = String(options.pathFilter || "");
+  for (const record of records || []) {
+    if (record?.task?.identityUnverified === true || record?.task?.identityAmbiguous === true) continue;
+    const snapshotRecord = isTaskReferenceSnapshotSourceKind(record.sourceKind);
+    const stubRecord = record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND;
+    const resolution = resolveTaskReferenceLocation(locationIndex, record.task);
+    const currentLocation = resolution?.location || null;
+    const currentLocations = resolution?.locations || (currentLocation ? [currentLocation] : (record.task.currentLocations || []));
+    const path = snapshotRecord || stubRecord ? taskReferenceSyntheticPath(record.sourceId, record.sourceKind) : currentLocation?.path || record.path || "";
+    const snapshotPathMatches = snapshotRecord && currentLocations.some((location) => String(location?.path || "") === String(pathFilter));
+    if (pathFilter && (stubRecord || (!snapshotRecord && path !== pathFilter) || (snapshotRecord && !snapshotPathMatches))) continue;
+    if (!path || (!snapshotRecord && !stubRecord && !isIndexablePath(path))) continue;
+    const task = Object.assign({}, record.task, {
+      path,
+      currentLocations: currentLocations.map((ref) => Object.assign({}, ref)),
+      sourceNoteRefs: (snapshotRecord || stubRecord || record.sourceKind === "note-task-reference-row") ? currentLocations.map((ref) => Object.assign({}, ref)) : [],
+      historicalLocations: snapshotRecord || stubRecord ? [] : (record.task.historicalLocations || []),
+      nonVaultSource: snapshotRecord || stubRecord,
+      sourceSurface: taskReferenceSourceSurface(record.sourceKind),
+      retrievalEligible: record.task.retrievalEligible !== false && !stubRecord,
+      childTaskIds: record.children.map((child) => String(child.task.id || child.task.todoistId || child.id || "")).filter(Boolean),
+      childOids: record.children.map((child) => String(child.task.oid || "")).filter(Boolean)
+    });
+    const sourceRecords = Array.isArray(task.sourceRecords)
+      ? task.sourceRecords.map((sourceRecord) => Object.assign({}, sourceRecord, {
+        distinctFields: Object.assign({}, sourceRecord?.distinctFields || {})
+      }))
+      : [];
+    const childSemanticText = semanticTaskReferenceChildSemanticText(record.children.map((child) => child.task));
+    const text = stubRecord ? semanticTaskReferenceParentStubText(task, record.sourceId) : semanticTaskReferenceText(record.id, task, settings, childSemanticText, {
+      sourceKind: record.sourceKind,
+      sourceId: record.sourceId,
+      childTasks: record.children.map((child) => child.task),
+      snapshotRevision: settings.taskReferenceSnapshotMeta?.revision || settings.taskReferenceSnapshotMeta?.fingerprint || ""
+    });
+    if (!text) continue;
+    const chunk = {
+      id: `${path}#${record.sourceKind}-${shortHash(record.sourceId)}`,
+      path,
+      title: stubRecord ? "Todoist structural parent reference" : snapshotRecord ? "Todoist task snapshot" : "Todoist task reference",
+      text,
+      kind: "todoist-task-reference",
+      source: "local-reference-table",
+      sourceKind: record.sourceKind,
+      sourceId: record.sourceId,
+      canonicalTaskId: String(task.canonicalTaskId || task.id || task.todoistId || record.id || ""),
+      sameAsSourceKinds: Array.isArray(task.sameAsSourceKinds) ? Array.from(task.sameAsSourceKinds) : [],
+      sameAs: Array.isArray(task.sameAs) ? Array.from(task.sameAs) : [],
+      sourceRecords,
+      identityUnverified: task.identityUnverified === true,
+      derived: task.derived === true,
+      nonVaultSource: snapshotRecord || stubRecord,
+      sourceSurface: taskReferenceSourceSurface(record.sourceKind),
+      retrievalEligible: task.retrievalEligible,
+      authority: task.authority || (stubRecord ? "structural-relationship" : "todoist-snapshot"),
+      taskReferenceSchemaVersion: SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION,
+      taskId: String(task.id || task.todoistId || record.id || ""),
+      todoistId: String(task.todoistId || task.id || record.id || ""),
+      oid: String(task.oid || ""),
+      parentId: String(task.parentId || ""),
+      parentOid: String(task.parentOid || ""),
+      childTaskIds: task.childTaskIds,
+      childOids: task.childOids,
+      childSemanticText,
+      sourceNoteRefs: task.sourceNoteRefs,
+      currentLocations: task.currentLocations,
+      historicalLocations: task.historicalLocations,
+      derivedFrom: Array.isArray(task.derivedFrom) ? task.derivedFrom.map((ref) => Object.assign({}, ref)) : [],
+      taskReference: Object.assign({}, task, { taskId: String(task.id || task.todoistId || record.id || ""), todoistId: String(task.todoistId || task.id || record.id || ""), retrievalEligible: task.retrievalEligible, sourceSurface: task.sourceSurface, sourceRecords, childSemanticText }),
+      taskReferenceEmbeddingProjectionVersion: SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION
+    };
+    if (resolution?.ambiguous) {
+      chunk.quarantined = true;
+      chunk.indexMetadata = { quarantined: true, quarantineReason: "ambiguous-current-note-location" };
+      chunk.provenance = { quarantined: true, quarantineReason: "ambiguous-current-note-location" };
+    }
+    if (record.hierarchyIssue) {
+      chunk.quarantined = true;
+      chunk.indexMetadata = Object.assign({}, chunk.indexMetadata || {}, { quarantined: true, quarantineReason: `task-reference-${record.hierarchyIssue}` });
+      chunk.provenance = Object.assign({}, chunk.provenance || {}, { quarantined: true, quarantineReason: `task-reference-${record.hierarchyIssue}` });
+    }
+    chunks.push(chunk);
+  }
+  return decorateSemanticIndexChunks(chunks, Number(options.indexRevision || 0));
+}
+
+function repairSemanticTaskReferenceCorpus(settings = DEFAULT_SETTINGS, basePath = "", locationIndex = null, options = {}) {
+  const records = semanticTaskReferenceRecords(settings, basePath, locationIndex);
+  const chunks = semanticTaskReferenceChunksForCorpus(records, settings, basePath, locationIndex, options);
+  const integrity = semanticTaskReferenceCorpusIntegrity(records, chunks, Object.assign({}, options, { settings, requireChunks: options.requireChunks !== false }));
+  return {
+    records,
+    chunks,
+    integrity,
+    repairTelemetry: {
+      snapshotRecords: records.filter(semanticTaskReferenceRecordRepresentsSnapshot).length,
+      derivedParents: records.filter(semanticTaskReferenceDerivedNoteRecord).length,
+      parentStubs: records.filter((record) => record.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND).length,
+      chunkCount: chunks.length,
+      locationCount: locationIndex ? locationIndex.byOid.size + locationIndex.byTodoistId.size : 0,
+      canonicalization: records.canonicalizationTelemetry || null
+    }
+  };
+}
+
+function semanticTaskReferenceSourceId(id, task = {}, sourceKind = "todoist-snapshot-reference-row") {
+  const identity = String(task?.todoistId || task?.id || id || task?.oid || task?.tempId || "").trim();
+  const fallback = shortHash([
+    task?.oid || "",
+    task?.id || task?.todoistId || "",
+    task?.tempId || "",
+    singleLine(task?.content || "")
+  ].join("\u0000"));
+  return `todoist:${identity || `legacy:${fallback}`}`;
+}
+
+function semanticDerivedTaskReferenceSourceId(task = {}, location = {}) {
+  const identity = task.oid
+    ? `oid:${String(task.oid).toUpperCase()}`
+    : task.id || task.todoistId
+      ? `id:${String(task.id || task.todoistId)}`
+      : "legacy";
+  return `note-task:${shortHash(identity)}`;
+}
+
+function taskReferenceParentStubSourceId(parent = {}) {
+  const identity = parent.oid
+    ? `oid:${String(parent.oid).toUpperCase()}`
+    : parent.id
+      ? `id:${String(parent.id)}`
+      : "unknown";
+  return `${SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND}:${shortHash(identity)}`;
+}
+
+function taskReferenceSyntheticPath(sourceId = "", sourceKind = "todoist-snapshot-reference-row") {
+  const prefix = sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND
+    ? SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX
+    : SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX;
+  return `${prefix}${shortHash(`${sourceKind}\u0000${sourceId}`)}`;
+}
+
+function isNonVaultTaskReferencePath(path = "") {
+  return String(path || "").startsWith(SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX)
+    || String(path || "").startsWith(SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX);
+}
+
+function isTaskReferenceSnapshotSourceKind(sourceKind = "") {
+  return sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record";
+}
+
+function taskReferenceSourceSurface(sourceKind = "") {
+  if (sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) return "structural-relationship";
+  if (isTaskReferenceSnapshotSourceKind(sourceKind)) return "todoist-snapshot";
+  if (sourceKind === "note-task-reference-row") return "vault-note-derived";
+  return "vault-note";
+}
+
+function semanticTaskSourceNoteRefs(task = {}) {
+  const refs = [];
+  const seen = new Set();
+  const add = (ref) => {
+    const path = vaultRelativePath(ref?.path || "");
+    if (!path || isNonVaultTaskReferencePath(path)) return;
+    const lineNumber = Number.isFinite(ref?.lineNumber) ? ref.lineNumber : null;
+    const oid = String(ref?.oid || task?.oid || "");
+    const key = `${path}\u0000${lineNumber ?? ""}\u0000${oid.toUpperCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    refs.push(Object.assign({}, ref, { path }));
+  };
+  const existingRefs = [
+    ...(Array.isArray(task.noteRefs) ? task.noteRefs : []),
+    ...(Array.isArray(task.sourceNoteRefs) ? task.sourceNoteRefs : []),
+    ...(Array.isArray(task.currentLocations) ? task.currentLocations : [])
+  ];
+  for (const ref of existingRefs) add(ref);
+  if (!existingRefs.length && task.path && !isNonVaultTaskReferencePath(task.path)) add(noteReferenceForTask(task, task.oid));
+  return refs;
+}
+
+function semanticTaskReferenceChildSemanticText(children = []) {
+  const values = [];
+  for (const child of children || []) {
+    const content = singleLine(child?.content || child?.title || child?.taskTitle || "");
+    const description = singleLine(child?.description || child?.narrativeDescription || "");
+    const text = [content, description].filter(Boolean).join(" — ");
+    if (text) values.push(text);
+  }
+  return values.join("; ");
+}
+
+function semanticTaskReferenceText(id, task, settings = DEFAULT_SETTINGS, childText = "", options = {}) {
   const content = singleLine(task?.content || "");
   if (!content) return "";
-  const knowledge = task?.knowledge?.intent ? task.knowledge : taskKnowledgeSnapshot(task, settings, childText, task?.knowledge || null);
-  const parts = [
-    task?.isSubtask ? "Todoist subtask" : "Todoist task",
-    task?.isCompleted ? "completed" : "open",
-    content
-  ];
-  if (task?.parentContent) parts.push(`parent: ${singleLine(task.parentContent)}`);
-  if (childText && !task?.isSubtask) parts.push(`subtasks: ${truncateAtWord(childText, 180)}`);
-  if (task?.due_date) parts.push(`due: ${task.due_date}`);
-  if (task?.scheduledDueDateTime) parts.push(`scheduled: ${task.scheduledDueDateTime}`);
-  if (durationMinutes(task?.duration)) parts.push(`duration: ${durationMinutes(task.duration)} minutes`);
-  if (task?.deadline_date) parts.push(`deadline: ${task.deadline_date}`);
-  if (task?.priority) parts.push(`priority: ${normalizePriority(task.priority)}`);
-  if (task?.labels?.length) parts.push(`labels: ${task.labels.map((label) => `#${cleanLabel(label)}`).join(" ")}`);
-  if (task?.section) parts.push(`section: ${singleLine(task.section)}`);
-  if (task?.projectName) parts.push(`project: ${singleLine(task.projectName)}`);
-  if (task?.description && !task?.isSubtask) parts.push(`description: ${truncateAtWord(cleanGeneratedDescriptionSummary(task.description, settings), 160)}`);
-  if (knowledge?.intent) parts.push(`intent: ${truncateAtWord(knowledge.intent, 180)}`);
-  if (knowledge?.rationale) parts.push(`rationale: ${truncateAtWord(knowledge.rationale, 220)}`);
-  if (knowledge?.outcomeType) parts.push(`outcome type: ${knowledge.outcomeType}`);
-  if (knowledge?.dependency) parts.push(`dependency: ${truncateAtWord(knowledge.dependency, 160)}`);
-  if (task?.oid) parts.push(`oid: ${task.oid}`);
-  return `- ${parts.filter(Boolean).join(". ")}.`;
+  const sourceKind = options.sourceKind || (task?.isSubtask ? "subtask-task-tree-record" : "todoist-snapshot-reference-row");
+  const sourceId = options.sourceId || semanticTaskReferenceSourceId(id, task, sourceKind);
+  const knowledge = task?.knowledge || {};
+  const noteRefs = semanticTaskSourceNoteRefs(task);
+  const childTasks = Array.isArray(options.childTasks) ? options.childTasks : [];
+  const parentLabel = task?.parentContent ? singleLine(task.parentContent) : "";
+  const state = task?.isCompleted ? "completed" : "open";
+  const lines = [
+    `Source kind: ${sourceKind}`,
+    `Source ID: ${sourceId}`,
+    `Todoist task ID: ${String(task?.id || id || "")}`,
+    `oid: ${String(task?.oid || "")}`,
+    `Title: ${content}`,
+    task?.description ? `Description: ${truncateAtWord(cleanGeneratedDescriptionSummary(task.description, settings), 1400)}` : "",
+    `State: ${state}`,
+    `Current state: ${task?.isCompleted ? "completed in Todoist snapshot" : "open in Todoist snapshot"}`,
+    `Subtask: ${Boolean(task?.isSubtask)}`,
+    parentLabel ? `Parent task: ${parentLabel}` : "",
+    task?.parentId ? `Parent Todoist task ID: ${task.parentId}` : "",
+    task?.parentOid ? `Parent OID: ${task.parentOid}` : "",
+    task?.rootTaskId ? `Root task ID: ${task.rootTaskId}` : "",
+    task?.rootOid ? `Root OID: ${task.rootOid}` : "",
+    task?.projectName || task?.projectId ? `Todoist location: project ${singleLine(task.projectName || "")}${task.projectId ? ` (${task.projectId})` : ""}` : "",
+    task?.section || task?.sectionId ? `Todoist section: ${singleLine(task.section || "")}${task.sectionId ? ` (${task.sectionId})` : ""}` : "",
+    task?.priority ? `Priority: ${normalizePriority(task.priority)}` : "",
+    task?.labels?.length ? `Labels: ${task.labels.map((label) => `#${cleanLabel(label)}`).join(" ")}` : "",
+    task?.due_date ? `Due: ${task.due_date}` : "",
+    task?.deadline_date ? `Deadline: ${task.deadline_date}` : "",
+    task?.scheduledDueDateTime ? `Scheduled: ${task.scheduledDueDateTime}` : "",
+    durationMinutes(task?.duration) ? `Duration: ${durationMinutes(task.duration)} minutes` : "",
+    noteRefs.length ? `Source note refs: ${noteRefs.map((ref) => `${ref.path}${Number.isFinite(ref.lineNumber) ? `:${ref.lineNumber + 1}` : ""}`).join("; ")}` : "",
+    task?.signature ? `Dedupe signature: ${task.signature}` : "",
+    task?.duplicateNoteReferenceCount ? `Dedupe continuity: ${task.duplicateNoteReferenceCount} additional note references` : "",
+    knowledge?.intent ? `Intent: ${truncateAtWord(knowledge.intent, 500)}` : "",
+    knowledge?.rationale ? `Rationale: ${truncateAtWord(knowledge.rationale, 600)}` : "",
+    knowledge?.outcomeType ? `Outcome type: ${singleLine(knowledge.outcomeType)}` : "",
+    knowledge?.dependency ? `Dependency: ${truncateAtWord(knowledge.dependency, 400)}` : "",
+    task?.createdAt ? `Created: ${task.createdAt}` : "",
+    task?.modifiedAt || task?.updatedAt ? `Modified: ${task.modifiedAt || task.updatedAt}` : "",
+    task?.observedAt ? `Observed: ${task.observedAt}` : "",
+    task?.cachedAt ? `Cached: ${task.cachedAt}` : "",
+    task?.rebuiltAt ? `Reference rebuilt: ${task.rebuiltAt}` : "",
+    options.snapshotRevision ? `Snapshot revision: ${options.snapshotRevision}` : "",
+    childText && !task?.isSubtask ? `Direct child tasks: ${truncateAtWord(childText, 500)}` : "",
+    childTasks.length && !task?.isSubtask ? `Direct child task relationships: ${childTasks.map((child) => `${child.id || child.todoistId || ""}${child.oid ? ` (${child.oid})` : ""}`).join("; ")}` : ""
+  ].filter(Boolean);
+  return truncateAtWord(lines.join("\n"), 6500);
+}
+
+function semanticTaskReferenceParentStubText(task = {}, sourceId = "") {
+  const identity = task.oid ? `oid ${String(task.oid)}` : task.id ? `Todoist task ID ${String(task.id)}` : "unknown task identity";
+  return `Structural parent relationship stub. Source ID: ${sourceId}. Authority: structural-relationship. Identity: ${identity}. No task title or description is available.`;
 }
 
 function chunkTaskReferenceRows(path, rows, maxChars = 1100) {
@@ -15996,7 +22554,129 @@ function chunkTaskReferenceRows(path, rows, maxChars = 1100) {
   return chunks;
 }
 
-function semanticPathChunksMatch(index, path, nextChunks) {
+function semanticIndexHealthSummary(chunks = []) {
+  const sourceKindCounts = {};
+  let missingIdentityCount = 0;
+  let invalidDimensionCount = 0;
+  let staleCount = 0;
+  let tombstonedCount = 0;
+  let orphanCount = 0;
+  let legacyTaskReferenceCount = 0;
+  const dimensions = (chunks || []).map((chunk) => Array.isArray(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || chunk?.indexMetadata?.dimension || 0)).filter((value) => value > 0);
+  const expectedDimension = dimensions[0] || 0;
+  const hierarchy = semanticTaskChunkHierarchyHealth(chunks);
+  for (const chunk of chunks || []) {
+    const sourceKind = String(chunk?.sourceKind || "");
+    sourceKindCounts[sourceKind] = (sourceKindCounts[sourceKind] || 0) + 1;
+    if (isLegacyGroupedTaskReferenceChunk(chunk)) legacyTaskReferenceCount += 1;
+    if (!chunk?.path || !chunk?.text || !chunk?.sourceKind || !chunk?.sourceId || !chunk?.evidenceId) missingIdentityCount += 1;
+    const actualDimension = Array.isArray(chunk?.embedding) ? chunk.embedding.length : 0;
+    const declaredDimension = Number(chunk?.indexMetadata?.dimension || chunk?.embeddingDimension || actualDimension);
+    if (!actualDimension || !declaredDimension || actualDimension !== declaredDimension || (expectedDimension > 0 && actualDimension !== expectedDimension)) invalidDimensionCount += 1;
+    if (chunk?.stale === true || chunk?.indexMetadata?.stale === true) staleCount += 1;
+    if (chunk?.tombstoned === true || chunk?.indexMetadata?.tombstoned === true) tombstonedCount += 1;
+    if (chunk?.orphan === true || chunk?.indexMetadata?.orphan === true || hierarchy.issueBySourceId?.[String(chunk?.sourceId || "")]) orphanCount += 1;
+  }
+  const totalCount = (chunks || []).length;
+  const invalidCount = Math.min(totalCount, missingIdentityCount + invalidDimensionCount + hierarchy.invalidNodeCount);
+  return {
+    state: invalidCount ? (totalCount > invalidCount ? "quarantined" : "failed") : "clean",
+    totalCount,
+    validCount: Math.max(0, totalCount - invalidCount),
+    invalidCount,
+    missingIdentityCount,
+    invalidDimensionCount,
+    duplicateEvidenceIdCount: 0,
+    conflictingEvidenceIdCount: 0,
+    sourceKindCounts,
+    staleCount,
+    tombstonedCount,
+    orphanCount,
+    legacyTaskReferenceCount,
+    expectedDimension,
+    taskReferenceHealth: hierarchy
+  };
+}
+
+function semanticTaskReferenceMetadata(chunks = []) {
+  const sourceKindCounts = {};
+  const sourceIds = new Set();
+  const sourceNotePaths = new Set();
+  const fingerprints = [];
+  let rootCount = 0;
+  let subtaskCount = 0;
+  let derivedParentCount = 0;
+  let parentStubCount = 0;
+  let retrievalEligibleTaskReferenceCount = 0;
+  for (const chunk of chunks || []) {
+    const sourceKind = String(chunk?.sourceKind || "");
+    const canonicalSnapshotKinds = semanticTaskReferenceCanonicalSnapshotKinds(chunk);
+    sourceKindCounts[sourceKind] = (sourceKindCounts[sourceKind] || 0) + 1;
+    if (sourceKind === "todoist-snapshot-reference-row" || canonicalSnapshotKinds.includes("todoist-snapshot-reference-row")) rootCount += 1;
+    if (sourceKind === "subtask-task-tree-record" || canonicalSnapshotKinds.includes("subtask-task-tree-record")) subtaskCount += 1;
+    if (semanticTaskReferenceDerivedNoteChunk(chunk)) derivedParentCount += 1;
+    if (sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) parentStubCount += 1;
+    if (chunk?.retrievalEligible !== false) retrievalEligibleTaskReferenceCount += 1;
+    if (chunk?.sourceId) sourceIds.add(String(chunk.sourceId));
+    for (const ref of chunk?.sourceNoteRefs || []) if (ref?.path) sourceNotePaths.add(vaultRelativePath(ref.path));
+    if (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record" || sourceKind === "note-task-reference-row" || sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
+      fingerprints.push([sourceKind, String(chunk?.sourceId || ""), String(chunk?.evidenceContentFingerprint || semanticChunkContentFingerprint(chunk?.text || ""))]);
+    }
+  }
+  fingerprints.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const taskReferenceCount = rootCount + subtaskCount + derivedParentCount + parentStubCount;
+  return {
+    taskReferenceSchemaVersion: SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION,
+    sourceKindCounts,
+    taskReferenceCoverage: {
+      taskReferenceCount,
+      rootCount,
+      subtaskCount,
+      derivedParentCount,
+      parentStubCount,
+      retrievalEligibleTaskReferenceCount,
+      uniqueSourceIds: sourceIds.size,
+      sourceNotePathCount: sourceNotePaths.size,
+      sourceNotePaths: Array.from(sourceNotePaths).sort()
+    },
+    taskReferenceFingerprint: shortHash(JSON.stringify(fingerprints))
+  };
+}
+
+function semanticEmbeddingStorageProjection(chunkCount = 0, dimension = 0, model = "") {
+  const chunks = Math.max(0, Number(chunkCount || 0));
+  const dimensions = Math.max(0, Number(dimension || 0));
+  const values = chunks * dimensions;
+  const nativeDimension = openAiEmbeddingNativeDimension(model);
+  return {
+    chunks,
+    dimension: dimensions,
+    vectorValues: values,
+    float32Bytes: values * 4,
+    javascriptNumberBytes: values * 8,
+    projectedSerializedBytes: values * 8,
+    nativeDimension,
+    relativeToNative: nativeDimension > 0 ? Math.round((dimensions / nativeDimension) * 1000) / 1000 : 1
+  };
+}
+
+function semanticIndexMetadata(chunks = [], taskReferenceHealth = null) {
+  const embedded = (chunks || []).find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length) || {};
+  const dimension = Array.isArray(embedded.embedding) ? embedded.embedding.length : Number(embedded.embeddingDimension || embedded.indexMetadata?.dimension || 0);
+  const model = String(embedded.embeddingModel || embedded.indexMetadata?.model || "");
+  return Object.assign({}, semanticTaskReferenceMetadata(chunks), {
+    indexHealth: semanticIndexHealthSummary(chunks),
+    embeddingStorageProjection: semanticEmbeddingStorageProjection((chunks || []).length, dimension, model),
+    taskReferenceHealth: taskReferenceHealth || semanticTaskReferenceHealthFromChunks(chunks)
+  });
+}
+
+function semanticTaskReferenceHealthFromChunks(chunks = []) {
+  const taskChunks = (chunks || []).filter((chunk) => chunk?.sourceKind === "todoist-snapshot-reference-row" || chunk?.sourceKind === "subtask-task-tree-record" || chunk?.sourceKind === "note-task-reference-row" || chunk?.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND);
+  return semanticTaskChunkHierarchyHealth(taskChunks);
+}
+
+function semanticPathChunksMatch(index, path, nextChunks, settings = DEFAULT_SETTINGS) {
   const currentChunks = (index || []).filter((chunk) => chunk.path === path);
   if (currentChunks.length !== nextChunks.length) return false;
   const currentById = new Map(currentChunks.map((chunk) => [chunk.id, chunk]));
@@ -16010,60 +22690,253 @@ function semanticPathChunksMatch(index, path, nextChunks) {
     if (Number(current.embeddingContentVersion || 1) !== Number(next.embeddingContentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION)) return false;
     if (Number(current.createdAt || 0) !== Number(next.createdAt || 0)) return false;
     if (String(current.createdAtSource || "") !== String(next.createdAtSource || "")) return false;
+    const targetDimension = semanticEmbeddingTargetDimension(settings);
+    const actualDimension = Array.isArray(current.embedding) ? current.embedding.length : 0;
+    if (targetDimension && actualDimension !== targetDimension) return false;
   }
   return true;
 }
 
 function semanticChunkEmbeddingInput(chunk) {
+  if (semanticTaskReferenceChunkSelected(chunk)) return semanticTaskReferenceEmbeddingProjection(chunk);
   const path = chunk?.path || "";
-  const project = noteProjectKey(path, chunk?.title || "");
+  const project = chunk?.projectId
+    ? `project:${chunk.projectId}`
+    : semanticEmbeddingProjectContextLabel(path, chunk?.title || "");
   const date = contextDatePart(chunk);
+  const sourceKind = semanticChunkSourceKind(chunk);
   return [
     `Title: ${chunk?.title || ""}`,
     path ? `Vault path: ${path}` : "",
     project ? `Project context: ${project}` : "",
     date ? `Note date: ${date}` : "",
-    chunk?.kind === "todoist-task-reference" ? "Content type: local Todoist task references" : "Content type: vault note",
+    sourceKind === "note" ? "Content type: vault note" : `Content type: ${sourceKind}`,
+    sourceKind !== "note" && chunk?.sourceId ? `Source ID: ${chunk.sourceId}` : "",
+    sourceKind !== "note" && chunk?.parentId ? `Parent task ID: ${chunk.parentId}` : "",
+    sourceKind !== "note" && chunk?.parentOid ? `Parent OID: ${chunk.parentOid}` : "",
+    sourceKind !== "note" && (chunk?.rootTaskId || chunk?.rootId) ? `Root task ID: ${chunk.rootTaskId || chunk.rootId}` : "",
+    sourceKind !== "note" && chunk?.rootOid ? `Root OID: ${chunk.rootOid}` : "",
+    sourceKind !== "note" && chunk?.childTaskIds?.length ? `Child task IDs: ${chunk.childTaskIds.join(", ")}` : "",
+    sourceKind !== "note" && chunk?.childOids?.length ? `Child OIDs: ${chunk.childOids.join(", ")}` : "",
+    sourceKind !== "note" && chunk?.projectName ? `Todoist project: ${chunk.projectName}` : "",
+    sourceKind !== "note" && chunk?.section ? `Todoist section: ${chunk.section}` : "",
     chunk?.text || ""
   ].filter(Boolean).join("\n");
 }
 
-function semanticChunkReuseKey(chunk) {
+function semanticChunkEmbeddingRequestKey(chunk = {}) {
+  const sourceKind = semanticChunkSourceKind(chunk);
+  const taskReference = semanticTaskReferenceChunkSelected(chunk);
+  const input = taskReference ? semanticTaskReferenceEmbeddingProjection(chunk) : String(chunk.text || "").replace(/\s+/g, " ").trim();
+  const key = [String(SEMANTIC_EMBEDDING_CONTENT_VERSION), sourceKind];
+  if (taskReference) key.push(String(SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION));
+  key.push(semanticChunkContentFingerprint(input));
+  return key.join("\u0000");
+}
+
+function semanticChunkSharedEmbeddingInput(chunk = {}) {
+  if (semanticTaskReferenceChunkSelected(chunk)) return semanticTaskReferenceEmbeddingProjection(chunk);
+  const sourceKind = semanticChunkSourceKind(chunk);
   return [
+    sourceKind === "note" ? "Content type: vault note" : `Content type: ${sourceKind}`,
+    String(chunk.text || "")
+  ].filter(Boolean).join("\n");
+}
+
+function semanticEmbeddingProjectContextLabel(path = "", title = "") {
+  const firstFolder = String(path || "").split("/").filter(Boolean)[0];
+  return firstFolder || "unassigned";
+}
+
+function semanticTaskReferenceEmbeddingProjection(chunk = {}) {
+  const reference = chunk?.taskReference || chunk?.task || {};
+  const read = (...keys) => {
+    for (const source of [reference, chunk]) {
+      for (const key of keys) {
+        const value = singleLine(source?.[key] || "");
+        if (value) return value;
+      }
+    }
+    return "";
+  };
+  const fromText = (label) => semanticTaskReferenceField(chunk?.text || "", label);
+  const title = read("content", "taskTitle") || fromText("Title") || read("title");
+  if (!title) return "";
+  const description = read("description", "narrativeDescription", "detail") || fromText("Description");
+  const parentRecord = reference?.parentTask || chunk?.parentTask || {};
+  const parentTitle = read("parentContent", "parentTitle", "parentTaskTitle")
+    || singleLine(parentRecord.content || parentRecord.title || parentRecord.taskTitle || "")
+    || fromText("Parent task");
+  const state = read("currentState", "state", "status") || (Boolean(reference?.isCompleted ?? chunk?.isCompleted) ? "completed" : fromText("Current state") || fromText("State") || "open");
+  const project = read("projectName", "project", "projectLabel") || fromText("Todoist project") || fromText("Project");
+  const section = read("section", "sectionName", "sectionLabel") || fromText("Todoist section") || fromText("Section");
+  const childValues = [];
+  const addChild = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) addChild(item);
+      return;
+    }
+    if (value && typeof value === "object") {
+      const text = [value.content || value.title || value.taskTitle, value.description || value.narrativeDescription].filter(Boolean).join(" — ");
+      if (text) childValues.push(singleLine(text));
+      return;
+    }
+    const text = singleLine(value || "");
+    if (text) childValues.push(text);
+  };
+  for (const source of [reference, chunk]) {
+    for (const key of ["childSemanticText", "childText", "childTaskText", "subtaskText", "parentChildText", "siblingText", "relatedSubtasks", "subtasks", "childTasks", "children"]) addChild(source?.[key]);
+  }
+  const childText = uniqueValues(childValues).join("; ");
+  return [
+    `Title: ${title}`,
+    description ? `Description: ${description}` : "",
+    parentTitle ? `Parent task: ${parentTitle}` : "",
+    childText ? `Related subtasks: ${childText}` : "",
+    `Current state: ${state}`,
+    project ? `Project: ${project}` : "",
+    section ? `Section: ${section}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function semanticTaskReferenceEmbeddingProjectionVersion(chunk = {}) {
+  return semanticTaskReferenceChunkSelected(chunk) ? SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION : 0;
+}
+
+function semanticChunkReuseKey(chunk) {
+  const path = vaultRelativePath(chunk?.path || "");
+  const sourceKind = semanticChunkSourceKind(chunk);
+  const sourceId = String(chunk?.sourceId || (sourceKind === "note" ? path : semanticTaskReferenceSourceId(chunk?.taskId || chunk?.oid || "", chunk, sourceKind)));
+  const key = [
     String(SEMANTIC_EMBEDDING_CONTENT_VERSION),
-    String(chunk?.path || ""),
+    path,
     String(chunk?.title || ""),
     String(chunk?.kind || ""),
     String(chunk?.source || ""),
-    shortHash(String(chunk?.text || ""))
-  ].join("\u0000");
+    sourceKind,
+    sourceId
+  ];
+  if (semanticTaskReferenceChunkSelected(chunk)) key.push(String(SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION));
+  key.push(shortHash(semanticTaskReferenceChunkSelected(chunk) ? semanticTaskReferenceEmbeddingProjection(chunk) : String(chunk?.text || "")));
+  return key.join("\u0000");
 }
 
 function semanticChunkEmbeddingsReusable(settings = DEFAULT_SETTINGS, meta = {}) {
   const currentModel = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
-  const indexedModel = meta?.model || currentModel;
-  if (indexedModel && indexedModel !== currentModel) return false;
+  const currentProvider = aiProviderForModel(currentModel);
   const currentPrecision = Number(settings.semanticIndexEmbeddingPrecision || DEFAULT_SETTINGS.semanticIndexEmbeddingPrecision);
-  const indexedPrecision = Number(meta?.embeddingPrecision || currentPrecision);
-  const indexedContentVersion = Number(meta?.embeddingContentVersion || 1);
-  return indexedPrecision === currentPrecision && indexedContentVersion === SEMANTIC_EMBEDDING_CONTENT_VERSION;
+  const targetDimension = semanticEmbeddingTargetDimension(settings, currentModel);
+  const hasValue = (value) => value !== undefined && value !== null && String(value) !== "";
+  const providerIdentity = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "openai" || normalized === "open-ai") return "openai";
+    if (normalized === "gemini" || normalized === "google") return "gemini";
+    return normalized;
+  };
+  const metadataValue = (...keys) => {
+    let value;
+    let conflict = false;
+    for (const key of keys) {
+      if (!hasValue(meta?.[key])) continue;
+      if (hasValue(value) && String(value) !== String(meta[key])) conflict = true;
+      else if (!hasValue(value)) value = meta[key];
+    }
+    return { value, conflict };
+  };
+  const indexedModel = metadataValue("model", "embeddingModel");
+  const indexedProvider = metadataValue("provider", "embeddingProvider");
+  const indexedPrecision = metadataValue("embeddingPrecision", "precision");
+  const indexedContentVersion = metadataValue("embeddingContentVersion", "contentVersion");
+  const indexedDimension = metadataValue("dimension", "embeddingDimension");
+  const indexedTargetDimension = metadataValue("targetDimension", "embeddingTargetDimension");
+  if (indexedProvider.conflict || (hasValue(indexedProvider.value) && providerIdentity(indexedProvider.value) !== currentProvider)) return false;
+  if (indexedModel.conflict || (hasValue(indexedModel.value) && modelIdentity(indexedModel.value) !== modelIdentity(currentModel))) return false;
+  if (indexedPrecision.conflict || (hasValue(indexedPrecision.value) && Number(indexedPrecision.value) !== currentPrecision)) return false;
+  if (indexedContentVersion.conflict || (hasValue(indexedContentVersion.value) && Number(indexedContentVersion.value) !== SEMANTIC_EMBEDDING_CONTENT_VERSION)) return false;
+  if (targetDimension && indexedDimension.conflict) return false;
+  if (targetDimension && hasValue(indexedDimension.value) && Number(indexedDimension.value) !== targetDimension) return false;
+  if (targetDimension && indexedTargetDimension.conflict) return false;
+  if (targetDimension && hasValue(indexedTargetDimension.value) && Number(indexedTargetDimension.value) !== targetDimension) return false;
+  return true;
 }
 
 function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {}) {
   const reuseMap = new Map();
   if (!semanticChunkEmbeddingsReusable(settings, meta)) return reuseMap;
+  const targetDimension = semanticEmbeddingTargetDimension(settings);
+  const currentModel = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  const currentProvider = aiProviderForModel(currentModel);
+  const currentPrecision = Number(settings.semanticIndexEmbeddingPrecision || DEFAULT_SETTINGS.semanticIndexEmbeddingPrecision);
+  const hasValue = (value) => value !== undefined && value !== null && String(value) !== "";
+  const providerIdentity = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (normalized === "openai" || normalized === "open-ai") return "openai";
+    if (normalized === "gemini" || normalized === "google") return "gemini";
+    return normalized;
+  };
+  const readChunkMetadata = (source, keys) => {
+    let value;
+    let conflict = false;
+    for (const key of (Array.isArray(keys) ? keys : [keys])) {
+      if (!hasValue(source?.[key])) continue;
+      if (hasValue(value) && String(value) !== String(source[key])) conflict = true;
+      else if (!hasValue(value)) value = source[key];
+    }
+    return { value, conflict };
+  };
+  const chunkMetadataValue = (chunk, key, nestedKey = key) => {
+    const topLevel = readChunkMetadata(chunk, key);
+    const nested = readChunkMetadata(chunk?.indexMetadata, nestedKey);
+    if (topLevel.conflict || nested.conflict) return { conflict: true };
+    if (hasValue(topLevel.value) && hasValue(nested.value) && String(topLevel.value) !== String(nested.value)) return { conflict: true };
+    if (hasValue(topLevel.value)) return { value: topLevel.value };
+    if (hasValue(nested.value)) return { value: nested.value };
+    return { value: undefined };
+  };
   for (const chunk of index || []) {
     if (!Array.isArray(chunk?.embedding) || !chunk.embedding.length) continue;
+    if (targetDimension ? chunk.embedding.length !== targetDimension : chunk.embedding.length <= 0) continue;
+    const dimension = chunkMetadataValue(chunk, ["embeddingDimension", "dimension"], ["dimension", "embeddingDimension"]);
+    if (dimension.conflict || (hasValue(dimension.value) && Number(dimension.value) !== chunk.embedding.length)) continue;
+    const contentVersion = chunkMetadataValue(chunk, ["embeddingContentVersion", "contentVersion"], ["contentVersion", "embeddingContentVersion"]);
+    if (contentVersion.conflict || !hasValue(contentVersion.value) || Number(contentVersion.value) !== SEMANTIC_EMBEDDING_CONTENT_VERSION) continue;
+    const model = chunkMetadataValue(chunk, ["embeddingModel", "model"], ["model", "embeddingModel"]);
+    if (model.conflict || (hasValue(model.value) && modelIdentity(model.value) !== modelIdentity(currentModel))) continue;
+    const provider = chunkMetadataValue(chunk, ["embeddingProvider", "provider"], ["provider", "embeddingProvider"]);
+    if (provider.conflict || (hasValue(provider.value) && providerIdentity(provider.value) !== currentProvider)) continue;
+    const precision = chunkMetadataValue(chunk, ["embeddingPrecision", "precision"]);
+    if (precision.conflict || (hasValue(precision.value) && Number(precision.value) !== currentPrecision)) continue;
+    if (semanticTaskReferenceChunkSelected(chunk)) {
+      const projectionVersion = chunkMetadataValue(chunk, "taskReferenceEmbeddingProjectionVersion");
+      if (projectionVersion.conflict || !hasValue(projectionVersion.value) || Number(projectionVersion.value) !== SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION) continue;
+    }
     const key = semanticChunkReuseKey(chunk);
     if (key && !reuseMap.has(key)) reuseMap.set(key, chunk.embedding);
   }
   return reuseMap;
 }
 
-function reusedSemanticChunk(chunk, reuseMap) {
+function reusedSemanticChunk(chunk, reuseMap, settings = DEFAULT_SETTINGS) {
   const embedding = reuseMap?.get(semanticChunkReuseKey(chunk));
   if (!Array.isArray(embedding) || !embedding.length) return null;
-  return Object.assign({}, chunk, { embedding, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
+  const provider = aiProviderForModel(settings.embeddingModel);
+  const projectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(chunk);
+  return Object.assign({}, chunk, {
+    embedding,
+    embeddingProvider: provider,
+    embeddingModel: settings.embeddingModel,
+    embeddingDimension: embedding.length,
+    embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+    ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {}),
+    indexMetadata: Object.assign({}, chunk.indexMetadata || {}, {
+      schemaVersion: 1,
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      provider,
+      model: settings.embeddingModel,
+      dimension: embedding.length,
+      ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {})
+    })
+  });
 }
 
 function todoistTaskMarkdownLink(id, settings = DEFAULT_SETTINGS, label = "") {
@@ -16219,16 +23092,16 @@ function compressForTaskPrompt(text, maxChars, settings = DEFAULT_SETTINGS) {
     const l = line.toLowerCase();
     return /please|action|todo|to do|follow up|review|comment|tracked changes?|verify|verification|accuracy|gap|highlight|draft|document|report|send|confirm|confirmation|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
   }).slice(0, limit).join("\n");
-  const currentLines = relevantLines(thread.current, 60) || thread.current.slice(0, Math.floor(maxChars * 0.45));
-  const historyLines = relevantLines(thread.history, 60) || thread.history.slice(0, Math.floor(maxChars * 0.3));
+  const currentLines = relevantLines(thread.current, 60) || thread.current;
+  const historyLines = relevantLines(thread.history, 60) || thread.history;
   const compact = [
     "Current/latest email message (primary status and next-action evidence):",
-    currentLines || cleaned.slice(0, Math.floor(maxChars * 0.75)),
+    currentLines || cleaned,
     thread.history ? "\nEarlier quoted email thread (background and unresolved context only):" : "",
     thread.history ? historyLines : "",
     links.length ? `\nReferenced links:\n${descriptionLinkReferences(links)}` : ""
   ].join("\n").trim();
-  return clamp(compact || cleaned, maxChars);
+  return compact || cleaned;
 }
 
 function splitEmailCurrentAndQuotedHistory(text = "") {
@@ -16247,17 +23120,357 @@ function splitEmailCurrentAndQuotedHistory(text = "") {
 }
 
 function compressSourceForTaskPrompt(source, settings = DEFAULT_SETTINGS) {
-  const maxChars = source.maxChars || DEFAULT_SETTINGS.maxEmailChars;
   if (source.type === "note") {
     const sourceText = stripExcludedLinks(stripGeneratedActionItemsSection(String(source.text || "")), settings);
     const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
-    return clamp(cleaned, maxChars);
+    return cleaned;
   }
-  return compressForTaskPrompt(source.text, maxChars, settings);
+  return compressForTaskPrompt(source.text, Number.POSITIVE_INFINITY, settings);
 }
 
-function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+function sourceContractSourceText(source = {}, settings = DEFAULT_SETTINGS) {
+  const raw = String(source?.text || "");
+  if (source?.type === "note") {
+    const sourceText = stripExcludedLinks(stripGeneratedActionItemsSection(raw), settings);
+    return cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
+  }
+  return cleanupEmailText(normalizeDescriptionLinks(stripExcludedLinks(raw, settings), raw, settings));
+}
+
+function flattenTaskPlanWithIndexes(tasks = [], prefix = "") {
+  const result = [];
+  (tasks || []).forEach((task, index) => {
+    const key = prefix ? `${prefix}.${index}` : String(index);
+    result.push([key, task]);
+    result.push(...flattenTaskPlanWithIndexes(task?.subtasks || [], key));
+  });
+  return result;
+}
+
+function uniqueSemanticEvidenceChunks(chunks = []) {
+  const byKey = new Map();
+  for (const chunk of chunks || []) {
+    const key = String(chunk?.evidenceId || chunk?.id || `${chunk?.path || ""}:${shortHash(chunk?.text || "")}`);
+    if (!key) continue;
+    const associations = uniqueTaskScopeAssociations([
+      ...(Array.isArray(chunk?.taskScopeAssociations) ? chunk.taskScopeAssociations : []),
+      chunk?.queryId ? {
+        taskId: chunk.queryTaskId || chunk.taskId || "",
+        scopeId: chunk.queryScopeId || chunk.scopeId || chunk.scope_id || "",
+        queryId: chunk.queryId || "",
+        sourceContractId: chunk.querySourceContractId || chunk.sourceContractId || ""
+      } : null
+    ]);
+    if (!byKey.has(key)) {
+      byKey.set(key, Object.assign({}, chunk, {
+        taskScopeAssociations: associations,
+        scopeIds: uniqueValues([...(chunk?.scopeIds || []), ...associations.map((item) => item.scopeId)].map(String).filter(Boolean))
+      }));
+      continue;
+    }
+    const previous = byKey.get(key);
+    const mergedAssociations = uniqueTaskScopeAssociations([...(previous.taskScopeAssociations || []), ...associations]);
+    byKey.set(key, Object.assign({}, previous, {
+      taskScopeAssociations: mergedAssociations,
+      scopeIds: uniqueValues([...(previous.scopeIds || []), ...(chunk?.scopeIds || []), ...mergedAssociations.map((item) => item.scopeId)].map(String).filter(Boolean)),
+      selectionReasonCodes: uniqueValues([...(previous.selectionReasonCodes || []), previous.selectionReasonCode, ...(chunk?.selectionReasonCodes || []), chunk?.selectionReasonCode].map(String).filter(Boolean))
+    }));
+  }
+  return Array.from(byKey.values());
+}
+
+function uniqueTaskScopeAssociations(associations = []) {
+  const seen = new Set();
+  const result = [];
+  for (const association of associations || []) {
+    if (!association) continue;
+    const normalized = {
+      taskId: String(association.taskId || association.task_id || ""),
+      scopeId: String(association.scopeId || association.scope_id || ""),
+      queryId: String(association.queryId || association.query_id || ""),
+      sourceContractId: String(association.sourceContractId || association.source_contract_id || "")
+    };
+    if (!normalized.taskId && !normalized.scopeId && !normalized.queryId) continue;
+    // A task/scope association is a logical relationship, not one row per
+    // semantic lane. Keep the first query ID for provenance while collapsing
+    // action/source/history/continuity lane duplicates.
+    const key = normalized.taskId || normalized.scopeId || normalized.sourceContractId
+      ? `${normalized.taskId}|${normalized.scopeId}|${normalized.sourceContractId}`
+      : normalized.queryId;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function taskSemanticQueryId(sourceContract = null, task = {}, index = 0, revision = 0) {
+  return `task-query-${shortHash(JSON.stringify({ sourceContractId: sourceContract?.id || "", taskId: task?.taskId || task?.id || task?.oid || `task-${index}`, scopeId: task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || "", revision }))}`;
+}
+
+function taskWorkflowLegacyCompatibilityEnabled(source = {}, settings = DEFAULT_SETTINGS) {
+  return source?.taskWorkflowCompatibility === "legacy-import"
+    || source?.workflowCompatibility === "legacy-import"
+    || source?.importedWorkflow === true
+    || settings?.taskWorkflowCompatibilityMode === "legacy-import";
+}
+
+function taskWorkflowScopeRecords(source = {}, sourceContract = null, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+  const contract = sourceContract || {};
+  const factsById = new Map((contract.facts || []).map((fact) => [String(fact.factId || ""), fact]));
+  const scopesById = new Map((contract.scopes || []).map((scope) => [String(scope.scopeId || scope.id || ""), scope]));
+  const markers = (contract.explicitMarkers || [])
+    .map((marker) => {
+      const factId = String(marker.factId || "");
+      const fact = factsById.get(factId);
+      const scope = scopesById.get(String(marker.scopeId || fact?.scopeId || "")) || {};
+      const action = singleLine(fact?.value || marker.action || "");
+      const scopeId = String(marker.scopeId || fact?.scopeId || "");
+      if (!action || !scopeId || !factId) return null;
+      return { scopeId, factId, action, fact, scope, markerIndex: Number(marker.markerIndex ?? 0) };
+    })
+    .filter(Boolean);
+  const sourceFact = (contract.facts || []).find((fact) => fact.factId === contract.primaryFactId) || contract.facts?.[0];
+  const fallback = sourceFact && contract.sourceScopeId
+    ? [{ scopeId: String(contract.sourceScopeId), factId: String(sourceFact.factId || ""), action: singleLine(sourceFact.value || source.title || "source request"), fact: sourceFact, markerIndex: -1 }]
+    : [];
+  const oneTaskMode = source?.oneTaskMode === true
+    || source?.singleTask === true
+    || source?.taskMode === "single"
+    || Number(settings?.maxGeneratedMainTasks) === 1;
+  const selected = (markers.length ? markers : fallback).slice(0, oneTaskMode ? 1 : 6);
+  return selected.map((record, index) => ({
+    ...record,
+    index,
+    taskId: `scope:${record.scopeId}`,
+    primaryContextFactIds: (record.scope?.primaryContextFactIds || []).slice(),
+    mandatoryTaskFactIds: (record.scope?.mandatoryTaskFactIds || []).slice(),
+    mandatoryDescriptionFactIds: (record.scope?.mandatoryDescriptionFactIds || []).slice(),
+    primaryExcerpt: [
+      record.fact?.sourceSurface || record.fact?.value || record.action,
+      ...(record.scope?.primaryContextFactIds || [])
+        .map((factId) => factsById.get(String(factId)))
+        .filter((fact) => fact && String(fact.scopeId || "") === String(record.scopeId) && fact.kind === "primary-context")
+        .map((fact) => fact.sourceSurface || fact.value || "")
+    ].filter(Boolean).join("\n"),
+    semanticQuery: [
+      singleLine(source.title || ""),
+      record.fact?.sourceSurface || record.fact?.value || record.action,
+      ...(record.scope?.primaryContextFactIds || [])
+        .map((factId) => factsById.get(String(factId)))
+        .filter((fact) => fact && String(fact.scopeId || "") === String(record.scopeId) && fact.kind === "primary-context")
+        .map((fact) => fact.sourceSurface || fact.value || "")
+    ].filter(Boolean).join("\n")
+  }));
+}
+
+function chatRequestedTaskScopeRecords(prompt = "", source = null, sourceContract = null, settings = DEFAULT_SETTINGS) {
+  if (!source || !sourceContract) return [];
+  const text = String(prompt || "");
+  const matches = Array.from(text.matchAll(/\btask\s*#?\s*(\d{1,2})\b/gi));
+  if (!matches.length) return [];
+  const records = taskWorkflowScopeRecords(source, sourceContract, source.text || "", settings);
+  const requestTextByOrdinal = new Map();
+  const ordinalOrder = [];
+  for (const [index, match] of matches.entries()) {
+    const ordinal = Number(match[1]);
+    if (!Number.isInteger(ordinal) || ordinal <= 0 || !records[ordinal - 1]) continue;
+    const requestText = text.slice(Number(match.index || 0), Number(matches[index + 1]?.index ?? text.length)).trim();
+    if (!requestTextByOrdinal.has(ordinal)) ordinalOrder.push(ordinal);
+    requestTextByOrdinal.set(ordinal, uniqueValues([...(requestTextByOrdinal.get(ordinal) || []), requestText]));
+  }
+  return ordinalOrder.map((ordinal) => Object.assign({}, records[ordinal - 1], {
+    requestText: (requestTextByOrdinal.get(ordinal) || []).join("\n")
+  }));
+}
+
+function chatRequestedNoteDateKeys(requestText = "", sourceContract = null) {
+  const text = String(requestText || "");
+  const sourceTimestamp = semanticSourceRelativeTimestamp(sourceContract || {});
+  const sourceYear = sourceTimestamp ? new Date(sourceTimestamp).getFullYear() : new Date().getFullYear();
+  const keys = [];
+  for (const match of text.matchAll(/\b(20\d{2})[-_/](\d{1,2})[-_/](\d{1,2})\b/g)) {
+    keys.push(`${match[1]}-${String(Number(match[2])).padStart(2, "0")}-${String(Number(match[3])).padStart(2, "0")}`);
+  }
+  for (const match of text.matchAll(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b/gi)) {
+    const year = Number(match[3] || sourceYear);
+    const month = monthNumber(match[1]);
+    const day = Number(match[2]);
+    if (year && month && day >= 1 && day <= 31) keys.push(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
+  }
+  return uniqueValues(keys);
+}
+
+function taskReservedSemanticEvidenceLineRange(chunk = {}) {
+  const range = chunk.sourceLineRange || chunk.source_line_range || {};
+  const lineStart = Number(range.lineStart || range.line_start || chunk.lineStart || chunk.line_start || 0);
+  const lineEnd = Number(range.lineEnd || range.line_end || chunk.lineEnd || chunk.line_end || lineStart || 0);
+  return {
+    lineStart: Number.isFinite(lineStart) && lineStart > 0 ? lineStart : 0,
+    lineEnd: Number.isFinite(lineEnd) && lineEnd > 0 ? lineEnd : 0
+  };
+}
+
+function buildTaskReservedSemanticEvidenceBundle(records = [], groups = [], source = null, sourceContract = null, settings = DEFAULT_SETTINGS) {
+  const activePath = vaultRelativePath(source?.path || "");
+  const laneDrafts = records.map((record, index) => {
+    const raw = uniqueSemanticEvidenceChunks(groups[index] || []);
+    const activeEvidenceIds = raw
+      .filter((chunk) => activePath && vaultRelativePath(chunk?.path || "") === activePath)
+      .map((chunk) => String(chunk?.evidenceId || chunk?.evidence_id || chunk?.id || ""))
+      .filter(Boolean);
+    const chunks = raw.filter((chunk) => !activePath || vaultRelativePath(chunk?.path || "") !== activePath);
+    return {
+      ordinal: index + 1,
+      taskId: String(record?.taskId || record?.id || `task-${index + 1}`),
+      scopeId: String(record?.scopeId || record?.scope_id || ""),
+      queryId: String(raw.find((chunk) => chunk?.queryId)?.queryId || ""),
+      chunks,
+      activeEvidenceIds: uniqueValues(activeEvidenceIds)
+    };
+  });
+  const sharedByEvidenceId = new Map();
+  const sharedOrder = [];
+  const unresolvedByTask = {};
+  const maxLaneLength = Math.max(0, ...laneDrafts.map((lane) => lane.chunks.length));
+  for (let itemIndex = 0; itemIndex < maxLaneLength; itemIndex += 1) {
+    for (const lane of laneDrafts) {
+      const chunk = lane.chunks[itemIndex];
+      if (!chunk) continue;
+      const evidenceId = String(chunk.evidenceId || chunk.evidence_id || chunk.id || "");
+      const excerpt = String(chunk.text ?? chunk.excerpt ?? "");
+      if (!evidenceId || !excerpt) {
+        (unresolvedByTask[lane.taskId] ||= []).push(evidenceId || `missing-evidence-id:${itemIndex}`);
+        continue;
+      }
+      const existing = sharedByEvidenceId.get(evidenceId);
+      if (existing && existing.excerpt !== excerpt) {
+        (unresolvedByTask[lane.taskId] ||= []).push(`${evidenceId}:conflicting-excerpt`);
+        continue;
+      }
+      if (existing) {
+        existing.taskIds = uniqueValues([...existing.taskIds, lane.taskId]);
+        existing.scopeIds = uniqueValues([...existing.scopeIds, lane.scopeId].filter(Boolean));
+        continue;
+      }
+      const lineRange = taskReservedSemanticEvidenceLineRange(chunk);
+      const sourceKind = semanticChunkSourceKind(chunk);
+      const taskReference = chunk.taskReference || chunk.task || {};
+      const todoistTaskId = String(taskReference.todoistId || taskReference.taskId || taskReference.id || chunk.todoistId || "");
+      const path = vaultRelativePath(chunk.path || chunk.provenance?.path || "");
+      const title = singleLine(chunk.title || chunk.name || chunk.path || evidenceId);
+      const linkTarget = semanticTaskReferenceChunkSelected(chunk) && todoistTaskId
+        ? todoistTaskUrl(todoistTaskId, settings)
+        : path ? `obsidian://open?file=${encodeURIComponent(path)}` : "";
+      const entry = {
+        evidenceId,
+        sourceId: String(chunk.sourceId || chunk.source_id || chunk.provenance?.sourceId || chunk.provenance?.source_id || ""),
+        sourceKind,
+        title,
+        path,
+        linkTarget,
+        linkMarkup: linkTarget ? `[${markdownLinkText(title)}](${linkTarget})` : "",
+        lineStart: lineRange.lineStart,
+        lineEnd: lineRange.lineEnd,
+        temporalRelation: String(chunk.temporalRelation || chunk.temporal_relation || "undated"),
+        authority: String(chunk.authorityState || chunk.authority_state || chunk.authority || chunk.provenance?.authority || "supporting"),
+        conflictState: String(chunk.conflictState || chunk.conflict_state || "none"),
+        taskIds: [lane.taskId],
+        scopeIds: lane.scopeId ? [lane.scopeId] : [],
+        excerpt
+      };
+      sharedByEvidenceId.set(evidenceId, entry);
+      sharedOrder.push(evidenceId);
+    }
+  }
+  const selectedEvidenceByTask = {};
+  const deliveredEvidenceByTask = {};
+  const activeEvidenceByTask = {};
+  const lanes = laneDrafts.map((lane) => {
+    const selected = uniqueValues(lane.chunks.map((chunk) => String(chunk?.evidenceId || chunk?.evidence_id || chunk?.id || "")).filter(Boolean));
+    const delivered = selected.filter((evidenceId) => sharedByEvidenceId.has(evidenceId));
+    const unresolved = uniqueValues([...(unresolvedByTask[lane.taskId] || []), ...selected.filter((evidenceId) => !sharedByEvidenceId.has(evidenceId))]);
+    if (!selected.length) unresolved.push("empty-reserved-lane");
+    selectedEvidenceByTask[lane.taskId] = selected;
+    deliveredEvidenceByTask[lane.taskId] = delivered;
+    activeEvidenceByTask[lane.taskId] = lane.activeEvidenceIds;
+    unresolvedByTask[lane.taskId] = uniqueValues(unresolved);
+    return {
+      ordinal: lane.ordinal,
+      taskId: lane.taskId,
+      scopeId: lane.scopeId,
+      queryId: lane.queryId,
+      evidenceRefs: delivered,
+      activeSourceEvidenceRefs: lane.activeEvidenceIds
+    };
+  });
+  const sharedEvidence = sharedOrder.map((evidenceId) => sharedByEvidenceId.get(evidenceId));
+  const laneText = lanes.map((lane, index) => [
+    `Task evidence lane ${index + 1}:`,
+    `- ordinal=${lane.ordinal} task_id=${lane.taskId} scope_id=${lane.scopeId || ""} query_id=${lane.queryId || ""}`,
+    `- evidence_refs=${lane.evidenceRefs.join(",") || "(none)"}`
+  ].join("\n")).join("\n\n");
+  const sharedText = sharedEvidence.map((entry) => [
+    `- evidence_id=${entry.evidenceId} source_id=${entry.sourceId} source_kind=${entry.sourceKind} title=${entry.title} link=${entry.linkTarget}`,
+    `- path=${entry.path}`,
+    `- lines=${entry.lineStart}-${entry.lineEnd} temporal=${entry.temporalRelation} authority=${entry.authority} conflict=${entry.conflictState}`,
+    "<excerpt>",
+    entry.excerpt,
+    "</excerpt>"
+  ].join("\n")).join("\n\n");
+  const serialized = [
+    "Reserved task semantic evidence lanes:",
+    laneText,
+    "Shared semantic evidence table:",
+    sharedText
+  ].filter(Boolean).join("\n\n");
+  const bundleHash = taskWorkflowHash({
+    sourceContractId: sourceContract?.id || "",
+    lanes: lanes.map((lane) => ({ taskId: lane.taskId, scopeId: lane.scopeId, evidenceRefs: lane.evidenceRefs })),
+    sharedEvidence: sharedEvidence.map((entry) => ({ evidenceId: entry.evidenceId, sourceId: entry.sourceId, excerptHash: shortHash(entry.excerpt) }))
+  });
+  return deepFreezeTaskWorkflow({
+    lanes,
+    sharedEvidence,
+    serialized,
+    bundleHash,
+    telemetry: {
+      taskSeparated: true,
+      laneCount: lanes.length,
+      sharedEvidenceCount: sharedEvidence.length,
+      sharedEvidenceIds: sharedOrder.slice(),
+      selectedEvidenceByTask,
+      deliveredEvidenceByTask,
+      unresolvedEvidenceByTask: unresolvedByTask,
+      activeEvidenceByTask,
+      serializedChars: serialized.length,
+      bundleHash
+    }
+  });
+}
+
+function assertTaskReservedSemanticEvidenceDelivery(bundle = null) {
+  if (!bundle?.lanes?.length) throw new Error("Reserved task evidence delivery failed: no task lanes were created.");
+  const unresolved = Object.entries(bundle.telemetry?.unresolvedEvidenceByTask || {}).filter(([, evidenceIds]) => evidenceIds?.length);
+  const mismatched = Object.entries(bundle.telemetry?.selectedEvidenceByTask || {}).filter(([taskId, selected]) => {
+    const delivered = new Set(bundle.telemetry?.deliveredEvidenceByTask?.[taskId] || []);
+    return !selected?.length || selected.some((evidenceId) => !delivered.has(evidenceId));
+  });
+  if (unresolved.length || mismatched.length) {
+    throw new Error(`Reserved task evidence delivery failed before AI call: ${JSON.stringify({ unresolved, mismatched })}`);
+  }
+}
+
+function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS, sourceContract = null) {
   const sourceTitle = singleLine(source.title || "");
+  if (sourceContract) {
+    const markerActions = (sourceContract.explicitMarkers || []).map((marker) => singleLine(marker.action)).filter(Boolean);
+    const explicitFacts = (sourceContract.facts || [])
+      .filter((fact) => /^(?:due-date|deadline|source-link|source-summary)$/.test(fact.kind || ""))
+      .map((fact) => singleLine(fact.value))
+      .filter(Boolean);
+    return [sourceTitle, singleLine(sourceSummary), ...markerActions, ...explicitFacts].filter(Boolean).join("\n");
+  }
   const intent = summarizeSourceForTaskContext(sourceSummary, sourceTitle, 1200, settings);
   const markerPattern = noteActionMarkerRegex(settings);
   const explicitActions = String(sourceSummary || "")
@@ -16275,54 +23488,1385 @@ function taskGenerationContextQuery(source = {}, sourceSummary = "", settings = 
   return [sourceTitle, explicitActions, contextGaps, intent].filter(Boolean).join("\n");
 }
 
+const TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION = 2;
+
+// Canonical task-workflow facts are intentionally allowlisted.  The source
+// contract may preserve exact structured facts, but it must never manufacture
+// semantic identity from prose, titles, paths, or lexical overlap.
+const TASK_WORKFLOW_FACT_TYPES = Object.freeze([
+  "action", "person", "owner", "deliverable", "criterion", "dependency",
+  "current-state", "direction", "recipient", "reviewer", "urgency",
+  "deadline", "priority", "marker", "summary", "date", "link"
+]);
+const TASK_WORKFLOW_FACT_MANDATORY_TARGETS = Object.freeze(["task", "description", "identity"]);
+const TASK_WORKFLOW_FACT_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    factId: { type: "string", minLength: 1 },
+    type: { type: "string", enum: TASK_WORKFLOW_FACT_TYPES },
+    kind: { type: "string", minLength: 1 },
+    role: { type: "string", minLength: 1 },
+    scopeId: { type: "string", minLength: 1 },
+    evidenceId: { type: "string", minLength: 1 },
+    sourceId: { type: "string", minLength: 1 },
+    authority: { type: "string", minLength: 1 },
+    authorityState: { type: "string", minLength: 1 },
+    current: { type: "boolean" },
+    temporalRelation: { type: "string", minLength: 1 },
+    conflictState: { type: "string", minLength: 1 },
+    mandatoryFor: { type: "array", items: { type: "string", enum: TASK_WORKFLOW_FACT_MANDATORY_TARGETS } },
+    contentFingerprint: { type: "string", minLength: 1 },
+    sourceSurface: {}
+  },
+  required: [
+    "factId", "type", "kind", "role", "scopeId", "evidenceId", "sourceId",
+    "authority", "authorityState", "current", "temporalRelation", "conflictState",
+    "mandatoryFor", "contentFingerprint", "sourceSurface"
+  ]
+});
+const TASK_WORKFLOW_FACT_BINDING_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    factId: { type: "string", minLength: 1 },
+    type: { type: "string", enum: TASK_WORKFLOW_FACT_TYPES },
+    role: { type: "string", minLength: 1 },
+    evidenceId: { type: "string", minLength: 1 },
+    scopeId: { type: "string", minLength: 1 }
+  },
+  required: ["factId", "type", "role", "evidenceId", "scopeId"]
+});
+
+function taskWorkflowFactTypeForKind(kind = "", fact = {}) {
+  const declared = String(fact.type || fact.factType || "").trim();
+  if (TASK_WORKFLOW_FACT_TYPES.includes(declared)) return declared;
+  const normalized = String(kind || "").trim().toLowerCase();
+  if (normalized === "marked-action" || normalized === "action") return "action";
+  if (normalized === "due-date" || normalized === "date") return "date";
+  if (normalized === "deadline") return "deadline";
+  if (normalized === "source-link" || normalized === "link") return "link";
+  if (normalized === "source-summary" || normalized === "summary") return "summary";
+  // Legacy source facts have no declared semantic type.  Summary is the only
+  // neutral type that does not infer identity from their wording.
+  if (normalized === "source-fact" || normalized === "") return "summary";
+  return "";
+}
+
+function taskWorkflowFactRoleForType(type = "", kind = "", fact = {}) {
+  const declared = String(fact.role || "").trim();
+  if (declared) return declared;
+  const normalizedKind = String(kind || "").trim().toLowerCase();
+  if (type === "action" && normalizedKind === "marked-action") return "requested-action";
+  if (type === "date") return "due-date";
+  if (type === "deadline") return "deadline";
+  if (type === "link") return "source-link";
+  if (type === "summary") return "source-summary";
+  return type;
+}
+
+function taskWorkflowFactMandatoryFor(type = "", kind = "", fact = {}) {
+  const declared = Array.isArray(fact.mandatoryFor || fact.mandatory_for)
+    ? fact.mandatoryFor || fact.mandatory_for
+    : [];
+  const allowed = uniqueValues(declared.map((value) => String(value)).filter((value) => TASK_WORKFLOW_FACT_MANDATORY_TARGETS.includes(value)));
+  if (allowed.length) return allowed;
+  if (type === "action" && String(kind || "").toLowerCase() === "marked-action") return ["task", "description", "identity"];
+  return [];
+}
+
+function taskWorkflowFactSourceSurface(value = "", fallback = "") {
+  const candidate = value == null || value === "" ? fallback : value;
+  if (candidate == null) return "";
+  if (typeof candidate === "string") return candidate;
+  try { return JSON.stringify(candidate); } catch { return String(candidate); }
+}
+
+function normalizeTaskWorkflowFactRecord(input = {}, defaults = {}) {
+  const raw = input || {};
+  const kind = String(raw.kind || defaults.kind || "source-fact").trim() || "source-fact";
+  const type = taskWorkflowFactTypeForKind(raw.type || defaults.type || kind, Object.assign({}, defaults, raw));
+  if (!TASK_WORKFLOW_FACT_TYPES.includes(type)) return null;
+  const role = taskWorkflowFactRoleForType(type, kind, Object.assign({}, defaults, raw));
+  const factId = String(raw.factId || raw.fact_id || raw.id || defaults.factId || "").trim();
+  const scopeId = String(raw.scopeId || raw.scope_id || defaults.scopeId || "").trim();
+  const evidenceId = String(raw.evidenceId || raw.evidence_id || defaults.evidenceId || "").trim();
+  const sourceId = String(raw.sourceId || raw.source_id || defaults.sourceId || "").trim();
+  const value = singleLine(raw.value || raw.text || raw.description || defaults.value || "");
+  const sourceSurface = taskWorkflowFactSourceSurface(raw.sourceSurface || raw.source_surface || defaults.sourceSurface, value);
+  if (!factId || !scopeId || !evidenceId || !sourceId || !sourceSurface) return null;
+  const mandatoryFor = taskWorkflowFactMandatoryFor(type, kind, Object.assign({}, defaults, raw));
+  const authority = String(raw.authority || defaults.authority || "current");
+  const authorityState = String(raw.authorityState || raw.authority_state || defaults.authorityState || "authoritative");
+  const current = raw.current == null ? defaults.current !== false : raw.current === true;
+  const temporalRelation = String(raw.temporalRelation || raw.temporal_relation || defaults.temporalRelation || (current ? "current" : "historical"));
+  const conflictState = String(raw.conflictState || raw.conflict_state || defaults.conflictState || "none");
+  const contentFingerprint = String(raw.contentFingerprint || raw.content_fingerprint || defaults.contentFingerprint || `fp-${shortHash(JSON.stringify({ type, role, value, sourceSurface }))}`);
+  return Object.assign({}, raw, {
+    factId,
+    id: factId,
+    type,
+    kind,
+    role,
+    scopeId,
+    evidenceId,
+    sourceId,
+    authority,
+    authorityState,
+    current,
+    temporalRelation,
+    conflictState,
+    mandatoryFor,
+    contentFingerprint,
+    sourceSurface,
+    value
+  });
+}
+
+const canonicalTaskWorkflowFact = normalizeTaskWorkflowFactRecord;
+const typedTaskWorkflowFactSchema = TASK_WORKFLOW_FACT_SCHEMA;
+
+function taskWorkflowFactBindingFromFact(fact = {}, evidence = null, scopeId = "") {
+  const normalized = normalizeTaskWorkflowFactRecord(fact, {
+    scopeId: scopeId || fact.scopeId || fact.scope_id,
+    evidenceId: fact.evidenceId || fact.evidence_id || evidence?.evidenceId,
+    sourceId: fact.sourceId || fact.source_id || evidence?.provenance?.sourceId,
+    sourceSurface: fact.sourceSurface || fact.value || evidence?.excerpt || ""
+  });
+  if (!normalized) return null;
+  return Object.freeze({
+    factId: normalized.factId,
+    type: normalized.type,
+    role: normalized.role,
+    evidenceId: normalized.evidenceId,
+    scopeId: normalized.scopeId
+  });
+}
+
+function stableTaskWorkflowValue(value) {
+  if (Array.isArray(value)) return value.map(stableTaskWorkflowValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.keys(value).sort().reduce((result, key) => {
+    if (value[key] !== undefined) result[key] = stableTaskWorkflowValue(value[key]);
+    return result;
+  }, {});
+}
+
+function taskWorkflowHash(value) {
+  return `tw-${shortHash(JSON.stringify(stableTaskWorkflowValue(value)))}`;
+}
+
+function deepFreezeTaskWorkflow(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreezeTaskWorkflow(child, seen);
+  return Object.freeze(value);
+}
+
+function taskWorkflowSourceKind(sourceType = "note") {
+  return sourceType === "email" ? "current-email-source" : "current-note-source";
+}
+
+function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = [], settings = DEFAULT_SETTINGS) {
+  const lines = String(sourceText || "").split("\n");
+  const records = [];
+  const markerActionLineIndexes = new Set();
+  const isBoundary = (line = "") => {
+    const trimmed = String(line || "").trim();
+    return !trimmed || /^#{1,6}\s/.test(trimmed) || /^[-*_]{3,}\s*$/.test(trimmed);
+  };
+  const isMarkerLine = (line = "") => noteActionMarkerRegex(settings).test(String(line || ""));
+  for (const marker of markerRecords || []) {
+    const lineIndex = Math.max(0, Number(marker.line || 1) - 1);
+    const rawLine = lines[lineIndex] || "";
+    const matches = Array.from(rawLine.matchAll(noteActionMarkerRegex(settings, true)));
+    const ordinal = markerRecords.filter((candidate) => Number(candidate.line) === Number(marker.line)).indexOf(marker);
+    const match = matches[ordinal] || matches[0] || null;
+    const nextMarkerIndex = matches[ordinal + 1]?.index;
+    const inlineAction = match
+      ? cleanMarkedActionSourceText(rawLine.slice((match.index || 0) + match[0].length, nextMarkerIndex ?? rawLine.length))
+      : "";
+    let actionLineIndex = lineIndex;
+    if (!inlineAction) {
+      for (let next = lineIndex + 1; next < lines.length; next += 1) {
+        const candidate = lines[next] || "";
+        if (!candidate.trim()) continue;
+        if (/^#{1,6}\s/.test(candidate.trim()) || isMarkerLine(candidate)) break;
+        actionLineIndex = next;
+        break;
+      }
+    }
+    markerActionLineIndexes.add(actionLineIndex);
+    const scoped = [];
+    const add = (lineNumber, surface) => {
+      const text = singleLine(surface || "");
+      if (!text || /^[-*]\s*$/.test(text) || isMarkerLine(text) || (markerActionLineIndexes.has(lineNumber - 1) && lineNumber - 1 !== lineIndex)) return;
+      if (!scoped.some((entry) => entry.line === lineNumber && entry.sourceSurface === text)) scoped.push({ line: lineNumber, sourceSurface: text });
+    };
+    if (match && Number(match.index || 0) > 0) add(lineIndex + 1, rawLine.slice(0, match.index));
+    for (const offset of [-1, 1]) {
+      const adjacentIndex = lineIndex + offset;
+      if (adjacentIndex < 0 || adjacentIndex >= lines.length || isBoundary(lines[adjacentIndex])) continue;
+      add(adjacentIndex + 1, lines[adjacentIndex]);
+    }
+    records.push({ marker, records: scoped });
+  }
+  return records;
+}
+
+function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
+  const sourceType = source.type || "note";
+  const title = singleLine(source.title || "");
+  const path = String(source.path || "");
+  const sourceTimestamp = semanticSourceRelativeTimestamp(Object.assign({}, source, { title, path }));
+  const primaryText = String(sourceSummary || "").trim();
+  const sourceId = source.sourceContractId || source.source_contract_id || source.sourceId || source.source_id || `src-${shortHash(JSON.stringify({ sourceType, title, path, text: primaryText }))}`;
+  const primaryEvidenceId = source.primaryEvidenceId || source.primary_evidence_id || source.evidenceId || source.evidence_id || `evidence-${shortHash(`${sourceId}:primary`)}`;
+  const markers = sourceType === "note" ? explicitNoteActionMarkers(primaryText, settings).slice(0, 64) : [];
+  const markerRecords = markers.map((marker, markerIndex) => Object.assign({}, marker, {
+    markerIndex,
+    markerRecordId: `marker-${markerIndex + 1}`
+  }));
+  let requestSignals = structuredMarkedActionSignals(markerRecords, settings);
+  const scopes = [];
+  const scopeByKey = new Map();
+  const addScope = (key, patch = {}) => {
+    const scopeId = key === "source" && (source.scope_id || source.scopeId) ? String(source.scope_id || source.scopeId) : `scope-${shortHash(`${sourceId}:${key}`)}`;
+    if (scopeByKey.has(scopeId)) return scopeByKey.get(scopeId);
+    const scope = Object.assign({
+      scopeId,
+      id: scopeId,
+      sourceId,
+      authority: "current",
+      authorityState: "authoritative",
+      current: true,
+      evidenceIds: [primaryEvidenceId],
+      factIds: []
+    }, patch);
+    scopeByKey.set(scopeId, scope);
+    scopes.push(scope);
+    return scope;
+  };
+  const sourceScope = addScope("source", {
+    action: "source",
+    family: "source",
+    markerTags: [],
+    lines: []
+  });
+  for (const marker of markerRecords) {
+    const scope = addScope(`marked:${marker.markerIndex}:${marker.line}:${marker.tag}`, {
+      action: singleLine(marker.action),
+      family: "marked-action",
+      markerTags: marker.tag ? [marker.tag] : [],
+      lines: Number.isFinite(Number(marker.line)) ? [Number(marker.line)] : [],
+      markerIndex: marker.markerIndex,
+      markerRecordId: marker.markerRecordId
+    });
+    marker.scopeId = scope.scopeId;
+  }
+  const facts = [];
+  const factKeys = new Set();
+  const addFact = (kind, value, scopeId = sourceScope.scopeId, line = null, extra = {}) => {
+    const cleanValue = singleLine(value || "");
+    if (!cleanValue) return "";
+    const requestedFactId = String(extra.factId || extra.fact_id || "").trim();
+    const key = requestedFactId ? `${kind}:${scopeId}:${requestedFactId}` : `${kind}:${scopeId}:${cleanValue.toLowerCase()}`;
+    if (factKeys.has(key)) return facts.find((fact) => fact.key === key)?.factId || "";
+    const factId = requestedFactId || `fact-${shortHash(`${sourceId}:${key}`)}`;
+    const fact = normalizeTaskWorkflowFactRecord(Object.assign({
+      key,
+      factId,
+      id: factId,
+      evidenceId: primaryEvidenceId,
+      kind,
+      value: cleanValue,
+      scopeId,
+      sourceId,
+      authority: "current",
+      authorityState: "authoritative",
+      temporalRelation: "current",
+      conflictState: "none",
+      current: true,
+      line: Number.isFinite(line) ? line : null,
+      sourceSurface: extra.sourceSurface || cleanValue,
+      type: extra.type || taskWorkflowFactTypeForKind(kind, extra),
+      role: extra.role || taskWorkflowFactRoleForType(taskWorkflowFactTypeForKind(kind, extra), kind, extra),
+      mandatoryFor: extra.mandatoryFor || taskWorkflowFactMandatoryFor(taskWorkflowFactTypeForKind(kind, extra), kind, extra)
+    }, extra), { sourceId, scopeId, evidenceId: extra.evidenceId || primaryEvidenceId, sourceSurface: extra.sourceSurface || cleanValue });
+    if (!fact) return "";
+    factKeys.add(key);
+    facts.push(fact);
+    const scope = scopes.find((item) => item.scopeId === scopeId) || sourceScope;
+    scope.factIds.push(factId);
+    return factId;
+  };
+  for (const marker of markerRecords) {
+    const factId = addFact("marked-action", marker.action, marker.scopeId || sourceScope.scopeId, marker.line, {
+      markerIndex: marker.markerIndex,
+      markerRecordId: marker.markerRecordId,
+      markerTag: marker.tag,
+      sourceSurface: marker.action,
+      type: "action",
+      role: "requested-action",
+      mandatoryFor: ["task", "description", "identity"]
+    });
+    marker.factId = factId;
+    const scope = scopes.find((item) => item.scopeId === marker.scopeId);
+    if (scope) scope.markerFactId = factId;
+  }
+  const primaryContextRecords = taskWorkflowPrimaryContextLineRecords(primaryText, markerRecords, settings);
+  for (const entry of primaryContextRecords) {
+    const marker = entry.marker;
+    for (const context of entry.records) {
+      addFact("primary-context", context.sourceSurface, marker.scopeId || sourceScope.scopeId, context.line, {
+        markerIndex: marker.markerIndex,
+        markerRecordId: marker.markerRecordId,
+        sourceSurface: context.sourceSurface,
+        type: "summary",
+        role: "primary-context",
+        mandatoryFor: [],
+        primaryContext: true,
+        optional: true
+      });
+    }
+  }
+  requestSignals = structuredMarkedActionSignals(markerRecords, settings);
+  for (const fact of source.fact_refs || source.factRefs || []) {
+    const factId = fact?.factId || fact?.fact_id || fact?.id || fact;
+    const evidenceId = fact?.evidenceId || fact?.evidence_id || primaryEvidenceId;
+    const value = fact?.value || fact?.text || fact?.description || factId;
+    const requestedScopeId = String(fact?.scopeId || fact?.scope_id || sourceScope.scopeId);
+    const validScope = scopes.some((scope) => scope.scopeId === requestedScopeId);
+    const validEvidence = !fact?.evidenceId && !fact?.evidence_id
+      ? evidenceId === primaryEvidenceId
+      : [primaryEvidenceId, source.primaryEvidenceId, source.primary_evidence_id].filter(Boolean).map(String).includes(String(evidenceId));
+    const declaredType = taskWorkflowFactTypeForKind(fact?.kind || "source-fact", fact || {});
+    if (factId && validScope && validEvidence && declaredType && !facts.some((entry) => entry.factId === String(factId))) {
+      addFact(fact?.kind || "source-fact", value, requestedScopeId, fact?.line, {
+        factId: String(factId), id: String(factId), evidenceId, sourceProvided: true,
+        type: declaredType,
+        role: fact?.role,
+        mandatoryFor: fact?.mandatoryFor || fact?.mandatory_for,
+        sourceSurface: fact?.sourceSurface || fact?.source_surface || value
+      });
+    }
+  }
+  if (!facts.some((fact) => fact.kind === "source-summary")) addFact("source-summary", primaryText, sourceScope.scopeId);
+  const lines = primaryText.split("\n");
+  lines.forEach((line, index) => {
+    const due = extractDueDate(line);
+    const deadline = extractDeadline(line);
+    if (due) addFact("due-date", due, sourceScope.scopeId, index + 1, { type: "date", role: "due-date", sourceSurface: line });
+    if (deadline) addFact("deadline", deadline, sourceScope.scopeId, index + 1, { type: "deadline", role: "deadline", sourceSurface: line });
+  });
+  for (const link of extractDescriptionLinkRecords(primaryText, settings).slice(0, 20)) addFact("source-link", link.url, sourceScope.scopeId, null, { label: link.label, type: "link", role: "source-link", sourceSurface: link.url });
+  if (!facts.length) addFact("source-summary", primaryText, sourceScope.scopeId);
+  const boundedFacts = facts.slice(0, 96);
+  const factIds = boundedFacts.map((fact) => fact.factId);
+  for (const scope of scopes) {
+    const scopeFacts = boundedFacts.filter((fact) => String(fact.scopeId) === String(scope.scopeId));
+    scope.factIds = uniqueValues(scopeFacts.map((fact) => String(fact.factId)));
+    scope.mandatoryFactIds = uniqueValues(scopeFacts.filter((fact) => Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.length).map((fact) => String(fact.factId)));
+    scope.mandatoryTaskFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("task")).map((fact) => String(fact.factId)));
+    scope.mandatoryDescriptionFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description")).map((fact) => String(fact.factId)));
+    scope.mandatoryIdentityFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("identity")).map((fact) => String(fact.factId)));
+    scope.primaryContextFactIds = uniqueValues(scopeFacts.filter((fact) => fact.kind === "primary-context" && fact.type === "summary" && fact.role === "primary-context" && fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && !(fact.mandatoryFor || []).length).map((fact) => String(fact.factId)));
+  }
+  const primaryFactId = boundedFacts.find((fact) => fact.sourceProvided)?.factId
+    || boundedFacts.find((fact) => fact.kind !== "marked-action")?.factId
+    || factIds[0]
+    || "";
+  const markedScopes = scopes.filter((scope) => scope.scopeId !== sourceScope.scopeId);
+  const scopeIds = scopes.map((scope) => scope.scopeId);
+  const sourceContract = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    id: sourceId,
+    sourceId,
+    source_id: sourceId,
+    sourceType,
+    source_type: sourceType,
+    sourceKind: taskWorkflowSourceKind(sourceType),
+    title,
+    path,
+    sourceTimestamp,
+    source_timestamp: sourceTimestamp,
+    authority: "current",
+    authorityState: "authoritative",
+    current: true,
+    currentSource: true,
+    sourceScopeId: sourceScope.scopeId,
+    scopeId: markedScopes[0]?.scopeId || sourceScope.scopeId,
+    scope_id: markedScopes[0]?.scopeId || sourceScope.scopeId,
+    defaultScopeId: markedScopes[0]?.scopeId || sourceScope.scopeId,
+    scopeIds,
+    scopes,
+    primaryEvidenceId,
+    primary_evidence_id: primaryEvidenceId,
+    evidence_id: primaryEvidenceId,
+    primaryEvidenceIds: [primaryEvidenceId],
+    factIds,
+    primaryFactId,
+    primary_fact_id: primaryFactId,
+    fact_refs: factIds.slice(),
+    facts: boundedFacts,
+    explicitMarkers: markerRecords.map((marker) => ({
+      tag: marker.tag,
+      action: marker.action,
+      line: marker.line,
+      markerIndex: marker.markerIndex,
+      markerRecordId: marker.markerRecordId,
+      scopeId: marker.scopeId,
+      factId: marker.factId
+    })),
+    markedActionFactIds: markerRecords.map((marker) => marker.factId).filter(Boolean),
+    requestedActionSignals: requestSignals
+  };
+  sourceContract.fingerprint = taskWorkflowHash(sourceContract);
+  return deepFreezeTaskWorkflow(sourceContract);
+}
+
+function evidenceScopeIdsForChunk(chunk = {}) {
+  const values = [
+    ...(Array.isArray(chunk.scopeIds) ? chunk.scopeIds : []),
+    ...(Array.isArray(chunk.taskScopeAssociations) ? chunk.taskScopeAssociations.map((association) => association?.scopeId || association?.scope_id) : []),
+    chunk.scopeId,
+    chunk.scope_id,
+    chunk.taskReference?.scopeId,
+    chunk.taskReference?.scope_id,
+    ...(Array.isArray(chunk.taskReference?.scopeIds) ? chunk.taskReference.scopeIds : [])
+  ];
+  return uniqueValues(values.map((value) => singleLine(value)).filter(Boolean)).slice(0, 12);
+}
+
+function semanticExactExcerptFactsForItem(item = {}) {
+  const excerpt = String(item.excerpt || "").trim();
+  const evidenceId = String(item.evidenceId || "");
+  const sourceId = String(item.provenance?.sourceId || "");
+  if (!excerpt || !evidenceId || !sourceId) return [];
+  const factsByScope = new Set((item.structuredFacts || []).map((fact) => String(fact?.scopeId || fact?.scope_id || "")).filter(Boolean));
+  return evidenceScopeIdsForChunk(item).filter((scopeId) => !factsByScope.has(scopeId)).map((scopeId) => normalizeTaskWorkflowFactRecord({
+    factId: `fact-semantic-${shortHash(`${evidenceId}:${scopeId}:exact-excerpt`)}`,
+    type: "summary",
+    kind: "semantic-excerpt",
+    role: "supporting-context",
+    evidenceId,
+    scopeId,
+    sourceId,
+    value: excerpt,
+    sourceSurface: excerpt,
+    authority: item.provenance?.authority || "supporting",
+    authorityState: item.authorityState || "supporting",
+    current: item.temporalRelation === "current",
+    temporalRelation: item.temporalRelation || "undated",
+    conflictState: item.conflictState || "none",
+    mandatoryFor: []
+  })).filter(Boolean);
+}
+
+function buildTaskEvidenceCatalog(sourceContract = null, semanticContext = [], settings = DEFAULT_SETTINGS, options = {}) {
+  const contract = sourceContract || buildTaskSourceContract(options.source || {}, options.sourceSummary || "", settings);
+  const canonicalCatalogFacts = (rawFacts = [], item = null) => {
+    const itemEvidenceId = String(item?.evidenceId || "");
+    const itemScopeIds = uniqueValues([
+      ...(Array.isArray(item?.scopeIds) ? item.scopeIds : []),
+      item?.scopeId,
+      item?.scope_id
+    ].map((value) => String(value || "")).filter(Boolean));
+    const validScopes = new Set((contract.scopeIds || []).map(String));
+    return (rawFacts || []).map((rawFact) => {
+      const fact = rawFact || {};
+      const factEvidenceId = String(fact.evidenceId || fact.evidence_id || itemEvidenceId);
+      const factScopeId = String(fact.scopeId || fact.scope_id || itemScopeIds[0] || "");
+      if (!factEvidenceId || factEvidenceId !== itemEvidenceId || !factScopeId || (validScopes.size && !validScopes.has(factScopeId))) return null;
+      return normalizeTaskWorkflowFactRecord(fact, {
+        factId: fact.factId || fact.fact_id || fact.id,
+        evidenceId: factEvidenceId,
+        scopeId: factScopeId,
+        sourceId: fact.sourceId || fact.source_id || item?.provenance?.sourceId || contract.sourceId,
+        sourceSurface: fact.sourceSurface || fact.source_surface || fact.value || fact.text || item?.excerpt || "",
+        authority: fact.authority || item?.provenance?.authority || "supporting",
+        authorityState: fact.authorityState || item?.authorityState || "supporting",
+        current: fact.current == null ? item?.sourceKind === "current-source" : fact.current,
+        temporalRelation: fact.temporalRelation || item?.temporalRelation || "supporting",
+        conflictState: fact.conflictState || item?.conflictState || "none"
+      });
+    }).filter(Boolean);
+  };
+  const primary = {
+    evidenceId: contract.primaryEvidenceId,
+    id: contract.primaryEvidenceId,
+    sourceKind: "current-source",
+    semanticScore: 1,
+    provenance: { sourceId: contract.sourceId, sourceType: contract.sourceType, title: contract.title, path: contract.path, authority: "current" },
+    temporalRelation: "current",
+    authorityState: "authoritative",
+    conflictState: "none",
+    scopeIds: contract.scopeIds.slice(0, 32),
+    factIds: contract.factIds.slice(0, 96),
+    structuredFacts: contract.facts.slice(0, 96).map((fact) => Object.assign({}, fact)),
+    excerpt: options.sourceSummary || contract.facts.map((fact) => fact.sourceSurface || fact.value || "").filter(Boolean).join(" ")
+  };
+  const semanticItems = [];
+  for (const chunk of uniqueSemanticEvidenceChunks(semanticContext || [])) {
+    const text = singleLine(chunk.text || chunk.content || chunk.chunk || "");
+    const path = String(chunk.path || chunk.file || chunk.provenance?.path || "");
+    const id = singleLine(chunk.evidenceId || chunk.id || chunk.chunkId || "");
+    const evidenceId = id || `evidence-${shortHash(`semantic:${path}:${chunk.lineStart || ""}:${text}`)}`;
+    if (!text && !path) continue;
+    const semanticItem = {
+      evidenceId,
+      id: evidenceId,
+      sourceKind: chunk.sourceKind || (chunk.taskReference ? "task-reference" : "semantic-index-chunk"),
+      semanticScore: Number.isFinite(Number(chunk.semanticScore)) ? Number(chunk.semanticScore) : Number(chunk.score || 0),
+      provenance: {
+        sourceId: chunk.sourceId || chunk.taskReference?.sourceId || "",
+        title: singleLine(chunk.title || chunk.taskReference?.content || path),
+        path,
+        chunkId: chunk.chunkId || chunk.id || "",
+        authority: chunk.authority || "supporting"
+      },
+      current: chunk.current === true
+        || ["current", "current-window"].includes(String(chunk.temporalRelation || "").toLowerCase())
+        || (taskDescriptionTaskReferenceSourceKind(chunk.sourceKind) && taskDescriptionEvidenceCurrentState(chunk) === "open"),
+      currentState: taskDescriptionEvidenceCurrentState(chunk),
+      createdAt: chunk.createdAt || chunk.provenance?.createdAt || "",
+      modifiedAt: chunk.modifiedAt || chunk.updatedAt || chunk.provenance?.modifiedAt || chunk.provenance?.updatedAt || "",
+      observedAt: chunk.observedAt || chunk.provenance?.observedAt || "",
+      temporalRelation: chunk.temporalRelation || "supporting",
+      authorityState: chunk.authorityState || "supporting",
+      conflictState: chunk.conflictState || "none",
+      taskId: String(chunk.taskId || chunk.task_id || chunk.taskReference?.id || ""),
+      scopeId: String(chunk.scopeId || chunk.scope_id || ""),
+      queryId: String(chunk.queryId || ""),
+      taskScopeAssociations: uniqueTaskScopeAssociations(chunk.taskScopeAssociations || []),
+      scopeIds: evidenceScopeIdsForChunk(chunk),
+      factIds: uniqueValues([
+        ...(Array.isArray(chunk.factIds) ? chunk.factIds : []),
+        ...(Array.isArray(chunk.fact_refs) ? chunk.fact_refs.map((fact) => fact?.factId || fact?.fact_id || fact) : []),
+        ...(Array.isArray(chunk.factRefs) ? chunk.factRefs.map((fact) => fact?.factId || fact?.fact_id || fact) : [])
+      ].map(String)).slice(0, 24),
+      structuredFacts: [
+        ...(Array.isArray(chunk.structuredFacts) ? chunk.structuredFacts : []),
+        ...(Array.isArray(chunk.fact_refs) ? chunk.fact_refs : []),
+        ...(Array.isArray(chunk.factRefs) ? chunk.factRefs : [])
+      ].slice(0, 24),
+      excerpt: text
+    };
+    semanticItem.structuredFacts = canonicalCatalogFacts(semanticItem.structuredFacts, semanticItem);
+    semanticItem.structuredFacts = canonicalCatalogFacts([
+      ...semanticItem.structuredFacts,
+      ...semanticExactExcerptFactsForItem(semanticItem)
+    ], semanticItem);
+    semanticItem.factIds = uniqueValues([
+      ...semanticItem.factIds,
+      ...semanticItem.structuredFacts.map((fact) => fact.factId)
+    ]).slice(0, 24);
+    semanticItems.push(semanticItem);
+  }
+  const items = [primary, ...semanticItems];
+  const manifest = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    sourceId: contract.sourceId,
+    sourceContractId: contract.id,
+    primaryEvidenceIds: [primary.evidenceId],
+    evidenceIds: items.map((item) => item.evidenceId),
+    semanticEvidenceIds: semanticItems.map((item) => item.evidenceId),
+    factIds: contract.factIds.slice(0, 96),
+    scopeIds: contract.scopeIds.slice(0, 32),
+    mode: semanticItems.length ? "semantic-plus-source" : "degraded-source-only"
+  };
+  const catalog = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    items,
+    manifest
+  };
+  catalog.hash = taskWorkflowHash(catalog);
+  return deepFreezeTaskWorkflow(catalog);
+}
+
+function taskWorkflowIdentitySnapshot(task = {}, index = 0, sourceContract = null, options = {}) {
+  const todoistId = String(task.todoistId || task.id || "");
+  const taskId = String(task.taskId || task.id || task.todoistId || `task-${index}`);
+  const oid = String(task.oid || "");
+  const isSubtask = Boolean(task.isSubtask || task.parentId || task.parentTaskId || task.parentOid);
+  const rootTaskId = String(task.rootTaskId || (!isSubtask ? todoistId : ""));
+  const rootOid = String(task.rootOid || (!isSubtask ? oid : ""));
+  return {
+    taskId,
+    todoistId,
+    oid,
+    rootTaskId,
+    rootId: rootTaskId,
+    rootOid,
+    parentTaskId: String(task.parentTaskId || task.parentId || ""),
+    parentId: String(task.parentId || task.parentTaskId || ""),
+    parentOid: String(task.parentOid || ""),
+    childTaskIds: Array.isArray(task.childTaskIds) ? task.childTaskIds.map(String).filter(Boolean) : [],
+    childOids: Array.isArray(task.childOids) ? task.childOids.map(String).filter(Boolean) : [],
+    treeDepth: task.treeDepth == null ? null : Number(task.treeDepth),
+    treePath: Array.isArray(task.treePath) ? task.treePath.map(String).filter(Boolean) : [],
+    siblingOrder: task.siblingOrder == null ? null : Number(task.siblingOrder),
+    sourceId: String(task.sourceId || task.source_id || ""),
+    sourceContractId: String(task.sourceContractId || task.source_contract_id || sourceContract?.id || sourceContract?.sourceContractId || ""),
+    queryId: String(task.queryId || options.queryId || ""),
+    queryHash: String(task.queryHash || options.queryHash || "")
+  };
+}
+
+function taskWorkflowIdentityMismatch(expected = {}, actual = {}) {
+  const errors = [];
+  const scalarFields = ["taskId", "todoistId", "oid", "rootTaskId", "rootId", "rootOid", "parentTaskId", "parentId", "parentOid", "treeDepth", "siblingOrder", "sourceId", "sourceContractId", "queryId", "queryHash"];
+  for (const field of scalarFields) {
+    if (expected[field] == null || expected[field] === "" || actual[field] == null || actual[field] === "") continue;
+    if (String(expected[field]) !== String(actual[field])) errors.push(`${field} mismatch`);
+  }
+  for (const field of ["childTaskIds", "childOids", "treePath"]) {
+    if (!Array.isArray(expected[field]) || !expected[field].length || !Array.isArray(actual[field]) || !actual[field].length) continue;
+    if (JSON.stringify(expected[field]) !== JSON.stringify(actual[field])) errors.push(`${field} mismatch`);
+  }
+  return errors;
+}
+
+function taskWorkflowFactCatalogMaps(sourceContract = null, evidenceCatalog = null) {
+  const factsById = new Map();
+  for (const fact of sourceContract?.facts || []) {
+    const normalized = normalizeTaskWorkflowFactRecord(fact, fact);
+    if (normalized) factsById.set(normalized.factId, normalized);
+  }
+  const evidenceById = new Map((evidenceCatalog?.items || []).map((item) => [String(item.evidenceId || item.id || ""), item]));
+  for (const item of evidenceCatalog?.items || []) {
+    for (const fact of item.structuredFacts || []) {
+      const normalized = normalizeTaskWorkflowFactRecord(fact, {
+        factId: fact.factId || fact.fact_id || fact.id,
+        evidenceId: item.evidenceId,
+        scopeId: fact.scopeId || fact.scope_id || item.scopeId || item.scopeIds?.[0],
+        sourceId: fact.sourceId || fact.source_id || item.provenance?.sourceId || sourceContract?.sourceId,
+        sourceSurface: fact.sourceSurface || fact.source_surface || fact.value || fact.text || item.excerpt,
+        authority: fact.authority || item.provenance?.authority || "supporting",
+        authorityState: fact.authorityState || item.authorityState || "supporting",
+        current: fact.current == null ? item.sourceKind === "current-source" : fact.current,
+        temporalRelation: fact.temporalRelation || item.temporalRelation || "supporting",
+        conflictState: fact.conflictState || item.conflictState || "none"
+      });
+      if (normalized && !factsById.has(normalized.factId)) factsById.set(normalized.factId, normalized);
+    }
+  }
+  return { factsById, evidenceById };
+}
+
+function taskWorkflowFactBindingErrors(task = {}, factsById = new Map(), evidenceById = new Map(), sourceContract = null, options = {}) {
+  const errors = [];
+  const reasonCodes = [];
+  const add = (code) => { errors.push(code); reasonCodes.push(code); };
+  const factRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
+  let bindings = Array.isArray(task.fact_bindings || task.factBindings)
+    ? (task.fact_bindings || task.factBindings).slice()
+    : [];
+  let legacy = false;
+  if (!bindings.length && options.allowLegacyFactBindings === true) {
+    const derived = factRefs.map((factId) => {
+      const fact = factsById.get(factId);
+      const evidence = fact ? evidenceById.get(String(fact.evidenceId)) : null;
+      return fact ? taskWorkflowFactBindingFromFact(fact, evidence, task.scope_id || task.scopeId || fact.scopeId) : null;
+    }).filter(Boolean);
+    if (derived.length === factRefs.length && derived.length > 0) {
+      bindings = derived;
+      legacy = true;
+    }
+  }
+  if (!bindings.length) add("fact-binding-missing");
+  const normalizedBindings = [];
+  const scopeId = String(task.scope_id || task.scopeId || "");
+  const selectedEvidenceIds = new Set((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean));
+  const contractScopeIds = new Set((sourceContract?.scopeIds || []).map(String));
+  for (const rawBinding of bindings) {
+    const factId = String(rawBinding?.factId || rawBinding?.fact_id || "");
+    const type = String(rawBinding?.type || "");
+    const role = String(rawBinding?.role || "");
+    const evidenceId = String(rawBinding?.evidenceId || rawBinding?.evidence_id || "");
+    const bindingScopeId = String(rawBinding?.scopeId || rawBinding?.scope_id || "");
+    const fact = factsById.get(factId);
+    const evidence = evidenceById.get(evidenceId);
+    if (!fact) { add("fact-binding-foreign-fact"); continue; }
+    if (!evidence) add("fact-binding-foreign-evidence");
+    if (!selectedEvidenceIds.has(evidenceId)) add("fact-binding-evidence-not-selected");
+    if (!type || type !== fact.type) add("fact-binding-type-mismatch");
+    if (!role || role !== fact.role) add("fact-binding-role-mismatch");
+    if (!evidenceId || evidenceId !== String(fact.evidenceId)) add("fact-binding-evidence-mismatch");
+    const sharedSourceScope = String(sourceContract?.sourceScopeId || sourceContract?.source_scope_id || "");
+    if (!bindingScopeId || bindingScopeId !== String(fact.scopeId) || (scopeId && bindingScopeId !== scopeId && bindingScopeId !== sharedSourceScope)) add("fact-binding-scope-mismatch");
+    if (contractScopeIds.size && !contractScopeIds.has(bindingScopeId)) add("fact-binding-foreign-scope");
+    const mandatory = Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.some((target) => ["task", "identity", "description"].includes(target));
+    if (mandatory && (fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none")) add("fact-binding-non-current");
+    const unusableFact = fact.authorityState === "rejected" || fact.authorityState === "conflict" || fact.conflictState === "conflict" || fact.conflictState === "conflicted";
+    const unusableEvidence = evidence && (evidence.authorityState === "rejected" || evidence.authorityState === "conflict" || evidence.conflictState === "conflict" || evidence.conflictState === "conflicted");
+    if (unusableFact || unusableEvidence) add("fact-binding-unusable");
+    if (fact && evidence && evidence.scopeIds?.length && !evidence.scopeIds.map(String).includes(bindingScopeId)) add("fact-binding-scope-mismatch");
+    if (fact && type === fact.type && role === fact.role && evidenceId === String(fact.evidenceId) && bindingScopeId === String(fact.scopeId)) {
+      normalizedBindings.push(Object.freeze({ factId, type, role, evidenceId, scopeId: bindingScopeId }));
+    }
+  }
+  const bindingIds = new Set(normalizedBindings.map((binding) => binding.factId));
+  for (const factRef of factRefs) if (!bindingIds.has(factRef)) add("fact-binding-ref-mismatch");
+  for (const binding of normalizedBindings) if (!factRefs.includes(binding.factId)) add("fact-binding-ref-mismatch");
+  const selectedFacts = factRefs.map((id) => factsById.get(id)).filter(Boolean);
+  const validMandatory = (target) => selectedFacts.filter((fact) =>
+    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
+    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes(target) && (!scopeId || String(fact.scopeId) === scopeId)
+  );
+  const allMandatory = (sourceContract?.facts || []).filter((fact) =>
+    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
+    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("task") && (!scopeId || String(fact.scopeId) === scopeId)
+  );
+  for (const fact of allMandatory) if (!bindingIds.has(String(fact.factId))) add("fact-binding-mandatory-task-omitted");
+  const identityMandatory = (sourceContract?.facts || []).filter((fact) =>
+    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
+    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("identity") && (!scopeId || String(fact.scopeId) === scopeId)
+  );
+  for (const fact of identityMandatory) if (!bindingIds.has(String(fact.factId))) add("fact-binding-mandatory-identity-omitted");
+  if (!allMandatory.length && !selectedFacts.some((fact) => fact.current === true && fact.evidenceId === sourceContract?.primaryEvidenceId)) add("fact-binding-current-source-fact-missing");
+  return { valid: errors.length === 0, errors: uniqueValues(errors), reasonCodes: uniqueValues(reasonCodes), bindings: normalizedBindings, legacy, factRefs, selectedFacts };
+}
+
+function validateTaskWorkflowFactBindings(task = {}, sourceContract = null, evidenceCatalog = null, options = {}) {
+  const maps = taskWorkflowFactCatalogMaps(sourceContract, evidenceCatalog);
+  return Object.assign(taskWorkflowFactBindingErrors(task, maps.factsById, maps.evidenceById, sourceContract, options), {
+    factsById: maps.factsById,
+    evidenceById: maps.evidenceById
+  });
+}
+
+function taskWorkflowEvidenceBundleForTask(task = {}, index = 0, sourceContract = null, evidenceCatalog = null, options = {}) {
+  const catalog = evidenceCatalog || buildTaskEvidenceCatalog(sourceContract, [], options.settings || DEFAULT_SETTINGS, options);
+  const contract = sourceContract || options.sourceContract;
+  const evidenceIds = uniqueValues((task.evidence_ids || task.evidenceIds || []).map((value) => String(value)).filter(Boolean));
+  const factRefs = uniqueValues((task.fact_refs || task.factRefs || []).map((value) => String(value)).filter(Boolean));
+  const scopeId = String(task.scope_id || task.scopeId || contract?.defaultScopeId || contract?.scopeId || "");
+  const byEvidenceId = new Map((catalog.items || []).map((item) => [item.evidenceId, item]));
+  const { factsById } = taskWorkflowFactCatalogMaps(contract, catalog);
+  const selectedItems = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
+  const selectedFacts = factRefs.map((id) => factsById.get(id)).filter(Boolean);
+  const factBindings = (Array.isArray(task.fact_bindings || task.factBindings) ? (task.fact_bindings || task.factBindings) : factRefs.map((factId) => taskWorkflowFactBindingFromFact(factsById.get(factId), byEvidenceId.get(String(factsById.get(factId)?.evidenceId)), scopeId)).filter(Boolean))
+    .map((binding) => Object.freeze({
+      factId: String(binding.factId || binding.fact_id || ""),
+      type: String(binding.type || ""),
+      role: String(binding.role || ""),
+      evidenceId: String(binding.evidenceId || binding.evidence_id || ""),
+      scopeId: String(binding.scopeId || binding.scope_id || scopeId)
+    })).filter((binding) => binding.factId);
+  const identity = taskWorkflowIdentitySnapshot(task, index, contract, options);
+  const bundle = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    taskId: String(task.taskId || task.id || `task-${index}`),
+    task_id: String(task.taskId || task.id || `task-${index}`),
+    taskIndex: index,
+    scope_id: scopeId,
+    scopeId,
+    evidence_ids: evidenceIds,
+    evidenceIds,
+    fact_refs: factRefs,
+    factRefs,
+    fact_bindings: factBindings,
+    factBindings,
+    ...identity,
+    sourceContractId: contract?.id || "",
+    catalogHash: catalog.hash || "",
+    items: selectedItems,
+    facts: selectedFacts,
+    acceptedEvidenceIds: evidenceIds.slice(),
+    acceptedFactRefs: factRefs.slice(),
+    immutable: true
+  };
+  bundle.hash = taskWorkflowHash(bundle);
+  return deepFreezeTaskWorkflow(bundle);
+}
+
+function validateTaskWorkflowEvidenceReferences(task = {}, index = 0, sourceContract = null, evidenceCatalog = null, options = {}) {
+  const errors = [];
+  const contract = sourceContract || {};
+  const catalog = evidenceCatalog || { items: [] };
+  const evidenceIds = Array.isArray(task.evidence_ids) ? task.evidence_ids.map(String) : [];
+  const factRefs = Array.isArray(task.fact_refs) ? task.fact_refs.map(String) : [];
+  const scopeId = String(task.scope_id || "");
+  if (!scopeId) errors.push("missing scope_id");
+  if (!evidenceIds.length) errors.push("missing evidence_ids");
+  if (!factRefs.length) errors.push("missing fact_refs");
+  if (new Set(evidenceIds).size !== evidenceIds.length) errors.push("duplicate evidence_ids");
+  if (new Set(factRefs).size !== factRefs.length) errors.push("duplicate fact_refs");
+  const itemById = new Map((catalog.items || []).map((item) => [item.evidenceId, item]));
+  const factById = taskWorkflowFactCatalogMaps(contract, catalog).factsById;
+  const selectedItems = evidenceIds.map((id) => itemById.get(id));
+  const selectedFacts = factRefs.map((id) => factById.get(id));
+  if (selectedItems.some((item) => !item)) errors.push("foreign evidence_id");
+  if (selectedFacts.some((fact) => !fact)) errors.push("foreign fact_ref");
+  if (selectedItems.some((item) => item && (item.authorityState === "rejected" || item.authorityState === "conflict" || item.conflictState === "conflict" || item.conflictState === "conflicted"))) errors.push("unusable evidence");
+  const currentItem = selectedItems.find((item) => item?.sourceKind === "current-source");
+  if (!currentItem) errors.push("missing current-source evidence");
+  const currentFact = selectedFacts.find((fact) => fact?.evidenceId === contract.primaryEvidenceId && fact?.current === true);
+  if (!currentFact) errors.push("missing current-source fact");
+  if (scopeId && Array.isArray(contract.scopeIds) && !contract.scopeIds.includes(scopeId)) errors.push("foreign scope_id");
+  if (scopeId && selectedItems.some((item) => item && item.scopeIds?.length && !item.scopeIds.includes(scopeId))) errors.push("scope mismatch");
+  const factBindingValidation = validateTaskWorkflowFactBindings(task, contract, catalog, {
+    allowLegacyFactBindings: options.allowLegacyFactBindings !== false
+  });
+  errors.push(...factBindingValidation.errors);
+  const bundle = taskWorkflowEvidenceBundleForTask(task, index, contract, catalog, options);
+  const existingBundle = task.evidenceBundle || task.taskEvidenceBundle;
+  if (existingBundle) errors.push(...taskWorkflowIdentityMismatch(existingBundle, bundle));
+  return {
+    valid: errors.length === 0,
+    errors: uniqueValues(errors),
+    evidenceIds,
+    factRefs,
+    factBindings: factBindingValidation.bindings,
+    legacyFactBindings: factBindingValidation.legacy,
+    scopeId,
+    selectedItems: selectedItems.filter(Boolean),
+    selectedFacts: selectedFacts.filter(Boolean),
+    bundle: errors.length ? null : deepFreezeTaskWorkflow(Object.assign({}, bundle, {
+      fact_bindings: factBindingValidation.bindings,
+      factBindings: factBindingValidation.bindings,
+      legacyFactBindings: factBindingValidation.legacy,
+      degraded: Boolean(bundle.degraded || factBindingValidation.legacy),
+      degradedState: factBindingValidation.legacy ? "legacy-fact-bindings" : bundle.degradedState
+    }))
+  };
+}
+
+function enrichTaskWorkflowPrimaryContextFacts(tasks = [], sourceContract = null) {
+  const contract = sourceContract || {};
+  const factsByScope = new Map();
+  for (const fact of contract.facts || []) {
+    if (fact?.kind !== "primary-context" || fact.type !== "summary" || fact.role !== "primary-context" || fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none" || (fact.mandatoryFor || []).length) continue;
+    const scopeId = String(fact.scopeId || "");
+    if (!scopeId) continue;
+    if (!factsByScope.has(scopeId)) factsByScope.set(scopeId, []);
+    factsByScope.get(scopeId).push(fact);
+  }
+  const visit = (task, parentScopeId = "") => {
+    if (!task) return task;
+    const scopeId = String(parentScopeId || task.scope_id || task.scopeId || "");
+    if (parentScopeId) task.scope_id = parentScopeId;
+    else if (scopeId) task.scope_id = scopeId;
+    const factRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
+    const evidenceIds = uniqueValues((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean));
+    const bindings = Array.isArray(task.fact_bindings || task.factBindings)
+      ? (task.fact_bindings || task.factBindings).slice()
+      : [];
+    for (const fact of factsByScope.get(scopeId) || []) {
+      const factId = String(fact.factId || "");
+      const evidenceId = String(fact.evidenceId || "");
+      if (factId && !factRefs.includes(factId)) factRefs.push(factId);
+      if (evidenceId && !evidenceIds.includes(evidenceId)) evidenceIds.push(evidenceId);
+      if (factId && !bindings.some((binding) => String(binding?.factId || binding?.fact_id || "") === factId)) {
+        bindings.push({ factId, type: fact.type, role: fact.role, evidenceId, scopeId: String(fact.scopeId) });
+      }
+    }
+    task.fact_refs = factRefs;
+    task.factRefs = factRefs.slice();
+    task.evidence_ids = evidenceIds;
+    task.evidenceIds = evidenceIds.slice();
+    task.fact_bindings = bindings;
+    task.factBindings = bindings.slice();
+    task.subtasks = (task.subtasks || []).map((subtask) => visit(subtask, scopeId)).filter(Boolean);
+    return task;
+  };
+  return (tasks || []).map((task) => visit(task));
+}
+
+function attachTaskLocalSemanticFacts(task = {}, evidenceIds = [], evidenceCatalog = null, scopeId = "") {
+  const localScopeId = String(scopeId || task.scope_id || task.scopeId || "");
+  if (!localScopeId) return task;
+  const selectedIds = new Set((evidenceIds || []).map(String).filter(Boolean));
+  const factRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
+  const bindings = Array.isArray(task.fact_bindings || task.factBindings)
+    ? (task.fact_bindings || task.factBindings).slice()
+    : [];
+  for (const item of evidenceCatalog?.items || []) {
+    const evidenceId = String(item?.evidenceId || item?.id || "");
+    if (!selectedIds.has(evidenceId)) continue;
+    for (const fact of item.structuredFacts || []) {
+      const factId = String(fact?.factId || fact?.fact_id || "");
+      if (!factId || String(fact.scopeId || fact.scope_id || "") !== localScopeId) continue;
+      if ((fact.mandatoryFor || []).length) continue;
+      if (["rejected", "conflict"].includes(String(fact.authorityState || "").toLowerCase()) || ["conflict", "conflicted"].includes(String(fact.conflictState || "").toLowerCase())) continue;
+      if (!factRefs.includes(factId)) factRefs.push(factId);
+      if (!bindings.some((binding) => String(binding?.factId || binding?.fact_id || "") === factId)) {
+        const binding = taskWorkflowFactBindingFromFact(fact, item, localScopeId);
+        if (binding) bindings.push(binding);
+      }
+    }
+  }
+  task.fact_refs = factRefs;
+  task.factRefs = factRefs.slice();
+  task.fact_bindings = bindings;
+  task.factBindings = bindings.slice();
+  return task;
+}
+
+function taskWorkflowEvidenceLedger(tasks = [], sourceContract = null, evidenceCatalog = null, options = {}) {
+  const entries = [];
+  const evidenceBundlesByTask = {};
+  const failures = [];
+  const visit = (task, index, parentScopeId = "") => {
+    const current = Object.assign({}, task);
+    if (!current.scope_id && parentScopeId) current.scope_id = parentScopeId;
+    const validation = validateTaskWorkflowEvidenceReferences(current, index, sourceContract, evidenceCatalog, options);
+    if (!validation.valid) {
+      failures.push({ index, content: current.content || "", errors: validation.errors });
+    } else {
+      evidenceBundlesByTask[String(index)] = validation.bundle;
+      entries.push(Object.assign({ index, scope_id: validation.scopeId, evidence_ids: validation.evidenceIds, fact_refs: validation.factRefs, fact_bindings: validation.factBindings, bundleHash: validation.bundle.hash }, taskWorkflowIdentitySnapshot(validation.bundle, index, sourceContract, options)));
+      for (const [subtaskIndex, subtask] of (current.subtasks || []).entries()) visit(subtask, `${index}.${subtaskIndex}`, validation.scopeId);
+    }
+  };
+  (tasks || []).forEach((task, index) => visit(task, index));
+  const ledger = { version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION, entries, evidenceBundlesByTask, failures, sourceContractId: sourceContract?.id || "", catalogHash: evidenceCatalog?.hash || "" };
+  ledger.hash = taskWorkflowHash(ledger);
+  ledger.promptBundleHash = ledger.hash;
+  ledger.validatorBundleHash = ledger.hash;
+  return deepFreezeTaskWorkflow(ledger);
+}
+
+function attachTaskWorkflowEvidenceBundles(tasks = [], sourceContract = null, evidenceCatalog = null, options = {}) {
+  const accepted = [];
+  const rejected = [];
+  const entries = [];
+  const evidenceBundlesByTask = {};
+  const visit = (task, index, parentScopeId = "") => {
+    if (!task) return null;
+    const candidate = Object.assign({}, task);
+    if (!candidate.scope_id && parentScopeId) candidate.scope_id = parentScopeId;
+    const validation = validateTaskWorkflowEvidenceReferences(candidate, index, sourceContract, evidenceCatalog, options);
+    if (!validation.valid) {
+      rejected.push({ task, index, errors: validation.errors });
+      return null;
+    }
+    const bundle = validation.bundle;
+    task.scope_id = validation.scopeId;
+    task.evidence_ids = validation.evidenceIds.slice();
+    task.fact_refs = validation.factRefs.slice();
+    task.fact_bindings = validation.factBindings.slice();
+    task.factBindings = task.fact_bindings.slice();
+    if (validation.legacyFactBindings) {
+      task.legacyFactBindings = true;
+      task.factBindingState = "legacy-degraded";
+    }
+    task.evidenceBundle = bundle;
+    task.taskEvidenceBundle = bundle;
+    evidenceBundlesByTask[String(index)] = bundle;
+    entries.push(Object.assign({ index, scope_id: bundle.scopeId, evidence_ids: bundle.evidenceIds, fact_refs: bundle.factRefs, fact_bindings: bundle.fact_bindings || bundle.factBindings || [], bundleHash: bundle.hash }, taskWorkflowIdentitySnapshot(bundle, index, sourceContract, options)));
+    task.subtasks = (task.subtasks || []).map((subtask, subtaskIndex) => visit(subtask, `${index}.${subtaskIndex}`, validation.scopeId)).filter(Boolean);
+    return task;
+  };
+  for (const [index, task] of (tasks || []).entries()) {
+    const acceptedTask = visit(task, index);
+    if (acceptedTask) accepted.push(acceptedTask);
+  }
+  const ledgerBase = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    entries,
+    evidenceBundlesByTask,
+    failures: rejected.map((entry) => ({ index: entry.index, content: entry.task?.content || "", errors: entry.errors })),
+    sourceContractId: sourceContract?.id || "",
+    catalogHash: evidenceCatalog?.hash || ""
+  };
+  ledgerBase.hash = taskWorkflowHash(ledgerBase);
+  ledgerBase.promptBundleHash = ledgerBase.hash;
+  ledgerBase.validatorBundleHash = ledgerBase.hash;
+  const ledger = deepFreezeTaskWorkflow(ledgerBase);
+  return { tasks: accepted, rejected, ledger };
+}
+
+function structuredMarkedActionFactRecords(sourceContract = null) {
+  const markerFactIds = new Set((sourceContract?.markedActionFactIds || []).map(String));
+  return (sourceContract?.facts || [])
+    .filter((fact) => fact?.kind === "marked-action" && (!markerFactIds.size || markerFactIds.has(String(fact.factId))))
+    .sort((left, right) => Number(left.markerIndex ?? Number.MAX_SAFE_INTEGER) - Number(right.markerIndex ?? Number.MAX_SAFE_INTEGER) || String(left.factId).localeCompare(String(right.factId)));
+}
+
+function structuredMarkedActionFactCoverage(tasks = [], sourceContract = null) {
+  const requiredFacts = structuredMarkedActionFactRecords(sourceContract);
+  const coveredFactIds = new Set(flattenTaskPlan(tasks || []).flatMap((task) => (task.fact_refs || task.factRefs || []).map(String)));
+  const missingFacts = requiredFacts.filter((fact) => !coveredFactIds.has(String(fact.factId)));
+  return {
+    passed: missingFacts.length === 0,
+    requiredFactIds: requiredFacts.map((fact) => String(fact.factId)),
+    coveredFactIds: requiredFacts.filter((fact) => coveredFactIds.has(String(fact.factId))).map((fact) => String(fact.factId)),
+    missingFactIds: missingFacts.map((fact) => String(fact.factId)),
+    missingFacts
+  };
+}
+
+function deterministicStructuredMarkedActionTaskTrees(sourceContract = null, missingFacts = [], settings = DEFAULT_SETTINGS) {
+  const maxTitleLength = 250;
+  const primaryEvidenceId = sourceContract?.primaryEvidenceId || sourceContract?.primary_evidence_id || "";
+  return (missingFacts || []).map((fact) => {
+    const action = singleLine(fact?.value || fact?.action || "");
+    if (!action || !fact?.factId) return null;
+    const scopeId = String(fact.scopeId || sourceContract?.sourceScopeId || sourceContract?.scopeId || "");
+    const bindingFor = (entry) => entry && taskWorkflowFactBindingFromFact(entry, { evidenceId: entry.evidenceId, sourceKind: "current-source", scopeIds: [entry.scopeId] }, scopeId);
+    const factBindings = uniqueValues([bindingFor(fact)].filter(Boolean).map((binding) => JSON.stringify(binding))).map((value) => JSON.parse(value));
+    return {
+      content: truncateAtWord(action, maxTitleLength),
+      description: "",
+      labels: [],
+      priority: 1,
+      due_date: null,
+      deadline_date: null,
+      subtasks: [],
+      scope_id: scopeId,
+      evidence_ids: uniqueValues([fact.evidenceId || primaryEvidenceId].filter(Boolean)),
+      fact_refs: uniqueValues([fact.factId].filter(Boolean)),
+      fact_bindings: factBindings,
+      markedActionFactId: String(fact.factId)
+    };
+  }).filter(Boolean);
+}
+
+function supplementMissingStructuredMarkedActionTasks(tasks = [], sourceContract = null, missingFacts = [], settings = DEFAULT_SETTINGS) {
+  const supplemented = (tasks || []).slice();
+  const limit = generationMainTaskLimit(settings);
+  const added = [];
+  const unresolved = [];
+  for (const task of deterministicStructuredMarkedActionTaskTrees(sourceContract, missingFacts, settings)) {
+    if (supplemented.filter((candidate) => !candidate?.isSubtask).length >= limit) {
+      unresolved.push(task.markedActionFactId);
+      continue;
+    }
+    supplemented.push(task);
+    added.push(task.markedActionFactId);
+  }
+  return { tasks: supplemented, addedFactIds: added, unresolvedFactIds: unresolved };
+}
+
+function validateTaskDescriptionEvidenceReferences(item = {}, task = {}, sourceContract = null) {
+  const bundle = task.evidenceBundle || task.taskEvidenceBundle;
+  const errors = [];
+  const scopeId = String(item.scope_id || item.scopeId || "");
+  const evidenceIds = Array.isArray(item.evidence_ids) ? uniqueValues(item.evidence_ids.map(String)) : [];
+  const factRefs = Array.isArray(item.fact_refs) ? uniqueValues(item.fact_refs.map(String)) : [];
+  const factBindings = Array.isArray(item.fact_bindings || item.factBindings)
+    ? (item.fact_bindings || item.factBindings).map((binding) => ({
+      factId: String(binding?.factId || binding?.fact_id || ""),
+      type: String(binding?.type || ""),
+      role: String(binding?.role || ""),
+      evidenceId: String(binding?.evidenceId || binding?.evidence_id || ""),
+      scopeId: String(binding?.scopeId || binding?.scope_id || scopeId)
+    })).filter((binding) => binding.factId)
+    : [];
+  if (!bundle) errors.push("task evidence bundle missing");
+  if (!scopeId) errors.push("description scope_id missing");
+  if (bundle && scopeId !== bundle.scopeId) errors.push("description scope_id mismatch");
+  if (!evidenceIds.length) errors.push("description evidence_ids missing");
+  if (!factRefs.length) errors.push("description fact_refs missing");
+  if (bundle && evidenceIds.some((id) => !bundle.evidenceIds.includes(id))) errors.push("description evidence_id outside task bundle");
+  if (bundle && factRefs.some((id) => !bundle.factRefs.includes(id))) errors.push("description fact_ref outside task bundle");
+  if (bundle && !evidenceIds.includes(bundle.evidenceIds.find((id) => bundle.items.some((entry) => entry.evidenceId === id && entry.sourceKind === "current-source")))) errors.push("description missing current-source evidence");
+  if (bundle && !factRefs.includes(bundle.factRefs.find((id) => bundle.facts.some((fact) => fact.factId === id && fact.current === true)))) errors.push("description missing current-source fact");
+  if (!factBindings.length) errors.push("fact-binding-description-missing");
+  const bundleFacts = new Map((bundle?.facts || []).map((fact) => [String(fact.factId), fact]));
+  const bundleItems = new Map((bundle?.items || []).map((entry) => [String(entry.evidenceId), entry]));
+  const bindingIds = new Set();
+  const selectedEvidenceIds = new Set(evidenceIds);
+  for (const binding of factBindings) {
+    const fact = bundleFacts.get(binding.factId);
+    const evidence = bundleItems.get(binding.evidenceId);
+    if (!fact) { errors.push("fact-binding-description-foreign-fact"); continue; }
+    if (!evidence) errors.push("fact-binding-description-foreign-evidence");
+    if (!selectedEvidenceIds.has(binding.evidenceId)) errors.push("fact-binding-evidence-not-selected");
+    if (binding.type !== fact.type) errors.push("fact-binding-description-type-mismatch");
+    if (binding.role !== fact.role) errors.push("fact-binding-description-role-mismatch");
+    if (binding.evidenceId !== String(fact.evidenceId)) errors.push("fact-binding-description-evidence-mismatch");
+    const sharedSourceScope = String(sourceContract?.sourceScopeId || sourceContract?.source_scope_id || "");
+    if (binding.scopeId !== String(fact.scopeId) || (scopeId && binding.scopeId !== scopeId && binding.scopeId !== sharedSourceScope)) errors.push("fact-binding-description-scope-mismatch");
+    const mandatory = Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description");
+    if (mandatory && (fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none")) errors.push("fact-binding-description-non-current");
+    if (fact.authorityState === "rejected" || fact.authorityState === "conflict" || fact.conflictState === "conflict" || fact.conflictState === "conflicted" || evidence?.authorityState === "rejected" || evidence?.authorityState === "conflict" || evidence?.conflictState === "conflict" || evidence?.conflictState === "conflicted") errors.push("fact-binding-description-unusable");
+    bindingIds.add(binding.factId);
+  }
+  for (const fact of bundle?.facts || []) {
+    if (Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description")) {
+      if (fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none") errors.push("fact-binding-description-non-current");
+      else if (!bindingIds.has(String(fact.factId))) errors.push("fact-binding-description-mandatory-omitted");
+    }
+  }
+  const actionFacts = (bundle?.facts || []).filter((fact) => fact.type === "action" && fact.role === "requested-action");
+  for (const fact of actionFacts) {
+    if (fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none") errors.push("fact-binding-description-non-current");
+    else if (!bindingIds.has(String(fact.factId))) errors.push("fact-binding-description-task-action-missing");
+  }
+  if (bundle) {
+    const suppliedIdentity = taskWorkflowIdentitySnapshot(item, item.index || 0, sourceContract, {});
+    for (const field of ["taskId", "todoistId", "oid", "rootTaskId", "rootId", "rootOid", "parentTaskId", "parentId", "parentOid", "childTaskIds", "childOids", "treeDepth", "treePath", "siblingOrder", "sourceId", "sourceContractId", "queryId", "queryHash"]) {
+      if (!Object.prototype.hasOwnProperty.call(item, field)) delete suppliedIdentity[field];
+    }
+    errors.push(...taskWorkflowIdentityMismatch(suppliedIdentity, bundle));
+  }
+  const acceptedItems = (bundle?.items || []).filter((item) => evidenceIds.includes(String(item.evidenceId)));
+  const acceptedFacts = (bundle?.facts || []).filter((fact) => factRefs.includes(String(fact.factId)));
+  const narrowedBundle = bundle ? deepFreezeTaskWorkflow(Object.assign({}, bundle, {
+    items: acceptedItems,
+    facts: acceptedFacts,
+    evidence_ids: evidenceIds,
+    evidenceIds,
+    fact_refs: factRefs,
+    factRefs,
+    fact_bindings: factBindings,
+    factBindings,
+    acceptedEvidenceIds: evidenceIds.slice(),
+    acceptedFactRefs: factRefs.slice()
+  })) : null;
+  return { valid: errors.length === 0, errors: uniqueValues(errors), scopeId, evidenceIds, factRefs, factBindings, bundle: narrowedBundle };
+}
+
+function structuredTaskDescriptionQualityReason(summary = "", task = {}, bundle = null) {
+  const text = singleLine(summary);
+  if (!text) return "description was empty";
+  if (/^(?:description|prompt|task|evidence|source)\s*:/i.test(text)) return "description used prompt commentary";
+  if (!bundle?.facts?.length) return "description had no supported facts";
+  return "passed";
+}
+
+function taskWorkflowRequiredPromptBlock(sourceContract = {}, evidenceCatalog = {}, settings = DEFAULT_SETTINGS) {
+  const compactFact = (fact = {}) => ({
+    type: String(fact.type || fact.kind || "summary"),
+    kind: String(fact.kind || ""),
+    role: String(fact.role || "source-summary"),
+    scopeId: String(fact.scopeId || ""),
+    evidenceId: String(fact.evidenceId || ""),
+    value: fact.sourceSurface || fact.value || fact.text || "",
+    authority: String(fact.authority || fact.authorityState || ""),
+    current: fact.current === true,
+    temporalRelation: String(fact.temporalRelation || ""),
+    conflictState: String(fact.conflictState || "none"),
+    mandatoryFor: Array.isArray(fact.mandatoryFor) ? fact.mandatoryFor.slice(0, 3) : [],
+    optional: fact.kind === "primary-context" && !(fact.mandatoryFor || []).length
+  });
+  const compactScope = (scope = {}) => ({
+    scopeId: String(scope.scopeId || scope.id || ""),
+    primaryEvidenceIds: uniqueValues((scope.primaryEvidenceIds || [scope.primaryEvidenceId || scope.evidenceIds?.[0]]).map(String).filter(Boolean)).slice(0, 12),
+    mandatoryTaskFactIds: uniqueValues((scope.mandatoryTaskFactIds || []).map(String)).slice(0, 96),
+    mandatoryDescriptionFactIds: uniqueValues((scope.mandatoryDescriptionFactIds || []).map(String)).slice(0, 96),
+    mandatoryIdentityFactIds: uniqueValues((scope.mandatoryIdentityFactIds || []).map(String)).slice(0, 96),
+    primaryContextFactIds: uniqueValues((scope.primaryContextFactIds || []).map(String)).slice(0, 96)
+  });
+  const compactEvidence = (item = {}) => ({
+    sourceId: String(item.provenance?.sourceId || item.sourceId || ""),
+    sourceKind: String(item.sourceKind || ""),
+    title: singleLine(item.provenance?.title || item.title || ""),
+    path: String(item.provenance?.path || item.path || ""),
+    lineStart: Number(item.provenance?.lineStart || item.lineStart || 0),
+    lineEnd: Number(item.provenance?.lineEnd || item.lineEnd || 0),
+    current: item.current === true || item.temporalRelation === "current" || item.sourceKind === "current-source",
+    authority: String(item.authority || item.authorityState || item.provenance?.authority || ""),
+    temporalRelation: String(item.temporalRelation || ""),
+    conflictState: String(item.conflictState || "none"),
+    contentFingerprint: String(item.contentFingerprint || item.provenance?.contentFingerprint || ""),
+    excerpt: item.excerpt || item.text || ""
+  });
+  const mandatoryFactIds = new Set([
+    String(sourceContract.primaryFactId || ""),
+    ...(sourceContract.scopes || []).flatMap((scope) => [
+      ...(scope.mandatoryFactIds || []),
+      ...(scope.mandatoryTaskFactIds || []),
+      ...(scope.mandatoryDescriptionFactIds || []),
+      ...(scope.mandatoryIdentityFactIds || []),
+      ...(scope.primaryContextFactIds || [])
+    ])
+  ].filter(Boolean).map(String));
+  const factTable = Object.fromEntries((sourceContract.facts || [])
+    .filter((fact) => mandatoryFactIds.has(String(fact.factId || "")))
+    .map((fact) => [String(fact.factId), compactFact(fact)]));
+  const compactContract = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    sourceContractId: String(sourceContract.id || ""),
+    sourceId: String(sourceContract.sourceId || ""),
+    sourceType: String(sourceContract.sourceType || ""),
+    sourceTitle: singleLine(sourceContract.title || ""),
+    sourcePath: String(sourceContract.path || ""),
+    sourceScopeId: String(sourceContract.sourceScopeId || ""),
+    defaultScopeId: String(sourceContract.defaultScopeId || sourceContract.scopeId || ""),
+    scopeIds: uniqueValues((sourceContract.scopeIds || []).map(String)),
+    scopes: (sourceContract.scopes || []).map(compactScope),
+    primaryEvidenceId: String(sourceContract.primaryEvidenceId || ""),
+    primaryFactId: String(sourceContract.primaryFactId || ""),
+    factTable
+  };
+  const compactManifest = {
+    version: evidenceCatalog.manifest?.version || TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    sourceId: String(evidenceCatalog.manifest?.sourceId || sourceContract.sourceId || ""),
+    sourceContractId: String(evidenceCatalog.manifest?.sourceContractId || sourceContract.id || ""),
+    primaryEvidenceIds: uniqueValues((evidenceCatalog.manifest?.primaryEvidenceIds || [sourceContract.primaryEvidenceId]).map(String).filter(Boolean)),
+    evidenceIds: uniqueValues((evidenceCatalog.manifest?.evidenceIds || []).map(String)),
+    semanticEvidenceIds: uniqueValues((evidenceCatalog.manifest?.semanticEvidenceIds || []).map(String)),
+    factIds: uniqueValues((evidenceCatalog.manifest?.factIds || sourceContract.factIds || []).map(String)),
+    scopeIds: uniqueValues((evidenceCatalog.manifest?.scopeIds || sourceContract.scopeIds || []).map(String)),
+    mode: String(evidenceCatalog.manifest?.mode || ""),
+    byEvidenceId: Object.fromEntries((evidenceCatalog.items || []).map((item) => [String(item.evidenceId || item.id || ""), compactEvidence(item)]).filter(([id]) => id))
+  };
+  const block = {
+    schemaVersion: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    sourceContract: compactContract,
+    evidenceCatalog: {
+      hash: String(evidenceCatalog.hash || ""),
+      manifest: compactManifest
+    }
+  };
+  const serialized = JSON.stringify(block);
+  let roundTrip = null;
+  let error = "";
+  try {
+    roundTrip = JSON.parse(serialized);
+  } catch {
+    error = "required workflow contract block failed JSON round-trip";
+  }
+  return { block: roundTrip || block, serialized, chars: serialized.length, error, hardCeiling: null, contextBudget: null };
+}
+
 function taskWorkflowContextBundle(options = {}) {
   const settings = options.settings || DEFAULT_SETTINGS;
   const sourceSummary = String(options.sourceSummary || "").trim();
   const sourceType = options.sourceType || options.source?.type || "note";
   const sourceTitle = singleLine(options.sourceTitle || options.source?.title || "");
   const sourcePath = options.sourcePath || options.source?.path || "";
-  const maxChars = Math.min(18000, Math.max(7000, Number(settings.maxContextChars || 12000)));
-  const sourceLimit = Math.min(9000, Math.floor(maxChars * 0.52));
-  const adaptiveLimit = Math.min(4200, Math.floor(maxChars * 0.25));
-  const semanticLimit = Math.min(5200, Math.floor(maxChars * 0.3));
-  const markers = explicitNoteActionMarkers(sourceSummary, settings);
-  const markedActionScopes = groupMarkedActions(markers).map((group) => ({
-    action: group.action,
-    family: group.family,
-    references: (group.references || []).map((reference) => ({ tag: reference.tag, action: reference.action, line: reference.line }))
-  }));
-  const adaptiveTaskContext = truncateMarkdownAtWord(options.adaptivePack?.text || options.taskContext || "", adaptiveLimit);
-  const semanticIndexContext = truncateMarkdownAtWord(
-    formatContext(options.semanticContext || [], semanticLimit, settings, [sourceTitle, sourceSummary].filter(Boolean).join("\n")) || "",
-    semanticLimit
-  );
-  const promptCachePrefix = truncateMarkdownAtWord([
+  const sourceContract = options.sourceContract || buildTaskSourceContract(options.source || { type: sourceType, title: sourceTitle, path: sourcePath }, sourceSummary, settings);
+  const evidenceCatalog = options.evidenceCatalog || buildTaskEvidenceCatalog(sourceContract, options.semanticContext || [], settings, { source: options.source, sourceSummary });
+  const adaptiveTaskContext = options.adaptivePack?.text || options.taskContext || "";
+  const scopeSemanticEvidence = options.scopeSemanticEvidence && typeof options.scopeSemanticEvidence === "object"
+    ? options.scopeSemanticEvidence
+    : {};
+  const scopeSemanticText = Object.values(scopeSemanticEvidence).map((bundle) => ({
+    scopeId: bundle.scopeId || "",
+    factId: bundle.factId || "",
+    action: bundle.action || "",
+    primaryExcerpt: bundle.primaryExcerpt || "",
+    mandatoryTaskFactIds: bundle.mandatoryTaskFactIds || [],
+    mandatoryDescriptionFactIds: bundle.mandatoryDescriptionFactIds || [],
+    evidenceIds: bundle.evidenceIds || [],
+    records: (bundle.context || []).map((chunk) => ({
+      evidenceId: chunk.evidenceId || chunk.evidence_id || "",
+      sourceId: chunk.sourceId || chunk.provenance?.sourceId || "",
+      sourceKind: chunk.sourceKind || chunk.provenance?.sourceKind || "",
+      score: Number(chunk.semanticScore || chunk.score || 0),
+      title: chunk.title || "",
+      path: chunk.path || chunk.provenance?.path || "",
+      excerpt: chunk.text || chunk.excerpt || "",
+      authority: chunk.authorityState || chunk.provenance?.authority || "",
+      temporalRelation: chunk.temporalRelation || "",
+      conflictState: chunk.conflictState || "none",
+      lineStart: Number(chunk.lineStart || chunk.provenance?.lineStart || 0),
+      lineEnd: Number(chunk.lineEnd || chunk.provenance?.lineEnd || 0),
+      taskId: chunk.taskId || ""
+    }))
+  })).filter((bundle) => bundle.scopeId || bundle.evidenceIds.length);
+  const semanticIndexContext = JSON.stringify({
+    preStructureScopes: scopeSemanticText,
+    selectedSemanticEvidence: (options.semanticContext || []).map((chunk) => ({
+      evidenceId: chunk.evidenceId || chunk.evidence_id || "",
+      sourceId: chunk.sourceId || chunk.provenance?.sourceId || "",
+      sourceKind: chunk.sourceKind || chunk.provenance?.sourceKind || "",
+      score: Number(chunk.semanticScore || chunk.score || 0),
+      title: chunk.title || "",
+      path: chunk.path || chunk.provenance?.path || "",
+      authority: chunk.authorityState || chunk.provenance?.authority || "",
+      temporalRelation: chunk.temporalRelation || "",
+      conflictState: chunk.conflictState || "none",
+      lineStart: Number(chunk.lineStart || chunk.provenance?.lineStart || 0),
+      lineEnd: Number(chunk.lineEnd || chunk.provenance?.lineEnd || 0)
+    })).filter((entry) => entry.evidenceId)
+  });
+  const requiredPromptBlock = taskWorkflowRequiredPromptBlock(sourceContract, evidenceCatalog, settings);
+  const promptManifest = requiredPromptBlock.block.evidenceCatalog.manifest;
+  const { byEvidenceId: promptEvidenceById, ...promptManifestMetadata } = promptManifest;
+  const generatedPromptEvidenceIds = Object.keys(promptEvidenceById || {});
+  const promptEvidenceIds = uniqueValues((options.promptEvidenceIdsOverride || generatedPromptEvidenceIds).map(String).filter(Boolean));
+  const promptEvidenceHash = String(options.promptEvidenceHashOverride || taskWorkflowHash(promptEvidenceIds));
+  const scopeSemanticPromptRefs = Object.values(scopeSemanticEvidence).map((bundle) => ({
+    scopeId: String(bundle.scopeId || ""),
+    factId: String(bundle.factId || ""),
+    mandatoryTaskFactIds: uniqueValues((bundle.mandatoryTaskFactIds || []).map(String)),
+    mandatoryDescriptionFactIds: uniqueValues((bundle.mandatoryDescriptionFactIds || []).map(String)),
+    primaryContextFactIds: uniqueValues((bundle.primaryContextFactIds || []).map(String)),
+    evidenceIds: uniqueValues((bundle.evidenceIds || []).map(String)),
+    records: (bundle.context || []).map((chunk) => ({
+      evidenceId: String(chunk.evidenceId || chunk.evidence_id || ""),
+      score: Number(chunk.semanticScore || chunk.score || 0),
+      taskId: String(chunk.taskId || ""),
+      queryId: String(chunk.queryId || bundle.queryId || "")
+    })).filter((record) => record.evidenceId)
+  })).filter((bundle) => bundle.scopeId || bundle.evidenceIds.length);
+  const promptHeader = [
     "Semantic Todoist Sync task workflow context (shared exact prefix):",
+    `Workflow evidence schema: v${TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION}`,
     `Source type: ${sourceType}`,
     `Source title: ${sourceTitle}`,
-    sourcePath ? `Source path: ${sourcePath}` : "",
-    "Primary source:",
-    truncateMarkdownAtWord(sourceSummary, sourceLimit),
-    "Marked action scopes (line numbers are source-local):",
-    JSON.stringify(markedActionScopes),
-    "Adaptive task, meeting, project, and portfolio context:",
-    adaptiveTaskContext || "No adaptive task context found.",
-    "Relevant semantic-index context:",
-    semanticIndexContext || "No relevant semantic-index context found."
-  ].filter(Boolean).join("\n"), maxChars);
-  return {
-    version: 1,
+    sourcePath ? `Source path: ${sourcePath}` : ""
+  ].filter(Boolean).join("\n");
+  const requiredPromptText = requiredPromptBlock.error
+    ? ["Required typed workflow contract block failure:", requiredPromptBlock.error, `serializedChars=${requiredPromptBlock.chars}`, `hardCeiling=${requiredPromptBlock.hardCeiling}`, `contextBudget=${requiredPromptBlock.contextBudget}`].join("\n")
+    : [
+      "Current source contract (authoritative):",
+      "Complete JSON; do not truncate:",
+      JSON.stringify(requiredPromptBlock.block.sourceContract),
+      "Bounded evidence catalog manifest:",
+      "Complete JSON; do not truncate:",
+      JSON.stringify(promptManifestMetadata),
+      "Complete evidence catalog provenance by evidence ID (use IDs only; do not invent citations):",
+      "Complete IDs/provenance JSON; do not truncate:",
+      JSON.stringify(promptEvidenceById)
+    ].join("\n");
+  const optionalPromptText = [
+    "Pre-structure marker-scoped semantic evidence (each scope is independent):",
+    JSON.stringify(scopeSemanticPromptRefs),
+    "Adaptive context summary (supporting context only):",
+    adaptiveTaskContext || "No adaptive task context found."
+  ].filter(Boolean).join("\n");
+  const generatedPromptCachePrefix = [promptHeader, requiredPromptText, optionalPromptText].filter(Boolean).join("\n\n");
+  const promptCachePrefix = typeof options.promptCachePrefixOverride === "string"
+    ? options.promptCachePrefixOverride
+    : generatedPromptCachePrefix;
+  const bundle = {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
     sourceType,
     sourceTitle,
     sourcePath,
+    sourceContractId: sourceContract.id,
     primarySource: sourceSummary,
-    markedActionScopes,
+    sourceContract,
+    evidenceCatalog,
+    evidenceManifest: evidenceCatalog.manifest,
+    evidenceCatalogHash: evidenceCatalog.hash,
+    evidenceLedger: options.evidenceLedger || {
+      version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+      sourceContractId: sourceContract.id,
+      catalogHash: evidenceCatalog.hash,
+      entries: [],
+      evidenceBundlesByTask: {}
+    },
+    evidenceBundlesByTask: options.evidenceBundlesByTask || {},
+    markedActionScopes: sourceContract.scopes.filter((scope) => scope.scopeId !== sourceContract.sourceScopeId),
     adaptiveTaskContext,
     semanticIndexContext,
     taskContext: options.taskContext || "",
+    taskContextHydration: options.taskContextHydration || null,
     semanticContext: options.semanticContext || [],
+    scopeSemanticEvidence: scopeSemanticEvidence,
+    scopeSemanticRetrievalTelemetry: options.scopeSemanticRetrievalTelemetry || null,
+    requiredPromptBlock: requiredPromptBlock.block,
+    requiredPromptBlockChars: requiredPromptBlock.chars,
+    requiredPromptBlockError: requiredPromptBlock.error || "",
+    requiredPromptBlockHardCeiling: requiredPromptBlock.hardCeiling,
+    promptEvidenceIds,
+    promptEvidenceHash,
     promptCachePrefix
   };
+  bundle.bundleHash = taskWorkflowHash(Object.assign({}, bundle, { promptCachePrefix: "" }));
+  bundle.promptBundleHash = bundle.bundleHash;
+  bundle.validatorBundleHash = bundle.bundleHash;
+  bundle.promptBundleId = bundle.bundleHash;
+  bundle.validatorBundleId = bundle.bundleHash;
+  return deepFreezeTaskWorkflow(bundle);
 }
 
 function explicitReviewRequestFallbackTask(source = {}, sourceSummary = "", settings = DEFAULT_SETTINGS) {
@@ -16726,6 +25270,222 @@ function taskReferenceKey(task, id = "") {
   return `task:${singleLine(task?.path || "")}:${singleLine(task?.content || "").toLowerCase()}:${singleLine(task?.parentContent || "").toLowerCase()}`;
 }
 
+function semanticTaskReferenceChunkSelected(chunk = {}) {
+  const kind = semanticChunkSourceKind(chunk);
+  return kind === "todoist-snapshot-reference-row" || kind === "subtask-task-tree-record" || kind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND || chunk.kind === "todoist-task-reference" || chunk.source === "local-reference-table";
+}
+
+function semanticTaskReferenceField(text = "", label = "") {
+  const escaped = escapeRegExp(label);
+  const match = String(text || "").match(new RegExp(`^${escaped}\\s*:\\s*(.+)$`, "im"));
+  return singleLine(match?.[1] || "");
+}
+
+function semanticTaskReferenceTaskFromChunk(chunk = {}, index = emptyTaskReferenceIndex()) {
+  const nested = chunk.taskReference || chunk.task || {};
+  const id = String(nested.id || nested.todoistId || chunk.taskId || chunk.todoistId || "");
+  const oid = String(nested.oid || chunk.oid || "");
+  const indexed = (id && index.byId?.get(id)) || (oid && index.byOid?.get(oid.toUpperCase()) ? index.byId?.get(index.byOid.get(oid.toUpperCase())) : null) || {};
+  const text = chunk.text || chunk.content || "";
+  const task = Object.assign({}, indexed, nested, {
+    id: id || indexed.id || "",
+    oid: oid || indexed.oid || "",
+    content: nested.content || nested.title || chunk.content || chunk.title || semanticTaskReferenceField(text, "Title"),
+    description: nested.description || chunk.description || semanticTaskReferenceField(text, "Description"),
+    projectId: nested.projectId || chunk.projectId || indexed.projectId || "",
+    projectName: nested.projectName || chunk.projectName || indexed.projectName || "",
+    sectionId: nested.sectionId || chunk.sectionId || indexed.sectionId || "",
+    section: nested.section || chunk.section || indexed.section || "",
+    parentId: nested.parentId || chunk.parentId || indexed.parentId || "",
+    parentOid: nested.parentOid || chunk.parentOid || indexed.parentOid || "",
+    parentTaskId: nested.parentTaskId || chunk.parentTaskId || indexed.parentTaskId || nested.parentId || chunk.parentId || indexed.parentId || "",
+    rootId: nested.rootTaskId || chunk.rootTaskId || indexed.rootTaskId || "",
+    rootTaskId: nested.rootTaskId || chunk.rootTaskId || indexed.rootTaskId || "",
+    rootOid: nested.rootOid || chunk.rootOid || indexed.rootOid || "",
+    childTaskIds: Array.isArray(nested.childTaskIds || chunk.childTaskIds || indexed.childTaskIds) ? (nested.childTaskIds || chunk.childTaskIds || indexed.childTaskIds).slice() : [],
+    childOids: Array.isArray(nested.childOids || chunk.childOids || indexed.childOids) ? (nested.childOids || chunk.childOids || indexed.childOids).slice() : [],
+    treeDepth: nested.treeDepth ?? chunk.treeDepth ?? indexed.treeDepth ?? null,
+    treePath: Array.isArray(nested.treePath || chunk.treePath || indexed.treePath) ? (nested.treePath || chunk.treePath || indexed.treePath).slice() : [],
+    siblingOrder: nested.siblingOrder ?? chunk.siblingOrder ?? indexed.siblingOrder ?? null,
+    parentContent: nested.parentContent || chunk.parentContent || indexed.parentContent || "",
+    isSubtask: nested.isSubtask ?? chunk.isSubtask ?? Boolean(nested.parentId || chunk.parentId || chunk.parentOid || chunk.sourceKind === "subtask-task-tree-record"),
+    isCompleted: nested.isCompleted ?? chunk.isCompleted ?? false,
+    currentState: nested.currentState || chunk.currentState || (nested.isCompleted || chunk.isCompleted ? "completed" : "open"),
+    labels: nested.labels || chunk.labels || indexed.labels || [],
+    due_date: nested.due_date || chunk.due_date || indexed.due_date || "",
+    deadline_date: nested.deadline_date || chunk.deadline_date || indexed.deadline_date || "",
+    noteRefs: nested.noteRefs || chunk.noteRefs || indexed.noteRefs || [],
+    evidence_ids: nested.evidence_ids || chunk.evidence_ids || (chunk.evidenceId ? [chunk.evidenceId] : []),
+    fact_refs: nested.fact_refs || chunk.fact_refs || [],
+    sourceId: chunk.sourceId || nested.sourceId || ""
+  });
+  return task.content ? task : null;
+}
+
+function semanticTaskReferenceIndexForChunks(plugin, chunks = []) {
+  const base = plugin?.taskReferenceIndex || emptyTaskReferenceIndex();
+  const index = Object.assign({}, base, {
+    entries: Array.isArray(base.entries) ? base.entries.slice() : [],
+    byId: new Map(base.byId || []),
+    byOid: new Map(base.byOid || []),
+    childTextByParentOid: new Map(base.childTextByParentOid || [])
+  });
+  for (const chunk of chunks || []) {
+    const reference = chunk?.taskReference || chunk?.task || null;
+    const id = String(reference?.id || reference?.todoistId || chunk?.taskId || chunk?.todoistId || "");
+    if (!id) continue;
+    const task = Object.assign({}, reference, {
+      id,
+      oid: reference?.oid || chunk?.oid || "",
+      parentId: reference?.parentId || reference?.parentTaskId || chunk?.parentId || "",
+      parentOid: reference?.parentOid || chunk?.parentOid || ""
+    });
+    index.byId.set(id, task);
+    if (task.oid) index.byOid.set(String(task.oid).toUpperCase(), id);
+    if (!index.entries.some(([entryId]) => String(entryId) === id)) index.entries.push([id, task]);
+  }
+  return index;
+}
+
+function semanticTaskContextBundle(plugin, active = {}, chunks = [], options = {}) {
+  const startedAt = Date.now();
+  const selectedChunks = (chunks || []).filter(semanticTaskReferenceChunkSelected);
+  const index = semanticTaskReferenceIndexForChunks(plugin, selectedChunks);
+  const tasksByIdentity = new Map();
+  const selectedEvidenceIds = [];
+  const selectedSourceIds = [];
+  const selectedTaskIds = [];
+  const addTask = (task, chunk = null) => {
+    if (!task?.content) return;
+    const identity = taskReferenceKey(task, task.id || task.oid || chunk?.sourceId || "");
+    if (tasksByIdentity.has(identity)) return;
+    const parent = taskReferenceParentTask(task, index);
+    if (parent && !task.parentContent) task.parentContent = parent.content || "";
+    tasksByIdentity.set(identity, { task, chunk });
+  };
+  for (const chunk of selectedChunks) {
+    const task = semanticTaskReferenceTaskFromChunk(chunk, index);
+    addTask(task, chunk);
+    if (chunk.evidenceId) selectedEvidenceIds.push(String(chunk.evidenceId));
+    if (chunk.sourceId) selectedSourceIds.push(String(chunk.sourceId));
+    if (chunk.taskId || task?.id) selectedTaskIds.push(String(chunk.taskId || task.id));
+  }
+  const rows = [];
+  for (const { task, chunk } of tasksByIdentity.values()) {
+    const id = task.id || "";
+    rows.push({
+      key: taskReferenceKey(task, id),
+      path: task.path || chunk?.path || "",
+      priority: task.isSubtask ? 1 : 2,
+      score: Number(chunk?.semanticScore || chunk?.matchScore || 0),
+      text: id ? formatCachedTaskReference(id, task, plugin.settings || DEFAULT_SETTINGS) : formatTaskReference(task, plugin.settings || DEFAULT_SETTINGS)
+    });
+  }
+  const activeRows = [];
+  if (active?.path && active?.text) {
+    const lines = String(active.text).split("\\n");
+    for (let indexLine = 0; indexLine < lines.length; indexLine += 1) {
+      const parsed = parseTaskLine(lines[indexLine], indexLine, active.path, lines, plugin.settings || DEFAULT_SETTINGS) || parseTaskReferenceLine(lines[indexLine], indexLine, active.path, plugin.settings || DEFAULT_SETTINGS);
+      if (parsed?.content) activeRows.push({ key: taskReferenceKey(parsed), path: active.path, priority: 3, score: 0, text: formatTaskReference(parsed, plugin.settings || DEFAULT_SETTINGS) });
+    }
+  }
+  const bounded = limitTaskRowsForChat(uniqueTaskReferenceRows(activeRows.concat(rows).sort((a, b) => b.priority - a.priority || b.score - a.score)));
+  const telemetry = {
+    selectedEvidenceIds: uniqueValues(selectedEvidenceIds),
+    selectedSourceIds: uniqueValues(selectedSourceIds),
+    selectedTaskIds: uniqueValues(selectedTaskIds),
+    selectedCount: bounded.length,
+    noScanFallback: true,
+    degraded: selectedChunks.length === 0,
+    degradedReason: selectedChunks.length ? "" : "semantic-task-reference-chunks-unavailable",
+    counts: { chunks: selectedChunks.length, tasks: tasksByIdentity.size, rows: bounded.length },
+    elapsedMs: Math.max(0, Date.now() - startedAt)
+  };
+  telemetry.bundleHash = taskWorkflowHash({ selectedEvidenceIds: telemetry.selectedEvidenceIds, selectedSourceIds: telemetry.selectedSourceIds, selectedTaskIds: telemetry.selectedTaskIds, rows: bounded.map((row) => row.key) });
+  return { text: bounded.map((row) => row.text).join("\\n"), telemetry };
+}
+
+function semanticAdaptiveTaskCards(plugin, options = {}) {
+  const index = plugin?.getTaskReferenceIndex ? plugin.getTaskReferenceIndex() : emptyTaskReferenceIndex();
+  const cards = [];
+  const seen = new Set();
+  const add = (task, source, chunk = null) => {
+    if (!task?.content) return;
+    const id = String(task.id || task.oid || chunk?.sourceId || "");
+    const key = id ? `id:${id}` : `${chunk?.sourceId || ""}:${singleLine(task.content).toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const knowledge = task.knowledge || task.taskKnowledge || {};
+    const relationship = semanticDedupeRelationship(task);
+    const eligibleLocations = uniqueValues([
+      ...(Array.isArray(task.currentLocations) ? task.currentLocations : []),
+      ...(Array.isArray(task.sourceNoteRefs) ? task.sourceNoteRefs : []),
+      ...(Array.isArray(task.noteRefs) ? task.noteRefs : [])
+    ].map((location) => vaultRelativePath(typeof location === "string" ? location : location?.path || ""))
+      .filter((path) => path && !path.startsWith("@todoist/") && !path.startsWith(SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX)));
+    const detail = (field, aliases = []) => {
+      for (const keyName of [field, ...aliases]) {
+        const value = singleLine(task[keyName] || task.taskReference?.[keyName] || "");
+        if (value) return value;
+      }
+      return "";
+    };
+    const details = {
+      owner: detail("owner", ["assignee", "person"]),
+      recipient: detail("recipient", ["audience", "to"]),
+      reviewer: detail("reviewer", ["reviewerName", "approver"]),
+      deliverable: detail("deliverable", ["artifact", "output"]),
+      dependency: detail("dependency", ["blocker", "dependsOn"]),
+      nextStep: detail("nextStep", ["next_step", "next"]),
+      timing: detail("timing", ["timingRequirement", "schedule"]) || String(task.due_date || task.deadline_date || ""),
+      criteria: detail("criteria", ["successCriteria", "acceptanceCriteria", "reviewCriteria"])
+    };
+    const description = String(task.description || "").trim();
+    cards.push({
+      id,
+      taskId: String(task.id || task.todoistId || ""),
+      oid: String(task.oid || ""),
+      title: task.content,
+      path: eligibleLocations[0] || vaultRelativePath(task.path || chunk?.path || ""),
+      source,
+      status: task.isCompleted ? "completed" : task.isSubtask ? "subtask" : "open",
+      priority: normalizePriority(task.priority),
+      due: task.due_date || task.scheduledDueDateTime || "",
+      deadline: task.deadline_date || "",
+      labels: (task.labels || []).map(cleanLabel).filter(Boolean),
+      project: task.projectName || "",
+      section: task.section || "",
+      parent: task.parentContent || relationship.parentContent || "",
+      parentId: relationship.parentId || String(task.parentId || ""),
+      rootId: relationship.rootId || String(task.rootTaskId || task.rootId || ""),
+      childIds: relationship.childIds || [],
+      todoistLink: id ? todoistTaskMarkdownLink(id, plugin.settings || DEFAULT_SETTINGS, task.content) : "",
+      knowledge,
+      description,
+      details,
+      evidence: String(task.evidence || knowledge.evidence || description || chunk?.text || ""),
+      evidence_ids: semanticDedupeList([
+        ...(Array.isArray(task.evidence_ids) ? task.evidence_ids : task.evidence_ids ? [task.evidence_ids] : []),
+        ...(Array.isArray(chunk?.evidence_ids) ? chunk.evidence_ids : chunk?.evidence_ids ? [chunk.evidence_ids] : []),
+        chunk?.evidenceId
+      ]),
+      fact_refs: semanticDedupeList(task.fact_refs || chunk?.fact_refs),
+      sourceId: chunk?.sourceId || task.sourceId || "",
+      relationship,
+      currentState: semanticDedupeCurrentState(task),
+      selectedSemanticEvidence: chunk?.evidenceId || "",
+      eligibleLocations
+    });
+  };
+  for (const task of flattenTaskPlan(options.tasks || [])) add(task, "current task");
+  for (const chunk of options.context || []) {
+    if (!semanticTaskReferenceChunkSelected(chunk)) continue;
+    add(semanticTaskReferenceTaskFromChunk(chunk, index), "selected semantic task reference", chunk);
+  }
+  const maxCards = Math.max(1, Number(options.maxCards || adaptiveContextBudget(options.mode || "chat").maxTasks));
+  return uniqueAdaptiveTaskCards(cards).slice(0, maxCards);
+}
+
 function uniqueTaskReferenceRows(rows) {
   const seen = new Set();
   return (rows || []).filter((row) => {
@@ -16785,12 +25545,150 @@ function vaultRelativePath(value, basePath = "") {
   }
   return normalizedPath;
 }
-function normalizeSemanticIndexPaths(chunks, app) {
+function semanticChunkContentFingerprint(text = "") {
+  return shortHash(String(text || "").replace(/\r\n/g, "\n"));
+}
+
+function semanticChunkEvidenceId(path = "", contentFingerprint = "", ordinal = 0) {
+  const canonicalPath = vaultRelativePath(path || "");
+  const fingerprint = String(contentFingerprint || "");
+  return `ev:${shortHash(`${canonicalPath}\u0000${fingerprint}`)}:${fingerprint}:${Math.max(0, Number(ordinal || 0))}`;
+}
+
+function semanticChunkProvenance(chunk = {}, path = "", rawChunkId = "", indexRevision = 0) {
+  const sourceKind = semanticChunkSourceKind(chunk);
+  const sourceId = chunk.sourceId || (sourceKind === "note" ? path : semanticTaskReferenceSourceId(chunk.taskId || chunk.oid || "", chunk, sourceKind));
+  return Object.assign({}, chunk.provenance || {}, {
+    sourceKind,
+    sourceId,
+    path: path || chunk.path || "",
+    title: chunk.title || "",
+    source: chunk.source || (sourceKind === "note" ? "vault" : "local-reference-table"),
+    kind: chunk.kind || (sourceKind === "note" ? "vault-note" : "todoist-task-reference"),
+    nonVaultSource: chunk.nonVaultSource === true,
+    sourceSurface: chunk.sourceSurface || taskReferenceSourceSurface(sourceKind),
+    retrievalEligible: chunk.retrievalEligible !== false,
+    authority: chunk.authority || "",
+    todoistSourceId: String(chunk.todoistSourceId || chunk.taskId || ""),
+    todoistSourceOid: String(chunk.todoistSourceOid || chunk.oid || ""),
+    chunkId: rawChunkId || chunk.chunkId || chunk.rawChunkId || chunk.id || "",
+    section: chunk.section || chunk.sectionName || "",
+    lineStart: Number(chunk.lineStart || chunk.startLine || 0),
+    lineEnd: Number(chunk.lineEnd || chunk.endLine || 0),
+    chunkIndex: Number(chunk.chunkIndex || 0),
+    taskId: String(chunk.taskId || ""),
+    oid: String(chunk.oid || ""),
+    rootId: String(chunk.rootTaskId || ""),
+    parentId: String(chunk.parentId || ""),
+    projectId: String(chunk.projectId || ""),
+    sectionId: String(chunk.sectionId || ""),
+    sourceNoteRefs: Array.isArray(chunk.sourceNoteRefs || chunk.noteRefs) ? (chunk.sourceNoteRefs || chunk.noteRefs).map((ref) => Object.assign({}, ref)) : [],
+    snapshotRevision: String(chunk.snapshotRevision || ""),
+    indexRevision: Number(chunk.indexRevision || indexRevision || 0),
+    taskReferenceSchemaVersion: Number(chunk.taskReferenceSchemaVersion || 0),
+    parentTaskId: String(chunk.parentTaskId || chunk.parentId || ""),
+    parentOid: String(chunk.parentOid || ""),
+    rootTaskId: String(chunk.rootTaskId || chunk.rootId || ""),
+    rootOid: String(chunk.rootOid || ""),
+    treeDepth: Number(chunk.treeDepth || 0),
+    treePath: Array.isArray(chunk.treePath) ? chunk.treePath.slice() : [],
+    siblingOrder: Number.isFinite(chunk.siblingOrder) ? chunk.siblingOrder : null,
+    childTaskIds: Array.isArray(chunk.childTaskIds) ? chunk.childTaskIds.slice() : [],
+    childOids: Array.isArray(chunk.childOids) ? chunk.childOids.slice() : [],
+    childEvidenceIds: Array.isArray(chunk.childEvidenceIds) ? chunk.childEvidenceIds.slice() : [],
+    historicalLocations: Array.isArray(chunk.historicalLocations) ? chunk.historicalLocations.map((ref) => Object.assign({}, ref)) : [],
+    derivedFrom: Array.isArray(chunk.derivedFrom) ? chunk.derivedFrom.map((ref) => Object.assign({}, ref)) : [],
+    currentLocations: Array.isArray(chunk.currentLocations) ? chunk.currentLocations.map((ref) => Object.assign({}, ref)) : [],
+    taskReference: chunk.taskReference ? Object.assign({}, chunk.taskReference, {
+      treePath: Array.isArray(chunk.taskReference.treePath) ? chunk.taskReference.treePath.slice() : [],
+      childTaskIds: Array.isArray(chunk.taskReference.childTaskIds) ? chunk.taskReference.childTaskIds.slice() : [],
+      childOids: Array.isArray(chunk.taskReference.childOids) ? chunk.taskReference.childOids.slice() : [],
+      sourceNoteRefs: Array.isArray(chunk.taskReference.sourceNoteRefs) ? chunk.taskReference.sourceNoteRefs.map((ref) => Object.assign({}, ref)) : [],
+      historicalLocations: Array.isArray(chunk.taskReference.historicalLocations) ? chunk.taskReference.historicalLocations.map((ref) => Object.assign({}, ref)) : [],
+      derivedFrom: Array.isArray(chunk.taskReference.derivedFrom) ? chunk.taskReference.derivedFrom.map((ref) => Object.assign({}, ref)) : [],
+      currentLocations: Array.isArray(chunk.taskReference.currentLocations) ? chunk.taskReference.currentLocations.map((ref) => Object.assign({}, ref)) : []
+    }) : null
+  });
+}
+
+function semanticChunkSourceKind(chunk = {}) {
+  if (chunk.sourceKind) return String(chunk.sourceKind);
+  if (chunk.kind === "todoist-task-reference" || chunk.source === "local-reference-table") {
+    return chunk.isSubtask || chunk.parentId || chunk.parentOid ? "subtask-task-tree-record" : "todoist-snapshot-reference-row";
+  }
+  return "note";
+}
+
+function isLegacyGroupedTaskReferenceChunk(chunk = {}) {
+  return String(chunk?.id || chunk?.chunkId || chunk?.rawChunkId || "").includes("#todoist-reference-");
+}
+
+function decorateSemanticIndexChunks(chunks = [], indexRevision = 0) {
+  const duplicateOrdinals = new Map();
+  const decorated = (chunks || []).map((chunk) => {
+    const path = vaultRelativePath(chunk?.path || "");
+    const rawChunkId = String(chunk?.chunkId || chunk?.rawChunkId || chunk?.id || "");
+    const contentFingerprint = semanticChunkContentFingerprint(chunk?.text || "");
+    const sourceKind = semanticChunkSourceKind(chunk);
+    const taskReferenceProjectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(chunk);
+    const sourceId = String(chunk?.sourceId || (sourceKind === "note" ? path : semanticTaskReferenceSourceId(chunk?.taskId || chunk?.oid || "", chunk, sourceKind)));
+    const embeddingDimension = Array.isArray(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || 0);
+    const duplicateKey = `${path}\u0000${contentFingerprint}`;
+    const ordinal = duplicateOrdinals.get(duplicateKey) || 0;
+    duplicateOrdinals.set(duplicateKey, ordinal + 1);
+    const evidenceId = semanticChunkEvidenceId(path, contentFingerprint, ordinal);
+    return Object.assign({}, chunk, {
+      path,
+      sourceKind,
+      sourceId,
+      chunkId: rawChunkId,
+      rawChunkId,
+      evidenceId,
+      evidenceContentFingerprint: contentFingerprint,
+      ...(taskReferenceProjectionVersion ? { taskReferenceEmbeddingProjectionVersion: taskReferenceProjectionVersion } : {}),
+      indexRevision: Number(chunk?.indexRevision || indexRevision || 0),
+      contentFingerprint,
+      indexMetadata: Object.assign({}, chunk?.indexMetadata || {}, {
+        schemaVersion: Number(chunk?.indexMetadata?.schemaVersion || 1),
+        contentVersion: Number(chunk?.indexMetadata?.contentVersion || chunk?.embeddingContentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION),
+        provider: String(chunk?.indexMetadata?.provider || chunk?.embeddingProvider || "unknown"),
+        model: String(chunk?.indexMetadata?.model || chunk?.embeddingModel || "unknown"),
+        dimension: embeddingDimension,
+        ...(taskReferenceProjectionVersion ? { taskReferenceEmbeddingProjectionVersion: taskReferenceProjectionVersion } : {})
+      }),
+      provenance: semanticChunkProvenance(chunk, path, rawChunkId, indexRevision)
+    });
+  });
+  const byTaskId = new Map();
+  const byOid = new Map();
+  for (const chunk of decorated) {
+    if (chunk.sourceKind === "note") continue;
+    const taskId = String(chunk.taskId || chunk.taskReference?.taskId || "");
+    const oid = String(chunk.oid || chunk.taskReference?.oid || "").toUpperCase();
+    if (taskId && !byTaskId.has(taskId)) byTaskId.set(taskId, chunk);
+    if (oid && !byOid.has(oid)) byOid.set(oid, chunk);
+  }
+  for (const chunk of decorated) {
+    if (chunk.sourceKind === "note") continue;
+    const childEvidenceIds = [];
+    for (let index = 0; index < (chunk.childTaskIds || []).length; index += 1) {
+      const child = byTaskId.get(String(chunk.childTaskIds[index])) || byOid.get(String(chunk.childOids?.[index] || "").toUpperCase());
+      if (child?.evidenceId && !childEvidenceIds.includes(child.evidenceId)) childEvidenceIds.push(child.evidenceId);
+    }
+    chunk.childEvidenceIds = childEvidenceIds;
+    if (chunk.provenance) chunk.provenance.childEvidenceIds = childEvidenceIds.slice();
+    if (chunk.taskReference) chunk.taskReference.childEvidenceIds = childEvidenceIds.slice();
+  }
+  return decorated;
+}
+
+function normalizeSemanticIndexPaths(chunks, app, indexRevision = 0) {
   const basePath = vaultBasePath(app);
-  return (chunks || []).map((chunk) => Object.assign({}, chunk, {
+  const normalized = (chunks || []).map((chunk) => Object.assign({}, chunk, {
     path: vaultRelativePath(chunk.path || "", basePath),
     id: chunk.id && chunk.path ? `${vaultRelativePath(chunk.path, basePath)}${String(chunk.id).includes("#") ? `#${String(chunk.id).split("#").pop()}` : ""}` : chunk.id
   }));
+  return decorateSemanticIndexChunks(normalized, indexRevision);
 }
 function normalizeStoredTaskReferencePaths(task, basePath = "") {
   const normalized = Object.assign({}, task, {
@@ -16991,6 +25889,62 @@ function preferredEmbeddingModelForProvider(settings = DEFAULT_SETTINGS, provide
   if (usesOpenAIEmbeddingModel(current)) return normalizeOpenAIModelId(current);
   const models = openAiEmbeddingModels(settings);
   return models.includes(DEFAULT_SETTINGS.embeddingModel) ? DEFAULT_SETTINGS.embeddingModel : models[0] || DEFAULT_SETTINGS.embeddingModel;
+}
+function openAiEmbeddingNativeDimension(model = "") {
+  const normalized = normalizeOpenAIModelId(model);
+  if (normalized === "text-embedding-3-large") return 3072;
+  if (normalized === "text-embedding-3-small") return 1536;
+  return 0;
+}
+function supportsOpenAiEmbeddingDimensions(model = "") {
+  return openAiEmbeddingNativeDimension(model) > 0;
+}
+function normalizeOpenAiEmbeddingDimensions(value, model = DEFAULT_SETTINGS.embeddingModel) {
+  const nativeDimension = openAiEmbeddingNativeDimension(model);
+  if (!nativeDimension) return 0;
+  const fallback = Math.min(nativeDimension, Number(DEFAULT_SETTINGS.openAiEmbeddingDimensions || 1024));
+  const parsed = Math.round(Number(value));
+  return Math.min(nativeDimension, Math.max(256, Number.isFinite(parsed) && parsed > 0 ? parsed : fallback));
+}
+function semanticEmbeddingTargetDimension(settings = DEFAULT_SETTINGS, model = settings.embeddingModel) {
+  if (!supportsOpenAiEmbeddingDimensions(model)) return 0;
+  return normalizeOpenAiEmbeddingDimensions(settings.openAiEmbeddingDimensions, model);
+}
+function semanticEmbeddingRequestDimension(settings = DEFAULT_SETTINGS, role = "document", meta = settings.semanticIndexMeta || {}) {
+  const model = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  const targetDimension = semanticEmbeddingTargetDimension(settings, model);
+  if (!targetDimension) return 0;
+  if (role !== "query") return targetDimension;
+  const indexedModel = normalizeOpenAIModelId(meta?.model || model);
+  const currentModel = normalizeOpenAIModelId(model);
+  const indexedDimension = Number(meta?.dimension || 0);
+  const nativeDimension = openAiEmbeddingNativeDimension(model);
+  if (indexedModel === currentModel && indexedDimension >= 256 && indexedDimension <= nativeDimension) return indexedDimension;
+  return targetDimension;
+}
+function semanticEmbeddingIndexCompatibility(settings = DEFAULT_SETTINGS, meta = settings.semanticIndexMeta || {}) {
+  const provider = aiProviderForModel(settings.embeddingModel);
+  const model = String(settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel);
+  const targetDimension = semanticEmbeddingTargetDimension(settings, model);
+  const indexedProvider = String(meta?.provider || provider);
+  const indexedModel = String(meta?.model || model);
+  const indexedDimension = Number(meta?.dimension || 0);
+  const dimensionControlled = targetDimension > 0;
+  const providerMatches = indexedProvider === provider;
+  const modelMatches = modelIdentity(indexedModel) === modelIdentity(model);
+  const dimensionMatches = !dimensionControlled || indexedDimension === targetDimension;
+  return {
+    provider,
+    model,
+    targetDimension,
+    indexedDimension,
+    dimensionControlled,
+    providerMatches,
+    modelMatches,
+    dimensionMatches,
+    migrationRequired: Boolean(dimensionControlled && providerMatches && modelMatches && indexedDimension > 0 && !dimensionMatches),
+    compatible: providerMatches && modelMatches && dimensionMatches
+  };
 }
 function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
@@ -17267,6 +26221,9 @@ function formatTodoistDescription(value, settings = DEFAULT_SETTINGS, sourceText
 function normalizeTodoistDescriptionSourceList(value) {
   const splitSummary = splitDescriptionSourceListBlock(value);
   if (!splitSummary.sourceList) return String(value || "");
+  if (/^Source List:[\s\S]*\nSources:\s*\n/i.test(splitSummary.sourceList)) {
+    return [splitSummary.summary.trim(), restoreSourceListLineBreaks(splitSummary.sourceList)].filter(Boolean).join("\n\n");
+  }
   const sourceBlock = normalizeDescriptionSourceList(splitSummary.sourceList);
   return [splitSummary.summary.trim(), sourceBlock].filter(Boolean).join("\n\n");
 }
@@ -17461,6 +26418,12 @@ function existingTodoistTaskMatchScore(task, parsed, parentId) {
   return score;
 }
 
+function countCreatedTaskTree(stats = emptyTaskDeduplicationStats(), task = {}) {
+  stats.created += 1;
+  for (const subtask of task.subtasks || []) stats.created += 1;
+  return stats;
+}
+
 function emptyTaskDeduplicationStats() {
   return {
     checked: 0,
@@ -17473,6 +26436,20 @@ function emptyTaskDeduplicationStats() {
     localConfirmed: 0,
     aiUsed: 0,
     taskGenerationUsed: 0,
+    semanticTelemetry: {
+      candidateCount: 0,
+      embeddingCacheHits: 0,
+      embeddingCalls: 0,
+      providerCalls: 0,
+      providerCost: 0,
+      elapsedMs: 0,
+      degraded: false,
+      degradedReason: "",
+      escalation: false
+    },
+    degradedState: "legacy",
+    degradedReason: "",
+    candidateOutcomes: [],
     candidateFlags: [],
     matches: []
   };
@@ -17545,7 +26522,12 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
     const resolutionOptions = Object.assign({}, options, { intraBatch: true });
     const resolution = taskDeduplicationResolution(decision, settings, resolutionOptions);
-    if (resolution === "none") continue;
+    if (resolution === "none") {
+      if (decision.candidate && (decision.outcome === "ambiguous-ai" || decision.decision === "ambiguous")) {
+        flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
+      }
+      continue;
+    }
     if (resolution === "manual") {
       flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
       continue;
@@ -17555,11 +26537,14 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     } else {
       const aiDecision = typeof aiDecisionFn === "function" ? await aiDecisionFn(task, decision, resolutionOptions) : null;
       if (aiDecision?.used) stats.aiUsed += 1;
-      if (aiDecision?.match !== true) continue;
+      if (aiDecision?.match !== true) {
+        if (aiDecision?.used) flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
+        continue;
+      }
     }
-    const generatedUpdate = typeof taskGenerationFn === "function"
-      ? await taskGenerationFn(task, decision, resolutionOptions)
-      : null;
+    const generatedUpdate = options.semanticDedupeState?.enabled
+      ? { used: false, task }
+      : (typeof taskGenerationFn === "function" ? await taskGenerationFn(task, decision, resolutionOptions) : null);
     if (!generatedUpdate?.task) {
       flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
       continue;
@@ -17568,6 +26553,8 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     if (generatedUpdate.used) {
       stats.taskGenerationUsed += 1;
       applyTaskGenerationDuplicateUpdate(target, generatedUpdate.task, settings);
+    } else {
+      mergeConfirmedGeneratedTaskTree(target, task, settings);
     }
     markGeneratedDuplicateTask(target, decision, settings);
     stats.merged += 1;
@@ -17579,6 +26566,44 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     i -= 1;
   }
   return stats;
+}
+
+function mergeConfirmedGeneratedTaskTree(target = {}, duplicate = {}, settings = DEFAULT_SETTINGS) {
+  if (!target || !duplicate) return target;
+  if ((!target.description || target.description.length < (duplicate.description || "").length) && duplicate.description) target.description = duplicate.description;
+  target.due_date = target.due_date || duplicate.due_date || "";
+  target.deadline_date = target.deadline_date || duplicate.deadline_date || "";
+  target.priority = normalizePriority(target.priority || duplicate.priority || 1);
+  target.labels = mergedTaskLabelsForDeduplication(target.labels || [], duplicate.labels || [], settings);
+  const existingByIdentity = new Map();
+  for (const subtask of target.subtasks || []) {
+    const key = JSON.stringify(semanticDedupeStructuredIdentity(subtask));
+    if (key !== "{}" && !existingByIdentity.has(key)) existingByIdentity.set(key, subtask);
+  }
+  for (const sourceSubtask of duplicate.subtasks || []) {
+    const key = JSON.stringify(semanticDedupeStructuredIdentity(sourceSubtask));
+    const existing = key !== "{}" ? existingByIdentity.get(key) : null;
+    if (existing) {
+      existing.description = existing.description || sourceSubtask.description || "";
+      existing.due_date = existing.due_date || sourceSubtask.due_date || "";
+      existing.deadline_date = existing.deadline_date || sourceSubtask.deadline_date || "";
+      existing.labels = mergedTaskLabelsForDeduplication(existing.labels || [], sourceSubtask.labels || [], settings);
+      continue;
+    }
+    const next = Object.assign({}, sourceSubtask, {
+      oid: sourceSubtask.oid || generateUniqueOid(settings),
+      isSubtask: true,
+      parentId: target.id || sourceSubtask.parentId || "",
+      parentOid: target.oid || sourceSubtask.parentOid || "",
+      parentContent: target.content || sourceSubtask.parentContent || ""
+    });
+    target.subtasks = target.subtasks || [];
+    target.subtasks.push(next);
+    if (key !== "{}") existingByIdentity.set(key, next);
+  }
+  target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
+  target.descriptionShouldSync = true;
+  return target;
 }
 
 function generatedTaskBatchCandidates(tasks = [], beforeIndex = 0) {
@@ -17599,26 +26624,17 @@ function generatedTaskBatchCandidates(tasks = [], beforeIndex = 0) {
 }
 
 function duplicatePairNeedsTaskGeneration(incoming = {}, existing = {}, options = {}) {
-  if (duplicateTaskPayloadEquivalent(incoming, existing)) return false;
   if (options.intraBatch === true) return true;
   if (options.isSubtask === true) return false;
   if (existing.due_date && !incoming.due_date) return true;
   if (existing.deadline_date && !incoming.deadline_date) return true;
-  const incomingText = taskDeduplicationContextText(incoming);
-  const incomingCounts = termCounts(incomingText);
-  const existingTerms = generatedTaskObjectTerms(taskDeduplicationContextText(existing));
-  const missingTerms = existingTerms.filter((term) => !contextAnchorVariants(term).some((variant) => incomingCounts[variant]));
-  if (missingTerms.length >= 2) return true;
   if (isRichTodoistDescription(existing.description) && !isRichTodoistDescription(incoming.description)) return true;
-  const incomingSubtaskText = taskDeduplicationSubtaskText(incoming);
-  const existingSubtaskText = [taskDeduplicationSubtaskText(existing), existing.childText || ""].filter(Boolean).join(" ");
-  if (existingSubtaskText && !duplicateActionRepresented(existingSubtaskText, incomingSubtaskText || incomingText)) return true;
   const incomingLinks = new Set(extractDescriptionLinkRecords(incoming.description || "", DEFAULT_SETTINGS).map((link) => link.url));
   return extractDescriptionLinkRecords(existing.description || "", DEFAULT_SETTINGS).some((link) => !incomingLinks.has(link.url));
 }
 
 function duplicateTaskPayloadEquivalent(incoming = {}, existing = {}) {
-  if (canonicalTaskMatchTitle(incoming.content || "") !== canonicalTaskMatchTitle(existing.content || "")) return false;
+  if (JSON.stringify(semanticDedupeStructuredIdentity(incoming)) !== JSON.stringify(semanticDedupeStructuredIdentity(existing))) return false;
   const incomingDescription = singleLine(splitDescriptionSourceListBlock(incoming.description || "").summary).toLowerCase();
   const existingDescription = singleLine(splitDescriptionSourceListBlock(existing.description || "").summary).toLowerCase();
   if (incomingDescription !== existingDescription) return false;
@@ -17626,29 +26642,14 @@ function duplicateTaskPayloadEquivalent(incoming = {}, existing = {}) {
   if (String(incoming.deadline_date || "") !== String(existing.deadline_date || "")) return false;
   const labels = (task) => uniqueValues((task.labels || []).map(cleanLabel).filter(Boolean)).sort().join("|").toLowerCase();
   if (labels(incoming) !== labels(existing)) return false;
-  const subtasks = (task) => (task.subtasks || []).map((subtask) => canonicalTaskMatchTitle(subtask.content || "")).filter(Boolean).sort().join("|");
+  const subtasks = (task) => (task.subtasks || []).map((subtask) => stableTaskTreeIdentity(subtask)).filter(Boolean).sort().join("|");
   return subtasks(incoming) === subtasks(existing);
 }
 
 function duplicateTaskGenerationPreservesEvidence(generated = {}, incoming = {}, existing = {}, settings = DEFAULT_SETTINGS) {
   if (!generated?.content) return false;
-  const evidence = [
-    taskDeduplicationContextText(incoming),
-    taskDeduplicationContextText(existing),
-    taskDeduplicationSubtaskText(incoming),
-    taskDeduplicationSubtaskText(existing),
-    existing.childText || ""
-  ].filter(Boolean).join("\n");
-  if (!generatedTaskMatchesPrimarySource(generated, evidence)) return false;
+  if (mainTaskClarityReason(generated) !== "passed") return false;
   if ((isRichTodoistDescription(incoming.description) || isRichTodoistDescription(existing.description)) && !isUsefulDescriptionSummary(generated.description, generated.content, settings)) return false;
-  const generatedText = taskDeduplicationContextText(generated);
-  const generatedCounts = termCounts(generatedText);
-  const sourceTerms = uniqueValues([
-    ...generatedTaskObjectTerms(incoming.content || ""),
-    ...generatedTaskObjectTerms(existing.content || "")
-  ]);
-  const representedTerms = sourceTerms.filter((term) => contextAnchorVariants(term).some((variant) => generatedCounts[variant]));
-  if (sourceTerms.length >= 4 && representedTerms.length < Math.min(3, Math.ceil(sourceTerms.length * 0.4))) return false;
   const sourceDueDates = uniqueValues([incoming.due_date, existing.due_date].filter(Boolean));
   if (sourceDueDates.length && !generated.due_date) return false;
   const sourceDeadlines = uniqueValues([incoming.deadline_date, existing.deadline_date].filter(Boolean));
@@ -17657,18 +26658,14 @@ function duplicateTaskGenerationPreservesEvidence(generated = {}, incoming = {},
   const sourceLinks = uniqueValues([incoming.description, existing.description]
     .flatMap((description) => extractDescriptionLinkRecords(description || "", settings).map((link) => link.url)));
   if (sourceLinks.some((link) => !generatedLinks.has(link))) return false;
-  const generatedActionText = [generated.content, generated.description, taskDeduplicationSubtaskText(generated)].filter(Boolean).join(" ");
-  const sourceSubtasks = [...(incoming.subtasks || []), ...(existing.subtasks || [])].filter((subtask) => subtask?.content);
-  if (sourceSubtasks.some((subtask) => !duplicateActionRepresented(subtask.content, generatedActionText))) return false;
   return true;
 }
 
-function duplicateActionRepresented(source = "", target = "") {
-  const sourceTerms = generatedTaskObjectTerms(source);
-  if (!sourceTerms.length) return true;
-  const targetCounts = termCounts(target);
-  const matches = sourceTerms.filter((term) => contextAnchorVariants(term).some((variant) => targetCounts[variant])).length;
-  return matches >= Math.min(2, sourceTerms.length);
+function stableTaskTreeIdentity(task = {}) {
+  const stableId = String(task.todoistId || task.id || task.oid || "").trim();
+  if (stableId) return `id:${stableId.toUpperCase()}`;
+  const structured = semanticDedupeStructuredIdentity(task);
+  return Object.keys(structured).length ? `structured:${JSON.stringify(structured)}` : "";
 }
 
 function applyTaskGenerationDuplicateUpdate(target = {}, generated = {}, settings = DEFAULT_SETTINGS) {
@@ -17680,10 +26677,19 @@ function applyTaskGenerationDuplicateUpdate(target = {}, generated = {}, setting
   target.priority = normalizePriority(generated.priority || target.priority || 1);
   target.labels = mergedTaskLabelsForDeduplication(generated.labels || [], target.labels || [], settings);
   if (!target.isSubtask) {
-    target.subtasks = (generated.subtasks || []).map((subtask, index) => {
-      const previous = previousSubtasks[index] || {};
-      const next = Object.assign({}, previous, subtask, {
-        oid: previous.oid || generateUniqueOid(settings),
+    const mergedSubtasks = [];
+    const seenSubtaskIdentities = new Set();
+    for (const subtask of [...previousSubtasks, ...(generated.subtasks || [])]) {
+      const identity = stableTaskTreeIdentity(subtask);
+      if (identity && seenSubtaskIdentities.has(identity)) continue;
+      if (identity) seenSubtaskIdentities.add(identity);
+      const previous = identity ? previousSubtasks.find((candidate) => stableTaskTreeIdentity(candidate) === identity) || {} : {};
+      const next = Object.assign({}, previous, subtask);
+      for (const field of TASK_SUBTASK_STABLE_IDENTITY_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(previous, field) && previous[field] !== undefined) next[field] = previous[field];
+      }
+      Object.assign(next, {
+        oid: previous.oid || subtask.oid || generateUniqueOid(settings),
         isSubtask: true,
         parentId: target.id || previous.parentId || "",
         parentOid: target.oid || previous.parentOid || "",
@@ -17694,8 +26700,9 @@ function applyTaskGenerationDuplicateUpdate(target = {}, generated = {}, setting
         sectionId: target.sectionId || previous.sectionId || ""
       });
       next.knowledge = taskKnowledgeSnapshot(next, settings, "", previous.knowledge || null);
-      return next;
-    });
+      mergedSubtasks.push(next);
+    }
+    target.subtasks = mergedSubtasks;
   }
   target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
   target.descriptionShouldSync = true;
@@ -17750,11 +26757,14 @@ function taskDeduplicationAiReviewConfig(settings = DEFAULT_SETTINGS, options = 
 }
 
 function isAiMediatedTaskDeduplicationCandidate(decision = {}) {
-  return Boolean(decision?.candidate && (decision.decision === "merge" || decision.decision === "ambiguous"));
+  return Boolean(decision?.candidate && (decision.decision === "merge" || decision.decision === "ambiguous" || decision.outcome === "merge" || decision.outcome === "ambiguous-ai"));
 }
 
 function taskDeduplicationResolution(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
   if (!isAiMediatedTaskDeduplicationCandidate(decision)) return "none";
+  if (decision.hardConflict) return "none";
+  if (decision.outcome === "merge" && decision.decision === "merge") return "local";
+  if (decision.outcome === "ambiguous-ai") return settings.enableAiAmbiguousTaskDeduplication === true ? "ai" : "none";
   if (decision.decision === "ambiguous") return isCredibleLocalAmbiguousTaskCandidate(decision, settings, options) ? "manual" : "none";
   if (settings.enableAiAmbiguousTaskDeduplication !== true) return "local";
   return isLocallyConclusiveTaskDuplicate(decision, settings, options) ? "local" : "ai";
@@ -17780,50 +26790,302 @@ function isTaskDeduplicationRoutingBoilerplate(task = {}) {
 }
 
 function isLocallyConclusiveTaskDuplicate(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
-  if (decision.decision !== "merge" || decision.hardMismatch || !decision.candidate?.task) return false;
-  const incomingTitle = canonicalTaskMatchTitle(decision.sourceTask?.content || decision.taskSource?.content || "");
-  const existingTitle = canonicalTaskMatchTitle(decision.candidate.task.content || "");
-  const exactTitleReason = (decision.reasons || []).some((reason) => /exact task title|near-exact task title/i.test(reason));
-  const exactTitle = exactTitleReason || Boolean(incomingTitle && incomingTitle === existingTitle);
-  if (exactTitle && Number(decision.titleOverlap || 0) >= 0.94) return true;
-  if (decision.hierarchyMismatch && !exactTitle) return false;
-  const strictness = settings.taskDeduplicationStrictness || DEFAULT_SETTINGS.taskDeduplicationStrictness;
-  const config = strictness === "strict"
-    ? { confidence: 98, title: 0.9, context: 0.6, corroboratedTitle: 0.8, corroboratedContext: 0.78 }
-    : strictness === "permissive"
-      ? { confidence: 94, title: 0.84, context: 0.5, corroboratedTitle: 0.7, corroboratedContext: 0.68 }
-      : { confidence: 96, title: 0.86, context: 0.55, corroboratedTitle: 0.75, corroboratedContext: 0.72 };
-  const confidence = Number(decision.confidence || 0);
-  const titleOverlap = Number(decision.titleOverlap || 0);
-  const contextOverlap = Number(decision.contextOverlap || 0);
-  if (confidence >= config.confidence && titleOverlap >= config.title && contextOverlap >= config.context) return true;
-  return Boolean(
-    confidence >= config.confidence + 1 &&
-    decision.projectContextMatch === true &&
-    titleOverlap >= config.corroboratedTitle &&
-    contextOverlap >= config.corroboratedContext &&
-    !options.crossProject
-  );
+  // Local certainty may only come from the semantic decision path or exact
+  // stable workflow identity; title similarity/equality is never evidence.
+  if (decision.outcome !== "merge" || decision.decision !== "merge" || decision.hardConflict || decision.hardMismatch || !decision.candidate?.task) return false;
+  const exactIdentity = (decision.basis || decision.reasons || []).some((reason) => /exact (?:task )?identity|stable (?:todoist )?(?:id|oid)|workflow identity/i.test(String(reason)));
+  const semanticScore = Number(decision.semanticScore);
+  return exactIdentity || (Number.isFinite(semanticScore) && semanticScore >= 0.88);
+}
+
+function semanticDedupeList(value = []) {
+  if (Array.isArray(value)) return uniqueValues(value.map((item) => singleLine(item)).filter(Boolean)).sort();
+  if (value === undefined || value === null || value === "") return [];
+  return [singleLine(value)].filter(Boolean);
+}
+
+function semanticDedupeStructuredIdentity(task = {}) {
+  const explicit = task.structuredIdentity || task.structured_identity || {};
+  const knowledge = task.knowledge || {};
+  const identity = {
+    action: singleLine(explicit.action || task.action || knowledge.action || ""),
+    outcome: singleLine(explicit.outcome || explicit.outcomeType || task.outcome || knowledge.outcome || knowledge.outcomeType || ""),
+    deliverable: singleLine(explicit.deliverable || task.deliverable || knowledge.deliverable || ""),
+    component: singleLine(explicit.component || task.component || knowledge.component || ""),
+    owner: singleLine(explicit.owner || task.owner || knowledge.owner || ""),
+    recipient: singleLine(explicit.recipient || task.recipient || knowledge.recipient || ""),
+    reviewer: singleLine(explicit.reviewer || task.reviewer || knowledge.reviewer || ""),
+    people: semanticDedupeList(explicit.people || task.people || knowledge.people),
+    projectId: String(explicit.projectId || task.projectId || ""),
+    projectName: singleLine(explicit.projectName || task.projectName || ""),
+    sectionId: String(explicit.sectionId || task.sectionId || ""),
+    section: singleLine(explicit.section || task.section || ""),
+    labels: semanticDedupeList(explicit.labels || task.labels),
+    dueDate: String(explicit.dueDate || explicit.due_date || task.due_date || ""),
+    deadlineDate: String(explicit.deadlineDate || explicit.deadline_date || task.deadline_date || ""),
+    progress: singleLine(explicit.progress || explicit.currentState || task.progress || task.currentState || knowledge.progress || "")
+  };
+  return Object.fromEntries(Object.entries(identity).filter(([, value]) => Array.isArray(value) ? value.length : value));
+}
+
+function semanticDedupeRelationship(task = {}, options = {}) {
+  const relationship = task.relationship || task.relation || {};
+  return {
+    kind: singleLine(relationship.kind || (task.isSubtask || task.parentId || task.parentOid ? "subtask" : "root")),
+    isSubtask: Boolean(relationship.isSubtask ?? (task.isSubtask || task.parentId || task.parentOid || options.isSubtask)),
+    parentId: String(relationship.parentId || task.parentId || options.parentId || ""),
+    parentOid: String(relationship.parentOid || task.parentOid || options.parentOid || ""),
+    parentContent: singleLine(relationship.parentContent || task.parentContent || options.parentContent || ""),
+    rootId: String(relationship.rootId || task.rootId || task.rootTaskId || ""),
+    rootOid: String(relationship.rootOid || task.rootOid || ""),
+    childIds: semanticDedupeList(relationship.childIds || task.childTaskIds || (task.subtasks || []).map((item) => item?.id || item?.todoistId)),
+    childOids: semanticDedupeList(relationship.childOids || task.childOids || (task.subtasks || []).map((item) => item?.oid)),
+    treeDepth: Number(relationship.treeDepth ?? task.treeDepth ?? 0),
+    treePath: semanticDedupeList(relationship.treePath || task.treePath)
+  };
+}
+
+function semanticDedupeCurrentState(task = {}) {
+  const state = task.currentState || task.current_state || task.state || task.progress || task.knowledge?.progress || "";
+  return task.isCompleted ? "completed" : singleLine(state || "open");
+}
+
+function semanticTaskDedupeProgressConflict(left = "", right = "") {
+  const a = singleLine(left).toLowerCase();
+  const b = singleLine(right).toLowerCase();
+  if (!a || !b || a === b) return false;
+  if (/\b(?:completed|complete|historical|prior|archived|obsolete|cancelled)\b/.test(a) || /\b(?:completed|complete|historical|prior|archived|obsolete|cancelled)\b/.test(b)) return true;
+  const generic = new Set(["open", "pending", "pending-confirmation", "ready-to-send", "current-review", "in-progress", "active"]);
+  return !(generic.has(a) && generic.has(b));
+}
+
+function taskTreeRepresentation(task = {}, options = {}) {
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  const evidenceIds = semanticDedupeList(task.evidence_ids || task.evidenceIds || task.evidence_id || task.evidence?.ids);
+  const factRefs = semanticDedupeList(task.fact_refs || task.factRefs || task.fact_refs_ids || task.facts);
+  return {
+    title: singleLine(task.content || task.title || ""),
+    description: singleLine(task.description || ""),
+    subtasks: subtasks.map((subtask) => taskTreeRepresentation(subtask, Object.assign({}, options, {
+      isSubtask: true,
+      parentId: task.id || options.parentId,
+      parentOid: task.oid || options.parentOid,
+      parentContent: task.content || options.parentContent
+    }))),
+    structuredIdentity: semanticDedupeStructuredIdentity(task),
+    relationship: semanticDedupeRelationship(task, options),
+    currentState: semanticDedupeCurrentState(task),
+    evidence_ids: evidenceIds,
+    fact_refs: factRefs,
+    sourceId: String(task.sourceId || task.source_id || ""),
+    taskId: String(task.id || task.todoistId || task.oid || ""),
+    oid: String(task.oid || "")
+  };
+}
+
+function taskTreeFingerprint(task = {}, options = {}) {
+  const representation = taskTreeRepresentation(task, options);
+  return taskWorkflowHash({
+    representation,
+    provider: String(options.provider || options.embeddingProvider || ""),
+    model: String(options.model || options.embeddingModel || ""),
+    dimension: Number(options.dimension || options.embeddingDimension || 0),
+    indexRevision: Number(options.indexRevision || 0)
+  });
+}
+
+function taskTreeEmbeddingText(task = {}, options = {}) {
+  const tree = taskTreeRepresentation(task, options);
+  const identity = tree.structuredIdentity || {};
+  const relationship = tree.relationship || {};
+  const lines = [
+    `Title: ${tree.title}`,
+    tree.description ? `Description: ${truncateAtWord(tree.description, 1400)}` : "",
+    identity.action ? `Action: ${identity.action}` : "",
+    identity.outcome ? `Outcome: ${identity.outcome}` : "",
+    identity.deliverable ? `Deliverable: ${identity.deliverable}` : "",
+    identity.component ? `Component: ${identity.component}` : "",
+    identity.owner ? `Owner: ${identity.owner}` : "",
+    identity.recipient ? `Recipient: ${identity.recipient}` : "",
+    identity.reviewer ? `Reviewer: ${identity.reviewer}` : "",
+    identity.people?.length ? `People: ${identity.people.join(", ")}` : "",
+    identity.projectName || identity.projectId ? `Project: ${identity.projectName || identity.projectId}` : "",
+    identity.section || identity.sectionId ? `Section: ${identity.section || identity.sectionId}` : "",
+    identity.progress ? `Progress: ${identity.progress}` : "",
+    identity.dueDate ? `Due date: ${identity.dueDate}` : "",
+    identity.deadlineDate ? `Deadline: ${identity.deadlineDate}` : "",
+    `Current state: ${tree.currentState}`,
+    `Hierarchy: ${relationship.kind || "root"}; subtask=${Boolean(relationship.isSubtask)}; parent=${relationship.parentContent || relationship.parentId || relationship.parentOid || ""}`,
+    tree.subtasks?.length ? `Subtasks: ${tree.subtasks.map((item) => item.title).filter(Boolean).join(" | ")}` : "",
+    tree.evidence_ids.length ? `Evidence IDs: ${tree.evidence_ids.join(", ")}` : "",
+    tree.fact_refs.length ? `Fact refs: ${tree.fact_refs.join(", ")}` : ""
+  ].filter(Boolean);
+  return truncateAtWord(lines.join("\n"), Number(options.maxChars || 6500));
+}
+
+function semanticTaskDedupeChunkIdentity(chunk = {}) {
+  const task = chunk.taskReference || chunk.task || chunk;
+  return Object.assign({}, task, {
+    id: task.id || chunk.taskId || chunk.todoistId || "",
+    oid: task.oid || chunk.oid || "",
+    content: task.content || chunk.content || chunk.title || "",
+    description: task.description || chunk.description || "",
+    projectId: task.projectId || chunk.projectId || "",
+    projectName: task.projectName || chunk.projectName || "",
+    sectionId: task.sectionId || chunk.sectionId || "",
+    section: task.section || chunk.section || "",
+    parentId: task.parentId || chunk.parentId || "",
+    parentOid: task.parentOid || chunk.parentOid || "",
+    parentTaskId: task.parentTaskId || chunk.parentTaskId || task.parentId || chunk.parentId || "",
+    rootTaskId: task.rootTaskId || chunk.rootTaskId || "",
+    rootOid: task.rootOid || chunk.rootOid || "",
+    childTaskIds: task.childTaskIds || chunk.childTaskIds || [],
+    childOids: task.childOids || chunk.childOids || [],
+    treeDepth: task.treeDepth ?? chunk.treeDepth ?? null,
+    treePath: task.treePath || chunk.treePath || [],
+    siblingOrder: task.siblingOrder ?? chunk.siblingOrder ?? null,
+    parentContent: task.parentContent || chunk.parentContent || "",
+    isSubtask: task.isSubtask ?? Boolean(chunk.parentId || chunk.parentOid || chunk.sourceKind === "subtask-task-tree-record"),
+    isCompleted: task.isCompleted ?? chunk.isCompleted,
+    evidence_ids: task.evidence_ids || chunk.evidence_ids || chunk.evidenceIds || (chunk.evidenceId ? [chunk.evidenceId] : []),
+    fact_refs: task.fact_refs || chunk.fact_refs || chunk.factRefs || [],
+    structuredIdentity: task.structuredIdentity || chunk.structuredIdentity,
+    relationship: task.relationship || chunk.relationship,
+    currentState: task.currentState || chunk.currentState || (task.isCompleted || chunk.isCompleted ? "completed" : "open")
+  });
+}
+
+function semanticTaskDedupeCandidateEnvelope(task = {}, candidate = {}, semanticScore = 0, reasons = []) {
+  const existing = candidate.task || semanticTaskDedupeChunkIdentity(candidate.semanticChunk || candidate);
+  const chunk = candidate.semanticChunk || candidate.chunk || {};
+  const tree = taskTreeRepresentation(existing);
+  return {
+    taskId: String(candidate.taskId || candidate.id || existing.id || existing.todoistId || existing.oid || ""),
+    sourceId: String(candidate.sourceId || chunk.sourceId || existing.sourceId || ""),
+    id: candidate.id || candidate.taskId || existing.id || existing.todoistId || existing.oid || "",
+    generatedTask: candidate.generatedTask || undefined,
+    semanticScore: Number.isFinite(Number(semanticScore)) ? Number(semanticScore) : 0,
+    evidence_ids: semanticDedupeList(candidate.evidence_ids || existing.evidence_ids || chunk.evidence_ids || chunk.evidenceIds || chunk.evidenceId),
+    fact_refs: semanticDedupeList(candidate.fact_refs || existing.fact_refs || chunk.fact_refs || chunk.factRefs),
+    structuredIdentity: tree.structuredIdentity,
+    relationship: tree.relationship,
+    currentState: tree.currentState,
+    reasons: uniqueValues((reasons || []).map((reason) => singleLine(reason)).filter(Boolean)),
+    task: existing,
+    semanticChunk: chunk
+  };
+}
+
+function semanticTaskDedupeStructuredConflict(source = {}, candidate = {}, options = {}) {
+  const left = taskTreeRepresentation(source, options);
+  const right = taskTreeRepresentation(candidate, options);
+  const a = left.structuredIdentity || {};
+  const b = right.structuredIdentity || {};
+  const reasons = [];
+  const hard = (label) => { reasons.push(label); return true; };
+  if (left.currentState === "completed" || right.currentState === "completed") return { hardConflict: true, uncertain: false, reasons: ["completed task cannot satisfy generated work"] };
+  if (a.projectId && b.projectId && a.projectId !== b.projectId) hard("different Todoist projects");
+  if (a.projectName && b.projectName && a.projectName.toLowerCase() !== b.projectName.toLowerCase()) hard("different Todoist projects");
+  if (a.sectionId && b.sectionId && a.sectionId !== b.sectionId && a.section && b.section) hard("different named sections");
+  if (a.section && b.section && a.section.toLowerCase() !== b.section.toLowerCase() && a.section.toLowerCase() !== "inbox" && b.section.toLowerCase() !== "inbox") hard("different named sections");
+  for (const [field, label] of [["action", "different actions"], ["owner", "different owners"], ["recipient", "different recipients"], ["reviewer", "different reviewers"], ["component", "different components"], ["deliverable", "different deliverables"]]) {
+    if (a[field] && b[field] && a[field].toLowerCase() !== b[field].toLowerCase()) hard(label);
+  }
+  if (a.people?.length && b.people?.length && !a.people.some((person) => b.people.includes(person))) hard("different people");
+  if (semanticTaskDedupeProgressConflict(a.progress, b.progress)) hard("different progress states");
+  if (a.dueDate && b.dueDate && a.dueDate !== b.dueDate) hard("different due-date roles");
+  if (a.deadlineDate && b.deadlineDate && a.deadlineDate !== b.deadlineDate) hard("different deadline roles");
+  const parentA = left.relationship?.parentId || left.relationship?.parentOid || left.relationship?.parentContent;
+  const parentB = right.relationship?.parentId || right.relationship?.parentOid || right.relationship?.parentContent;
+  const hierarchyUncertain = Boolean(parentA && parentB && String(parentA) !== String(parentB));
+  if (hierarchyUncertain) reasons.push("different parent context");
+  const uncertain = hierarchyUncertain || !a.action && !a.deliverable && !a.component;
+  return { hardConflict: reasons.some((reason) => reason.startsWith("different") || reason.startsWith("completed")), uncertain, reasons };
+}
+
+function buildSemanticTaskDedupeCandidates(task = {}, typedChunks = [], options = {}) {
+  const source = taskTreeRepresentation(task, options);
+  return (typedChunks || []).map((candidate) => {
+    const existing = candidate.task || semanticTaskDedupeChunkIdentity(candidate);
+    const score = Number(candidate.semanticScore ?? candidate.score ?? 0);
+    const conflict = semanticTaskDedupeStructuredConflict(task, existing, options);
+    return semanticTaskDedupeCandidateEnvelope(task, Object.assign({}, candidate, { task: existing }), score, conflict.reasons);
+  }).filter((candidate) => candidate.taskId && candidate.currentState !== "completed").sort((left, right) => right.semanticScore - left.semanticScore || left.taskId.localeCompare(right.taskId));
+}
+
+function semanticTaskDedupeDecision(task = {}, candidates = [], options = {}) {
+  const startedAt = Date.now();
+  const top = (candidates || []).find((candidate) => candidate?.currentState !== "completed") || null;
+  const baseTelemetry = Object.assign({ candidateCount: candidates?.length || 0, escalation: false, providerCalls: 0, providerCost: 0, elapsedMs: 0, degraded: false, degradedReason: "" }, options.telemetry || {});
+  const clearThreshold = Number(options.clearThreshold ?? 0.88);
+  const ambiguousThreshold = Number(options.ambiguousThreshold ?? 0.68);
+  const candidateOutcomes = {};
+  for (const candidate of candidates || []) {
+    const candidateId = String(candidate.taskId || candidate.id || candidate.task?.id || "");
+    if (!candidateId) continue;
+    const conflict = semanticTaskDedupeStructuredConflict(task, candidate.task || {}, options);
+    const score = Number(candidate.semanticScore || 0);
+    const exactCandidate = Boolean((task.id && candidate.taskId && String(task.id) === String(candidate.taskId)) || (task.oid && candidate.task?.oid && String(task.oid).toUpperCase() === String(candidate.task.oid).toUpperCase()));
+    candidateOutcomes[candidateId] = candidate.currentState === "completed" || conflict.hardConflict
+      ? "create"
+      : exactCandidate && !conflict.hardConflict ? "merge"
+      : baseTelemetry.degraded ? "create"
+      : score >= clearThreshold && !conflict.uncertain ? "merge" : score >= ambiguousThreshold ? "ambiguous-ai" : "create";
+  }
+  if (!top) return { outcome: "create", decision: "create", resolution: "local", candidateId: "", confidence: 0, semanticScore: 0, basis: ["no semantic task-reference candidate"], evidence_ids: [], fact_refs: [], candidate: null, candidateOutcomes, reasons: [], telemetry: Object.assign(baseTelemetry, { elapsedMs: Date.now() - startedAt }) };
+  const conflict = semanticTaskDedupeStructuredConflict(task, top.task || {}, options);
+  const exact = Boolean((task.id && top.taskId && String(task.id) === String(top.taskId)) || (task.oid && top.task?.oid && String(task.oid).toUpperCase() === String(top.task.oid).toUpperCase()));
+  const score = Number(top.semanticScore || 0);
+  let outcome = "create";
+  let decision = "create";
+  let basis = [];
+  if (exact && !conflict.hardConflict) { outcome = "merge"; decision = "merge"; basis = ["exact task identity"]; }
+  else if (conflict.hardConflict) basis = ["structured conflict gate", ...conflict.reasons];
+  else if (!baseTelemetry.degraded && score >= clearThreshold && !conflict.uncertain) { outcome = "merge"; decision = "merge"; basis = ["local semantic index cosine", "structured identity agrees"]; }
+  else if (!baseTelemetry.degraded && score >= ambiguousThreshold) { outcome = "ambiguous-ai"; decision = "ambiguous"; basis = ["bounded semantic candidate requires review", ...conflict.reasons]; baseTelemetry.escalation = true; }
+  else basis = baseTelemetry.degraded ? ["semantic index unavailable", baseTelemetry.degradedReason || "degraded"] : ["semantic score below merge threshold"];
+  if (conflict.hardConflict || score < ambiguousThreshold || (baseTelemetry.degraded && !exact)) {
+    outcome = "create";
+    decision = "create";
+  }
+  return {
+    outcome, decision, resolution: outcome === "ambiguous-ai" ? "ai" : "local", candidateId: outcome === "create" ? "" : (top.taskId || ""), confidence: Math.round(Math.max(0, Math.min(1, score)) * 100), semanticScore: score,
+    basis: uniqueValues(basis), evidence_ids: top.evidence_ids || [], fact_refs: top.fact_refs || [], candidate: top,
+    reasons: uniqueValues([...(top.reasons || []), ...conflict.reasons]), candidateOutcomes, hardConflict: conflict.hardConflict, uncertain: conflict.uncertain,
+    telemetry: Object.assign(baseTelemetry, { elapsedMs: Date.now() - startedAt })
+  };
 }
 
 function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
-  const threshold = taskDeduplicationThreshold(settings);
-  const sourceFeatures = taskDeduplicationFeatures(task, settings, options);
-  let best = null;
-  for (const candidate of candidates) {
-    if (!candidate?.id || candidate.task?.isCompleted) continue;
-    const scored = taskDeduplicationScore(task, candidate, settings, options, sourceFeatures);
-    if (scored.hierarchyMismatch && !scored.hierarchyCandidate) continue;
-    if (!best || scored.confidence > best.confidence) best = Object.assign(scored, { sourceTask: task });
+  if (options.semanticDedupeState?.enabled) {
+    const state = options.semanticDedupeState;
+    const fingerprintOptions = {
+      provider: settings.aiModelProvider || "openai",
+      model: settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel,
+      dimension: semanticEmbeddingRequestDimension(settings, "query", settings.semanticIndexMeta || {}),
+      indexRevision: options.semanticIndexRevision || state.indexRevision || 0
+    };
+    const sourceFingerprint = taskTreeFingerprint(task, fingerprintOptions);
+    const sourceEmbedding = state.generatedEmbeddingsByObject?.get(task) || state.generatedEmbeddings?.get(sourceFingerprint) || null;
+    const scoredCandidates = (candidates || []).map((candidate) => {
+      const candidateTask = candidate.generatedTask || candidate.task || semanticTaskDedupeChunkIdentity(candidate.semanticChunk || candidate);
+      const candidateFingerprint = taskTreeFingerprint(candidateTask, fingerprintOptions);
+      const candidateEmbedding = candidate.semanticChunk?.embedding || state.generatedEmbeddingsByObject?.get(candidateTask) || state.generatedEmbeddings?.get(candidateFingerprint) || null;
+      const semanticScore = sourceEmbedding && candidateEmbedding ? cosine(sourceEmbedding, candidateEmbedding) : Number(candidate.semanticScore || 0);
+      return Object.assign({}, candidate, { semanticScore });
+    });
+    const semanticCandidates = buildSemanticTaskDedupeCandidates(task, scoredCandidates, options);
+    return Object.assign(semanticTaskDedupeDecision(task, semanticCandidates, Object.assign({}, options, { telemetry: options.semanticDedupeState.telemetry })), { sourceTask: task });
   }
-  if (!best || !best.candidate) return { decision: "create", confidence: 0, reasons: ["No active local candidate."], candidate: null };
-  const contextSupported = best.projectContextMatch === true;
-  if (best.confidence >= threshold && (best.titleOverlap >= 0.52 || contextSupported) && !best.hardMismatch) return Object.assign(best, { decision: "merge" });
-  const aiReview = taskDeduplicationAiReviewConfig(settings, options);
-  if (options.intraBatch && best.batchContextMatch && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
-  if (options.intraBatch && best.titleOverlap >= aiReview.batchTitleOverlap && best.contextOverlap >= aiReview.batchContextOverlap && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
-  if (best.confidence >= threshold - aiReview.band && (best.titleOverlap >= aiReview.titleOverlap || best.contextOverlap >= aiReview.contextOverlap || contextSupported) && !best.hardMismatch) return Object.assign(best, { decision: "ambiguous" });
-  return Object.assign(best, { decision: "create" });
+  return {
+    decision: "create",
+    confidence: 0,
+    reasons: ["semantic dedupe state unavailable; lexical fallback disabled"],
+    candidate: null,
+    degraded: true,
+    degradedReason: "semantic-dedupe-state-unavailable",
+    sourceTask: task
+  };
 }
 
 function taskDeduplicationFeatures(task = {}, settings = DEFAULT_SETTINGS, options = {}) {
@@ -17865,7 +27127,6 @@ function intraBatchTaskIdentitySignal(task = {}, existing = {}, metrics = {}, ai
     !/^\d+$/.test(token) &&
     !TASK_DEDUPE_INTRA_BATCH_GENERIC_TOKENS.has(token)
   ));
-  if (metrics.sourceTitle && metrics.sourceTitle === metrics.existingTitle) return true;
   if (meaningfulSharedTokens.length >= 2) return true;
   if (!meaningfulSharedTokens.length) return false;
   return Boolean(

@@ -26,14 +26,21 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.5 - More reliable task and description completion**
+1. **0.7.6 - More focused task context**
+
+   Task context now keeps current source statements, exact terms, related note
+   history, and task-local evidence together so generated work stays focused.
+   Description requests also serialize 8.06% less context without dropping
+   useful task details.
+
+2. **0.7.5 - More reliable task and description completion**
 
    Task and description requests no longer set a fixed output-token ceiling, so
    the selected model can complete each strict structured phase in one ordinary
    request using the full bounded context. Descriptions preserve every
    materially useful task-local fact; concise does not mean thin.
 
-2. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
+3. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
 
    Device-local display times now stay consistent across task, scheduler, and
    activity views. Desktop and mobile settings are organized into six focused
@@ -44,27 +51,6 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
    after startup without rebuilding every vault note. Shared evidence reduces
    repeated context serialization, and GPT-5.6 Terra at Medium remains the
    primary OpenAI model with GPT-5.6 Luna at Medium as the same-provider fallback.
-
-3. **0.7.1 - Semantic Index Optimization**
-
-   The task-generation backend has been redesigned around the semantic index so
-   task titles and descriptions are selected from precise, source-grounded
-   meaning instead of depending on lexical heuristics that could confuse shared
-   words with shared intent. The current source remains authoritative while
-   relevant task history, open-work continuity, recency, and supporting evidence
-   stay connected through exact stable IDs. Complete task-local evidence remains
-   available across generation phases without stale context overriding newer
-   direction, unrelated matches leaking into descriptions, or a global record
-   cap discarding useful context.
-
-   The same redesign improves precision throughout duplicate detection,
-   same-title subtask reconciliation, task-local failure handling, citations,
-   and repeated semantic retrieval. Evidence is serialized once and reused by
-   stable ID, reducing estimated task-generation input by 51.7% and description
-   input by about 60.0% in a six-task live-vault A/B while retaining complete
-   source grounding. This release also introduces GPT-5.6 Terra at Medium as the
-   default OpenAI model, with GPT-5.6 Luna at Medium as its same-provider
-   fallback, while preserving custom model and reasoning settings.
 
 ## What It Uses
 

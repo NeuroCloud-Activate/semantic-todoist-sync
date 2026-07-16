@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.6
+
+- Improved semantic task-context selection so current source statements, exact terminology, historical note threads, and task-local evidence stay bound to the right work.
+- Reduced description-request serialization by 8.06% losslessly, keeping the complete task-local evidence needed for grounded descriptions.
+
 ## 0.7.5
 
 - Removed fixed output-token ceilings and special output-limit retry machinery from task and description requests; ordinary success uses one provider request with the strict schema and complete bounded context.

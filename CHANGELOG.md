@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.5
+
+- Removed fixed output-token ceilings and special output-limit retry machinery from task and description requests; ordinary success uses one provider request with the strict schema and complete bounded context.
+- Strengthened description prompts so concise briefs retain every materially useful task-local fact and expand into multiple natural sentences when the evidence supports multiple execution dimensions.
+
 ## 0.7.4
 
 - Corrected release metadata and root/testing/shareable mirror alignment, and removed unsupported CSS selectors/declarations for Obsidian compatibility; no runtime logic changed.

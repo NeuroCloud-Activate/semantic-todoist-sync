@@ -161,7 +161,8 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
 const DEFAULT_REASONING_EFFORT = "default";
 const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a concise grounded brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
+const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Concise must not mean thin: incorporate every materially useful task-local fact supplied for execution. When the evidence supports multiple execution dimensions, integrate them into multiple complete natural sentences covering applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, and remaining action. Permit one sentence only when the entire task-local evidence bundle truly supports no additional material execution detail beyond the action. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
+const LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a concise grounded brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
 
 // This state is intentionally limited to aggregate load facts. It is safe to
 // expose in diagnostics because it never contains vault paths, note text, or
@@ -484,12 +485,6 @@ function taskWorkflowSystemInstruction() {
     "For every task and subtask, use only supplied scope_id, evidence_ids, fact_refs, and fact_bindings from the current source contract and bounded evidence catalog. Each fact_binding is {factId,type,role,evidenceId,scopeId} and must exactly match the immutable catalog fact metadata. Main tasks must include current-source evidence and at least one current-source fact; subtasks inherit only their parent scope when the supplied contract permits it.",
     "For every description object, use evidence_ids, fact_refs, and fact_bindings that are unique and members of that task's immutable bundle. Description narratives may use numbered (n) citations only when they match the supplied task-local citation ledger; never emit foreign IDs or citation numbers. Section-title and other non-task phases must return empty tasks and descriptions arrays."
   ].join(" ");
-}
-
-function openAiMaxOutputTokensForOperation(operation = "chat", taskCount = 0) {
-  if (operation === "task-generation") return 2500;
-  if (operation === "description") return Math.min(7200, Math.max(1800, 1200 + Math.max(1, Number(taskCount || 1)) * 900));
-  return 0;
 }
 
 function openAiTerminalResponseDiagnostic(response = {}) {
@@ -1272,7 +1267,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const previousDefault = String(newValue || "").endsWith(` ${TASK_DESCRIPTION_ANTI_FILLER_RULE}`)
         ? String(newValue).slice(0, -(TASK_DESCRIPTION_ANTI_FILLER_RULE.length + 1))
         : "";
-      if (uniqueValues([...values.slice(0, -1), previousDefault].filter(Boolean)).includes(this.settings[key])) {
+      const legacyPreviousDefault = previousDefault
+        ? `${previousDefault} ${LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE}`
+        : "";
+      if (uniqueValues([...values.slice(0, -1), previousDefault, legacyPreviousDefault].filter(Boolean)).includes(this.settings[key])) {
         this.settings[key] = newValue;
         changed = true;
       }
@@ -4699,7 +4697,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0 }) {
+  async openaiResponse({ model, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "" }) {
     const primaryModel = model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
     let lastError = null;
@@ -4714,7 +4712,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const reasoningConfig = modelReasoningConfig(candidateModel, effectiveEffort);
         const response = usesGeminiChatModel(candidateModel)
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation, promptCachePrefix })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey, maxOutputTokens });
+          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -4754,7 +4752,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0 }) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "" }) {
     const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
     const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
@@ -4780,12 +4778,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         { role: "user", content: userContent }
       ]
     };
-    const outputTokenLimit = Math.max(0, Number(maxOutputTokens || openAiMaxOutputTokensForOperation(operation)));
-    if (outputTokenLimit > 0) body.max_output_tokens = outputTokenLimit;
     if (usePromptCache) {
       body.prompt_cache_options = { mode: "explicit" };
-      if (promptCacheKey) body.prompt_cache_key = promptCacheKey;
-      else body.prompt_cache_key = openAiPromptCacheKey(operation);
+      body.prompt_cache_key = promptCacheKey || openAiPromptCacheKey(operation);
     }
     if (reasoningConfig.openai) body.reasoning = reasoningConfig.openai;
     if (background !== false) body.background = true;
@@ -5165,7 +5160,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
          "Title wording: use clear professional language, expand informal shorthand or abbreviations, and correct obvious capitalization, spelling, and grammar (for example, write vacation instead of Vaca). Preserve the source's exact action, people, object, conditions, and temporal attachment; do not add or remove scope.",
          "Exact source semantics: preserve exact proper names, quoted terms, organization names, document names, and product names in task titles and subtasks. A grammatical warning about a term's use is not a blanket prohibition on that term. Avoidance applies only to the exact named phrase or object supplied; never generalize it to a shorter word, related name, or broader concept.",
          "Epistemic-state wording: preserve source certainty exactly. Do not upgrade is going to or plans to into scheduled, confirmed, approved, or another stronger status unless a supplied bound fact explicitly supports it. Keep distinct action and supporting facts clear and do not invent calendar mechanics.",
-         "Scope contract: each marker/requested-action scope is independent. Use its current primary source facts for action and direction, and only its same-scope optional primary-context summaries or pre-structure semantic context for relevant intent, background, current task state, people, deliverable, dependencies, timing, criteria, or conflicts. Optional primary context is not presumed relevant; preserve distinct timing attachments and never borrow another marker scope. Preserve current/history distinctions; do not invent conventional mechanics or fill unsupported categories. Create subtasks only when independently actionable and parent-aligned. Preserve actor-specific handoffs: if the evidence says a named person must check with, send to, or obtain review from another named person, keep both actors and the concrete handoff rather than replacing it with generic address, resolve, or follow up wording."
+         "Scope contract: each marker/requested-action scope is independent. Use its current primary source facts for action and direction, and only its same-scope optional primary-context summaries or pre-structure semantic context for relevant intent, background, current task state, people, deliverable, dependencies, timing, criteria, or conflicts. Optional primary context is not presumed relevant; preserve distinct timing attachments and never borrow another marker scope. Preserve current/history distinctions; do not invent conventional mechanics or fill unsupported categories. Create subtasks only when independently actionable and parent-aligned. Preserve actor-specific handoffs: if the evidence says a named person must check with, send to, or obtain review from another named person, keep both actors and the concrete handoff rather than replacing it with generic address, resolve, or follow up wording. Do not return a main-task-only shell when supplied same-scope facts contain independently actionable steps, handoffs, criteria, or conflicts. Attach materially execution-relevant selected semantic fact bindings even when those facts are context rather than subtasks."
       ].filter(Boolean).join("\n\n")
     }));
     const parsed = JSON.parse(json);
@@ -5489,7 +5484,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         description: subtask.description || "",
         labels: subtask.labels || []
       })).filter((subtask) => subtask.title);
-      item.mandatoryRequestFacts = item.requiredRequestCoverage || "";
       item.primarySourceEvidence = structuredEvidence
         ? {
           evidenceId: evidence?.evidenceBundle?.evidenceIds?.[0] || "",
@@ -5512,6 +5506,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }));
       item.immutableEvidenceBundle = evidence?.evidenceBundle || null;
       item.taskLocalEvidence = taskDescriptionRichLocalPayload(task, evidence, options.sourceContract);
+      const existingRequestCoverage = String(item.requiredRequestCoverage || "");
+      const currentSourceFactValues = uniqueValues((item.taskLocalEvidence?.typedFacts || [])
+        .filter((fact) => fact.current === true
+          && fact.authorityState === "authoritative"
+          && fact.conflictState === "none"
+          && String(fact.scopeId || "") === String(item.taskLocalEvidence?.scopeId || "")
+          && String(fact.evidenceId || "") === String(item.taskLocalEvidence?.primarySourceEvidence?.evidenceId || ""))
+        .map((fact) => String(fact.sourceSurface || fact.value || ""))
+        .filter((value) => value.trim()));
+      item.mandatoryRequestFacts = [
+        existingRequestCoverage,
+        ...currentSourceFactValues.filter((value) => !existingRequestCoverage.includes(value))
+      ].filter(Boolean).join("\n");
     }
     const sharedTaskEvidence = taskDescriptionSharedEvidencePayload(mainTasks, options.sourceContract, {
       contextBundle: options.contextBundle
@@ -5532,7 +5539,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
         system: taskWorkflowSystemInstruction(),
         reasoningEffort: "medium",
-        maxOutputTokens: openAiMaxOutputTokensForOperation("description", mainTasks.length),
         promptCachePrefix: options.contextBundle?.promptCachePrefix || "",
         promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
         user: [
@@ -5553,10 +5559,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Exact source semantics: preserve exact proper names, quoted terms, organization names, document names, and product names. A grammatical warning about a term's use is not a blanket prohibition on that term. Avoidance applies only to the exact named phrase or object supplied; never generalize it to a shorter word, related name, or broader concept.",
           "Epistemic-state semantics: preserve the source's certainty exactly. A statement such as is going to or plans to must not be upgraded to scheduled, confirmed, approved, or another stronger status unless a supplied bound fact explicitly supports it. Keep distinct action and supporting facts clear, even in one sentence, and do not invent calendar mechanics.",
           "Rich task-local evidence payload: taskLocalEvidence contains the exact primary excerpt, typed facts, mandatory fact types, selected semantic records, source/evidence IDs, source kind, score, authority, current/history, temporal/conflict state, provenance/line range, and structured task details when present. Use only this task-local payload; never borrow a neighboring task's facts.",
+          "Priority fact rule: every taskLocalEvidence.priorityFactRefs entry is materially selected and must be represented in narrative sentence bindings unless it conflicts or was rejected, in which case it should not have been selected. Ordinary remaining taskLocalEvidence.factRefs are optional.",
           "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
           structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from immutableEvidenceBundle only; all IDs and bindings must be subsets of that bundle, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
           "Task-local evidence rule: use concrete wording from existingSubtasks, workingContext, and mandatoryRequestFacts when it adds supported intent, object, dependency, recipient, or criteria for this task; currentDescription and labels are scope hints, not permission to invent source facts.",
-          "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; include every supplied task-local fact that materially changes how the work should be understood or performed, such as the artifact or current state, intent, audience or reviewer, criteria, dependency, timing, or link. When evidence is sparse, one grounded sentence is enough; stay concise and never invent or pad details.",
+          "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; incorporate every supplied task-local fact that materially changes how the work should be understood or performed, including applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, remaining action, and links. Concise must not mean thin. When the task-local evidence bundle supports multiple execution dimensions, use multiple complete natural sentences; use one sentence only when the entire bundle truly supports no additional material execution detail beyond the action. Do not invent or pad details.",
           "Use materially relevant current or historical task-local semantic evidence whenever it changes execution, even when the primary source is already detailed. This includes prior reviewer edits or comments, known concerns, existing artifact state, unresolved decisions or conflicts, reviewer expectations, and earlier handoffs. Do not omit selected history merely because it is historical when it identifies what to inspect, preserve, verify, or resolve now. State who reviewed what, what they found or changed, and what remains to be addressed when the evidence supports it. Distinguish historical context from current direction, never promote fine to formal approval, and exclude unrelated or neighboring-task context.",
           "Actor-specific handoff rule: when task-local evidence says a named person will check with, send to, or obtain review from another named person, preserve the actor, counterpart, and concrete next step. Do not reduce that evidence to generic address the conflict, resolve the issue, or follow up wording.",
           "Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
@@ -5565,7 +5572,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Context-note citation rule:",
           contextCitationInstructions(citeContextNotes),
           "",
-          structuredEvidence ? "Respect the schema's 1200-character upper bound with no minimum length. A concise direct execution sentence is valid when it contains at least one supplied fact; never pad sparse evidence to meet a word count." : "Keep every description between 80 and 1200 characters, with at least 12 words and complete sentences. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, and handoffs when supplied.",
+          structuredEvidence ? "Respect the schema's 1200-character upper bound; there is no hard character, word, or sentence minimum. Concise must not mean thin: include every materially useful task-local fact. Use one complete sentence only when the entire task-local bundle supports no additional material execution detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Keep every description at or below 1200 characters; there is no hard character, word, or sentence minimum. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, timing, useful history or handoffs, and remaining action when supplied. Concise must not mean thin: include every materially useful task-local fact and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
           "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). Resolve taskLocalEvidence.evidenceIds and citationLedgerByTask entries through evidenceById. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
           JSON.stringify(sharedTaskEvidence),
           "Main tasks and their structured task-specific evidence:",
@@ -19203,6 +19210,23 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     lineEnd: Number(item.provenance?.lineEnd || item.lineEnd || 0),
     taskId: item.taskId || ""
   })).filter((item) => item.evidenceId);
+  const taskScopeId = String(task.scope_id || task.scopeId || bundle.scopeId || "");
+  const mandatoryPriorityFactRefs = facts.filter((fact) => fact.current === true
+    && fact.authorityState === "authoritative"
+    && fact.conflictState === "none"
+    && String(fact.scopeId || "") === taskScopeId
+    && ["task", "description", "identity"].some((target) => fact.mandatoryFor.includes(target)))
+    .map((fact) => fact.factId);
+  const selectedSupportingEvidenceIds = supporting
+    .filter((item) => item.authorityState !== "rejected" && !["conflict", "conflicted", "rejected"].includes(item.conflictState))
+    .slice(0, 2)
+    .map((item) => item.evidenceId);
+  const selectedSupportingFactRefs = selectedSupportingEvidenceIds.flatMap((evidenceId) => facts
+    .filter((fact) => String(fact.evidenceId || "") === String(evidenceId)
+      && fact.authorityState !== "rejected"
+      && !["conflict", "conflicted", "rejected"].includes(fact.conflictState))
+    .map((fact) => fact.factId));
+  const priorityFactRefs = uniqueValues([...mandatoryPriorityFactRefs, ...selectedSupportingFactRefs]);
   const citationLedger = [
     primary.evidenceId ? {
       number: 1,
@@ -19225,7 +19249,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
   return {
     taskId: String(task.id || task.taskId || ""),
     oid: String(task.oid || ""),
-    scopeId: String(task.scope_id || task.scopeId || bundle.scopeId || ""),
+    scopeId: taskScopeId,
     title: task.content || "",
     narrativeDescription: String(task.description || "").trim(),
     currentState: singleLine(task.currentState || task.current_state || task.state || (task.isCompleted ? "completed" : "open")),
@@ -19264,6 +19288,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     citationLedger,
     evidenceIds: (bundle.evidenceIds || bundle.evidence_ids || []).slice(),
     factRefs: (bundle.factRefs || bundle.fact_refs || []).slice(),
+    priorityFactRefs,
     factBindings: (bundle.fact_bindings || bundle.factBindings || []).slice(),
     requiredFactTypes: facts.filter((fact) => fact.current && ["task", "description", "identity"].some((target) => (sourceContract?.facts || []).find((candidate) => candidate.factId === fact.factId)?.mandatoryFor?.includes(target))).map((fact) => fact.type),
     typedFacts: facts
@@ -19471,6 +19496,7 @@ function taskDescriptionPromptTask(item = {}) {
       hierarchy: rich.hierarchy || {},
       evidenceIds: rich.evidenceIds || item.evidence_ids || [],
       factRefs: rich.factRefs || item.fact_refs || [],
+      priorityFactRefs: rich.priorityFactRefs || [],
       factBindings: rich.factBindings || item.fact_bindings || [],
       requiredFactTypes: rich.requiredFactTypes || []
     }

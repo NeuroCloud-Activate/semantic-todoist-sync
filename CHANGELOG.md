@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.2
+
+- Kept device-local display times consistent across task, scheduler, and activity views.
+- Simplified desktop and mobile settings into six focused groups, while removing plugin-defined email, chat, and context character caps and retaining bounded resource and provider limits.
+- Added task-reference snapshot/index fingerprint alignment: durable snapshot writes queue a coalesced task-reference-only repair, reuse unchanged embeddings, persist alignment metadata after successful saves, and recover promptly on startup without rebuilding all vault notes.
+- Preserved the GPT-5.6 Terra Medium primary and GPT-5.6 Luna Medium fallback defaults, and reduced repeated context serialization through shared evidence.
+
 ## 0.7.1
 
 - Redesigned task and description generation around semantic-index evidence so

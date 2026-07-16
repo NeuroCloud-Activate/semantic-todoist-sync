@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.1
+
+- Redesigned task and description generation around semantic-index evidence so
+  meaning, current-source authority, task history, recency, and open-work
+  continuity determine context instead of lexical heuristics that could mistake
+  shared wording for shared intent.
+- Admitted an exact current/open canonical task reference for its matching
+  structured scope without requiring a redundant history lane, while same-title
+  non-identities and historical/non-current rows retain the existing independent
+  support gate; no lexical title fallback was added.
+- Shared immutable evidence and facts by exact stable ID across generation
+  phases, removed the redundant global 16-record catalog cap, and retained
+  complete selected task-local context with bounded retrieval, deduplication,
+  cache reuse, and mobile-safe yielding.
+- Kept descriptions natural and source-grounded with citations restricted to
+  accepted task evidence. Instructions targeting an exact phrase or object now
+  remain scoped to that phrase or object rather than becoming blanket bans.
+- Made duplicate outcomes exhaustive, preserved identity while refreshing
+  compatible same-title subtasks, and isolated description failures so valid
+  sibling tasks can continue.
+- Added a safely cloned semantic-retrieval cache that invalidates on index,
+  provider, model, settings, query scope, or task-reference changes.
+- Normalized the shared task/description prompt without losing evidence: exact
+  text and provenance serialize once, stable-ID references reuse cached records,
+  later task-selected evidence remains complete, and the initial cached prefix
+  stays byte-identical across both phases.
+- In a six-task live-vault A/B, estimated task-generation input fell from
+  68,077 tokens to 32,908 (-51.7%) and description input fell from 151,260 to
+  60,726 (about 60.0%), with the same 121,061-character prefix and hash reused.
+- GPT-5.6 Terra at Medium reasoning produced all six tasks and descriptions;
+  plugin validation accepted 6 and failed 0. Exact-phrase semantics, named
+  reviewer handoffs and history, sentence-end citations, zero Todoist writes,
+  and zero provider-generation API calls all passed.
+- Changed the default OpenAI primary model to `gpt-5.6-terra` with Medium reasoning and the same-provider fallback to `gpt-5.6-luna` with Medium reasoning.
+- Migrated only the exact legacy OpenAI default model pair and exact legacy available-model list; legacy provider-default reasoning values move to Medium while custom models and reasoning settings remain preserved.
+- Added focused regression coverage for default selection, legacy migration preservation, fallback reasoning, compliant workflow traversal, and intentional blocking before Todoist mutation.
+
 ## 0.6.39
 
 - Added configurable required-action hashtags for notes, defaulting to `#todo`, with one task tree required for every distinct marked action while repeated references to the same action can be grouped.

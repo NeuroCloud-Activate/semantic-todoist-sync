@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.9
+
+- Removed the partially supported `scrollbar-width` declaration for compatibility with Obsidian 1.4.5.
+- Replaced the rejected custom artifact-attestation path with exact tag-to-release asset verification; no runtime behavior changed.
+
 ## 0.7.8
 
 - Added shared model-neutral task and description rules for phase shape, source-relative dates, task-local IDs, and current/history authority.

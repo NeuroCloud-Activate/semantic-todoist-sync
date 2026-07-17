@@ -342,6 +342,7 @@ const DEFAULT_SETTINGS = {
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
+  taskSectionTitleMode: "local",
   chatFontSizePx: 13,
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
@@ -1071,6 +1072,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    const normalizedTaskSectionTitleMode = normalizeTaskSectionTitleMode(this.settings.taskSectionTitleMode);
+    if (this.settings.taskSectionTitleMode !== normalizedTaskSectionTitleMode) {
+      this.settings.taskSectionTitleMode = normalizedTaskSectionTitleMode;
+      changed = true;
+    }
     if ((parseInt(this.settings.emailPollIntervalSeconds, 10) || 0) < MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS) {
       this.settings.emailPollIntervalSeconds = MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS;
       changed = true;
@@ -5458,6 +5464,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const sourceType = options.source || plan.taskWorkflowContextBundle?.sourceType || "note";
     const fallback = cleanGeneratedSectionName(options.sectionName || plan.sectionName || "Tasks");
     const workflowContext = options.contextBundle || plan.taskWorkflowContextBundle || plan.contextBundle;
+    if (normalizeTaskSectionTitleMode(this.settings.taskSectionTitleMode) === "local") {
+      return localTaskSectionName(tasks, fallback, sourceType, options.sourceContext || null);
+    }
     if (!workflowContext?.promptCachePrefix) return fallback;
     const modelChoice = this.aiModelForRequest("task-generation", {
       prompt: [options.sourceTitle || workflowContext.sourceTitle, (tasks || []).map((task) => task.content || "").join("\n")].filter(Boolean).join("\n"),
@@ -6752,6 +6761,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       source: options.source || "",
       sectionName: fallbackSectionName,
       sourceTitle: options.sourceTitle || "",
+      sourceContext: options.sourceContext || null,
       contextBundle: workflowContext
     });
     const descriptionPromise = this.refineTaskDescriptions(tasks, plan.sourceSummary, plan.semanticContext || [], options.sourceTitle || "", plan.descriptionInstructions, {
@@ -9539,6 +9549,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "Shared task generation", "These limits and formatting rules apply to both note and email task generation.");
+    taskSectionTitleModeSetting(containerEl, this.plugin);
     numberSetting(containerEl, "Maximum main tasks", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
     numberSetting(containerEl, "Maximum Todoist description characters", this.plugin, "todoistDescriptionMaxChars");
@@ -10949,6 +10960,21 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
       dropdown.setValue(selected);
       dropdown.onChange(async (value) => {
         plugin.settings.taskDeduplicationAiModel = value;
+        await plugin.saveSettings();
+      });
+    });
+}
+
+function taskSectionTitleModeSetting(containerEl, plugin) {
+  const current = normalizeTaskSectionTitleMode(plugin.settings.taskSectionTitleMode);
+  new Setting(containerEl)
+    .setName("Section title generation")
+    .setDesc("Local uses note frontmatter (project, purpose, topic, or focus), a meaningful note title, the containing folder, the first generated task, then the existing fallback; AI uses the optional section-title phase. Both preserve Notes_YY_MM_DD_Subject and Email_YY_MM_DD_Subject syntax.")
+    .addDropdown((dropdown) => {
+      dropdown.addOption("local", "Local (recommended)");
+      dropdown.addOption("ai", "AI");
+      dropdown.setValue(current).onChange(async (value) => {
+        plugin.settings.taskSectionTitleMode = normalizeTaskSectionTitleMode(value);
         await plugin.saveSettings();
       });
     });
@@ -27902,6 +27928,87 @@ function uniqueMarkdownPath(app, folder, title) {
 
 function markdownTitleFromPath(path = "") {
   return String(path || "").split("/").pop()?.replace(/\.md$/i, "") || "";
+}
+
+function normalizeTaskSectionTitleMode(value) {
+  return String(value || "").toLowerCase() === "ai" ? "ai" : "local";
+}
+
+function simpleFrontmatterScalar(value) {
+  const raw = String(value || "").trim();
+  if (!raw || /^[>|{}]/.test(raw)) return "";
+  const quoted = raw.match(/^(["'])([\s\S]*)\1$/);
+  if (quoted) return singleLine(quoted[2]).trim();
+  const inlineArray = raw.match(/^\[\s*(?:(["'])([\s\S]*?)\1|([^\[\]{},]+))\s*\]$/);
+  if (inlineArray) return singleLine(inlineArray[2] || inlineArray[3]).trim();
+  if (/^\[|^\{|^&|^\*/.test(raw)) return "";
+  return singleLine(raw.replace(/\s+#.*$/, "")).trim();
+}
+
+function noteFrontmatterSectionSubject(text = "") {
+  const match = /^\s*---\s*\n([\s\S]*?)\n---(?:\n|$)/.exec(String(text || ""));
+  if (!match) return "";
+  const values = {};
+  for (const line of match[1].split("\n")) {
+    const field = /^\s*(project|purpose|topic|focus)\s*:\s*(.*?)\s*$/i.exec(line);
+    if (!field) continue;
+    const key = field[1].toLowerCase();
+    const value = simpleFrontmatterScalar(field[2]);
+    if (value && !values[key]) values[key] = value;
+  }
+  for (const key of ["project", "purpose", "topic", "focus"]) {
+    if (values[key]) return values[key];
+  }
+  return "";
+}
+
+function noteTitleWithoutDate(title = "") {
+  let value = singleLine(title).trim();
+  if (!value) return "";
+  const isoDate = /^\d{4}[-_]\d{1,2}[-_]\d{1,2}/;
+  const monthDate = /^(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}/i;
+  if (isoDate.test(value)) value = value.replace(isoDate, "").replace(/^\s*[-–—:]\s*/, "").trim();
+  else if (monthDate.test(value)) value = value.replace(monthDate, "").replace(/^\s*[-–—:]\s*/, "").trim();
+  if (/^(?:\d{4}[-_]\d{1,2}[-_]\d{1,2}|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})$/i.test(value)) return "";
+  return value;
+}
+
+function immediateContainingFolder(path = "") {
+  const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 2] : "";
+}
+
+function sectionSubjectFromFallback(sectionName = "") {
+  const clean = cleanGeneratedSectionName(sectionName);
+  const prefix = /^(?:Notes|Email)(?:_\d{2}_\d{2}_\d{2})?_/i.exec(clean);
+  return prefix ? clean.slice(prefix[0].length) : "";
+}
+
+function sectionNameWithSubject(fallback, subject) {
+  const cleanFallback = cleanGeneratedSectionName(fallback);
+  const prefix = /^(Notes|Email)(?:(_\d{2}_\d{2}_\d{2}))?(?:_|$)/i.exec(cleanFallback);
+  if (!prefix) return cleanFallback;
+  const base = prefix[1] + (prefix[2] || "");
+  const safeSubject = cleanGeneratedSectionName(subject || sectionSubjectFromFallback(cleanFallback)).slice(0, 70) || "Note";
+  return cleanGeneratedSectionName(base + "_" + safeSubject);
+}
+
+function localNoteSectionSubject(sourceContext = {}, tasks = [], fallback = "") {
+  const frontmatterSubject = noteFrontmatterSectionSubject(sourceContext.text || "");
+  if (frontmatterSubject) return frontmatterSubject;
+  const titleSubject = noteTitleWithoutDate(sourceContext.title || markdownTitleFromPath(sourceContext.path || ""));
+  if (titleSubject) return titleSubject;
+  const folderSubject = immediateContainingFolder(sourceContext.path || "");
+  if (folderSubject) return folderSubject;
+  const generatedTask = (tasks || []).find((task) => !task?.isSubtask && singleLine(task?.content || "").trim());
+  if (generatedTask) return singleLine(generatedTask.content).trim();
+  return sectionSubjectFromFallback(fallback) || "Note";
+}
+
+function localTaskSectionName(tasks = [], fallback = "", sourceType = "note", sourceContext = null) {
+  const cleanFallback = cleanGeneratedSectionName(fallback);
+  if (/^email$/i.test(String(sourceType || "")) || /^Email(?:_\d{2}_\d{2}_\d{2})?_/i.test(cleanFallback)) return cleanFallback;
+  return sectionNameWithSubject(cleanFallback, localNoteSectionSubject(sourceContext || {}, tasks, cleanFallback));
 }
 
 function makeNoteSectionName(title, text = "", path = "") {

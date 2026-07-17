@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.7
+
+- Made section titles default to deterministic local generation from already-loaded frontmatter, note title, containing folder, and generated task context, while retaining configurable AI mode and the existing section-title syntax. The default workflow removes the separate section-title model call and its context cost.
+
 ## 0.7.6
 
 - Improved semantic task-context selection so current source statements, exact terminology, historical note threads, and task-local evidence stay bound to the right work.

@@ -26,31 +26,26 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.6 - More focused task context**
+1. **0.7.7 - Local section titles by default**
+
+   Task Workflows now uses Local section titles by default, using already-loaded
+   frontmatter, note title, folder, and task context while keeping the existing
+   section-title syntax. AI section titles remain configurable, and Local skips
+   the separate section-title AI request.
+
+2. **0.7.6 - More focused task context**
 
    Task context now keeps current source statements, exact terms, related note
    history, and task-local evidence together so generated work stays focused.
    Description requests also serialize 8.06% less context without dropping
    useful task details.
 
-2. **0.7.5 - More reliable task and description completion**
+3. **0.7.5 - More reliable task and description completion**
 
    Task and description requests no longer set a fixed output-token ceiling, so
    the selected model can complete each strict structured phase in one ordinary
    request using the full bounded context. Descriptions preserve every
    materially useful task-local fact; concise does not mean thin.
-
-3. **0.7.2 - Faster, clearer, and fingerprint-aligned local workflows**
-
-   Device-local display times now stay consistent across task, scheduler, and
-   activity views. Desktop and mobile settings are organized into six focused
-   groups, while plugin-defined email, chat, and context character caps are
-   removed without relaxing bounded resource, provider, or Todoist-field limits.
-   Task-reference snapshot writes now align the compatible semantic index with
-   exact payload fingerprints, reuse unchanged embeddings, and recover promptly
-   after startup without rebuilding every vault note. Shared evidence reduces
-   repeated context serialization, and GPT-5.6 Terra at Medium remains the
-   primary OpenAI model with GPT-5.6 Luna at Medium as the same-provider fallback.
 
 ## What It Uses
 
@@ -192,6 +187,8 @@ Todoist IDs are stored in the local index/reference table, but are viewable in t
 Subtasks are kept indented under their parent tasks during insertion and sync. If Todoist updates or older note content collapse the indentation, sync normalization repairs subtasks to the configured indentation width.
 
 It is recommended, when writing meeting notes, to flag action items with a consistent marker such as `#todo` so task extraction has a strong signal. Settings include separate plain-language instruction areas for main tasks, subtasks, section titles, dates, deadlines, tags, priorities, descriptions, links, and optional source/citation behavior.
+
+Task Workflows lets you choose Local (recommended) or AI section titles. Local uses project/purpose/topic/focus frontmatter, then falls back to the note title, folder, or generated task title; it keeps the current syntax and avoids a separate section-title AI request.
 
 ## Changelog
 

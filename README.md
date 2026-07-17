@@ -26,26 +26,25 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.7 - Local section titles by default**
+1. **0.7.8 - Better task details across AI models**
+
+   Every AI model now follows the same core task rules, and selected useful
+   context is passed directly into task details. Luna and Terra keep small
+   automatic tuning for their own strengths.
+
+2. **0.7.7 - Local section titles by default**
 
    Task Workflows now uses Local section titles by default, using already-loaded
    frontmatter, note title, folder, and task context while keeping the existing
    section-title syntax. AI section titles remain configurable, and Local skips
    the separate section-title AI request.
 
-2. **0.7.6 - More focused task context**
+3. **0.7.6 - More focused task context**
 
    Task context now keeps current source statements, exact terms, related note
    history, and task-local evidence together so generated work stays focused.
    Description requests also serialize 8.06% less context without dropping
    useful task details.
-
-3. **0.7.5 - More reliable task and description completion**
-
-   Task and description requests no longer set a fixed output-token ceiling, so
-   the selected model can complete each strict structured phase in one ordinary
-   request using the full bounded context. Descriptions preserve every
-   materially useful task-local fact; concise does not mean thin.
 
 ## What It Uses
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.8
+
+- Added shared model-neutral task and description rules for phase shape, source-relative dates, task-local IDs, and current/history authority.
+- Passed selected task-local priority fact content directly to descriptions in order, so useful context is stated and bound in detailed narratives without changing retrieval/admission or adding calls.
+- A six-task live validation with Terra/Medium and Luna/High produced 6 tasks and 6 accepted descriptions with exact phrase/date/current-history semantics, embedding-only network use, and zero Todoist writes.
+
 ## 0.7.7
 
 - Made section titles default to deterministic local generation from already-loaded frontmatter, note title, containing folder, and generated task context, while retaining configurable AI mode and the existing section-title syntax. The default workflow removes the separate section-title model call and its context cost.

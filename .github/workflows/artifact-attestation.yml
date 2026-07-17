@@ -1,10 +1,8 @@
 name: Artifact Attestation
 
 on:
-  push:
   release:
     types: [published]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,8 +17,27 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          path: source
+
+      - name: Download published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern main.js \
+            --pattern manifest.json \
+            --pattern styles.css
 
       - name: Validate release asset inputs
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -28,9 +45,9 @@ jobs:
           test -f main.js
           test -f manifest.json
           test -f styles.css
-          test -f versions.json
+          test -f source/versions.json
 
-          VERSION="$(jq -r '.version' manifest.json)"
+          VERSION="$(jq -r '.version' source/manifest.json)"
           if [[ -z "${VERSION}" || "${VERSION}" == "null" ]]; then
             echo "manifest.json does not contain a version." >&2
             exit 1
@@ -41,13 +58,24 @@ jobs:
             exit 1
           fi
 
-          jq -e --arg version "${VERSION}" 'has($version)' versions.json >/dev/null
-          node --check main.js
+          test "${RELEASE_TAG}" = "${VERSION}"
+          jq -e --arg version "${VERSION}" 'has($version)' source/versions.json >/dev/null
+          cmp main.js source/main.js
+          cmp manifest.json source/manifest.json
+          cmp styles.css source/styles.css
+          node --check source/main.js
 
-      - name: Generate artifact attestation
+      - name: Attest main.js
         uses: actions/attest@v4
         with:
-          subject-path: |
-            main.js
-            manifest.json
-            styles.css
+          subject-path: main.js
+
+      - name: Attest manifest.json
+        uses: actions/attest@v4
+        with:
+          subject-path: manifest.json
+
+      - name: Attest styles.css
+        uses: actions/attest@v4
+        with:
+          subject-path: styles.css

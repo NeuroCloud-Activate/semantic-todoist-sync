@@ -471,10 +471,24 @@ function openAiPromptCacheKey(operation = "chat") {
 
 const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
 
-function taskWorkflowSystemInstruction() {
+function lunaPromptGuidance(model = "", mode = "task") {
+  if (normalizeOpenAIModelId(model).toLowerCase() !== "gpt-5.6-luna") return "";
+  if (mode === "chat") {
+    return "Luna-only profile guidance: Lead with current action items and keep the response to at most six total claims. Include historical or contextual claims only when they directly change execution, dependencies, criteria, timing, or current state; do not enumerate unrelated note topics.";
+  }
+  return "";
+}
+
+function terraPromptGuidance(model = "", mode = "task") {
+  if (normalizeOpenAIModelId(model).toLowerCase() !== "gpt-5.6-terra" || mode !== "task") return "";
+  return "Terra-only final self-check: Verify the shared phase-shape, authoritative source-date, and priorityFacts content-plus-binding rules before returning.";
+}
+
+function taskWorkflowSystemInstruction(model = "") {
   return [
     "You are generating one phase of a bounded Semantic Todoist Sync task workflow.",
     "Return only JSON matching the supplied strict structured-output schema.",
+    "For descriptions, return one continuous natural narrative paragraph containing one or more complete sentences. State evidence-backed facts directly; never describe them as coming from provided, supplied, input, or source context, and never describe the model-input container.",
     "Use only the retained workflow context and the phase-specific task data supplied after it.",
     "Never invent people, documents, links, dates, dependencies, ownership, status, decisions, or outcomes.",
     "Keep each task scope isolated from neighboring topics and preserve explicit source action facts.",
@@ -484,7 +498,13 @@ function taskWorkflowSystemInstruction() {
     "Preserve epistemic state exactly in task and description wording. A source statement such as is going to or plans to must not become scheduled, confirmed, approved, or otherwise stronger unless a supplied bound fact says so. Keep distinct action and supporting facts clear, even in one sentence, and never invent calendar mechanics.",
     "Use materially relevant current or historical task-local semantic evidence when it changes how the task should be executed. Preserve who reviewed what, what they found or changed, what remains unresolved, reviewer expectations, and actor-specific handoffs when supported. Distinguish history from current direction, never treat fine as formal approval, and never reduce a named person checking with another person to a generic instruction to address or resolve an issue.",
     "For every task and subtask, use only supplied scope_id, evidence_ids, fact_refs, and fact_bindings from the current source contract and bounded evidence catalog. Each fact_binding is {factId,type,role,evidenceId,scopeId} and must exactly match the immutable catalog fact metadata. Main tasks must include current-source evidence and at least one current-source fact; subtasks inherit only their parent scope when the supplied contract permits it.",
-    "For every description object, use evidence_ids, fact_refs, and fact_bindings that are unique and members of that task's immutable bundle. Description narratives may use numbered (n) citations only when they match the supplied task-local citation ledger; never emit foreign IDs or citation numbers. Section-title and other non-task phases must return empty tasks and descriptions arrays."
+    "Enforce phase shapes exactly: task-structure phases return section_name:\"\" and descriptions:[]; description phases return section_name:\"\" and tasks:[]; only section-title phases may populate section_name and must keep tasks and descriptions empty.",
+    "Resolve relative source terms such as today or tomorrow only from authoritative source note/date metadata in the workflow context when that source date is established. If no authoritative source date is established, preserve the source phrase; never resolve it from the execution date or invent a date.",
+    "Copy every supplied scope_id, evidence_id, fact_ref, and fact_binding exactly from the current task-local contract; never reuse IDs or bindings from another task, note, or request.",
+    "In description phases, every taskLocalEvidence.priorityFacts row is required unless it is marked conflicting or rejected. State each row's content accurately in a natural execution sentence; that sentence must carry the row's exact factId in fact_refs and evidenceId in evidence_ids, and the containing description object must include the exact matching fact_binding. Never bind or cite without stating the supported content. Use separate sentences when priority facts add distinct current-state, history, criteria, or dependency dimensions; label historical facts as history and preserve current direction.",
+    "For every description object, description_sentences[].text is prose-only and must not contain numeric citation markers. Return exact task-local evidence_ids, fact_refs, and fact_bindings from that task's immutable bundle; the plugin renders citations locally.",
+    lunaPromptGuidance(model, "task"),
+    terraPromptGuidance(model, "task")
   ].join(" ");
 }
 
@@ -4519,7 +4539,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
         "Use the task context to identify whether a task already exists before suggesting task creation.",
         "When referring to an existing task, include its supplied Todoist task link when available after explaining the relevant note-based evidence.",
-        "Avoid long preambles."
+        "Avoid long preambles.",
+        lunaPromptGuidance(modelChoice.model, "chat")
       ].join(" "),
       user: [
         `Mode: ${this.settings.chatMode}`,
@@ -5220,8 +5241,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       operation: "task-generation",
       model: modelChoice.model,
       jsonSchema: taskWorkflowResponseSchema(maxMainTasks, maxSubtasks),
-      system: taskWorkflowSystemInstruction(),
-      reasoningEffort: "medium",
+      system: taskWorkflowSystemInstruction(modelChoice.model),
       promptCachePrefix: workflowContext.promptCachePrefix,
       promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
       user: [
@@ -5477,7 +5497,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       operation: "section-title",
       model: modelChoice.model,
       jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
-      system: taskWorkflowSystemInstruction(),
+      system: taskWorkflowSystemInstruction(modelChoice.model),
       reasoningEffort: "medium",
       promptCachePrefix: workflowContext.promptCachePrefix,
       promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
@@ -5541,7 +5561,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return report;
     };
     const failAll = (reason, stage = "") => finalize(mainTasks.map((task) => ({ taskIndex: task.index, reason, stage })), 0);
-    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary });
+    const citationState = contextCitationState(options.contextNotes || [], options.basePath || "", options.citeContextNotes !== false, { title: sourceTitle, text: sourceSummary, sourceType: options.source || "note" }, options.source || "note");
     hydrateContextCitationEvidence(citationState, context, options.basePath || "");
     const citeContextNotes = citationState.citeContextNotes;
     const structuredEvidence = Boolean(options.sourceContract && options.evidenceCatalog);
@@ -5619,8 +5639,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         operation: "description",
         model: modelChoice.model,
         jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
-        system: taskWorkflowSystemInstruction(),
-        reasoningEffort: "medium",
+        system: taskWorkflowSystemInstruction(modelChoice.model),
         promptCachePrefix: options.contextBundle?.promptCachePrefix || "",
         promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
         user: [
@@ -5629,6 +5648,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
           "Description instructions:",
           descriptionInstructions || "",
+          "Narrative form rule: write one continuous natural narrative paragraph containing one or more complete sentences. State evidence-backed facts directly; never refer to provided, supplied, input, or source context or otherwise describe the model-input container.",
           "",
           `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
           "",
@@ -5641,7 +5661,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Exact source semantics: preserve exact proper names, quoted terms, organization names, document names, and product names. A grammatical warning about a term's use is not a blanket prohibition on that term. Avoidance applies only to the exact named phrase or object supplied; never generalize it to a shorter word, related name, or broader concept.",
           "Epistemic-state semantics: preserve the source's certainty exactly. A statement such as is going to or plans to must not be upgraded to scheduled, confirmed, approved, or another stronger status unless a supplied bound fact explicitly supports it. Keep distinct action and supporting facts clear, even in one sentence, and do not invent calendar mechanics.",
           "Rich task-local evidence payload: taskLocalEvidence contains the exact primary excerpt, typed facts, mandatory fact types, selected semantic records, source/evidence IDs, source kind, score, authority, current/history, temporal/conflict state, provenance/line range, and structured task details when present. Use only this task-local payload; never borrow a neighboring task's facts.",
-          "Priority fact rule: every taskLocalEvidence.priorityFactRefs entry is materially selected and must be represented in narrative sentence bindings unless it conflicts or was rejected, in which case it should not have been selected. Ordinary remaining taskLocalEvidence.factRefs are optional.",
+          "Priority fact rule: every taskLocalEvidence.priorityFacts row is required unless it is marked conflicting or rejected. State each row's content accurately in a natural execution sentence; that sentence must carry the row's exact factId in fact_refs and evidenceId in evidence_ids, and the containing description object must include the exact matching fact_binding. Never bind or cite without stating the supported content; use separate sentences when priority facts add distinct current-state, history, criteria, or dependency dimensions, label historical facts as history, and preserve current direction. Ordinary remaining taskLocalEvidence.factRefs are optional.",
           "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
           structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from immutableEvidenceBundle only; all IDs and bindings must be subsets of that bundle, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
           "Task-local evidence rule: use concrete wording from existingSubtasks, workingContext, and mandatoryRequestFacts when it adds supported intent, object, dependency, recipient, or criteria for this task; currentDescription and labels are scope hints, not permission to invent source facts.",
@@ -6787,7 +6807,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings,
       plan.semanticContext || [],
       vaultBasePath(this.app),
-      options.citeContextNotes !== false
+      options.citeContextNotes !== false,
+      options.source || plan.taskWorkflowContextBundle?.sourceType || "note"
     );
     plan.sectionName = sectionName || cleanGeneratedSectionName(fallbackSectionName);
     for (const task of tasks || []) task.section = plan.sectionName;
@@ -6820,7 +6841,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings,
         plan.semanticContext || [],
         vaultBasePath(this.app),
-        true
+        true,
+        options.source || plan.taskWorkflowContextBundle?.sourceType || "note"
       );
     }
     const finalTaskQualityCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
@@ -19402,17 +19424,41 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       && !["conflict", "conflicted", "rejected"].includes(fact.conflictState))
     .map((fact) => fact.factId));
   const priorityFactRefs = uniqueValues([...mandatoryPriorityFactRefs, ...selectedSupportingFactRefs]);
+  const sourceType = String(sourceContract?.sourceType || sourceContract?.source_type || "note").toLowerCase() === "email" ? "email" : "note";
+  const citationNumbersBySource = new Map();
+  let nextCitationNumber = sourceType === "email" ? 1 : 2;
+  const primarySourceKey = singleLine(primary.path || primary.provenance?.path || sourceContract?.path || "");
+  if (sourceType === "note" && primarySourceKey) citationNumbersBySource.set(primarySourceKey, 1);
+  const emailDisplayEligible = (entry = {}) => Boolean(
+    singleLine(entry.path || "")
+      && !entry.taskId
+      && !taskDescriptionTaskReferenceSourceKind(entry.sourceKind)
+      && !/^@todoist\//i.test(String(entry.path || ""))
+  );
+  const supportingCitationEntry = (entry) => {
+    if (sourceType === "email" && !emailDisplayEligible(entry)) {
+      return Object.assign({}, entry, { number: 0, section: "Email" });
+    }
+    const sourceKey = singleLine(entry.path || entry.sourceId || entry.title || entry.evidenceId || "");
+    const existingNumber = sourceKey ? citationNumbersBySource.get(sourceKey) : null;
+    const number = Number.isInteger(existingNumber) ? existingNumber : nextCitationNumber++;
+    if (sourceKey && !citationNumbersBySource.has(sourceKey)) citationNumbersBySource.set(sourceKey, number);
+    return Object.assign({}, entry, { number, section: sourceType === "email" ? "Context Notes" : "Sources" });
+  };
   const citationLedger = [
     primary.evidenceId ? {
-      number: 1,
-      section: "Sources",
+      // Email is the current source for grounding, but it is not a source-list
+      // entry. Keep a zero-number ledger row so evidence bindings remain
+      // closed without rendering an inline citation that has no list item.
+      number: sourceType === "email" ? 0 : 1,
+      section: sourceType === "email" ? "Email" : "Sources",
       evidenceId: primary.evidenceId,
       sourceId: primary.provenance?.sourceId || primary.sourceId || sourceContract?.sourceId || "",
       title: primary.provenance?.title || sourceContract?.title || "Primary source",
       path: primary.provenance?.path || sourceContract?.path || "",
       sourceKind: primary.sourceKind || "current-source"
     } : null,
-    ...supporting.map((entry, index) => Object.assign({}, entry, { number: index + 2, section: "Context" }))
+    ...supporting.map((entry) => supportingCitationEntry(entry))
   ].filter(Boolean);
   const value = (field, aliases = []) => {
     for (const key of [field, ...aliases]) {
@@ -19491,13 +19537,13 @@ function taskDescriptionSentenceText(value = "") {
 
 function renderTaskDescriptionSentences(sentences = [], citationLedger = []) {
   const numbersByEvidenceId = new Map((citationLedger || [])
-    .filter((entry) => entry?.evidenceId && Number.isFinite(Number(entry.number)))
+    .filter((entry) => entry?.evidenceId && Number.isFinite(Number(entry.number)) && Number(entry.number) > 0)
     .map((entry) => [String(entry.evidenceId), Number(entry.number)]));
   return (sentences || []).map((sentence) => {
     const text = taskDescriptionSentenceText(sentence?.text || "");
     const citations = uniqueValues((sentence?.evidence_ids || []).map(String))
       .map((evidenceId) => numbersByEvidenceId.get(evidenceId))
-      .filter((number) => Number.isFinite(number));
+      .filter((number) => Number.isFinite(number) && number > 0);
     const narrative = /[.!?]$/.test(text) ? text : `${text}.`;
     return `${narrative}${citations.length ? ` ${citations.map((number) => `(${number})`).join(" ")}` : ""}`;
   }).join(" ").trim();
@@ -19645,6 +19691,28 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
 function taskDescriptionPromptTask(item = {}) {
   const rich = item.taskLocalEvidence || {};
   const { evidence_ids, fact_refs, fact_bindings, ...task } = item;
+  const priorityFactIds = Array.isArray(rich.priorityFactRefs) ? rich.priorityFactRefs.map(String).filter(Boolean) : [];
+  const typedFactsById = new Map((rich.typedFacts || []).map((fact) => [String(fact.factId || ""), fact]));
+  const priorityFacts = priorityFactIds.map((factId) => {
+    const fact = typedFactsById.get(factId);
+    if (!fact) return null;
+    const row = {
+      factId: String(fact.factId || ""),
+      type: fact.type || "",
+      role: fact.role || "",
+      evidenceId: fact.evidenceId || "",
+      scopeId: fact.scopeId || "",
+      current: fact.current === true,
+      temporalRelation: fact.temporalRelation || "",
+      authorityState: fact.authorityState || "",
+      conflictState: fact.conflictState || "",
+      content: fact.sourceSurface || fact.value || ""
+    };
+    for (const [key, value] of Object.entries(row)) {
+      if (value === "" || value === null || value === undefined) delete row[key];
+    }
+    return row.factId ? row : null;
+  }).filter(Boolean);
   const taskLocalEvidence = {
     taskId: rich.taskId || "",
     oid: rich.oid || "",
@@ -19666,6 +19734,7 @@ function taskDescriptionPromptTask(item = {}) {
     hierarchy: rich.hierarchy || {},
     factRefs: rich.factRefs || item.fact_refs || [],
     priorityFactRefs: rich.priorityFactRefs || [],
+    priorityFacts,
     requiredFactTypes: rich.requiredFactTypes || []
   };
   for (const [key, value] of Object.entries(taskLocalEvidence)) {
@@ -19818,8 +19887,6 @@ function taskDescriptionKnowledgeCoverageReason(value = "", task = {}, evidence 
 }
 
 function taskDescriptionEvidenceReason(value = "", task = {}, evidence = null, settings = DEFAULT_SETTINGS) {
-  const styleReason = taskDescriptionStyleReason(value);
-  if (styleReason) return styleReason;
   if (!isUsefulDescriptionSummary(value, task.content || "", settings)) return descriptionQualityReason(value, task.content || "", settings);
   const unsupportedFact = taskDescriptionUnsupportedFactReason(value, evidence, settings);
   if (unsupportedFact) return unsupportedFact;
@@ -19956,6 +20023,18 @@ function taskDescriptionStyleReason(value = "") {
   const text = singleLine(value || "");
   const structuredHeading = /(?:^|\n)\s*(?:goal|intent|person(?:\s+involved)?|source|where\s+this\s+came\s+from|context|evidence|action|outcome|deliverable|recipient|owner|criteria|dependencies?|rationale|next\s+step|notes?)\s*:/i;
   if (structuredHeading.test(String(value || ""))) return "uses structured field headings instead of a narrative execution brief";
+  const metaContextPatterns = [
+    /\baccording\s+to\s+(?:the\s+)?(?:provided|supplied|input|source)?\s*context\b/i,
+    /\b(?:the\s+)?(?:provided|supplied|input|source)\s+context\s+(?:says|states|indicates|mentions|shows|contains|includes|requires|supports)\b/i,
+    /\b(?:based|relying)\s+on\s+(?:the\s+)?(?:provided|supplied|input|source)?\s*context\b/i,
+    /\b(?:from|within|in|using|given)\s+(?:the\s+)?(?:provided|supplied|input|source)?\s*context\b/i,
+    /\b(?:the\s+)?context\s+(?:provided|supplied|given|above|below)\b/i,
+    /\b(?:the\s+)?context\s+(?:says|states|indicates|mentions|shows|contains|includes|requires|supports)\b/i,
+    /\b(?:provided|supplied|input|source)\s+context\b/i,
+    /\baccording\s+to\s+(?:the\s+)?(?:provided|supplied|input|source)\b/i,
+    /\b(?:the\s+)?(?:provided|supplied|input|source)\s+(?:says|states|indicates|mentions|shows|contains|includes|requires|supports)\b/i
+  ];
+  if (metaContextPatterns.some((pattern) => pattern.test(text))) return "meta-context framing: refers to facts as model-input context";
   const crossTaskPatterns = [
     [/\bseparate(?:ly)?\s+from\s+(?:the\s+)?(?:other|today'?s|next|previous|prior|preceding|following)\s+task\b/i, "references a separate or ordered task"],
     [/\b(?:another|the\s+other|a\s+different|separate)\s+task\b/i, "references another task"],
@@ -19990,8 +20069,6 @@ function taskDescriptionStyleReason(value = "") {
 
 function taskDescriptionClarityReason(value = "", task = {}, settings = DEFAULT_SETTINGS) {
   const cleaned = cleanGeneratedDescriptionSummary(value || "", settings);
-  const styleReason = taskDescriptionStyleReason(value);
-  if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
   if (!singleLine(cleaned)) return "description has no task-focused narrative";
@@ -20752,26 +20829,24 @@ function descriptionSpecificEntities(value = "") {
   }).filter((entity) => entity && !/^(January|February|March|April|May|June|July|August|September|October|November|December)$/i.test(entity))).slice(0, 12);
 }
 
-function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", includeSourceList = true) {
+function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", includeSourceList = true, sourceType = "") {
   if (!includeSourceList) return "";
   const bundle = task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle;
   if (!bundle) return "";
-  const lines = ["Source List:"];
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(
+    sourceType || bundle.sourceContract?.sourceType || bundle.sourceContract?.source_type,
+    active
+  );
+  const lines = [workflowSourceType === "email" ? "Context Notes:" : "Sources:"];
   const seen = new Set();
-  const add = (label, path) => {
+  const rendered = [];
+  const add = (path) => {
     const cleanPath = singleLine(path || "");
     if (!cleanPath || seen.has(cleanPath)) return;
     seen.add(cleanPath);
-    lines.push(`${label}: ${cleanPath}`);
+    rendered.push(cleanPath);
   };
-  const currentPath = bundle.items.find((item) => item.sourceKind === "current-source")?.provenance?.path || active?.path || "";
-  add("Primary Source", vaultRelativePath(currentPath, basePath));
   const acceptedEvidenceIds = new Set((bundle.acceptedEvidenceIds || bundle.evidenceIds || bundle.evidence_ids || []).map(String));
-  for (const item of bundle.items || []) {
-    if (item.sourceKind === "current-source") continue;
-    if (acceptedEvidenceIds.size && !acceptedEvidenceIds.has(String(item.evidenceId))) continue;
-    add("Supporting Source", vaultRelativePath(item.provenance?.path || "", basePath));
-  }
   const ledger = (task.descriptionCitationLedger || task.taskLocalEvidence?.citationLedger || [])
     .filter((entry) => entry && Number.isInteger(Number(entry.number)) && entry.evidenceId)
     .filter((entry) => entry.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
@@ -20789,33 +20864,40 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       }
       return singleLine(entry.title || entry.sourceId);
     };
-    const primaryEntries = ledger.filter((entry) => entry.section === "Sources" || entry.sourceKind === "current-source");
-    const contextEntries = ledger.filter((entry) => !primaryEntries.includes(entry));
-    lines.push("", "Sources:");
-    for (const entry of primaryEntries) lines.push(`${Number(entry.number)}. ${renderedCitation(entry)}`);
-    if (contextEntries.length) {
-      lines.push("", "Context:");
-      for (const entry of contextEntries) lines.push(`${Number(entry.number)}. ${renderedCitation(entry)}`);
+    const sourceEntries = workflowSourceType === "email"
+      ? ledger.filter((entry) => Number(entry.number) > 0 && entry.sourceKind !== "current-source" && !entry.taskId && !taskDescriptionTaskReferenceSourceKind(entry.sourceKind) && !/^@todoist\//i.test(String(entry.path || "")))
+      : ledger.filter((entry) => Number(entry.number) > 0);
+    for (const entry of sourceEntries) add(renderedCitation(entry));
+  } else {
+    const currentPath = bundle.items?.find((item) => item.sourceKind === "current-source")?.provenance?.path || active?.path || "";
+    if (workflowSourceType !== "email") add(vaultRelativePath(currentPath, basePath));
+    for (const item of bundle.items || []) {
+      if (item.sourceKind === "current-source") continue;
+      if (acceptedEvidenceIds.size && !acceptedEvidenceIds.has(String(item.evidenceId))) continue;
+      const path = vaultRelativePath(item.provenance?.path || "", basePath);
+      if (workflowSourceType === "email" && (taskDescriptionTaskReferenceSourceKind(item.sourceKind) || /^@todoist\//i.test(path))) continue;
+      add(path);
     }
   }
-  return lines.length > 1 ? lines.join("\n") : "";
+  return rendered.length ? lines.concat(rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n") : "";
 }
 
-function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFAULT_SETTINGS, basePath = "", includeSourceList = true) {
+function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFAULT_SETTINGS, basePath = "", includeSourceList = true, sourceType = "") {
   const bundle = task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle;
   if (!bundle) return "";
   const selectedEvidence = new Set(bundle.evidenceIds || bundle.evidence_ids || []);
   const selectedFacts = new Set(bundle.factRefs || bundle.fact_refs || []);
   const linkContext = (bundle.facts || []).filter((fact) => selectedFacts.has(fact.factId) && fact.kind === "source-link").map((fact) => fact.value).join("\n");
   const summary = normalizeDescriptionLinks(cleanGeneratedDescriptionSummary(task.description || "", settings), linkContext, settings);
-  const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList);
+  const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList, sourceType);
   const parts = [summary, sourceList].filter(Boolean);
   if (!selectedEvidence.size || !selectedFacts.size) return "";
   return formatTodoistDescription(parts.join("\n\n"), settings);
 }
 
-function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true) {
-  const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active);
+function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DEFAULT_SETTINGS, contextChunks = [], basePath = "", includeSourceList = true, sourceType = "") {
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, active);
+  const citationState = contextCitationState(contextNotes, basePath, includeSourceList, active, workflowSourceType);
   hydrateContextCitationEvidence(citationState, contextChunks, basePath);
   const hasStructuredEvidence = (tasks || []).some((task) => task?.descriptionEvidenceBundle || task?.evidenceBundle || task?.taskEvidenceBundle);
   const evidenceBundles = hasStructuredEvidence
@@ -20829,14 +20911,14 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
       continue;
     }
     if (task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle) {
-      task.description = renderStructuredTaskDescription(task, active, settings, basePath, includeSourceList);
+      task.description = renderStructuredTaskDescription(task, active, settings, basePath, includeSourceList, workflowSourceType);
       for (const subtask of task.subtasks || []) subtask.description = "";
       continue;
     }
     const evidence = evidenceBundles[index] || null;
     const relevantContext = evidence?.contextChunks || [];
     const parentSummary = task.description || "";
-    const attribution = taskScopedDescriptionAttribution(parentSummary, active, citationState, basePath, includeSourceList);
+    const attribution = taskScopedDescriptionAttribution(parentSummary, active, citationState, basePath, includeSourceList, workflowSourceType);
     const linkContext = [
       active?.text || "",
       active?.sourceSummary || "",
@@ -20849,7 +20931,7 @@ function addContextToTaskDescriptions(tasks, contextNotes, active, settings = DE
   }
 }
 
-function taskScopedDescriptionAttribution(value = "", active = null, citationState = {}, basePath = "", includeSourceList = true) {
+function taskScopedDescriptionAttribution(value = "", active = null, citationState = {}, basePath = "", includeSourceList = true, sourceType = "") {
   const split = splitDescriptionSourceListBlock(value);
   const citedNumbers = new Set(Array.from(split.summary.matchAll(/\((\d{1,3})\)(?=([.!?;,)]|$))/g), (match) => Number(match[1])));
   const selectedNotes = (citationState.contextCitationNotes || [])
@@ -20863,10 +20945,13 @@ function taskScopedDescriptionAttribution(value = "", active = null, citationSta
   const scopedNotes = selectedNotes.map((note) => ({
     path: note.source || "",
     title: note.title || note.source || "Context note",
-    summary: note.text || ""
+    summary: note.text || "",
+    evidenceIds: uniqueValues(note.evidenceIds || note.evidence_ids || (note.evidenceId ? [note.evidenceId] : [])),
+    sourceIds: uniqueValues(note.sourceIds || note.source_ids || (note.sourceId ? [note.sourceId] : []))
   }));
-  const scopedState = contextCitationState(scopedNotes, basePath, includeSourceList, active);
-  const sources = includeSourceList ? descriptionSourceList(active, scopedNotes, basePath) : "";
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType || citationState.sourceType, active);
+  const scopedState = contextCitationState(scopedNotes, basePath, includeSourceList, active, workflowSourceType);
+  const sources = includeSourceList ? descriptionSourceList(active, scopedNotes, basePath, workflowSourceType) : "";
   return { summary, sources, citationState: scopedState, contextNotes: scopedNotes };
 }
 
@@ -20950,8 +21035,6 @@ function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETT
   const text = singleLine(cleanGeneratedDescriptionSummary(value || "", settings));
   if (!text) return "description has no task-focused narrative";
   if (text.length > 1200) return "description exceeded 1200 characters";
-  const styleReason = taskDescriptionStyleReason(value);
-  if (styleReason) return styleReason;
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
   if (/\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "description contained prompt-injection text";
@@ -21085,28 +21168,33 @@ function capitalizeSentenceStart(value) {
   return text.replace(/^([a-z])/, (match) => match.toUpperCase());
 }
 
-function descriptionSourceList(active, contextNotes, basePath = "") {
-  const lines = ["Source List:"];
-  const primaryPath = sourceReference(active, basePath);
-  if (primaryPath) lines.push(`Primary Note: ${primaryPath}`);
-  const seen = new Set(primaryPath ? [primaryPath] : []);
-  const contextLines = [];
-  for (const note of contextNotes || []) {
-    const notePath = sourceReference(note, basePath);
-    if (!notePath || seen.has(notePath)) continue;
-    seen.add(notePath);
-    contextLines.push(notePath);
-  }
-  if (contextLines.length) {
-    if (primaryPath) lines.push("");
-    lines.push("Context Notes:");
-    contextLines.forEach((line, index) => lines.push(`${index + 1}. ${line}`));
-  }
+function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) {
+  const raw = String(sourceType || source?.sourceType || source?.source_type || source?.type || "note").trim().toLowerCase();
+  return raw === "email" || raw === "email-to-todoist" ? "email" : "note";
+}
+
+function descriptionSourceList(active, contextNotes, basePath = "", sourceType = "") {
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, active);
+  const heading = workflowSourceType === "email" ? "Context Notes:" : "Sources:";
+  const lines = [];
+  const seen = new Set();
+  const sourceLines = [];
+  const add = (path) => {
+    const cleanPath = singleLine(path || "");
+    if (!cleanPath || seen.has(cleanPath)) return;
+    seen.add(cleanPath);
+    sourceLines.push(cleanPath);
+  };
+  if (workflowSourceType !== "email") add(sourceReference(active, basePath));
+  for (const note of contextNotes || []) add(sourceReference(note, basePath));
+  if (!sourceLines.length) return "";
+  lines.push(heading);
+  sourceLines.forEach((line, index) => lines.push(`${index + 1}. ${line}`));
   return lines.join("\n");
 }
 
 function sourceListStartIndex(value) {
-  return String(value || "").search(/\b(?:source list|sources?)\s*:/i);
+  return String(value || "").search(/\b(?:source list|sources?|context notes?)\s*:/i);
 }
 
 function splitDescriptionSourceListBlock(value) {
@@ -21128,8 +21216,8 @@ function normalizeDescriptionSourceList(value) {
 function restoreSourceListLineBreaks(value) {
   const restored = String(value || "")
     .replace(/\r\n/g, "\n")
-    .replace(/\s*(source list\s*:)\s*/i, "Source List:\n")
-    .replace(/\s*(sources\s*:)\s*/i, "\n\nSources:\n")
+    .replace(/\s*(source list\s*:)\s*/i, "\nSources:\n")
+    .replace(/\s*(sources\s*:)\s*/i, "\nSources:\n")
     .replace(/\s*(^|\n)(context\s*:)\s*/im, "$1\nContext:\n")
     .replace(/\s*(primary note\s*:)\s*/i, "\nPrimary Note: ")
     .replace(/\s*(context notes?\s*:)\s*/i, "\n\nContext Notes:\n")
@@ -21139,17 +21227,22 @@ function restoreSourceListLineBreaks(value) {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return restored
-    .replace(/^Source List:\n+/i, "Source List:\n")
-    .replace(/^Source List:\n+Primary Note:/i, "Source List:\nPrimary Note:")
+    .replace(/^Sources:\n+/i, "Sources:\n")
+    .replace(/^Sources:\n+Primary Note:/i, "Sources:\nPrimary Note:")
     .replace(/\n+Sources:\n+/i, "\n\nSources:\n")
     .replace(/\n+Context:\n+/i, "\n\nContext:\n")
     .replace(/\n+Context Notes:\n+/i, "\n\nContext Notes:\n");
 }
 
-function contextCitationMap(contextNotes, basePath = "", primary = null) {
+function contextCitationMap(contextNotes, basePath = "", primary = null, sourceType = "") {
   const map = new Map();
-  const primaryPath = sourceReference(primary, basePath);
-  const seen = new Set(primaryPath ? [primaryPath] : []);
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, primary);
+  const primaryPath = workflowSourceType === "note" ? sourceReference(primary, basePath) : "";
+  const seen = new Set();
+  if (primaryPath) {
+    seen.add(primaryPath);
+    map.set(primaryPath, 1);
+  }
   for (const note of contextNotes || []) {
     const notePath = sourceReference(note, basePath);
     if (!notePath || seen.has(notePath)) continue;
@@ -21159,8 +21252,9 @@ function contextCitationMap(contextNotes, basePath = "", primary = null) {
   return map;
 }
 
-function contextCitationState(contextNotes, basePath = "", enabled = true, primary = null) {
-  const citationMap = contextCitationMap(contextNotes, basePath, primary);
+function contextCitationState(contextNotes, basePath = "", enabled = true, primary = null, sourceType = "") {
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, primary);
+  const citationMap = contextCitationMap(contextNotes, basePath, primary, workflowSourceType);
   const contextCitationNotes = [];
   for (const note of contextNotes || []) {
     const notePath = sourceReference(note, basePath);
@@ -21181,7 +21275,8 @@ function contextCitationState(contextNotes, basePath = "", enabled = true, prima
     contextCitationNotes,
     primaryText: [primary?.title, primary?.text, primary?.sourceSummary].filter(Boolean).join("\n"),
     citeContextNotes: enabled !== false && citationMap.size > 0,
-    allowedContextCitations: new Set(citationMap.values())
+    sourceType: workflowSourceType,
+    allowedContextCitations: new Set(contextCitationNotes.map((note) => Number(note.number)))
   };
 }
 
@@ -21428,7 +21523,7 @@ function isStandaloneActionItemsHeading(line) {
 function sanitizeStoredTodoistDescription(value, settings = DEFAULT_SETTINGS) {
   const text = String(value || "");
   if (!text) return "";
-  const sourceIndex = text.search(/(?:^|\n)\s*(source list|sources?)\s*:/i);
+  const sourceIndex = text.search(/(?:^|\n)\s*(source list|sources?|context notes?)\s*:/i);
   const sourceBlock = sourceIndex >= 0 ? normalizeStoredSourceList(text.slice(sourceIndex)) : "";
   const summaryText = sourceIndex >= 0 ? text.slice(0, sourceIndex) : text;
   const summary = conciseDescriptionSummary([summaryText], settings);
@@ -21460,19 +21555,19 @@ function normalizeStoredSourceList(value) {
     .map((line) => singleLine(line).replace(/^[-*]\s*/, ""))
     .filter(Boolean);
   const primary = vaultRelativePath(rawLines.find((line) => /^primary note\s*:/i.test(line))?.replace(/^primary note\s*:\s*/i, "").trim() || "");
-  const context = rawLines
+  const sourceHeadingIndex = rawLines.findIndex((line) => /^sources?\s*:/i.test(line));
+  const contextHeadingIndex = rawLines.findIndex((line) => /^context notes?\s*:/i.test(line));
+  const numbered = (startIndex, endIndex) => rawLines
+    .slice(startIndex >= 0 ? startIndex + 1 : 0, endIndex >= 0 ? endIndex : rawLines.length)
     .filter((line) => /^\d+\.\s*/.test(line))
     .map((line) => vaultRelativePath(line.replace(/^\d+\.\s*/, "").trim()))
     .filter(Boolean);
-  if (!primary && !context.length) return "";
-  const lines = ["Source List:"];
-  if (primary) lines.push(`Primary Note: ${primary}`);
-  if (context.length) {
-    if (primary) lines.push("");
-    lines.push("Context Notes:");
-    context.slice(0, 8).forEach((source, index) => lines.push(`${index + 1}. ${source}`));
-  }
-  return lines.join("\n");
+  const sourceItems = numbered(sourceHeadingIndex, contextHeadingIndex);
+  const contextItems = numbered(contextHeadingIndex, -1);
+  const noteSources = uniqueValues([primary, ...sourceItems, ...((primary || sourceHeadingIndex >= 0) ? contextItems : [])].filter(Boolean)).slice(0, 8);
+  if (noteSources.length) return ["Sources:", ...noteSources.map((source, index) => `${index + 1}. ${source}`)].join("\n");
+  if (contextItems.length) return ["Context Notes:", ...uniqueValues(contextItems).slice(0, 8).map((source, index) => `${index + 1}. ${source}`)].join("\n");
+  return "";
 }
 
 function summarizeSourceForTaskContext(text, query = "", maxChars = 360, settings = DEFAULT_SETTINGS, options = {}) {

@@ -1962,22 +1962,67 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     };
     const pointerFile = normalizedPluginBasename(`${TASK_REFERENCE_MANIFEST_FILE}.${generation}.tmp.json`);
+    const pointerPath = `${this.manifest.dir}/${TASK_REFERENCE_MANIFEST_FILE}`;
+    const stagedPointerPath = `${this.manifest.dir}/${pointerFile}`;
+    let previousPointerBody = null;
+    let hadPreviousPointer = false;
+    if (typeof adapter.read === "function") {
+      try {
+        previousPointerBody = await adapter.read(pointerPath);
+        hadPreviousPointer = true;
+      } catch {}
+    }
+    const removeStagedFile = (path) => {
+      const index = stagedFiles.indexOf(path);
+      if (index >= 0) stagedFiles.splice(index, 1);
+    };
+    const restorePreviousPointer = async () => {
+      if (hadPreviousPointer) {
+        await adapter.write(pointerPath, previousPointerBody);
+      } else if (typeof adapter.read === "function" && typeof adapter.remove === "function") {
+        await adapter.remove(pointerPath);
+      }
+    };
+    const publishPointerByStableWrite = async () => {
+      try {
+        await adapter.write(pointerPath, pointerBody);
+        if (typeof adapter.read === "function") {
+          const readBack = await adapter.read(pointerPath);
+          if (shortHash(readBack) !== shortHash(pointerBody)) throw new Error("Task-reference pointer fallback verification failed.");
+        }
+      } catch (fallbackError) {
+        try {
+          await restorePreviousPointer();
+        } catch (restoreError) {
+          this.lastTaskReferencePersistenceError = { phase: "pointer-restore", message: restoreError?.message || String(restoreError) };
+        }
+        throw fallbackError;
+      }
+      if (typeof adapter.remove === "function") {
+        try {
+          await adapter.remove(stagedPointerPath);
+          removeStagedFile(stagedPointerPath);
+        } catch {}
+      }
+    };
     try {
       await stage(snapshotFile, snapshotBody);
       await stage(indexFile, indexBody);
       await stage(pointerFile, pointerBody);
-      const pointerPath = `${this.manifest.dir}/${TASK_REFERENCE_MANIFEST_FILE}`;
-      const stagedPointerPath = `${this.manifest.dir}/${pointerFile}`;
       if (typeof adapter.rename === "function") {
-        await adapter.rename(stagedPointerPath, pointerPath);
-        stagedFiles.splice(stagedFiles.indexOf(stagedPointerPath), 1);
+        try {
+          await adapter.rename(stagedPointerPath, pointerPath);
+          removeStagedFile(stagedPointerPath);
+        } catch {
+          await publishPointerByStableWrite();
+        }
       } else {
-        await adapter.write(pointerPath, pointerBody);
+        await publishPointerByStableWrite();
       }
       // The generation pair is committed once the pointer is published; keep
       // both artifacts out of rollback cleanup while removing only temp files.
-      stagedFiles.splice(stagedFiles.indexOf(`${this.manifest.dir}/${snapshotFile}`), 1);
-      stagedFiles.splice(stagedFiles.indexOf(`${this.manifest.dir}/${indexFile}`), 1);
+      removeStagedFile(`${this.manifest.dir}/${snapshotFile}`);
+      removeStagedFile(`${this.manifest.dir}/${indexFile}`);
     } catch (error) {
       await cleanup();
       throw error;
@@ -4155,7 +4200,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
         return { id: `${path}#${index}`, path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION };
       });
-        chunks.push(...this.semanticTaskReferenceChunks(path, taskReferenceLocationIndex));
+        const taskReferenceChunks = this.semanticTaskReferenceChunks("", taskReferenceLocationIndex);
+        chunks.push(...taskReferenceChunks);
         if (semanticPathChunksMatch(this.semanticIndex, path, chunks, this.settings)) {
           return semanticOperationResult({ ok: true, reasonCode: this.refreshSemanticPathChunkMetadata(path, chunks) ? "metadata-updated" : "unchanged" });
         }
@@ -4163,32 +4209,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const reuseMap = buildSemanticChunkReuseMap(previousIndex || [], this.settings, this.settings.semanticIndexMeta || {});
         const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`);
         const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
-        const activeTaskReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex);
-        const activeTaskReferencePaths = new Map(activeTaskReferenceRecords.map((record) => [record.sourceId, record.path]));
-        const activeTaskReferenceIds = new Set(activeTaskReferencePaths.keys());
-        const replacementSourceIds = new Set(indexed
-      .filter((chunk) => chunk.sourceKind === "todoist-snapshot-reference-row" || chunk.sourceKind === "subtask-task-tree-record" || chunk.sourceKind === "note-task-reference-row" || chunk.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
-      .map((chunk) => String(chunk.sourceId || ""))
-      .filter(Boolean));
-        const replacementTaskReferenceIdentities = new Set(indexed
-      .filter((chunk) => chunk.sourceKind === "note-task-reference-row")
-      .flatMap((chunk) => [
-        chunk.oid ? `oid:${String(chunk.oid).toUpperCase()}` : "",
-        chunk.taskId ? `id:${String(chunk.taskId)}` : ""
-      ])
-      .filter(Boolean));
+        const activeTaskReferenceRecords = taskReferenceChunks.taskReferenceRecords || semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex);
         const candidateIndex = (previousIndex || []).filter((chunk) => {
       if (chunk.path === path) return false;
       if (isLegacyGroupedTaskReferenceChunk(chunk)) return false;
-      if (chunk.sourceKind === "todoist-snapshot-reference-row" || chunk.sourceKind === "subtask-task-tree-record" || chunk.sourceKind === "note-task-reference-row" || chunk.sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) {
-        if (replacementSourceIds.has(String(chunk.sourceId || ""))) return false;
-        if (chunk.sourceKind === "note-task-reference-row" && replacementTaskReferenceIdentities.has(`oid:${String(chunk.oid || chunk.taskReference?.oid || "").toUpperCase()}`)) return false;
-        if (chunk.sourceKind === "note-task-reference-row" && replacementTaskReferenceIdentities.has(`id:${String(chunk.taskId || chunk.taskReference?.taskId || "")}`)) return false;
-        const activePath = activeTaskReferencePaths.get(String(chunk.sourceId || ""));
-        if (!activeTaskReferenceIds.has(String(chunk.sourceId || ""))) return false;
-        if (chunk.snapshotBackedLocalFallback === true && isNonVaultTaskReferencePath(chunk.path)) return true;
-        if (activePath !== chunk.path) return false;
-      }
+      if (semanticTaskReferenceChunkSelected(chunk)) return false;
       return true;
     }).concat(indexed);
         const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(

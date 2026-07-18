@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.11
+
+- Task-reference snapshot and manifest publication now handles Obsidian adapters that reject rename-over-existing by using a verified stable write with rollback, so task creation and note sync do not fail with destination-already-exists errors.
+- Incremental semantic note updates now atomically replace the complete current task-reference projection, allowing multi-note moves and swaps to converge without incremental-integrity retries while preserving Todoist IDs, OIDs, subtask parent edges, and unchanged embeddings.
+
 ## 0.7.10
 
 - Closed shared description evidence and fact tables over each task's referenced material, with a conservative full-table fallback when closure is uncertain, reducing repeated provider-equivalent input while preserving task-local grounding.

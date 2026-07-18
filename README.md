@@ -26,23 +26,24 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.10 - More grounded task details**
+1. **0.7.11 - Smoother task-reference updates**
+
+   Task-reference files now update safely even when Obsidian will not rename
+   over an existing file, and multi-note moves or swaps settle into one clean
+   snapshot without losing Todoist links.
+
+2. **0.7.10 - More grounded task details**
 
    Task details now keep only the facts and evidence each task actually uses,
    trimming repeated context while preserving the useful source information.
    Semantic handoffs and citations are clearer too, including relevant review
    history when it changes the work.
 
-2. **0.7.9 - Obsidian publishing compatibility**
+3. **0.7.9 - Obsidian publishing compatibility**
 
    Removed a partially supported scrollbar style and replaced the rejected
    custom artifact-attestation path with exact release asset verification.
    Runtime behavior is unchanged.
-
-3. **0.7.8 - Better task details across AI models**
-
-   Every AI model now follows the same core task rules, and selected useful
-   context is passed directly into task details.
 
 ## What It Uses
 

@@ -26,24 +26,23 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.9 - Obsidian publishing compatibility**
+1. **0.7.10 - More grounded task details**
+
+   Task details now keep only the facts and evidence each task actually uses,
+   trimming repeated context while preserving the useful source information.
+   Semantic handoffs and citations are clearer too, including relevant review
+   history when it changes the work.
+
+2. **0.7.9 - Obsidian publishing compatibility**
 
    Removed a partially supported scrollbar style and replaced the rejected
    custom artifact-attestation path with exact release asset verification.
    Runtime behavior is unchanged.
 
-2. **0.7.8 - Better task details across AI models**
+3. **0.7.8 - Better task details across AI models**
 
    Every AI model now follows the same core task rules, and selected useful
-   context is passed directly into task details. Luna and Terra keep small
-   automatic tuning for their own strengths.
-
-3. **0.7.7 - Local section titles by default**
-
-   Task Workflows now uses Local section titles by default, using already-loaded
-   frontmatter, note title, folder, and task context while keeping the existing
-   section-title syntax. AI section titles remain configurable, and Local skips
-   the separate section-title AI request.
+   context is passed directly into task details.
 
 ## What It Uses
 
@@ -219,7 +218,12 @@ Each GitHub release tag matches the version in `manifest.json` and includes `mai
 
 ## Mobile Notes
 
-The plugin has been tested and is functional on iPadOS/iOS mobile Obsidian apps. Background polling and sync run only while Obsidian is open and the plugin is loaded because of iPadOS/iOS limits. The scheduler preview uses compact controls on narrow screens, so you can adjust blocks without relying on desktop drag-and-drop.
+Mobile paths are covered by simulated iPadOS/iOS validation. Physical-device
+testing is still required before claiming real-device support. Background
+polling and sync run only while Obsidian is open and the plugin is loaded
+because of mobile limits. The scheduler preview uses compact controls on
+narrow screens, so you can adjust blocks without relying on desktop
+drag-and-drop.
 
 ## License
 

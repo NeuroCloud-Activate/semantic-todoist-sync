@@ -6121,6 +6121,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         rawDimensionResults: laneCoverage.rawDimensionResults,
         dimensionResults: laneCoverage.dimensionResults,
         moduleInfluenceTelemetry: laneCoverage.moduleInfluenceTelemetry,
+        fusedAdmission: laneCoverage.fusedAdmission || null,
         fusedIdentityCount: laneCoverage.fusedIdentityCount,
         fusedIdentityMappings: laneCoverage.fusedIdentityMappings,
         laneCoverage: {
@@ -7898,11 +7899,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Descriptions that are generic, title-only, procedural, or written as prompt commentary are rejected. Write direct execution guidance rather than prompt commentary, grounded in at least one supplied fact beyond the title.",
           "Description contract: write a standalone, detailed, task-specific execution brief that preserves the current artifact or state, intent when non-obvious, audience/reviewer/recipient needs, required details, decisions, dependencies, timing, constraints, substantive review criteria, and supported links or citations when available.",
           "Write a natural narrative execution brief, not a structured field display. Do not prefix lines with labels such as Goal:, Intent:, Person involved:, Source:, Where this came from:, Context:, Evidence:, Action:, Outcome:, Deliverable:, Criteria:, Dependencies:, or Next step:; integrate those facts into complete sentences instead.",
-          "Structured payload rules: treat action/title and existingSubtasks as the task scope; preserve mandatoryRequestFacts and resolve taskLocalEvidence.factRefs, priorityFactRefs, materialDescriptionFactRefs, and candidateSupportingFactRefs through shared factsById. Use citationLedgerByTask[index] and evidenceById for task-local evidence; never borrow another task's IDs or facts.",
+          "Structured payload rules: treat action/title and existingSubtasks as the task scope; preserve mandatoryRequestFacts and resolve taskLocalEvidence.factRefs, priorityFactRefs, materialDescriptionFactRefs, executionDetailFactRefs, and candidateSupportingFactRefs through shared factsById. Use citationLedgerByTask[index] and evidenceById for task-local evidence; never borrow another task's IDs or facts.",
           "Fact semantics: requested-action facts are mandatory current-source requirements. Same-scope primary-context summary facts are optional adjacency context; use them only when they materially clarify intent, state, timing, recipient, or criteria. Keep distinct timing statements attached to their own source facts and never merge or reassign them.",
           "Rich task-local evidence payload: taskLocalEvidence contains the closed task-local IDs and structured task details. Resolve taskLocalEvidence facts through shared factsById and citationLedgerByTask through evidenceById; use only this task-local payload and never borrow a neighboring task's facts.",
           "Priority fact rule: every taskLocalEvidence.priorityFacts row is required unless it is marked conflicting or rejected. This includes every materialDescriptionFactRefs ID. Resolve each priority ID through shared factsById, state its exact content accurately in a natural execution sentence, carry that row's exact factId in fact_refs and evidenceId in evidence_ids, and include the exact matching fact_binding on the containing description object. Never bind or cite without stating the supported content; use separate sentences when priority facts add distinct current-state, history, criteria, or dependency dimensions, label a fact as history only when its temporal relation is historical rather than merely old, and preserve current direction. Ordinary remaining taskLocalEvidence.factRefs are optional.",
-          "Candidate supporting-fact rule: candidateSupportingFactRefs is an optional ID-only shortlist for semantic evidence navigation, not a mandatory narrative set. Resolve each optional ID through shared factsById and select a candidate only when removing it would change execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff; if selected, state it directly and return its exact evidence ID, fact ID, and binding. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. PriorityFacts, including materialDescriptionFactRefs, remain the only mandatory narrative facts.",
+          "Execution-detail fact rule: executionDetailFactRefs is an ordered, ID-only closed set of exact-task-scope non-action facts. Every successful description must state and bind at least one usable fact from this set, with its exact factId, evidenceId, and fact_binding; an action-only or title-only description fails even when the action fact is correctly bound. Resolve the IDs once through shared factsById, preserve their exact scope and source binding, and never invent or substitute a neighboring fact. If the closed set has no usable detail fact, local validation fails.",
+          "Candidate supporting-fact rule: candidateSupportingFactRefs is an optional ID-only shortlist for semantic evidence navigation, not a mandatory narrative set. Resolve each optional ID through shared factsById and select a candidate only when removing it would change execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff; if selected, state it directly and return its exact evidence ID, fact ID, and binding. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. PriorityFacts, including materialDescriptionFactRefs, remain mandatory; when executionDetailFactRefs has usable members, at least one of those members must be selected and stated.",
           TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
           "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
           structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from the task-local factsById/evidenceById contract only; all IDs and bindings must be subsets of that closed contract, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
@@ -7917,7 +7919,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           contextCitationInstructions(citeContextNotes, structuredEvidence),
           "",
           structuredEvidence ? "Respect the schema's 1200-character upper bound; there is no hard character, word, or sentence minimum. Concise must not mean thin: include every materially useful task-local fact. Use one complete sentence only when the entire task-local bundle supports no additional material execution detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Keep every description at or below 1200 characters; there is no hard character, word, or sentence minimum. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, timing, useful history or handoffs, and remaining action when supplied. Concise must not mean thin: include every materially useful task-local fact and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
-          "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). citationLedgerByTask[index] is the task's closed evidence set; resolve those entries through evidenceById. taskLocalEvidence.factRefs is the task's closed fact set, materialDescriptionFactRefs and priorityFactRefs are mandatory fact IDs, and candidateSupportingFactRefs is an optional ID-only navigation shortlist; resolve all of them through factsById. Copy response fact_bindings from those factsById rows using the keyed factId plus type, role, evidenceId, and scopeId. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
+          "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). citationLedgerByTask[index] is the task's closed evidence set; resolve those entries through evidenceById. taskLocalEvidence.factRefs is the task's closed fact set, materialDescriptionFactRefs and priorityFactRefs are mandatory fact IDs, executionDetailFactRefs is the ordered non-action detail set whose usable members are adaptive choices with at least one member required when available, and candidateSupportingFactRefs is an optional ID-only navigation shortlist; resolve all of them through factsById. Copy response fact_bindings from those factsById rows using the keyed factId plus type, role, evidenceId, and scopeId. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
           JSON.stringify(sharedTaskEvidence),
           "Main tasks and their structured task-specific evidence:",
           JSON.stringify(promptMainTasks)
@@ -8009,7 +8011,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           item,
           task,
           Object.assign({}, structuredRefs, {
-            materialDescriptionFactRefs: mainTasks[item.index]?.taskLocalEvidence?.materialDescriptionFactRefs || []
+            materialDescriptionFactRefs: mainTasks[item.index]?.taskLocalEvidence?.materialDescriptionFactRefs || [],
+            executionDetailFactRefs: mainTasks[item.index]?.taskLocalEvidence?.executionDetailFactRefs || []
           }),
           options.sourceContract,
           mainTasks[item.index]?.taskLocalEvidence?.citationLedger || []
@@ -19687,9 +19690,56 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     return [key, reason];
   }));
   const remainingSlots = Math.max(0, maxItems - reserved.length);
-  const remaining = fused.filter((item) => !reservedKeys.has(semanticTaskCandidateStableKey(item))).slice(0, remainingSlots);
+  const optionalFusedCandidates = fused.filter((item) => !reservedKeys.has(semanticTaskCandidateStableKey(item)));
+  const fusedAdmissionDistribution = remainingSlots > 0
+    ? taskRelativeSemanticScoreDistribution(optionalFusedCandidates, remainingSlots)
+    : { pool: [], scores: [], median: 0, deviation: 0, gapMedian: 0, gapDeviation: 0, distributionFloor: 0, elbowIndex: -1, elbowGap: 0 };
+  const adaptiveAdmittedCandidates = remainingSlots > 0
+    ? taskRelativeSemanticAdmissionPool(optionalFusedCandidates, remainingSlots)
+    : [];
+  const meaningfulAdaptiveCut = fusedAdmissionDistribution.elbowIndex >= 0
+    && fusedAdmissionDistribution.elbowGap > fusedAdmissionDistribution.gapMedian + fusedAdmissionDistribution.gapDeviation * 2 + 1e-9;
+  const adaptiveAdmittedKeys = new Set((meaningfulAdaptiveCut ? adaptiveAdmittedCandidates : optionalFusedCandidates.slice(0, remainingSlots))
+    .map((item) => semanticTaskCandidateStableKey(item)));
+  const originalFusedCeilingWindow = optionalFusedCandidates.slice(0, remainingSlots);
+  const adaptiveDroppedKeys = new Set((meaningfulAdaptiveCut ? originalFusedCeilingWindow : [])
+    .map((item) => semanticTaskCandidateStableKey(item))
+    .filter((key) => !adaptiveAdmittedKeys.has(key)));
+  const remaining = optionalFusedCandidates
+    .filter((item) => adaptiveAdmittedKeys.has(semanticTaskCandidateStableKey(item)))
+    .slice(0, remainingSlots);
   const selectedViews = [...reserved, ...remaining];
   const selectedKeys = new Set(selectedViews.map((item) => semanticTaskCandidateStableKey(item)));
+  const droppedCount = Math.max(0, optionalFusedCandidates.length - remaining.length);
+  const ceilingExcludedKeys = new Set(optionalFusedCandidates
+    .map((item) => semanticTaskCandidateStableKey(item))
+    .filter((key) => !selectedKeys.has(key) && !adaptiveDroppedKeys.has(key)));
+  const fusedAdmissionReasonCodes = [];
+  if (remainingSlots <= 0) fusedAdmissionReasonCodes.push("fused-no-optional-slots");
+  else if (optionalFusedCandidates.length === 0) fusedAdmissionReasonCodes.push("fused-no-optional-candidates");
+  else {
+    if (adaptiveDroppedKeys.size > 0) fusedAdmissionReasonCodes.push("fused-adaptive-admission-excluded");
+    if (ceilingExcludedKeys.size > 0) fusedAdmissionReasonCodes.push("fused-stable-evidence-ceiling-excluded");
+    if (!fusedAdmissionReasonCodes.length) fusedAdmissionReasonCodes.push("fused-adaptive-admission-retained");
+  }
+  const fusedAdmission = {
+    candidateCount: optionalFusedCandidates.length,
+    admittedCount: remaining.length,
+    droppedCount,
+    adaptiveDroppedCount: adaptiveDroppedKeys.size,
+    ceilingExcludedCount: ceilingExcludedKeys.size,
+    ceiling: remainingSlots,
+    reasonCodes: fusedAdmissionReasonCodes,
+    adaptive: {
+      median: fusedAdmissionDistribution.median,
+      deviation: fusedAdmissionDistribution.deviation,
+      gapMedian: fusedAdmissionDistribution.gapMedian,
+      gapDeviation: fusedAdmissionDistribution.gapDeviation,
+      distributionFloor: fusedAdmissionDistribution.distributionFloor,
+      elbowIndex: fusedAdmissionDistribution.elbowIndex,
+      elbowGap: fusedAdmissionDistribution.elbowGap
+    }
+  };
   const materialHistoryCandidates = [];
   for (const relationshipCandidate of relationshipDimensionResult?.selected || []) {
     const relationshipSource = relationshipCandidate[TASK_SEMANTIC_DIMENSION_SOURCE_RECORD] || {};
@@ -19749,7 +19799,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     const key = semanticTaskCandidateStableKey(item);
     return [key, selectedKeys.has(key)
       ? reservedKeys.has(key) ? "fused-reservation-selected" : "fused-weighted-ceiling-selected"
-      : "fused-stable-evidence-ceiling-excluded"];
+      : adaptiveDroppedKeys.has(key) ? "fused-adaptive-admission-excluded" : "fused-stable-evidence-ceiling-excluded"];
   }));
   const finalizedDimensionResults = Object.freeze(rawDimensionResults.map((result) => {
     const candidates = result.candidates.map((candidate) => {
@@ -19891,7 +19941,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
       materialityState: records.map((candidate) => candidate.materialityState).find((value) => value && value !== "unclassified") || "unclassified",
       materialityReason: records.map((candidate) => candidate.materialityReason).find(Boolean) || "",
       reservationState: records.map((candidate) => candidate.reservationState).find((value) => value && value !== "unreserved") || "unreserved",
-      inclusionReason: selectedKeys.has(fusedIdentityKey) ? explicitReservationReason || finalReasonByKey[fusedIdentityKey] || "fused-weighted-ceiling-selected" : "fused-stable-evidence-ceiling-excluded",
+      inclusionReason: selectedKeys.has(fusedIdentityKey) ? explicitReservationReason || finalReasonByKey[fusedIdentityKey] || "fused-weighted-ceiling-selected" : finalReasonByKey[fusedIdentityKey] || "fused-stable-evidence-ceiling-excluded",
       exclusionReason: selectedKeys.has(fusedIdentityKey) ? "" : finalReasonByKey[fusedIdentityKey] || "fused-stable-evidence-ceiling-excluded",
       aggregateContribution: Number(fused.find((item) => semanticTaskCandidateStableKey(item) === fusedIdentityKey)?.aggregateContribution || 0),
       finalReasonCode: explicitReservationReason || finalReasonByKey[fusedIdentityKey] || records.map((candidate) => candidate.finalReasonCode).find(Boolean) || "dimension-not-in-fused-selection"
@@ -19904,6 +19954,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     rawDimensionResults,
     dimensionResults: finalizedDimensionResults,
     moduleInfluenceTelemetry,
+    fusedAdmission,
     fusedIdentityCount: selectedKeys.size,
     fusedIdentityMappings,
     request,
@@ -22824,6 +22875,31 @@ const TASK_DESCRIPTION_MATERIAL_ADMISSION_REASONS = new Set([
 ]);
 const TASK_DESCRIPTION_MAX_MATERIAL_FACT_REFS = 8;
 
+function taskDescriptionFactIsNonAction(fact = {}) {
+  const normalizeMetadata = (value) => String(value || "").trim().toLowerCase().replaceAll("_", "-").replaceAll(" ", "-");
+  const actionMetadata = new Set(["action", "marked-action", "requested-action"]);
+  return [fact.type, fact.kind, fact.role].map(normalizeMetadata).every((value) => !actionMetadata.has(value));
+}
+
+function taskDescriptionFactBindingKey(factId = "", evidenceId = "", scopeId = "") {
+  return [String(factId || ""), String(evidenceId || ""), String(scopeId || "")].join("\u0000");
+}
+
+function taskDescriptionFactIsUsableExecutionDetail(fact = {}, taskScopeId = "", exactFactBindings = new Set(), evidence = null) {
+  const factId = String(fact.factId || "");
+  const evidenceId = String(fact.evidenceId || "");
+  const scopeId = String(fact.scopeId || "");
+  const evidenceAuthority = String(evidence?.authorityState || "").toLowerCase();
+  const evidenceConflict = String(evidence?.conflictState || "").toLowerCase();
+  return Boolean(factId && evidenceId && taskScopeId && scopeId === String(taskScopeId)
+    && exactFactBindings.has(taskDescriptionFactBindingKey(factId, evidenceId, scopeId))
+    && taskDescriptionFactIsNonAction(fact)
+    && fact.authorityState !== "rejected"
+    && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase())
+    && evidenceAuthority !== "rejected"
+    && !["conflict", "conflicted", "rejected"].includes(evidenceConflict));
+}
+
 function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContract = null) {
   const bundle = evidence?.evidenceBundle || task.evidenceBundle || task.taskEvidenceBundle || {};
   const facts = (bundle.facts || []).map((fact) => ({
@@ -23003,6 +23079,25 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       && fact.authorityState !== "rejected"
       && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase()))
     .map((fact) => String(fact.factId || "")));
+  const factsById = new Map(facts.map((fact) => [String(fact.factId), fact]));
+  const evidenceById = new Map(supporting.concat(primary.evidenceId ? [primary] : []).map((entry) => [String(entry.evidenceId || ""), entry]));
+  const executionDetailFactRefs = [];
+  const addExecutionDetailRefs = (factIds = []) => {
+    for (const factId of factIds || []) {
+      const normalizedFactId = String(factId || "");
+      const fact = factsById.get(normalizedFactId);
+      if (!fact || !taskDescriptionFactIsUsableExecutionDetail(fact, taskScopeId, exactFactBindings, evidenceById.get(String(fact.evidenceId || "")))) continue;
+      if (!executionDetailFactRefs.includes(normalizedFactId)) executionDetailFactRefs.push(normalizedFactId);
+    }
+  };
+  const primaryEvidenceId = String(primary.evidenceId || "");
+  addExecutionDetailRefs(facts
+    .filter((fact) => String(fact.evidenceId || "") === primaryEvidenceId
+      && fact.current === true
+      && [fact.type, fact.kind, fact.role].some((value) => String(value || "").toLowerCase() === "primary-context"))
+    .map((fact) => fact.factId));
+  addExecutionDetailRefs(materialDescriptionFactRefs);
+  addExecutionDetailRefs(candidateSupportingFactRefs);
   const sourceType = String(sourceContract?.sourceType || sourceContract?.source_type || "note").toLowerCase() === "email" ? "email" : "note";
   const citationNumbersBySource = new Map();
   let nextCitationNumber = sourceType === "email" ? 1 : 2;
@@ -23090,6 +23185,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     factRefs: (bundle.factRefs || bundle.fact_refs || []).slice(),
     priorityFactRefs,
     materialDescriptionFactRefs: uniqueValues(materialDescriptionFactRefs),
+    executionDetailFactRefs: uniqueValues(executionDetailFactRefs),
     candidateSupportingFactRefs: uniqueValues(candidateSupportingFactRefs),
     selectedSupportingEvidenceIds,
     factBindings: (bundle.fact_bindings || bundle.factBindings || []).slice(),
@@ -23136,15 +23232,34 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
   const errors = [];
   const rawSentences = Array.isArray(item.description_sentences) ? item.description_sentences : [];
   if (!rawSentences.length) return { valid: false, errors: ["description-sentence-missing"], sentences: [], rendered: "" };
-  const bundle = structuredRefs.bundle || task.evidenceBundle || task.taskEvidenceBundle || null;
+  const closureBundle = task.evidenceBundle || task.taskEvidenceBundle || structuredRefs.bundle || null;
+  const bundle = structuredRefs.bundle || closureBundle;
   const allowedEvidence = new Set((structuredRefs.evidenceIds || []).map(String));
   const allowedFacts = new Set((structuredRefs.factRefs || []).map(String));
   const ledgerByEvidenceId = new Map((citationLedger || []).filter((entry) => entry?.evidenceId).map((entry) => [String(entry.evidenceId), entry]));
-  const factsById = new Map((bundle?.facts || []).map((fact) => [String(fact.factId), fact]));
-  const itemsByEvidenceId = new Map((bundle?.items || []).map((entry) => [String(entry.evidenceId), entry]));
+  const factsById = new Map((closureBundle?.facts || bundle?.facts || []).map((fact) => [String(fact.factId), fact]));
+  const itemsByEvidenceId = new Map((closureBundle?.items || bundle?.items || []).map((entry) => [String(entry.evidenceId), entry]));
   const coveredMandatoryFacts = new Set();
   const coveredSentenceFacts = new Set();
   const materialDescriptionFactRefs = uniqueValues((structuredRefs.materialDescriptionFactRefs || structuredRefs.material_description_fact_refs || []).map(String).filter(Boolean));
+  const executionDetailContractProvided = Object.prototype.hasOwnProperty.call(structuredRefs, "executionDetailFactRefs")
+    || Object.prototype.hasOwnProperty.call(structuredRefs, "execution_detail_fact_refs");
+  const executionDetailFactRefs = uniqueValues((structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || []).map(String).filter(Boolean));
+  const closureFactBindings = closureBundle?.fact_bindings || closureBundle?.factBindings || structuredRefs.factBindings || [];
+  const exactFactBindings = new Set(closureFactBindings.map((binding) => taskDescriptionFactBindingKey(
+    binding?.factId || binding?.fact_id,
+    binding?.evidenceId || binding?.evidence_id,
+    binding?.scopeId || binding?.scope_id || ""
+  )));
+  const responseFactBindingKeys = new Set((structuredRefs.factBindings || []).map((binding) => taskDescriptionFactBindingKey(
+    binding?.factId || binding?.fact_id,
+    binding?.evidenceId || binding?.evidence_id,
+    binding?.scopeId || binding?.scope_id || ""
+  )));
+  const usableExecutionDetailFactIds = executionDetailFactRefs.filter((factId) => {
+    const fact = factsById.get(factId);
+    return taskDescriptionFactIsUsableExecutionDetail(fact, structuredRefs.scopeId || item.scope_id || "", exactFactBindings, itemsByEvidenceId.get(String(fact?.evidenceId || "")));
+  });
   const sentences = [];
   for (let index = 0; index < rawSentences.length; index += 1) {
     const raw = rawSentences[index] || {};
@@ -23189,6 +23304,17 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
   for (const factId of materialDescriptionFactRefs) {
     if (!coveredSentenceFacts.has(factId)) errors.push(`description-sentence-material-fact-omitted:${factId}`);
   }
+  if (executionDetailContractProvided) {
+    if (!usableExecutionDetailFactIds.length) errors.push("description-execution-detail-unavailable");
+    else {
+      const coveredExecutionDetailFactIds = usableExecutionDetailFactIds.filter((factId) => coveredSentenceFacts.has(factId));
+      if (!coveredExecutionDetailFactIds.length) errors.push("description-execution-detail-omitted");
+      else if (!coveredExecutionDetailFactIds.some((factId) => {
+        const fact = factsById.get(factId);
+        return responseFactBindingKeys.has(taskDescriptionFactBindingKey(factId, fact?.evidenceId, fact?.scopeId));
+      })) errors.push("description-execution-detail-binding-missing");
+    }
+  }
   const uniqueErrors = uniqueValues(errors);
   return {
     valid: uniqueErrors.length === 0,
@@ -23208,6 +23334,7 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
   const referencedFactIds = new Set();
   const referencedEvidenceIds = new Set();
   const factRowsById = new Map();
+  const executionDetailFactRefsByTask = {};
   const addIds = (target, values = []) => {
     for (const value of values || []) {
       const id = String(value || "").trim();
@@ -23224,6 +23351,7 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
       ...(rich.factRefs || []), ...(rich.fact_refs || []),
       ...(rich.priorityFactRefs || []), ...(rich.priority_fact_refs || []),
       ...(rich.materialDescriptionFactRefs || []), ...(rich.material_description_fact_refs || []),
+      ...(rich.executionDetailFactRefs || []), ...(rich.execution_detail_fact_refs || []),
       ...(rich.candidateSupportingFactRefs || []), ...(rich.candidate_supporting_fact_refs || []),
       ...(item.fact_refs || []), ...(item.factRefs || [])
     ]);
@@ -23238,6 +23366,7 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
     }
     for (const entry of rich.citationLedger || []) addIds(referencedEvidenceIds, [entry?.evidenceId || entry?.evidence_id]);
     addIds(referencedEvidenceIds, [rich.primarySourceEvidence?.evidenceId || rich.primarySourceEvidence?.evidence_id]);
+    executionDetailFactRefsByTask[String(item.index)] = uniqueValues((rich.executionDetailFactRefs || rich.execution_detail_fact_refs || []).map(String).filter(Boolean));
   }
   for (const fact of Object.values(contextBundle?.factsById || {})) registerFact(fact);
   let unresolvedReference = false;
@@ -23413,7 +23542,8 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
     promptEvidenceHash: String(contextBundle?.promptEvidenceHash || ""),
     factsById: Object.fromEntries(factsById),
     evidenceById: Object.fromEntries(evidenceById),
-    citationLedgerByTask
+    citationLedgerByTask,
+    executionDetailFactRefsByTask
   };
 }
 
@@ -23421,6 +23551,7 @@ function taskDescriptionPromptTask(item = {}) {
   const rich = item.taskLocalEvidence || {};
   const { evidence_ids, fact_refs, fact_bindings, ...task } = item;
   const priorityFactIds = Array.isArray(rich.priorityFactRefs) ? rich.priorityFactRefs.map(String).filter(Boolean) : [];
+  const sourceFactBindings = new Set((rich.factBindings || rich.fact_bindings || []).map((binding) => taskDescriptionFactBindingKey(binding?.factId || binding?.fact_id, binding?.evidenceId || binding?.evidence_id, binding?.scopeId || binding?.scope_id || rich.scopeId || item.scope_id || "")));
   const typedFactsById = new Map((rich.typedFacts || []).map((fact) => [String(fact.factId || ""), fact]));
   const taskScopeId = String(rich.scopeId || item.scope_id || "");
   const factRow = (fact = {}) => {
@@ -23445,6 +23576,17 @@ function taskDescriptionPromptTask(item = {}) {
     const fact = typedFactsById.get(factId);
     return fact ? factRow(fact) : null;
   }).filter(Boolean);
+  const executionDetailFactRefs = uniqueValues((Array.isArray(rich.executionDetailFactRefs) ? rich.executionDetailFactRefs : [])
+    .map(String)
+    .filter((factId) => {
+      const fact = typedFactsById.get(factId);
+      return Boolean(fact)
+        && String(fact.scopeId || "") === taskScopeId
+        && sourceFactBindings.has(taskDescriptionFactBindingKey(fact.factId, fact.evidenceId, fact.scopeId))
+        && taskDescriptionFactIsNonAction(fact)
+        && String(fact.authorityState || "").toLowerCase() !== "rejected"
+        && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase());
+    }));
   const fallbackCandidateRefs = (Array.isArray(rich.selectedSupportingEvidenceIds) ? rich.selectedSupportingEvidenceIds : [])
     .map(String)
     .flatMap((evidenceId) => Array.from(typedFactsById.values())
@@ -23484,12 +23626,13 @@ function taskDescriptionPromptTask(item = {}) {
     factRefs: rich.factRefs || item.fact_refs || [],
     priorityFactRefs: rich.priorityFactRefs || [],
     materialDescriptionFactRefs: rich.materialDescriptionFactRefs || [],
+    executionDetailFactRefs,
     priorityFacts,
     candidateSupportingFactRefs,
     requiredFactTypes: rich.requiredFactTypes || []
   };
   for (const [key, value] of Object.entries(taskLocalEvidence)) {
-    if (value === "" || (Array.isArray(value) && value.length === 0) || (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0)) {
+    if (value === "" || (Array.isArray(value) && value.length === 0 && key !== "executionDetailFactRefs") || (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0)) {
       delete taskLocalEvidence[key];
     }
   }
@@ -24447,6 +24590,9 @@ const TASK_DESCRIPTION_FAILURE_REASON_CODES = new Set([
   "description-sentence-fact-unusable",
   "description-sentence-mandatory-fact-omitted",
   "description-sentence-material-fact-omitted",
+  "description-execution-detail-unavailable",
+  "description-execution-detail-omitted",
+  "description-execution-detail-binding-missing",
   "quality-too-short",
   "quality-fragment",
   "quality-generic",
@@ -24466,7 +24612,7 @@ function taskDescriptionFailureReasonCode(reason = "", stage = "") {
   if (stage === "missing/nontext" || /missing or not text/.test(text)) return "missing-or-nontext";
   if (stage === "provider" || /provider call failed/.test(text)) return "provider-failure";
   if (stage === "sentences" || /description-sentence-/.test(text)) {
-    const code = text.match(/description-sentence-(?:missing|empty|evidence-missing|fact-missing|foreign-evidence|foreign-fact|citation-ledger-missing|evidence-unusable|fact-evidence-mismatch|fact-unusable|mandatory-fact-omitted|material-fact-omitted)/)?.[0];
+    const code = text.match(/description-(?:sentence-(?:missing|empty|evidence-missing|fact-missing|foreign-evidence|foreign-fact|citation-ledger-missing|evidence-unusable|fact-evidence-mismatch|fact-unusable|mandatory-fact-omitted|material-fact-omitted)|execution-detail-(?:unavailable|omitted|binding-missing))/)?.[0];
     return code || "description-sentence-missing";
   }
   if (/json could not be parsed/.test(text)) return "response-parse-failure";

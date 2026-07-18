@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.12
+
+- Kept semantic evidence scoped to each generated task, so neighboring tasks do not share unrelated context.
+- Let structurally verified current-note context enrich only its matching task without lexical or title heuristics.
+- Carried selected semantic context and its supporting metadata through description generation.
+- Restricted descriptions to validated task-local facts and citations; source lists now include only evidence cited in the final narrative.
+
 ## 0.7.11
 
 - Task-reference snapshot and manifest publication now handles Obsidian adapters that reject rename-over-existing by using a verified stable write with rollback, so task creation and note sync do not fail with destination-already-exists errors.

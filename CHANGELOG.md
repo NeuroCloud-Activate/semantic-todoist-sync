@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.10
+
+- Closed shared description evidence and fact tables over each task's referenced material, with a conservative full-table fallback when closure is uncertain, reducing repeated provider-equivalent input while preserving task-local grounding.
+- Clarified prompt field contracts and sentence-end citations, including numeric citation de-duplication.
+- Promoted already-selected, same-scope semantic reviewer and handoff history when its material contribution changes the current action, and validated every resulting material fact sentence.
+- Preserved independent dimension source reservations through final evidence fusion and kept current task/source handoffs intact.
+
 ## 0.7.9
 
 - Removed the partially supported `scrollbar-width` declaration for compatibility with Obsidian 1.4.5.

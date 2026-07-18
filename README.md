@@ -31,11 +31,11 @@ The 0.7 line makes task capture more grounded, lighter, and easier to keep in sy
 1. **Better context and task details**
 
    Task generation starts with the current note's request, then adds task-scoped
-   semantic context without mixing neighboring work. Structurally verified
-   current-note context can enrich only its matching task, while stale or
-   unrelated context stays out. Descriptions carry selected facts, context, and
-   citations through the workflow, stay natural and actionable, and list only
-   sources actually cited.
+   semantic context without mixing neighboring work. Essential context stays
+   protected while weaker optional matches are trimmed for the current request.
+   Descriptions must include at least one task-specific execution detail beyond
+   the title or requested action, carry selected facts and citations through the
+   workflow, and list only sources actually cited.
 
 2. **Less repetition and simpler workflows**
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.13
+
+- Added adaptive, request-relative trimming for weak optional semantic evidence after protected context is reserved, preserving fused retrieval telemetry without lexical or note-specific rules.
+- Tightened description acceptance so each description must bind at least one exact-scope execution detail beyond the title or requested action; action-only descriptions now fail safely rather than being accepted.
+- Provider-equivalent Luna and Terra validation generated six tasks and six accepted descriptions with zero failures.
+
 ## 0.7.12
 
 - Kept semantic evidence scoped to each generated task, so neighboring tasks do not share unrelated context.

@@ -26,24 +26,39 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-1. **0.7.11 - Smoother task-reference updates**
+The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync:
 
-   Task-reference files now update safely even when Obsidian will not rename
-   over an existing file, and multi-note moves or swaps settle into one clean
-   snapshot without losing Todoist links.
+1. **Better context and task details**
 
-2. **0.7.10 - More grounded task details**
+   Task generation starts with the current note's request, then adds task-scoped
+   semantic context without mixing neighboring work. Structurally verified
+   current-note context can enrich only its matching task, while stale or
+   unrelated context stays out. Descriptions carry selected facts, context, and
+   citations through the workflow, stay natural and actionable, and list only
+   sources actually cited.
 
-   Task details now keep only the facts and evidence each task actually uses,
-   trimming repeated context while preserving the useful source information.
-   Semantic handoffs and citations are clearer too, including relevant review
-   history when it changes the work.
+2. **Less repetition and simpler workflows**
 
-3. **0.7.9 - Obsidian publishing compatibility**
+   Shared context and facts are reused across task and description steps, reducing
+   repeated input while keeping useful detail. Local section titles use note and
+   project context by default, so everyday captures need less setup. Settings,
+   local time display, and mobile controls are clearer, with separate result
+   limits and bounded resource settings.
 
-   Removed a partially supported scrollbar style and replaced the rejected
-   custom artifact-attestation path with exact release asset verification.
-   Runtime behavior is unchanged.
+3. **Reliable models, references, and sync**
+
+   OpenAI defaults to GPT 5.6 Terra at Medium reasoning with GPT 5.6 Luna at
+   Medium as the same-provider fallback; provider, model, and reasoning choices
+   remain configurable. Task-reference snapshots and semantic indexes repair and
+   align safely after note changes, reuse compatible data, and preserve Todoist
+   IDs/OIDs, parent/subtask links, and project relationships through moves and
+   swaps.
+
+4. **Smoother Obsidian experience**
+
+   Mobile-safe indexing, persistence, and settings continue to work across
+   desktop and mobile layouts, with more reliable styling on supported Obsidian
+   versions.
 
 ## What It Uses
 

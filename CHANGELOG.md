@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.14
+
+- Kept same-line marker context authoritative and grounded for its task while requiring neighboring lines to pass semantic admission before they are included.
+- Added model-selectable Default, Luna, and Terra prompt-only profiles with Auto and Manual settings; profile guidance remains separate from worker and runtime transport.
+- Kept irrelevant history optional, including when upstream materiality classifies it as useful; both July 6 provider-equivalent testers produced 6/6 accepted descriptions.
+
 ## 0.7.13
 
 - Added adaptive, request-relative trimming for weak optional semantic evidence after protected context is reserved, preserving fused retrieval telemetry without lexical or note-specific rules.

@@ -35,7 +35,9 @@ The 0.7 line makes task capture more grounded, lighter, and easier to keep in sy
    protected while weaker optional matches are trimmed for the current request.
    Descriptions must include at least one task-specific execution detail beyond
    the title or requested action, carry selected facts and citations through the
-   workflow, and list only sources actually cited.
+   workflow, and list only sources actually cited. You can also let task prompt
+   profiles follow the selected model automatically or choose one manually, with
+   better grounding for named artifacts and useful execution detail.
 
 2. **Less repetition and simpler workflows**
 

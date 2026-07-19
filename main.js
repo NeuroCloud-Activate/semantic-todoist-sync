@@ -170,8 +170,8 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
 const DEFAULT_REASONING_EFFORT = "default";
 const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Concise must not mean thin: incorporate every materially useful task-local fact supplied for execution. When the evidence supports multiple execution dimensions, integrate them into multiple complete natural sentences covering applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, and remaining action. Permit one sentence only when the entire task-local evidence bundle truly supports no additional material execution detail beyond the action. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
-const LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a concise grounded brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
+const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Keep descriptions complete: incorporate every materially useful task-local fact supplied for execution. When the evidence supports multiple execution dimensions, integrate them into multiple complete natural sentences covering applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, and remaining action. Permit one sentence only when the entire task-local evidence bundle truly supports no additional material execution detail beyond the action. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
+const LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a grounded execution brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
 
 // This state is intentionally limited to aggregate load facts. It is safe to
 // expose in diagnostics because it never contains vault paths, note text, or
@@ -1237,6 +1237,8 @@ const DEFAULT_SETTINGS = {
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
+  taskGenerationPromptProfileMode: "auto",
+  taskGenerationPromptProfile: "default",
   taskSectionTitleMode: "local",
   chatFontSizePx: 13,
   taskContextSummaryMaxNotes: 5,
@@ -1265,7 +1267,7 @@ const DEFAULT_SETTINGS = {
       syncAfterInsert: false
     }
   ],
-  mainTaskInstructions: "Review the source together with relevant ranked vault context and identify tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
+  mainTaskInstructions: "Review the source together with relevant ranked vault context and identify tasks that are required to be actioned or completed. Create a detailed list of tasks with context for each. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
   subtaskInstructions: "Create subtasks only when they are required and supported by the source or relevant ranked vault context. Subtasks should be clear actionable items, not background information.",
   sectionTitleInstructions: "Create one Todoist section for all tasks from the same source. For Notes-To-Todoist, use Notes_YY_MM_DD_Subject based on the note date and note subject. For Email-To-Todoist, use Email_YY_MM_DD_Subject based on the email received date and email subject.",
   dateInstructions: "Determine a task completion deadline and a due date for each main task based on urgency, priority, and complexity. Do not add due dates to subtasks. Avoid weekends and the holidays that apply to the user's locale.",
@@ -1366,6 +1368,55 @@ function openAiPromptCacheKey(operation = "chat") {
 
 const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
 const TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE = "Semantic disambiguation: when current terminology is ambiguous and same-scope semantic history identifies a legacy named term being phased out and its replacement, state the direction as use the replacement and avoid the legacy proper name; never invert that direction or prohibit the replacement. Treat the exact terminology and replacement direction as material. When the current action is to review an artifact, treat same-artifact prior reviewer edits or comments as materially useful if evidence says they remain to be reviewed or addressed, unless newer evidence supersedes or closes them.";
+const TASK_GENERATION_PROMPT_PROFILE_VERSION = 1;
+const TASK_GENERATION_PROMPT_PROFILE_MODES = ["auto", "manual"];
+const TASK_GENERATION_PROMPT_PROFILES = ["default", "gpt-5.6-luna", "gpt-5.6-terra"];
+const TASK_GENERATION_PROMPT_PROFILE_NAMES = Object.freeze({
+  "default": "Default",
+  "gpt-5.6-luna": "GPT 5.6 Luna",
+  "gpt-5.6-terra": "GPT 5.6 Terra"
+});
+const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Historical facts remain optional even when classified as material; omit them unless they directly change the named artifact, action, recipient, or dependency. Never use merely same-topic history to satisfy execution-detail coverage.";
+const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = "Descriptions must be complete and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. Do not use unrelated same-topic evidence merely to satisfy the execution-detail rule. Historical facts remain optional even when classified as material; omit them unless they directly change the named artifact, action, recipient, or dependency. Never use merely same-topic history to satisfy execution-detail coverage.";
+const TASK_GENERATION_PROMPT_PROFILE_GUIDANCE = Object.freeze({
+  "default": Object.freeze({ taskGuidance: TASK_GENERATION_SHARED_TASK_GUIDANCE, descriptionGuidance: TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE }),
+  "gpt-5.6-luna": Object.freeze({
+    taskGuidance: `${TASK_GENERATION_SHARED_TASK_GUIDANCE} Before stopping at the first useful fact, inspect supported material dependencies, handoffs, and reviewer history for this exact scope.`,
+    descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Inspect supported material dependencies, handoffs, and reviewer history before stopping at the first useful fact.`
+  }),
+  "gpt-5.6-terra": Object.freeze({
+    taskGuidance: TASK_GENERATION_SHARED_TASK_GUIDANCE,
+    descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Do not compress a supported execution brief into a one-line title restatement; integrate multiple materially useful facts when available.`
+  })
+});
+
+function normalizeTaskGenerationPromptProfileMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return TASK_GENERATION_PROMPT_PROFILE_MODES.includes(normalized) ? normalized : "auto";
+}
+
+function normalizeTaskGenerationPromptProfile(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return TASK_GENERATION_PROMPT_PROFILES.includes(normalized) ? normalized : "default";
+}
+
+function resolveTaskGenerationPromptProfile({ mode = "auto", profile = "default", selectedModel = "", phase = "" } = {}) {
+  const normalizedMode = normalizeTaskGenerationPromptProfileMode(mode);
+  const normalizedProfile = normalizeTaskGenerationPromptProfile(profile);
+  const modelId = String(selectedModel || "").trim().toLowerCase();
+  const id = normalizedMode === "manual"
+    ? normalizedProfile
+    : modelId === "gpt-5.6-luna" || modelId === "gpt-5.6-terra"
+      ? modelId
+      : "default";
+  const guidance = TASK_GENERATION_PROMPT_PROFILE_GUIDANCE[id] || TASK_GENERATION_PROMPT_PROFILE_GUIDANCE.default;
+  return Object.freeze({
+    id,
+    version: TASK_GENERATION_PROMPT_PROFILE_VERSION,
+    taskGuidance: guidance.taskGuidance,
+    descriptionGuidance: guidance.descriptionGuidance
+  });
+}
 
 function taskWorkflowSystemInstruction() {
   return [
@@ -1380,7 +1431,7 @@ function taskWorkflowSystemInstruction() {
     "Use clear professional task titles: expand informal shorthand or abbreviations and correct obvious capitalization, spelling, and grammar (for example, write vacation instead of Vaca) while preserving the source's exact action, people, object, conditions, and temporal attachment. Do not add or remove scope.",
     "Preserve exact proper names, quoted terms, organization names, document names, and product names. A source warning that a term is grammatically incorrect in context is not a blanket prohibition on that term. An instruction to avoid a named phrase or object applies only to that exact phrase or object; do not generalize it to a shorter word, related name, or broader concept.",
     "Preserve epistemic state exactly in task and description wording. A source statement such as is going to or plans to must not become scheduled, confirmed, approved, or otherwise stronger unless a supplied bound fact says so. Keep distinct action and supporting facts clear, even in one sentence, and never invent calendar mechanics.",
-    "Use retained task-local semantic evidence only when it materially changes execution, current state, decision criteria, recipient/reviewer, dependency, timing, or handoff. Omit stale availability, expired scheduling, merely related history, and evidence-container narration. Preserve who reviewed what, what they found or changed, what remains unresolved, reviewer expectations, and actor-specific handoffs when supported. Distinguish history from current direction; an old timestamp alone does not make a durable fact historical, do not write Historically merely because a record is old, never treat fine as formal approval, and never reduce a named person checking with another person to a generic instruction to address or resolve an issue.",
+    "Use retained task-local semantic evidence only when it materially changes execution, current state, decision criteria, recipient/reviewer, dependency, timing, or handoff. Omit stale availability, expired scheduling, merely related history, and evidence-container narration. Historical facts remain optional even when classified as material; omit them unless they directly change the named artifact, action, recipient, or dependency. Never use merely same-topic history to satisfy execution-detail coverage. Preserve who reviewed what, what they found or changed, what remains unresolved, reviewer expectations, and actor-specific handoffs when supported. Distinguish history from current direction; an old timestamp alone does not make a durable fact historical, do not write Historically merely because a record is old, never treat fine as formal approval, and never reduce a named person checking with another person to a generic instruction to address or resolve an issue.",
     "For every task and subtask, use only supplied scope_id, evidence_ids, fact_refs, and fact_bindings from the current source contract and bounded evidence catalog. Each fact_binding is {factId,type,role,evidenceId,scopeId} and must exactly match the immutable catalog fact metadata. Main tasks must include current-source evidence and at least one current-source fact; subtasks inherit only their parent scope when the supplied contract permits it.",
     "Enforce phase shapes exactly: task-structure phases return section_name:\"\" and descriptions:[]; description phases return section_name:\"\" and tasks:[]; only section-title phases may populate section_name and must keep tasks and descriptions empty.",
     "Resolve relative source terms such as today or tomorrow only from authoritative source note/date metadata in the workflow context when that source date is established. If no authoritative source date is established, preserve the source phrase; never resolve it from the execution date or invent a date.",
@@ -2147,6 +2198,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.taskSectionTitleMode = normalizedTaskSectionTitleMode;
       changed = true;
     }
+    const normalizedPromptProfileMode = normalizeTaskGenerationPromptProfileMode(this.settings.taskGenerationPromptProfileMode);
+    const normalizedPromptProfile = normalizeTaskGenerationPromptProfile(this.settings.taskGenerationPromptProfile);
+    if (this.settings.taskGenerationPromptProfileMode !== normalizedPromptProfileMode) {
+      this.settings.taskGenerationPromptProfileMode = normalizedPromptProfileMode;
+      changed = true;
+    }
+    if (this.settings.taskGenerationPromptProfile !== normalizedPromptProfile) {
+      this.settings.taskGenerationPromptProfile = normalizedPromptProfile;
+      changed = true;
+    }
     if ((parseInt(this.settings.emailPollIntervalSeconds, 10) || 0) < MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS) {
       this.settings.emailPollIntervalSeconds = MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS;
       changed = true;
@@ -2353,7 +2414,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const taskInstructionUpdates = {
       mainTaskInstructions: [
-        "Review the tasks that are required to be actioned or completed. Create a detailed list of tasks with brief context for each. Each task should be no longer than 250 characters. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
+        "Review the tasks that are required to be actioned or completed. Create a detailed list of tasks with context for each. Do not group unrelated items under one main task. Main tasks and subtasks should refer to the same project or program.",
         DEFAULT_SETTINGS.mainTaskInstructions
       ],
       subtaskInstructions: [
@@ -7483,6 +7544,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskContext,
       taskCount: maxMainTasks + maxSubtasks
     });
+    const promptProfile = resolveTaskGenerationPromptProfile({
+      mode: this.settings.taskGenerationPromptProfileMode,
+      profile: this.settings.taskGenerationPromptProfile,
+      selectedModel: this.settings.chatModel,
+      phase: "task"
+    });
     const json = await this.withAiActivity("Generating task list", () => this.openaiResponse({
       operation: "task-generation",
       model: modelChoice.model,
@@ -7495,6 +7562,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Return the tasks field only. Return section_name as an empty string and descriptions as an empty array.",
         "Create Todoist task structure from the shared workflow context.",
         instructions,
+        `Prompt profile guidance: ${promptProfile.taskGuidance}`,
         `Fallback section name if the Section title instructions cannot be applied: ${source.sectionName || ""}`,
         source.type === "email" ? "For emails, preserve the current/latest message as authoritative and create the user's next unresolved review, reply, follow-up, decision, or completion action." : "For notes, cover every distinct marked action before adding additional clearly user-owned actions from the source and matching context.",
         "Follow the configured main-task, subtask, date, deadline, label, priority, and source-type instructions.",
@@ -7737,7 +7805,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       model: modelChoice.model,
       jsonSchema: taskWorkflowResponseSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings)),
       system: taskWorkflowSystemInstruction(),
-      reasoningEffort: "medium",
+      reasoningEffort: aiOperationReasoningEffort(this.settings.chatReasoningEffort, "task-generation", this.settings.optimizeStructuredAiUsage !== false),
       promptCachePrefix: workflowContext.promptCachePrefix,
       promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
       user: [
@@ -7875,6 +7943,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       context,
       taskCount: mainTasks.length
     });
+    const promptProfile = resolveTaskGenerationPromptProfile({
+      mode: this.settings.taskGenerationPromptProfileMode,
+      profile: this.settings.taskGenerationPromptProfile,
+      selectedModel: this.settings.chatModel,
+      phase: "description"
+    });
     this.setSidebarStatus(`Writing descriptions for ${mainTasks.length} main task${mainTasks.length === 1 ? "" : "s"}...`);
     let json;
     try {
@@ -7891,6 +7965,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           `Source title for internal grounding only; do not include it verbatim in descriptions: ${sourceTitle || ""}`,
           "Description instructions:",
           descriptionInstructions || "",
+          `Prompt profile guidance: ${promptProfile.descriptionGuidance}`,
           "Description form: use one continuous natural narrative paragraph; state evidence-backed facts directly; never refer to provided, supplied, input, or source context or describe the model-input container.",
           "",
           `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
@@ -7909,7 +7984,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
           structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from the task-local factsById/evidenceById contract only; all IDs and bindings must be subsets of that closed contract, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
           "Task-local evidence rule: use concrete wording from existingSubtasks, workingContext, and mandatoryRequestFacts when it adds supported intent, object, dependency, recipient, or criteria for this task; currentDescription and labels are scope hints, not permission to invent source facts.",
-          "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; incorporate every supplied task-local fact that materially changes how the work should be understood or performed, including applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, remaining action, and links. Concise must not mean thin. When the task-local evidence bundle supports multiple execution dimensions, use multiple complete natural sentences; use one sentence only when the entire bundle truly supports no additional material execution detail beyond the action. Do not invent or pad details.",
+          "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; incorporate every supplied task-local fact that materially changes how the work should be understood or performed, including applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, remaining action, and links. Keep descriptions complete. When the task-local evidence bundle supports multiple execution dimensions, use multiple complete natural sentences; use one sentence only when the entire bundle truly supports no additional material execution detail beyond the action. Do not invent or pad details.",
           "Task-local materiality: use retained same-scope semantic facts only when they materially change execution, current state, decision criteria, recipient/reviewer, dependency, timing, or handoff, even when the current source is detailed. Include prior reviewer edits or comments, known concerns, existing artifact state, unresolved decisions or conflicts, reviewer expectations, and earlier handoffs only when they identify what to inspect, preserve, verify, or resolve now. Omit stale availability, expired scheduling, merely related history, and unrelated task context.",
           "Actor-specific handoff rule: when task-local evidence says a named person will check with, send to, or obtain review from another named person, preserve the actor, counterpart, and concrete next step. Do not reduce that evidence to generic address the conflict, resolve the issue, or follow up wording.",
           "Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
@@ -7918,7 +7993,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Context-note citation rule:",
           contextCitationInstructions(citeContextNotes, structuredEvidence),
           "",
-          structuredEvidence ? "Respect the schema's 1200-character upper bound; there is no hard character, word, or sentence minimum. Concise must not mean thin: include every materially useful task-local fact. Use one complete sentence only when the entire task-local bundle supports no additional material execution detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Keep every description at or below 1200 characters; there is no hard character, word, or sentence minimum. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, timing, useful history or handoffs, and remaining action when supplied. Concise must not mean thin: include every materially useful task-local fact and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
+          structuredEvidence ? "Respect the schema's 1200-character upper bound; there is no hard character, word, or sentence minimum. Keep descriptions complete by including every materially useful task-local fact. Use one complete sentence only when the entire task-local bundle supports no additional material execution detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Keep every description at or below 1200 characters; there is no hard character, word, or sentence minimum. Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives/criteria, urgency, dependencies, timing, useful history or handoffs, and remaining action when supplied. Keep descriptions complete by including every materially useful task-local fact and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
           "Shared immutable task evidence (serialized once; use IDs to bind each sentence and never borrow across task scopes). citationLedgerByTask[index] is the task's closed evidence set; resolve those entries through evidenceById. taskLocalEvidence.factRefs is the task's closed fact set, materialDescriptionFactRefs and priorityFactRefs are mandatory fact IDs, executionDetailFactRefs is the ordered non-action detail set whose usable members are adaptive choices with at least one member required when available, and candidateSupportingFactRefs is an optional ID-only navigation shortlist; resolve all of them through factsById. Copy response fact_bindings from those factsById rows using the keyed factId plus type, role, evidenceId, and scopeId. An evidenceById row with prefixEvidenceRef=true resolves its complete base record through the cached prefix's byEvidenceId table; the row contains only description-unique overlay fields. Other evidenceById rows contain complete accepted records. A fact with valueEvidenceId takes its exact value from that evidence record's excerpt:",
           JSON.stringify(sharedTaskEvidence),
           "Main tasks and their structured task-specific evidence:",
@@ -11973,6 +12048,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "Shared task generation", "These limits and formatting rules apply to both note and email task generation.");
+    taskGenerationPromptProfileSettings(containerEl, this.plugin);
     taskSectionTitleModeSetting(containerEl, this.plugin);
     numberSetting(containerEl, "Maximum main tasks", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
@@ -12941,6 +13017,8 @@ const SETTING_DESCRIPTIONS = {
   maxTaskContextChunks: "Maximum semantic search results used for note and email task descriptions; this is a result count, not a character limit.",
   promptTemplatesFolder: "Markdown files in this folder become reusable prompt actions. Frontmatter can set createTasks, insertResponse, syncTasks, and action: schedule-today.",
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
+  taskGenerationPromptProfileMode: "Choose whether task and description prompt guidance follows the configured primary model or a manually selected profile.",
+  taskGenerationPromptProfile: "Manual task-generation prompt profile. This changes only variable task and description user-prompt guidance.",
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
   googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
   aiModelProvider: "Choose which provider to prefer when both OpenAI and Gemini API keys are saved. Model dropdowns follow this provider.",
@@ -13213,6 +13291,30 @@ function taskGenerationPromptTemplateSetting(containerEl, plugin) {
         dropdown.setValue(values.has(current) ? current : (candidates[0]?.source || candidates[0]?.name || current));
       }).catch((error) => {
         console.error("Could not load task generation templates", error);
+      });
+    });
+}
+
+function taskGenerationPromptProfileSettings(containerEl, plugin) {
+  new Setting(containerEl)
+    .setName("Task-generation prompt profile mode")
+    .setDesc(settingDescription("Task-generation prompt profile mode", "taskGenerationPromptProfileMode", "Auto follows the exact configured primary model when it is GPT 5.6 Luna or GPT 5.6 Terra; Manual uses the saved profile below."))
+    .addDropdown((dropdown) => {
+      dropdown.addOption("auto", "Auto");
+      dropdown.addOption("manual", "Manual");
+      dropdown.setValue(normalizeTaskGenerationPromptProfileMode(plugin.settings.taskGenerationPromptProfileMode)).onChange(async (value) => {
+        plugin.settings.taskGenerationPromptProfileMode = normalizeTaskGenerationPromptProfileMode(value);
+        await plugin.saveSettings();
+      });
+    });
+  new Setting(containerEl)
+    .setName("Task-generation prompt profile")
+    .setDesc(settingDescription("Task-generation prompt profile", "taskGenerationPromptProfile", "Choose the bounded task and description guidance used when prompt profile mode is Manual."))
+    .addDropdown((dropdown) => {
+      for (const profile of TASK_GENERATION_PROMPT_PROFILES) dropdown.addOption(profile, TASK_GENERATION_PROMPT_PROFILE_NAMES[profile]);
+      dropdown.setValue(normalizeTaskGenerationPromptProfile(plugin.settings.taskGenerationPromptProfile)).onChange(async (value) => {
+        plugin.settings.taskGenerationPromptProfile = normalizeTaskGenerationPromptProfile(value);
+        await plugin.saveSettings();
       });
     });
 }
@@ -22869,9 +22971,7 @@ function taskDescriptionTaskReferenceSourceKind(sourceKind = "") {
 
 const TASK_DESCRIPTION_MATERIAL_ADMISSION_REASONS = new Set([
   "task-semantic-current-open-continuation-selected",
-  "task-semantic-exact-current-open-identity",
-  "task-semantic-history-relationship-material-selected",
-  "task-semantic-relationship-handoff-material-selected"
+  "task-semantic-exact-current-open-identity"
 ]);
 const TASK_DESCRIPTION_MAX_MATERIAL_FACT_REFS = 8;
 
@@ -28139,10 +28239,6 @@ function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = 
   const lines = String(sourceText || "").split("\n");
   const records = [];
   const markerActionLineIndexes = new Set();
-  const isBoundary = (line = "") => {
-    const trimmed = String(line || "").trim();
-    return !trimmed || /^#{1,6}\s/.test(trimmed) || /^[-*_]{3,}\s*$/.test(trimmed);
-  };
   const isMarkerLine = (line = "") => noteActionMarkerRegex(settings).test(String(line || ""));
   for (const marker of markerRecords || []) {
     const lineIndex = Math.max(0, Number(marker.line || 1) - 1);
@@ -28172,11 +28268,6 @@ function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = 
       if (!scoped.some((entry) => entry.line === lineNumber && entry.sourceSurface === text)) scoped.push({ line: lineNumber, sourceSurface: text });
     };
     if (match && Number(match.index || 0) > 0) add(lineIndex + 1, rawLine.slice(0, match.index));
-    for (const offset of [-1, 1]) {
-      const adjacentIndex = lineIndex + offset;
-      if (adjacentIndex < 0 || adjacentIndex >= lines.length || isBoundary(lines[adjacentIndex])) continue;
-      add(adjacentIndex + 1, lines[adjacentIndex]);
-    }
     records.push({ marker, records: scoped });
   }
   return records;
@@ -28292,9 +28383,9 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
         sourceSurface: context.sourceSurface,
         type: "summary",
         role: "primary-context",
-        mandatoryFor: [],
+        mandatoryFor: ["task", "description", "identity"],
         primaryContext: true,
-        optional: true
+        optional: false
       });
     }
   }
@@ -28338,7 +28429,7 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
     scope.mandatoryTaskFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("task")).map((fact) => String(fact.factId)));
     scope.mandatoryDescriptionFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("description")).map((fact) => String(fact.factId)));
     scope.mandatoryIdentityFactIds = uniqueValues(scopeFacts.filter((fact) => fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("identity")).map((fact) => String(fact.factId)));
-    scope.primaryContextFactIds = uniqueValues(scopeFacts.filter((fact) => fact.kind === "primary-context" && fact.type === "summary" && fact.role === "primary-context" && fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" && !(fact.mandatoryFor || []).length).map((fact) => String(fact.factId)));
+    scope.primaryContextFactIds = uniqueValues(scopeFacts.filter((fact) => fact.kind === "primary-context" && fact.type === "summary" && fact.role === "primary-context" && fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none").map((fact) => String(fact.factId)));
   }
   const primaryFactId = boundedFacts.find((fact) => fact.sourceProvided)?.factId
     || boundedFacts.find((fact) => fact.kind !== "marked-action")?.factId
@@ -28911,7 +29002,7 @@ function enrichTaskWorkflowPrimaryContextFacts(tasks = [], sourceContract = null
   const contract = sourceContract || {};
   const factsByScope = new Map();
   for (const fact of contract.facts || []) {
-    if (fact?.kind !== "primary-context" || fact.type !== "summary" || fact.role !== "primary-context" || fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none" || (fact.mandatoryFor || []).length) continue;
+    if (fact?.kind !== "primary-context" || fact.type !== "summary" || fact.role !== "primary-context" || fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none") continue;
     const scopeId = String(fact.scopeId || "");
     if (!scopeId) continue;
     if (!factsByScope.has(scopeId)) factsByScope.set(scopeId, []);

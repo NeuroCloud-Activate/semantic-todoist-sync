@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.15
+
+- Separated semantic note content from provenance when building embeddings, keeping scoped task references eligible without letting path metadata dominate matching.
+- Required exact task-scoped historical facts in descriptions while omitting competing optional history after the relevant evidence is selected.
+- Reduced description input while preserving grounded execution detail; both Luna/High and Terra/Medium provider-equivalent checks produced 6/6 accepted descriptions.
+
 ## 0.7.14
 
 - Kept same-line marker context authoritative and grounded for its task while requiring neighboring lines to pass semantic admission before they are included.

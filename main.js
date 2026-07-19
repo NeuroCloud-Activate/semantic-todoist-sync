@@ -44,7 +44,7 @@ const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
-const SEMANTIC_EMBEDDING_CONTENT_VERSION = 2;
+const SEMANTIC_EMBEDDING_CONTENT_VERSION = 3;
 const SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION = 1;
 const SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION = 2;
 const SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND = "task-reference-parent-stub";
@@ -864,12 +864,15 @@ function taskSemanticCurrentSourceCandidateDecision(item = {}, source = {}, sour
   return { admitted: true, item: Object.assign({}, item, metadata, { chunk: Object.assign({}, chunk, metadata) }), metadata };
 }
 
-function taskSemanticScopeResolverIndex(resolverIndex = [], source = {}, sourceContract = {}, scopeId = "", task = {}) {
+function taskSemanticScopeResolverIndex(resolverIndex = [], source = {}, sourceContract = {}, scopeId = "", task = {}, lane = null) {
   const normalizedScopeId = String(scopeId || task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || "");
   const scope = (sourceContract?.scopes || []).find((entry) => String(entry?.scopeId || entry?.id || "") === normalizedScopeId) || {};
   const marker = (sourceContract?.explicitMarkers || []).find((entry) => String(entry?.scopeId || "") === normalizedScopeId) || {};
   const sourceType = String(sourceContract?.sourceType || sourceContract?.source_type || source?.type || "note").toLowerCase();
   const markedScope = sourceType === "note" && (scope.family === "marked-action" || scope.markerIndex !== undefined || marker.scopeId === normalizedScopeId);
+  const laneOrigin = String(lane?.origin || lane?.name || "").toLowerCase();
+  const activeSourceSeedLane = !lane || ["action", "source-statement", "terminology", "current-vault"].some((origin) => laneOrigin === origin || laneOrigin.startsWith(`${origin}-`));
+  if (!activeSourceSeedLane) return { chunks: resolverIndex, lineRanges: [], degradedReason: "" };
   const lineRanges = markedScope ? taskSemanticScopeLineRanges(sourceContract, normalizedScopeId, task) : [];
   if (!lineRanges.length) return { chunks: resolverIndex, lineRanges: [], degradedReason: "" };
   const sourcePath = vaultRelativePath(source?.path || sourceContract?.path || "");
@@ -5031,7 +5034,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     }
     const rawIndex = (this.semanticIndex || [])
-      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+      .filter((chunk) => semanticRetrievalChunkEligible(chunk, { isIndexablePath: (path) => this.isIndexablePath(path) }));
     const index = decorateSemanticIndexChunks(rawIndex, this.semanticIndexRevision || 0);
     const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
     const usableIndex = integrity.validChunks;
@@ -5719,7 +5722,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       try { await this.ensureSemanticIndexLoaded("task semantic search index"); } catch (error) { indexLoadError = error; }
     }
     const rawIndex = (this.semanticIndex || [])
-      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
+      .filter((chunk) => semanticRetrievalChunkEligible(chunk, { isIndexablePath: (path) => this.isIndexablePath(path) }));
     const index = decorateSemanticIndexChunks(rawIndex, revision);
     const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
     const usableIndex = integrity.validChunks;
@@ -5795,7 +5798,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const boundedResolverIndex = productionSemanticRoutingLookupRows(productionRoutingState.handleLookup, handleRequest)
           .map((row) => productionRoutingState.chunkByEvidenceId.get(productionRoutingState.routingIndex.evidenceIds[row]))
           .filter(Boolean);
-        const scopeResolver = taskSemanticScopeResolverIndex(boundedResolverIndex, source, sourceContract || {}, lane.scopeId, task);
+        const scopeResolver = taskSemanticScopeResolverIndex(boundedResolverIndex, source, sourceContract || {}, lane.scopeId, task, lane);
         lane.lineScopeDegradedReason = scopeResolver.degradedReason;
         const resolved = resolveIndexedSemanticQueryHandles(scopeResolver.chunks, handleRequest);
         lane.queryHandles = resolved.handles || [];
@@ -17989,6 +17992,22 @@ function isSemanticNoiseChunk(chunk = "") {
   return todoistPlaceholder && text.length < 500;
 }
 
+function semanticRetrievalChunkEligible(chunk = {}, options = {}) {
+  if (!chunk || typeof chunk !== "object" || isSemanticNoiseChunk(chunk)) return false;
+  const sourceKind = semanticChunkSourceKind(chunk);
+  const path = vaultRelativePath(chunk.path || chunk.provenance?.path || "");
+  const isIndexablePath = typeof options.isIndexablePath === "function" ? options.isIndexablePath : () => true;
+  const evidenceId = String(chunk.evidenceId || chunk.evidence_id || chunk.id || chunk.chunkId || chunk.chunk_id || "").trim();
+  if (!evidenceId || chunk.nonEvidence === true || chunk.isEvidence === false) return false;
+  if (sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND || isLegacyGroupedTaskReferenceChunk(chunk)) return false;
+  if (chunk.retrievalEligible === false || chunk.taskReference?.retrievalEligible === false) return false;
+  if (chunk.stale === true || chunk.tombstoned === true || chunk.orphan === true || chunk.indexMetadata?.stale === true || chunk.indexMetadata?.tombstoned === true) return false;
+  const syntheticTaskPath = path.startsWith(SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX);
+  if (syntheticTaskPath) return semanticTaskReferenceChunkSelected(chunk) && chunk.retrievalEligible !== false;
+  if (isNonVaultTaskReferencePath(path)) return false;
+  return Boolean(path && isIndexablePath(path));
+}
+
 function formatContext(chunks, settings = DEFAULT_SETTINGS, query = "", options = {}) {
   const hasCitationMap = options.citationMap instanceof Map;
   return chunks.map((chunk, index) => {
@@ -19386,6 +19405,37 @@ function taskSemanticCandidateMatchesRequestScope(item = {}, request = {}, optio
   return taskMatch && scopeMatch;
 }
 
+function taskSemanticCandidateHasExactRequestScopeClosure(item = {}, request = {}, options = {}) {
+  if (!taskSemanticCandidateMatchesRequestScope(item, request, options)) return false;
+  const chunk = item?.chunk || item || {};
+  const task = options.task && typeof options.task === "object" ? options.task : {};
+  const taskId = String(options.taskId || request.taskId || task.taskId || task.task_id || task.id || "");
+  const scopeId = String(options.scopeId || request.scopeId || task.scopeId || task.scope_id || "");
+  const associations = uniqueTaskScopeAssociations([
+    ...(Array.isArray(item.taskScopeAssociations) ? item.taskScopeAssociations : []),
+    ...(Array.isArray(chunk.taskScopeAssociations) ? chunk.taskScopeAssociations : [])
+  ]);
+  const taskIds = uniqueValues([
+    item.taskId, item.task_id, ...(Array.isArray(item.taskIds) ? item.taskIds : []),
+    chunk.taskId, chunk.task_id, ...(Array.isArray(chunk.taskIds) ? chunk.taskIds : []),
+    ...associations.map((association) => association.taskId)
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+  const scopeIds = evidenceScopeIdsForChunk(Object.assign({}, chunk, {
+    scopeId: item.scopeId || item.scope_id || chunk.scopeId || chunk.scope_id,
+    scopeIds: uniqueValues([
+      ...(Array.isArray(item.scopeIds) ? item.scopeIds : []),
+      ...(Array.isArray(chunk.scopeIds) ? chunk.scopeIds : [])
+    ]),
+    taskScopeAssociations: associations
+  }));
+  return taskIds.length === 1
+    && taskIds[0] === taskId
+    && scopeIds.length === 1
+    && scopeIds[0] === scopeId
+    && associations.every((association) => (!association.taskId || association.taskId === taskId)
+      && (!association.scopeId || association.scopeId === scopeId));
+}
+
 function taskSemanticMaterialSemanticEligibility(item = {}, dimensionResult = null) {
   const baseScore = Number(item.semanticBaseScore ?? item.semanticScore ?? item.semantic ?? 0);
   if (!Number.isFinite(baseScore) || baseScore <= 0) return false;
@@ -19730,6 +19780,7 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     Number(right.aggregateContribution || 0) - Number(left.aggregateContribution || 0)
     || Number(right.semantic || 0) - Number(left.semantic || 0)
     || semanticTaskCandidateStableKey(left).localeCompare(semanticTaskCandidateStableKey(right)));
+  const selectedFusedByKey = new Map(fused.map((item) => [semanticTaskCandidateStableKey(item), item]));
   const historyEligible = rawDimensionResults.some((result) => result.dimension === "history-thread" && result.selected.length > 0);
   const continuityEligible = rawDimensionResults.some((result) => result.dimension === "task-continuity" && result.selected.length > 0);
   const structuralReservations = fused.filter((item) => {
@@ -19742,10 +19793,23 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
   const continuityReservation = fused.find((item) => supportedContinuityKeys.has(semanticTaskCandidateStableKey(item))) || null;
   const historyDimensionResult = rawDimensionResults.find((result) => result.dimension === "history-thread");
   const relationshipDimensionResult = rawDimensionResults.find((result) => result.dimension === "relationship-handoff");
-  const historyCandidatesByKey = new Map((historyDimensionResult?.selected || []).map((candidate) => {
-    const source = candidate[TASK_SEMANTIC_DIMENSION_SOURCE_RECORD] || {};
-    return [semanticTaskCandidateStableKey(source), { candidate, source }];
-  }));
+  const authoritativeDimensionResult = rawDimensionResults.find((result) => result.dimension === "authoritative-source");
+  const currentVaultDimensionResult = rawDimensionResults.find((result) => result.dimension === "current-vault");
+  const dimensionCandidatesByKey = (dimensionResult, candidates = dimensionResult?.candidates || []) => {
+    const byKey = new Map();
+    for (const candidate of candidates) {
+      const source = candidate[TASK_SEMANTIC_DIMENSION_SOURCE_RECORD] || {};
+      const key = semanticTaskCandidateStableKey(source);
+      const previous = byKey.get(key);
+      if (!previous || Number(candidate.weightedContribution || 0) > Number(previous.candidate.weightedContribution || 0)) {
+        byKey.set(key, { candidate, source });
+      }
+    }
+    return byKey;
+  };
+  const historyCandidatesByKey = dimensionCandidatesByKey(historyDimensionResult, historyDimensionResult?.selected || []);
+  const authoritativeCandidatesByKey = dimensionCandidatesByKey(authoritativeDimensionResult);
+  const currentVaultCandidatesByKey = dimensionCandidatesByKey(currentVaultDimensionResult);
   const dimensionCoverageReservationKeys = new Set();
   const dimensionCoverageReservations = [];
   for (const result of rawDimensionResults) {
@@ -19842,33 +19906,12 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
       elbowGap: fusedAdmissionDistribution.elbowGap
     }
   };
-  const materialHistoryCandidates = [];
-  for (const relationshipCandidate of relationshipDimensionResult?.selected || []) {
-    const relationshipSource = relationshipCandidate[TASK_SEMANTIC_DIMENSION_SOURCE_RECORD] || {};
-    const key = semanticTaskCandidateStableKey(relationshipSource);
-    if (!selectedKeys.has(key)) continue;
-    const history = historyCandidatesByKey.get(key);
-    const source = history?.source || relationshipSource;
+  const materialCandidate = ({ key, source, fusedCandidate, dimensions, dimensionEntries, materialityReason }) => {
     const chunk = source?.chunk || source || {};
-    const temporalRelation = String(source.temporalRelation || chunk.temporalRelation || semanticTemporalRelation(chunk, {}) || "").toLowerCase();
-    const consensusEligible = Boolean(history && taskSemanticMaterialSemanticEligibility(source, historyDimensionResult));
-    const relationshipEligible = !history && taskSemanticRelationshipMaterialEligibility(relationshipCandidate, relationshipDimensionResult);
-    if (semanticTaskReferenceChunkSelected(chunk)
-      || semanticChunkSourceKind(chunk) !== "note"
-      || temporalRelation !== "historical"
-      || !semanticCandidateIsAdmissible(source)
-      || (!consensusEligible && !relationshipEligible)
-      || !taskSemanticCandidateMatchesRequestScope(source, request, options)) continue;
-    const fusedCandidate = fused.find((item) => semanticTaskCandidateStableKey(item) === key);
-    if (!fusedCandidate) continue;
-    const dimensions = history ? ["history-thread", "relationship-handoff"] : ["relationship-handoff"];
-    const weights = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimension === "history-thread"
-      ? history?.candidate?.dimensionWeight || historyDimensionResult?.normalizedWeight || 0
-      : relationshipCandidate.dimensionWeight || relationshipDimensionResult?.normalizedWeight || 0)]));
-    const contributions = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimension === "history-thread"
-      ? history?.candidate?.weightedContribution || 0
-      : relationshipCandidate.weightedContribution || 0)]));
-    materialHistoryCandidates.push({
+    const weights = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimensionEntries[dimension]?.candidate?.dimensionWeight
+      || dimensionEntries[dimension]?.result?.normalizedWeight || 0)]));
+    const contributions = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimensionEntries[dimension]?.candidate?.weightedContribution || 0)]));
+    return {
       key,
       source,
       fusedCandidate,
@@ -19876,19 +19919,73 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
       dimensions,
       weights,
       contributions,
-      materialityReason: history
-        ? "task-semantic-history-relationship-material-selected"
-        : "task-semantic-relationship-handoff-material-selected",
-      sourceCoverageReserved: Boolean(history
-        && history.candidate.admissionReason === "dimension-distinct-source-reserved"
-        && relationshipCandidate.admissionReason === "dimension-distinct-source-reserved"),
+      materialityReason,
+      sourceCoverageReserved: dimensions.every((dimension) => dimensionEntries[dimension]?.candidate?.admissionReason === "dimension-distinct-source-reserved"),
       aggregateContribution: Number(fusedCandidate.aggregateContribution || 0) || Object.values(contributions).reduce((sum, value) => sum + value, 0)
-    });
+    };
+  };
+  const exactHistoricalMaterialSource = (sources = []) => sources.find((source) => {
+    const chunk = source?.chunk || source || {};
+    const temporalRelation = String(source?.temporalRelation || chunk.temporalRelation || semanticTemporalRelation(chunk, {}) || "").toLowerCase();
+    return !semanticTaskReferenceChunkSelected(chunk)
+      && semanticChunkSourceKind(chunk) === "note"
+      && temporalRelation === "historical"
+      && semanticCandidateIsAdmissible(source)
+      && taskSemanticCandidateHasExactRequestScopeClosure(source, request, options);
+  }) || null;
+  const strongMaterialCandidates = [];
+  for (const [key, authoritative] of authoritativeCandidatesByKey) {
+    const currentVault = currentVaultCandidatesByKey.get(key);
+    const fusedCandidate = selectedFusedByKey.get(key);
+    const authoritativeEligible = Number(authoritative.candidate.weightedContribution || 0) > 0
+      && taskSemanticMaterialSemanticEligibility(authoritative.source, authoritativeDimensionResult);
+    const currentVaultEligible = Boolean(currentVault
+      && Number(currentVault.candidate.weightedContribution || 0) > 0
+      && taskSemanticMaterialSemanticEligibility(currentVault.source, currentVaultDimensionResult));
+    if (!authoritativeEligible || !currentVaultEligible || !fusedCandidate || !selectedKeys.has(key)) continue;
+    const source = exactHistoricalMaterialSource([authoritative.source, currentVault.source, fusedCandidate]);
+    if (!source) continue;
+    strongMaterialCandidates.push(materialCandidate({
+      key,
+      source,
+      fusedCandidate,
+      dimensions: ["authoritative-source", "current-vault"],
+      dimensionEntries: {
+        "authoritative-source": Object.assign({ result: authoritativeDimensionResult }, authoritative),
+        "current-vault": Object.assign({ result: currentVaultDimensionResult }, currentVault)
+      },
+      materialityReason: "task-semantic-authoritative-current-material-selected"
+    }));
   }
-  materialHistoryCandidates.sort((left, right) => Number(right.sourceCoverageReserved) - Number(left.sourceCoverageReserved)
+  const fallbackMaterialCandidates = [];
+  for (const relationshipCandidate of relationshipDimensionResult?.selected || []) {
+    const relationshipSource = relationshipCandidate[TASK_SEMANTIC_DIMENSION_SOURCE_RECORD] || {};
+    const key = semanticTaskCandidateStableKey(relationshipSource);
+    if (!selectedKeys.has(key)) continue;
+    const history = historyCandidatesByKey.get(key);
+    const fusedCandidate = selectedFusedByKey.get(key);
+    if (!history || !fusedCandidate || !taskSemanticMaterialSemanticEligibility(history.source, historyDimensionResult)) continue;
+    const source = exactHistoricalMaterialSource([history.source, relationshipSource, fusedCandidate]);
+    if (!source) continue;
+    fallbackMaterialCandidates.push(materialCandidate({
+      key,
+      source,
+      fusedCandidate,
+      dimensions: ["history-thread", "relationship-handoff"],
+      dimensionEntries: {
+        "history-thread": Object.assign({ result: historyDimensionResult }, history),
+        "relationship-handoff": { candidate: relationshipCandidate, source: relationshipSource, result: relationshipDimensionResult }
+      },
+      materialityReason: "task-semantic-history-relationship-material-selected"
+    }));
+  }
+  const rankMaterialCandidates = (candidates) => candidates.sort((left, right) => Number(right.sourceCoverageReserved) - Number(left.sourceCoverageReserved)
     || Number(right.aggregateContribution || 0) - Number(left.aggregateContribution || 0)
     || left.key.localeCompare(right.key));
-  const materialReservation = materialHistoryCandidates[0] || null;
+  rankMaterialCandidates(strongMaterialCandidates);
+  rankMaterialCandidates(fallbackMaterialCandidates);
+  const materialReservation = strongMaterialCandidates[0] || fallbackMaterialCandidates[0] || null;
+  const materialHistoryCandidates = materialReservation ? [materialReservation] : [];
   const materialReservationByKey = Object.fromEntries(materialHistoryCandidates.map((candidate) => [candidate.key, {
     materialityState: "material-review-history-candidate",
     materialityReason: candidate.materialityReason,
@@ -21427,7 +21524,8 @@ function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_
     if (chunk.tombstoned === true || chunk.indexMetadata?.tombstoned === true) tombstonedCount += 1;
     const hierarchyIssue = hierarchy.issueBySourceId?.[String(chunk.sourceId || "")] || "";
     if (chunk.orphan === true || chunk.indexMetadata?.orphan === true || hierarchyIssue) orphanCount += 1;
-    if (missingIdentity || invalidDimension || invalidEmbeddingIdentity || duplicateEvidence || hierarchyIssue) {
+    const quarantined = chunk.quarantined === true || chunk.indexMetadata?.quarantined === true;
+    if (missingIdentity || invalidDimension || invalidEmbeddingIdentity || duplicateEvidence || hierarchyIssue || quarantined) {
       invalidIndices.add(index);
       continue;
     }
@@ -23084,6 +23182,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
   const selectedSupportingEvidenceIds = orderedSupporting.map((item) => item.evidenceId).filter(Boolean);
   const materialDescriptionFactRefs = [];
   let currentContinuationAdmitted = false;
+  const historicalMaterialCandidates = [];
   const exactFactBindings = new Set((bundle.fact_bindings || bundle.factBindings || []).map((binding) => [
     String(binding?.factId || binding?.fact_id || ""),
     String(binding?.evidenceId || binding?.evidence_id || ""),
@@ -23111,6 +23210,17 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     const exactTaskScopeMatch = Boolean(taskScopeId
       && (scopeIds.includes(taskScopeId) || closedFactScopeMatch)
       && exactTaskScopeAssociation);
+    const exactHistoricalTaskScopeAssociation = associations.every((association) => {
+      const associationScopeId = String(association?.scopeId || association?.scope_id || "");
+      const associationTaskId = String(association?.taskId || association?.task_id || "");
+      const canonicalScopeTaskId = associationScopeId ? `scope:${associationScopeId}` : "";
+      return (!taskScopeId || !associationScopeId || associationScopeId === taskScopeId)
+        && (!taskId || !associationTaskId || associationTaskId === taskId || associationTaskId === canonicalScopeTaskId);
+    });
+    const exactHistoricalTaskScopeMatch = Boolean(taskScopeId
+      && ((scopeIds.length === 1 && scopeIds[0] === taskScopeId) || closedFactScopeMatch)
+      && (!taskId || !item.taskId || String(item.taskId) === taskId)
+      && exactHistoricalTaskScopeAssociation);
     const currentOpen = item.current === true
       && taskDescriptionEvidenceCurrentState(item) === "open"
       && String(item.temporalRelation || "").toLowerCase() !== "historical";
@@ -23121,7 +23231,29 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       && taskDescriptionTaskReferenceSourceKind(item.sourceKind)
       && exactTaskScopeMatch
       && currentOpen;
-    if (!evidenceId || !usableEvidence || !currentOpenContinuation) continue;
+    const historicalMaterialCandidate = String(item.sourceKind || "").toLowerCase() === "note"
+      && !String(item.path || item.provenance?.path || "").startsWith("@todoist/")
+      && exactHistoricalTaskScopeMatch
+      && String(item.temporalRelation || "").toLowerCase() === "historical";
+    if (!evidenceId || !usableEvidence) continue;
+    if (historicalMaterialCandidate) {
+      const historyFacts = facts
+        .filter((fact) => String(fact.evidenceId || "") === evidenceId
+          && String(fact.scopeId || "") === taskScopeId
+          && String(fact.temporalRelation || "").toLowerCase() === "historical"
+          && fact.current !== true
+          && taskDescriptionFactIsNonAction(fact)
+          && exactFactBindings.has(taskDescriptionFactBindingKey(fact.factId, evidenceId, taskScopeId))
+          && fact.authorityState !== "rejected"
+          && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase()));
+      if (historyFacts.length) {
+        historicalMaterialCandidates.push({
+          item,
+          fact: historyFacts.sort((left, right) => String(left.factId || "").localeCompare(String(right.factId || "")))[0]
+        });
+      }
+    }
+    if (!currentOpenContinuation) continue;
     const requiresExactCurrentBinding = !scopeIds.length;
     const factIds = facts
       .filter((fact) => String(fact.evidenceId || "") === evidenceId
@@ -23136,6 +23268,9 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     if (!factIds.length) continue;
     materialDescriptionFactRefs.push(...factIds.slice(0, TASK_DESCRIPTION_MAX_MATERIAL_FACT_REFS - materialDescriptionFactRefs.length));
     if (currentOpenContinuation) currentContinuationAdmitted = true;
+  }
+  if (materialDescriptionFactRefs.length < TASK_DESCRIPTION_MAX_MATERIAL_FACT_REFS && historicalMaterialCandidates.length) {
+    materialDescriptionFactRefs.push(String(historicalMaterialCandidates[0].fact.factId));
   }
   const taskIdForScope = String(task.taskId || task.id || "");
   const taskScopedSelectedEvidenceIds = new Set(orderedSupporting
@@ -23171,7 +23306,8 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       && !["conflict", "conflicted", "rejected"].includes(fact.conflictState))
     .map((fact) => fact.factId));
   const priorityFactRefs = uniqueValues([...mandatoryPriorityFactRefs, ...materialDescriptionFactRefs, ...selectedSupportingFactRefs]);
-  const candidateSupportingFactRefs = selectedSupportingEvidenceIds.flatMap((evidenceId) => facts
+  const materialClosureActive = materialDescriptionFactRefs.length > 0;
+  const candidateSupportingFactRefs = materialClosureActive ? [] : selectedSupportingEvidenceIds.flatMap((evidenceId) => facts
     .filter((fact) => String(fact.evidenceId || "") === String(evidenceId)
       && taskScopedSelectedEvidenceIds.has(String(evidenceId))
       && String(fact.scopeId || "") === taskScopeId
@@ -23191,13 +23327,14 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     }
   };
   const primaryEvidenceId = String(primary.evidenceId || "");
-  addExecutionDetailRefs(facts
+  const primaryExecutionDetailFactRefs = facts
     .filter((fact) => String(fact.evidenceId || "") === primaryEvidenceId
       && fact.current === true
       && [fact.type, fact.kind, fact.role].some((value) => String(value || "").toLowerCase() === "primary-context"))
-    .map((fact) => fact.factId));
+    .map((fact) => fact.factId);
+  addExecutionDetailRefs(primaryExecutionDetailFactRefs);
   addExecutionDetailRefs(materialDescriptionFactRefs);
-  addExecutionDetailRefs(candidateSupportingFactRefs);
+  if (!materialClosureActive) addExecutionDetailRefs(candidateSupportingFactRefs);
   const sourceType = String(sourceContract?.sourceType || sourceContract?.source_type || "note").toLowerCase() === "email" ? "email" : "note";
   const citationNumbersBySource = new Map();
   let nextCitationNumber = sourceType === "email" ? 1 : 2;
@@ -23234,6 +23371,29 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     } : null,
     ...supporting.map((entry) => supportingCitationEntry(entry))
   ].filter(Boolean);
+  const bundleFactRefs = (bundle.factRefs || bundle.fact_refs || []).map(String).filter(Boolean);
+  const bundleFactBindings = (bundle.fact_bindings || bundle.factBindings || []).slice();
+  const modelFactRefs = materialClosureActive
+    ? uniqueValues([...priorityFactRefs, ...primaryExecutionDetailFactRefs])
+    : bundleFactRefs;
+  const modelFactRefSet = new Set(modelFactRefs);
+  const modelFactBindings = materialClosureActive
+    ? bundleFactBindings.filter((binding) => modelFactRefSet.has(String(binding?.factId || binding?.fact_id || "")))
+    : bundleFactBindings;
+  const modelEvidenceIds = materialClosureActive
+    ? uniqueValues([
+      primaryEvidenceId,
+      ...modelFactRefs.map((factId) => String(factsById.get(factId)?.evidenceId || "")),
+      ...modelFactBindings.map((binding) => String(binding?.evidenceId || binding?.evidence_id || ""))
+    ].filter(Boolean))
+    : (bundle.evidenceIds || bundle.evidence_ids || []).slice();
+  const modelEvidenceIdSet = new Set(modelEvidenceIds);
+  const modelCitationLedger = materialClosureActive
+    ? citationLedger.filter((entry) => modelEvidenceIdSet.has(String(entry.evidenceId || "")))
+    : citationLedger;
+  const modelSelectedSupportingEvidenceIds = materialClosureActive
+    ? modelEvidenceIds.slice()
+    : selectedSupportingEvidenceIds;
   const value = (field, aliases = []) => {
     for (const key of [field, ...aliases]) {
       const candidate = singleLine(task[key] || "");
@@ -23280,15 +23440,15 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       provenance: primary.provenance || {}
     },
     supportingSemanticEvidence: supporting,
-    citationLedger,
-    evidenceIds: (bundle.evidenceIds || bundle.evidence_ids || []).slice(),
-    factRefs: (bundle.factRefs || bundle.fact_refs || []).slice(),
+    citationLedger: modelCitationLedger,
+    evidenceIds: modelEvidenceIds,
+    factRefs: modelFactRefs,
     priorityFactRefs,
     materialDescriptionFactRefs: uniqueValues(materialDescriptionFactRefs),
     executionDetailFactRefs: uniqueValues(executionDetailFactRefs),
     candidateSupportingFactRefs: uniqueValues(candidateSupportingFactRefs),
-    selectedSupportingEvidenceIds,
-    factBindings: (bundle.fact_bindings || bundle.factBindings || []).slice(),
+    selectedSupportingEvidenceIds: modelSelectedSupportingEvidenceIds,
+    factBindings: modelFactBindings,
     requiredFactTypes: facts.filter((fact) => fact.current && ["task", "description", "identity"].some((target) => (sourceContract?.facts || []).find((candidate) => candidate.factId === fact.factId)?.mandatoryFor?.includes(target))).map((fact) => fact.type),
     typedFacts: facts
   };
@@ -23447,13 +23607,17 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
   };
   for (const item of mainTasks || []) {
     const rich = item.taskLocalEvidence || {};
+    const materialClosureActive = uniqueValues([
+      ...(rich.materialDescriptionFactRefs || []),
+      ...(rich.material_description_fact_refs || [])
+    ].map(String).filter(Boolean)).length > 0;
     addIds(referencedFactIds, [
       ...(rich.factRefs || []), ...(rich.fact_refs || []),
       ...(rich.priorityFactRefs || []), ...(rich.priority_fact_refs || []),
       ...(rich.materialDescriptionFactRefs || []), ...(rich.material_description_fact_refs || []),
       ...(rich.executionDetailFactRefs || []), ...(rich.execution_detail_fact_refs || []),
       ...(rich.candidateSupportingFactRefs || []), ...(rich.candidate_supporting_fact_refs || []),
-      ...(item.fact_refs || []), ...(item.factRefs || [])
+      ...(materialClosureActive ? [] : [...(item.fact_refs || []), ...(item.factRefs || [])])
     ]);
     for (const binding of rich.factBindings || rich.fact_bindings || item.fact_bindings || item.factBindings || []) {
       addIds(referencedFactIds, [binding?.factId || binding?.fact_id]);
@@ -26979,35 +27143,13 @@ function semanticPathChunksMatch(index, path, nextChunks, settings = DEFAULT_SET
 
 function semanticChunkEmbeddingInput(chunk) {
   if (semanticTaskReferenceChunkSelected(chunk)) return semanticTaskReferenceEmbeddingProjection(chunk);
-  const path = chunk?.path || "";
-  const project = chunk?.projectId
-    ? `project:${chunk.projectId}`
-    : semanticEmbeddingProjectContextLabel(path, chunk?.title || "");
-  const date = contextDatePart(chunk);
-  const sourceKind = semanticChunkSourceKind(chunk);
-  return [
-    `Title: ${chunk?.title || ""}`,
-    path ? `Vault path: ${path}` : "",
-    project ? `Project context: ${project}` : "",
-    date ? `Note date: ${date}` : "",
-    sourceKind === "note" ? "Content type: vault note" : `Content type: ${sourceKind}`,
-    sourceKind !== "note" && chunk?.sourceId ? `Source ID: ${chunk.sourceId}` : "",
-    sourceKind !== "note" && chunk?.parentId ? `Parent task ID: ${chunk.parentId}` : "",
-    sourceKind !== "note" && chunk?.parentOid ? `Parent OID: ${chunk.parentOid}` : "",
-    sourceKind !== "note" && (chunk?.rootTaskId || chunk?.rootId) ? `Root task ID: ${chunk.rootTaskId || chunk.rootId}` : "",
-    sourceKind !== "note" && chunk?.rootOid ? `Root OID: ${chunk.rootOid}` : "",
-    sourceKind !== "note" && chunk?.childTaskIds?.length ? `Child task IDs: ${chunk.childTaskIds.join(", ")}` : "",
-    sourceKind !== "note" && chunk?.childOids?.length ? `Child OIDs: ${chunk.childOids.join(", ")}` : "",
-    sourceKind !== "note" && chunk?.projectName ? `Todoist project: ${chunk.projectName}` : "",
-    sourceKind !== "note" && chunk?.section ? `Todoist section: ${chunk.section}` : "",
-    chunk?.text || ""
-  ].filter(Boolean).join("\n");
+  return semanticChunkSharedEmbeddingInput(chunk);
 }
 
 function semanticChunkEmbeddingRequestKey(chunk = {}) {
   const sourceKind = semanticChunkSourceKind(chunk);
   const taskReference = semanticTaskReferenceChunkSelected(chunk);
-  const input = taskReference ? semanticTaskReferenceEmbeddingProjection(chunk) : String(chunk.text || "").replace(/\s+/g, " ").trim();
+  const input = taskReference ? semanticTaskReferenceEmbeddingProjection(chunk) : semanticChunkSharedEmbeddingInput(chunk);
   const key = [String(SEMANTIC_EMBEDDING_CONTENT_VERSION), sourceKind];
   if (taskReference) key.push(String(SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION));
   key.push(semanticChunkContentFingerprint(input));

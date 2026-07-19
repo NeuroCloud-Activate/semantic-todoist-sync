@@ -28,6 +28,10 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync:
 
+Task descriptions now keep reliable task-scoped history while sending less
+repeated context, so useful past decisions and handoffs stay grounded without
+crowding out the work at hand.
+
 1. **Better context and task details**
 
    Task generation starts with the current note's request, then adds task-scoped

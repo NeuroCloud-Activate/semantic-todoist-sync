@@ -4,7 +4,7 @@ Semantic Todoist Sync is for people who live in Obsidian, but still need their a
 
 It builds a local semantic index of your vault, uses your own AI API key to understand note context, turns notes or forwarded emails into Todoist-ready tasks, writes those tasks back into Obsidian for traceability, and keeps the two sides synced. It can also preview a practical workday schedule from your Todoist tasks. The plugin keeps local Todoist and scheduler memory files so it can answer questions about existing tasks, plan from prior scheduling choices, and avoid pestering external APIs more than it needs to.
 
-> **AI vibecoded project:** This plugin was built collaboratively with AI using OpenAI Codex. Please review the code, security model, and workflow assumptions before using it with vault content, emails, or Todoist data you care about.
+> **AI-assisted project:** Please review the code, security model, and workflow assumptions before using it with vault content, emails, or Todoist data you care about.
 
 ## What It Does
 
@@ -26,7 +26,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync. In 0.7.18, the default task context allowance is now 24 relevant chunks, final dedup reuses stable IDs to cut repeated context, and compatible semantic indexes upgrade automatically as soon as the plugin starts. Todoist IDs/OIDs and parent links stay attached, while descriptions keep richer task-local detail and useful history. Desktop and mobile layouts stay responsive too.
+The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync. In 0.7.19, 48 remains a broad local semantic-evidence ceiling per task. Provider input now uses one batch-wide shared optional evidence pool capped at 48 unique records after stable-ID deduplication—not 48 per task—while protected current-source, mandatory, and material facts remain included. Final Sources/Context lists contain only evidence actually used or cited, not a count of retrieved candidates. Same-note source threads can retain more than two independently relevant facts when they pass scope and materiality checks, and stale or mismatched routing sidecars rebuild locally from the current index. Useful non-action history can contribute when it passes the same checks.
 
 Task descriptions now keep reliable task-scoped history and all materially
 useful local detail while sending less repeated context. Important decisions
@@ -36,11 +36,16 @@ repeating the task title.
 1. **Better context and task details**
 
    Task generation starts with the current note's request, then adds task-scoped
-   semantic context without mixing neighboring work. Essential context stays
-   protected while weaker optional matches are trimmed for the current request.
+   semantic context without mixing neighboring work. The broad local semantic-
+   evidence ceiling is 48 records per task; provider input uses one batch-wide
+   shared optional pool capped at 48 unique records after stable-ID
+   deduplication—not 48 per task. Protected current-source, mandatory, and
+   material facts remain included while weaker optional matches are trimmed for
+   the current request.
    Descriptions include all materially useful task-local detail beyond the title
    or requested action, carry selected facts and citations through the workflow,
-   and list only sources actually cited. Blank descriptions stop the save, and a
+   and final Sources/Context lists show only evidence actually used or cited—not
+   retrieved-candidate counts. Blank descriptions stop the save, and a
    parseable response can be retried once only after the plugin confirms its own
    prepared evidence is complete. You can also let task prompt profiles follow
    the selected model automatically or choose one manually, with better grounding
@@ -49,14 +54,18 @@ repeating the task title.
 2. **Less repetition and simpler workflows**
 
    Shared context and facts are reused across task and description steps, and final
-   dedup reuses stable IDs to cut repeated input while keeping task-specific
-   semantic signals intact. Matching review decisions and handoffs remain
-   available when repeated context is merged.
+   dedup reuses stable IDs to serialize repeated evidence once while keeping
+   task-specific semantic signals intact. Same-note source threads can retain
+   more than two independently relevant facts when each passes its own checks;
+   useful non-action history can contribute only after passing those checks.
+   Matching review decisions and
+   handoffs remain available when repeated context is merged.
    Local section titles use note and project context by default, so everyday
    captures need less setup. Automatic semantic-index compatibility rebuilds keep
    the last-good index available until a compatible replacement is ready. Settings,
    local time display, and mobile controls are clearer, with more responsive
-   layouts, separate result limits, and bounded resource settings.
+   layouts, separate result limits, and bounded resource settings. Stale or
+   mismatched semantic-routing sidecars rebuild locally from the current index.
 
 3. **Reliable models, references, and sync**
 

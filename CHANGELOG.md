@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.17
+
+- Kept direct exact selected fact text alongside canonical evidence so detailed task-scoped descriptions preserve reliable current and historical evidence.
+- Canonicalized citation identity and made source rendering idempotent, preventing duplicate primary sources across rerenders.
+- Added automatic semantic-index compatibility rebuilds that preserve the last-good index and pause retrieval until a compatible index is ready.
+- Improved responsive settings CSS for mobile and narrow layouts while removing an unsupported declaration for Obsidian compatibility.
+
 ## 0.7.16
 
 - Preserved semantic selector action-lane and task-focus metadata through final context deduplication, keeping exact-scope historical review facts available for grounded task descriptions.

@@ -532,7 +532,6 @@
   color: var(--link-color);
   font-weight: 600;
   border-bottom: 1px solid currentColor;
-  text-decoration: none;
 }
 
 .theme-dark .semantic-todoist-message-assistant .semantic-todoist-message-text a {
@@ -1482,7 +1481,34 @@
   overscroll-behavior-inline: contain;
 }
 
+.semantic-todoist-settings .semantic-todoist-settings-heading {
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-heading div,
+.semantic-todoist-settings .setting-item-info .setting-item-name,
+.semantic-todoist-settings .setting-item-info .setting-item-description {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-settings .setting-item {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .setting-item-info,
 .semantic-todoist-settings .setting-item-control {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .setting-item-control {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-start;
   max-width: 100%;
 }
 
@@ -1490,7 +1516,19 @@
 .semantic-todoist-settings .setting-item-control select,
 .semantic-todoist-settings .setting-item-control textarea,
 .semantic-todoist-settings .setting-item-control button {
+  min-width: 0;
   max-width: 100%;
+}
+
+.semantic-todoist-settings .setting-item-control button {
+  flex: 0 1 auto;
+  height: auto;
+  line-height: 1.25;
+  margin-inline-start: 0;
+  overflow-wrap: anywhere;
+  padding: 8px 12px;
+  text-align: center;
+  white-space: normal;
 }
 
 @media (max-width: 700px) {
@@ -1515,6 +1553,7 @@
   .semantic-todoist-settings .setting-item-control {
     justify-content: flex-start;
     flex-wrap: wrap;
+    margin-inline-start: 0;
   }
 }
 

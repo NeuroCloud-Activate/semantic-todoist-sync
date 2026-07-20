@@ -52,8 +52,10 @@ repeating the task title.
    repeated input while keeping task-specific semantic signals intact. Matching
    review decisions and handoffs remain available when repeated context is merged.
    Local section titles use note and project context by default, so everyday
-   captures need less setup. Settings, local time display, and mobile controls are
-   clearer, with separate result limits and bounded resource settings.
+   captures need less setup. Automatic semantic-index compatibility rebuilds keep
+   the last-good index available until a compatible replacement is ready. Settings,
+   local time display, and mobile controls are clearer, with more responsive
+   layouts, separate result limits, and bounded resource settings.
 
 3. **Reliable models, references, and sync**
 

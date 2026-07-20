@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.16
+
+- Preserved semantic selector action-lane and task-focus metadata through final context deduplication, keeping exact-scope historical review facts available for grounded task descriptions.
+- Made descriptions detailed, task-specific narratives that use all materially useful local evidence. Blank descriptions block persistence, and one bounded retry is allowed only for a parseable model-output failure after the plugin confirms its prepared input is valid.
+- Fresh July 9 production-equivalent checks with Luna/High and Terra/Medium each accepted 6/6 descriptions without retry or cross-task evidence leakage.
+
 ## 0.7.15
 
 - Separated semantic note content from provenance when building embeddings, keeping scoped task references eligible without letting path metadata dominate matching.

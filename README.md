@@ -28,28 +28,32 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync:
 
-Task descriptions now keep reliable task-scoped history while sending less
-repeated context, so useful past decisions and handoffs stay grounded without
-crowding out the work at hand.
+Task descriptions now keep reliable task-scoped history and all materially
+useful local detail while sending less repeated context. Important decisions
+and handoffs stay grounded without crowding out the work at hand or merely
+repeating the task title.
 
 1. **Better context and task details**
 
    Task generation starts with the current note's request, then adds task-scoped
    semantic context without mixing neighboring work. Essential context stays
    protected while weaker optional matches are trimmed for the current request.
-   Descriptions must include at least one task-specific execution detail beyond
-   the title or requested action, carry selected facts and citations through the
-   workflow, and list only sources actually cited. You can also let task prompt
-   profiles follow the selected model automatically or choose one manually, with
-   better grounding for named artifacts and useful execution detail.
+   Descriptions include all materially useful task-local detail beyond the title
+   or requested action, carry selected facts and citations through the workflow,
+   and list only sources actually cited. Blank descriptions stop the save, and a
+   parseable response can be retried once only after the plugin confirms its own
+   prepared evidence is complete. You can also let task prompt profiles follow
+   the selected model automatically or choose one manually, with better grounding
+   for named artifacts and useful execution detail.
 
 2. **Less repetition and simpler workflows**
 
    Shared context and facts are reused across task and description steps, reducing
-   repeated input while keeping useful detail. Local section titles use note and
-   project context by default, so everyday captures need less setup. Settings,
-   local time display, and mobile controls are clearer, with separate result
-   limits and bounded resource settings.
+   repeated input while keeping task-specific semantic signals intact. Matching
+   review decisions and handoffs remain available when repeated context is merged.
+   Local section titles use note and project context by default, so everyday
+   captures need less setup. Settings, local time display, and mobile controls are
+   clearer, with separate result limits and bounded resource settings.
 
 3. **Reliable models, references, and sync**
 

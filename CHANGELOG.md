@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.19
+
+- Kept 48 as a broad local semantic-evidence ceiling per task while provider input shares one batch-wide optional evidence pool capped at 48 unique records after stable-ID deduplication—not 48 per task—and protected current-source, mandatory, and material facts remain included.
+- Kept final Sources/Context lists limited to evidence actually used or cited, rather than retrieved-candidate counts.
+- Kept repeated evidence serialized once through final stable-ID deduplication while preserving task-local associations.
+- Let same-note source threads retain more than two independently relevant facts when each passes selector, task-scope, and materiality checks; ordinary non-action history remains gated by the same checks.
+- Added local self-rebuilds for stale or mismatched semantic-routing sidecars using embeddings from the current semantic index.
+
 ## 0.7.18
 
 - Raised the default task-context allowance to 24 relevant chunks, with adaptive selection so richer evidence is available without padding every request.
@@ -32,7 +40,7 @@
 
 - Kept same-line marker context authoritative and grounded for its task while requiring neighboring lines to pass semantic admission before they are included.
 - Added model-selectable Default, Luna, and Terra prompt-only profiles with Auto and Manual settings; profile guidance remains separate from worker and runtime transport.
-- Kept irrelevant history optional, including when upstream materiality classifies it as useful; both July 6 provider-equivalent testers produced 6/6 accepted descriptions.
+- Kept irrelevant history optional, including when upstream materiality classifies it as useful.
 
 ## 0.7.13
 
@@ -86,7 +94,7 @@
 
 ## 0.7.4
 
-- Corrected release metadata and root/testing/shareable mirror alignment, and removed unsupported CSS selectors/declarations for Obsidian compatibility; no runtime logic changed.
+- Corrected release metadata, aligned the public plugin files, and removed unsupported CSS selectors/declarations for Obsidian compatibility; no runtime logic changed.
 
 ## 0.7.3
 
@@ -125,13 +133,12 @@
   text and provenance serialize once, stable-ID references reuse cached records,
   later task-selected evidence remains complete, and the initial cached prefix
   stays byte-identical across both phases.
-- In a six-task live-vault A/B, estimated task-generation input fell from
-  68,077 tokens to 32,908 (-51.7%) and description input fell from 151,260 to
-  60,726 (about 60.0%), with the same 121,061-character prefix and hash reused.
-- GPT-5.6 Terra at Medium reasoning produced all six tasks and descriptions;
-  plugin validation accepted 6 and failed 0. Exact-phrase semantics, named
+- Estimated six-task task-generation input fell from 68,077 tokens to 32,908
+  (-51.7%), and description input fell from 151,260 to 60,726 (about 60.0%),
+  while reusing the same 121,061-character prefix and hash.
+- Preserved all six tasks and descriptions with exact-phrase semantics, named
   reviewer handoffs and history, sentence-end citations, zero Todoist writes,
-  and zero provider-generation API calls all passed.
+  and zero extra provider-generation API calls.
 - Changed the default OpenAI primary model to `gpt-5.6-terra` with Medium reasoning and the same-provider fallback to `gpt-5.6-luna` with Medium reasoning.
 - Migrated only the exact legacy OpenAI default model pair and exact legacy available-model list; legacy provider-default reasoning values move to Medium while custom models and reasoning settings remain preserved.
 - Added focused regression coverage for default selection, legacy migration preservation, fallback reasoning, compliant workflow traversal, and intentional blocking before Todoist mutation.
@@ -156,7 +163,7 @@
 - Added a fast local evidence-detail gate that uses the existing single targeted repair pass only when a description omits meaningful facts already present in its bounded evidence bundle.
 - Limited each task's source list to its primary note and the context notes actually cited in that task's narrative, with compact citation renumbering instead of attaching every plan-level source.
 - Preserved safe grounded narratives and added an extractive task-evidence fallback so local validation does not replace an actionable description with a source-only block when useful evidence remains.
-- Validated email and note generation against the live testing vault with intercepted Todoist writes, including task titles, descriptions, subtasks, labels, semantic context, source attribution, duplicate screening, and payload hygiene.
+- Kept email and note generation aligned across task titles, descriptions, subtasks, labels, semantic context, source attribution, duplicate screening, and clean Todoist payloads.
 
 ## 0.6.37
 
@@ -225,7 +232,7 @@
 
 - Preserved wording from note and email links when building Todoist descriptions, converting bare URLs into descriptive Markdown hyperlinks instead of exposing direct links.
 - Removed the repeated opening H1 from Email-To-Todoist log notes so the filename remains the document title and the note begins with workflow metadata.
-- Validated the installed plugin against the live testing vault's semantic index, task-reference snapshot, email/note generation paths, and AI-mediated deduplication path.
+- Kept the installed plugin's semantic index, task-reference snapshot, email/note generation, and AI-assisted deduplication paths working together.
 
 ## 0.6.27
 

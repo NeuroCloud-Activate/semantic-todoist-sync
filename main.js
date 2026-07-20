@@ -74,6 +74,7 @@ const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
 const STARTUP_SEMANTIC_INDEX_RESHARD_DELAY_MS = 120000;
 const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
+const SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS = 0;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 const SUBTASK_INDENT_REPAIR_VERSION = "stsubsync-indent-v2";
 const DEFAULT_TASK_HEADING = "## Semantic Todoist Sync - Action Items";
@@ -204,6 +205,9 @@ function emptySemanticIndexLoadTelemetry() {
     reads: 0,
     pathMetaReads: 0,
     completed: false,
+    compatibilityState: "idle",
+    compatibilityReason: "",
+    compatibilityKey: "",
     error: ""
   };
 }
@@ -230,7 +234,45 @@ function semanticIndexLoadTelemetrySnapshot(value = {}) {
     reads: number(value.reads),
     pathMetaReads: number(value.pathMetaReads),
     completed: Boolean(value.completed),
+    compatibilityState: text(value.compatibilityState || base.compatibilityState),
+    compatibilityReason: text(value.compatibilityReason || base.compatibilityReason, 120),
+    compatibilityKey: text(value.compatibilityKey || base.compatibilityKey, 24),
     error: text(value.error, 240)
+  };
+}
+
+function emptySemanticIndexCompatibilityRefresh() {
+  return {
+    state: "idle",
+    key: "",
+    reasonCode: "",
+    reason: "",
+    persistedGeneration: "",
+    storageFingerprint: "",
+    queuedAt: "",
+    startedAt: "",
+    completedAt: "",
+    attempts: 0,
+    error: ""
+  };
+}
+
+function semanticIndexCompatibilityRefreshSnapshot(value = {}) {
+  const base = emptySemanticIndexCompatibilityRefresh();
+  const text = (input, max = 120) => singleLine(input || "").slice(0, max);
+  const code = (input, max = 120) => text(input, max).replace(/[^a-z0-9._:-]+/gi, "-").replace(/^-+|-+$/g, "");
+  return {
+    state: text(value.state || base.state, 24),
+    key: text(value.key || base.key, 24),
+    reasonCode: code(value.reasonCode || base.reasonCode, 80),
+    reason: code(value.reason || base.reason, 160),
+    persistedGeneration: text(value.persistedGeneration || base.persistedGeneration, 80),
+    storageFingerprint: text(value.storageFingerprint || base.storageFingerprint, 80),
+    queuedAt: text(value.queuedAt || base.queuedAt, 40),
+    startedAt: text(value.startedAt || base.startedAt, 40),
+    completedAt: text(value.completedAt || base.completedAt, 40),
+    attempts: Math.max(0, Math.round(Number(value.attempts) || 0)),
+    error: code(value.error || base.error, 160)
   };
 }
 
@@ -1507,6 +1549,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.productionSemanticRoutingInvalidationSerial = 0;
     this.productionSemanticRoutingTelemetry = { state: "cold", reasonCode: "routing-state-not-prepared", providerCalls: 0, networkCalls: 0 };
     this.semanticIndexLoadTelemetry = emptySemanticIndexLoadTelemetry();
+    this.semanticIndexCompatibilityRefresh = emptySemanticIndexCompatibilityRefresh();
+    this.semanticIndexCompatibilityRefreshTelemetry = this.semanticIndexCompatibilityRefresh;
+    this.semanticIndexCompatibilityRefreshKeys = new Set();
+    this.semanticIndexCompatibilityRefreshTimer = null;
+    this.semanticIndexCompatibilityRefreshPromise = null;
     this.semanticIndexLoadStartedAt = 0;
     this.semanticIndexPendingLoadMode = "";
     this.semanticIndexLoaded = false;
@@ -1614,6 +1661,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     await this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings flush failed", error));
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
+    window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
+    this.semanticIndexCompatibilityRefreshTimer = null;
     window.clearTimeout(this.semanticIndexReshardTimer);
     this.semanticIndexReshardTimer = null;
     window.clearTimeout(this.taskReferenceSnapshotTimer);
@@ -1922,6 +1971,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   scheduleSemanticTaskReferenceRepair(reason = "integrity") {
     const prompt = reason === "snapshot-write" || reason === "snapshot-fingerprint-mismatch" || reason === "incremental-integrity";
     if (this.isUnloading) return false;
+    if (this.semanticIndexCompatibilityRefreshPending?.()) {
+      this.lastTaskReferenceRepairReason = "compatibility-refresh-pending";
+      return false;
+    }
     const snapshotFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || "";
     const persistedMeta = this.settings.semanticIndexMeta || {};
     const compatibility = semanticEmbeddingIndexCompatibility(this.settings, persistedMeta);
@@ -2518,8 +2571,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const current = this.semanticIndexLoadTelemetry || emptySemanticIndexLoadTelemetry();
     const elapsedMs = this.semanticIndexLoadStartedAt ? Math.max(0, Date.now() - this.semanticIndexLoadStartedAt) : Number(current.elapsedMs || 0);
     this.semanticIndexLoadStartedAt = 0;
+    const compatibilityPending = this.semanticIndexCompatibilityRefreshPending?.() === true;
     this.semanticIndexLoadTelemetry = semanticIndexLoadTelemetrySnapshot(Object.assign({}, current, {
-      state: error ? "failed" : "ready",
+      state: compatibilityPending ? "queued" : error ? "failed" : "ready",
       completed: true,
       elapsedMs,
       shardCount: Number(stats.shards || current.shardCount || 0),
@@ -2528,6 +2582,113 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       error: error?.message || error || ""
     }));
     return this.semanticIndexLoadTelemetry;
+  }
+
+  updateSemanticIndexCompatibilityRefresh(patch = {}) {
+    const current = this.semanticIndexCompatibilityRefresh || emptySemanticIndexCompatibilityRefresh();
+    const next = semanticIndexCompatibilityRefreshSnapshot(Object.assign({}, current, patch));
+    this.semanticIndexCompatibilityRefresh = next;
+    this.semanticIndexCompatibilityRefreshTelemetry = next;
+    this.updateSemanticIndexLoadTelemetry({
+      compatibilityState: next.state,
+      compatibilityReason: next.reasonCode,
+      compatibilityKey: next.key
+    });
+    this.refreshSidebarStatus();
+    return next;
+  }
+
+  semanticIndexCompatibilityRefreshPending() {
+    const state = this.semanticIndexCompatibilityRefresh?.state || "";
+    return state === "queued" || state === "running";
+  }
+
+  queueSemanticIndexCompatibilityRefresh(classification = {}) {
+    if (this.isUnloading) return false;
+    if (this.semanticIndexCompatibilityRefreshPending?.()) return false;
+    const settings = this.settings || DEFAULT_SETTINGS;
+    const meta = classification.meta || settings.semanticIndexMeta || {};
+    const key = String(classification.key || semanticIndexCompatibilityRefreshKey(settings, meta, classification.storageFingerprint || ""));
+    if (!key) return false;
+    this.semanticIndexCompatibilityRefreshKeys = this.semanticIndexCompatibilityRefreshKeys || new Set();
+    if (this.semanticIndexCompatibilityRefreshKeys.has(key)) return false;
+    this.semanticIndexCompatibilityRefreshKeys.add(key);
+    const reasonCodes = Array.isArray(classification.reasonCodes) ? classification.reasonCodes : [classification.reasonCode || "incompatible-generation"];
+    const reason = reasonCodes.filter(Boolean).slice(0, 4).join(",");
+    const queued = this.updateSemanticIndexCompatibilityRefresh({
+      state: "queued",
+      key,
+      reasonCode: classification.reasonCode || reasonCodes[0] || "incompatible-generation",
+      reason,
+      persistedGeneration: classification.persistedGeneration || meta.generation || "",
+      storageFingerprint: classification.storageFingerprint || "",
+      queuedAt: deviceTimestamp(),
+      startedAt: "",
+      completedAt: "",
+      attempts: Number(this.semanticIndexCompatibilityRefresh?.attempts || 0) + 1,
+      error: ""
+    });
+    this.logLocal("Semantic index compatibility rebuild queued", {
+      reason: queued.reasonCode,
+      key: queued.key,
+      generation: queued.persistedGeneration || ""
+    });
+    this.setSidebarStatus("Semantic index compatibility rebuild queued...");
+    const start = () => {
+      const current = this.semanticIndexCompatibilityRefresh || {};
+      if (this.isUnloading || current.key !== key || current.state !== "queued") return;
+      if (typeof this.canStartBackgroundWork === "function" && !this.canStartBackgroundWork()) {
+        this.semanticIndexCompatibilityRefreshTimer = window.setTimeout(() => {
+          this.semanticIndexCompatibilityRefreshTimer = null;
+          start();
+        }, 30000);
+        this.setSidebarStatus("Semantic index compatibility rebuild remains queued until idle...");
+        return;
+      }
+      this.updateSemanticIndexCompatibilityRefresh({ state: "running", startedAt: deviceTimestamp() });
+      this.setSidebarStatus("Rebuilding semantic index compatibility...");
+      let operation;
+      try {
+        operation = this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(false));
+      } catch (error) {
+        operation = Promise.reject(error);
+      }
+      this.semanticIndexCompatibilityRefreshPromise = Promise.resolve(operation)
+        .then((result) => {
+          const ok = result === true || Boolean(result?.ok);
+          const reasonCode = semanticIndexCompatibilityRefreshSnapshot({ reasonCode: ok ? String(result?.reasonCode || "rebuilt") : String(result?.reasonCode || "compatibility-rebuild-failed") }).reasonCode;
+          this.updateSemanticIndexCompatibilityRefresh({
+            state: ok ? "complete" : "failed",
+            reasonCode,
+            reason: ok ? "" : reasonCode,
+            completedAt: deviceTimestamp(),
+            error: ok ? "" : reasonCode
+          });
+          this.logLocal(ok ? "Semantic index compatibility rebuild complete" : "Semantic index compatibility rebuild failed", {
+            reason: reasonCode,
+            key
+          });
+          this.refreshSidebarStatus();
+          return result;
+        })
+        .catch((error) => {
+          const reasonCode = semanticIndexCompatibilityRefreshSnapshot({ reasonCode: String(error?.code || error?.message || "compatibility-rebuild-failed").split("\n")[0] }).reasonCode;
+          this.updateSemanticIndexCompatibilityRefresh({ state: "failed", reasonCode, reason: reasonCode, completedAt: deviceTimestamp(), error: reasonCode });
+          this.logLocal("Semantic index compatibility rebuild failed", { reason: reasonCode, key });
+          this.refreshSidebarStatus();
+          return semanticOperationResult({ ok: false, reasonCode });
+        });
+    };
+    if (typeof window?.setTimeout === "function") {
+      window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
+      this.semanticIndexCompatibilityRefreshTimer = window.setTimeout(() => {
+        this.semanticIndexCompatibilityRefreshTimer = null;
+        start();
+      }, SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS);
+    } else {
+      Promise.resolve().then(start);
+    }
+    return true;
   }
 
   recordSemanticIndexLoadYield() {
@@ -2602,6 +2763,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let shouldRewriteShardedIndex = false;
       let settingsChanged = false;
       let loadedFromDisk = false;
+      let compatibilityRefreshCandidate = null;
+      const rememberCompatibilityRefresh = (error) => {
+        if (error?.code !== "semantic-index-compatibility-refresh-required") return;
+        compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
+      };
       const applyLoaded = async (loaded, file, extraMeta = {}) => {
         this.semanticIndexStats = loaded.stats;
         this.semanticIndexKnownShardFiles = loaded.shardFiles || [];
@@ -2639,14 +2805,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await applyLoaded(loaded, indexFile);
         loadedFromDisk = true;
       } catch (error) {
+        rememberCompatibilityRefresh(error);
         if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
           try {
             const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
             await applyLoaded(loaded, SEMANTIC_INDEX_FILE, { legacy: true });
             loadedFromDisk = true;
-          } catch {}
+            compatibilityRefreshCandidate = null;
+          } catch (legacyError) {
+            rememberCompatibilityRefresh(legacyError);
+          }
         }
-        if (!this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
+        if (!compatibilityRefreshCandidate && !this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
           this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app, this.semanticIndexRevision);
           this.invalidateSemanticRetrievalCache();
           delete this.settings.semanticIndex;
@@ -2661,6 +2831,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
           }
         }
+      }
+      if (compatibilityRefreshCandidate) {
+        restorePreviousState();
+        const queued = this.queueSemanticIndexCompatibilityRefresh(compatibilityRefreshCandidate);
+        return semanticOperationResult({
+          ok: false,
+          queued: queued ? 1 : 0,
+          reasonCode: queued ? "compatibility-rebuild-queued" : "compatibility-rebuild-suppressed"
+        });
       }
       if (!loadedFromDisk) {
         restorePreviousState();
@@ -2876,6 +3055,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${indexFile}`);
     const parsed = JSON.parse(raw);
+    const preflightCompatibility = parsed && typeof parsed === "object" && parsed.meta
+      ? semanticIndexCompatibilityRefreshClassification(this.settings, parsed.meta, "")
+      : { compatible: true };
+    if (!preflightCompatibility.compatible) throw semanticIndexCompatibilityRefreshError(preflightCompatibility);
     if (Array.isArray(parsed.shards)) {
       if (!parsed.meta) throw new Error("Semantic-index manifest metadata is missing.");
       const manifestValidation = semanticIndexManifestValidation(parsed, indexFile, this.settings);
@@ -2929,6 +3112,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const integrity = semanticIndexIntegrity(chunks, chunks, integritySettings);
       if (chunks.length && integrity.health.invalidCount) throw new Error(`Semantic-index manifest corpus integrity failed: ${integrity.health.invalidCount}`);
       if (Number(manifestMeta.chunks) !== chunks.length) throw new Error("Semantic-index manifest chunk count mismatch.");
+      const compatibility = semanticIndexCompatibilityRefreshClassification(this.settings, manifestMeta, semanticIndexStorageFingerprint(raw, shardReads));
+      if (!compatibility.compatible) throw semanticIndexCompatibilityRefreshError(compatibility);
       return {
         parsed,
         chunks,
@@ -2938,6 +3123,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
     }
     const bytes = utf8ByteLength(raw);
+    const compatibility = semanticIndexCompatibilityRefreshClassification(this.settings, parsed?.meta || {}, semanticIndexStorageFingerprint(raw, []));
+    if (!compatibility.compatible) throw semanticIndexCompatibilityRefreshError(compatibility);
     const legacyChunks = Array.isArray(parsed.chunks) ? parsed.chunks : [];
     if (legacyChunks.length) {
       semanticIndexChunkIdentityValidation(legacyChunks);
@@ -3537,6 +3724,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexLoadTelemetry = emptySemanticIndexLoadTelemetry();
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
+    window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
+    this.semanticIndexCompatibilityRefreshTimer = null;
+    this.semanticIndexCompatibilityRefreshPromise = null;
+    this.semanticIndexCompatibilityRefresh = emptySemanticIndexCompatibilityRefresh();
+    this.semanticIndexCompatibilityRefreshTelemetry = this.semanticIndexCompatibilityRefresh;
+    this.semanticIndexCompatibilityRefreshKeys = new Set();
     window.clearTimeout(this.semanticIndexReshardTimer);
     this.semanticIndexReshardTimer = null;
     this.semanticIndexKnownShardFiles = [];
@@ -5082,6 +5275,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const plan = queryPlan || contextQueryPlan(query, "chat");
     const request = semanticRetrievalRequestMetadata(query, limit, plan, this.settings);
     const cacheKey = this.semanticRetrievalCacheKey(query, limit, plan);
+    if (this.semanticIndexCompatibilityRefreshPending?.() === true) {
+      return this.finalizeSemanticRetrievalContext([], request, {
+        indexState: "degraded-source-only",
+        degradedReason: "semantic-index-compatibility-refresh-pending",
+        candidateCount: 0,
+        elapsedMs: Date.now() - startedAt
+      });
+    }
     const cached = this.getSemanticRetrievalCache(cacheKey);
     if (cached) return cached;
     let indexLoadError = null;
@@ -5795,6 +5996,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       telemetry.elapsedMs = Date.now() - startedAt;
       return { byTask, taskKeyByIndex, telemetry };
     }
+    if (this.semanticIndexCompatibilityRefreshPending?.() === true) {
+      const degradedReason = "semantic-index-compatibility-refresh-pending";
+      telemetry.degraded = true;
+      telemetry.degradedReason = degradedReason;
+      for (const [indexValue, task] of flattened) {
+        const key = makeTaskKey(task, indexValue);
+        taskKeyByIndex[String(indexValue)] = key;
+        byTask[key] = { queryId: taskSemanticQueryId(sourceContract, task, indexValue, revision), context: [], telemetry: { indexState: "degraded-source-only", degradedReason, selected: [], rejected: [] } };
+        telemetry.rejectedEvidenceByTask[key] = [];
+      }
+      telemetry.elapsedMs = Date.now() - startedAt;
+      this.lastSemanticRetrievalTelemetry = telemetry;
+      return { byTask, taskKeyByIndex, telemetry };
+    }
     const resultCacheKey = taskSemanticRetrievalCacheKey({
       request: {
         requestId: `task-semantic-batch-${shortHash(JSON.stringify(flattened.map(([indexValue, task]) => [indexValue, makeTaskKey(task, indexValue)])))}`,
@@ -6330,6 +6545,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       indexState: "degraded-source-only",
       degradedReason: "semantic-index-empty"
     }));
+    if (this.semanticIndexCompatibilityRefreshPending?.() === true) {
+      const degradedReason = "semantic-index-compatibility-refresh-pending";
+      const telemetry = {
+        schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
+        queryId: schedulerSemanticBatchQueryId(list, revision, provider, model, dimension),
+        mode: "schedule",
+        sourceType: "semantic-index",
+        indexRevision: revision,
+        provider,
+        model,
+        dimension,
+        candidateCount: 0,
+        bundleCount: list.length,
+        taskIds: list.map((candidate) => String(candidate.id || "")).filter(Boolean),
+        scopeIds: list.map(schedulerSemanticScopeId).filter(Boolean),
+        selectedEvidenceByTask: {},
+        rejectedEvidenceByTask: {},
+        embeddingBatchCount: 0,
+        embeddingCacheHits: 0,
+        embeddingCacheMisses: 0,
+        embeddingCalls: 0,
+        runtimeExternalCalls: 0,
+        routingElapsedMs: 0,
+        routingCacheHits: 0,
+        routedCandidateCount: 0,
+        fullIndexScanCount: 0,
+        exactScorePairCount: 0,
+        exactScoreCacheHits: 0,
+        contextBundleElapsedMs: 0,
+        queryHandleSource: "indexed",
+        queryHandleCount: 0,
+        degraded: true,
+        indexHealth: {},
+        indexState: "degraded-source-only",
+        degradedReason,
+        elapsedMs: Date.now() - startedAt
+      };
+      this.lastSemanticRetrievalTelemetry = telemetry;
+      return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: telemetry.indexState, degradedReason })), telemetry };
+    }
 
     let indexLoadError = null;
     if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
@@ -8403,7 +8658,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         descriptionCitedEvidenceIds: sentenceValidation
           ? uniqueValues(sentenceValidation.sentences.flatMap((sentence) => sentence.evidence_ids || []).map(String).filter(Boolean))
           : undefined
-      } : truncateAtWord(summary, 1200));
+      } : summary);
       }
       for (const index of expectedIndexes) if (!seenIndexes.has(index)) failures.push({ taskIndex: index, reason: "description response omitted the task index", stage: "response" });
       return { validatedDescriptions, failures };
@@ -16898,7 +17153,11 @@ function allActiveWorkflowStatusItems(plugin) {
   if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: "Processing" });
   if (plugin.syncInProgress || fileSyncCount) items.push({ label: "Notes", value: `Syncing${fileSyncCount ? ` (${fileSyncCount})` : ""}` });
   else if (plugin.noteSyncTimer) items.push({ label: "Notes", value: "Sync queued" });
-  if (plugin.semanticIndexLoadInProgress) items.push({ label: "Index", value: "Loading" });
+  const compatibilityState = plugin.semanticIndexCompatibilityRefresh?.state || "";
+  if (compatibilityState === "queued") items.push({ label: "Index", value: "Compatibility rebuild queued" });
+  else if (compatibilityState === "running") items.push({ label: "Index", value: "Compatibility rebuild running" });
+  else if (compatibilityState === "failed") items.push({ label: "Index", value: `Compatibility rebuild failed${plugin.semanticIndexCompatibilityRefresh?.reasonCode ? ` (${plugin.semanticIndexCompatibilityRefresh.reasonCode})` : ""}` });
+  else if (plugin.semanticIndexLoadInProgress) items.push({ label: "Index", value: "Loading" });
   else if (plugin.semanticIndexLoadTimer) items.push({ label: "Index", value: "Cache queued" });
   else if (plugin.semanticIndexOptimizeInProgress) items.push({ label: "Index", value: "Optimizing" });
   else if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
@@ -24350,10 +24609,46 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
   addExecutionDetailRefs(primaryExecutionDetailFactRefs);
   addExecutionDetailRefs(materialDescriptionFactRefs);
   const sourceType = String(sourceContract?.sourceType || sourceContract?.source_type || "note").toLowerCase() === "email" ? "email" : "note";
-  const citationNumbersBySource = new Map();
+  const citationSourceRecords = [];
+  const normalizedCitationPath = (value) => vaultRelativePath(value, "").replace(/\/+/g, "/");
+  const normalizedCitationTitle = (value) => singleLine(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const citationSourceIdentity = (entry = {}) => ({
+    path: normalizedCitationPath(entry.path || entry.provenance?.path || ""),
+    sourceId: singleLine(entry.sourceId || entry.provenance?.sourceId || ""),
+    title: normalizedCitationTitle(entry.title || entry.provenance?.title || "")
+  });
+  const citationSourceMatches = (left, right) => {
+    // Two concrete paths are authoritative and must not collapse when they
+    // differ, even if a provider reused a source ID or title.
+    if (left.path && right.path) return left.path === right.path;
+    // A pathless alias may still resolve to a path-bearing source by its stable
+    // source ID. Title-only aliases remain a final fallback, never a bridge
+    // between distinct path-bearing notes.
+    if (left.sourceId || right.sourceId) return Boolean(left.sourceId && right.sourceId && left.sourceId === right.sourceId);
+    if (left.path || right.path) return false;
+    if (left.title && right.title) return left.title === right.title;
+    return false;
+  };
+  const citationNumberForSource = (entry, numberFactory) => {
+    const identity = citationSourceIdentity(entry);
+    const matched = citationSourceRecords.find((record) => citationSourceMatches(identity, record.identity));
+    if (matched) return matched.number;
+    const number = numberFactory();
+    citationSourceRecords.push({ identity, number });
+    return number;
+  };
   let nextCitationNumber = sourceType === "email" ? 1 : 2;
-  const primarySourceKey = singleLine(primary.path || primary.provenance?.path || sourceContract?.path || "");
-  if (sourceType === "note" && primarySourceKey) citationNumbersBySource.set(primarySourceKey, 1);
+  const primaryCitationEntry = Object.assign({}, primary, {
+    path: primary.path || primary.provenance?.path || sourceContract?.path || "",
+    sourceId: primary.sourceId || primary.provenance?.sourceId || sourceContract?.sourceId || "",
+    title: primary.title || primary.provenance?.title || sourceContract?.title || ""
+  });
+  if (sourceType === "note" && (primaryCitationEntry.path || primaryCitationEntry.sourceId || primaryCitationEntry.title)) {
+    citationSourceRecords.push({ identity: citationSourceIdentity(primaryCitationEntry), number: 1 });
+  }
   const emailDisplayEligible = (entry = {}) => Boolean(
     singleLine(entry.path || "")
       && !entry.taskId
@@ -24364,10 +24659,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     if (sourceType === "email" && !emailDisplayEligible(entry)) {
       return Object.assign({}, entry, { number: 0, section: "Email" });
     }
-    const sourceKey = singleLine(entry.path || entry.sourceId || entry.title || entry.evidenceId || "");
-    const existingNumber = sourceKey ? citationNumbersBySource.get(sourceKey) : null;
-    const number = Number.isInteger(existingNumber) ? existingNumber : nextCitationNumber++;
-    if (sourceKey && !citationNumbersBySource.has(sourceKey)) citationNumbersBySource.set(sourceKey, number);
+    const number = citationNumberForSource(entry, () => nextCitationNumber++);
     return Object.assign({}, entry, { number, section: sourceType === "email" ? "Context Notes" : "Context" });
   };
   const citationLedger = [
@@ -24816,11 +25108,10 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
       const semanticContext = projectedEvidence?.semanticContext || taskDescriptionSemanticContextEnvelope(projectedEvidence);
       if (Object.keys(semanticContext).length) normalizedFact.semanticContext = semanticContext;
       const projectedEvidenceCarriesExcerpt = typeof projectedEvidence?.excerpt === "string" && projectedEvidence.excerpt.length > 0;
-      if (evidenceText && normalizedFact.sourceSurface === evidenceText) {
-        delete normalizedFact.sourceSurface;
-      }
       if (normalizedFact.value && normalizedFact.value === evidenceText && projectedEvidenceCarriesExcerpt) {
-        delete normalizedFact.value;
+        // Keep the exact factual text directly on the shared fact row. The
+        // evidence pointer is supplemental and must not replace model-readable
+        // prose with an indirect lookup.
         normalizedFact.valueEvidenceId = evidenceId;
       }
       factsById.set(String(fact.factId), normalizedFact);
@@ -26033,6 +26324,7 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
   const lines = [workflowSourceType === "email" ? "Context Notes:" : "Sources:"];
   const seen = new Set();
   const rendered = [];
+  let ledgerRenderedLines = null;
   const add = (path) => {
     const cleanPath = singleLine(path || "");
     if (!cleanPath || seen.has(cleanPath)) return;
@@ -26063,7 +26355,34 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     const sourceEntries = workflowSourceType === "email"
       ? ledger.filter((entry) => Number(entry.number) > 0 && entry.sourceKind !== "current-source" && !entry.taskId && !taskDescriptionTaskReferenceSourceKind(entry.sourceKind) && !/^@todoist\//i.test(String(entry.path || "")))
       : ledger.filter((entry) => Number(entry.number) > 0);
-    for (const entry of sourceEntries) add(renderedCitation(entry));
+    const sourceIdentity = (entry) => ({
+      path: vaultRelativePath(entry.path || "", basePath),
+      sourceId: singleLine(entry.sourceId || ""),
+      title: singleLine(entry.title || "").replace(/\s+/g, " ").toLowerCase()
+    });
+    const sameSourceIdentity = (left, right) => {
+      if (left.path && right.path) return left.path === right.path;
+      if (left.sourceId || right.sourceId) return Boolean(left.sourceId && right.sourceId && left.sourceId === right.sourceId);
+      if (left.path || right.path) return false;
+      return Boolean(left.title && right.title && left.title === right.title);
+    };
+    const canonicalSourceEntries = new Map();
+    for (const entry of sourceEntries) {
+      const number = Number(entry.number);
+      const existing = canonicalSourceEntries.get(number);
+      if (existing && !sameSourceIdentity(sourceIdentity(existing), sourceIdentity(entry))) return "";
+      for (const [existingNumber, existingEntry] of canonicalSourceEntries.entries()) {
+        if (existingNumber !== number && sameSourceIdentity(sourceIdentity(existingEntry), sourceIdentity(entry))) return "";
+      }
+      const rank = entry.path ? 3 : entry.sourceId ? 2 : entry.title ? 1 : 0;
+      const existingRank = existing ? (existing.path ? 3 : existing.sourceId ? 2 : existing.title ? 1 : 0) : -1;
+      if (!existing || rank > existingRank) canonicalSourceEntries.set(number, entry);
+    }
+    ledgerRenderedLines = [];
+    for (const [number, entry] of [...canonicalSourceEntries.entries()].sort((left, right) => left[0] - right[0])) {
+      const citation = renderedCitation(entry);
+      if (citation) ledgerRenderedLines.push(String(number) + ". " + citation);
+    }
   } else {
     const currentPath = bundle.items?.find((item) => item.sourceKind === "current-source")?.provenance?.path || active?.path || "";
     if (workflowSourceType !== "email") add(vaultRelativePath(currentPath, basePath));
@@ -26075,7 +26394,8 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       add(path);
     }
   }
-  return rendered.length ? lines.concat(rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n") : "";
+  if (!rendered.length && !ledgerRenderedLines?.length) return "";
+  return lines.concat(ledgerRenderedLines || rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n");
 }
 
 function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFAULT_SETTINGS, basePath = "", includeSourceList = true, sourceType = "") {
@@ -26084,7 +26404,12 @@ function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFA
   const selectedEvidence = new Set(bundle.evidenceIds || bundle.evidence_ids || []);
   const selectedFacts = new Set(bundle.factRefs || bundle.fact_refs || []);
   const linkContext = (bundle.facts || []).filter((fact) => selectedFacts.has(fact.factId) && fact.kind === "source-link").map((fact) => fact.value).join("\n");
-  const summary = normalizeDescriptionLinks(cleanGeneratedDescriptionSummary(task.description || "", settings), linkContext, settings);
+  const descriptionText = String(task.description || "").replace(/\r\n/g, "\n");
+  const renderedSourceHeading = descriptionText.match(/(?:^|\n)[ \t]*(?:Sources:|Context Notes:|Source List:)[ \t]*(?:\n|$)/i);
+  const summaryInput = renderedSourceHeading
+    ? descriptionText.slice(0, renderedSourceHeading.index).trim()
+    : descriptionText.trim();
+  const summary = normalizeDescriptionLinks(cleanGeneratedDescriptionSummary(summaryInput, settings), linkContext, settings);
   if (!summary) return "";
   const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList, sourceType);
   const parts = [summary, sourceList].filter(Boolean);
@@ -26242,7 +26567,7 @@ function fallbackActionSummary(task, sourceText, contextChunks, sourceTitle = ""
   const activeContext = summarizeSourceForTaskContext(sourceText, query, 780, settings, { strictQuery: true });
   const vaultContext = summarizeSourceForTaskContext((contextChunks || []).map((chunk) => `${chunk.title || chunk.path}\n${chunk.text || ""}`).join("\n\n"), query, 420, settings, { strictQuery: true });
   const summary = removeTitleEcho(conciseDescriptionSummary(mergeStrings([activeContext], [vaultContext]), settings), task.content);
-  if (isUsefulDescriptionSummary(summary, task.content, settings) && taskDescriptionClarityReason(summary, task, settings) === "passed") return truncateAtWord(summary, 1200);
+  if (isUsefulDescriptionSummary(summary, task.content, settings) && taskDescriptionClarityReason(summary, task, settings) === "passed") return summary;
   const fallbackEvidence = evidence || {
     corpus: [sourceText, ...(contextChunks || []).map((chunk) => `${chunk.title || chunk.path || ""}\n${chunk.text || ""}`)].filter(Boolean).join("\n\n")
   };
@@ -26264,10 +26589,10 @@ function deterministicTaskFallbackDescription(task = {}, settings = DEFAULT_SETT
     : dependency
       ? `Given that ${fallbackDetailClause(dependency)}, ${action}.`
       : `${capitalizeSentenceStart(action)}.`;
-  const grounded = truncateAtWord([
+  const grounded = [
     lead,
     rationale && dependency && canonicalTaskMatchTitle(dependency) !== canonicalTaskMatchTitle(rationale) ? `Keep in mind that ${fallbackDetailClause(dependency)}.` : ""
-  ].filter(Boolean).join(" "), 1200);
+  ].filter(Boolean).join(" ");
   return taskDescriptionEvidenceReason(grounded, task, evidence, settings) === "passed" && taskDescriptionClarityReason(grounded, task, settings) === "passed"
     ? grounded
     : "";
@@ -26305,7 +26630,7 @@ function enrichTaskDescriptions(tasks, sourceText, contextChunks, sourceTitle = 
       [removeTitleEcho(activeContext, task.content)],
       [removeTitleEcho(vaultContext, task.content)]
     ));
-    task.description = truncateAtWord(enriched || base || activeContext || "", 1200);
+    task.description = enriched || base || activeContext || "";
     for (const subtask of task.subtasks || []) subtask.description = "";
   }
 }
@@ -26390,7 +26715,9 @@ function descriptionSourceList(active, contextNotes, basePath = "", sourceType =
 }
 
 function sourceListStartIndex(value) {
-  return String(value || "").search(/\b(?:source list|sources?|context notes?)\s*:/i);
+  const text = String(value || "").replace(/\r\n/g, "\n");
+  const match = /(?:^|\n)[ \t]*(?=(?:source list|sources?|context notes?)\s*:)/im.exec(text);
+  return match ? match.index + match[0].length : -1;
 }
 
 function splitDescriptionSourceListBlock(value) {
@@ -26608,7 +26935,7 @@ function cleanGeneratedDescriptionSummary(value, settings = DEFAULT_SETTINGS) {
     .replace(/\[truncated\]/gi, "")
     .replace(/\b(?:without|instead of)\s+reopening\s+(?:Notes|Email)_\d{2}_\d{2}_\d{2}_[A-Za-z0-9_-]+/gi, "")
     .replace(/\b(?:from|in|for)\s+the\s+(?:email\s+)?(?:thread|subject)(?:\s+with\s+subject)?\s+["“][^"”]+["”]\s*,?/gi, "")
-    .replace(/\b(document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?|source(?:s)?(?:\s+note)?|useful\s+vault\s+context|vault\s+context|note\s+context)\s*:\s*/gi, "")
+    .replace(/(^|\n)[ \t]*(?:document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?|source(?:s)?(?:\s+note)?|useful\s+vault\s+context|vault\s+context|note\s+context)\s*:\s*/gim, "$1")
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => {
@@ -26627,17 +26954,9 @@ function conciseDescriptionSummary(parts, settings = DEFAULT_SETTINGS) {
     .flatMap((part) => splitDescriptionSentences(part))
     .map((part) => cleanGeneratedDescriptionSummary(part, settings))
     .filter(Boolean);
-  const selected = [];
-  let length = 0;
-  for (const sentence of sentences) {
-    const nextLength = length + (selected.length ? 1 : 0) + sentence.length;
-    if (nextLength > 1200) continue;
-    selected.push(sentence);
-    length = nextLength;
-  }
-  if (selected.length) return selected.join(" ");
+  if (sentences.length) return sentences.join(" ");
   const fallback = cleanGeneratedDescriptionSummary((parts || []).join(" "), settings);
-  return truncateAtWord(fallback, 1200);
+  return fallback;
 }
 
 function splitDescriptionSentences(text) {
@@ -26673,8 +26992,7 @@ function stripMetadataSentences(text) {
 
 function isDescriptionMetadataLine(line) {
   const value = singleLine(line).replace(/^[-*]\s*/, "");
-  return /^(summary|source(?:s)?(?:\s+note)?|source list|primary note|context notes?|useful vault context|vault context|note context|document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?)\s*:/i.test(value) ||
-    /\b(document(?: topic)?|project|program|tags?|sub-?tasks?)\s*:/i.test(value);
+  return /^(summary|source(?:s)?(?:\s+note)?|source list|primary note|context notes?|useful vault context|vault context|note context|document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?)\s*:/i.test(value);
 }
 
 function stripTaskAndMetadataLines(text) {
@@ -26763,13 +27081,28 @@ function normalizeStoredSourceList(value) {
   const numbered = (startIndex, endIndex) => rawLines
     .slice(startIndex >= 0 ? startIndex + 1 : 0, endIndex >= 0 ? endIndex : rawLines.length)
     .filter((line) => /^\d+\.\s*/.test(line))
-    .map((line) => vaultRelativePath(line.replace(/^\d+\.\s*/, "").trim()))
-    .filter(Boolean);
+    .map((line) => {
+      const match = line.match(/^(\d+)\.\s*(.*)$/);
+      return { number: Number(match?.[1] || 0), source: vaultRelativePath(match?.[2] || "") };
+    })
+    .filter((entry) => entry.number > 0 && entry.source);
   const sourceItems = numbered(sourceHeadingIndex, contextHeadingIndex);
   const contextItems = numbered(contextHeadingIndex, -1);
-  const noteSources = uniqueValues([primary, ...sourceItems, ...((primary || sourceHeadingIndex >= 0) ? contextItems : [])].filter(Boolean)).slice(0, 8);
-  if (noteSources.length) return ["Sources:", ...noteSources.map((source, index) => `${index + 1}. ${source}`)].join("\n");
-  if (contextItems.length) return ["Context Notes:", ...uniqueValues(contextItems).slice(0, 8).map((source, index) => `${index + 1}. ${source}`)].join("\n");
+  const dedupeNumberedSources = (entries) => {
+    const seen = new Set();
+    return entries.filter((entry) => {
+      if (!entry?.source || seen.has(entry.source)) return false;
+      seen.add(entry.source);
+      return true;
+    });
+  };
+  const noteSources = dedupeNumberedSources([
+    ...(primary ? [{ number: 1, source: primary }] : []),
+    ...sourceItems,
+    ...((primary || sourceHeadingIndex >= 0) ? contextItems : [])
+  ]).slice(0, 8);
+  if (noteSources.length) return ["Sources:", ...noteSources.map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
+  if (contextItems.length) return ["Context Notes:", ...dedupeNumberedSources(contextItems).slice(0, 8).map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
   return "";
 }
 
@@ -32038,6 +32371,83 @@ function semanticEmbeddingIndexCompatibility(settings = DEFAULT_SETTINGS, meta =
     migrationRequired: Boolean(dimensionControlled && providerMatches && modelMatches && indexedDimension > 0 && !dimensionMatches),
     compatible: providerMatches && modelMatches && dimensionMatches
   };
+}
+
+function semanticIndexCompatibilityRefreshKey(settings = DEFAULT_SETTINGS, meta = {}, storageFingerprint = "") {
+  const anchor = meta?.semanticMaterialityAnchors || meta?.materialityAnchors || {};
+  return shortHash(JSON.stringify({
+    persistedGeneration: String(meta?.generation || ""),
+    storageFingerprint: String(storageFingerprint || meta?.storageFingerprint || ""),
+    provider: aiProviderForModel(settings.embeddingModel),
+    model: String(settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel),
+    targetDimension: semanticEmbeddingTargetDimension(settings),
+    persistenceSchemaVersion: SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION,
+    contentSchemaVersion: SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION,
+    embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+    taskReferenceEmbeddingProjectionVersion: SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION,
+    materialityAnchorVersion: SEMANTIC_MATERIALITY_ANCHOR_VERSION,
+    materialityAnchorProvider: String(anchor.provider || ""),
+    materialityAnchorModel: String(anchor.model || ""),
+    materialityAnchorDimension: Number(anchor.dimension || 0)
+  })).slice(0, 20);
+}
+
+function semanticIndexCompatibilityRefreshClassification(settings = DEFAULT_SETTINGS, meta = {}, storageFingerprint = "") {
+  const persisted = meta && typeof meta === "object" ? meta : {};
+  const versioned = Boolean(
+    persisted.generation ||
+    Number(persisted.persistenceSchemaVersion || 0) > 0 ||
+    Object.prototype.hasOwnProperty.call(persisted, "contentSchemaVersion") ||
+    Object.prototype.hasOwnProperty.call(persisted, "embeddingContentVersion") ||
+    Object.prototype.hasOwnProperty.call(persisted, "taskReferenceEmbeddingProjectionVersion") ||
+    persisted.semanticMaterialityAnchors || persisted.materialityAnchors
+  );
+  const reasonCodes = [];
+  if (versioned && !persisted.generation) reasonCodes.push("generation-missing");
+  if (versioned && Number(persisted.persistenceSchemaVersion || 0) !== SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION) reasonCodes.push("persistence-version-stale");
+  if (versioned && Number(persisted.contentSchemaVersion || 0) !== SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION) reasonCodes.push("content-version-stale");
+  if (versioned && Number(persisted.embeddingContentVersion || 0) !== SEMANTIC_EMBEDDING_CONTENT_VERSION) reasonCodes.push("embedding-content-version-stale");
+  if (versioned && Number(persisted.taskReferenceEmbeddingProjectionVersion || 0) !== SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION) reasonCodes.push("embedding-projection-version-stale");
+  if (versioned && Object.prototype.hasOwnProperty.call(persisted, "materialityAnchorVersion") && Number(persisted.materialityAnchorVersion || 0) !== SEMANTIC_MATERIALITY_ANCHOR_VERSION) reasonCodes.push("materiality-anchor-version-stale");
+  if (versioned && !String(persisted.provider || "")) reasonCodes.push("provider-metadata-missing");
+  if (versioned && !String(persisted.model || "")) reasonCodes.push("model-metadata-missing");
+  if (versioned && !Number(persisted.dimension || 0)) reasonCodes.push("dimension-metadata-missing");
+  const embedding = semanticEmbeddingIndexCompatibility(settings, persisted);
+  const hasProvider = Object.prototype.hasOwnProperty.call(persisted, "provider");
+  const hasModel = Object.prototype.hasOwnProperty.call(persisted, "model");
+  const hasDimension = Object.prototype.hasOwnProperty.call(persisted, "dimension");
+  if ((versioned || hasProvider) && !embedding.providerMatches) reasonCodes.push("provider-mismatch");
+  if ((versioned || hasModel) && !embedding.modelMatches) reasonCodes.push("model-mismatch");
+  if ((versioned || hasDimension) && embedding.dimensionControlled && (!embedding.indexedDimension || !embedding.dimensionMatches)) reasonCodes.push("dimension-mismatch");
+  if ((versioned || Object.prototype.hasOwnProperty.call(persisted, "targetDimension")) && embedding.dimensionControlled && Object.prototype.hasOwnProperty.call(persisted, "targetDimension") && Number(persisted.targetDimension || 0) !== embedding.targetDimension) reasonCodes.push("target-dimension-mismatch");
+  const anchors = semanticMaterialityAnchorCompatibility(settings, persisted);
+  if (versioned && !anchors.compatible) reasonCodes.push(`materiality-anchor-${anchors.reasonCode}`);
+  const persistedStorageFingerprint = String(persisted.storageFingerprint || "");
+  if (versioned && persistedStorageFingerprint && storageFingerprint && persistedStorageFingerprint !== storageFingerprint) reasonCodes.push("storage-fingerprint-mismatch");
+  const uniqueReasons = Array.from(new Set(reasonCodes));
+  const key = semanticIndexCompatibilityRefreshKey(settings, persisted, storageFingerprint);
+  return {
+    compatible: uniqueReasons.length === 0,
+    versioned,
+    meta: persisted,
+    reasonCode: uniqueReasons[0] || "compatible",
+    reasonCodes: uniqueReasons,
+    key,
+    persistedGeneration: String(persisted.generation || ""),
+    storageFingerprint: String(storageFingerprint || persistedStorageFingerprint || ""),
+    provider: embedding.provider,
+    model: embedding.model,
+    targetDimension: embedding.targetDimension,
+    persistedDimension: embedding.indexedDimension,
+    anchors
+  };
+}
+
+function semanticIndexCompatibilityRefreshError(classification = {}) {
+  const error = new Error(`Semantic-index compatibility refresh required: ${String(classification.reasonCode || "incompatible-generation")}.`);
+  error.code = "semantic-index-compatibility-refresh-required";
+  error.compatibilityRefresh = classification;
+  return error;
 }
 function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;

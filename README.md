@@ -26,7 +26,7 @@ It builds a local semantic index of your vault, uses your own AI API key to unde
 
 ## What's New
 
-The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync:
+The 0.7 line makes task capture more grounded, lighter, and easier to keep in sync. In 0.7.18, the default task context allowance is now 24 relevant chunks, final dedup reuses stable IDs to cut repeated context, and compatible semantic indexes upgrade automatically as soon as the plugin starts. Todoist IDs/OIDs and parent links stay attached, while descriptions keep richer task-local detail and useful history. Desktop and mobile layouts stay responsive too.
 
 Task descriptions now keep reliable task-scoped history and all materially
 useful local detail while sending less repeated context. Important decisions
@@ -48,9 +48,10 @@ repeating the task title.
 
 2. **Less repetition and simpler workflows**
 
-   Shared context and facts are reused across task and description steps, reducing
-   repeated input while keeping task-specific semantic signals intact. Matching
-   review decisions and handoffs remain available when repeated context is merged.
+   Shared context and facts are reused across task and description steps, and final
+   dedup reuses stable IDs to cut repeated input while keeping task-specific
+   semantic signals intact. Matching review decisions and handoffs remain
+   available when repeated context is merged.
    Local section titles use note and project context by default, so everyday
    captures need less setup. Automatic semantic-index compatibility rebuilds keep
    the last-good index available until a compatible replacement is ready. Settings,
@@ -61,8 +62,8 @@ repeating the task title.
 
    OpenAI defaults to GPT 5.6 Terra at Medium reasoning with GPT 5.6 Luna at
    Medium as the same-provider fallback; provider, model, and reasoning choices
-   remain configurable. Task-reference snapshots and semantic indexes repair and
-   align safely after note changes, reuse compatible data, and preserve Todoist
+   remain configurable. Task-reference snapshots and semantic indexes upgrade or
+   repair themselves automatically, reuse compatible data, and preserve Todoist
    IDs/OIDs, parent/subtask links, and project relationships through moves and
    swaps.
 

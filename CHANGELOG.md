@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.18
+
+- Raised the default task-context allowance to 24 relevant chunks, with adaptive selection so richer evidence is available without padding every request.
+- Reused stable evidence IDs during final task/description deduplication, cutting repeated context while keeping task-local facts, references, and history intact.
+- Refreshed the local semantic router schema and compatibility metadata while preserving Todoist IDs/OIDs and parent/subtask relationships through index upgrades.
+- Kept current instructions, relevant history, and source-thread evidence attached to the right task so descriptions stay detailed and task-specific.
+- Started compatible index upgrades immediately and removed a duplicate old-shard cleanup pass that could report a false persistence error.
+- Kept settings and sidebar layouts responsive across desktop and mobile.
+
 ## 0.7.17
 
 - Kept direct exact selected fact text alongside canonical evidence so detailed task-scoped descriptions preserve reliable current and historical evidence.

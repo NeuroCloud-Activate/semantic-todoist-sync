@@ -4,6 +4,9 @@ Plan.md
 .repowise/
 .mcp.json
 .claude/
+.env
+.env.*
+!.env.example
 
 # OS and editor noise
 .DS_Store

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1
+
+- Finalized adaptive Gemini and OpenRouter provider handling, including provider-aware model selection, bounded compatibility retries, request-sized output budgets, and 20-calls-per-minute free-router pacing.
+- Added provider-aware OpenWebUI/model worker and context-window discovery behavior, including model-affine lanes, configurable workers, and allocation-first context-window discovery.
+- Made response application and semantic-index persistence autosave-safe with queued target coordination, revision checks, and last-good recovery.
+- Refined compact responsive provider/model settings and sidebar controls for clearer operation choices on narrow panes and mobile layouts.
+- Documented the sanitized cross-provider validation snapshot across OpenAI, Gemini, OpenRouter, and OpenWebUI, including quality, completion, timing, and input-budget observations.
+
 ## 0.8.0
 
 - Changed current generation defaults to OpenAI GPT 5.6 Luna at explicit High reasoning with GPT 5.6 Terra at Medium fallback, and Gemini 3.5 Flash Lite primary with Gemini 3.5 Flash fallback; provider bulk routing now selects these explicit model priorities instead of the first lexicographically sorted discovery result while preserving saved per-operation choices until the user runs another bulk provider action.

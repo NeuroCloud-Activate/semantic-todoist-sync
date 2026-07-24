@@ -215,30 +215,47 @@
 }
 
 .semantic-todoist-view {
+  container-type: inline-size;
+  container-name: semantic-todoist-pane;
   display: flex;
   flex-direction: column;
   gap: 8px;
   height: 100%;
   min-height: 0;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   overflow: hidden;
   padding: 12px;
 }
 
+.semantic-todoist-view > * {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
 .semantic-todoist-header {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .semantic-todoist-header h3 {
   flex: 1 1 auto;
   margin: 0;
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .semantic-todoist-header button {
   border-radius: 6px;
   flex: 0 0 auto;
+  max-width: 100%;
 }
 
 .semantic-todoist-header-icon {
@@ -254,28 +271,53 @@
   flex-direction: column;
   gap: 4px;
   align-items: stretch;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.semantic-todoist-note-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-start;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  flex-wrap: wrap;
 }
 
 .semantic-todoist-note-label {
+  align-items: center;
   color: var(--text-muted);
+  display: inline-flex;
+  flex: 0 0 auto;
   font-size: var(--font-ui-small);
   font-weight: 600;
+  gap: 8px;
   line-height: 1.15;
+  max-width: 100%;
+  white-space: nowrap;
+  width: fit-content;
 }
 
 .semantic-todoist-note-picker {
+  width: 100%;
+  max-width: 100%;
   position: relative;
   min-width: 0;
 }
 
 .semantic-todoist-note-picker-line {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 34px;
-  gap: 5px;
+  display: block;
   min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .semantic-todoist-note-picker input {
+  box-sizing: border-box;
+  max-width: 100%;
   min-width: 0;
   width: 100%;
 }
@@ -295,18 +337,26 @@
   align-items: center;
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
+  box-sizing: border-box;
   color: var(--text-muted);
   display: inline-flex;
   font-size: var(--font-ui-smaller);
   font-weight: 700;
   justify-content: center;
   line-height: 1;
-  min-height: 32px;
-  min-width: 34px;
-  padding: 0;
+  min-height: 44px;
+  min-width: 44px;
+  flex: 0 0 auto;
+  margin-inline-start: 0;
+  padding: 0 8px;
   position: relative;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.semantic-todoist-note-chat-toggle:focus-within {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .semantic-todoist-note-chat-toggle input {
@@ -334,6 +384,9 @@
 
 .semantic-todoist-note-results {
   max-height: 180px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   overflow: auto;
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
@@ -345,9 +398,16 @@
 }
 
 .semantic-todoist-note-result {
-  padding: 7px 8px;
+  appearance: none;
+  background: transparent;
+  border: 0;
   border-bottom: 1px solid var(--background-modifier-border);
+  box-sizing: border-box;
   cursor: var(--cursor-link);
+  display: block;
+  padding: 9px 8px;
+  text-align: left;
+  width: 100%;
 }
 
 .semantic-todoist-note-result:last-child {
@@ -358,8 +418,21 @@
   background: var(--background-modifier-hover);
 }
 
+.semantic-todoist-note-result:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+
 .semantic-todoist-note-result strong {
   display: block;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-note-result-path {
+  color: var(--text-muted);
+  display: block;
+  font-size: var(--font-ui-smaller);
+  word-break: break-word;
 }
 
 .semantic-todoist-note-result div {
@@ -371,9 +444,13 @@
 .semantic-todoist-relevant {
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   padding: 7px 8px;
   background: var(--background-secondary);
   font-size: var(--font-ui-small);
+  overflow-wrap: anywhere;
 }
 
 .semantic-todoist-relevant {
@@ -390,7 +467,9 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 4px;
+  min-width: 0;
   width: 100%;
+  max-width: 100%;
 }
 
 .semantic-todoist-source-card {
@@ -400,8 +479,8 @@
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
   cursor: var(--cursor-link);
 }
 
@@ -420,6 +499,9 @@
 .semantic-todoist-view textarea {
   min-height: 76px;
   max-height: 34vh;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   resize: vertical;
 }
 
@@ -428,6 +510,9 @@
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   align-items: center;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .semantic-todoist-toolbar button {
@@ -441,6 +526,7 @@
   justify-content: center;
   line-height: 1;
   min-height: 34px;
+  max-width: 100%;
   padding-block: 0;
   text-align: center;
   white-space: nowrap;
@@ -452,6 +538,8 @@
   gap: 6px;
   grid-template-columns: auto minmax(0, 1fr);
   min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .semantic-todoist-action-label {
@@ -464,6 +552,11 @@
 .semantic-todoist-action-row select {
   border-radius: 6px;
   min-height: 34px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   width: 100%;
 }
 
@@ -474,7 +567,9 @@
   overflow: auto;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 280px;
+  min-height: min(280px, 28vh);
+  width: 100%;
+  max-width: 100%;
   background: var(--background-primary);
   user-select: text;
   -webkit-user-select: text;
@@ -508,6 +603,8 @@
   padding: 8px 10px;
   background: var(--background-secondary);
   font-size: var(--semantic-todoist-chat-font-size, 13px);
+  min-width: 0;
+  max-width: 100%;
   word-break: break-word;
   line-height: 1.35;
   user-select: text;
@@ -579,6 +676,9 @@
 
 .semantic-todoist-status {
   flex: 0 0 auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   min-height: calc(2 * 1.25em + 8px);
   max-height: calc(2 * 1.25em + 8px);
   overflow: hidden;
@@ -614,12 +714,18 @@
   overflow: auto;
   flex: 1;
   min-height: 0;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   white-space: pre-wrap;
   background: var(--background-secondary);
 }
 
 .semantic-todoist-activity-log {
   max-height: 260px;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
   overflow: auto;
   padding: 10px;
   border: 1px solid var(--background-modifier-border);
@@ -1112,6 +1218,10 @@
 }
 
 @media (max-width: 700px) {
+  .semantic-todoist-note-chat-toggle {
+    width: auto;
+  }
+
   .semantic-todoist-settings .setting-item {
     align-items: stretch;
     flex-direction: column;
@@ -1160,21 +1270,31 @@
   .semantic-todoist-header {
     align-items: center;
     flex-direction: row;
+    flex-wrap: wrap;
     gap: 5px;
   }
 
   .semantic-todoist-header h3 {
+    flex: 0 0 100%;
     font-size: 1.05em;
     min-width: 0;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    width: 100%;
   }
 
   .semantic-todoist-header button,
   .semantic-todoist-toolbar button {
+    box-sizing: border-box;
+    flex: 0 0 auto;
     font-size: var(--font-ui-small);
+    max-width: 100%;
     min-height: 30px;
+    min-width: 0;
+    white-space: nowrap;
+    width: auto;
   }
 
   .semantic-todoist-header-icon {
@@ -1192,7 +1312,6 @@
 
   .semantic-todoist-note-picker-line {
     gap: 3px;
-    grid-template-columns: minmax(0, 1fr) 28px;
   }
 
   .semantic-todoist-note-select {
@@ -1201,8 +1320,8 @@
 
   .semantic-todoist-note-chat-toggle {
     font-size: 0.62em;
-    min-height: 28px;
-    min-width: 28px;
+    min-height: 44px;
+    min-width: 44px;
   }
 
   .semantic-todoist-relevant,
@@ -1486,6 +1605,82 @@
   padding-bottom: 8px;
 }
 
+.semantic-todoist-settings .semantic-todoist-settings-disclosure {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 18px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary {
+  align-items: flex-start;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  min-height: 44px;
+  min-width: 0;
+  padding: 14px 0 8px;
+  position: relative;
+  width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary::before {
+  color: var(--text-muted);
+  content: "▸";
+  flex: 0 0 1em;
+  line-height: 1.4;
+  text-align: center;
+  transform-origin: center;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure[open] > summary::before {
+  content: "▾";
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary > .semantic-todoist-settings-summary-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary > .semantic-todoist-settings-summary-copy h3 {
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > summary > .semantic-todoist-settings-summary-copy > div {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-summary-status {
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
+  margin-inline-start: auto;
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > .setting-item,
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > table,
+.semantic-todoist-settings .semantic-todoist-settings-disclosure > pre {
+  max-width: 100%;
+}
+
 .semantic-todoist-settings .semantic-todoist-settings-heading div,
 .semantic-todoist-settings .setting-item-info .setting-item-name,
 .semantic-todoist-settings .setting-item-info .setting-item-description {
@@ -1520,6 +1715,20 @@
   max-width: 100%;
 }
 
+.semantic-todoist-settings .semantic-todoist-openwebui-unknown-context-fallback-input {
+  box-sizing: border-box;
+  min-height: 44px;
+  width: 100%;
+  max-width: 680px;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-model-load-timeout-input {
+  box-sizing: border-box;
+  min-height: 44px;
+  width: 100%;
+  max-width: 680px;
+}
+
 .semantic-todoist-settings .setting-item-control button {
   flex: 0 1 auto;
   height: auto;
@@ -1532,6 +1741,17 @@
 }
 
 @media (max-width: 700px) {
+  .semantic-todoist-settings .semantic-todoist-settings-disclosure > summary {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-summary-status {
+    flex-basis: auto;
+    margin-inline-start: 1.8em;
+    text-align: start;
+  }
+
   .semantic-todoist-settings .semantic-todoist-tabs {
     flex-wrap: nowrap;
     overflow-x: auto;
@@ -1593,4 +1813,405 @@
 .is-mobile .semantic-todoist-view button,
 .is-mobile .semantic-todoist-view .clickable-icon {
   min-height: 44px;
+}
+
+/* Searchable provider/model controls use a fixed popup so settings overflow
+ * and narrow mobile panes cannot clip the option list. */
+.semantic-todoist-searchable-combobox {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  position: relative;
+}
+
+/* Model and reasoning selectors need the full settings column: the description stays above
+ * the control so native Setting flex sizing cannot squeeze long model IDs. */
+.semantic-todoist-settings .semantic-todoist-model-setting,
+.semantic-todoist-settings .semantic-todoist-reasoning-setting {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-setting .setting-item-info,
+.semantic-todoist-settings .semantic-todoist-model-setting .setting-item-control,
+.semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-info,
+.semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-control {
+  flex: 0 1 auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-setting .setting-item-control {
+  justify-content: flex-start;
+  margin-inline-start: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-control {
+  justify-content: flex-start;
+  margin-inline-start: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-setting .semantic-todoist-searchable-combobox {
+  width: 100%;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-provider-setting {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-info,
+.semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-control {
+  flex: 0 1 auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 680px;
+}
+
+.semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-control {
+  justify-content: flex-start;
+  margin-inline-start: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-provider-setting select {
+  flex: 1 1 100%;
+  min-width: 0;
+  width: 100%;
+  max-width: 680px;
+}
+
+.semantic-todoist-searchable-combobox-input {
+  box-sizing: border-box;
+  display: block;
+  min-height: 44px;
+  width: 100%;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.semantic-todoist-searchable-combobox-selected-value {
+  display: none;
+  box-sizing: border-box;
+  min-height: 44px;
+  width: 100%;
+  max-width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: var(--text-normal);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.semantic-todoist-searchable-combobox.has-selected-value .semantic-todoist-searchable-combobox-selected-value {
+  display: block;
+}
+
+.semantic-todoist-searchable-combobox.has-selected-value:not(:focus-within) .semantic-todoist-searchable-combobox-input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  color: transparent;
+  caret-color: transparent;
+  background: transparent;
+  border-color: transparent;
+}
+
+.semantic-todoist-searchable-combobox.has-selected-value:not(:focus-within) .semantic-todoist-searchable-combobox-input:focus-visible {
+  border-color: var(--background-modifier-border);
+}
+
+.semantic-todoist-searchable-combobox-input:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.semantic-todoist-searchable-combobox-popup {
+  position: fixed;
+  --semantic-todoist-combobox-layer: 1100;
+  z-index: var(--layer-tooltip, var(--layer-menu, var(--semantic-todoist-combobox-layer)));
+  display: block;
+  max-width: calc(100vw - 16px);
+  min-height: 44px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+}
+
+.semantic-todoist-searchable-combobox-popup[hidden] {
+  display: none;
+}
+
+.semantic-todoist-searchable-combobox-group + .semantic-todoist-searchable-combobox-group {
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.semantic-todoist-searchable-combobox-group-label {
+  padding: 7px 10px 4px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-searchable-combobox-option {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  width: 100%;
+  max-width: 100%;
+  padding: 8px 10px;
+  border-radius: 4px;
+  color: var(--text-normal);
+  cursor: pointer;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  touch-action: manipulation;
+}
+
+.semantic-todoist-searchable-combobox-option:hover,
+.semantic-todoist-searchable-combobox-option.is-active,
+.semantic-todoist-searchable-combobox-option:focus-visible {
+  background: var(--background-modifier-hover);
+  outline: none;
+}
+
+.semantic-todoist-searchable-combobox-option[aria-selected="true"] {
+  color: var(--text-accent);
+  font-weight: 600;
+}
+
+.semantic-todoist-searchable-combobox-option[aria-disabled="true"] {
+  color: var(--text-faint);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.semantic-todoist-searchable-combobox-option-label {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.semantic-todoist-searchable-combobox-status {
+  min-height: 44px;
+  padding: 10px;
+  color: var(--text-muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.semantic-todoist-searchable-combobox-status.is-error {
+  color: var(--text-error);
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-settings .semantic-todoist-model-setting,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting,
+  .semantic-todoist-settings .semantic-todoist-model-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-model-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-model-setting .semantic-todoist-searchable-combobox,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-provider-setting,
+  .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-provider-setting select {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .semantic-todoist-searchable-combobox {
+    width: 100%;
+  }
+
+  .semantic-todoist-searchable-combobox-popup {
+    max-width: calc(100vw - 16px);
+  }
+}
+
+/* Obsidian's settings sidebar can leave a narrow plugin content column on
+ * phone-sized windows. Only collapse that host sidebar for this plugin; the
+ * plugin's own tab strip remains the navigation surface. */
+@media (max-width: 700px) {
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .vertical-tab-header {
+    display: none;
+  }
+
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .vertical-tabs-container,
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .vertical-tab-content-container,
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .vertical-tab-content,
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .semantic-todoist-settings {
+    box-sizing: border-box;
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .vertical-tab-content-container {
+    flex: 1 1 100%;
+  }
+
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .semantic-todoist-tabs {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .semantic-todoist-settings .semantic-todoist-model-setting,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting,
+  .semantic-todoist-settings .semantic-todoist-model-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-model-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-model-setting .semantic-todoist-searchable-combobox,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-reasoning-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-provider-setting,
+  .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-control,
+  .semantic-todoist-settings .semantic-todoist-provider-setting select {
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+/* Narrow settings panes keep every tab reachable without horizontal clipping. */
+@media (max-width: 700px) {
+  .semantic-todoist-settings .semantic-todoist-tabs,
+  .is-mobile .semantic-todoist-settings .semantic-todoist-tabs,
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .semantic-todoist-tabs {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    min-width: 0;
+    overflow: visible;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-tabs button {
+    display: block;
+    min-width: 0;
+    min-height: 44px;
+    width: 100%;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+}
+
+@media (max-width: 480px) {
+  .semantic-todoist-settings .semantic-todoist-tabs,
+  .is-mobile .semantic-todoist-settings .semantic-todoist-tabs,
+  .modal.mod-settings.mod-sidebar-layout:has(.semantic-todoist-settings) .semantic-todoist-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Keep settings actions intrinsically sized on desktop; stack them without
+ * clipping in narrow panes. */
+.semantic-todoist-settings .semantic-todoist-settings-action-setting {
+  align-items: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-info {
+  flex: 1 1 360px;
+  min-width: min(100%, 280px);
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  min-width: max-content;
+  width: auto;
+}
+
+.semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control button {
+  flex: 0 0 auto;
+  min-height: 44px;
+  min-width: 7rem;
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-info,
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {
+    justify-content: flex-start;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control button {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+@media (max-width: 520px) and (pointer: coarse) {
+  .semantic-todoist-header button {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+@container semantic-todoist-pane (max-width: 320px) {
+  .semantic-todoist-header {
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+
+  .semantic-todoist-header h3 {
+    flex: 0 0 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 100%;
+  }
+
+  .semantic-todoist-header button {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    max-width: 100%;
+    min-height: 44px;
+    min-width: 44px;
+    white-space: nowrap;
+    width: auto;
+  }
 }

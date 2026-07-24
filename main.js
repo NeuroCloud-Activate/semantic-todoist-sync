@@ -1631,6 +1631,7 @@ const DEFAULT_SETTINGS = {
   enableOpenAiPromptCaching: true,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
+  debugDiagnosticsEnabled: false,
   chatMode: "Vault QA",
   embeddingModel: "text-embedding-3-large",
   openAiEmbeddingDimensions: 1024,
@@ -1980,6 +1981,23 @@ function taskWorkflowSystemInstruction() {
     "candidateSupportingFactRefs is an optional ID-only shortlist for semantic evidence navigation, not a mandatory narrative set. Resolve each optional ID through shared factsById and select a candidate only when removing it would change execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff; if selected, state it directly and return its exact evidence ID and fact ID in refs. The plugin derives the canonical binding locally. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. Optional priority, materialDescriptionFactRefs, executionDetailFactRefs, and candidate-supporting rows remain advisory; only current marked-action/current-source grounding is mandatory.",
     TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
     "For every description object, description_sentences[].text is prose-only and must not contain numeric citation markers. Return exact task-local evidence_ids and fact_refs from that task's immutable bundle; the plugin derives canonical bindings and renders citations locally."
+  ].join(" ");
+}
+
+function taskDescriptionSystemInstruction() {
+  return [
+    "You are generating one singleton task-description phase of a bounded Semantic Todoist Sync workflow.",
+    "Return only JSON matching the supplied strict structured-output schema.",
+    "Return exactly one nonempty object inside the descriptions array for the supplied task_id and scope_id; return tasks:[] and section_name:\"\".",
+    "Write a standalone, task-specific execution brief as one continuous natural narrative with complete sentences. State the requested action, intent, current artifact or state, owner, audience or reviewer, deliverable, criteria, dependencies, timing, constraints, and supported links when supplied, with enough detail to execute without reopening the source.",
+    "Do not use a title-only or slight-restatement description. Open with direct execution sentences rather than repeating or paraphrasing the task title.",
+    TASK_DESCRIPTION_ANTI_FILLER_RULE,
+    TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
+    TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
+    "Treat the current source direction and current-source evidence as authoritative. Preserve epistemic state, named people, recipients, decisions, criteria, chronology, and actor-specific handoffs exactly; never invent or strengthen facts, and never narrate completion, result, handoff, batching, task order, or workflow mechanics.",
+    "Use only this singleton task's immutable task-local evidence, factsById, evidenceById, and citationLedgerByTask. Current action/current-source grounding is mandatory; optional priority, historical, material, execution-detail, and candidate-supporting facts are advisory and may be omitted when they do not materially clarify execution. Never borrow neighboring task IDs, scopes, evidence, or facts.",
+    "State accepted facts directly and never refer to provided, supplied, input, source, context, context notes, or evidence containers. Return exact task-local evidence_ids and fact_refs for every fact stated; prose is citation-marker-free, and the plugin resolves canonical bindings and renders numbered citations locally.",
+    "Do not return fact_bindings, required-current scalars, or structural metadata beyond task_id, scope_id, description_sentences, evidence_ids, and fact_refs; the plugin owns those fields after strict acceptance."
   ].join(" ");
 }
 
@@ -5694,7 +5712,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async withAiActivity(label, work, options = {}) {
     const previous = this.aiActivity || "";
     const activity = singleLine(label || "Working");
+    const debugOperation = aiDebugOperationName(activity);
+    const retrievalSequenceAtStart = Number(this._debugSemanticRetrievalSequence || 0);
+    const priorActivityRetrievalSequence = Number(this._debugDiagnosticsLastActivityRetrievalSequence || 0);
+    const recordContextSummary = () => {
+      const retrievalSequence = Number(this._debugSemanticRetrievalSequence || 0);
+      const retrieval = retrievalSequence > retrievalSequenceAtStart || retrievalSequenceAtStart > priorActivityRetrievalSequence
+        ? this.lastSemanticRetrievalTelemetry || {}
+        : {};
+      this._debugDiagnosticsLastActivityRetrievalSequence = Math.max(priorActivityRetrievalSequence, retrievalSequence);
+      this.recordDebugDiagnostic?.({
+        operation: debugOperation,
+        phase: "context",
+        step: "summary",
+        status: Object.keys(retrieval).length ? "observed" : "unavailable",
+        contextSummary: {
+          evidenceCount: retrieval.selectedFusedIdentityCount || retrieval.routedCandidateCount || 0,
+          factCount: retrieval.selectedDimensionRecordCount || 0,
+          scopeCount: retrieval.taskCount || 0,
+          cacheHits: retrieval.embeddingCacheHits || retrieval.routingCacheHits || retrieval.resultCacheHit ? 1 : 0,
+          queueDepth: retrieval.queueDepth,
+          laneCount: retrieval.laneCount,
+          contextSource: Object.keys(retrieval).length ? "semantic-retrieval" : "not-observed"
+        }
+      });
+    };
     this.aiActivity = activity;
+    this.recordDebugDiagnostic?.({ operation: debugOperation, phase: "workflow", step: "start", status: "started" });
     this.logLocal("AI activity started", { activity });
     this.refreshSidebarStatus();
     try {
@@ -5702,10 +5746,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         ? await this.runtimeWorkCoordinator.runAiWork({ operation: activity, workflowToken: options.workflowToken || null, execute: () => work() })
         : await work();
       this.lastAiActivityDiagnostics = null;
+      recordContextSummary();
+      this.recordDebugDiagnostic?.({ operation: debugOperation, phase: "workflow", step: "terminal", status: "completed" });
       this.logLocal("AI activity complete", { activity });
       return result;
     } catch (error) {
       this.lastAiActivityDiagnostics = aiProviderFailureDiagnostics(error);
+      recordContextSummary();
+      this.recordDebugDiagnostic?.({ operation: debugOperation, phase: "workflow", step: "terminal", status: "failed", code: error?.providerError?.code || error?.code, retryable: error?.providerError?.retryable });
       this.logLocal("AI activity failed", this.lastAiActivityDiagnostics);
       throw error;
     } finally {
@@ -7061,6 +7109,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async retrieveSemanticContext(query, limit, queryPlan = null) {
     const startedAt = Date.now();
     const plan = queryPlan || contextQueryPlan(query, "chat");
+    this._debugSemanticRetrievalSequence = Number(this._debugSemanticRetrievalSequence || 0) + 1;
+    this.recordDebugDiagnostic?.({ operation: aiDebugOperationName(plan.mode || "chat"), phase: "semantic", step: "selection-start", status: "started", contextSummary: { scopeCount: plan.scopeIds?.length || 0 } });
     const request = semanticRetrievalRequestMetadata(query, limit, plan, this.settings);
     const cacheKey = this.semanticRetrievalCacheKey(query, limit, plan);
     if (this.semanticIndexCompatibilityRefreshPending?.() === true) {
@@ -7993,6 +8043,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async retrieveTaskSemanticContexts(tasks = [], source = {}, sourceContract = null, options = {}) {
     const startedAt = Date.now();
     const flattened = flattenTaskPlanWithIndexes(tasks);
+    this._debugSemanticRetrievalSequence = Number(this._debugSemanticRetrievalSequence || 0) + 1;
+    this.recordDebugDiagnostic?.({ operation: aiDebugOperationName(options.mode || "task-generation"), phase: "semantic", step: "selection-start", status: "started", contextSummary: { scopeCount: flattened.length, evidenceCount: 0 } });
     const limit = Math.max(1, Number(options.limit || this.settings.maxTaskContextChunks || 6));
     const provider = semanticEmbeddingProviderForSettings(this.settings);
     const model = String(this.settings.embeddingModel || "");
@@ -9537,8 +9589,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async openaiProviderResponse({ model, system, user, promptContextSuffix = "", jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0, onUsage = null, attempt = null }) {
     const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
+    const capabilityProfileRevision = "openai-responses-v2";
+    const backgroundCapability = aiCloudCapabilityMemoryState({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "background" });
+    const cacheCapability = aiCloudCapabilityMemoryState({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "prompt-cache" });
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
-    const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
+    const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls && cacheCapability.state !== "unsupported";
+    const useBackground = background !== false && backgroundCapability.state !== "unsupported";
     const contextPrefix = String(promptCachePrefix || "");
     const systemContent = [{
       type: "input_text",
@@ -9568,7 +9624,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (reasoningConfig.openai) body.reasoning = reasoningConfig.openai;
     if (Number.isSafeInteger(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) body.max_output_tokens = Math.round(Number(maxOutputTokens));
-    if (background !== false) body.background = true;
+    if (useBackground) body.background = true;
     if (jsonSchema) {
       body.text = {
         ...(["task-generation", "task-description", "section-title"].includes(String(operation || "").trim().toLowerCase()) && /^gpt-5(?:[.-]|$)/i.test(modelId)
@@ -9578,10 +9634,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
     }
     let response = await this.openaiResponsesRequest("POST", "/responses", body);
-    if (response.status === 400 && /background/i.test(response.text || "")) {
-      const foregroundBody = Object.assign({}, body);
-      delete foregroundBody.background;
-      response = await this.openaiResponsesRequest("POST", "/responses", foregroundBody);
+    const controlRejectionText = String(response?.text || response?.json?.error?.message || "");
+    const backgroundRejected = useBackground && /\bbackground\b/i.test(controlRejectionText);
+    const cacheRejected = usePromptCache && /prompt[_ -]?cache|cache[_ -]?control|prompt-cache/i.test(controlRejectionText);
+    let compatibilityRetry = false;
+    if (response.status === 400 && (backgroundRejected || cacheRejected)) {
+      if (backgroundRejected) aiCloudCapabilityRemember({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "background" }, "unsupported");
+      if (cacheRejected) aiCloudCapabilityRemember({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "prompt-cache" }, "unsupported");
+      const compatibilityBody = JSON.parse(JSON.stringify(body));
+      if (backgroundRejected) delete compatibilityBody.background;
+      if (cacheRejected) {
+        delete compatibilityBody.prompt_cache_options;
+        delete compatibilityBody.prompt_cache_key;
+      }
+      response = await this.openaiResponsesRequest("POST", "/responses", compatibilityBody);
+      compatibilityRetry = true;
     }
     if (response.status < 200 || response.status >= 300) {
       const diagnostic = openAiHttpResponseDiagnostic(response, "response create");
@@ -9593,7 +9660,34 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (usageSummary && typeof onUsage === "function") {
       try { onUsage(usageSummary); } catch {}
     }
-    return completed.output_text || extractOutputText(completed);
+    const refusalItems = (completed.output || []).flatMap((item) => (item?.content || []).filter((content) => content?.type === "refusal"));
+    const rawText = completed.output_text || extractOutputText(completed);
+    if (!rawText && refusalItems.length) {
+      throw STS_MULTI_PROVIDER.providerError("openai", response.status, "provider-refusal", false, "OpenAI returned a refusal instead of structured output.", {
+        classification: "refusal",
+        refusalPresent: true,
+        refusalItemCount: refusalItems.length,
+        compatibilityRetry,
+        responseIdHash: completed.id ? shortHash(String(completed.id)) : ""
+      });
+    }
+    if (!backgroundRejected && backgroundCapability.state !== "unsupported" && useBackground) aiCloudCapabilityRemember({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "background" }, "supported");
+    if (!cacheRejected && cacheCapability.state !== "unsupported" && usePromptCache) aiCloudCapabilityRemember({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "prompt-cache" }, "supported");
+    return {
+      text: rawText,
+      rawText,
+      provider: "openai",
+      model: modelId,
+      providerRequestTelemetry: {
+        ...aiCloudCapabilityTelemetry(backgroundCapability),
+        backgroundPresent: Boolean(useBackground),
+        promptCacheControlsPresent: Boolean(usePromptCache),
+        promptCacheCompatibilityRetry: compatibilityRetry,
+        promptCacheCapabilityCacheHit: Boolean(cacheCapability.cacheHit),
+        promptCacheCapabilityState: cacheCapability.state,
+        refusalPresent: refusalItems.length > 0
+      }
+    };
   }
 
   recordAiTokenUsage(operation = "chat", model = "", usage = {}, provider = "") {
@@ -9621,6 +9715,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async geminiResponse({ model, system, user, promptContextSuffix = "", jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", maxOutputTokens = 0, onUsage = null, attempt = null }) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || STS_MULTI_PROVIDER.providerDefaultModel("gemini", "primary"));
     const requestProfile = geminiGenerateContentRequestProfile(modelId);
+    const capabilityProfileRevision = requestProfile.id || "gemini-generate-content-v2";
+    const responseSchemaCapability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "responseSchema" });
+    const responseJsonSchemaCapability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "responseJsonSchema" });
     const generationConfig = {};
     const geminiUser = [promptCachePrefix, providerContextSuffixJoin(promptContextSuffix, user)].filter(Boolean).join("\n\n");
     if (reasoningConfig.gemini) generationConfig.thinkingConfig = reasoningConfig.gemini;
@@ -9637,9 +9734,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       strict: geminiSchemaOmittedKeywordCount(jsonSchema, strictSchema),
       compatible: geminiSchemaOmittedKeywordCount(jsonSchema, compatibleSchema)
     } : { strict: 0, compatible: 0 };
+    const preferredSchemaCarrier = jsonSchema && responseSchemaCapability.state === "supported" && responseJsonSchemaCapability.state !== "supported"
+      ? "responseSchema"
+      : "responseJsonSchema";
     if (jsonSchema) {
       generationConfig.responseMimeType = "application/json";
-      generationConfig.responseJsonSchema = strictSchema;
+      if (preferredSchemaCarrier === "responseSchema") generationConfig.responseSchema = compatibleSchema;
+      else generationConfig.responseJsonSchema = strictSchema;
     }
     const requestBody = (config = generationConfig) => ({
       systemInstruction: { parts: [{ text: system || "" }] },
@@ -9676,11 +9777,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       body: JSON.stringify(requestBody()),
       throw: false
     });
-    const retryEligible = Boolean(jsonSchema && geminiStructuredSchemaRetryEligible(response));
+    const retryEligible = Boolean(jsonSchema
+      && preferredSchemaCarrier === "responseJsonSchema"
+      && geminiStructuredSchemaRetryEligible(response));
     const retryReason = retryEligible
       ? geminiStructuredSchemaFieldRejected(response) ? "schema-field-rejected" : "invalid-argument-structured-schema"
       : "none";
-    logStructuredAttempt(response, "strict-json-schema", "responseJsonSchema", retryReason, 1);
+    logStructuredAttempt(response, preferredSchemaCarrier === "responseSchema" ? "compatible-openapi-schema" : "strict-json-schema", preferredSchemaCarrier, retryReason, 1);
     if (retryEligible) {
       const compatibleGenerationConfig = Object.assign({}, generationConfig, {
         responseJsonSchema: undefined,
@@ -9732,9 +9835,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
       });
     }
-    const text = extractGeminiText(response.json);
-    if (!text) throw STS_MULTI_PROVIDER.providerError("gemini", response.status, "invalid-response", false, "Gemini returned no text.");
-    return jsonSchema ? extractJsonPayload(text) : text;
+    const rawText = extractGeminiText(response.json);
+    if (!rawText) throw STS_MULTI_PROVIDER.providerError("gemini", response.status, "invalid-response", false, "Gemini returned no text.");
+    if (jsonSchema) aiCloudCapabilityRemember({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: retryEligible ? "responseSchema" : preferredSchemaCarrier }, "supported");
+    return {
+      text: rawText,
+      rawText,
+      provider: "gemini",
+      model: modelId,
+      providerRequestTelemetry: {
+        schemaCarrier: retryEligible ? "responseSchema" : preferredSchemaCarrier,
+        schemaCompatibilityRetry: retryEligible,
+        schemaCapabilityCacheHit: Boolean((preferredSchemaCarrier === "responseSchema" ? responseSchemaCapability : responseJsonSchemaCapability).cacheHit),
+        schemaCapabilityState: (preferredSchemaCarrier === "responseSchema" ? responseSchemaCapability : responseJsonSchemaCapability).state,
+        schemaCapabilityProfileRevision: capabilityProfileRevision
+      }
+    };
   }
 
   async openaiResponsesRequest(method, path, body) {
@@ -11149,16 +11265,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const singletonDescriptionCachePrefix = [
       "Description phase cache prefix (stable, evidence-free):",
       "Dynamic request-local schema fields: index, task_id, description_sentences, scope_id, evidence_ids, and fact_refs. Exact singleton enum values are supplied only in the request-local schema; provider current scalars and fact_bindings are not part of the description output contract.",
-      "Phase shape: return exactly one description object for the supplied main-task index; return tasks:[] and section_name:\"\".",
       "Description instructions:",
       descriptionInstructions || "",
       `Selected prompt-profile delta: ${promptProfile.descriptionGuidance}`,
       `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
-      "Strict description output: return description_sentences with prose-only text plus exact task-local evidence_ids and fact_refs; never return fact_bindings or numeric citation markers. The plugin derives canonical binding metadata locally from the immutable singleton contract after strict output acceptance.",
-      "Description citation rule: every sentence must cite its task-local evidence and bound facts; the plugin resolves citationLedgerByTask and renders numbered Sources/Context entries.",
-      "Evidence rule: use only task-local evidence_ids and fact_refs supplied in the exact closure. The plugin derives canonical bindings and owns current-source identity locally; optional, historical, material, and execution-detail facts are advisory and may be omitted.",
-      TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
-      TASK_DESCRIPTION_ANTI_FILLER_RULE,
       "Context-note citation rule:",
       contextCitationInstructions(citeContextNotes, structuredEvidence),
       structuredEvidence
@@ -11299,11 +11409,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         const providerJson = await this.withAiActivity(`Writing ${requestMainTasks.length} task description${requestMainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
         operation: "description",
+        singletonDescription: requestMainTasks.length === 1,
         model: modelChoice.model,
         fallbackOnly: phase === "fallback",
           jsonSchema: taskDescriptionSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings), requestSchemaVocabulary),
           schemaVocabulary: requestSchemaVocabulary,
-          system: taskWorkflowSystemInstruction(),
+          system: taskDescriptionSystemInstruction(),
           promptCachePrefix: singletonDescriptionCachePrefix,
           promptContextSuffix,
           promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
@@ -16033,6 +16144,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.plugin = plugin;
     this.activeTab = "Setup";
     this.sectionOpenState = new Map();
+    this.operationOpenState = new Map();
   }
 
   goTo(tab) {
@@ -16040,8 +16152,38 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.display();
   }
 
-  onunload() {
+  settingsModalElement() {
+    const containerEl = this.containerEl;
+    if (!containerEl || typeof containerEl.closest !== "function") return null;
+    return containerEl.closest(".modal.mod-settings.mod-sidebar-layout");
+  }
+
+  syncSettingsModalClass() {
+    const modal = this.settingsModalElement();
+    if (this.settingsModalEl && this.settingsModalEl !== modal) {
+      this.settingsModalEl.classList?.remove("semantic-todoist-settings-modal");
+    }
+    if (!modal) {
+      this.settingsModalEl = null;
+      return;
+    }
+    modal.classList?.add("semantic-todoist-settings-modal");
+    this.settingsModalEl = modal;
+  }
+
+  clearSettingsModalClass() {
+    const modal = this.settingsModalEl || this.settingsModalElement();
+    modal?.classList?.remove("semantic-todoist-settings-modal");
+    this.settingsModalEl = null;
+  }
+
+  hide() {
+    this.clearSettingsModalClass();
     stsMpDestroySearchableComboboxes();
+  }
+
+  onunload() {
+    this.hide();
   }
 
   display() {
@@ -16049,6 +16191,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     stsMpDestroySearchableComboboxes();
     containerEl.empty();
     containerEl.addClass("semantic-todoist-settings");
+    this.syncSettingsModalClass();
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
     const tabNames = ["Setup", "AI & Search", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"];
@@ -16164,8 +16307,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(this.plugin, "gemini") });
     secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
-      stsMpRenderProviderAccessSettings(containerEl, this.plugin);
-      stsMpRenderOperationModelSettings(containerEl, this.plugin, () => this.display());
+      stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
+      stsMpRenderOperationModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
     }
     settingsHeading(containerEl, "AI behavior", "Configure reasoning, fallback notices, optimization, and provider prompt caching for the operation-specific model selections above.");
     toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
@@ -16352,6 +16495,31 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     activitySetting(containerEl, "Reference rebuild", `Last rebuild: ${formatDeviceDateTime(this.plugin.settings.lastReferenceRebuildAt) || "Not yet rebuilt"}. Automatic rebuild: ${this.plugin.settings.autoRebuildReferences ? "on" : "off"}. ${this.plugin.settings.lastReferenceRebuildCandidateCount || 0} local candidates.`);
     activitySetting(containerEl, "Email", `Last poll: ${formatDeviceDateTime(this.plugin.settings.lastEmailPollAt) || "Not yet polled"}. Automatic processing: ${this.plugin.settings.autoProcessEmails ? "on" : "off"}.`);
     activitySetting(containerEl, "Notes sync", `Last sync: ${formatDeviceDateTime(this.plugin.settings.lastNoteAutoSyncAt) || "Not yet synced"}. Automatic sync: ${this.plugin.settings.notesAutoSync ? "on" : "off"}.`);
+    settingsHeading(containerEl, "Debug diagnostics", "Optional, content-free runtime records for retrieval, context, provider attempts, and terminal workflow status. Records stay in memory and are never written to plugin data.");
+    toggleSetting(containerEl, "Enable debug diagnostics", "Disabled by default. Enable temporarily when investigating a production failure; turning it off clears retained records.", this.plugin, "debugDiagnosticsEnabled", (value) => {
+      if (!value) this.plugin.clearDebugDiagnostics?.();
+      this.display();
+    });
+    const diagnostics = this.plugin.getDebugDiagnosticSnapshot?.() || { enabled: false, capacity: AI_DEBUG_DIAGNOSTIC_CAPACITY, count: 0, events: [] };
+    activitySetting(containerEl, "Diagnostics status", diagnostics.enabled ? `${diagnostics.count}/${diagnostics.capacity} in-memory records.` : "Off; no records retained.");
+    new Setting(containerEl)
+      .setName("Diagnostics actions")
+      .setDesc("Copy the bounded content-free snapshot for support, or clear it immediately.")
+      .addButton((button) => button.setButtonText("Copy diagnostics").onClick(async () => {
+        const snapshot = this.plugin.getDebugDiagnosticSnapshot?.() || { enabled: false, capacity: AI_DEBUG_DIAGNOSTIC_CAPACITY, count: 0, events: [] };
+        try {
+          const writeText = globalThis.navigator?.clipboard?.writeText;
+          if (typeof writeText !== "function") throw new Error("clipboard-unavailable");
+          await writeText.call(globalThis.navigator.clipboard, JSON.stringify(snapshot, null, 2));
+          new Notice("Diagnostics copied.");
+        } catch {
+          new Notice("Clipboard unavailable.");
+        }
+      }))
+      .addButton((button) => button.setButtonText("Clear").onClick(() => {
+        this.plugin.clearDebugDiagnostics?.();
+        this.display();
+      }));
     new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
     settingsHeading(containerEl, "Activity log", "Local workflow events. Secrets and raw provider payloads are not shown.");
     const log = containerEl.createEl("pre", { cls: "semantic-todoist-activity-log" });
@@ -39902,6 +40070,13 @@ function providerContextProjectionHash(value = "") {
   return shortHash(String(value == null ? "" : value));
 }
 
+function openWebUINativeDescriptionSystemText(value = "") {
+  return String(value || "").replace(
+    "Return exactly one nonempty object inside the descriptions array for the supplied task_id and scope_id; return tasks:[] and section_name:\"\".",
+    "Return one complete task-description object matching the supplied schema for the exact task_id and scope_id."
+  );
+}
+
 function providerContextProjectionMetrics(value = "") {
   const text = String(value == null ? "" : value);
   return {
@@ -40817,6 +40992,7 @@ function taskDescriptionProviderContextPreflight({
   promptContextSuffix = "",
   user = "",
   schema = null,
+  originalSchema = null,
   schemaVocabulary = null,
   outputHeadroomTokens = TASK_DESCRIPTION_OUTPUT_HEADROOM_TOKENS,
   reasoningHeadroomTokens = TASK_DESCRIPTION_REASONING_HEADROOM_TOKENS
@@ -40836,24 +41012,48 @@ function taskDescriptionProviderContextPreflight({
   const contextWindow = contextBudget.contextWindowTokens;
   const inputTokenLimit = limits.inputTokenLimitTokens;
   const outputTokenLimit = limits.outputTokenLimitTokens;
-  const systemChars = String(system || "").length;
+  const nativeDescription = normalizedProvider === "openwebui"
+    && ["description", "task-description"].includes(String(operation || ""))
+    && settings.openwebuiModelMetadata?.[normalizedModel]?.ollamaBacked === true;
+  const nativeDescriptionCapability = nativeDescription && typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState === "function"
+    ? STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState(normalizedModel)
+    : null;
+  const descriptionCarrier = nativeDescription
+    ? nativeDescriptionCapability?.preferredCarrier === "wrapper-json" ? "wrapper-json" : nativeDescriptionCapability?.preferredCarrier === "direct-json" ? "direct-json" : "direct-schema"
+    : "";
+  const consumerSchema = nativeDescription
+    && originalSchema
+    && typeof originalSchema === "object"
+    && !Array.isArray(originalSchema)
+    && originalSchema.properties?.descriptions?.items
+    && typeof originalSchema.properties.descriptions.items === "object"
+    && !Array.isArray(originalSchema.properties.descriptions.items)
+    ? originalSchema
+    : schema;
+  const schemaForPreflight = nativeDescription && consumerSchema
+    ? descriptionCarrier === "wrapper-json"
+      ? STS_MULTI_PROVIDER.openWebUIDescriptionWrapperSchema(consumerSchema)
+      : STS_MULTI_PROVIDER.openWebUICompactDescriptionSchema(consumerSchema)
+    : schema;
+  const effectiveSystem = nativeDescription ? openWebUINativeDescriptionSystemText(system) : String(system || "");
+  const systemChars = effectiveSystem.length;
   const promptPrefixChars = String(promptCachePrefix || "").length;
   const suffix = providerContextSuffixJoin(promptContextSuffix, user);
   const userChars = suffix.length;
   const suffixMetrics = providerContextProjectionMetrics(promptContextSuffix);
   const totalChars = systemChars + promptPrefixChars + userChars;
-  const schemaProjection = normalizedProvider === "openwebui" && schema
-    ? (Object.prototype.hasOwnProperty.call(schema, "schema") && Object.prototype.hasOwnProperty.call(schema, "telemetry")
-      ? schema
-      : STS_MULTI_PROVIDER.openWebUISchemaProjection(schema))
+  const schemaProjection = normalizedProvider === "openwebui" && schemaForPreflight
+    ? (Object.prototype.hasOwnProperty.call(schemaForPreflight, "schema") && Object.prototype.hasOwnProperty.call(schemaForPreflight, "telemetry")
+      ? schemaForPreflight
+      : STS_MULTI_PROVIDER.openWebUISchemaProjection(schemaForPreflight))
     : null;
   const schemaGrounding = openWebUISchemaGroundingText(schemaProjection);
   const envelopeEstimate = providerVisibleInputEnvelopeEstimate({
-    system,
+    system: effectiveSystem,
     promptCachePrefix,
     promptContextSuffix,
     user,
-    schema: schemaProjection?.schema || schema,
+    schema: schemaProjection?.schema || schemaForPreflight || schema,
     schemaGroundingText: schemaGrounding.text
   });
   const estimatedInputTokens = envelopeEstimate.adjustedEstimatedInputTokens;
@@ -40862,9 +41062,13 @@ function taskDescriptionProviderContextPreflight({
   const reservedHeadroomTokens = outputHeadroom + reasoningHeadroom;
   const availableInputTokens = contextBudget.operationalInputTokenLimitTokens;
   const status = estimatedInputTokens > availableInputTokens ? "overflow" : "ok";
-  const schemaVocabularyPreflight = taskWorkflowSchemaVocabularyHasRequiredEnums(schema, schemaVocabulary);
+  const schemaVocabularyPreflight = taskWorkflowSchemaVocabularyHasRequiredEnums(schemaForPreflight, schemaVocabulary);
   const schemaBytes = envelopeEstimate.schemaBytes;
-  const schemaHash = schema ? taskWorkflowHash(schema) : "";
+  const schemaHash = schemaForPreflight
+    ? nativeDescription
+      ? STS_MULTI_PROVIDER.stableHash(JSON.stringify(schemaForPreflight))
+      : taskWorkflowHash(schemaForPreflight)
+    : "";
   return Object.freeze({
     provider: String(normalizedProvider || ""),
     model: String(normalizedModel || ""),
@@ -40929,7 +41133,14 @@ function taskDescriptionProviderContextPreflight({
     schemaVocabularyEvidenceCount: schemaVocabularyPreflight.evidenceCount,
     schemaVocabularyFactCount: schemaVocabularyPreflight.factCount,
     schemaVocabularyScopeCount: schemaVocabularyPreflight.scopeCount,
-    schemaVocabularyTaskCount: schemaVocabularyPreflight.taskCount
+    schemaVocabularyTaskCount: schemaVocabularyPreflight.taskCount,
+    schemaProjectionProfile: nativeDescription ? "openwebui-description-item-v1" : "",
+    descriptionCompactSchemaHash: nativeDescription ? schemaHash : "",
+    descriptionOriginalSchemaHash: nativeDescription && consumerSchema ? STS_MULTI_PROVIDER.stableHash(JSON.stringify(consumerSchema)) : "",
+    descriptionCarrier,
+    descriptionCapabilityCacheHit: Boolean(nativeDescriptionCapability?.cacheHit),
+    descriptionCapabilityPreference: nativeDescription ? descriptionCarrier : "",
+    descriptionGrammarLearned: Boolean(nativeDescriptionCapability?.grammarUnsupported)
   });
 }
 
@@ -45545,6 +45756,15 @@ const STS_MULTI_PROVIDER = (() => {
   });
   const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
   const OPENROUTER_MODEL_METADATA_STALE_MS = 24 * 60 * 60 * 1000;
+  const OPENROUTER_REASONING_HEADROOM_TOKENS = 512;
+  const OPENROUTER_REASONING_OUTPUT_BUDGETS = Object.freeze({
+    minimal: { target: 2048, headroom: 512 },
+    low: { target: 3072, headroom: 1024 },
+    medium: { target: 3584, headroom: 2048 },
+    high: { target: 4096, headroom: 3072 },
+    xhigh: { target: 4608, headroom: 3584 },
+    max: { target: 5120, headroom: 4096 }
+  });
   const SAFE_ERROR_MESSAGES = Object.freeze({
     "missing-credential": "A credential is required for this provider.",
     "invalid-url": "The Open WebUI base URL must be a valid HTTP(S) URL without credentials, query, or fragment.",
@@ -46603,8 +46823,8 @@ const STS_MULTI_PROVIDER = (() => {
       return 0;
     };
     const normalized = {
-      inputTokens: number("prompt_tokens", "input_tokens", "promptTokenCount"),
-      outputTokens: number("completion_tokens", "output_tokens", "candidatesTokenCount"),
+      inputTokens: number("prompt_tokens", "input_tokens", "promptTokenCount", "prompt_eval_count"),
+      outputTokens: number("completion_tokens", "output_tokens", "candidatesTokenCount", "eval_count"),
       reasoningTokens: number("completion_tokens_details.reasoning_tokens", "output_tokens_details.reasoning_tokens", "thoughtsTokenCount"),
       cachedInputTokens: number("prompt_tokens_details.cached_tokens", "input_tokens_details.cached_tokens", "cachedContentTokenCount"),
       totalTokens: number("total_tokens", "totalTokenCount"),
@@ -46834,6 +47054,7 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const defaultOpenRouterFreeRateLimiter = createOpenRouterFreeRateLimiter();
   const OPENWEBUI_RESPONSE_PROFILE_JSON = "openwebui-json";
+  const OPENWEBUI_RESPONSE_PROFILE_NATIVE = "openwebui-ollama-native-v1";
   const OPENWEBUI_RESPONSE_PROFILE_SSE = "openwebui-sse-delta-v1";
   const OPENWEBUI_STRUCTURED_ENVELOPE_PROFILE = "openwebui-fenced-json-v1";
   const OPENWEBUI_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
@@ -46870,7 +47091,17 @@ const STS_MULTI_PROVIDER = (() => {
     structuredEnvelopeNormalized = false,
     structuredEnvelopeProfile = "",
     structuredEnvelopeReason = "",
-    finishReason = ""
+    finishReason = "",
+    thinkingPresent = false,
+    thinkingByteCount = 0,
+    descriptionCompactSchemaPresent = false,
+    descriptionCompactAccepted = false,
+    descriptionEnvelopeAdded = false,
+    descriptionFullSchemaAccepted = false,
+    descriptionSchemaProfile = "",
+    descriptionCompactSchemaHash = "",
+    descriptionOriginalSchemaHash = "",
+    descriptionCarrier = ""
   } = {}) => ({
     profile,
     eventCount: Math.max(0, Math.min(OPENWEBUI_RESPONSE_MAX_EVENTS, Math.round(Number(eventCount) || 0))),
@@ -46886,7 +47117,17 @@ const STS_MULTI_PROVIDER = (() => {
     structuredEnvelopeNormalized: Boolean(structuredEnvelopeNormalized),
     structuredEnvelopeProfile: nonEmpty(structuredEnvelopeProfile).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
     structuredEnvelopeReason: nonEmpty(structuredEnvelopeReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
-    finishReason: nonEmpty(finishReason).slice(0, 48)
+    finishReason: nonEmpty(finishReason).slice(0, 48),
+    thinkingPresent: Boolean(thinkingPresent),
+    thinkingByteCount: Math.max(0, Math.min(OPENWEBUI_RESPONSE_MAX_BYTES, Math.round(Number(thinkingByteCount) || 0))),
+    descriptionCompactSchemaPresent: Boolean(descriptionCompactSchemaPresent),
+    descriptionCompactAccepted: Boolean(descriptionCompactAccepted),
+    descriptionEnvelopeAdded: Boolean(descriptionEnvelopeAdded),
+    descriptionFullSchemaAccepted: Boolean(descriptionFullSchemaAccepted),
+    descriptionSchemaProfile: nonEmpty(descriptionSchemaProfile).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
+    descriptionCompactSchemaHash: nonEmpty(descriptionCompactSchemaHash).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
+    descriptionOriginalSchemaHash: nonEmpty(descriptionOriginalSchemaHash).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
+    descriptionCarrier: nonEmpty(descriptionCarrier).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48)
   });
   const openWebUIReasoningOnlyValidationResult = (accepted, reason, schemaHash = "") => ({
     accepted: Boolean(accepted),
@@ -47209,7 +47450,7 @@ const STS_MULTI_PROVIDER = (() => {
       reason: "fenced-json"
     };
   };
-  const openWebUIResponseNormalize = (response, requestedModel = "", { strictSchemaExpected = false, originalSchema = null } = {}) => {
+  const openWebUIResponseNormalize = (response, requestedModel = "", { strictSchemaExpected = false, originalSchema = null, nativeOllama = false, nativeDescription = false } = {}) => {
     const status = response ? statusOf(response) : Number(error.providerError.status) || 0;
     const bodyText = asString(response?.text || "");
     const hasSseData = /^\s*data:\s*/m.test(bodyText);
@@ -47226,6 +47467,34 @@ const STS_MULTI_PROVIDER = (() => {
       let payload = jsonPayload;
       if (!payload || !Array.isArray(payload.choices)) {
         try { payload = JSON.parse(bodyText || "{}"); } catch { payload = {}; }
+      }
+      if (nativeOllama || (payload?.message && !Array.isArray(payload?.choices))) {
+        if (payload?.done === false) throw providerError("openwebui", status, "invalid-response");
+        const message = payload?.message && typeof payload.message === "object" && !Array.isArray(payload.message)
+          ? payload.message
+          : {};
+        const text = message.content;
+        if (typeof text !== "string" || text.trim().length === 0) throw providerError("openwebui", status, "invalid-response");
+        const envelope = nativeDescription
+          ? { text, rawText: text, normalized: false, profile: "", reason: "native-description-raw" }
+          : openWebUIStructuredContentEnvelope(text, strictSchemaExpected);
+        const thinking = message.thinking;
+        const thinkingText = typeof thinking === "string" ? thinking : "";
+        return {
+          text: envelope.text,
+          rawText: envelope.rawText,
+          thinking: thinkingText,
+          model: normalizeModel("openwebui", payload?.model || requestedModel),
+          usage: normalizeUsage(payload?.usage || payload || {}),
+          responseTelemetry: openWebUIResponseTelemetry(OPENWEBUI_RESPONSE_PROFILE_NATIVE, {
+            finishReason: payload?.done_reason || payload?.finish_reason,
+            thinkingPresent: thinkingText.length > 0,
+            thinkingByteCount: openWebUIUtf8ByteLength(thinkingText),
+            structuredEnvelopeNormalized: envelope.normalized,
+            structuredEnvelopeProfile: envelope.profile,
+            structuredEnvelopeReason: envelope.reason
+          })
+        };
       }
       const message = payload?.choices?.[0]?.message;
       let text = message?.content;
@@ -47906,6 +48175,9 @@ const STS_MULTI_PROVIDER = (() => {
       const diagnostic = {
         source: "openrouter-error-metadata",
         classification,
+        capabilityCarrier: /require[_ -]?parameters|provider\s*parameter/i.test(metadata)
+          ? "provider.require_parameters"
+          : /response[_ -]?healing|plugins?/i.test(metadata) ? "plugins.response-healing" : "",
         transport: classification === "transport" ? "http" : "",
         responseByteCount: openWebUIUtf8ByteLength(responseText),
         bodyHash: responseText ? stableHash(responseText.slice(0, 64 * 1024)) : "",
@@ -47931,8 +48203,9 @@ const STS_MULTI_PROVIDER = (() => {
   const supportsParameter = (metadata, names) => {
     if (!metadata || !Object.prototype.hasOwnProperty.call(metadata, "supported_parameters")) return null;
     if (!Array.isArray(metadata.supported_parameters) || metadata.supported_parameters.length === 0) return false;
-    const values = metadata.supported_parameters.map((value) => nonEmpty(value).toLowerCase());
-    return names.some((name) => values.includes(name) || values.some((value) => value.includes(name)));
+    const values = new Set(metadata.supported_parameters.map((value) => nonEmpty(value).trim().toLowerCase()).filter(Boolean));
+    const aliases = (Array.isArray(names) ? names : [names]).map((name) => nonEmpty(name).trim().toLowerCase()).filter(Boolean);
+    return aliases.some((name) => values.has(name));
   };
   const OPENROUTER_REASONING_EFFORT_VALUES = Object.freeze(REASONING_EFFORT_VALUES.filter((effort) => effort !== DEFAULT_REASONING_EFFORT));
   const sanitizeOpenRouterReasoningMetadata = (value) => {
@@ -47981,7 +48254,8 @@ const STS_MULTI_PROVIDER = (() => {
       metadataSource: nonEmpty(generationMetadata?.metadataSource || generationMetadata?.source || "unknown"),
       staleness: metadataStale ? "stale" : fetchedAtMs > 0 ? "fresh" : "unknown",
       stale: metadataStale,
-      revision: Math.max(0, Math.round(Number(settings.openrouterMetadataRevision || 0)))
+      revision: Math.max(0, Math.round(Number(settings.openrouterMetadataRevision || 0))),
+      fingerprint: nonEmpty(settings.openrouterMetadataFingerprint)
     });
     const reasoningMetadata = sanitizeOpenRouterReasoningMetadata(metadata?.reasoning);
     const reasoningMetadataKnown = Object.keys(reasoningMetadata).length > 0;
@@ -48117,6 +48391,82 @@ const STS_MULTI_PROVIDER = (() => {
       patterns,
       telemetry: { profile: OPENWEBUI_SCHEMA_PROFILE, omittedPatternCount: patterns.length }
     };
+  };
+  const OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE = "openwebui-description-item-v1";
+  const openWebUICompactDescriptionSchema = (schema) => {
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) throw openWebUISchemaError("Description schema must be an object.");
+    const descriptions = schema.properties?.descriptions;
+    const item = descriptions?.items;
+    const directItemProperties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+      ? schema.properties
+      : null;
+    const directItemRequired = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const directItemShape = directItemProperties
+      && ["description_sentences", "scope_id", "evidence_ids", "fact_refs"].every((key) => Object.prototype.hasOwnProperty.call(directItemProperties, key) && directItemRequired.has(key));
+    if (!descriptions && schema.type === "object" && directItemShape) {
+      // The gateway projects singleton descriptions to this direct item schema
+      // before dispatch. Keep the item contract unchanged and let the bounded
+      // local validator enforce its required fields/grammar.
+      return schema;
+    }
+    if (!descriptions || typeof descriptions !== "object" || Array.isArray(descriptions) || descriptions.type !== "array") throw openWebUISchemaError("Description schema must define a descriptions array.");
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw openWebUISchemaError("Description schema must define a descriptions item schema.");
+    // The provider receives the unchanged model-authored item schema itself.
+    return item;
+  };
+  const openWebUIDescriptionWrapperSchema = (schema) => {
+    const item = openWebUICompactDescriptionSchema(schema);
+    return {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        descriptions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 1,
+          items: item
+        }
+      },
+      required: ["descriptions"]
+    };
+  };
+  const OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS = 64;
+  const openWebUISingletonDescriptionCapabilityMemory = new Map();
+  const openWebUISingletonDescriptionCapabilityState = (model) => {
+    const key = normalizeModel("openwebui", model);
+    const cached = key ? openWebUISingletonDescriptionCapabilityMemory.get(key) : null;
+    return {
+      cacheHit: Boolean(cached),
+      grammarUnsupported: Boolean(cached?.grammarUnsupported),
+      preferredCarrier: cached?.preferredCarrier === "wrapper-json"
+        ? "wrapper-json"
+        : cached?.preferredCarrier === "direct-json" || cached?.grammarUnsupported
+          ? "direct-json"
+          : "direct-schema"
+    };
+  };
+  const openWebUIRecordSingletonDescriptionCapability = (model, patch = {}) => {
+    const key = normalizeModel("openwebui", model);
+    if (!key) return;
+    const current = openWebUISingletonDescriptionCapabilityMemory.get(key) || {
+      grammarUnsupported: false,
+      preferredCarrier: "direct-schema"
+    };
+    if (!openWebUISingletonDescriptionCapabilityMemory.has(key)
+      && openWebUISingletonDescriptionCapabilityMemory.size >= OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS) {
+      const oldest = openWebUISingletonDescriptionCapabilityMemory.keys().next().value;
+      if (oldest) openWebUISingletonDescriptionCapabilityMemory.delete(oldest);
+    }
+    openWebUISingletonDescriptionCapabilityMemory.set(key, {
+      grammarUnsupported: Boolean(patch.grammarUnsupported ?? current.grammarUnsupported),
+      preferredCarrier: patch.preferredCarrier === "wrapper-json"
+        ? "wrapper-json"
+        : patch.preferredCarrier === "direct-json"
+          ? "direct-json"
+          : patch.preferredCarrier === "direct-schema"
+            ? "direct-schema"
+            : current.preferredCarrier
+    });
   };
   const openWebUISchemaGroundingText = (schemaOrProjection = null) => {
     if (!schemaOrProjection || typeof schemaOrProjection !== "object") return {
@@ -48274,7 +48624,7 @@ const STS_MULTI_PROVIDER = (() => {
       ? "refusal-only"
       : choice?.finish_reason === "error" && !choice?.error && !payload?.error ? "finish-reason-error" : "";
     const status = metadata.status || statusOf(body?.response);
-    return { status, code, retryable: classification === "transport", retryAfterMs: status === 429 ? retryAfterFromResponse(body?.response, payload) : 0, diagnostic: openRouterResponseDiagnostic(body, requestedModel, { classification, ...(responseShape ? { responseShape } : {}) }) };
+    return { status, code, retryable: classification === "transport", retryAfterMs: status === 429 ? retryAfterFromResponse(body?.response, payload) : 0, diagnostic: openRouterResponseDiagnostic(body, requestedModel, { classification, capabilityCarrier: /require[_ -]?parameters|provider\s*parameter/i.test(token) ? "provider.require_parameters" : /response[_ -]?healing|plugins?/i.test(token) ? "plugins.response-healing" : "", ...(responseShape ? { responseShape } : {}) }) };
   };
   const openRouterShapeError = (body, requestedModel, responseShape) => {
     const error = providerError("openrouter", statusOf(body?.response), "invalid-response", false, "", openRouterResponseDiagnostic(body, requestedModel, { responseShape }));
@@ -48338,6 +48688,7 @@ const STS_MULTI_PROVIDER = (() => {
     if (!model || !model.includes("/")) throw providerError("openrouter", null, "model-required");
     const capabilities = openRouterCapabilities(settings, model);
     const schema = requestInput.jsonSchema;
+    const operation = nonEmpty(requestInput.operation || "chat-query").toLowerCase();
     const reasoning = requestInput.reasoningConfig || {};
     const requestedEffortRaw = nonEmpty(reasoning.effort || reasoning.level || reasoning.reasoning_effort).toLowerCase();
     const requestedEffort = OPENROUTER_REASONING_EFFORT_VALUES.includes(requestedEffortRaw) ? requestedEffortRaw : "";
@@ -48350,8 +48701,18 @@ const STS_MULTI_PROVIDER = (() => {
         : capabilities.reasoning !== true ? "reasoning-unsupported"
           : "effort-unsupported";
     const explicitMaxOutputTokens = Math.max(0, Math.round(Number(requestInput.maxOutputTokens || 0)));
+    const reasoningOutputBudget = effort ? OPENROUTER_REASONING_OUTPUT_BUDGETS[effort] || null : null;
+    const schemaBaselineMaxOutputTokens = schema
+      ? Math.max(1024, Math.ceil(JSON.stringify(schema).length / 4) + 1024)
+      : 0;
+    const reasoningHeadroomTokens = capabilities.reasoning === true
+      ? Math.max(OPENROUTER_REASONING_HEADROOM_TOKENS, reasoningOutputBudget?.headroom || 0)
+      : 0;
     const schemaDerivedMaxOutputTokens = schema
-      ? Math.min(8192, Math.max(1024, Math.ceil(JSON.stringify(schema).length / 4) + 1024))
+      ? Math.min(8192, Math.max(
+        schemaBaselineMaxOutputTokens + reasoningHeadroomTokens,
+        reasoningOutputBudget?.target || 1024
+      ))
       : 0;
     const fixedModelOutputLimit = capabilities.adaptiveProfile.dynamicRouter
       ? 0
@@ -48364,12 +48725,16 @@ const STS_MULTI_PROVIDER = (() => {
       && (schema || (hasOutputBudget ? capabilities.maxTokens !== false : capabilities.maxTokens === true))
       ? "max_tokens"
       : "";
+    const retryOutputBudgetCeiling = outputBudgetWireField
+      ? Math.min(8192, fixedModelOutputLimit > 0 ? fixedModelOutputLimit : 8192)
+      : 0;
+    const canIncreaseDerivedRetryBudget = Boolean(outputBudgetWireField && !explicitMaxOutputTokens);
     if (schema && capabilities.metadataKnown && capabilities.schema !== true) throw providerError("openrouter", null, "unsupported-schema");
     const messages = [];
     if (requestInput.system != null && asString(requestInput.system) !== "") messages.push({ role: "system", content: asString(requestInput.system) });
     const user = [requestInput.promptCachePrefix, providerContextSuffixJoin(requestInput.promptContextSuffix, requestInput.user)].filter((value) => value != null && asString(value) !== "").map(asString).join("\n\n");
     if (user) messages.push({ role: "user", content: user });
-    const body = { model, messages, stream: false };
+    let body = { model, messages, stream: false };
     const cacheMetadata = requestInput.cacheMetadata && typeof requestInput.cacheMetadata === "object" ? requestInput.cacheMetadata : {};
     const explicitSessionIdentity = nonEmpty(
       requestInput.workflowSessionId
@@ -48389,6 +48754,19 @@ const STS_MULTI_PROVIDER = (() => {
     // stable prefix content remains in the user message for cache matching.
     const sessionIdentitySource = explicitSessionIdentity || cacheIdentity;
     const sessionIdentity = sessionIdentitySource ? `sts-${stableHash(sessionIdentitySource)}`.slice(0, 256) : "";
+    const sessionIdHash = sessionIdentity ? stableHash(sessionIdentity) : "";
+    const capabilityProfileRevision = `openrouter-v2-${capabilities.adaptiveProfile.revision || 0}`;
+    const capabilityMemoryParams = {
+      provider: "openrouter",
+      model,
+      profileRevision: capabilityProfileRevision,
+      operation,
+      dynamicRouter: capabilities.adaptiveProfile.dynamicRouter === true,
+      fingerprint: capabilities.adaptiveProfile.fingerprint,
+      sessionIdHash
+    };
+    const requireParametersCapability = aiCloudCapabilityMemoryState(Object.assign({}, capabilityMemoryParams, { carrier: "provider.require_parameters" }));
+    const responseHealingCapability = aiCloudCapabilityMemoryState(Object.assign({}, capabilityMemoryParams, { carrier: "plugins.response-healing" }));
     if (settings.enableOpenAiPromptCaching !== false) {
       if (sessionIdentity) body.session_id = sessionIdentity;
     }
@@ -48396,7 +48774,7 @@ const STS_MULTI_PROVIDER = (() => {
     if (effort) body.reasoning = { effort };
     if (outputBudgetWireField) body[outputBudgetWireField] = requestedMaxOutputTokens;
     if (schema || effort || outputBudgetWireField) body.provider = { require_parameters: true };
-    if (schema && body.stream === false) body.plugins = [{ id: "response-healing" }];
+    if (schema && body.stream === false && responseHealingCapability.state !== "unsupported") body.plugins = [{ id: "response-healing" }];
     const preflightSource = requestInput.preflight && typeof requestInput.preflight === "object" ? requestInput.preflight : null;
     const preflightTelemetry = preflightSource ? {
       preflightStatus: nonEmpty(preflightSource.preflightStatus || preflightSource.status || (preflightSource.overflow ? "overflow" : "ok")),
@@ -48417,8 +48795,8 @@ const STS_MULTI_PROVIDER = (() => {
       requestedMaxOutputTokens,
       appliedMaxOutputTokens: outputBudgetWireField ? requestedMaxOutputTokens : 0,
       shapeVisibleOutputTokens: Math.max(0, Math.round(Number(requestInput.outputBudget?.shapeVisibleOutputTokens || 0))),
-      reasoningHeadroomTokens: Math.max(0, Math.round(Number(requestInput.outputBudget?.reasoningHeadroomTokens || 0))),
-      reasoningHeadroomMinimumTokens: Math.max(0, Math.round(Number(requestInput.outputBudget?.reasoningHeadroomMinimumTokens || 0))),
+      reasoningHeadroomTokens: Math.max(0, Math.round(Number(requestInput.outputBudget?.reasoningHeadroomTokens || reasoningHeadroomTokens))),
+      reasoningHeadroomMinimumTokens: Math.max(0, Math.round(Number(requestInput.outputBudget?.reasoningHeadroomMinimumTokens || reasoningHeadroomTokens))),
       retryOrdinal: Math.max(0, Math.round(Number(requestInput.outputBudget?.retryOrdinal || 0))),
       dynamicRouter: capabilities.adaptiveProfile.dynamicRouter,
       wireField: outputBudgetWireField,
@@ -48444,7 +48822,13 @@ const STS_MULTI_PROVIDER = (() => {
       requireParameters: Boolean(body.provider?.require_parameters),
       preflightPresent: Boolean(preflightTelemetry),
       attemptDeadlineMs,
-      deadlineSource
+      deadlineSource,
+      ...aiCloudCapabilityTelemetry(requireParametersCapability),
+      requireParametersCapabilityCacheHit: Boolean(requireParametersCapability.cacheHit),
+      requireParametersCapabilityState: requireParametersCapability.state,
+      responseHealingCapabilityCacheHit: Boolean(responseHealingCapability.cacheHit),
+      responseHealingCapabilityState: responseHealingCapability.state,
+      capabilityProfileRevision
     };
     let observedUsage = null;
     const structuredRetryState = {
@@ -48453,6 +48837,7 @@ const STS_MULTI_PROVIDER = (() => {
       retryAttempted: false,
       retryReason: "",
       retryOrdinal: 0,
+      compatibilityRetryUsed: false,
       attempts: [],
       rawOutputs: []
     };
@@ -48481,6 +48866,20 @@ const STS_MULTI_PROVIDER = (() => {
         error.providerRetry = openRouterStructuredRetrySnapshot(structuredRetryState, false);
       }
       return error;
+    };
+    const increaseDerivedRetryBudget = () => {
+      if (!canIncreaseDerivedRetryBudget || retryOutputBudgetCeiling <= 0) return false;
+      const current = Math.max(0, Math.round(Number(body[outputBudgetWireField] || 0)));
+      const next = Math.min(retryOutputBudgetCeiling, Math.max(
+        current + Math.max(OPENROUTER_REASONING_HEADROOM_TOKENS, reasoningHeadroomTokens),
+        Math.ceil(current * 1.5)
+      ));
+      if (next <= current) return false;
+      body = Object.assign({}, body, { [outputBudgetWireField]: next });
+      outputBudgetTelemetry.requestedMaxOutputTokens = next;
+      outputBudgetTelemetry.appliedMaxOutputTokens = next;
+      providerRequestTelemetry.nativeMaxValue = next;
+      return true;
     };
     try {
       for (let structuredAttempt = 1; structuredAttempt <= 2; structuredAttempt += 1) {
@@ -48540,10 +48939,14 @@ const STS_MULTI_PROVIDER = (() => {
             try { JSON.parse(text); } catch { throw openRouterShapeError(Object.assign({}, bodyMetadata, { response }), model, "invalid-json-content"); }
           }
           const actualModel = normalizeModel("openrouter", payload.model || choice.model || model);
+          const capabilityObservation = Object.assign({}, capabilityMemoryParams, { servedModel: actualModel, fingerprint: capabilities.adaptiveProfile.fingerprint });
+          if (body.provider?.require_parameters === true) aiCloudCapabilityRemember(Object.assign({}, capabilityObservation, { carrier: "provider.require_parameters" }), "supported");
+          if (body.plugins?.some((plugin) => plugin?.id === "response-healing")) aiCloudCapabilityRemember(Object.assign({}, capabilityObservation, { carrier: "plugins.response-healing" }), "supported");
           structuredRetryState.rawOutputs.push(text);
           structuredRetryState.attempts.push({ attempt: structuredAttempt, status: "succeeded", code: "ok", requestedModel: model, servedModel: actualModel, finishReason, usage: normalizeUsage(payload.usage || {}) });
           return {
             text,
+            rawText: text,
             model: actualModel,
             requestedModel: model,
             actualModel,
@@ -48565,6 +48968,29 @@ const STS_MULTI_PROVIDER = (() => {
             providerRetry: openRouterStructuredRetrySnapshot(structuredRetryState)
           };
         } catch (error) {
+          const providerErrorValue = error?.providerError || {};
+          const providerDiagnostic = providerErrorValue.providerDiagnostic || {};
+          const capabilityCarrier = String(providerDiagnostic.capabilityCarrier || "");
+          const compatibilityEligible = structuredAttempt === 1
+            && schema
+            && !structuredRetryState.compatibilityRetryUsed
+            && providerErrorValue.provider === "openrouter"
+            && providerErrorValue.code === "unsupported-schema"
+            && capabilityCarrier === "plugins.response-healing"
+            && !providerDiagnostic.draining;
+          if (compatibilityEligible) {
+            const servedModel = normalizeModel("openrouter", providerDiagnostic.servedModel || "");
+            const rememberedParams = Object.assign({}, capabilityMemoryParams, { servedModel: servedModel && servedModel !== model ? servedModel : "", fingerprint: capabilities.adaptiveProfile.fingerprint });
+            aiCloudCapabilityRemember(Object.assign({}, rememberedParams, { carrier: capabilityCarrier }), "unsupported");
+            body = Object.assign({}, body);
+            if (capabilityCarrier === "plugins.response-healing") delete body.plugins;
+            structuredRetryState.compatibilityRetryUsed = true;
+            structuredRetryState.retryEligible = true;
+            structuredRetryState.retryAttempted = true;
+            structuredRetryState.retryReason = `compatibility-${capabilityCarrier}`;
+            structuredRetryState.retryOrdinal = structuredAttempt;
+            continue;
+          }
           if (bodyMetadata && statusOf(response) === 200) {
             const rawOutput = openRouterStructuredRetryRaw(bodyMetadata, error?.providerError?.providerDiagnostic?.responseShape || "");
             structuredRetryState.rawOutputs.push(rawOutput);
@@ -48584,6 +49010,7 @@ const STS_MULTI_PROVIDER = (() => {
               structuredRetryState.retryAttempted = true;
               structuredRetryState.retryReason = code === "output-truncated" ? "output-truncated" : String(diagnostic.responseShape || code);
               structuredRetryState.retryOrdinal = 1;
+              if (code === "output-truncated") increaseDerivedRetryBudget();
               continue;
             }
           }
@@ -48742,6 +49169,22 @@ const STS_MULTI_PROVIDER = (() => {
 
   const openWebUIRequest = async (auth, options = {}, method, path, body = null, requestConfig = {}) => {
     const request = requestFunction(options.requestUrl);
+    const normalizeOpenWebUIFailureResponse = async (response) => {
+      if (!response || typeof response !== "object") return response;
+      if (response.json && typeof response.json === "object") return response;
+      if (typeof response.text === "string") return response;
+      const clone = typeof response.clone === "function" ? response.clone() : response;
+      if (!clone || typeof clone.text !== "function") return response;
+      let text = "";
+      try { text = await clone.text(); } catch { return response; }
+      if (typeof text !== "string" || openWebUIUtf8ByteLength(text) > OPENWEBUI_RESPONSE_MAX_BYTES) return response;
+      const normalized = Object.assign({}, response, { status: statusOf(response), text });
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object") normalized.json = parsed;
+      } catch {}
+      return normalized;
+    };
     const execute = async () => {
       const abortedAttemptError = () => providerError("openwebui", null, "attempt-timeout", false, "", {
         source: "openwebui-abort",
@@ -48774,7 +49217,7 @@ const STS_MULTI_PROVIDER = (() => {
         throw providerError("openwebui", 401, "auth-required");
       }
       if (!successful(response)) {
-        const classification = classifyOpenWebUIError(response);
+        const classification = classifyOpenWebUIError(await normalizeOpenWebUIFailureResponse(response));
         throw providerError("openwebui", statusOf(response), classification.code, classification.retryable, "", classification.diagnostic);
       }
       return response;
@@ -48812,24 +49255,34 @@ const STS_MULTI_PROVIDER = (() => {
     "content-empty", "content-missing", "malformed-response", "invalid-json", "invalid-json-content"
   ]);
   const openWebUIJsonModeCompatibilityRequest = (strictBody) => {
-    const { response_format: _responseFormat, ...withoutSchema } = strictBody || {};
-    return Object.assign({}, withoutSchema, {
-      stream: false,
-      options: Object.assign({}, strictBody?.options || {}, { format: "json" })
-    });
+    const { response_format: _responseFormat, format: _format, ...withoutSchema } = strictBody || {};
+    const nativeSchemaCarrier = Object.prototype.hasOwnProperty.call(strictBody || {}, "format");
+    const compatibility = Object.assign({}, withoutSchema, { stream: false });
+    if (nativeSchemaCarrier) compatibility.format = "json";
+    else compatibility.options = Object.assign({}, strictBody?.options || {}, { format: "json" });
+    return compatibility;
+  };
+  const openWebUIGrammarCompatibilityEligible = (error, response, options = {}) => {
+    if (options.ollamaBacked !== true) return false;
+    const providerError = error?.providerError || {};
+    if (providerError.provider !== "openwebui") return false;
+    const diagnostic = providerError.providerDiagnostic || {};
+    if (diagnostic.classification !== "schema" || diagnostic.grammar !== true) return false;
+    const code = String(providerError.code || "").toLowerCase();
+    if (["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted", "transport"].includes(code)) return false;
+    if (diagnostic.draining === true || String(diagnostic.finalization || "").toLowerCase() === "draining" || String(diagnostic.transport || "").toLowerCase() === "abort") return false;
+    const status = response ? statusOf(response) : Number(providerError.status) || 0;
+    const errorStatus = providerError.status == null ? status : Number(providerError.status);
+    return status !== 200 || errorStatus !== 200;
   };
   const openWebUIStructuredRetryEligible = (error, schema, response, requestProfile = "", options = {}) => {
-    if (!schema || !error?.providerError || requestProfile !== "strict-schema") return false;
+    if (!schema || !error?.providerError || !["strict-schema", "strict-native-schema"].includes(requestProfile)) return false;
     if (error.providerError.provider !== "openwebui") return false;
     if (error.providerError.providerDiagnostic?.draining) return false;
     const status = response ? statusOf(response) : Number(error.providerError.status) || 0;
     const errorStatus = error.providerError.status == null ? status : Number(error.providerError.status);
     const diagnostic = error.providerError.providerDiagnostic || {};
-    if (status === 400 && errorStatus === 400) {
-      return options.ollamaBacked === true
-        && diagnostic.classification === "schema"
-        && diagnostic.grammar === true;
-    }
+    if (openWebUIGrammarCompatibilityEligible(error, response, options)) return true;
     if (status !== 200 || errorStatus !== 200) return false;
     const code = String(error.providerError.code || "").toLowerCase();
     const shape = String(diagnostic.responseShape || "").toLowerCase();
@@ -48841,6 +49294,8 @@ const STS_MULTI_PROVIDER = (() => {
       if (!/^\s*data:\s*/m.test(text)) {
         try {
           const payload = JSON.parse(text);
+          const nativeContent = payload?.message?.content;
+          if (typeof nativeContent === "string") return nativeContent;
           const content = payload?.choices?.[0]?.message?.content;
           if (typeof content === "string") return content;
         } catch {}
@@ -48848,7 +49303,13 @@ const STS_MULTI_PROVIDER = (() => {
       return text;
     }
     if (response?.json !== undefined) {
-      try { return JSON.stringify(response.json); } catch {}
+      try {
+        const nativeContent = response.json?.message?.content;
+        if (typeof nativeContent === "string") return nativeContent;
+        const content = response.json?.choices?.[0]?.message?.content;
+        if (typeof content === "string") return content;
+        return JSON.stringify(response.json);
+      } catch {}
     }
     return "";
   };
@@ -48858,10 +49319,21 @@ const STS_MULTI_PROVIDER = (() => {
     if (!model) throw providerError("openwebui", null, "model-required");
     const metadata = settings.openwebuiModelMetadata?.[model] || {};
     const capabilities = openWebUICapabilities(metadata);
-    const schema = requestInput.jsonSchema;
-    const schemaProjection = schema ? openWebUISchemaProjection(schema) : null;
-    const schemaGrounding = schemaProjection ? openWebUISchemaGroundingText(schemaProjection) : openWebUISchemaGroundingText(null);
+    const sharedSchema = requestInput.originalJsonSchema || requestInput.jsonSchema;
     const ollamaBacked = metadata.ollamaBacked === true;
+    const nativeDescription = ollamaBacked && ["description", "task-description"].includes(String(requestInput.operation || "")) && Boolean(sharedSchema);
+    const schema = nativeDescription ? openWebUICompactDescriptionSchema(sharedSchema) : requestInput.jsonSchema;
+    const wrapperSchema = nativeDescription ? openWebUIDescriptionWrapperSchema(sharedSchema) : null;
+    const descriptionCapability = nativeDescription ? openWebUISingletonDescriptionCapabilityState(model) : null;
+    const descriptionInitialCarrier = nativeDescription ? descriptionCapability.preferredCarrier : "";
+    const descriptionAttemptMax = nativeDescription
+      ? descriptionInitialCarrier === "direct-schema" ? 3 : descriptionInitialCarrier === "direct-json" ? 2 : 1
+      : 2;
+    const transportSchema = nativeDescription && descriptionInitialCarrier === "wrapper-json" ? wrapperSchema : schema;
+    const schemaProjection = transportSchema ? openWebUISchemaProjection(transportSchema) : null;
+    const wrapperSchemaProjection = wrapperSchema ? openWebUISchemaProjection(wrapperSchema) : null;
+    const schemaGrounding = schemaProjection ? openWebUISchemaGroundingText(schemaProjection) : openWebUISchemaGroundingText(null);
+    const wrapperSchemaGrounding = wrapperSchemaProjection ? openWebUISchemaGroundingText(wrapperSchemaProjection) : openWebUISchemaGroundingText(null);
     const reasoningCapability = providerReasoningCapability(settings, "openwebui", model);
     const thinkingMode = normalizeOpenWebUIThinkingMode(settings.openwebuiThinkingMode);
     const reportedOllamaThinking = Array.isArray(metadata.ollamaCapabilities)
@@ -48871,7 +49343,7 @@ const STS_MULTI_PROVIDER = (() => {
     const effort = requestedEffort.toLowerCase() === "default" ? "" : requestedEffort;
     // Reasoning effort is independent from Ollama's native thinking channel.
     // Only explicitly advertised effort levels may reach the provider.
-    const automaticReasoningDisable = Boolean(schemaProjection && !effort && reasoningCapability.configurable);
+    const automaticReasoningDisable = Boolean(schemaProjection && !effort && reasoningCapability.configurable && !ollamaBacked);
     const requestedMaxOutputTokens = Math.max(0, Math.round(Number(requestInput.maxOutputTokens || 0)));
     const hasOutputBudget = Boolean(requestInput.outputBudget && typeof requestInput.outputBudget === "object");
     const outputBudgetWireField = requestedMaxOutputTokens > 0 && hasOutputBudget && capabilities.maxTokens !== false
@@ -48879,36 +49351,66 @@ const STS_MULTI_PROVIDER = (() => {
       : requestedMaxOutputTokens > 0 && capabilities.maxCompletionTokens === true
         ? "max_completion_tokens"
         : requestedMaxOutputTokens > 0 && capabilities.maxTokens === true ? "max_tokens" : "";
-    const capabilityDirectedCompatibility = Boolean(schemaProjection && capabilities.structuredOutput === false);
-    if (effort && (!reasoningCapability.configurable || !reasoningCapability.supported.includes(effort))) throw providerError("openwebui", null, "unsupported-reasoning");
-    const messages = [];
-    if (requestInput.system != null && asString(requestInput.system) !== "") messages.push({ role: "system", content: asString(requestInput.system) });
-    if (schemaGrounding.present) messages.push({ role: "system", content: schemaGrounding.text });
+    const capabilityDirectedCompatibility = Boolean(schemaProjection && !ollamaBacked && capabilities.structuredOutput === false);
+    if (!ollamaBacked && effort && (!reasoningCapability.configurable || !reasoningCapability.supported.includes(effort))) throw providerError("openwebui", null, "unsupported-reasoning");
+    const businessSystemText = requestInput.system != null
+      ? (nativeDescription ? openWebUINativeDescriptionSystemText(requestInput.system) : asString(requestInput.system))
+      : "";
     const user = [requestInput.promptCachePrefix, providerContextSuffixJoin(requestInput.promptContextSuffix, requestInput.user)].filter((value) => value != null && asString(value) !== "").map(asString).join("\n\n");
-    if (user) messages.push({ role: "user", content: user });
-    const body = { model, messages, stream: Boolean(schemaProjection && !capabilityDirectedCompatibility) };
+    const messagesForGrounding = (grounding) => {
+      const groundingText = grounding?.present ? grounding.text : "";
+      const systemParts = [businessSystemText, groundingText].filter(Boolean);
+      const next = [];
+      if (ollamaBacked) {
+        if (systemParts.length) next.push({ role: "system", content: systemParts.join("\n\n") });
+      } else {
+        if (businessSystemText) next.push({ role: "system", content: businessSystemText });
+        if (groundingText) next.push({ role: "system", content: groundingText });
+      }
+      if (user) next.push({ role: "user", content: user });
+      return next;
+    };
+    const messages = messagesForGrounding(schemaGrounding);
+    const schemaWireHash = transportSchema ? stableHash(JSON.stringify(transportSchema)) : "";
+    const directSchemaWireHash = schema ? stableHash(JSON.stringify(schema)) : "";
+    const wrapperSchemaWireHash = wrapperSchema ? stableHash(JSON.stringify(wrapperSchema)) : "";
+    const sharedSchemaHash = nativeDescription && sharedSchema ? stableHash(JSON.stringify(sharedSchema)) : "";
+    const systemSchemaText = schemaGrounding.present ? schemaGrounding.text : "";
+    const systemMessageCount = messages.filter((message) => message.role === "system").length;
+    const systemMergeProfile = ollamaBacked && systemMessageCount === 1 && businessSystemText && systemSchemaText ? "openwebui-single-system-v1" : "";
+    const nativeEndpoint = ollamaBacked ? "/ollama/api/chat" : "/api/chat/completions";
+    const body = {
+      model,
+      messages,
+      // Native Ollama envelopes are completed objects. Preserve the existing
+      // Chat Completions streaming compatibility path for non-Ollama models.
+      stream: ollamaBacked ? false : Boolean(schemaProjection && !capabilityDirectedCompatibility)
+    };
     if (ollamaThinking) {
       body.think = true;
-      body.options = Object.assign({}, body.options || {}, { think: true });
     }
     if (schemaProjection) {
-      body.temperature = 0;
-      if (!capabilityDirectedCompatibility) body.response_format = { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema: schemaProjection.schema } };
       if (ollamaBacked) {
-        if (capabilityDirectedCompatibility) body.options = Object.assign({}, body.options || {}, { format: "json" });
+        body.format = nativeDescription && descriptionInitialCarrier !== "direct-schema" ? "json" : schemaProjection.schema;
+        body.options = Object.assign({}, body.options || {}, { temperature: 0 });
+      } else {
+        body.temperature = 0;
+        if (!capabilityDirectedCompatibility) body.response_format = { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema: schemaProjection.schema } };
       }
     }
     // OpenWebUI accepts reasoning_effort only for explicitly advertised level
     // support. Thinking is carried independently through the Ollama fields.
-    if (effort && reasoningCapability.configurable) body.reasoning_effort = effort;
+    if (!ollamaBacked && effort && reasoningCapability.configurable) body.reasoning_effort = effort;
     else if (automaticReasoningDisable) body.reasoning_effort = "none";
-    if (outputBudgetWireField) body[outputBudgetWireField] = requestedMaxOutputTokens;
+    if (ollamaBacked) {
+      if (requestedMaxOutputTokens > 0) body.options = Object.assign({}, body.options || {}, { num_predict: requestedMaxOutputTokens });
+    } else if (outputBudgetWireField) body[outputBudgetWireField] = requestedMaxOutputTokens;
     const outputBudgetTelemetry = {
       requestedMaxOutputTokens,
-      appliedMaxOutputTokens: outputBudgetWireField ? requestedMaxOutputTokens : 0,
-      wireField: outputBudgetWireField,
-      capabilityKnown: capabilities.maxCompletionTokens !== null || capabilities.maxTokens !== null,
-      applied: Boolean(outputBudgetWireField)
+      appliedMaxOutputTokens: ollamaBacked ? (requestedMaxOutputTokens > 0 ? requestedMaxOutputTokens : 0) : (outputBudgetWireField ? requestedMaxOutputTokens : 0),
+      wireField: ollamaBacked ? (requestedMaxOutputTokens > 0 ? "options.num_predict" : "") : outputBudgetWireField,
+      capabilityKnown: ollamaBacked || capabilities.maxCompletionTokens !== null || capabilities.maxTokens !== null,
+      applied: ollamaBacked ? requestedMaxOutputTokens > 0 : Boolean(outputBudgetWireField)
     };
     const cacheMetadata = requestInput.cacheMetadata && typeof requestInput.cacheMetadata === "object" ? requestInput.cacheMetadata : {};
     const cacheIdentity = nonEmpty(
@@ -48923,13 +49425,13 @@ const STS_MULTI_PROVIDER = (() => {
       || ""
     );
     const cacheIdentityHash = cacheIdentity ? stableHash(cacheIdentity) : "";
-    const schemaHash = schema ? stableHash(JSON.stringify(schema)) : "";
+    const schemaHash = schemaWireHash;
     const providerRequestTelemetry = {
       schemaPresent: Boolean(schemaProjection),
       streamPresent: true,
-      stream: Boolean(schemaProjection),
-      temperaturePresent: Boolean(schemaProjection),
-      temperature: schemaProjection ? 0 : null,
+      stream: Boolean(body.stream),
+      temperaturePresent: ollamaBacked ? Object.prototype.hasOwnProperty.call(body.options || {}, "temperature") : Object.prototype.hasOwnProperty.call(body, "temperature"),
+      temperature: ollamaBacked ? (body.options?.temperature ?? null) : (body.temperature ?? null),
       reasoningPresent: Boolean((effort || automaticReasoningDisable) && reasoningCapability.configurable),
       reasoningRequestedPresent: Boolean(effort),
       reasoningRequestedEffort: effort,
@@ -48938,8 +49440,8 @@ const STS_MULTI_PROVIDER = (() => {
       ollamaBacked,
       thinkPresent: ollamaThinking,
       think: ollamaThinking ? true : null,
-      thinkOptionsPresent: ollamaThinking,
-      thinkCarrier: ollamaThinking ? "top-level+options" : "",
+      thinkOptionsPresent: false,
+      thinkCarrier: ollamaThinking ? "top-level" : "",
       thinkingMode,
       jsonModePresent: false,
       jsonModeValue: "",
@@ -48951,43 +49453,70 @@ const STS_MULTI_PROVIDER = (() => {
       schemaGroundingHash: String(requestInput.preflight?.schemaGroundingHash || schemaGrounding.hash || "").slice(0, 80),
       schemaGroundingProfile: String(requestInput.preflight?.schemaGroundingProfile || schemaGrounding.profile || "").slice(0, 80),
       schemaGroundingOmittedPatternCount: Math.max(0, Math.round(Number(requestInput.preflight?.schemaGroundingOmittedPatternCount || schemaGrounding.omittedPatternCount || 0))),
+      systemMessageCount,
+      systemBusinessBytes: openWebUIUtf8ByteLength(businessSystemText),
+      systemBusinessHash: businessSystemText ? stableHash(businessSystemText) : "",
+      systemSchemaBytes: openWebUIUtf8ByteLength(systemSchemaText),
+      systemSchemaHash: systemSchemaText ? stableHash(systemSchemaText) : "",
+      systemMergeProfile,
+      descriptionSchemaProjectionProfile: nativeDescription ? OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE : "",
+      descriptionOriginalSchemaHash: sharedSchemaHash,
+      descriptionCompactSchemaHash: nativeDescription ? schemaWireHash : "",
+      descriptionCarrier: nativeDescription ? descriptionInitialCarrier : "",
+      descriptionCapabilityCacheHit: nativeDescription ? descriptionCapability.cacheHit : false,
+      descriptionCapabilityPreference: nativeDescription ? descriptionInitialCarrier : "",
+      descriptionGrammarLearned: nativeDescription ? descriptionCapability.grammarUnsupported : false,
+      descriptionAttemptOrdinal: nativeDescription ? 1 : 0,
+      descriptionAttemptMax: nativeDescription ? descriptionAttemptMax : 0,
+      descriptionWrapperFallbackEligible: false,
+      descriptionWrapperFallbackAttempted: false,
       structuredTextVerbosityPresent: false,
       structuredTextVerbosity: "",
-      outputBudgetPresent: Boolean(outputBudgetWireField),
-      nativeMaxField: outputBudgetWireField,
-      nativeMaxFieldPresent: Boolean(outputBudgetWireField),
-      nativeMaxValue: outputBudgetWireField ? requestedMaxOutputTokens : 0,
+      outputBudgetPresent: ollamaBacked ? requestedMaxOutputTokens > 0 : Boolean(outputBudgetWireField),
+      nativeMaxField: ollamaBacked ? (requestedMaxOutputTokens > 0 ? "options.num_predict" : "") : outputBudgetWireField,
+      nativeMaxFieldPresent: ollamaBacked ? requestedMaxOutputTokens > 0 : Boolean(outputBudgetWireField),
+      nativeMaxValue: requestedMaxOutputTokens > 0 ? requestedMaxOutputTokens : 0,
       requireParameters: false,
       preflightPresent: Boolean(requestInput.preflight),
       attemptDeadlineMs: Math.max(0, Math.round(Number(requestInput.attemptDeadlineMs || options.timeoutMs || 0))),
       deadlineSource: String(requestInput.attemptDeadlineSource || "").slice(0, 48)
     };
-    const requestTelemetryForBody = (requestBody, requestProfile, retryReason = "") => Object.assign({}, providerRequestTelemetry, {
+    const requestTelemetryForBody = (requestBody, requestProfile, retryReason = "", telemetryOverrides = {}) => Object.assign({}, providerRequestTelemetry, {
       requestBodyHash: stableHash(JSON.stringify(requestBody || {})),
       schemaHash,
       cacheIdentityHash,
+      endpoint: nativeEndpoint,
+      schemaCarrier: Object.prototype.hasOwnProperty.call(requestBody || {}, "format")
+        ? "root.format"
+        : Object.prototype.hasOwnProperty.call(requestBody || {}, "response_format") ? "response_format.json_schema" : "none",
+      outputBudgetCarrier: requestBody?.options && Object.prototype.hasOwnProperty.call(requestBody.options, "num_predict")
+        ? "options.num_predict"
+        : Object.prototype.hasOwnProperty.call(requestBody || {}, "max_tokens") ? "max_tokens"
+          : Object.prototype.hasOwnProperty.call(requestBody || {}, "max_completion_tokens") ? "max_completion_tokens" : "",
       requestProfile: String(requestProfile || "standard").slice(0, 64),
       retryReason: String(retryReason || "").slice(0, 64),
       retryOrdinal: Math.max(0, Math.round(Number(structuredRetryState.retryOrdinal || 0))),
       compatibilityReason: requestProfile === "local-schema-compatibility-capability"
         ? "structured-output-unsupported"
-        : requestProfile === "local-schema-compatibility-grammar" ? "grammar-unsupported" : "",
+        : requestProfile === "local-schema-compatibility-grammar" || requestProfile === "local-schema-compatibility-json" ? "native-json-compatibility" : "",
       responseFormatPresent: Object.prototype.hasOwnProperty.call(requestBody || {}, "response_format"),
       streamPresent: Object.prototype.hasOwnProperty.call(requestBody || {}, "stream"),
       stream: Object.prototype.hasOwnProperty.call(requestBody || {}, "stream") ? Boolean(requestBody.stream) : null,
-      temperaturePresent: Object.prototype.hasOwnProperty.call(requestBody || {}, "temperature"),
-      temperature: Object.prototype.hasOwnProperty.call(requestBody || {}, "temperature") ? requestBody.temperature : null,
+      temperaturePresent: nativeEndpoint === "/ollama/api/chat"
+        ? Object.prototype.hasOwnProperty.call(requestBody?.options || {}, "temperature")
+        : Object.prototype.hasOwnProperty.call(requestBody || {}, "temperature"),
+      temperature: nativeEndpoint === "/ollama/api/chat"
+        ? (requestBody?.options?.temperature ?? null)
+        : (Object.prototype.hasOwnProperty.call(requestBody || {}, "temperature") ? requestBody.temperature : null),
       thinkPresent: Object.prototype.hasOwnProperty.call(requestBody || {}, "think"),
       think: Object.prototype.hasOwnProperty.call(requestBody || {}, "think") ? Boolean(requestBody.think) : null,
       thinkOptionsPresent: Boolean(requestBody?.options && Object.prototype.hasOwnProperty.call(requestBody.options, "think")),
-      thinkCarrier: Object.prototype.hasOwnProperty.call(requestBody || {}, "think") && requestBody?.options && Object.prototype.hasOwnProperty.call(requestBody.options, "think")
-        ? "top-level+options"
-        : Object.prototype.hasOwnProperty.call(requestBody || {}, "think") ? "top-level" : requestBody?.options && Object.prototype.hasOwnProperty.call(requestBody.options, "think") ? "options" : "",
-      jsonModePresent: requestBody?.options?.format === "json",
-      jsonModeValue: requestBody?.options?.format === "json" ? "json" : "",
-      jsonModeProfile: requestBody?.options?.format === "json" ? OPENWEBUI_JSON_MODE_PROFILE : "",
-      jsonModeCarrier: requestBody?.options?.format === "json" ? "options.format" : ""
-    });
+      thinkCarrier: Object.prototype.hasOwnProperty.call(requestBody || {}, "think") ? "top-level" : "",
+      jsonModePresent: requestBody?.format === "json" || requestBody?.options?.format === "json",
+      jsonModeValue: requestBody?.format === "json" || requestBody?.options?.format === "json" ? "json" : "",
+      jsonModeProfile: requestBody?.format === "json" || requestBody?.options?.format === "json" ? OPENWEBUI_JSON_MODE_PROFILE : "",
+      jsonModeCarrier: requestBody?.format === "json" ? "root.format" : requestBody?.options?.format === "json" ? "options.format" : ""
+    }, telemetryOverrides);
     const schemaGroundingTelemetry = {
       present: schemaGrounding.present,
       bytes: schemaGrounding.bytes,
@@ -48995,7 +49524,11 @@ const STS_MULTI_PROVIDER = (() => {
       hash: schemaGrounding.hash,
       profile: schemaGrounding.profile,
       omittedPatternCount: schemaGrounding.omittedPatternCount,
-      placement: schemaGrounding.present ? "system" : ""
+      placement: schemaGrounding.present ? "system" : "",
+      descriptionSchemaProjectionProfile: nativeDescription ? OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE : "",
+      descriptionCompactSchemaHash: nativeDescription ? schemaWireHash : "",
+      descriptionOriginalSchemaHash: sharedSchemaHash,
+      descriptionCarrier: nativeDescription ? descriptionInitialCarrier : ""
     };
     const preserveRequestTelemetry = (error, telemetry = providerRequestTelemetry) => {
       if (!error) return error;
@@ -49004,7 +49537,11 @@ const STS_MULTI_PROVIDER = (() => {
       return error;
     };
     const requestBody = body;
-    const requestProfile = capabilityDirectedCompatibility ? "local-schema-compatibility-capability" : schemaProjection ? "strict-schema" : "standard";
+    const requestProfile = capabilityDirectedCompatibility
+      ? "local-schema-compatibility-capability"
+      : schemaProjection
+        ? (ollamaBacked ? "strict-native-schema" : "strict-schema")
+        : "standard";
     let lastStructuredResponseDiagnostic = null;
     const structuredRetryState = {
       requestedModel: model,
@@ -49012,18 +49549,57 @@ const STS_MULTI_PROVIDER = (() => {
       retryAttempted: false,
       retryReason: "",
       retryOrdinal: 0,
+      descriptionNextCarrier: descriptionInitialCarrier,
       attempts: [],
       rawOutputs: []
     };
-    for (let structuredAttempt = 1; structuredAttempt <= 2; structuredAttempt += 1) {
-      const jsonModeCompatibility = structuredRetryState.retryOrdinal > 0 && structuredRetryState.retryReason === "grammar-compatibility";
-      const attemptRequestBody = jsonModeCompatibility && ollamaBacked
-        ? openWebUIJsonModeCompatibilityRequest(requestBody)
-        : requestBody;
-      const attemptRequestProfile = jsonModeCompatibility && ollamaBacked
-        ? "local-schema-compatibility-grammar"
-        : requestProfile;
-      const attemptProviderRequestTelemetry = requestTelemetryForBody(attemptRequestBody, attemptRequestProfile, structuredRetryState.retryReason);
+    for (let structuredAttempt = 1; structuredAttempt <= (nativeDescription ? descriptionAttemptMax : 2); structuredAttempt += 1) {
+      const attemptCarrier = nativeDescription
+        ? structuredAttempt === 1 ? descriptionInitialCarrier : structuredRetryState.descriptionNextCarrier
+        : "";
+      const attemptWrapper = nativeDescription && attemptCarrier === "wrapper-json";
+      const attemptSchema = nativeDescription && attemptWrapper ? wrapperSchema : schema;
+      const attemptSchemaProjection = nativeDescription && attemptWrapper ? wrapperSchemaProjection : schemaProjection;
+      const attemptSchemaGrounding = nativeDescription && attemptWrapper ? wrapperSchemaGrounding : schemaGrounding;
+      const attemptSchemaHash = nativeDescription && attemptWrapper ? wrapperSchemaWireHash : nativeDescription ? directSchemaWireHash : schemaWireHash;
+      const jsonModeCompatibility = ollamaBacked && (nativeDescription
+        ? attemptCarrier === "direct-json" || attemptCarrier === "wrapper-json"
+        : structuredRetryState.retryOrdinal > 0);
+      let attemptRequestBody = requestBody;
+      if (jsonModeCompatibility && ollamaBacked) {
+        attemptRequestBody = openWebUIJsonModeCompatibilityRequest(requestBody);
+        if (nativeDescription && attemptWrapper) {
+          attemptRequestBody = Object.assign({}, attemptRequestBody, {
+            messages: messagesForGrounding(attemptSchemaGrounding),
+            format: "json"
+          });
+        }
+      }
+      const attemptRequestProfile = nativeDescription
+        ? attemptCarrier === "wrapper-json" ? "local-schema-compatibility-description-wrapper-json"
+          : attemptCarrier === "direct-json" ? "local-schema-compatibility-json" : "strict-native-schema"
+        : jsonModeCompatibility ? "local-schema-compatibility-json" : requestProfile;
+      const attemptSchemaSystemText = attemptSchemaGrounding.present ? attemptSchemaGrounding.text : "";
+      const attemptSystemMessageCount = attemptRequestBody.messages?.filter?.((message) => message.role === "system").length || 0;
+      const attemptProviderRequestTelemetry = requestTelemetryForBody(attemptRequestBody, attemptRequestProfile, structuredRetryState.retryReason, {
+        schemaHash: attemptSchemaHash,
+        descriptionCompactSchemaHash: nativeDescription ? attemptSchemaHash : "",
+        descriptionOriginalSchemaHash: sharedSchemaHash,
+        schemaGroundingBytes: attemptSchemaGrounding.bytes,
+        schemaGroundingTokens: attemptSchemaGrounding.estimatedTokens,
+        schemaGroundingHash: attemptSchemaGrounding.hash,
+        schemaGroundingProfile: attemptSchemaGrounding.profile,
+        schemaGroundingOmittedPatternCount: attemptSchemaGrounding.omittedPatternCount,
+        systemMessageCount: attemptSystemMessageCount,
+        systemSchemaBytes: openWebUIUtf8ByteLength(attemptSchemaSystemText),
+        systemSchemaHash: attemptSchemaSystemText ? stableHash(attemptSchemaSystemText) : "",
+        descriptionCarrier: nativeDescription ? attemptCarrier : "",
+        descriptionCapabilityPreference: nativeDescription ? descriptionInitialCarrier : "",
+        descriptionGrammarLearned: nativeDescription ? descriptionCapability.grammarUnsupported : false,
+        descriptionAttemptOrdinal: nativeDescription ? structuredAttempt : 0,
+        descriptionAttemptMax: nativeDescription ? descriptionAttemptMax : 0,
+        descriptionWrapperFallbackAttempted: attemptWrapper
+      });
       let response = null;
       let queueTelemetry = null;
       let normalizedResponse = null;
@@ -49035,7 +49611,7 @@ const STS_MULTI_PROVIDER = (() => {
         return preserveRequestTelemetry(error, attemptProviderRequestTelemetry);
       };
       try {
-        response = await openWebUIRequest(auth, options, "POST", "/api/chat/completions", attemptRequestBody, {
+        response = await openWebUIRequest(auth, options, "POST", nativeEndpoint, attemptRequestBody, {
           modelExecution: true,
           model,
           concurrencyLimit: openWebUIModelConcurrencyLimit(settings, model),
@@ -49045,11 +49621,13 @@ const STS_MULTI_PROVIDER = (() => {
         if (!successful(response)) throw providerError("openwebui", statusOf(response), "transport", retryableStatus(statusOf(response)));
         try {
           normalizedResponse = openWebUIResponseNormalize(response, model, {
-            strictSchemaExpected: Boolean(schema),
-            originalSchema: schema
+            strictSchemaExpected: Boolean(attemptSchema),
+            originalSchema: nativeDescription ? sharedSchema : schema,
+            nativeOllama: ollamaBacked,
+            nativeDescription
           });
         } catch (error) { throw preserveQueueTelemetry(error); }
-        if (schemaProjection
+        if (attemptSchemaProjection
           && normalizedResponse.responseTelemetry?.reasoningOnlyCandidateUsed
           && !normalizedResponse.responseTelemetry?.reasoningOnlyCandidateAccepted) {
           throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), "invalid-response"));
@@ -49065,32 +49643,73 @@ const STS_MULTI_PROVIDER = (() => {
             usage: normalizedResponse.usage,
             outputBudgetTelemetry: {
               requestedMaxOutputTokens,
-              appliedMaxOutputTokens: outputBudgetWireField ? requestedMaxOutputTokens : 0,
-              wireField: outputBudgetWireField,
-              capabilityKnown: capabilities.maxCompletionTokens !== null || capabilities.maxTokens !== null
+              appliedMaxOutputTokens: ollamaBacked ? (requestedMaxOutputTokens > 0 ? requestedMaxOutputTokens : 0) : (outputBudgetWireField ? requestedMaxOutputTokens : 0),
+              wireField: ollamaBacked ? (requestedMaxOutputTokens > 0 ? "options.num_predict" : "") : outputBudgetWireField,
+              capabilityKnown: ollamaBacked || capabilities.maxCompletionTokens !== null || capabilities.maxTokens !== null
             }
           }));
           truncationError.outputBudgetTelemetry = truncationError.providerError.providerDiagnostic.outputBudgetTelemetry;
           truncationError.providerUsage = normalizedResponse.usage;
           throw truncationError;
         }
-        const text = normalizedResponse.text;
-        if (schema) {
-          const validation = openWebUIReasoningOnlyJson(text, schema);
+        let text = normalizedResponse.text;
+        if (attemptSchema) {
+          const validation = openWebUIReasoningOnlyJson(text, attemptSchema);
           schemaValidationTelemetry = {
-            profile: OPENWEBUI_REASONING_VALIDATION_PROFILE,
+            profile: nativeDescription ? OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE : OPENWEBUI_REASONING_VALIDATION_PROFILE,
             reason: validation.reason,
             schemaHash: validation.schemaHash,
-            accepted: validation.accepted
+            accepted: validation.accepted,
+            compactSchemaAccepted: nativeDescription ? validation.accepted : undefined,
+            compactSchemaHash: nativeDescription ? validation.schemaHash : ""
           };
           if (!validation.accepted) {
             const validationCode = validation.reason === "schema-pattern-mismatch" ? "schema-pattern-mismatch" : "invalid-response";
             throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), validationCode));
           }
+          let parsedValue;
+          try { parsedValue = JSON.parse(text); } catch {
+            throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), "invalid-response"));
+          }
           try {
-            validateOpenWebUIPatterns(JSON.parse(text), schemaProjection);
+            validateOpenWebUIPatterns(parsedValue, attemptSchemaProjection);
           } catch (error) {
             throw preserveQueueTelemetry(error?.providerError ? error : providerError("openwebui", statusOf(response), "invalid-response"));
+          }
+          if (nativeDescription) {
+            const parsedItem = attemptWrapper
+              ? Array.isArray(parsedValue?.descriptions) && parsedValue.descriptions.length === 1
+                ? parsedValue.descriptions[0]
+                : null
+              : parsedValue;
+            if (!parsedItem || typeof parsedItem !== "object" || Array.isArray(parsedItem)) {
+              throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), "invalid-response"));
+            }
+            const normalizedValue = { tasks: [], section_name: "", descriptions: [parsedItem] };
+            const normalizedText = JSON.stringify(normalizedValue);
+            const fullValidation = openWebUIReasoningOnlyJson(normalizedText, sharedSchema);
+            schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+              normalizedSchemaHash: fullValidation.schemaHash,
+              normalizedSchemaReason: fullValidation.reason,
+              normalizedSchemaAccepted: fullValidation.accepted,
+              fullSchemaHash: sharedSchemaHash,
+              fullSchemaAccepted: fullValidation.accepted
+            });
+            if (!fullValidation.accepted) {
+              const validationCode = fullValidation.reason === "schema-pattern-mismatch" ? "schema-pattern-mismatch" : "invalid-response";
+              throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), validationCode));
+            }
+            text = normalizedText;
+            normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+              descriptionCompactSchemaPresent: true,
+              descriptionCompactAccepted: true,
+              descriptionEnvelopeAdded: true,
+              descriptionFullSchemaAccepted: true,
+              descriptionSchemaProfile: OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE,
+              descriptionCompactSchemaHash: validation.schemaHash,
+              descriptionOriginalSchemaHash: sharedSchemaHash,
+              descriptionCarrier: attemptCarrier
+            });
           }
         }
         const actualModel = normalizedResponse.model || model;
@@ -49100,7 +49719,7 @@ const STS_MULTI_PROVIDER = (() => {
           profile: normalizedResponse.responseTelemetry?.reasoningOnlyValidationProfile || "",
           reason: normalizedResponse.responseTelemetry?.reasoningOnlyValidationReason || "",
           schemaHash: normalizedResponse.responseTelemetry?.reasoningOnlyValidationSchemaHash || "",
-          accepted: Boolean(normalizedResponse.responseTelemetry?.reasoningOnlyCandidateAccepted || !schema)
+          accepted: Boolean(normalizedResponse.responseTelemetry?.reasoningOnlyCandidateAccepted || !attemptSchema)
         };
         structuredRetryState.attempts.push({
           attempt: structuredAttempt,
@@ -49111,6 +49730,10 @@ const STS_MULTI_PROVIDER = (() => {
           requestedModel: model,
           servedModel: actualModel,
           requestProfile: attemptRequestProfile,
+          endpoint: attemptProviderRequestTelemetry.endpoint,
+          schemaCarrier: attemptProviderRequestTelemetry.schemaCarrier,
+          outputBudgetCarrier: attemptProviderRequestTelemetry.outputBudgetCarrier,
+          thinkingCarrier: attemptProviderRequestTelemetry.thinkCarrier,
           requestBodyHash: attemptProviderRequestTelemetry.requestBodyHash,
           schemaHash: attemptProviderRequestTelemetry.schemaHash,
           cacheIdentityHash: attemptProviderRequestTelemetry.cacheIdentityHash,
@@ -49129,6 +49752,17 @@ const STS_MULTI_PROVIDER = (() => {
           structuredEnvelopeNormalized: Boolean(normalizedResponse.responseTelemetry?.structuredEnvelopeNormalized),
           structuredEnvelopeProfile: String(normalizedResponse.responseTelemetry?.structuredEnvelopeProfile || "").slice(0, 80),
           structuredEnvelopeReason: String(normalizedResponse.responseTelemetry?.structuredEnvelopeReason || "").slice(0, 80),
+          descriptionCompactAccepted: Boolean(normalizedResponse.responseTelemetry?.descriptionCompactAccepted),
+          descriptionEnvelopeAdded: Boolean(normalizedResponse.responseTelemetry?.descriptionEnvelopeAdded),
+          descriptionFullSchemaAccepted: Boolean(normalizedResponse.responseTelemetry?.descriptionFullSchemaAccepted),
+          descriptionCarrier: String(attemptProviderRequestTelemetry.descriptionCarrier || "").slice(0, 48),
+          descriptionCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.descriptionCapabilityCacheHit),
+          descriptionCapabilityPreference: String(attemptProviderRequestTelemetry.descriptionCapabilityPreference || "").slice(0, 48),
+          descriptionGrammarLearned: Boolean(attemptProviderRequestTelemetry.descriptionGrammarLearned),
+          descriptionAttemptOrdinal: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptOrdinal) || 0)),
+          descriptionAttemptMax: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptMax) || 0)),
+          descriptionWrapperFallbackEligible: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackEligible),
+          descriptionWrapperFallbackAttempted: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackAttempted),
           httpStatus: statusOf(response),
           retryReason: structuredRetryState.retryReason,
           retryOrdinal: structuredRetryState.retryOrdinal,
@@ -49136,17 +49770,38 @@ const STS_MULTI_PROVIDER = (() => {
           usage: normalizedResponse.usage,
           queueTelemetry
         });
-        const schemaTelemetry = schemaProjection?.telemetry || { profile: "none", omittedPatternCount: 0 };
+        const schemaTelemetry = Object.assign({}, attemptSchemaProjection?.telemetry || { profile: "none", omittedPatternCount: 0 }, nativeDescription ? {
+          descriptionSchemaProfile: OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE,
+          descriptionCompactSchemaHash: attemptSchemaHash,
+          descriptionOriginalSchemaHash: sharedSchemaHash,
+          descriptionCarrier: attemptCarrier
+        } : {});
+        if (nativeDescription) {
+          openWebUIRecordSingletonDescriptionCapability(model, {
+            grammarUnsupported: descriptionCapability.grammarUnsupported,
+            preferredCarrier: attemptWrapper ? "wrapper-json" : descriptionCapability.grammarUnsupported ? "direct-json" : "direct-schema"
+          });
+        }
         return {
           text,
           rawText,
+          thinking: normalizedResponse.thinking || "",
           model: actualModel,
           provider: "openwebui",
           usage: normalizedResponse.usage,
           schemaProfile: schemaTelemetry.profile,
           schemaOmittedPatternCount: schemaTelemetry.omittedPatternCount,
           schemaTelemetry,
-          schemaGroundingTelemetry,
+          schemaGroundingTelemetry: nativeDescription ? Object.assign({}, schemaGroundingTelemetry, {
+            present: attemptSchemaGrounding.present,
+            bytes: attemptSchemaGrounding.bytes,
+            estimatedTokens: attemptSchemaGrounding.estimatedTokens,
+            hash: attemptSchemaGrounding.hash,
+            profile: attemptSchemaGrounding.profile,
+            omittedPatternCount: attemptSchemaGrounding.omittedPatternCount,
+            descriptionCompactSchemaHash: attemptSchemaHash,
+            descriptionCarrier: attemptCarrier
+          }) : schemaGroundingTelemetry,
           responseProfile: normalizedResponse.responseTelemetry.profile,
           responseTelemetry: normalizedResponse.responseTelemetry,
           outputBudgetTelemetry,
@@ -49161,15 +49816,24 @@ const STS_MULTI_PROVIDER = (() => {
           reason: normalizedResponse?.responseTelemetry?.reasoningOnlyValidationReason || "",
           schemaHash: normalizedResponse?.responseTelemetry?.reasoningOnlyValidationSchemaHash || ""
         };
-        if (normalizedResponse && schema) {
-          const providerDiagnostic = openWebUIStructuredResponseDiagnostic(response, normalizedResponse, schemaGroundingTelemetry, responseValidation);
+        if (normalizedResponse && attemptSchema) {
+          const providerDiagnostic = openWebUIStructuredResponseDiagnostic(response, normalizedResponse, {
+            ...schemaGroundingTelemetry,
+            present: attemptSchemaGrounding.present,
+            bytes: attemptSchemaGrounding.bytes,
+            estimatedTokens: attemptSchemaGrounding.estimatedTokens,
+            hash: attemptSchemaGrounding.hash,
+            profile: attemptSchemaGrounding.profile,
+            omittedPatternCount: attemptSchemaGrounding.omittedPatternCount,
+            descriptionCarrier: attemptCarrier
+          }, responseValidation);
           lastStructuredResponseDiagnostic = providerDiagnostic;
           const providerErrorValue = preserved?.providerError;
           if (providerErrorValue && typeof providerErrorValue === "object") {
             providerErrorValue.providerDiagnostic = Object.assign({}, providerErrorValue.providerDiagnostic || {}, providerDiagnostic);
             preserved.providerDiagnostic = providerErrorValue.providerDiagnostic;
           } else preserved.providerDiagnostic = providerDiagnostic;
-        } else if (!normalizedResponse && lastStructuredResponseDiagnostic && schema) {
+        } else if (!normalizedResponse && lastStructuredResponseDiagnostic && attemptSchema) {
           const providerErrorValue = preserved?.providerError;
           if (providerErrorValue && typeof providerErrorValue === "object") {
             providerErrorValue.providerDiagnostic = Object.assign({}, lastStructuredResponseDiagnostic, providerErrorValue.providerDiagnostic || {});
@@ -49179,9 +49843,27 @@ const STS_MULTI_PROVIDER = (() => {
         const responseStatus = response ? statusOf(response) : Number(preserved?.providerError?.status) || 0;
         const rawOutput = responseStatus === 200 ? openWebUIStructuredRetryRaw(response) : "";
         if (responseStatus === 200) structuredRetryState.rawOutputs.push(rawOutput);
-        if (schemaProjection) {
+        if (attemptSchemaProjection) {
           const providerErrorValue = preserved?.providerError || {};
           const diagnostic = providerErrorValue.providerDiagnostic || {};
+          const nativeDescriptionGrammarFailure = nativeDescription
+            && attemptCarrier === "direct-schema"
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+          if (nativeDescriptionGrammarFailure) {
+            descriptionCapability.grammarUnsupported = true;
+            openWebUIRecordSingletonDescriptionCapability(model, { grammarUnsupported: true, preferredCarrier: "direct-json" });
+            attemptProviderRequestTelemetry.descriptionGrammarLearned = true;
+          }
+          const nativeDescriptionWrapperFallbackEligible = nativeDescription
+            && attemptCarrier === "direct-json"
+            && responseStatus === 200
+            && Number(providerErrorValue.status) === 200
+            && ["invalid-response", "schema-pattern-mismatch"].includes(String(providerErrorValue.code || "").toLowerCase())
+            && !(normalizedResponse?.model
+              && normalizeModel("openwebui", normalizedResponse.model) !== model)
+            && schemaValidationTelemetry.fullSchemaAccepted !== false
+            && structuredAttempt < descriptionAttemptMax;
+          attemptProviderRequestTelemetry.descriptionWrapperFallbackEligible = nativeDescriptionWrapperFallbackEligible;
           structuredRetryState.attempts.push({
             attempt: structuredAttempt,
             status: "failed",
@@ -49192,6 +49874,10 @@ const STS_MULTI_PROVIDER = (() => {
             servedModel: String(diagnostic.servedModel || normalizedResponse?.model || model),
             finishReason: String(diagnostic.finishReason || finishReason || ""),
             requestProfile: attemptRequestProfile,
+            endpoint: attemptProviderRequestTelemetry.endpoint,
+            schemaCarrier: attemptProviderRequestTelemetry.schemaCarrier,
+            outputBudgetCarrier: attemptProviderRequestTelemetry.outputBudgetCarrier,
+            thinkingCarrier: attemptProviderRequestTelemetry.thinkCarrier,
             requestBodyHash: attemptProviderRequestTelemetry.requestBodyHash,
             schemaHash: attemptProviderRequestTelemetry.schemaHash,
             cacheIdentityHash: attemptProviderRequestTelemetry.cacheIdentityHash,
@@ -49213,14 +49899,37 @@ const STS_MULTI_PROVIDER = (() => {
             structuredEnvelopeNormalized: Boolean(normalizedResponse?.responseTelemetry?.structuredEnvelopeNormalized),
             structuredEnvelopeProfile: String(normalizedResponse?.responseTelemetry?.structuredEnvelopeProfile || "").slice(0, 80),
             structuredEnvelopeReason: String(normalizedResponse?.responseTelemetry?.structuredEnvelopeReason || "").slice(0, 80),
+            descriptionCompactAccepted: Boolean(normalizedResponse?.responseTelemetry?.descriptionCompactAccepted),
+            descriptionEnvelopeAdded: Boolean(normalizedResponse?.responseTelemetry?.descriptionEnvelopeAdded),
+            descriptionFullSchemaAccepted: Boolean(normalizedResponse?.responseTelemetry?.descriptionFullSchemaAccepted),
+            descriptionCarrier: String(attemptProviderRequestTelemetry.descriptionCarrier || "").slice(0, 48),
+            descriptionCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.descriptionCapabilityCacheHit),
+            descriptionCapabilityPreference: String(attemptProviderRequestTelemetry.descriptionCapabilityPreference || "").slice(0, 48),
+            descriptionGrammarLearned: Boolean(attemptProviderRequestTelemetry.descriptionGrammarLearned),
+            descriptionAttemptOrdinal: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptOrdinal) || 0)),
+            descriptionAttemptMax: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptMax) || 0)),
+            descriptionWrapperFallbackEligible: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackEligible),
+            descriptionWrapperFallbackAttempted: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackAttempted),
             usage: preserved?.providerUsage || diagnostic.usage || {},
             queueTelemetry
           });
-          if (structuredAttempt === 1 && !capabilityDirectedCompatibility && openWebUIStructuredRetryEligible(preserved, schema, response, attemptRequestProfile, { ollamaBacked })) {
+          if (nativeDescription && nativeDescriptionWrapperFallbackEligible) {
+            structuredRetryState.retryEligible = true;
+            structuredRetryState.retryAttempted = true;
+            structuredRetryState.retryReason = "description-wrapper-schema";
+            structuredRetryState.retryOrdinal = structuredAttempt;
+            structuredRetryState.descriptionNextCarrier = "wrapper-json";
+            continue;
+          }
+          if (structuredAttempt === 1
+            && !capabilityDirectedCompatibility
+            && (!nativeDescription || attemptCarrier === "direct-schema")
+            && openWebUIStructuredRetryEligible(preserved, attemptSchema, response, attemptRequestProfile, { ollamaBacked })) {
             structuredRetryState.retryEligible = true;
             structuredRetryState.retryAttempted = true;
             structuredRetryState.retryReason = diagnostic.grammar === true ? "grammar-compatibility" : String(providerErrorValue.code || "invalid-response");
             structuredRetryState.retryOrdinal = 1;
+            if (nativeDescription) structuredRetryState.descriptionNextCarrier = "direct-json";
             continue;
           }
         }
@@ -49753,7 +50462,13 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUIWorkerCount,
     openWebUICapabilities,
     openWebUIRoleCapabilities,
+    stableHash,
     openWebUISchemaProjection,
+    openWebUICompactDescriptionSchema,
+    openWebUIDescriptionWrapperSchema,
+    openWebUIReasoningOnlyJson,
+    validateProviderStructuredJson: openWebUIReasoningOnlyJson,
+    openWebUISingletonDescriptionCapabilityState,
     openWebUISchemaGroundingText,
     validateOpenWebUIPatterns,
     openWebUIAuth,
@@ -49798,6 +50513,8 @@ const AI_GATEWAY_ATTEMPT_MAX_DEADLINE_MS = 600000;
 const AI_GATEWAY_ABORT_SETTLE_GRACE_MS = 25;
 const AI_GATEWAY_OPERATION_KINDS = Object.freeze(["generate", "embed", "discover", "setup-check"]);
 const AI_GATEWAY_EVENT_STEPS = Object.freeze(["plan-resolved", "preflight", "attempt-started", "provider-response", "attempt-observation", "attempt-failed", "fallback-decision", "completed"]);
+const AI_DEBUG_DIAGNOSTIC_CAPACITY = 128;
+const AI_DEBUG_DIAGNOSTIC_PROVIDERS = new Set(["openai", "gemini", "openrouter", "openwebui", "unknown"]);
 
 function aiGatewayClone(value) {
   if (value === undefined) return undefined;
@@ -50029,6 +50746,73 @@ function aiGatewayDiagnosticState(operation = "", phase = "") {
       return Object.assign({}, summary, { parsedRootKeys: summary.parsedRootKeys.slice() });
     }
   };
+}
+
+function aiDebugOperationName(value = "") {
+  const text = String(value || "").trim().toLowerCase();
+  if (text.includes("description")) return "task-description";
+  if (text.includes("duplicate") || text.includes("dedup")) return "deduplication";
+  if (text.includes("schedul") || text.includes("duration")) return "scheduler";
+  if (text.includes("section")) return "section-title";
+  if (text.includes("task") || text.includes("generat")) return "task-generation";
+  if (text.includes("answer") || text.includes("chat") || text.includes("question")) return "chat-query";
+  if (text.includes("prompt")) return "prompt-response";
+  if (text.includes("embed")) return "embedding";
+  if (text.includes("discover") || text.includes("model")) return "model-discovery";
+  if (text.includes("setup") || text.includes("check")) return "setup-check";
+  return "workflow";
+}
+
+function aiGatewayDebugDiagnosticRecord(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const token = (input, max = 80) => String(input || "").replace(/[^A-Za-z0-9._:-]/g, "-").replace(/^-+|-+$/g, "").slice(0, max);
+  const number = (input, max = 1e9) => Math.max(0, Math.min(max, Math.round(Number(input) || 0)));
+  const firstNumber = (...inputs) => inputs.find((input) => input !== undefined && input !== null && Number.isFinite(Number(input)));
+  const providerValue = String(source.provider || "").trim().toLowerCase();
+  const provider = AI_DEBUG_DIAGNOSTIC_PROVIDERS.has(providerValue) ? providerValue : "unknown";
+  const preflight = source.preflight && typeof source.preflight === "object" ? source.preflight : {};
+  const observation = source.attemptObservation && typeof source.attemptObservation === "object" ? source.attemptObservation : {};
+  const requestTelemetry = source.providerRequestTelemetry && typeof source.providerRequestTelemetry === "object" ? source.providerRequestTelemetry : {};
+  const queueTelemetry = source.queueTelemetry && typeof source.queueTelemetry === "object" ? source.queueTelemetry : {};
+  const context = source.contextSummary && typeof source.contextSummary === "object"
+    ? source.contextSummary
+    : source.context && typeof source.context === "object" ? source.context : {};
+  const usage = source.usage && typeof source.usage === "object" ? source.usage : {};
+  const model = String(source.model || source.requestedModel || source.actualModel || "").trim();
+  const hashes = source.hashes && typeof source.hashes === "object" ? source.hashes : {};
+  const rawDiagnostic = source.providerDiagnostic && typeof source.providerDiagnostic === "object" ? source.providerDiagnostic : {};
+  const rawResponseHash = String(source.rawResponseHash || source.rawSha256 || hashes.rawSha256 || hashes.rawTextHash || rawDiagnostic.rawSha256 || rawDiagnostic.rawHash || "").toLowerCase();
+  const record = {
+    timestamp: new Date().toISOString(),
+    operation: aiDebugOperationName(source.operation || context.operation || "workflow"),
+    provider,
+    modelHash: model ? aiGatewaySha256(model).slice(0, 24) : "",
+    phase: token(source.phase || source.kind || "gateway", 32),
+    step: token(source.step || "", 40),
+    boundary: token(source.boundary || "gateway", 40),
+    status: token(source.status || "", 32),
+    code: token(source.code || rawDiagnostic.code || "", 80),
+    retryable: Boolean(source.retryable),
+    elapsedMs: number(firstNumber(source.elapsedMs, observation.elapsedMs)),
+    attemptCount: number(firstNumber(source.attemptCount, source.attempt, observation.attempt)),
+    callCount: number(firstNumber(source.callCount, source.attemptCount, observation.callCount)),
+    cacheCount: number(firstNumber(source.cacheCount, context.cacheHits, context.cacheHitCount, source.cacheHits)),
+    retryCount: number(firstNumber(source.retryCount, source.retryOrdinal, observation.retryCount, source.dynamicRouterRetry?.retryOrdinal)),
+    schemaName: token(source.schemaName || source.schemaProfile || observation.schemaProfile || requestTelemetry.schemaProfile, 48),
+    carrier: token(source.carrier || requestTelemetry.jsonModeCarrier || requestTelemetry.thinkCarrier || "", 48),
+    contextSource: token(source.contextSource || preflight.contextWindowSource || observation.effectiveContextSource || "", 56),
+    inputTokens: number(firstNumber(source.inputTokens, usage.inputTokens, usage.input_tokens, preflight.adjustedEstimatedInputTokens)),
+    outputTokens: number(firstNumber(source.outputTokens, usage.outputTokens, usage.output_tokens, usage.completion_tokens)),
+    reasoningTokens: number(firstNumber(source.reasoningTokens, usage.reasoningTokens, usage.reasoning_tokens)),
+    queueDepth: number(firstNumber(source.queueDepth, queueTelemetry.depthAtEnqueue, queueTelemetry.depth, context.queueDepth), 256),
+    laneCount: number(firstNumber(source.laneCount, queueTelemetry.laneCount, context.laneCount), 64),
+    evidenceCount: number(firstNumber(source.evidenceCount, context.evidenceCount, context.selectedEvidenceCount, context.selectedCount, source.protectedDeliveredCount, source.optionalDeliveredCount), 512),
+    factCount: number(firstNumber(source.factCount, context.factCount, context.selectedFactCount, source.protectedDeliveredCount), 512),
+    scopeCount: number(firstNumber(source.scopeCount, context.scopeCount, context.taskCount), 128),
+    rawResponseHash: /^[a-f0-9]{16,96}$/.test(rawResponseHash) ? rawResponseHash : "",
+    rawByteCount: number(firstNumber(source.rawByteCount, source.rawUtf8Bytes, hashes.rawByteCount, rawDiagnostic.rawUtf8Bytes, rawDiagnostic.responseByteCount), 2 * 1024 * 1024)
+  };
+  return Object.freeze(record);
 }
 
 function aiGatewayBoundedRateLimit(value = null) {
@@ -50574,7 +51358,7 @@ function aiProviderFailureSummary(error) {
 function aiGatewayRawMetadata(raw) {
   if (raw == null) return {};
   const text = typeof raw === "string" ? raw : JSON.stringify(raw);
-  return { rawTextHash: shortHash(text), rawByteCount: utf8ByteLength(text) };
+  return { rawTextHash: shortHash(text), rawSha256: aiGatewaySha256(text), rawByteCount: utf8ByteLength(text) };
 }
 
 const AI_GATEWAY_USAGE_FIELD_PATHS = Object.freeze([
@@ -51075,6 +51859,128 @@ async function aiGatewayRunAttempt(adapter, operationRequest, { plan, attempt, p
   });
 }
 
+const AI_CLOUD_CAPABILITY_MEMORY_LIMIT = 128;
+const aiCloudCapabilityMemory = new Map();
+const aiCloudCapabilityMemoryKey = ({ provider = "", model = "", profileRevision = "", operation = "", carrier = "", servedModel = "", fingerprint = "", sessionIdHash = "" } = {}) => [
+  String(provider || "").trim().toLowerCase(), String(model || "").trim(), String(profileRevision || "").trim(), String(operation || "").trim().toLowerCase(), String(carrier || "").trim(), String(servedModel || "").trim(), String(fingerprint || "").trim(), String(sessionIdHash || "").trim()
+].join("|");
+const aiCloudCapabilityMemoryState = (params = {}) => {
+  const provider = String(params.provider || "").trim().toLowerCase();
+  const dynamic = provider === "openrouter" && params.dynamicRouter === true;
+  const requestedModel = String(params.model || "").trim();
+  const profileRevision = String(params.profileRevision || "").trim();
+  const operation = String(params.operation || "").trim().toLowerCase();
+  const carrier = String(params.carrier || "").trim();
+  const sessionIdHash = String(params.sessionIdHash || "").trim();
+  let key = aiCloudCapabilityMemoryKey({ provider, model: requestedModel, profileRevision, operation, carrier, servedModel: params.servedModel, fingerprint: params.fingerprint, sessionIdHash });
+  let record = key ? aiCloudCapabilityMemory.get(key) : null;
+  return {
+    cacheHit: Boolean(record),
+    state: record?.state === "unsupported" ? "unsupported" : record?.state === "supported" ? "supported" : "unknown",
+    key,
+    provider,
+    model: requestedModel,
+    profileRevision,
+    operation,
+    carrier,
+    servedModel: String(record?.servedModel || params.servedModel || ""),
+    fingerprint: String(record?.fingerprint || params.fingerprint || ""),
+    sessionIdHash
+  };
+};
+const aiCloudCapabilityRemember = (params = {}, state = "supported") => {
+  const provider = String(params.provider || "").trim().toLowerCase();
+  const model = String(params.model || "").trim();
+  const profileRevision = String(params.profileRevision || "").trim();
+  const operation = String(params.operation || "").trim().toLowerCase();
+  const carrier = String(params.carrier || "").trim();
+  const dynamic = provider === "openrouter" && params.dynamicRouter === true;
+  const servedModel = String(params.servedModel || "").trim();
+  const fingerprint = String(params.fingerprint || "").trim();
+  const sessionIdHash = String(params.sessionIdHash || "").trim();
+  if (!provider || !model || !profileRevision || !operation || !carrier || !["supported", "unsupported"].includes(state)) return null;
+  if (dynamic && (!servedModel || !fingerprint || !sessionIdHash)) return null;
+  const key = aiCloudCapabilityMemoryKey({ provider, model, profileRevision, operation, carrier, servedModel: dynamic ? servedModel : "", fingerprint: dynamic ? fingerprint : "", sessionIdHash: dynamic ? sessionIdHash : "" });
+  if (!aiCloudCapabilityMemory.has(key) && aiCloudCapabilityMemory.size >= AI_CLOUD_CAPABILITY_MEMORY_LIMIT) {
+    const oldest = aiCloudCapabilityMemory.keys().next().value;
+    if (oldest) aiCloudCapabilityMemory.delete(oldest);
+  }
+  const record = Object.freeze({ key, provider, model, profileRevision, operation, carrier, state, servedModel: dynamic ? servedModel : "", fingerprint: dynamic ? fingerprint : "", sessionIdHash: dynamic ? sessionIdHash : "" });
+  aiCloudCapabilityMemory.set(key, record);
+  return record;
+};
+const aiCloudCapabilityTelemetry = (state = {}) => ({
+  capabilityCacheHit: Boolean(state.cacheHit),
+  capabilityState: String(state.state || "unknown"),
+  capabilityCarrier: String(state.carrier || "").slice(0, 64),
+  capabilityProfileRevision: String(state.profileRevision || "").slice(0, 64),
+  capabilityServedModelHash: state.servedModel ? shortHash(state.servedModel) : "",
+  capabilityFingerprintHash: state.fingerprint ? shortHash(state.fingerprint) : ""
+});
+const aiGatewaySingletonDescriptionContract = (operation = "", request = {}) => {
+  if (!request?.singletonDescription || stsMpOperationName(operation) !== "task-description") return null;
+  const consumerSchema = [request.originalSchema, request.jsonSchema, request.schema].find((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const item = candidate.properties?.descriptions?.items;
+    return Boolean(item && typeof item === "object" && !Array.isArray(item));
+  });
+  if (!consumerSchema) return null;
+  const consumerItem = consumerSchema.properties.descriptions.items;
+  const directSchema = request.schema && typeof request.schema === "object" && !Array.isArray(request.schema)
+    ? request.schema
+    : null;
+  const transportItem = directSchema?.properties?.descriptions?.items;
+  const transportSchema = transportItem && typeof transportItem === "object" && !Array.isArray(transportItem)
+    ? transportItem
+    : directSchema || consumerItem;
+  if (!transportSchema || typeof transportSchema !== "object" || Array.isArray(transportSchema)) return null;
+  return Object.freeze({ consumerSchema, transportSchema, schemaProfile: "singleton-description-item-v1" });
+};
+const aiGatewayRestoreSingletonDescription = (response = {}, contract = null) => {
+  if (!contract) return response;
+  const rawText = response?.rawText !== undefined ? String(response.rawText == null ? "" : response.rawText) : String(response?.text == null ? "" : response.text);
+  const consumerText = response?.text !== undefined ? String(response.text == null ? "" : response.text) : "";
+  if (consumerText) {
+    const consumerValidation = STS_MULTI_PROVIDER.validateProviderStructuredJson(consumerText, contract.consumerSchema);
+    if (consumerValidation.accepted) {
+      let parsedConsumer;
+      try { parsedConsumer = JSON.parse(consumerText); } catch { parsedConsumer = null; }
+      const consumerItem = Array.isArray(parsedConsumer?.descriptions) && parsedConsumer.descriptions.length === 1
+        ? parsedConsumer.descriptions[0]
+        : null;
+      let transportValidation = null;
+      if (consumerItem && typeof consumerItem === "object" && !Array.isArray(consumerItem)) {
+        try {
+          transportValidation = STS_MULTI_PROVIDER.validateProviderStructuredJson(JSON.stringify(consumerItem), contract.transportSchema);
+        } catch { transportValidation = null; }
+      }
+      if (transportValidation?.accepted) {
+        return Object.assign({}, response, {
+          text: consumerText,
+          rawText,
+          singletonDescriptionTelemetry: {
+            transportSchemaAccepted: true,
+            transportSchemaHash: transportValidation.schemaHash,
+            consumerSchemaAccepted: true,
+            consumerSchemaHash: consumerValidation.schemaHash,
+            consumerTextAccepted: true,
+            responseShape: "singleton-description-envelope",
+            profile: contract.schemaProfile
+          }
+        });
+      }
+    }
+  }
+  const validation = STS_MULTI_PROVIDER.validateProviderStructuredJson(rawText, contract.transportSchema);
+  if (!validation.accepted) throw STS_MULTI_PROVIDER.providerError("gateway", 200, "invalid-response", false, "Provider output failed the singleton description item schema.", { classification: "schema", responseShape: "singleton-description-item", schemaValidationReason: validation.reason, schemaValidationSchemaHash: validation.schemaHash });
+  let item;
+  try { item = JSON.parse(rawText); } catch { throw STS_MULTI_PROVIDER.providerError("gateway", 200, "invalid-response", false, "Provider output was not one JSON description item.", { classification: "schema", responseShape: "singleton-description-item" }); }
+  const restoredText = JSON.stringify({ tasks: [], section_name: "", descriptions: [item] });
+  const fullValidation = STS_MULTI_PROVIDER.validateProviderStructuredJson(restoredText, contract.consumerSchema);
+  if (!fullValidation.accepted) throw STS_MULTI_PROVIDER.providerError("gateway", 200, "invalid-response", false, "Restored singleton description failed the consumer schema.", { classification: "schema", responseShape: "singleton-description-envelope", schemaValidationReason: fullValidation.reason, schemaValidationSchemaHash: fullValidation.schemaHash });
+  return Object.assign({}, response, { text: restoredText, rawText, singletonDescriptionTelemetry: { transportSchemaAccepted: true, transportSchemaHash: validation.schemaHash, consumerSchemaAccepted: true, consumerSchemaHash: fullValidation.schemaHash, profile: contract.schemaProfile } });
+};
+
 class AIModelGateway {
   constructor(runtime = null, options = {}) {
     this.runtime = runtime;
@@ -51140,6 +52046,10 @@ class AIModelGateway {
       finalization: attempt?.finalization ? aiGatewayAttemptSnapshot(attempt) : undefined
     }, patch || {}));
     events.push(event);
+    try {
+      const debugContext = hooks?.__debugContext && typeof hooks.__debugContext === "object" ? hooks.__debugContext : {};
+      this.runtime?.recordDebugDiagnostic?.(Object.assign({}, event, debugContext));
+    } catch {}
     try { hooks?.onEvent?.(event); } catch {}
     try { hooks?.onStep?.(event); } catch {}
     return event;
@@ -51156,7 +52066,10 @@ class AIModelGateway {
         promptContextSuffix: ""
       });
     }
-    const hooks = request.hooks && typeof request.hooks === "object" ? request.hooks : {};
+    const callerHooks = request.hooks && typeof request.hooks === "object" ? request.hooks : {};
+    const hooks = Object.assign({}, callerHooks, {
+      __debugContext: request.debugContext || request.contextSummary || request.providerProjectionTelemetry || {}
+    });
     const plan = this.plan(request);
     const events = [];
     const attempts = [];
@@ -51184,6 +52097,7 @@ class AIModelGateway {
       if (index > 0) dynamicRouterRetryBudget = null;
       const attemptDeadline = aiGatewayAttemptDeadlineResolution(request, reference);
       const attempt = { attempt: ++attemptOrdinal, provider: reference.provider, model: reference.model, isFallback: index > 0 || request.fallbackOnly === true, startedAt: this.now(), deadlineSource: attemptDeadline.source };
+      const singletonDescription = aiGatewaySingletonDescriptionContract(plan.operation, request);
       const operationRequest = Object.assign({}, request, {
         kind: plan.kind,
         operation: plan.operation,
@@ -51191,7 +52105,9 @@ class AIModelGateway {
         model: reference.model,
         reasoningEffort: reference.reasoningEffort,
         reasoningSource: reference.reasoningSource,
-        schema: request.schema || request.jsonSchema || null,
+        schema: singletonDescription?.transportSchema || request.schema || request.jsonSchema || null,
+        originalSchema: singletonDescription?.consumerSchema || request.schema || request.jsonSchema || null,
+        singletonDescription: Boolean(singletonDescription),
         transport: this.transport
       });
       if (plan.operation === "task-generation" && request.taskStructureSchemaContract) {
@@ -51277,7 +52193,7 @@ class AIModelGateway {
         if (plan.preflightPolicy.enabled && typeof taskDescriptionProviderContextPreflight === "function") {
           preflight = ["chat-query", "prompt-response"].includes(plan.operation)
             ? chatProviderContextPreflight({ settings: this.settings(), provider: reference.provider, model: reference.model, system: request.system, user: request.user, projection: request.chatContextProjection, schema: operationRequest.schema })
-            : taskDescriptionProviderContextPreflight({ settings: this.settings(), provider: reference.provider, model: reference.model, operation: plan.operation, system: request.system, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", user: request.user, schema: operationRequest.schema, schemaVocabulary: request.schemaVocabulary || null });
+            : taskDescriptionProviderContextPreflight({ settings: this.settings(), provider: reference.provider, model: reference.model, operation: plan.operation, system: request.system, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", user: request.user, schema: operationRequest.schema, originalSchema: operationRequest.originalSchema, schemaVocabulary: request.schemaVocabulary || null });
           const derivedOutputBudget = aiDynamicOutputBudget({
             operation: plan.operation,
             schema: operationRequest.schema,
@@ -51339,9 +52255,10 @@ class AIModelGateway {
         } finally {
           try { openWebUIAllocationPollingHandle?.(); } catch {}
         }
-        const response = plan.kind === "embed"
+        let response = plan.kind === "embed"
           ? aiGatewayNormalizeEmbeddingResponse(adapterResponse, reference, Array.isArray(request.texts) ? request.texts.length : 0)
           : typeof adapterResponse === "string" ? { text: adapterResponse } : (adapterResponse || {});
+        if (singletonDescription && plan.kind === "generate") response = aiGatewayRestoreSingletonDescription(response, singletonDescription);
         const rateLimit = aiGatewayBoundedRateLimit(response?.rateLimit);
         if (preflight && response.queueTelemetry) {
           preflight = Object.freeze(Object.assign({}, preflight, {
@@ -51430,6 +52347,7 @@ class AIModelGateway {
         try { hooks.onAttemptObservation?.(attemptObservation); } catch {}
         const result = {
           schemaVersion: AI_GATEWAY_SCHEMA_VERSION,
+          text: typeof response?.text === "string" ? response.text : raw == null ? undefined : String(raw),
           rawText: typeof raw === "string" ? raw : raw == null ? undefined : String(raw),
           vectors: Array.isArray(response?.vectors) ? response.vectors : undefined,
           models: response?.models || (plan.kind === "discover" ? {
@@ -51449,6 +52367,7 @@ class AIModelGateway {
           dynamicRouterRetry: Object.freeze(Object.assign({}, dynamicRouterRetryTelemetry)),
           providerRetry: response?.providerRetry || undefined,
           providerModelTelemetry,
+          singletonDescriptionTelemetry: response?.singletonDescriptionTelemetry || undefined,
           ...(usagePresent ? { usage } : {}),
           usagePresent,
           usageSource: usage?.source || "",
@@ -51719,6 +52638,9 @@ if (typeof module !== "undefined" && module.exports) {
     aiGatewaySanitizeProviderDiagnostic,
     aiGatewayDiagnosticRoot,
     aiGatewaySha256,
+    aiGatewayDebugDiagnosticRecord,
+    aiDebugOperationName,
+    debugDiagnosticCapacity: AI_DEBUG_DIAGNOSTIC_CAPACITY,
     aiGatewayAttemptDeadlineMs,
     aiGatewayAttemptDeadlineResolution,
     aiGatewayAttemptSnapshot,
@@ -51778,6 +52700,35 @@ const stsMpOperationName = (operation = "chat") => {
 if (typeof module !== "undefined" && module.exports?.prototype) {
   const stsMpPluginPrototype = module.exports.prototype;
 
+  stsMpPluginPrototype.recordDebugDiagnostic = function(value = {}) {
+    if (this.settings?.debugDiagnosticsEnabled !== true) {
+      if (Array.isArray(this._debugDiagnosticRing)) this._debugDiagnosticRing.length = 0;
+      return null;
+    }
+    if (!Array.isArray(this._debugDiagnosticRing)) this._debugDiagnosticRing = [];
+    const record = aiGatewayDebugDiagnosticRecord(value);
+    if (this._debugDiagnosticRing.length >= AI_DEBUG_DIAGNOSTIC_CAPACITY) {
+      this._debugDiagnosticRing.splice(0, this._debugDiagnosticRing.length - AI_DEBUG_DIAGNOSTIC_CAPACITY + 1);
+    }
+    this._debugDiagnosticRing.push(record);
+    return record;
+  };
+
+  stsMpPluginPrototype.getDebugDiagnosticSnapshot = function() {
+    if (this.settings?.debugDiagnosticsEnabled !== true) {
+      if (Array.isArray(this._debugDiagnosticRing)) this._debugDiagnosticRing.length = 0;
+      return { enabled: false, capacity: AI_DEBUG_DIAGNOSTIC_CAPACITY, count: 0, events: [] };
+    }
+    const events = (Array.isArray(this._debugDiagnosticRing) ? this._debugDiagnosticRing : []).slice(-AI_DEBUG_DIAGNOSTIC_CAPACITY);
+    return { enabled: true, capacity: AI_DEBUG_DIAGNOSTIC_CAPACITY, count: events.length, events };
+  };
+
+  stsMpPluginPrototype.clearDebugDiagnostics = function() {
+    const cleared = Array.isArray(this._debugDiagnosticRing) ? this._debugDiagnosticRing.length : 0;
+    this._debugDiagnosticRing = [];
+    return cleared;
+  };
+
   stsMpPluginPrototype.aiModelForRequest = function(mode, options = {}) {
     const operation = stsMpOperationName(mode);
     const reference = STS_MULTI_PROVIDER.operationModelReference(this.settings, operation);
@@ -51825,12 +52776,15 @@ function stsCreateRuntimeAiModelGateway(plugin) {
       generate: {
         openai: async (request, adapterContext = {}) => {
           let usage = null;
-          const text = await plugin.openaiProviderResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, background: request.background !== false, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", promptCacheKey: request.promptCacheKey || request.cacheMetadata?.promptCacheKey || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
+          const providerResponse = await plugin.openaiProviderResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, background: request.background !== false, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", promptCacheKey: request.promptCacheKey || request.cacheMetadata?.promptCacheKey || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
+          const text = typeof providerResponse === "string" ? providerResponse : providerResponse?.text;
+          const rawText = typeof providerResponse === "string" ? providerResponse : providerResponse?.rawText;
           const verbosity = Boolean(request.schema)
             && ["task-generation", "task-description", "section-title"].includes(String(request.operation || "").trim().toLowerCase())
             && /^gpt-5(?:[.-]|$)/i.test(normalizeOpenAIModelId(request.model)) ? "low" : "";
           return {
             text,
+            rawText,
             provider: "openai",
             model: request.model,
             usage: aiGatewayNormalizedUsage(usage || {}),
@@ -51842,6 +52796,7 @@ function stsCreateRuntimeAiModelGateway(plugin) {
               applied: Boolean(request.maxOutputTokens)
             },
             providerRequestTelemetry: {
+              ...(providerResponse?.providerRequestTelemetry || {}),
               schemaPresent: Boolean(request.schema),
               reasoningPresent: Boolean(request.reasoningEffort && request.reasoningEffort !== "default"),
               structuredTextVerbosityPresent: Boolean(verbosity),
@@ -51859,9 +52814,12 @@ function stsCreateRuntimeAiModelGateway(plugin) {
         gemini: async (request, adapterContext = {}) => {
           let usage = null;
           const geminiRequestProfile = geminiGenerateContentRequestProfile(request.model);
-          const text = await plugin.geminiResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
+          const providerResponse = await plugin.geminiResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
+          const text = typeof providerResponse === "string" ? providerResponse : providerResponse?.text;
+          const rawText = typeof providerResponse === "string" ? providerResponse : providerResponse?.rawText;
           return {
             text,
+            rawText,
             provider: "gemini",
             model: request.model,
             usage: aiGatewayNormalizedUsage(usage || {}),
@@ -51873,6 +52831,7 @@ function stsCreateRuntimeAiModelGateway(plugin) {
               applied: Boolean(request.maxOutputTokens)
             },
             providerRequestTelemetry: {
+              ...(providerResponse?.providerRequestTelemetry || {}),
               geminiRequestProfile: geminiRequestProfile.id,
               deprecatedSamplingFieldsOmitted: geminiRequestProfile.deprecatedSamplingFieldsOmitted,
               prefilledModelTurnOmitted: geminiRequestProfile.prefilledModelTurnOmitted,
@@ -51935,6 +52894,7 @@ function stsCreateRuntimeAiModelGateway(plugin) {
             sessionId: request.sessionId || request.cacheMetadata?.sessionId || request.cache?.sessionId || "",
             cacheMetadata: request.cacheMetadata || request.cache || {},
             jsonSchema: request.schema || null,
+            originalJsonSchema: request.originalSchema || request.schema || null,
             reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? { effort: request.reasoningEffort } : {},
             operation: request.operation,
             maxOutputTokens: request.maxOutputTokens,
@@ -52509,9 +53469,9 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
       dynamicRouter: Boolean(result.dynamicRouter)
     });
     if (input.appendFallbackNotice && !input.jsonSchema && result.attempts?.some((attempt) => attempt.isFallback && attempt.status === "succeeded")) {
-      return `${String(result.rawText || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(result.model)}`;
+      return `${String(result.text || result.rawText || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(result.model)}`;
     }
-    return result.rawText;
+    return result.text !== undefined ? result.text : result.rawText;
   };
   gatewayPrototype.embedTexts = async function(texts, role = "document") {
     const result = await this.aiModelGateway().execute({ kind: "embed", operation: "embedding", texts: (texts || []).map((text) => String(text == null ? "" : text)), role });
@@ -53005,16 +53965,16 @@ function stsMpSetOperationReference(plugin, operation, reference, fallback = nul
   return plugin.saveSettings();
 }
 
-function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDisplay = null) {
+function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
   const rows = stsMpCatalogForOperation(plugin.settings, operation);
   const current = stsMpProviderScopedValue(reference?.primary);
   const setting = new Setting(containerEl)
-    .setName(`${operation} model`)
-    .setDesc("Type to search provider name, display label, or the full native model ID. The provider scope is persisted explicitly and slash IDs remain intact.");
+    .setName(options.name || `${operation} model`)
+    .setDesc(options.desc || "Type to search provider name, display label, or the full native model ID. The provider scope is persisted explicitly and slash IDs remain intact.");
   setting.settingEl?.addClass?.("semantic-todoist-model-setting");
   stsMpSearchableCombobox(setting.controlEl, {
-    accessibleLabel: `${operation} model`,
+    accessibleLabel: options.accessibleLabel || `${operation} model`,
     rows,
     getRows: () => stsMpCatalogForOperation(plugin.settings, operation),
     value: current,
@@ -53033,16 +53993,16 @@ function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDispl
   });
 }
 
-function stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDisplay = null) {
+function stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
   const rows = STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, stsMpCatalogForOperation(plugin.settings, operation));
   const current = stsMpProviderScopedValue(reference?.fallback);
   const setting = new Setting(containerEl)
-    .setName(`${operation} fallback`)
-    .setDesc("Type to search the fixed provider groups. Automatic selects a provider-local fallback; choose an explicit provider:model to use any configured provider. The exact primary model is disabled. Selection alone makes no network call.");
+    .setName(options.name || `${operation} fallback`)
+    .setDesc(options.desc || "Type to search the fixed provider groups. Automatic selects a provider-local fallback; choose an explicit provider:model to use any configured provider. The exact primary model is disabled. Selection alone makes no network call.");
   setting.settingEl?.addClass?.("semantic-todoist-model-setting");
   stsMpSearchableCombobox(setting.controlEl, {
-    accessibleLabel: `${operation} fallback`,
+    accessibleLabel: options.accessibleLabel || `${operation} fallback`,
     rows,
     getRows: () => STS_MULTI_PROVIDER.fallbackCatalogRows(
       STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation)?.primary,
@@ -53068,7 +54028,7 @@ function stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDispla
   });
 }
 
-function stsMpOperationReasoningSetting(containerEl, plugin, operation, role = "primary", refreshDisplay = null) {
+function stsMpOperationReasoningSetting(containerEl, plugin, operation, role = "primary", refreshDisplay = null, uiOptions = {}) {
   const isFallback = role === "fallback";
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
   const target = isFallback ? reference?.fallback : reference?.primary;
@@ -53084,10 +54044,10 @@ function stsMpOperationReasoningSetting(containerEl, plugin, operation, role = "
     && target.reasoningEffort !== "default"
     && selected === "default";
   const setting = new Setting(containerEl)
-    .setName(`${operation} ${isFallback ? "fallback " : ""}reasoning`)
-    .setDesc(unsupportedSavedEffort
+    .setName(uiOptions.name || `${operation} ${isFallback ? "fallback " : ""}reasoning`)
+    .setDesc(uiOptions.desc || (unsupportedSavedEffort
       ? `Saved ${reasoningEffortLabel(target.reasoningEffort)} is no longer supported by this model's current metadata. Requests use Provider default until another supported choice is saved.`
-      : "Automatic follows the selected provider/model capability. Provider default leaves the effort to the provider; only discovered supported efforts are offered.");
+      : "Automatic follows the selected provider/model capability. Provider default leaves the effort to the provider; only discovered supported efforts are offered."));
   setting.settingEl?.addClass?.("semantic-todoist-reasoning-setting");
   setting.addDropdown((dropdown) => {
     const values = Object.fromEntries(options.map((option) => [option.value, option.label]));
@@ -53204,14 +54164,59 @@ function stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, provider, k
   });
 }
 
-function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay = null) {
-  settingsHeading(containerEl, "Multi-provider operation models", "Every AI operation has an explicit provider-scoped primary and optional fallback. Automatic fallback selects a provider-local model; an explicit fallback may use any distinct provider/model. Groups are ordered Gemini, OpenAI, OpenRouter, Self-Hosted OpenWebUI and sorted by display label.");
-  for (const operation of STS_MULTI_PROVIDER.OPERATION_KEYS) {
-    stsMpOperationModelSetting(containerEl, plugin, operation, refreshDisplay);
-    stsMpOperationReasoningSetting(containerEl, plugin, operation, "primary", refreshDisplay);
-    stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDisplay);
-    stsMpOperationReasoningSetting(containerEl, plugin, operation, "fallback", refreshDisplay);
-  }
+const STS_MP_OPERATION_LABELS = Object.freeze({
+  "chat-query": "Chat",
+  "prompt-response": "Prompt response",
+  "task-generation": "Task generation",
+  "task-description": "Task descriptions",
+  "section-title": "Section title",
+  scheduler: "Scheduler",
+  policy: "Policy",
+  deduplication: "Deduplication"
+});
+
+function stsMpOperationDisplayHint(plugin, operation) {
+  const settings = plugin?.settings || {};
+  const reference = STS_MULTI_PROVIDER.operationModelReference(settings, operation) || {};
+  const primary = reference.primary;
+  const primaryText = primary?.provider && primary?.model
+    ? modelDisplayName(`${primary.provider}:${primary.model}`, settings)
+    : "Not configured";
+  if (settings.enableAiModelFallback === false) return `Primary: ${primaryText}; fallback off`;
+  const fallback = reference.fallback;
+  const fallbackText = fallback?.provider && fallback?.model
+    ? modelDisplayName(`${fallback.provider}:${fallback.model}`, settings)
+    : "Automatic";
+  return `Primary: ${primaryText}; fallback: ${fallbackText}`;
+}
+
+function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay = null, operationOpenState = null) {
+  settingsHeading(containerEl, "Multi-provider operation models", "Each operation keeps its provider-scoped primary and optional fallback together. Open a group to edit only that operation; model selection still uses the shared catalogs and saves locally without a provider call.");
+  const groups = Object.entries(STS_MP_OPERATION_LABELS);
+  groups.forEach(([operation, label], index) => {
+    const details = containerEl.createEl("details", {
+      cls: "semantic-todoist-operation-disclosure",
+      attr: { "data-operation": operation }
+    });
+    const stateKey = `operation::${operation}`;
+    const stored = operationOpenState instanceof Map ? operationOpenState.get(stateKey) : undefined;
+    details.open = typeof stored === "boolean" ? stored : index === 0;
+    details.addEventListener("toggle", () => {
+      if (operationOpenState instanceof Map) operationOpenState.set(stateKey, Boolean(details.open));
+    });
+    const summary = details.createEl("summary", { cls: "semantic-todoist-operation-summary" });
+    const hint = stsMpOperationDisplayHint(plugin, operation);
+    summary.createSpan({ cls: "semantic-todoist-operation-summary-label", text: label });
+    summary.createSpan({ cls: "semantic-todoist-operation-summary-hint", text: hint });
+    summary.setAttribute("aria-label", `${label}: ${hint}`);
+    const body = details.createDiv({ cls: "semantic-todoist-operation-body" });
+    const field = (name, accessibleLabel) => ({ name, accessibleLabel });
+    stsMpOperationModelSetting(body, plugin, operation, refreshDisplay, field("Primary model", `${label} primary model`));
+    stsMpOperationReasoningSetting(body, plugin, operation, "primary", refreshDisplay, field("Primary reasoning", `${label} primary reasoning`));
+    stsMpFallbackModelSetting(body, plugin, operation, refreshDisplay, field("Fallback model", `${label} fallback model`));
+    stsMpOperationReasoningSetting(body, plugin, operation, "fallback", refreshDisplay, field("Fallback reasoning", `${label} fallback reasoning`));
+  });
+  settingsHeading(containerEl, "Embedding and manual provider catalogs", "Embedding selection, provider dimensions, and optional manual provider:model entries stay outside operation groups. These controls use the same searchable catalogs and persistence contracts.");
   stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay);
   stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, "openrouter", "openrouterEmbeddingDimensions");
   stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, "openwebui", "openwebuiEmbeddingDimensions");
@@ -53387,7 +54392,7 @@ function stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin) {
   };
   new Setting(containerEl)
     .setName("OpenWebUI worker lanes")
-    .setDesc("Number of model-affine OpenWebUI/Ollama workers. Default 1 keeps model operations sequential; additional lanes allow distinct models to run concurrently.")
+    .setDesc("Number of model-affine OpenWebUI/Ollama workers. Default 1 keeps model operations sequential; use additional lanes for independently available GPUs or Ollama instances behind the same OpenWebUI endpoint. A lane keeps its model assigned until idle to avoid model eviction/thrashing or overwhelming one runtime; same-model calls may share the configured per-model limit.")
     .addText((text) => {
       text.inputEl.type = "number";
       text.inputEl.min = "1";
@@ -53484,7 +54489,69 @@ function stsMpOpenRouterAdaptiveProfileSummary(plugin) {
   }).join("\n");
 }
 
-function stsMpRenderProviderAccessSettings(containerEl, plugin) {
+function stsMpNormalizeOpenWebUIAuthMode(value) {
+  return String(value || "").trim().toLowerCase() === "login" ? "login" : "api-key";
+}
+
+function stsMpRenderOpenWebUIAuthModeSetting(containerEl, plugin, refreshDisplay = null) {
+  const setting = new Setting(containerEl)
+    .setName("Open WebUI authentication")
+    .setDesc("Choose API key or email + password login. Changing this selection saves only the authentication method and redraws the matching controls; saved values for the other method stay untouched.");
+  setting.addDropdown((dropdown) => {
+    dropdown.addOption("api-key", "API key");
+    dropdown.addOption("login", "Email + password login");
+    dropdown.setValue(stsMpNormalizeOpenWebUIAuthMode(plugin.settings.openwebuiAuthMode)).onChange(async (value) => {
+      plugin.settings.openwebuiAuthMode = stsMpNormalizeOpenWebUIAuthMode(value);
+      await plugin.saveSettings();
+      if (typeof refreshDisplay === "function") await refreshDisplay();
+    });
+  });
+  return setting;
+}
+
+function stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin) {
+  const mode = stsMpNormalizeOpenWebUIAuthMode(plugin.settings.openwebuiAuthMode);
+  const details = containerEl.createEl("details", {
+    cls: "semantic-todoist-openwebui-auth-details",
+    attr: { "data-openwebui-auth-mode": mode }
+  });
+  details.open = true;
+  const summary = details.createEl("summary", {
+    cls: "semantic-todoist-openwebui-auth-summary",
+    text: mode === "login" ? "Email + password login" : "API key"
+  });
+  summary.setAttribute("aria-label", `${mode === "login" ? "Email and password login" : "API key"} settings`);
+  details.createDiv({
+    cls: "semantic-todoist-openwebui-auth-description",
+    text: mode === "login"
+      ? "Use the saved email to start a one-time login. The password is held only in this form and discarded after success or failure."
+      : "Use a saved API key. An optional custom header can replace Authorization Bearer when the endpoint requires a nonstandard header."
+  });
+  if (mode === "login") {
+    textSetting(details, "Open WebUI email", "Login identity only; the password is never saved.", plugin, "openwebuiEmail");
+    const passwordSetting = new Setting(details).setName("Open WebUI login password").setDesc("Ephemeral login field; it is not persisted or logged.");
+    passwordSetting.addText((text) => {
+      text.inputEl.type = "password";
+      text.setValue("");
+      passwordSetting.addButton((button) => button.setButtonText("Login").setCta().onClick(async () => {
+        try {
+          await plugin.loginOpenWebUI(plugin.settings.openwebuiEmail, text.getValue());
+          text.setValue("");
+          new Notice("Open WebUI login succeeded; the password was discarded.");
+        } catch (error) {
+          text.setValue("");
+          new Notice(error.message || String(error));
+        }
+      }));
+    });
+  } else {
+    secretSetting(details, "Open WebUI API key", plugin, "openwebuiApiKey");
+    textSetting(details, "Open WebUI custom header (optional)", "Use a validated custom header instead of Authorization Bearer in API-key mode.", plugin, "openwebuiCustomHeader");
+  }
+  return details;
+}
+
+function stsMpRenderProviderAccessSettings(containerEl, plugin, refreshDisplay = null) {
   settingsHeading(containerEl, "OpenRouter", "Full provider/model slugs use the non-streaming Chat Completions and embeddings endpoints. Keys stay local and are never included in diagnostics.", { status: settingsProviderStatus(plugin, "openrouter") });
   secretSetting(containerEl, "OpenRouter API key", plugin, "openrouterApiKey");
   new Setting(containerEl)
@@ -53492,10 +54559,8 @@ function stsMpRenderProviderAccessSettings(containerEl, plugin) {
     .setDesc(stsMpOpenRouterAdaptiveProfileSummary(plugin));
   settingsHeading(containerEl, "Self-Hosted OpenWebUI", "Open WebUI can use an API key or an explicit email/password login. Passwords are held only in the login action and discarded after authentication.", { status: settingsProviderStatus(plugin, "openwebui") });
   textSetting(containerEl, "Open WebUI base URL", "HTTPS is required unless insecure HTTP is explicitly enabled. Embedded credentials, query strings, and fragments are rejected.", plugin, "openwebuiBaseUrl");
-  dropdownSetting(containerEl, "Open WebUI authentication", plugin, "openwebuiAuthMode", ["api-key", "login"]);
-  secretSetting(containerEl, "Open WebUI API key", plugin, "openwebuiApiKey");
-  textSetting(containerEl, "Open WebUI custom header (optional)", "Use a validated custom header instead of Authorization Bearer in API-key mode.", plugin, "openwebuiCustomHeader");
-  textSetting(containerEl, "Open WebUI email", "Login identity only; the password is never saved.", plugin, "openwebuiEmail");
+  stsMpRenderOpenWebUIAuthModeSetting(containerEl, plugin, refreshDisplay);
+  stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin);
   toggleSetting(containerEl, "Allow insecure Open WebUI HTTP", "Disabled by default. Enable only for a deliberately trusted local HTTP endpoint.", plugin, "openwebuiAllowInsecureHttp");
   new Setting(containerEl)
     .setName("OpenWebUI native thinking")
@@ -53508,21 +54573,6 @@ function stsMpRenderProviderAccessSettings(containerEl, plugin) {
         await plugin.saveSettings();
       });
     });
-  const passwordSetting = new Setting(containerEl).setName("Open WebUI login password").setDesc("Ephemeral login field; it is not persisted or logged.");
-  passwordSetting.addText((text) => {
-    text.inputEl.type = "password";
-    text.setValue("");
-    passwordSetting.addButton((button) => button.setButtonText("Login").setCta().onClick(async () => {
-      try {
-        await plugin.loginOpenWebUI(plugin.settings.openwebuiEmail, text.getValue());
-        text.setValue("");
-        new Notice("Open WebUI login succeeded; the password was discarded.");
-      } catch (error) {
-        text.setValue("");
-        new Notice(error.message || String(error));
-      }
-    }));
-  });
   setupStatusSetting(containerEl, "Open WebUI status", (() => {
     try {
       const status = plugin.openWebUIAuthStatus();

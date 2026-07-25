@@ -2049,6 +2049,60 @@
   max-width: 100%;
 }
 
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profiles {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  max-height: min(40vh, 22rem);
+  max-width: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 10px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row {
+  align-items: center;
+  border-bottom: 1px solid var(--background-modifier-border);
+  display: grid;
+  gap: 8px 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin: 0;
+  min-width: 0;
+  padding: 8px 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row:last-child {
+  border-bottom: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row .setting-item-info,
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row .setting-item-control {
+  min-width: 0;
+  width: auto;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row .setting-item-info .setting-item-name,
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row .setting-item-info .setting-item-description {
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row .setting-item-control {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profile-row button {
+  min-height: 44px;
+  min-width: 44px;
+  white-space: nowrap;
+}
+
+.semantic-todoist-settings .semantic-todoist-openwebui-learned-profiles-empty {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  padding: 10px 4px;
+}
+
 .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-info,
 .semantic-todoist-settings .semantic-todoist-provider-setting .setting-item-control {
   flex: 0 1 auto;
@@ -2346,6 +2400,14 @@
   .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {
     min-width: 0;
     width: 100%;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-info {
+    flex: 0 1 auto;
+  }
+
+  .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {
+    flex: 0 0 auto;
   }
 
   .semantic-todoist-settings .semantic-todoist-settings-action-setting .setting-item-control {

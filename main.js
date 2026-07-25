@@ -31,7 +31,7 @@ const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
 const SCHEDULER_RELATED_GROUPING_POLICY_ID = "related-task-grouping";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
 const SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION = 2;
-const SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION = 2;
+const SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION = 3;
 const SEMANTIC_INDEX_PATH_META_SCHEMA_VERSION = 2;
 const TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION = 2;
 const TASK_REFERENCE_MANIFEST_FILE = "task-reference-manifest.json";
@@ -71,6 +71,17 @@ const LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE = "semantic-index-routing.json";
 const SEMANTIC_INDEX_PARTITION_ROOT = "index";
 const SEMANTIC_INDEX_PARTITION_IDENTITY_VERSION = 1;
 const SEMANTIC_INDEX_PARTITION_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui"]);
+
+function semanticIndexProviderManifestCandidates(provider = "") {
+  const normalized = semanticIndexPartitionProvider(provider);
+  const byProvider = {
+    openai: [OPENAI_SEMANTIC_INDEX_FILE, SEMANTIC_INDEX_FILE],
+    gemini: [GEMINI_SEMANTIC_INDEX_FILE, SEMANTIC_INDEX_FILE],
+    openrouter: ["semantic-index.openrouter.json", "semantic-index.multi-provider.openrouter.json", SEMANTIC_INDEX_FILE],
+    openwebui: ["semantic-index.openwebui.json", "semantic-index.multi-provider.openwebui.json", SEMANTIC_INDEX_FILE]
+  };
+  return uniqueValues(byProvider[normalized] || [SEMANTIC_INDEX_FILE]);
+}
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_DIMENSION = 384;
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION = "int8";
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION_SCALE = 127;
@@ -188,6 +199,28 @@ const TASK_GENERATION_REQUESTED_OUTCOME_CONTENT_RULE = "Every task and subtask c
 const TASK_GENERATION_ROOT_REQUESTED_OUTCOME_RULE = "For each supplied source-action scope, the root tasks[0].content must itself state the complete requested action and matching work object, plus every scope-bound recipient, reviewer, or stakeholder and every scope-bound condition. Subtasks may add only distinct supporting child actions; they must not replace the root requested outcome or move any scope-bound root recipient or condition off the root title.";
 const TASK_WORKFLOW_SCOPE_ISOLATION_RULE = "Each distinct marked or requested-action scope must remain its own task tree. A subtask may belong only to the same exact source scope and request as its parent; never absorb a sibling scope's action, recipient, stakeholder, artifact, or condition into that tree.";
 const TASK_WORKFLOW_INTERNAL_METADATA_CONTENT_RE = /\b(?:scope[_ -]?id|evidence[_ -]?(?:id|ids|metadata)|fact[_ -]?(?:ref|refs|binding|bindings)|source[_ -]?contract(?:[_ -]?id)?|task[_ -]?generation[_ -]?(?:batch|scope))\b/i;
+const TASK_GENERATION_STRUCTURAL_RETRY_CODES = Object.freeze([
+  "response-invalid-json",
+  "response-root-invalid",
+  "response-shape-missing-tasks",
+  "response-task-invalid",
+  "response-unexpected-provider-field",
+  "response-internal-metadata-field",
+  "response-identifier-field",
+  "response-scope-structure-invalid",
+  "scope-call-not-singleton",
+  "scope-id-mismatch",
+  "tree-scope-mismatch",
+  "requested-outcome-content-missing",
+  "internal-metadata-in-content",
+  "task-structure-field-mismatch",
+  "response-schema-fragments-in-content"
+]);
+
+function taskGenerationScopeRecoveryAllowed(reasonCodes = []) {
+  const codes = Array.isArray(reasonCodes) ? reasonCodes : [];
+  return codes.length > 0 && codes.every((code) => TASK_GENERATION_STRUCTURAL_RETRY_CODES.includes(String(code || "")));
+}
 const TASK_WORKFLOW_TITLE_MAX_CHARS = 250;
 const TASK_WORKFLOW_LABEL_MAX_ITEMS = 16;
 const TASK_WORKFLOW_LABEL_MAX_CHARS = 100;
@@ -206,6 +239,11 @@ const TASK_DESCRIPTION_REASONING_HEADROOM_TOKENS = 1024;
 // windows use a conservative explicit input budget rather than optimistic
 // truncation or an unbounded request.
 const CHAT_PROVIDER_UNKNOWN_INPUT_BUDGET_TOKENS = 16384;
+// OpenAI model metadata can omit context capacity even though current
+// generation models support substantially more than the operational 16K
+// efficiency target. Keep that target as telemetry/selection guidance while
+// using a conservative provider-profile minimum for hard output feasibility.
+const OPENAI_PROVIDER_PROFILE_CONTEXT_MIN_TOKENS = 65536;
 const OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS = 4096;
 const OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS = 1_000_000;
 const OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS = 16384;
@@ -708,12 +746,8 @@ function resolveIndexedSemanticQueryHandles(index = [], request = {}) {
     const rank = preferredRank || (taskMode && taskMatch ? 9 : evidenceMatch ? 8 : factMatch ? 7 : sourceMatch ? 6 : taskMatch ? 5 : scopeMatch ? 1 : 0);
     return { matched, rank, evidenceMatch, sourceMatch, taskMatch, factMatch, scopeMatch };
   };
-  for (let row = 0; row < (index || []).length; row += 1) {
-    const chunk = index[row];
-    if (!chunk || typeof chunk !== "object") continue;
-    const match = matches(chunk);
-    if (!match.matched) continue;
-    const values = chunk.embedding;
+  const compatibleEntry = (chunk, row, match) => {
+    const values = chunk?.embedding;
     const meta = metadata(chunk);
     const provider = String(meta.provider || "").trim().toLowerCase();
     const model = String(meta.model || "");
@@ -725,15 +759,48 @@ function resolveIndexedSemanticQueryHandles(index = [], request = {}) {
       && (!requestedDimension || dimension === requestedDimension)
       && (!requestedRevision || !revision || revision === requestedRevision || allowReadyRevisionSkew)
       && Number(meta.contentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION) === SEMANTIC_EMBEDDING_CONTENT_VERSION;
-    if (!compatible) {
-      rejected.push({ evidenceId: String(chunk.evidenceId || chunk.id || ""), sourceId: String(chunk.sourceId || ""), reasonCode: "indexed-handle-incompatible", provider, model, dimension, revision });
+    return compatible ? { chunk, match, row, meta } : null;
+  };
+  for (let row = 0; row < (index || []).length; row += 1) {
+    const chunk = index[row];
+    if (!chunk || typeof chunk !== "object") continue;
+    const match = matches(chunk);
+    if (!match.matched) continue;
+    const entry = compatibleEntry(chunk, row, match);
+    if (!entry) {
+      const meta = metadata(chunk);
+      rejected.push({ evidenceId: String(chunk.evidenceId || chunk.id || ""), sourceId: String(chunk.sourceId || ""), reasonCode: "indexed-handle-incompatible", provider: String(meta.provider || "").trim().toLowerCase(), model: String(meta.model || ""), dimension: Number(meta.dimension || 0), revision: Number(meta.indexRevision || 0) });
       continue;
     }
-    candidates.push({ chunk, match, row, meta });
+    candidates.push(entry);
   }
   const highestIdentityRank = candidates.reduce((highest, candidate) => Math.max(highest, candidate.match.rank), 0);
-  const selectedCandidates = candidates.filter((candidate) => candidate.match.rank === highestIdentityRank);
-  selectedCandidates.sort((left, right) => String(left.chunk.evidenceId || left.chunk.id || "").localeCompare(String(right.chunk.evidenceId || right.chunk.id || "")));
+  const maxHandles = Math.max(1, Math.min(16, Number(request.maxHandles || 8)));
+  const highestIdentityCandidates = candidates.filter((candidate) => candidate.match.rank === highestIdentityRank);
+  const sourceIdentity = (candidate) => String(
+    candidate?.chunk?.sourceId
+      || candidate?.chunk?.provenance?.sourceId
+      || candidate?.chunk?.path
+      || candidate?.chunk?.provenance?.path
+      || candidate?.chunk?.evidenceId
+      || candidate?.chunk?.id
+      || ""
+  ).trim();
+  const candidateKey = (candidate) => `${String(candidate?.chunk?.evidenceId || candidate?.chunk?.id || "")}:${sourceIdentity(candidate)}`;
+  const sortedByEvidence = (values) => values.slice().sort((left, right) =>
+    sourceIdentity(left).localeCompare(sourceIdentity(right))
+    || String(left.chunk.evidenceId || left.chunk.id || "").localeCompare(String(right.chunk.evidenceId || right.chunk.id || "")));
+  const selectedCandidates = [];
+  const selectedKeys = new Set();
+  // Query handles are protected identity seeds only. Routed evidence rows
+  // must never become independent document-vector query handles.
+  for (const candidate of sortedByEvidence(highestIdentityCandidates)) {
+    if (selectedCandidates.length >= maxHandles) break;
+    const key = candidateKey(candidate);
+    if (selectedKeys.has(key)) continue;
+    selectedKeys.add(key);
+    selectedCandidates.push(candidate);
+  }
   const seenVectors = new Set();
   const handles = selectedCandidates.filter(({ chunk, meta }) => {
     const key = `${chunk.evidenceId || chunk.id || ""}|${chunk.sourceId || ""}|${meta.dimension}|${meta.model}`;
@@ -775,6 +842,8 @@ function resolveIndexedSemanticQueryHandles(index = [], request = {}) {
       mode,
       requestedIdentityCount,
       selectedIdentityRank: highestIdentityRank,
+      selectedIdentityRankCount: selectedCandidates.filter((candidate) => candidate.match.rank === highestIdentityRank).length,
+      selectedSourceCount: new Set(selectedCandidates.map(sourceIdentity).filter(Boolean)).size,
       indexedHandleCount: handles.length,
       incompatibleHandleCount: rejected.length,
       rejected: Object.freeze(rejected.slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED)),
@@ -2065,6 +2134,7 @@ const AI_MODEL_CONCURRENCY_DEFAULT = 10;
 const AI_MODEL_CONCURRENCY_MAX = 16;
 const OPENWEBUI_WORKER_COUNT_DEFAULT = 1;
 const OPENWEBUI_WORKER_COUNT_MAX = 8;
+const RUNTIME_INDEX_WRITER_WAIT_MS = 180000;
 
 function boundedRuntimeConcurrency(value, fallback, maximum) {
   const candidate = Number(value);
@@ -2116,6 +2186,7 @@ class RuntimeWorkCoordinator {
     this.capacityQueues = new Map();
     this.indexQueue = [];
     this.indexActive = 0;
+    this.indexWriterWaiters = new Set();
     this.activePromises = new Set();
     this.telemetry = {
       queued: 0,
@@ -2205,6 +2276,49 @@ class RuntimeWorkCoordinator {
     this._leaseWaiters.clear();
   }
 
+  _indexWriterBusy() {
+    return this.indexActive > 0 || this.indexQueue.length > 0;
+  }
+
+  _waitForIndexWriters() {
+    if (this.closed) {
+      const error = new Error("Runtime work coordinator is closed.");
+      error.code = "runtime-work-cancelled";
+      return Promise.reject(error);
+    }
+    if (!this._indexWriterBusy()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this.indexWriterWaiters.delete(waiter);
+        const error = new Error("Semantic index writer remained active beyond the bounded generation wait.");
+        error.code = "runtime-index-writer-timeout";
+        reject(error);
+      }, RUNTIME_INDEX_WRITER_WAIT_MS);
+      this.indexWriterWaiters.add(waiter);
+    });
+  }
+
+  _notifyIndexWriterWaiters() {
+    if (this._indexWriterBusy() || !this.indexWriterWaiters.size) return;
+    for (const waiter of this.indexWriterWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+    this.indexWriterWaiters.clear();
+  }
+
+  _cancelIndexWriterWaiters() {
+    if (!this.indexWriterWaiters.size) return;
+    const error = new Error("Runtime work was cancelled during unload.");
+    error.code = "runtime-work-cancelled";
+    for (const waiter of this.indexWriterWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.indexWriterWaiters.clear();
+  }
+
   _capacityState(key, limit) {
     const boundedLimit = boundedRuntimeConcurrency(limit, 1, AI_MODEL_CONCURRENCY_MAX);
     let state = this.capacityQueues.get(key);
@@ -2262,15 +2376,40 @@ class RuntimeWorkCoordinator {
     return limits[`${normalizedProvider}:${normalizedModel}`] || limits[normalizedProvider] || boundedRuntimeConcurrency(this.settings().aiModelConcurrency, AI_MODEL_CONCURRENCY_DEFAULT, AI_MODEL_CONCURRENCY_MAX);
   }
 
-  runProviderWork({ provider = "", model = "", execute } = {}) {
+  runProviderWork({ provider = "", model = "", operation = "provider-work", workflowToken = null, allowActiveIndex = false, execute } = {}) {
     if (typeof execute !== "function") return Promise.reject(new Error("Provider work callback is required."));
-    // OpenWebUI's shared model-affine lane pool owns both cross-model worker
-    // capacity and same-model transport concurrency. A second coordinator
-    // semaphore would double-throttle those calls and make workerCount=1
-    // incorrectly cap the selected model below its configured default of 2.
-    if (String(provider || "").trim().toLowerCase() === "openwebui") return execute();
-    const key = `provider:${String(provider || "provider").trim().toLowerCase()}:${String(model || "model").trim().toLowerCase()}`;
-    return this._runCapacity(key, this._providerConcurrency(provider, model), execute);
+    if (this.closed) {
+      const error = new Error("Runtime work coordinator is closed.");
+      error.code = "runtime-work-closed";
+      return Promise.reject(error);
+    }
+    const normalizedProvider = String(provider || "").trim().toLowerCase();
+    const run = () => {
+      // OpenWebUI's shared model-affine lane pool owns both cross-model worker
+      // capacity and same-model transport concurrency. A second coordinator
+      // semaphore would double-throttle those calls and make workerCount=1
+      // incorrectly cap the selected model below its configured default of 2.
+      if (normalizedProvider === "openwebui") return execute();
+      const key = `provider:${normalizedProvider || "provider"}:${String(model || "model").trim().toLowerCase()}`;
+      return this._runCapacity(key, this._providerConcurrency(provider, model), execute);
+    };
+    // Direct provider calls still participate in the semantic-generation
+    // barrier so an index writer cannot begin while a model call is active.
+    // Calls made from an existing workflow lease (the normal gateway path), or
+    // explicitly marked as the active index operation's own embedding/publication
+    // call, reuse that admission to avoid nested leases and self-deadlock.
+    if (allowActiveIndex || this._ownsWorkflowToken(workflowToken)) return Promise.resolve().then(run);
+    return this.runAiWorkflow({ operation: operation || `${normalizedProvider || "provider"}-provider`, execute: () => run() });
+  }
+
+  _ownsWorkflowToken(workflowToken = null) {
+    const ownedLease = workflowToken?.leaseId ? this.leases.get(workflowToken.leaseId) : null;
+    return Boolean(
+      ownedLease
+      && workflowToken.workflowId === ownedLease.leaseId
+      && workflowToken.generation === ownedLease.snapshot.generation
+      && workflowToken.generationHash === ownedLease.snapshot.generationHash
+    );
   }
 
   _workflowToken(lease, operation = "ai") {
@@ -2285,21 +2424,30 @@ class RuntimeWorkCoordinator {
 
   runAiWorkflow({ jobId = "", operation = "ai", execute } = {}) {
     if (typeof execute !== "function") return Promise.reject(new Error("AI work callback is required."));
-    return this._runCapacity(`runtime-workers`, normalizeRuntimeWorkerCount(this.settings().runtimeWorkerCount), () => {
-      // Acquire only when a runtime worker actually starts. Queued AI jobs do
-      // not hold a generation lease or defer unrelated index publication.
+    // The coordinator is not a plugin-wide semaphore. Provider:model lanes
+    // below own AI admission, while this boundary protects one immutable
+    // semantic-generation lease for the workflow. A top-level generation
+    // cannot overtake an active or queued exclusive index writer; nested work
+    // re-enters through runAiWork with its existing workflow token instead.
+    const acquireAfterWriterCheck = () => {
+      // `_waitForIndexWriters()` may have resolved before a synchronous
+      // enqueueIndexWork call runs. Recheck in this same microtask before
+      // acquiring the lease; a busy writer loops through a Promise boundary,
+      // avoiding recursive stack growth while preserving atomic admission.
+      if (this._indexWriterBusy()) return this._waitForIndexWriters().then(acquireAfterWriterCheck);
       const lease = this.acquireSemanticGenerationLease({ operation });
       const workflowToken = this._workflowToken(lease, operation);
       return Promise.resolve().then(() => execute(workflowToken)).finally(() => {
         this.releaseSemanticGenerationLease(lease);
         this._notifyLeaseWaiters();
       });
-    });
+    };
+    return this._waitForIndexWriters().then(acquireAfterWriterCheck);
   }
 
   runAiWork({ jobId = "", operation = "ai", workflowToken = null, execute } = {}) {
     if (typeof execute !== "function") return Promise.reject(new Error("AI work callback is required."));
-    if (workflowToken?.leaseId && this.leases.has(workflowToken.leaseId)) return Promise.resolve().then(() => execute(workflowToken));
+    if (this._ownsWorkflowToken(workflowToken)) return Promise.resolve().then(() => execute(workflowToken));
     return this.runAiWorkflow({ jobId, operation, execute });
   }
 
@@ -2341,8 +2489,9 @@ class RuntimeWorkCoordinator {
 
   _drainIndexQueue() {
     // Semantic publication mutates one shared index/meta generation. Keep
-    // this critical section single-file while allowing local embedding pools
-    // inside the operation to retain their own safe parallelism.
+    // this critical section single-file and preserve the global generation /
+    // indexing exclusion barrier: every semantic index mutation waits until
+    // all active generation leases settle.
     const indexConcurrency = 1;
     if (this.closed || this.leases.size || this.indexActive >= indexConcurrency) {
       if (this.leases.size && this.indexQueue.length) this.telemetry.indexDeferred += 1;
@@ -2355,12 +2504,14 @@ class RuntimeWorkCoordinator {
     Promise.resolve().then(() => item.request.execute?.(item.request)).then((result) => item.resolve({ status: "completed", jobId: item.request.jobId || "", coalesced: item.coalesced, waitMs: Math.max(0, this.now() - item.enqueuedAt), result }), (error) => item.resolve({ status: "failed", jobId: item.request.jobId || "", coalesced: item.coalesced, waitMs: Math.max(0, this.now() - item.enqueuedAt), failure: { code: String(error?.code || "runtime-index-failed").slice(0, 80) } })).finally(() => {
       this.indexActive = Math.max(0, this.indexActive - 1);
       this._drainIndexQueue();
+      this._notifyIndexWriterWaiters();
     });
     if (this.indexActive < indexConcurrency) this._drainIndexQueue();
   }
 
   cancelRuntimeWork() {
     this.closed = true;
+    this._cancelIndexWriterWaiters();
     for (const state of this.capacityQueues.values()) {
       for (const item of state.queue.splice(0)) {
         item.cancelled = true;
@@ -4717,6 +4868,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const targetDimension = semanticEmbeddingTargetDimension(this.settings);
     const partition = this.semanticIndexStoragePartition({ indexFile, actualDimension: activeDimension || targetDimension, configuredDimension: targetDimension });
     this.semanticIndexActivePartition = partition;
+    // A provider/model/dimension change can select a brand-new identity
+    // partition. Stage every generation only after its directory exists;
+    // otherwise the first shard write fails with ENOENT before the manifest
+    // can establish the generation gate.
+    await this.ensureSemanticIndexStorageDirectory(partition);
     if (candidateChunks.some((chunk) => !Array.isArray(chunk?.embedding) || !chunk.embedding.length)) {
       throw new Error("Semantic-index save rejected empty embedding vectors.");
     }
@@ -5437,6 +5593,98 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  async getSemanticIndexProviderStorageSummaries() {
+    const rows = [];
+    for (const provider of SEMANTIC_INDEX_PARTITION_PROVIDERS) rows.push(await semanticIndexProviderStorageSummary(this, provider));
+    return rows;
+  }
+
+  clearActiveSemanticIndexAfterProviderDelete(provider) {
+    const activeProvider = semanticIndexPartitionProvider(semanticEmbeddingProviderForSettings(this.settings));
+    if (activeProvider !== semanticIndexPartitionProvider(provider)) return false;
+    this.semanticIndex = [];
+    this.semanticIndexLoaded = false;
+    this.semanticIndexLoadInProgress = false;
+    this.semanticIndexLoadPromise = null;
+    this.semanticIndexKnownShardFiles = [];
+    this.semanticIndexStorageFingerprint = "";
+    this.semanticIndexPathMeta?.clear?.();
+    this.semanticIndexPathMetaSnapshotFingerprint = "";
+    this.semanticIndexActivePartition = null;
+    this.semanticIndexStats = { bytes: 0, totalBytes: 0, files: 0, shards: 0, path: this.semanticIndexFileName() };
+    this.semanticIndexLoadTelemetry = emptySemanticIndexLoadTelemetry();
+    this.semanticIndexCompatibilityRefresh = emptySemanticIndexCompatibilityRefresh();
+    this.semanticIndexCompatibilityRefreshTelemetry = this.semanticIndexCompatibilityRefresh;
+    this.semanticIndexCompatibilityRefreshPromise = null;
+    this.semanticIndexCompatibilityRefreshKeys = new Set();
+    this.invalidateProductionSemanticRoutingState("provider-index-deleted");
+    this.invalidateSemanticRetrievalCache?.();
+    this.semanticChunkTermCache?.clear?.();
+    this.queryEmbeddingCache?.clear?.();
+    this.contextQueryProfileCache?.clear?.();
+    this.settings.semanticIndexMeta = {
+      provider: activeProvider,
+      model: this.settings.embeddingModel,
+      dimension: semanticEmbeddingTargetDimension(this.settings),
+      targetDimension: semanticEmbeddingTargetDimension(this.settings),
+      file: this.semanticIndexFileName(),
+      chunks: 0,
+      shardCount: 0,
+      shardBytes: 0,
+      totalBytes: 0,
+      purgedAt: deviceTimestamp()
+    };
+    return true;
+  }
+
+  async deleteSemanticIndexProvider(provider) {
+    const normalizedProvider = semanticIndexPartitionProvider(provider);
+    return this.withSemanticIndexOperation("delete-provider", async () => {
+      await this.runtimeWorkCoordinator?.waitForSemanticGenerationLeases?.();
+      const adapter = this.app?.vault?.adapter;
+      const providerDir = `${String(this.manifest?.dir || "").replace(/\/+$/, "")}/${SEMANTIC_INDEX_PARTITION_ROOT}/${normalizedProvider}`;
+      const result = { provider: normalizedProvider, partitionsFound: 0, partitionsRemoved: 0, filesFound: 0, filesRemoved: 0, errors: [], changed: false };
+      if (!adapter?.list) { result.errors.push({ scope: "adapter", code: "adapter-unavailable" }); return Object.assign(semanticOperationResult({ ok: false, reasonCode: "delete-failed" }), result); }
+      let listed;
+      try { listed = await adapter.list(providerDir); } catch (error) { result.errors.push({ scope: "list", code: String(error?.code || "list-failed").slice(0, 80) }); return Object.assign(semanticOperationResult({ ok: false, reasonCode: "delete-failed" }), result); }
+      const identities = [];
+      for (const value of listed?.folders || []) { const identity = semanticIndexProviderIdentityName(semanticIndexProviderChildName(providerDir, value)); if (identity && !identities.includes(identity)) identities.push(identity); }
+      for (const identity of identities) {
+        const inspected = await inspectSemanticIndexProviderPartition(this, normalizedProvider, identity);
+        if (!inspected.retained) continue;
+        result.partitionsFound += 1;
+        const safeFiles = inspected.files.filter((name) => semanticIndexProviderSafeFileName(name, inspected.manifestFile));
+        result.filesFound += safeFiles.length;
+        for (const name of safeFiles) {
+          try { await adapter.remove(`${inspected.path}/${name}`); result.filesRemoved += 1; result.changed = true; }
+          catch (error) { result.errors.push({ scope: "remove", path: `${identity}/${name}`, code: String(error?.code || "remove-failed").slice(0, 80) }); }
+        }
+        const unknown = inspected.files.filter((name) => !semanticIndexProviderSafeFileName(name, inspected.manifestFile));
+        if (unknown.length) result.errors.push({ scope: "partition", path: identity, code: "unknown-direct-files", count: unknown.length });
+        try {
+          const after = await adapter.list(inspected.path);
+          if (!(after?.files || []).length && !(after?.folders || []).length && typeof adapter.rmdir === "function") {
+            await adapter.rmdir(inspected.path, false);
+            result.partitionsRemoved += 1;
+          } else if (!(after?.files || []).length && !(after?.folders || []).length) {
+            result.errors.push({ scope: "rmdir", path: identity, code: "rmdir-unavailable" });
+          }
+        } catch (error) { result.errors.push({ scope: "rmdir", path: identity, code: String(error?.code || "rmdir-failed").slice(0, 80) }); }
+      }
+      try {
+        const afterProvider = await adapter.list(providerDir);
+        if (!(afterProvider?.files || []).length && !(afterProvider?.folders || []).length && typeof adapter.rmdir === "function") await adapter.rmdir(providerDir, false);
+      } catch (error) { result.errors.push({ scope: "provider-rmdir", code: String(error?.code || "rmdir-failed").slice(0, 80) }); }
+      const active = semanticIndexPartitionProvider(semanticEmbeddingProviderForSettings(this.settings)) === normalizedProvider;
+      if (active && result.changed) {
+        this.clearActiveSemanticIndexAfterProviderDelete(normalizedProvider);
+        try { await this.saveSettings({ skipTaskReferenceSnapshot: true }); } catch (error) { result.errors.push({ scope: "settings", code: String(error?.code || "settings-save-failed").slice(0, 80) }); }
+      }
+      const complete = result.errors.length === 0 && result.partitionsRemoved === result.partitionsFound;
+      return Object.assign(semanticOperationResult({ ok: complete, changed: result.changed, changedCount: result.filesRemoved, reasonCode: complete ? "deleted" : result.changed ? "delete-partial-failure" : "no-index" }), result, { complete });
+    }, { paths: [`${this.manifest?.dir || ""}/${SEMANTIC_INDEX_PARTITION_ROOT}/${normalizedProvider}`] });
+  }
+
   async purgeSemanticIndex(showNotice = true) {
     const indexFile = this.semanticIndexFileName();
     this.semanticIndexActivePartition = this.semanticIndexStoragePartition({ indexFile });
@@ -5743,7 +5991,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.refreshSidebarStatus();
     try {
       const result = this.runtimeWorkCoordinator
-        ? await this.runtimeWorkCoordinator.runAiWork({ operation: activity, workflowToken: options.workflowToken || null, execute: () => work() })
+        ? await this.runtimeWorkCoordinator.runAiWork({ operation: activity, workflowToken: options.workflowToken || null, execute: (workflowToken) => work(workflowToken) })
         : await work();
       this.lastAiActivityDiagnostics = null;
       recordContextSummary();
@@ -6058,7 +6306,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const editor = view.editor;
     const selection = editor?.getSelection?.() || "";
     const text = await this.app.vault.cachedRead(file);
-    return { title: file.basename, path: file.path, text, selection };
+    const context = { title: file.basename, path: file.path, text, selection };
+    if (selection) {
+      const from = editor?.getCursor?.("from") || editor?.getCursor?.() || null;
+      const line = Number(from?.line);
+      context.sourceLineOffset = Number.isSafeInteger(line) && line >= 0 ? line : 0;
+    }
+    return context;
   }
 
   async rebuildSemanticIndex(showNotice) {
@@ -7321,18 +7575,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const requestedLimit = Math.max(1, Number(limit || 1));
     const poolSize = Math.max(requestedLimit * 6, 40);
     const profile = buildContextQueryProfile(this, usableIndex, plan);
-    const chatRelevanceProfile = taskSemanticRelevanceProfile({
-      content: plan.prompt || query,
-      semanticQuery: plan.prompt || query,
-      description: plan.queryText || query
-    }, plan.source || {}, plan.sourceContract || {}, { mode: retrievalMode });
-    const chatQueryRelevanceProfile = retrievalMode === "chat"
-      ? taskSemanticRelevanceProfile({
-        content: plan.prompt || query,
-        semanticQuery: plan.prompt || query,
-        description: plan.queryText || query
-      }, plan.source || {}, Object.assign({}, plan.sourceContract || {}, { facts: [], factRefs: [], fact_refs: [], factIds: [], fact_ids: [] }), { mode: retrievalMode })
-      : chatRelevanceProfile;
     const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
     const routedBatch = await this.routeProductionSemanticCandidateBatches([{ groupId: "chat", handles: queryHandles, topK: poolSize }], usableIndex, {
       mode: retrievalMode,
@@ -7362,35 +7604,37 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       return this.setSemanticRetrievalCache(cacheKey, result);
     }
-    const routedCandidateIds = new Set(routed.candidates.map((item) => chatSemanticCandidateEvidenceId(item)).filter(Boolean));
-    const chatActivePathFallbacks = retrievalMode === "chat"
-      ? usableIndex
-        .filter((chunk) => !routedCandidateIds.has(chatSemanticCandidateEvidenceId(chunk))
-          && chatSemanticCandidateActivePathAssociated({ chunk }, plan))
-        .map((chunk) => {
-          const vector = Array.isArray(chunk?.embedding) ? chunk.embedding : [];
-          const semanticScore = vector.length && queryEmbedding.length === vector.length ? Math.max(0, cosine(queryEmbedding, vector)) : 0;
-          return Object.assign({}, chunk, { chunk, semantic: semanticScore, semanticScore, semanticRankScore: semanticScore, source: "chat-active-source-fallback" });
-        })
-        .filter((item) => Number(item.semantic) > 0)
-      : [];
-    const routedCandidates = routed.candidates.concat(chatActivePathFallbacks);
-    const semanticRawCandidates = routedCandidates.map((item) => {
+    const routedCandidates = routed.candidates;
+    const chatEvidencePartition = retrievalMode === "chat"
+      ? semanticExecutionEvidencePartition(routedCandidates, retrievalMode)
+      : { selected: routedCandidates, rejected: [] };
+    const executionRoutedCandidates = chatEvidencePartition.selected;
+    const semanticRawCandidates = executionRoutedCandidates.map((item) => {
       const chunk = item.chunk;
-      return taskSemanticApplyExactEvidenceRelevance({
+      const rawCandidate = {
         ...item,
-        useNoteCreatedTime,
-        recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime })),
         ...contextCandidateScopeMetadata(chunk, profile, {})
-      }, chatRelevanceProfile);
+      };
+      return {
+        ...rawCandidate,
+        useNoteCreatedTime,
+        recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime }))
+      };
     });
     // Semantic index records already carry bounded temporal metadata; never scan vault files to hydrate relevance.
     const scopedCandidates = filterContextCandidatesForPlan(semanticRawCandidates, profile);
-    const candidates = rankContextCandidates(scopedCandidates.filter(semanticCandidateIsAdmissible)).slice(0, poolSize);
+    const eligibleCandidates = scopedCandidates.filter(semanticCandidateIsAdmissible);
+    const candidates = (retrievalMode === "chat"
+      ? eligibleCandidates.slice().sort((left, right) => {
+        const leftScore = Number(left?.semanticRankScore ?? left?.semanticScore ?? left?.semantic ?? 0);
+        const rightScore = Number(right?.semanticRankScore ?? right?.semanticScore ?? right?.semantic ?? 0);
+        return rightScore - leftScore
+          || String(chatSemanticCandidateEvidenceId(left)).localeCompare(String(chatSemanticCandidateEvidenceId(right)));
+      })
+      : rankContextCandidates(eligibleCandidates)
+    ).slice(0, poolSize);
     const uniqueCandidates = deduplicateSemanticRetrievalCandidates(candidates);
-    const admissionPlan = retrievalMode === "chat"
-      ? Object.assign({}, plan, { chatRelevanceProfile: chatQueryRelevanceProfile, chatRelevanceSourceContract: plan.sourceContract || plan.source || {} })
-      : plan;
+    const admissionPlan = plan;
     const admission = chatSemanticAdmissionPool(uniqueCandidates, requestedLimit, admissionPlan);
     const selectionPlan = Object.assign({}, admissionPlan, {
       chatProtectedEvidenceIds: admission.protectedEvidenceIds
@@ -7423,7 +7667,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         externalBackfillCount: admission.externalBackfillCount || 0,
         activeSourceAssociatedEvidenceIds: selected.filter((item) => chatSemanticCandidateActivePathAssociated(item, profile)).map(chatSemanticCandidateEvidenceId).filter(Boolean),
         queryRelevanceDroppedCount: Math.max(0, Number(admission.queryRelevanceDroppedCount || 0)),
-        activePathFallbackCount: chatActivePathFallbacks.length,
+        activePathFallbackCount: 0,
         mode: admission.mode,
         reason: admission.reason
       },
@@ -8088,6 +8332,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       queryHandleSource: "indexed",
       indexedHandleCount: 0,
       incompatibleHandleCount: 0,
+      queryHandleSelectedIdentityRankCount: 0,
+      queryHandleSelectedSourceCount: 0,
       externalQueryEmbeddingCalls: 0,
       runtimeExternalCalls: 0,
       routingElapsedMs: 0,
@@ -8216,7 +8462,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (indexLoadError) return degraded("index-load-failed");
     if (!usableIndex.length) return degraded(index.length ? "index-integrity-failed" : "semantic-index-empty");
     const productionRoutingState = options.mode === "chat"
-      ? (this.productionSemanticRoutingState?.routingIndex ? this.productionSemanticRoutingState : null)
+      ? (this.productionSemanticRoutingState?.routingIndex ? this.productionSemanticRoutingState : await this.ensureProductionSemanticRoutingState({
+        chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
+        settings: this.settings,
+        revision,
+        storageFingerprint: this.semanticIndexStorageFingerprint || "",
+        allowLoad: true,
+        allowBuild: false,
+        persist: false
+      }))
       : await this.ensureProductionSemanticRoutingState({
         chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
         settings: this.settings,
@@ -8230,6 +8484,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
     const laneDataByTask = new Map();
     const taskSeedHandlesByKey = new Map();
+    const taskSeedHandleTelemetryByKey = new Map();
     for (const [indexValue, task] of flattened) {
       const key = makeTaskKey(task, indexValue);
       taskKeyByIndex[String(indexValue)] = key;
@@ -8254,7 +8509,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       telemetry.laneCount += lanes.length;
       telemetry.laneNamesByTask[key] = lanes.map((lane) => lane.name);
       laneDataByTask.set(key, { key, queryId, scopeId, task, lanes, evidenceRequest, markedActionScope });
-      for (const lane of lanes) {
+      const isSeedLane = (lane = {}) => ["action", "source-statement", "terminology", "current-vault"].some((origin) => {
+        const laneOrigin = String(lane.origin || lane.name || "").toLowerCase();
+        return laneOrigin === origin || laneOrigin.startsWith(`${origin}-`);
+      });
+      // Resolve marker-line seed lanes before any history/handoff lane. The
+      // latter must reuse the exact seed handles and never broaden task
+      // identity into a second document-vector query.
+      const laneResolutionOrder = lanes.slice().sort((left, right) => Number(isSeedLane(right)) - Number(isSeedLane(left)));
+      for (const lane of laneResolutionOrder) {
         const handleRequest = {
           mode: options.mode || "task-generation",
           provider,
@@ -8275,27 +8538,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           preferredIdentity: "task",
           indexReady: Boolean(productionRoutingState?.routingIndex)
         };
-        const boundedResolverIndex = productionSemanticRoutingLookupRows(productionRoutingState.handleLookup, handleRequest)
-          .map((row) => productionRoutingState.chunkByEvidenceId.get(productionRoutingState.routingIndex.evidenceIds[row]))
-          .filter(Boolean);
-        const scopeResolver = taskSemanticScopeResolverIndex(boundedResolverIndex, source, sourceContract || {}, lane.scopeId, task, lane);
-        lane.lineScopeDegradedReason = scopeResolver.degradedReason;
-        const seedLane = ["action", "source-statement", "terminology", "current-vault"].some((origin) => String(lane.origin || lane.name || "").toLowerCase() === origin || String(lane.origin || lane.name || "").toLowerCase().startsWith(`${origin}-`));
+        const seedLane = isSeedLane(lane);
+        let scopeResolver = { chunks: [], lineRanges: [], degradedReason: "" };
         let resolved = null;
         if (markedActionScope && !seedLane) {
-          const seedHandles = taskSeedHandlesByKey.get(key) || [];
-          resolved = seedHandles.length
-            ? { handles: seedHandles, telemetry: { indexedHandleCount: seedHandles.length, incompatibleHandleCount: 0 }, degradedReason: "" }
-            : { handles: [], telemetry: { indexedHandleCount: 0, incompatibleHandleCount: 0 }, degradedReason: "marked-seed-unavailable" };
+          const seedHandles = taskSeedHandlesByKey.get(key);
+          if (seedHandles?.length) {
+            resolved = {
+              handles: seedHandles.slice(),
+              telemetry: Object.assign({}, taskSeedHandleTelemetryByKey.get(key) || {}, {
+                mode: "marked-action-seed-reused",
+                reusedSeedHandles: true
+              })
+            };
+          } else {
+            resolved = {
+              handles: [],
+              telemetry: { mode: "marked-action-seed-unavailable", seedHandlesUnavailable: true },
+              degradedReason: "marked-action-seed-unavailable"
+            };
+          }
         } else {
+          const boundedResolverIndex = productionSemanticRoutingLookupRows(productionRoutingState.handleLookup, handleRequest)
+            .map((row) => productionRoutingState.chunkByEvidenceId.get(productionRoutingState.routingIndex.evidenceIds[row]))
+            .filter(Boolean);
+          scopeResolver = taskSemanticScopeResolverIndex(boundedResolverIndex, source, sourceContract || {}, lane.scopeId, task, lane);
           resolved = resolveIndexedSemanticQueryHandles(scopeResolver.chunks, handleRequest);
-          if (markedActionScope && seedLane && resolved.handles?.length && !taskSeedHandlesByKey.has(key)) taskSeedHandlesByKey.set(key, resolved.handles.slice());
+          if (markedActionScope && seedLane && resolved.handles?.length && !taskSeedHandlesByKey.has(key)) {
+            taskSeedHandlesByKey.set(key, Object.freeze(resolved.handles.slice()));
+            taskSeedHandleTelemetryByKey.set(key, Object.freeze(Object.assign({}, resolved.telemetry || {})));
+          }
         }
+        lane.lineScopeDegradedReason = scopeResolver.degradedReason || resolved.degradedReason || "";
         lane.queryHandles = resolved.handles || [];
+        lane.queryHandleTelemetry = resolved.telemetry || {};
         lane.embedding = lane.queryHandles[0]?.vector || [];
         lane.cacheKey = lane.queryHandles[0]?.cacheKey || `indexed-missing:${queryId}:${lane.name}`;
         telemetry.indexedHandleCount += lane.queryHandles.length;
         telemetry.incompatibleHandleCount += Number(resolved.telemetry?.incompatibleHandleCount || 0);
+        telemetry.queryHandleSelectedIdentityRankCount += Number(resolved.telemetry?.selectedIdentityRankCount || 0);
+        telemetry.queryHandleSelectedSourceCount += Number(resolved.telemetry?.selectedSourceCount || 0);
         if (scopeResolver.degradedReason || resolved.degradedReason || !lane.queryHandles.length) {
           telemetry.degraded = true;
           telemetry.degradedReason = telemetry.degradedReason || scopeResolver.degradedReason || resolved.degradedReason || "query-vector-unavailable";
@@ -8360,7 +8642,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const profile = buildContextQueryProfile(this, usableIndex, plan);
       const taskItemLimit = taskSemanticEvidenceItemLimit(limit, plan);
       const retrievalMode = String(options.mode || "task-generation");
-      const relevanceProfile = taskSemanticRelevanceProfile(task, source, sourceContract, { mode: retrievalMode });
       const supportingEvidenceOnly = retrievalMode.startsWith("task-generation") || retrievalMode === "description";
       const laneResults = [];
       for (const lane of laneData.lanes) {
@@ -8391,7 +8672,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             temporalRelation: semanticTemporalRelation(chunk, laneProfile)
           });
         });
-        const relevanceRanked = ranked.map((item) => taskSemanticApplyExactEvidenceRelevance(item, relevanceProfile));
+        const relevanceRanked = ranked;
         const scoped = filterContextCandidatesForPlan(relevanceRanked, laneProfile);
         const laneRouted = lane.name === "continuity"
           ? scoped.filter((item) => semanticTaskReferenceChunkSelected(item.chunk || item))
@@ -8427,15 +8708,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           task,
           taskId: key,
           scopeId: laneData.scopeId,
-          relevanceProfile,
-          exactRelevanceMode: true
         });
         const diagnosticWindow = ownershipExclusions.map((entry) => Object.assign({}, entry.item, {
           semanticOwnershipExcluded: true,
           scopeOwnershipReason: entry.reasonCode,
           scopeOwnership: "diagnostic-only"
         }));
-        laneResults.push({ lane: lane.name, origin: lane.origin || lane.name, mandatory: lane.mandatory === true, factIds: Array.isArray(lane.factIds) ? lane.factIds.slice() : [], embedding: lane.embedding, queryId: lane.queryId, queryHandleEvidenceIds: lane.queryHandles.flatMap((handle) => handle.sourceEvidenceIds || []), queryHandleSourceIds: lane.queryHandles.flatMap((handle) => handle.sourceIds || []), profile: laneProfile, relevanceProfile, ranked: relevanceRanked, admissible: ownershipAdmissible, originalAdmissible: admissible, ownershipExclusions, ownershipDiagnosticWindow: diagnosticWindow, sourceExclusions, elbowAdmitted: admitted, admitted: admitted, candidateWindow: candidateWindow.candidates, candidateWindowFloor: candidateWindow.floor, candidateWindowPoolCount: candidateWindow.poolCount, candidateWindowBaseCount: candidateWindow.baseCount, candidateWindowTailCount: candidateWindow.tailCount, candidateWindowLimit: candidateWindow.windowLimit || candidateWindow.candidates.length, candidateWindowScoreSupportedCount: candidateWindow.scoreSupportedCount || candidateWindow.candidates.length, candidateWindowRecencyDimension: candidateWindow.recencyDimension || "", candidateWindowRecencyContributionCount: candidateWindow.recencyContributionCount || 0, candidateWindowRecencyContributionMax: candidateWindow.recencyContributionMax || 0, candidateWindowSourceCoverageReservationCount: candidateWindow.sourceCoverageReservationCount || 0, candidateWindowSourceCoverageReservationReason: candidateWindow.sourceCoverageReservationReason || "", candidateWindowSourceCoverageReservation: candidateWindow.sourceCoverageReservation || null, candidateWindowSourceThreadReservationCount: candidateWindow.sourceThreadReservationCount || 0, candidateWindowSourceThreadReservationReason: candidateWindow.sourceThreadReservationReason || "", candidateWindowSourceThreadReservations: candidateWindow.sourceThreadReservations || [], candidateWindowSourceThreadCandidates: candidateWindow.sourceThreadCandidates || [], candidateWindowReasonCodes: candidateWindow.reasonCodes, lineScopeDegradedReason: lane.lineScopeDegradedReason || "" });
+        const handleTelemetry = lane.queryHandles.length
+          ? (lane.queryHandleTelemetry || {})
+          : {};
+        laneResults.push({ lane: lane.name, origin: lane.origin || lane.name, mandatory: lane.mandatory === true, factIds: Array.isArray(lane.factIds) ? lane.factIds.slice() : [], embedding: lane.embedding, queryId: lane.queryId, queryHandleEvidenceIds: lane.queryHandles.flatMap((handle) => handle.sourceEvidenceIds || []), queryHandleSourceIds: lane.queryHandles.flatMap((handle) => handle.sourceIds || []), queryHandleSelectedIdentityRankCount: Number(handleTelemetry.selectedIdentityRankCount || 0), queryHandleSelectedSourceCount: Number(handleTelemetry.selectedSourceCount || 0), profile: laneProfile, ranked: relevanceRanked, admissible: ownershipAdmissible, originalAdmissible: admissible, ownershipExclusions, ownershipDiagnosticWindow: diagnosticWindow, sourceExclusions, elbowAdmitted: admitted, admitted: admitted, candidateWindow: candidateWindow.candidates, candidateWindowFloor: candidateWindow.floor, candidateWindowPoolCount: candidateWindow.poolCount, candidateWindowBaseCount: candidateWindow.baseCount, candidateWindowTailCount: candidateWindow.tailCount, candidateWindowLimit: candidateWindow.windowLimit || candidateWindow.candidates.length, candidateWindowScoreSupportedCount: candidateWindow.scoreSupportedCount || candidateWindow.candidates.length, candidateWindowRecencyDimension: candidateWindow.recencyDimension || "", candidateWindowRecencyContributionCount: candidateWindow.recencyContributionCount || 0, candidateWindowRecencyContributionMax: candidateWindow.recencyContributionMax || 0, candidateWindowSourceCoverageReservationCount: candidateWindow.sourceCoverageReservationCount || 0, candidateWindowSourceCoverageReservationReason: candidateWindow.sourceCoverageReservationReason || "", candidateWindowSourceCoverageReservation: candidateWindow.sourceCoverageReservation || null, candidateWindowSourceThreadReservationCount: candidateWindow.sourceThreadReservationCount || 0, candidateWindowSourceThreadReservationReason: candidateWindow.sourceThreadReservationReason || "", candidateWindowSourceThreadReservations: candidateWindow.sourceThreadReservations || [], candidateWindowReasonCodes: candidateWindow.reasonCodes, lineScopeDegradedReason: lane.lineScopeDegradedReason || "" });
       }
       telemetry.laneTelemetryByTask[key] = laneResults.map((result) => {
         const scores = result.admissible.map((item) => Number(item.semantic || 0)).filter(Number.isFinite).sort((left, right) => right - left);
@@ -8447,6 +8729,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           queryId: result.queryId,
           queryHandleEvidenceIds: result.queryHandleEvidenceIds || [],
           queryHandleSourceIds: result.queryHandleSourceIds || [],
+          queryHandleSelectedIdentityRankCount: result.queryHandleSelectedIdentityRankCount || 0,
+          queryHandleSelectedSourceCount: result.queryHandleSelectedSourceCount || 0,
           candidateCount: result.ranked.length,
           admissibleCount: result.admissible.length,
           candidateWindowCount: result.candidateWindow.length,
@@ -8506,9 +8790,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         task,
         taskId: key,
         scopeId: laneData.scopeId,
-        materialityAnchors,
-        relevanceProfile,
-        exactRelevanceMode: true
+        materialityAnchors
       });
       for (const laneTelemetry of telemetry.laneTelemetryByTask[key] || []) {
         const alignment = laneCoverage.laneAlignment?.[laneTelemetry.lane];
@@ -9281,7 +9563,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       type: "note",
       title: active.title || "",
       path: activePath,
-      text: activeText
+      text: activeText,
+      ...(active?.selection ? {
+        sourceLineOffset: Number.isSafeInteger(Number(active.sourceLineOffset)) && Number(active.sourceLineOffset) >= 0
+          ? Number(active.sourceLineOffset)
+          : 0
+      } : {})
     } : null;
     const sourceContract = source ? buildTaskSourceContract(source, activeText, this.settings) : null;
     const requestedTaskScopes = chatRequestedTaskScopeRecords(prompt, source, sourceContract, this.settings);
@@ -9428,8 +9715,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       model: modelChoice.model
     });
     const responseSchema = chatResponseSchema(CHAT_RESPONSE_MAX_CLAIMS, chatContextProjection.allowedEvidenceIds);
-    let response = await this.withAiActivity("Answering question", () => this.openaiResponse({
+    let response = await this.withAiActivity("Answering question", (workflowToken) => this.openaiResponse({
       operation: chatDispatchOperation,
+      workflowToken,
       model: modelChoice.model,
       provider: modelChoice.provider,
       chatContextProjection,
@@ -9445,6 +9733,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
         "Treat the active note as the primary supplied evidence. Set established=true only when the claim is supported by one or more supplied evidence_ids; otherwise set established=false and say that the element is not established.",
         "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
+        "evidence_ids accepts only the exact enum values listed in the supplied schema. fact-* identifiers are metadata only and never citation IDs; never put fact-* values in evidence_ids.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
         "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
         "Preserve exact proper names and quoted terms from the evidence. For every supported claim, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
@@ -10004,8 +10293,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     for (const record of scopeRecords) {
       const key = retrieval.taskKeyByIndex?.[String(record.index)] || record.taskId;
       const local = retrieval.byTask?.[key] || { context: [], telemetry: {} };
-      const context = (local.context || []).map((chunk) => materializeSelectedTaskSemanticExcerptFact(chunk, record.taskId, record.scopeId));
+      const context = Array.isArray(local.context) ? local.context : [];
       const syntheticTask = taskWorkflowPreStructureSyntheticTask(record, sourceContract, context, local);
+      const selectedContext = Array.isArray(syntheticTask?.taskLocalSemanticEvidence?.context)
+        ? syntheticTask.taskLocalSemanticEvidence.context
+        : context;
       byScope[record.scopeId] = {
         scopeId: record.scopeId,
         factId: record.factId,
@@ -10015,13 +10307,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         mandatoryTaskFactIds: record.mandatoryTaskFactIds || [],
         mandatoryDescriptionFactIds: record.mandatoryDescriptionFactIds || [],
         queryId: local.queryId || "",
-        evidenceIds: context.map((chunk) => chunk.evidenceId).filter(Boolean),
-        context,
+        evidenceIds: selectedContext.map((chunk) => chunk.evidenceId).filter(Boolean),
+        context: selectedContext,
         syntheticTask,
         telemetry: local.telemetry || {}
       };
       tasks.push(syntheticTask);
-      chunks.push(...context);
+      chunks.push(...selectedContext);
     }
     return {
       scopes: scopeRecords,
@@ -10308,12 +10600,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         system: taskGenerationSystem,
         user: requestUser
       }) : null;
+      const activeProviderProjectionTelemetry = Object.assign({},
+        activeWorkflowContext.providerEvidenceProjection?.telemetry || {},
+        batch?.providerProjectionTelemetry || {}
+      );
       taskGenerationRecoveryTelemetry.callCount += 1;
       if (phase === "initial") taskGenerationRecoveryTelemetry.initialCallCount += 1;
       if (phase === "scope-recovery") taskGenerationRecoveryTelemetry.recoveryCallCount += 1;
       try {
-        return await this.withAiActivity("Generating task list", () => this.openaiResponse({
+        return await this.withAiActivity("Generating task list", (workflowToken) => this.openaiResponse({
           operation: "task-generation",
+          workflowToken,
           model: modelChoice.model,
           jsonSchema: providerTaskStructureSchema,
           schemaVocabulary: providerSchemaVocabulary,
@@ -10330,10 +10627,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             : providerScopeBoundary?.promptContextSuffix || activeWorkflowContext.promptContextSuffix,
           promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
           fallbackOnly,
-          providerProjectionTelemetry: recoveryClosure ? {
+          providerProjectionTelemetry: recoveryClosure ? Object.assign({}, activeProviderProjectionTelemetry, {
             protectedDeliveredCount: (recoveryClosure.sourceContract?.facts || []).filter((fact) => Array.isArray(fact?.mandatoryFor) && fact.mandatoryFor.length > 0).length,
             optionalDeliveredCount: Math.max(0, (recoveryClosure.evidenceCatalog?.items || []).length - (recoveryClosure.sourceContract?.facts || []).filter((fact) => Array.isArray(fact?.mandatoryFor) && fact.mandatoryFor.length > 0).length)
-          } : activeWorkflowContext.providerEvidenceProjection?.telemetry,
+          }) : activeProviderProjectionTelemetry,
           onUsage: (usage) => { requestUsage = Object.assign({}, usage || {}); },
           onEvent: requestDiagnostic.onEvent,
           onRawOutput: requestDiagnostic.onRawOutput,
@@ -10345,12 +10642,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }), { workflowToken: requestOptions.workflowToken || null });
       } finally {
         const usage = requestUsage;
-        const serializedFactIds = Object.keys(activeWorkflowContext.requiredPromptBlock?.sourceContract?.factTable || {});
         const recoveryFactIds = recoveryClosure
           ? (recoveryClosure.sourceContract?.facts || []).map((fact) => String(fact?.factId || fact?.fact_id || fact?.id || "")).filter(Boolean)
           : [];
-        const providerDeliveredFactIds = uniqueValues([...serializedFactIds, ...recoveryFactIds]);
         const projectedFactIds = uniqueValues((activeWorkflowContext.providerEvidenceProjection?.providerFactIds || []).map(String).filter(Boolean));
+        // The provider suffix contains one canonical fact table: the closed
+        // projection. Required-block factTable metadata is intentionally not
+        // serialized into that suffix and therefore is not counted as a
+        // second provider delivery.
+        const providerDeliveredFactIds = recoveryClosure
+          ? uniqueValues(recoveryFactIds)
+          : projectedFactIds.slice();
         const deliveredFactIdSet = new Set(providerDeliveredFactIds);
         const retrievedButNotDeliveredFactIds = projectedFactIds.filter((factId) => !deliveredFactIdSet.has(factId));
         taskGenerationRecoveryTelemetry.calls.push(Object.assign({
@@ -10383,6 +10685,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           providerDeliveredFactCount: providerDeliveredFactIds.length,
           retrievedButNotDeliveredFactIds,
           retrievedButNotDeliveredFactCount: retrievedButNotDeliveredFactIds.length,
+          providerContextDeduplication: {
+            requiredBlockEvidenceBodyCount: 0,
+            requiredBlockFactBodyCount: 0,
+            requiredBlockManifestEvidenceIdCount: Number(activeWorkflowContext.requiredPromptBlock?.evidenceCatalog?.manifest?.evidenceIds?.length || 0),
+            requiredBlockManifestFactIdCount: Number(activeWorkflowContext.requiredPromptBlock?.evidenceCatalog?.manifest?.factIds?.length || 0),
+            providerProjectionEvidenceBodyCount: recoveryClosure
+              ? Number(recoveryClosure.evidenceCatalog?.items?.length || 0)
+              : Number(activeWorkflowContext.providerEvidenceProjection?.selectedEvidenceIds?.length || 0),
+            providerProjectionFactBodyCount: providerDeliveredFactIds.length,
+            duplicateEvidenceBodyCount: 0,
+            duplicateFactBodyCount: 0,
+            canonicalTable: "providerEvidenceProjection"
+          },
           selectedModel: modelChoice.model,
           selectedProvider: modelChoice.provider || "",
           providerDeliveredModel: modelChoice.model,
@@ -10504,26 +10819,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               let evaluated = evaluate(await requestTaskStructure(null, false, { workflowContext: batch.contextBundle, batch, workflowToken }));
               scopeOutcome.initialStatus = evaluated.terminalCode ? "invalid" : "accepted";
               scopeOutcome.initialReasonCodes = uniqueValues([evaluated.terminalCode, ...(evaluated.closureErrors || [])].filter(Boolean));
-              const structuralRetryCodes = new Set([
-                "response-invalid-json",
-                "response-root-invalid",
-                "response-shape-missing-tasks",
-                "response-task-invalid",
-                "response-unexpected-provider-field",
-                "response-internal-metadata-field",
-                "response-identifier-field",
-                "response-scope-structure-invalid",
-                "scope-call-not-singleton",
-                "scope-id-mismatch",
-                "tree-scope-mismatch",
-                "requested-outcome-content-missing",
-                "internal-metadata-in-content",
-                "requested-action-fact-missing",
-                "requested-action-binding-missing",
-                "task-structure-field-mismatch",
-                "response-schema-fragments-in-content"
-              ]);
-              const recoverable = evaluated.task && evaluated.closureErrors.length > 0 && evaluated.closureErrors.every((code) => structuralRetryCodes.has(code));
+              const recoverable = evaluated.task && evaluated.closureErrors.length > 0 && taskGenerationScopeRecoveryAllowed(evaluated.closureErrors);
               if (recoverable) {
                 scopeOutcome.recoveryAttempted = true;
                 taskGenerationRecoveryTelemetry.retryScopeIds.push(String(batch.scopeIds[0]));
@@ -10787,8 +11083,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const taskSemanticChunks = Object.values(taskSemanticRetrieval.byTask || {})
       .flatMap((entry) => entry.context || []);
     evidenceCatalog = buildTaskEvidenceCatalog(sourceContract, [...(initialSemanticContext || []), ...taskSemanticChunks], this.settings, { source, sourceSummary });
-    const catalogEvidenceIds = new Set((evidenceCatalog.items || []).map((item) => String(item.evidenceId || item.id || "")).filter(Boolean));
     attachTaskWorkflowSemanticEvidence(limitedTasks, sourceContract, evidenceCatalog, preStructureScopes, taskSemanticRetrieval);
+    // Semantic attachment materializes task-local exact excerpt facts. Build a
+    // fresh authoritative catalog from that bounded final context before any
+    // downstream validator reads it; buildTaskEvidenceCatalog freezes its
+    // result, so closure never mutates a shared frozen instance.
+    const taskLocalSemanticRows = flattenTaskPlan(limitedTasks)
+      .flatMap((task) => task?.taskLocalSemanticEvidence?.context || []);
+    evidenceCatalog = buildTaskEvidenceCatalog(
+      sourceContract,
+      [...(initialSemanticContext || []), ...taskSemanticChunks, ...taskLocalSemanticRows],
+      this.settings,
+      { source, sourceSummary }
+    );
+    // Reattach against the rebuilt catalog so task fact refs/bindings are
+    // canonicalized to the same authoritative fact map used by validation.
+    attachTaskWorkflowSemanticEvidence(limitedTasks, sourceContract, evidenceCatalog, preStructureScopes, taskSemanticRetrieval);
+    const catalogEvidenceIds = new Set((evidenceCatalog.items || []).map((item) => String(item.evidenceId || item.id || "")).filter(Boolean));
     // Evidence validation below may reject individual generated tasks. Do not
     // let a rejected task's foreign IDs poison the shared bundle for accepted
     // siblings; retain only complete, catalog-backed task-ref entries here.
@@ -10985,8 +11296,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     let json;
     try {
-      json = await this.withAiActivity("Naming task section", () => this.openaiResponse({
+      json = await this.withAiActivity("Naming task section", (workflowToken) => this.openaiResponse({
         operation: "section-title",
+        workflowToken,
         model: modelChoice.model,
         jsonSchema: sectionTitleResponseSchema(),
         system: taskWorkflowSystemInstruction(),
@@ -11051,8 +11363,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       attributionCode: "",
       preflightReasonCodes: [],
       singletonPreflightDiagnostics: [],
+      normalizationCorrections: [],
       descriptionProviderEvidence: null,
       calls: []
+    };
+    const recordDescriptionNormalizationCorrections = (phase, corrections = []) => {
+      for (const correction of corrections || []) {
+        if (!correction || !Number.isInteger(correction.taskIndex)) continue;
+        const record = Object.assign({ phase }, correction);
+        recoveryTelemetry.normalizationCorrections.push(record);
+        this.logLocal("Task description singleton response normalized", {
+          phase,
+          taskIndex: correction.taskIndex,
+          reasonCode: correction.reasonCode || "singleton-missing-index-repaired"
+        });
+      }
     };
     const finalize = (failureEntries = [], generatedCount = 0) => {
       const failures = new Map();
@@ -11088,6 +11413,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         attempted: report.attempted,
         generated: report.generated,
         failed: report.failed,
+        normalizationCorrections: recoveryTelemetry.normalizationCorrections.map((correction) => Object.assign({}, correction)),
         providerDiagnostic: null
       };
       recoveryTelemetry.terminalFailureIndexes = Array.from(failures.keys()).sort((left, right) => left - right);
@@ -11186,20 +11512,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
     }
     const initialProviderProjection = options.contextBundle?.providerEvidenceProjection || null;
+    // Description selection starts from the exact provider task closure. Do
+    // not promote complete task-local or pre-projection IDs into a baseline:
+    // those rows may be stale, unrelated, or intentionally excluded by the
+    // upstream provider projection.
+    const descriptionProviderTaskRefs = options.contextBundle?.providerTaskEvidenceRefs || {};
+    const descriptionTaskLocalBaselineIds = uniqueValues(Object.values(descriptionProviderTaskRefs)
+      .flatMap((refs) => Array.isArray(refs) ? refs : [])
+      .map(String)
+      .filter(Boolean));
     const descriptionProviderProjection = structuredEvidence && Array.isArray(descriptionEvidenceItems)
       ? taskWorkflowProviderEvidenceProjection(descriptionProjectionItems, {
         settings: this.settings,
         sourceContract: options.sourceContract,
         tasks: mainTasks,
-        taskEvidenceRefs: options.contextBundle?.taskEvidenceRefs || {},
+        taskEvidenceRefs: options.contextBundle?.providerTaskEvidenceRefs || options.contextBundle?.taskEvidenceRefs || {},
         scopeSemanticEvidence: options.contextBundle?.scopeSemanticEvidence || {},
         recordCeiling: initialProviderProjection?.recordCeiling
           ?? initialProviderProjection?.telemetry?.recordCeiling
           ?? this.settings.maxTaskContextChunks
           ?? 48,
-        baselineSelectedEvidenceIds: initialProviderProjection?.selectedEvidenceIds || [],
+        baselineSelectedEvidenceIds: descriptionTaskLocalBaselineIds,
         candidateCount: descriptionProjectionItems.length,
-        contextBundle: options.contextBundle
+        contextBundle: options.contextBundle,
+        descriptionProjection: true
       })
       : initialProviderProjection;
     if (descriptionProviderProjection) {
@@ -11236,9 +11572,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             ?? descriptionProviderProjection?.telemetry?.recordCeiling
             ?? this.settings.maxTaskContextChunks
             ?? 48,
-          baselineSelectedEvidenceIds: descriptionProviderProjection?.selectedEvidenceIds || []
+          baselineSelectedEvidenceIds: descriptionProviderProjection?.selectedEvidenceIds || [],
+          descriptionProjection: true
         })
         : null;
+      if (projection) {
+        synchronizeTaskLocalEvidenceWithProviderProjection(requestTask, projection, options.sourceContract || {}, {
+          index: taskIndex,
+          useProjectionAll: true,
+          evidenceItems: descriptionProjectionItems
+        });
+      }
       taskLocalProviderProjectionCache.set(taskIndex, projection);
       return projection;
     };
@@ -11324,13 +11668,41 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description response must contain exactly one description object", reasonCode: "description-response-cardinality-mismatch", stage: "response" });
               return;
             }
+            const singletonDescription = singletonParsed.descriptions[0];
+            if (!singletonDescription || typeof singletonDescription !== "object" || Array.isArray(singletonDescription)) {
+              singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description response item was not an object", reasonCode: "description-response-item-invalid", stage: "response" });
+              return;
+            }
+            const expectedTaskId = String(requestTask.taskLocalEvidence?.taskId || requestTask.taskId || requestTask.task_id || requestTask.id || "");
+            const expectedScopeId = String(requestTask.taskLocalEvidence?.scopeId || requestTask.scopeId || requestTask.scope_id || "");
+            const providerTaskId = String(singletonDescription.task_id || singletonDescription.taskId || "");
+            const providerScopeId = String(singletonDescription.scope_id || singletonDescription.scopeId || "");
+            if (!expectedTaskId || providerTaskId !== expectedTaskId) {
+              singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description task_id did not match requested task", reasonCode: "description-response-task-id-mismatch", stage: "response" });
+              return;
+            }
+            if (!expectedScopeId || providerScopeId !== expectedScopeId) {
+              singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description scope_id did not match requested scope", reasonCode: "description-response-scope-id-mismatch", stage: "response" });
+              return;
+            }
+            if (Object.prototype.hasOwnProperty.call(singletonDescription, "index")) {
+              const providerIndex = Number(singletonDescription.index);
+              const requestedIndex = Number(requestTask.index);
+              // Singleton prompts use local index 0 in some provider/router
+              // paths. Preserve that documented transport coordinate while
+              // rejecting every other explicit cross-task index.
+              if (!Number.isInteger(providerIndex) || (providerIndex !== requestedIndex && providerIndex !== 0)) {
+                singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description index did not match requested task", reasonCode: "description-response-index-mismatch", stage: "response" });
+                return;
+              }
+            }
             // A singleton request has its own local coordinate space. Some
             // providers/router models return that local index (usually 0)
             // even when the prompt carries the original global index. Once
             // cardinality is proven, remap the sole result to the immutable
             // outer task index before merging; validators still enforce the
             // task-local evidence/fact/binding closure for that target.
-            descriptions.push(Object.assign({}, singletonParsed.descriptions[0], { index: requestTask.index }));
+            descriptions.push(Object.assign({}, singletonDescription, { index: requestTask.index }));
             if (Array.isArray(singletonParsed.failures)) singletonFailures.push(...singletonParsed.failures);
           } catch (error) {
             const reasonCode = String(error?.code || error?.providerError?.code || error?.providerError?.providerDiagnostic?.code || "provider-failure");
@@ -11407,8 +11779,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (singletonSharedTaskEvidence?.dispatchAllowed === false) {
           throw new Error("singleton description evidence closure was incomplete");
         }
-        const providerJson = await this.withAiActivity(`Writing ${requestMainTasks.length} task description${requestMainTasks.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+        const providerJson = await this.withAiActivity(`Writing ${requestMainTasks.length} task description${requestMainTasks.length === 1 ? "" : "s"}`, (workflowToken) => this.openaiResponse({
         operation: "description",
+        workflowToken,
         singletonDescription: requestMainTasks.length === 1,
         model: modelChoice.model,
         fallbackOnly: phase === "fallback",
@@ -11560,7 +11933,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return failAll("description response contained unexpected task or section content", "response");
     }
     const validateDescriptionBatch = (parsedBatch, targetMainTasks) => {
-      const descriptions = parsedBatch.descriptions || [];
+      const normalizedResponse = normalizeSingletonTaskDescriptionResponse(parsedBatch, targetMainTasks);
+      const descriptions = normalizedResponse.descriptions;
       const expectedIndexes = new Set(targetMainTasks.map((task) => task.index));
       const expectedIdentityByIndex = new Map(targetMainTasks.map((task) => {
         const contract = singletonContractByTaskIndex.get(task.index);
@@ -11699,9 +12073,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         reasonCode: "description-response-missing-index",
         stage: "response"
       });
-      return { validatedDescriptions, failures };
+      return {
+        validatedDescriptions,
+        failures,
+        normalizationCorrections: normalizedResponse.corrections
+      };
     };
-    const annotateDescriptionTelemetry = (phase, targetMainTasks, validatedDescriptions, rawDescriptions = [], validationFailures = []) => {
+    const annotateDescriptionTelemetry = (phase, targetMainTasks, validatedDescriptions, rawDescriptions = [], validationFailures = [], normalizationCorrections = []) => {
       const byIndex = validatedDescriptions instanceof Map ? validatedDescriptions : new Map();
       const rawByIndex = new Map((rawDescriptions || [])
         .filter((item) => Number.isInteger(item?.index))
@@ -11719,6 +12097,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ...(failure?.validatorReasonCodes || []),
           ...taskDescriptionValidatorReasonCodes(failure?.reason ? [failure.reason] : [])
         ]).slice(0, 64));
+      }
+      const correctionByIndex = new Map();
+      for (const correction of normalizationCorrections || []) {
+        if (Number.isInteger(correction?.taskIndex)) correctionByIndex.set(correction.taskIndex, correction);
       }
       const outputReferences = (item = {}) => {
         const sentenceRows = Array.isArray(item.description_sentences) ? item.description_sentences : [];
@@ -11754,6 +12136,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         call.boundCount = factRefs.length;
         call.uncitedCount = Math.max(0, Number(call.providerDeliveredEvidenceCount || 0) - evidenceIds.length);
         call.outputValidationState = validated ? "accepted" : raw ? "rejected" : "unparsed";
+        const normalizationCorrection = correctionByIndex.get(taskIndex);
+        call.normalizationCorrections = normalizationCorrection ? [Object.assign({}, normalizationCorrection)] : [];
+        call.singletonIndexCorrectionApplied = Boolean(normalizationCorrection);
         const contract = singletonContractByTaskIndex.get(taskIndex);
         if (contract) Object.assign(call, taskDescriptionSingletonContractDiagnostics(contract, raw || {}, validated ? "passed" : "output-rejected"));
         call.validatorReasonCounts = failureDiagnosticsByIndex.get(taskIndex) || taskDescriptionValidatorReasonCounts();
@@ -11761,8 +12146,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     };
     const initialValidation = validateDescriptionBatch(parsed, mainTasks);
+    recordDescriptionNormalizationCorrections("initial", initialValidation.normalizationCorrections);
     const validatedDescriptions = initialValidation.validatedDescriptions;
-    annotateDescriptionTelemetry("initial", mainTasks, validatedDescriptions, parsed.descriptions, initialValidation.failures);
+    annotateDescriptionTelemetry("initial", mainTasks, validatedDescriptions, parsed.descriptions, initialValidation.failures, initialValidation.normalizationCorrections);
     let failures = [
       ...(Array.isArray(parsed.failures) ? parsed.failures : []),
       ...initialValidation.failures
@@ -11868,7 +12254,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "description-response-duplicate-task-id",
       "description-response-duplicate-scope-id",
       "description-response-identity-mismatch",
-      "description-response-missing-index"
+      "description-response-missing-index",
+      "description-response-item-invalid",
+      "description-response-task-id-mismatch",
+      "description-response-scope-id-mismatch",
+      "description-response-index-mismatch"
     ]);
     const retryableFailure = (failure) => ["evidence", "sentences"].includes(String(failure.stage || ""))
       || (failure.stage === "missing/nontext" && failure.reason === "description was missing or not text")
@@ -11951,6 +12341,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             recoveryTelemetry.fallbackIndexes = retryIndexes;
             let fallbackParsed = null;
             let fallbackFailures = [];
+            let fallbackNormalizationCorrections = [];
             try {
               const fallbackJson = await requestDescriptionBatch(retryMainTasks, recoveryPayloads.get(retryMainTasks[0]?.index), "fallback");
               try { fallbackParsed = JSON.parse(fallbackJson); } catch { fallbackParsed = null; }
@@ -11959,6 +12350,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
                 fallbackFailures = retryMainTasks.map((task) => ({ taskIndex: task.index, reason: "description fallback response shape was invalid", stage: "response" }));
               } else {
                 const fallbackValidation = validateDescriptionBatch(fallbackParsed, retryMainTasks);
+                recordDescriptionNormalizationCorrections("fallback", fallbackValidation.normalizationCorrections);
+                fallbackNormalizationCorrections = fallbackValidation.normalizationCorrections;
                 for (const [taskIndex, validated] of fallbackValidation.validatedDescriptions) validatedDescriptions.set(taskIndex, validated);
                 fallbackFailures = fallbackValidation.failures;
               }
@@ -11967,7 +12360,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             }
             annotateDescriptionTelemetry("fallback", retryMainTasks, new Map(retryMainTasks
               .map((task) => [task.index, validatedDescriptions.get(task.index)])
-              .filter((entry) => entry[1])), fallbackParsed?.descriptions || [], fallbackFailures);
+              .filter((entry) => entry[1])), fallbackParsed?.descriptions || [], fallbackFailures, fallbackNormalizationCorrections);
             const fallbackFailureIndexes = new Set(fallbackFailures.map((failure) => failure.taskIndex));
             failures = failures.filter((failure) => !retryIndexes.includes(failure.taskIndex));
             failures.push(...fallbackFailures);
@@ -12175,8 +12568,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     let parsed = { estimates: [] };
     try {
-      const json = await this.withAiActivity(`Estimating ${missing.length} triaged task duration${missing.length === 1 ? "" : "s"}`, () => this.openaiResponse({
+      const json = await this.withAiActivity(`Estimating ${missing.length} triaged task duration${missing.length === 1 ? "" : "s"}`, (workflowToken) => this.openaiResponse({
         operation: "scheduler",
+        workflowToken,
         model: durationModel,
         jsonSchema: scheduleDurationSchema(),
         system: [
@@ -12860,7 +13254,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (shouldInsert && shouldSyncAfterInsert) this.requireTodoistAccess();
       const responseSourceState = this.responseApplicationSourceState(active);
       const fallbackSectionName = makeNoteSectionName(active.title, active.text, active.path);
-      const plan = await this.createTaskPlan({
+      const taskSource = {
         type: "note",
         title: active.title,
         path: active.path,
@@ -12868,6 +13262,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         sectionName: fallbackSectionName,
         maxChars: this.settings.maxNoteChars,
         templateInstructions: template.prompt
+      };
+      if (active.selection) {
+        taskSource.sourceLineOffset = Number.isSafeInteger(Number(active.sourceLineOffset)) && Number(active.sourceLineOffset) >= 0
+          ? Number(active.sourceLineOffset)
+          : 0;
+      }
+      const plan = await this.createTaskPlan({
+        ...taskSource
       });
       let sectionName = plan.sectionName || fallbackSectionName;
       const tasks = plan.tasks || [];
@@ -13053,8 +13455,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           `Current generated tasks: ${JSON.stringify(repairSeedTasks)}`,
           `Primary source: ${primarySource}`
         ].join("\n\n");
-        const json = await this.withAiActivity(attempt === 1 ? "Repairing missing requested task outcomes" : "Retrying task hierarchy and coverage repair", () => this.openaiResponse({
+        const json = await this.withAiActivity(attempt === 1 ? "Repairing missing requested task outcomes" : "Retrying task hierarchy and coverage repair", (workflowToken) => this.openaiResponse({
           operation: "task-generation",
+          workflowToken,
           model: modelChoice.model,
           jsonSchema: taskCreationSchema(generationMainTaskLimit(this.settings), generationSubtaskLimit(this.settings), null, {
             allowUnboundedMarkedActionTitles: taskWorkflowAllowsUnboundedMarkedActionTitles(plan.sourceContract)
@@ -14634,8 +15037,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const model = taskDeduplicationAiModel(this.settings);
     if (!hasChatCredentialForModel(this.settings, model)) return null;
     try {
-      const json = await this.withAiActivity("Confirming possible duplicate task", () => this.openaiResponse({
+      const json = await this.withAiActivity("Confirming possible duplicate task", (workflowToken) => this.openaiResponse({
         operation: "deduplication",
+        workflowToken,
         model,
         reasoningEffort: this.settings.taskDeduplicationAiReasoningEffort,
         jsonSchema: taskDeduplicationAiDecisionSchema(),
@@ -14717,8 +15121,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     const requestDiagnostic = aiGatewayDiagnosticState("task-generation", "dedupe-update");
     try {
-      const json = await this.withAiActivity("Updating confirmed duplicate through task generation", () => this.openaiResponse({
+      const json = await this.withAiActivity("Updating confirmed duplicate through task generation", (workflowToken) => this.openaiResponse({
         operation: "task-generation",
+        workflowToken,
         model: modelChoice.model,
         jsonSchema: taskCreationSchema(1, generationSubtaskLimit(this.settings), null, {
           allowUnboundedMarkedActionTitles: taskWorkflowAllowsUnboundedMarkedActionTitles(options.sourceContract)
@@ -16138,6 +16543,47 @@ class SemanticTodoistView extends ItemView {
   }
 }
 
+class SemanticIndexDeleteModal extends Modal {
+  constructor(app, plugin, provider, summary, onComplete) {
+    super(app);
+    this.plugin = plugin;
+    this.provider = semanticIndexPartitionProvider(provider);
+    this.summary = summary || {};
+    this.onComplete = onComplete;
+    this.submitting = false;
+  }
+  onOpen() {
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.contentEl.addClass("semantic-todoist-modal-content");
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: `Delete ${providerDisplayName(this.provider)} index?` });
+    this.contentEl.createDiv({ text: `This removes ${this.summary.partitions || 0} retained identity partition${this.summary.partitions === 1 ? "" : "s"} under ${this.plugin.manifest?.dir || PLUGIN_DATA_FOLDER}/index/${this.provider}/. Sibling providers and shared task-reference files are preserved.` });
+    this.contentEl.createDiv({ cls: "mod-warning", text: "This cannot be undone." });
+    const actions = new Setting(this.contentEl);
+    actions.addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()));
+    actions.addButton((button) => {
+      this.confirmButton = button;
+      button.setButtonText("Delete index").setWarning().onClick(async () => {
+        if (this.submitting) return;
+        this.submitting = true;
+        button.setDisabled(true);
+        try {
+          const result = await this.plugin.deleteSemanticIndexProvider(this.provider);
+          this.close();
+          if (result?.complete) new Notice(`${providerDisplayName(this.provider)} semantic index deleted.`);
+          else new Notice(`${providerDisplayName(this.provider)} semantic index deletion incomplete.`);
+          this.onComplete?.(result);
+        } catch (error) {
+          this.submitting = false;
+          button.setDisabled(false);
+          new Notice(`Could not delete ${providerDisplayName(this.provider)} index: ${error?.message || error}`);
+        }
+      });
+    });
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 class SemanticTodoistSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -16145,6 +16591,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.activeTab = "Setup";
     this.sectionOpenState = new Map();
     this.operationOpenState = new Map();
+    this.providerStorageSummaries = null;
+    this.providerStorageSummaryPromise = null;
   }
 
   goTo(tab) {
@@ -16227,8 +16675,16 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     }
   }
 
+  refreshProviderStorageSummaries() {
+    if (this.providerStorageSummaryPromise || this.providerStorageSummaries) return;
+    this.providerStorageSummaryPromise = this.plugin.getSemanticIndexProviderStorageSummaries?.()
+      ?.then((rows) => { this.providerStorageSummaries = rows; if (this.activeTab === "AI & Search") this.display(); })
+      ?.catch(() => { this.providerStorageSummaries = SEMANTIC_INDEX_PARTITION_PROVIDERS.map((provider) => ({ provider, displayName: providerDisplayName(provider), hasIndex: false, state: "no-index", partitions: 0, shards: 0, bytes: 0 })); })
+      ?.finally(() => { this.providerStorageSummaryPromise = null; });
+  }
+
   renderSetup(containerEl) {
-    settingsHeading(containerEl, "Setup", "Check your connections here, then use the buttons to open the one place where each setting lives.");
+    settingsHeading(containerEl, "Setup", "Check connections here, then use the buttons to open the relevant settings. AI & Search holds provider, search, and sidebar controls; Task Workflows holds Todoist, note, and email settings; the other tabs hold scheduler, integrity, and activity controls.");
     setupStatusSetting(containerEl, "AI provider", aiSetupSummary(this.plugin.settings), [
       ["Configure AI & Search", () => this.goTo("AI & Search")],
       ["Validate AI", async () => { try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${error.message || error}`); } }]
@@ -16248,16 +16704,21 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     setupStatusSetting(containerEl, "Overall setup", "Run a bounded check for services that have credentials saved. No note content is sent by this check.", [
       ["Check setup", async () => { await this.plugin.validateConfiguredSetup(true); this.display(); }]
     ]);
-    settingsHeading(containerEl, "Next steps", "AI & Search holds provider keys, models, search, and sidebar behavior. Task Workflows holds Todoist, note, and email settings. Daily Scheduler and Task Integrity hold their own workflow controls.");
   }
 
   renderAiSearch(containerEl) {
-    settingsHeading(containerEl, "Provider and access", "Choose the primary generation provider, optional fallback provider, and global fallback policy. Provider credentials are configured in their own sections.");
+    settingsHeading(containerEl, "AI routing", "Choose the primary provider and fallback behavior.");
+    aiProviderSetting(containerEl, this.plugin, () => this.display());
+    toggleSetting(containerEl, "Enable AI fallback globally", "Applies to every provider and AI operation. When off, every operation uses only its primary model; saved fallback selections are preserved for when you turn this back on.", this.plugin, "enableAiModelFallback", () => this.display());
+    if (this.plugin.settings.enableAiModelFallback) fallbackAiProviderSetting(containerEl, this.plugin, () => this.display());
+    settingsHeading(containerEl, "Selected AI configuration", "Review provider-scoped primary, fallback, and reasoning selections.");
+    stsMpRenderSelectedAiConfiguration(containerEl, this.plugin.settings);
+    settingsHeading(containerEl, "Model catalog maintenance", "Refresh model lists or validate configured AI access.");
     const refreshState = this.plugin.modelCatalogRefreshState || { loading: false, error: "" };
     const refreshDescription = [
       modelSummary(this.plugin.settings),
       refreshState.loading ? "Refreshing model lists…" : "",
-      refreshState.error ? `Model list refresh failed: ${refreshState.error}` : ""
+      refreshState.error ? `Model list refresh: ${refreshState.error}` : ""
     ].filter(Boolean).join(" ");
     const refreshModelSetting = new Setting(containerEl).setName("Refresh model lists").setDesc(refreshDescription);
     refreshModelSetting.settingEl.addClass("semantic-todoist-settings-action-setting");
@@ -16272,8 +16733,11 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
           stsMpSetSearchableComboboxCatalogState(loadingState);
           this.display();
           try {
-            await this.plugin.refreshOpenAIModels(true);
-            const readyState = { loading: false, error: "" };
+            const refreshResult = await this.plugin.refreshOpenAIModels(true);
+            const readyState = {
+              loading: false,
+              error: refreshResult?.partialFailure ? refreshResult.summary : ""
+            };
             this.plugin.modelCatalogRefreshState = readyState;
             stsMpSetSearchableComboboxCatalogState(readyState);
             this.display();
@@ -16297,50 +16761,62 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     validateAiSetting.addButton((button) => button.setButtonText("Test AI").setCta().onClick(async () => {
       try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${aiProviderFailureSummary(error)}`); }
     }));
-    aiProviderSetting(containerEl, this.plugin, () => this.display());
-    toggleSetting(containerEl, "Enable AI fallback globally", "Applies to every provider and AI operation. When off, every operation uses only its primary model; saved fallback selections are preserved for when you turn this back on.", this.plugin, "enableAiModelFallback", () => this.display());
-    if (this.plugin.settings.enableAiModelFallback) fallbackAiProviderSetting(containerEl, this.plugin, () => this.display());
-    settingsHeading(containerEl, "Selected AI configuration", "Current provider, model, and effective reasoning selections for the operation map. Embedding selection is independent; legacy bulk provider fields are not used here.");
-    stsMpRenderSelectedAiConfiguration(containerEl, this.plugin.settings);
     settingsHeading(containerEl, "OpenAI", "Configure the OpenAI credential used by OpenAI operations.", { status: settingsProviderStatus(this.plugin, "openai") });
     secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
     settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(this.plugin, "gemini") });
     secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
       stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
+      stsMpRenderOpenWebUILearnedProfiles(containerEl, this.plugin, () => this.display());
       stsMpRenderOperationModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
     }
-    settingsHeading(containerEl, "AI behavior", "Configure reasoning, fallback notices, optimization, and provider prompt caching for the operation-specific model selections above.");
-    toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
-    toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls; keep your selected level for chat, tasks, and descriptions.", this.plugin, "optimizeStructuredAiUsage");
-    toggleSetting(containerEl, "Enable provider prompt caching", "Cache stable instructions when the selected provider supports it. Note, email, and vault content stays outside the cached portion.", this.plugin, "enableOpenAiPromptCaching");
-    numberSetting(containerEl, "Runtime work coordinator workers", this.plugin, "runtimeWorkerCount");
-    numberSetting(containerEl, "Same-model AI call concurrency", this.plugin, "aiModelConcurrency");
-    settingsHeading(containerEl, "Embeddings and semantic search", "The local semantic index uses the selected embedding model and configured vault scope. Rebuild after changing the model or dimension.");
-    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
+    settingsHeading(containerEl, "Semantic search and index", "Choose the vault scope and automatic index behavior, then inspect or rebuild each provider's local index.");
     textSetting(containerEl, "Indexed folders", "Comma-separated folders. Leave blank to index the whole vault.", this.plugin, "indexedFolders");
     folderListSetting(containerEl, "Excluded folders", "Folders ignored by semantic search and indexing.", this.plugin, "excludedFolders");
     textSetting(containerEl, "Excluded link domains", "Comma-separated web domains omitted from prompts and descriptions.", this.plugin, "excludedLinkDomains");
-    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
-    numberSetting(containerEl, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
-    numberSetting(containerEl, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
-    numberSetting(containerEl, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
-    toggleSetting(containerEl, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
     toggleSetting(containerEl, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
-    numberSetting(containerEl, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
-    new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true))).addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
+    new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)));
+    const providerRows = this.providerStorageSummaries || SEMANTIC_INDEX_PARTITION_PROVIDERS.map((provider) => ({ provider, displayName: providerDisplayName(provider), hasIndex: false, state: "no-index", partitions: 0, shards: 0, bytes: 0 }));
+    for (const row of providerRows) {
+      const setting = new Setting(containerEl).setName(row.displayName || providerDisplayName(row.provider)).setDesc(semanticIndexProviderStorageSummaryText(row));
+      if (row.hasIndex) {
+        setting.settingEl.addClass("semantic-todoist-settings-action-setting");
+        setting.addButton((button) => button.setButtonText("Delete…").setWarning().onClick(() => {
+          new SemanticIndexDeleteModal(this.app, this.plugin, row.provider, row, (result) => { this.providerStorageSummaries = null; this.providerStorageSummaryPromise = null; this.display(); }).open();
+        }));
+      }
+    }
+    this.refreshProviderStorageSummaries();
 
-    settingsHeading(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.");
+    settingsHeading(containerEl, "Sidebar", "Choose how the sidebar starts and where it opens.");
     dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
     dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
     numberSetting(containerEl, "Chat font size", this.plugin, "chatFontSizePx");
     toggleSetting(containerEl, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
     toggleSetting(containerEl, "Include active note in search", "Include the active note alongside semantic search by default.", this.plugin, "searchIncludeActiveNote");
+    new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
+
+    settingsHeading(containerEl, "Advanced AI behavior", "Configure reasoning, fallback notices, optimization, and provider prompt caching.");
+    toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
+    toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls; keep your selected level for chat, tasks, and descriptions.", this.plugin, "optimizeStructuredAiUsage");
+    toggleSetting(containerEl, "Enable provider prompt caching", "Cache stable instructions when the selected provider supports it. Note, email, and vault content stays outside the cached portion.", this.plugin, "enableOpenAiPromptCaching");
+    numberSetting(containerEl, "Runtime work coordinator workers", this.plugin, "runtimeWorkerCount");
+    numberSetting(containerEl, "Same-model AI call concurrency", this.plugin, "aiModelConcurrency");
+
+    settingsHeading(containerEl, "Advanced indexing", "Advanced embedding and indexing limits. Rebuild after changing dimensions or chunking settings.");
+    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
+    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
+    numberSetting(containerEl, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
+    numberSetting(containerEl, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
+    numberSetting(containerEl, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
+    toggleSetting(containerEl, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
+    numberSetting(containerEl, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
+
+    settingsHeading(containerEl, "Context and prompt templates", "Choose context limits and reusable prompt actions.");
     numberSetting(containerEl, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
     numberSetting(containerEl, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
     textSetting(containerEl, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
     taskGenerationPromptTemplateSetting(containerEl, this.plugin);
-    new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
     new Setting(containerEl).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
 
     settingsHeading(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.");
@@ -16353,7 +16829,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Todoist", "Todoist is the write target for note and email workflows. Choose the project once here.");
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
-    settingsHeading(containerEl, "Shared task generation", "These limits and formatting rules apply to both note and email task generation.");
+    settingsHeading(containerEl, "Task defaults", "Limits and formatting rules shared by note and email task generation.");
     taskGenerationPromptProfileSettings(containerEl, this.plugin);
     taskSectionTitleModeSetting(containerEl, this.plugin);
     numberSetting(containerEl, "Maximum main tasks", this.plugin, "maxGeneratedMainTasks");
@@ -16363,19 +16839,19 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// links when task references are shown in the sidebar.", this.plugin, "linksAppURI");
     numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
 
-    settingsHeading(containerEl, "Notes-To-Todoist", "Create and sync tasks from notes or selected text. Required-action markers remain mandatory coverage anchors.");
+    settingsHeading(containerEl, "Note tasks", "Create and sync tasks from notes or selected text. Required-action markers remain mandatory coverage anchors.");
     textSetting(containerEl, "Required-action hashtags", "Comma-separated markers such as #todo that require a relevant generated task.", this.plugin, "noteActionMarkerTags");
     textSetting(containerEl, "Main sync tag", "Marker used on main task lines.", this.plugin, "syncTag");
     textSetting(containerEl, "Subtask sync tag", "Marker used on indented subtask lines.", this.plugin, "subtaskSyncTag");
     toggleSetting(containerEl, "Keep sync markers out of labels", "Do not send internal marker tags to Todoist labels.", this.plugin, "excludeSyncTagsFromLabels");
     toggleSetting(containerEl, "Automatic note sync", "Sync changed note task lines while Obsidian is open.", this.plugin, "notesAutoSync");
+    toggleSetting(containerEl, "Add source citations to note descriptions", "Include source references and context-note citations in note-created Todoist descriptions.", this.plugin, "noteIncludeSourceListInDescriptions");
+    new Setting(containerEl).setName("Sync note tasks").addButton((button) => button.setButtonText("Sync").setCta().onClick(() => this.plugin.syncNoteTasks()));
+
+    settingsHeading(containerEl, "Advanced note sync", "Tune automatic note synchronization and existing-ID recovery.");
     numberSetting(containerEl, "Note sync interval seconds", this.plugin, "syncIntervalSeconds");
     numberSetting(containerEl, "Note sync workers", this.plugin, "syncWorkerCount");
     numberSetting(containerEl, "Maximum note source characters", this.plugin, "maxNoteChars");
-    toggleSetting(containerEl, "Add source citations to note descriptions", "Include source references and context-note citations in note-created Todoist descriptions.", this.plugin, "noteIncludeSourceListInDescriptions");
-    taskInstructionSettings(containerEl, this.plugin, "Note task instructions", "note");
-    new Setting(containerEl).setName("Sync note tasks").addButton((button) => button.setButtonText("Sync").setCta().onClick(() => this.plugin.syncNoteTasks()));
-
     const legacyMode = this.plugin.settings.legacyTodoistIdMode === "convert" ? "convert" : "preserve";
     new Setting(containerEl)
       .setName("Existing Todoist IDs")
@@ -16391,16 +16867,18 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("Recover IDs").onClick(async () => {
         try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {}
       }));
+    taskInstructionSettings(containerEl, this.plugin, "Note task instructions", "note");
 
-    settingsHeading(containerEl, "Email-To-Todoist", "Process forwarded email through your own Cloudflare Worker. This workflow has no user-facing character cap; use the source and task rules below to shape generated tasks.");
+    settingsHeading(containerEl, "Email tasks", "Process forwarded email through your Cloudflare Worker.");
     textSetting(containerEl, "Cloudflare Worker URL", "HTTPS queue endpoint.", this.plugin, "workerUrl");
     secretSetting(containerEl, "Cloudflare Worker token", this.plugin, "workerToken");
     toggleSetting(containerEl, "Automatically process new email", "Poll the Worker queue while Obsidian is open.", this.plugin, "autoProcessEmails");
-    numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
-    textSetting(containerEl, "Email log folder", "Vault folder for the plain-language processing log.", this.plugin, "emailLogFolder");
     toggleSetting(containerEl, "Add source citations to email descriptions", "Include source references and context-note citations in email-created Todoist descriptions.", this.plugin, "emailIncludeSourceListInDescriptions");
     new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
-    taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
+
+    settingsHeading(containerEl, "Advanced email workflow", "Tune polling, logs, and Cloudflare setup actions.");
+    numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
+    textSetting(containerEl, "Email log folder", "Vault folder for the plain-language processing log.", this.plugin, "emailLogFolder");
     setupStatusSetting(containerEl, "Cloudflare setup", emailSetupSummary(this.plugin.settings), [
       ["Generate token", async () => { try { await this.plugin.generateWorkerToken(true); this.display(); } catch (error) { new Notice(`Could not generate Worker token: ${error.message || error}`); } }],
       ["Copy token", async () => {
@@ -16416,6 +16894,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       ["Create setup note", async () => { try { await this.plugin.createCloudflareSetupNote(true); } catch (error) { new Notice(`Could not create setup note: ${error.message || error}`); } }],
       ["Validate email", async () => { try { await this.plugin.validateEmailSetup(true); this.display(); } catch (error) { new Notice(`Email setup check failed: ${error.message || error}`); } }]
     ]);
+    taskInstructionSettings(containerEl, this.plugin, "Email task instructions", "email");
   }
 
   renderScheduleToday(containerEl) {
@@ -16448,11 +16927,13 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 
   renderTaskIntegrity(containerEl) {
-    settingsHeading(containerEl, "Task deduplication", "Check generated tasks against open local references before creating anything new.");
+    settingsHeading(containerEl, "Deduplication basics", "Check generated tasks against open local references before creating anything new.");
     toggleSetting(containerEl, "Enable task deduplication", "Use conservative local matching and keep ambiguous candidates for review.", this.plugin, "enableTaskDeduplication");
     taskDeduplicationStrictnessSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Merge labels additively", "Keep existing labels and add new labels.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
     toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Remove a linked subtask only when newer source text clearly says it is obsolete.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
+
+    settingsHeading(containerEl, "AI duplicate review and policy", "Review unresolved duplicate candidates and maintain the local matching policy.");
     toggleSetting(containerEl, "Use AI for unresolved duplicates", "Ask the selected dedupe model only about strong unresolved candidates; it never rewrites task fields.", this.plugin, "enableAiAmbiguousTaskDeduplication");
     taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
     reasoningEffortSetting(containerEl, "Deduplication reasoning", "Reasoning used only for AI duplicate verdicts.", this.plugin, "taskDeduplicationAiReasoningEffort", taskDeduplicationAiModel(this.plugin.settings));
@@ -18513,6 +18994,151 @@ function indexSummary(pluginOrSettings) {
   if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes}${total} Rebuild the semantic vault index.`;
   if (stats.bytes) return `No semantic index chunks are available. ${bytes}${total} Rebuild the semantic vault index.`;
   return "No semantic index has been built yet.";
+}
+
+function semanticIndexProviderChildName(parentPath, value) {
+  const text = String(value || "");
+  const prefix = `${String(parentPath || "").replace(/\/+$/, "")}/`;
+  const relative = text.startsWith(prefix) ? text.slice(prefix.length) : text;
+  if (!relative || relative.includes("/") || relative.includes("\\")) return "";
+  try { return normalizedPluginBasename(relative, "semantic-index provider entry"); } catch { return ""; }
+}
+
+function semanticIndexProviderIdentityName(value) {
+  const name = semanticIndexProviderChildName("", value);
+  return /^[a-z0-9][a-z0-9._-]{7,63}$/i.test(name) ? name : "";
+}
+
+function semanticIndexProviderManifestFile(provider, directFiles = []) {
+  const files = new Set(directFiles || []);
+  for (const candidate of semanticIndexProviderManifestCandidates(provider)) if (files.has(candidate)) return candidate;
+  return Array.from(files).find((name) => /^semantic-index(?:\.[a-z0-9._-]+)?\.json$/i.test(name) &&
+    !/^semantic-index-(?:path-meta|routing)\.json$/i.test(name)) || "";
+}
+
+function semanticIndexProviderRoutingFile(name) {
+  return /^semantic-index-routing(?:\.[a-z0-9-]+)?(?:\.staged)?\.json$/i.test(String(name || ""));
+}
+
+async function inspectSemanticIndexProviderPartition(plugin, provider, identityName) {
+  const adapter = plugin?.app?.vault?.adapter;
+  const normalizedProvider = semanticIndexPartitionProvider(provider);
+  const providerDir = `${String(plugin?.manifest?.dir || "").replace(/\/+$/, "")}/${SEMANTIC_INDEX_PARTITION_ROOT}/${normalizedProvider}`;
+  const partitionPath = `${providerDir}/${identityName}`;
+  const result = {
+    provider: normalizedProvider,
+    identity: identityName,
+    path: partitionPath,
+    files: [],
+    manifestFile: "",
+    shardFiles: [],
+    bytes: 0,
+    errors: []
+  };
+  if (!adapter?.list) return result;
+  let listed;
+  try { listed = await adapter.list(partitionPath); } catch (error) {
+    result.errors.push({ scope: "list", code: String(error?.code || "list-failed").slice(0, 80) });
+    return result;
+  }
+  const directFiles = [];
+  for (const value of listed?.files || []) {
+    const name = semanticIndexProviderChildName(partitionPath, value);
+    if (name && !directFiles.includes(name)) directFiles.push(name);
+  }
+  result.files = directFiles;
+  result.manifestFile = semanticIndexProviderManifestFile(normalizedProvider, directFiles);
+  let parsed = null;
+  if (result.manifestFile && typeof adapter.read === "function") {
+    try {
+      parsed = JSON.parse(await adapter.read(`${partitionPath}/${result.manifestFile}`));
+    } catch (error) {
+      result.errors.push({ scope: "manifest", code: String(error?.code || "manifest-unreadable").slice(0, 80) });
+    }
+  }
+  const manifestShardFiles = [];
+  let manifestShardsValid = Array.isArray(parsed?.shards);
+  if (manifestShardsValid) {
+    const seen = new Set();
+    for (const shard of parsed.shards) {
+      const candidate = shard?.file ?? shard?.path;
+      let name = "";
+      try { name = semanticIndexShardName(result.manifestFile || SEMANTIC_INDEX_FILE, candidate, { allowLegacy: true }); } catch { manifestShardsValid = false; break; }
+      if (String(candidate) !== name || seen.has(name)) { manifestShardsValid = false; break; }
+      seen.add(name);
+      manifestShardFiles.push(name);
+    }
+  }
+  if (manifestShardsValid) {
+    result.shardFiles = manifestShardFiles.filter((name) => directFiles.includes(name));
+  } else {
+    result.shardFiles = directFiles.filter((name) => {
+      try { semanticIndexShardName(result.manifestFile || SEMANTIC_INDEX_FILE, name, { allowLegacy: true }); return true; } catch { return false; }
+    });
+  }
+  if (typeof adapter.stat === "function") {
+    for (const name of directFiles) {
+      try { result.bytes += Math.max(0, Number((await adapter.stat(`${partitionPath}/${name}`))?.size || 0)); }
+      catch (error) { result.errors.push({ scope: "stat", path: name, code: String(error?.code || "stat-failed").slice(0, 80) }); }
+    }
+  }
+  result.retained = directFiles.length > 0;
+  result.complete = result.errors.length === 0;
+  return result;
+}
+
+async function semanticIndexProviderStorageSummary(plugin, provider) {
+  const normalizedProvider = semanticIndexPartitionProvider(provider);
+  const empty = {
+    provider: normalizedProvider,
+    displayName: providerDisplayName(normalizedProvider),
+    manifestFile: "",
+    partitions: 0,
+    shards: 0,
+    bytes: 0,
+    hasIndex: false,
+    state: "no-index",
+    errors: []
+  };
+  const adapter = plugin?.app?.vault?.adapter;
+  if (!adapter?.list) return empty;
+  const providerDir = `${String(plugin?.manifest?.dir || "").replace(/\/+$/, "")}/${SEMANTIC_INDEX_PARTITION_ROOT}/${normalizedProvider}`;
+  let listed;
+  try { listed = await adapter.list(providerDir); } catch { return empty; }
+  const identities = [];
+  for (const value of listed?.folders || []) {
+    const name = semanticIndexProviderIdentityName(semanticIndexProviderChildName(providerDir, value));
+    if (name && !identities.includes(name)) identities.push(name);
+  }
+  const partitions = [];
+  for (const identity of identities) {
+    const inspected = await inspectSemanticIndexProviderPartition(plugin, normalizedProvider, identity);
+    if (!inspected.retained) continue;
+    partitions.push(inspected);
+    if (!empty.manifestFile && inspected.manifestFile) empty.manifestFile = inspected.manifestFile;
+    empty.shards += inspected.shardFiles.length;
+    empty.bytes += inspected.bytes;
+    empty.errors.push(...inspected.errors);
+  }
+  empty.partitions = partitions.length;
+  empty.hasIndex = empty.partitions > 0;
+  empty.state = empty.hasIndex ? "retained" : "no-index";
+  return empty;
+}
+
+function semanticIndexProviderSafeFileName(name, manifestFile = "") {
+  const value = String(name || "");
+  try { normalizedPluginBasename(value, "semantic-index partition file"); } catch { return false; }
+  if (value === manifestFile || semanticIndexProviderManifestFile("openai", [value]) === value || semanticIndexProviderManifestFile("gemini", [value]) === value || semanticIndexProviderManifestFile("openrouter", [value]) === value || semanticIndexProviderManifestFile("openwebui", [value]) === value) return true;
+  try { semanticIndexShardName(manifestFile || SEMANTIC_INDEX_FILE, value, { allowLegacy: true }); return true; } catch {}
+  return value === SEMANTIC_INDEX_PATH_META_FILE || isSemanticIndexPathMetaGenerationFile(value) || semanticIndexProviderRoutingFile(value);
+}
+
+function semanticIndexProviderStorageSummaryText(row = {}) {
+  if (!row.hasIndex) return "No local index retained.";
+  const manifest = row.manifestFile ? `Manifest: ${row.manifestFile}.` : "Manifest: unavailable.";
+  const size = row.errors?.length ? "Local size unavailable." : `${formatBytes(row.bytes || 0)} local files.`;
+  return `${manifest} ${row.partitions} identity partition${row.partitions === 1 ? "" : "s"}; ${row.shards} shard${row.shards === 1 ? "" : "s"}; ${size}`;
 }
 
 function indexFilesSummary(pluginOrSettings) {
@@ -23047,11 +23673,21 @@ function semanticMarkdownCoherentUnits(text = "") {
       previousKind = "boundary";
       continue;
     }
-    const listItem = /^\s*(?:[-*+]|\d+[.)])\s+/.test(rawLine);
+    const listMatch = /^(\s*)(?:[-*+]|\d+[.)])\s+/.exec(rawLine);
+    const listItem = Boolean(listMatch);
+    const nestedListItem = listItem && listMatch[1].length > 0;
     const explicitAction = /(?:^|\s)#todo\b/i.test(rawLine) || /^\s*(?:[-*+]\s+)?\[[ xX]\]\s+/.test(rawLine) || /^\s*(?:[-*+]\s+)?(?:action|todo|next step)\s*:/i.test(rawLine);
+    if (nestedListItem && (pending?.kind === "list-item" || pending?.kind === "action")) {
+      pending.lines.push(rawLine.trim());
+      pending.lineEnd = lineNumber;
+      blankRun = 0;
+      continue;
+    }
     if (listItem) {
       flushPending();
-      if (previousKind !== "list-item" || blankRun > 0 || explicitAction) listGroup += 1;
+      // Each top-level bullet is its own semantic unit. Nested bullets and
+      // indented continuation lines stay attached to their parent above.
+      listGroup += 1;
       pending = {
         lines: [rawLine.trim()], lineStart: lineNumber, lineEnd: lineNumber, kind: explicitAction ? "action" : "list-item",
         metadata: { listGroup, sectionGroup, blankBefore: blankRun }
@@ -23463,6 +24099,112 @@ function parseChatEvidenceResponse(value = "") {
   }
 }
 
+function normalizeChatEvidencePayload(parsed = null, options = {}) {
+  const allowedEvidenceIds = Array.isArray(options.allowedEvidenceIds)
+    ? new Set(options.allowedEvidenceIds.map((value) => String(value || "").trim()).filter(Boolean))
+    : null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.claims)) {
+    return { value: parsed, corrections: [] };
+  }
+  const corrections = [];
+  const addCorrection = (correction) => {
+    if (corrections.length < CHAT_RESPONSE_MAX_CLAIMS * 4) corrections.push(correction);
+  };
+  const claims = parsed.claims.map((claim, index) => {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim)) return claim;
+    const next = Object.assign({}, claim);
+    const category = String(claim.category || "").trim().toLowerCase();
+    const categoryAlias = {
+      action: "next-step",
+      process: "fact",
+      context: "fact",
+      "requested-action": "next-step",
+      "historical-context": "history"
+    }[category];
+    if (categoryAlias && categoryAlias !== claim.category) {
+      next.category = categoryAlias;
+      addCorrection({ reasonCode: "chat-category-alias-mapped", claimIndex: index, from: category, to: categoryAlias });
+    }
+    const claimKeys = Object.keys(claim);
+    const hasOwnText = Object.prototype.hasOwnProperty.call(claim, "text");
+    const hasOwnClaim = Object.prototype.hasOwnProperty.call(claim, "claim");
+    if (!hasOwnText && hasOwnClaim && typeof claim.claim === "string"
+      && claimKeys.every((key) => ["text", "established", "evidence_ids", "category", "claim"].includes(key))) {
+      next.text = claim.claim;
+      delete next.claim;
+      addCorrection({ reasonCode: "chat-claim-field-promoted", claimIndex: index });
+    }
+    if (allowedEvidenceIds && options.filterForeignEvidenceIds !== false && Array.isArray(claim.evidence_ids)) {
+      const rawEvidenceIds = claim.evidence_ids.map((value) => String(value || "").trim()).filter(Boolean);
+      const evidenceIds = rawEvidenceIds.filter((evidenceId) => allowedEvidenceIds.has(evidenceId));
+      const removed = rawEvidenceIds.filter((evidenceId) => !allowedEvidenceIds.has(evidenceId));
+      if (removed.length) {
+        next.evidence_ids = evidenceIds;
+        addCorrection({
+          reasonCode: "chat-evidence-id-filtered",
+          claimIndex: index,
+          removedCount: removed.length,
+          removedIds: removed.slice(0, CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM)
+        });
+        if (claim.established === true && evidenceIds.length === 0) {
+          addCorrection({ reasonCode: "chat-established-claim-no-allowed-evidence", claimIndex: index });
+        }
+      }
+    }
+    return next;
+  });
+  return {
+    value: Object.assign({}, parsed, { claims }),
+    corrections
+  };
+}
+
+function normalizeChatEvidencePayloadForValidation(rawText = "", options = {}) {
+  const raw = String(rawText == null ? "" : rawText);
+  const parsed = parseChatEvidenceResponse(raw);
+  if (!parsed) return { text: raw, rawText: raw, value: null, corrections: [], applied: false };
+  const normalized = normalizeChatEvidencePayload(parsed, Object.assign({}, options, {
+    filterForeignEvidenceIds: false
+  }));
+  const structuralCorrections = normalized.corrections.filter((correction) =>
+    ["chat-category-alias-mapped", "chat-claim-field-promoted"].includes(String(correction?.reasonCode || ""))
+  ).slice(0, CHAT_RESPONSE_MAX_CLAIMS * 2);
+  if (!structuralCorrections.length) return { text: raw, rawText: raw, value: parsed, corrections: [], applied: false };
+  return {
+    text: JSON.stringify(normalized.value),
+    rawText: raw,
+    value: normalized.value,
+    corrections: structuralCorrections,
+    applied: true
+  };
+}
+
+function normalizeChatProviderResponse(response = {}) {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return { response, corrections: [], applied: false };
+  const rawText = response.rawText !== undefined ? response.rawText : response.text;
+  if (typeof rawText !== "string") return { response, corrections: [], applied: false };
+  const derived = normalizeChatEvidencePayloadForValidation(rawText);
+  if (!derived.applied) return { response, corrections: [], applied: false };
+  return {
+    response: Object.assign({}, response, {
+      text: derived.text,
+      rawText,
+      responseTelemetry: Object.assign({}, response.responseTelemetry || {}, {
+        derivedChatStructuralNormalization: true,
+        derivedChatStructuralNormalizationCorrections: derived.corrections
+      }),
+      providerDiagnostic: Object.assign({}, response.providerDiagnostic || {}, {
+        source: "derived-chat-response-normalization",
+        classification: "schema-normalization",
+        derivedChatStructuralNormalization: true,
+        derivedChatStructuralNormalizationCorrections: derived.corrections
+      })
+    }),
+    corrections: derived.corrections,
+    applied: true
+  };
+}
+
 function validateChatEvidencePayload(parsed = null, options = {}) {
   const allowedEvidenceIds = Array.isArray(options.allowedEvidenceIds)
     ? new Set(options.allowedEvidenceIds.map((value) => String(value || "").trim()).filter(Boolean))
@@ -23620,18 +24362,23 @@ function finalizeStructuredChatSentence(value = "") {
 function renderStructuredChatEvidenceResponse(value = "", ledger = [], options = {}) {
   const parsed = parseChatEvidenceResponse(value);
   const entries = Array.isArray(ledger) ? ledger.filter((entry) => entry?.url && entry?.evidenceId) : [];
-  const validation = validateChatEvidencePayload(parsed, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId) });
+  const normalized = normalizeChatEvidencePayload(parsed, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId) });
+  const validation = validateChatEvidencePayload(normalized.value, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId) });
   const byEvidenceId = new Map(entries.map((entry) => [String(entry.evidenceId), entry]));
-  const reasonCodes = [];
+  const reasonCodes = normalized.corrections.map((correction) => correction.reasonCode);
   const renderedClaims = [];
   let invalidClaimCount = 0;
   let unsupportedClaimCount = 0;
   const citedEvidenceIds = new Set();
   const usedEvidenceIds = new Set();
   if (!validation.valid) {
+    const invalidTelemetry = invalidChatEvidenceResponseTelemetry(entries, options, validation);
     return {
       answer: "Not established from supplied evidence: the assistant did not return a valid structured evidence response.",
-      telemetry: invalidChatEvidenceResponseTelemetry(entries, options, validation)
+      telemetry: Object.assign(invalidTelemetry, {
+        normalizationCorrections: normalized.corrections,
+        reasonCodes: uniqueValues([...(invalidTelemetry.reasonCodes || []), ...normalized.corrections.map((correction) => correction.reasonCode)])
+      })
     };
   }
   for (const claim of validation.claims) {
@@ -23691,6 +24438,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     ...evidenceUtilization,
     removedInventedLinkCount: 0,
     removedLinkCount: 0,
+    normalizationCorrections: normalized.corrections,
     claimCount: parsed.claims.length,
     supportedClaimCount: Math.max(0, validation.claims.filter((claim) => claim?.established === true && Array.isArray(claim?.evidence_ids) && claim.evidence_ids.length > 0).length - invalidClaimCount),
     acceptedClaimCount: renderedClaims.filter((claim) => !/^[-*]?\s*Not established from supplied evidence:/i.test(claim)).length,
@@ -23795,20 +24543,42 @@ function adaptiveSemanticRetrievalLimit(settings = DEFAULT_SETTINGS, mode = "cha
   return Math.max(base, Math.min(budget.maxRetrieval, expanded));
 }
 
+const CONTEXT_QUERY_HISTORY_RE = /\b(?:change\s+history|history|timeline|evolution|over\s+time|progress(?:ion)?|what\s+changed|how\s+(?:has|have|did)\s+.+\s+change|milestones?)\b/i;
+const CONTEXT_QUERY_PORTFOLIO_RE = /\b(?:portfolio|all\s+(?:my\s+)?projects?|my\s+projects?|projects?\s+(?:overall|across)|across\s+(?:all\s+)?projects?|where\s+(?:all\s+)?(?:my\s+)?projects?\s+stand)\b/i;
+const CONTEXT_QUERY_TASK_SCOPE_RE = /\b(?:all\s+(?:my\s+)?(?:open\s+)?tasks?|my\s+(?:open\s+|incomplete\s+)?tasks?|open\s+tasks?|incomplete\s+tasks?|overdue\s+tasks?|due\s+tasks?|today(?:'s|s)?\s+tasks?|next\s+tasks?|todoist\s+tasks?|what\s+should\s+i\s+do|what\s+do\s+i\s+need\s+to\s+do)\b/i;
+// Request-mode classification is intentionally separate from evidence
+// admission: these phrases describe an action-oriented question without
+// matching evidence text, titles, paths, or people.
+const CONTEXT_QUERY_ACTION_RE = /\b(?:what\s+(?:action|actions)\s+(?:is|are)\s+(?:requested|needed)|requested\s+action|remaining\s+action|what\s+(?:should|needs\s+to)\s+happen\s+next|what(?:'s|\s+is)\s+next|next\s+steps?|how\s+should\s+(?:i|we)\s+proceed|task\s+(?:status|state)|(?:status|state)\s+of\s+(?:this|the|my)\s+task)\b/i;
+const CONTEXT_QUERY_BROAD_RE = /\b(?:across\s+(?:the\s+)?(?:vault|notes?|work)|all\s+(?:my\s+)?(?:notes?|work|projects?|tasks?|items?)|whole\s+vault|everything|overall\s+(?:portfolio|projects?|work)|compare\s+(?:across|all|the\s+vault)|rank\s+(?:across|all)|top\s+priorit(?:y|ies)|most\s+important\s+across|priorit(?:ies|ize)\s+across|where\s+(?:work|projects?)\s+stand\s+across)\b/i;
+
+function classifyContextQueryIntent(prompt = "") {
+  const text = singleLine(prompt || "");
+  const history = CONTEXT_QUERY_HISTORY_RE.test(text);
+  const portfolio = CONTEXT_QUERY_PORTFOLIO_RE.test(text);
+  const tasks = CONTEXT_QUERY_TASK_SCOPE_RE.test(text);
+  const action = CONTEXT_QUERY_ACTION_RE.test(text);
+  const broad = history || portfolio || tasks || CONTEXT_QUERY_BROAD_RE.test(text);
+  return { history, tasks, portfolio, action, broad };
+}
+
 function contextQueryPlan(prompt = "", mode = "chat", structured = {}) {
   const text = singleLine(prompt || "");
   const metadata = structured?.queryPlan && typeof structured.queryPlan === "object" ? structured.queryPlan : structured;
+  const natural = classifyContextQueryIntent(text);
+  const hasFlag = (name) => Object.prototype.hasOwnProperty.call(metadata || {}, name);
+  const history = hasFlag("history") ? metadata.history === true : natural.history;
+  const tasks = hasFlag("tasks") ? metadata.tasks === true : natural.tasks;
+  const portfolio = hasFlag("portfolio") ? metadata.portfolio === true : natural.portfolio;
+  const broad = hasFlag("broad") ? metadata.broad === true : natural.broad;
+  const action = hasFlag("action") ? metadata.action === true : natural.action;
   const anchorTerms = Array.isArray(metadata?.anchorTerms)
     ? uniqueValues(metadata.anchorTerms.map((term) => String(term || "").trim()).filter(Boolean))
     : [];
-  const history = metadata?.history === true;
-  const tasks = metadata?.tasks === true;
-  const broad = metadata?.broad === true;
   const scoped = metadata?.scoped === true || Boolean(metadata?.scopeId || metadata?.scope);
-  const portfolio = metadata?.portfolio === true;
   return {
     mode,
-    intent: String(metadata?.intent || (history ? "history" : tasks ? "tasks" : portfolio ? "portfolio" : "focused")),
+    intent: String(metadata?.intent || (history ? "history" : tasks ? "tasks" : portfolio ? "portfolio" : action ? "action" : "focused")),
     broad,
     history,
     tasks,
@@ -24090,142 +24860,98 @@ function chatSemanticCandidateActivePathAssociated(item = {}, profile = {}) {
   return references.some((reference) => vaultRelativePath(reference?.path || reference?.sourcePath || reference?.source_path || "") === sourcePath);
 }
 
+function chatSemanticActionFocusedPlan(profile = {}) {
+  const mode = String(profile.mode || "chat").trim().toLowerCase();
+  if (mode !== "chat") return false;
+  if (profile.broad === true || profile.history === true || profile.tasks === true || profile.portfolio === true) return false;
+  const intent = String(profile.intent || "").trim().toLowerCase().replace(/[ _]+/g, "-");
+  return ["action", "actions", "actionable", "focused-action", "next-step", "next-steps", "task", "tasks", "task-status", "follow-up", "followups"].includes(intent)
+    || intent.startsWith("action-")
+    || intent.startsWith("next-step");
+}
+
+function chatSemanticCandidateActionProof(item = {}) {
+  const wrapper = item && typeof item === "object" ? item : {};
+  const candidate = wrapper.chunk && typeof wrapper.chunk === "object" ? wrapper.chunk : wrapper;
+  const nested = [wrapper, candidate, candidate.provenance, candidate.indexMetadata, candidate.taskReference, candidate.task]
+    .filter((value) => value && typeof value === "object");
+  const booleanSignal = (keys = []) => nested.some((value) => keys.some((key) => value[key] === true));
+  const numericSignal = (keys = []) => nested
+    .flatMap((value) => keys.map((key) => Number(value[key])))
+    .some((value) => Number.isFinite(value) && value > 0);
+  const objectPositiveSignal = (keys = []) => nested.some((value) => keys.some((key) => value[key] && typeof value[key] === "object"
+    && Object.values(value[key]).some((entry) => Number.isFinite(Number(entry)) && Number(entry) > 0)));
+  const actionLaneSupported = booleanSignal(["actionLaneSupported", "action_lane_supported"]);
+  const actionLaneContribution = numericSignal(["actionLaneContribution", "action_lane_contribution", "taskFocusContribution", "task_focus_contribution"])
+    || nested.some((value) => Number.isFinite(Number(value.laneScores?.action)) && Number(value.laneScores.action) > 0);
+  const materialityContribution = objectPositiveSignal(["materialityContributions", "materiality_contributions", "dimensionContributions", "dimension_contributions"])
+    || numericSignal(["materialityAnchorContrast", "materiality_anchor_contrast"]);
+  const materialityState = nested.map((value) => String(value.materialityState || value.materiality_state || "").trim().toLowerCase()).find(Boolean) || "";
+  return actionLaneSupported || actionLaneContribution || materialityContribution
+    || (materialityState === "material-review-history-candidate" && materialityContribution);
+}
+
 function chatSemanticCandidateQueryRelevant(item = {}, profile = {}) {
-  const relevanceProfile = profile?.chatRelevanceProfile || profile?.relevanceProfile || null;
-  if (!relevanceProfile) return true;
-  const associationProfile = Object.assign({}, profile, {
-    sourceContract: profile?.chatRelevanceSourceContract || profile?.sourceContract || profile?.source || {},
-    sourcePath: profile?.sourcePath || profile?.source?.path || ""
-  });
-  const candidate = item?.chunk || item || {};
-  const relevance = item?.semanticExactRelevance || candidate.semanticExactRelevance || null;
-  const activePathAssociated = chatSemanticCandidateActivePathAssociated(item, associationProfile);
-  const sourceContract = associationProfile.sourceContract || {};
-  const sourcePath = vaultRelativePath(sourceContract.path || sourceContract.sourcePath || sourceContract.source_path || associationProfile.sourcePath || "");
-  const candidatePath = chatSemanticCandidatePath(item);
-  const candidateSourceKind = String(item?.sourceKind || candidate.sourceKind || candidate.provenance?.sourceKind || "").trim().toLowerCase();
-  const candidateEvidenceId = chatSemanticCandidateEvidenceId(item);
-  const expectedActiveEvidenceIds = new Set([
-    associationProfile.primaryEvidenceId,
-    ...(associationProfile.primaryEvidenceIds || []),
-    sourceContract.primaryEvidenceId,
-    sourceContract.primary_evidence_id,
-    ...(sourceContract.primaryEvidenceIds || [])
-  ].map((value) => String(value || "").trim()).filter(Boolean));
-  const exactActiveSource = activePathAssociated && (
-    (candidateEvidenceId && expectedActiveEvidenceIds.has(candidateEvidenceId))
-      || (sourcePath && candidatePath === sourcePath && [
-        "current-source", "current-source-context", "note", "note-frontmatter", "semantic-index-chunk"
-      ].includes(candidateSourceKind))
-  );
-  // Current-note frontmatter is structural evidence rather than historical
-  // context. Keep it queryable through its exact active-source association.
-  if (activePathAssociated && relevance?.metadataOnly === true) return true;
-  // Exact active-source evidence remains queryable even when its semantic
-  // relevance record is absent. A generic historical workflow row can point at
-  // the active note through task/reference metadata without being that source.
-  if (exactActiveSource) return true;
-  // Historical workflow/process boilerplate can share generic subject terms
-  // with the active note without carrying intent or action-lane support. Keep
-  // a historical row only when its identity metadata carries a non-generic
-  // subject anchor that overlaps the focused relevance profile.
-  if (relevance?.genericHistoricalWorkflow === true) {
-    const identityText = [
-      item?.title,
-      item?.path,
-      item?.sourceSurface,
-      item?.source_surface,
-      item?.provenance?.title,
-      item?.provenance?.path,
-      item?.provenance?.sourceSurface,
-      item?.provenance?.source_surface,
-      candidate?.title,
-      candidate?.path,
-      candidate?.sourceSurface,
-      candidate?.source_surface,
-      candidate?.provenance?.title,
-      candidate?.provenance?.path,
-      candidate?.provenance?.sourceSurface,
-      candidate?.provenance?.source_surface
-    ].map(taskSemanticRelevanceText).filter(Boolean).join(" ");
-    const identityTokens = taskSemanticRelevanceTokens(identityText);
-    const profileIdentityTokens = new Set([
-      ...(relevanceProfile.objectTokens || []),
-      ...(relevanceProfile.entityTokens || [])
-    ]);
-    const hasSubjectIdentityAnchor = Array.from(identityTokens).some((term) => profileIdentityTokens.has(term));
-    if (!hasSubjectIdentityAnchor) return false;
-  }
-  if (relevance?.available === true && relevance.materialEligible !== true) return false;
-  if (!relevance || relevance.available !== true || relevance.materialEligible !== true) return false;
+  const candidate = item?.chunk && typeof item.chunk === "object" ? item.chunk : item || {};
+  const taskReference = candidate.taskReference || candidate.task || {};
   const semanticScore = Number(item?.semanticRankScore ?? item?.semanticScore ?? item?.semantic ?? candidate.semanticRankScore ?? candidate.semanticScore ?? 0);
-  return Number.isFinite(semanticScore) && semanticScore > 0;
+  if (!Number.isFinite(semanticScore) || semanticScore <= 0) return false;
+  if (semanticMetadataOnlyUnit(item)) return false;
+  if (item?.retrievalEligible === false || candidate.retrievalEligible === false || candidate.taskReference?.retrievalEligible === false) return false;
+  const sourceKind = String(item?.sourceKind || candidate.sourceKind || candidate.provenance?.sourceKind || taskReference.sourceKind || taskReference.provenance?.sourceKind || "").trim().toLowerCase();
+  if (sourceKind === SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND) return false;
+  const authorityState = String(item?.authorityState || candidate.authorityState || candidate.provenance?.authorityState || candidate.provenance?.authority || taskReference.authorityState || taskReference.authority || taskReference.provenance?.authorityState || taskReference.provenance?.authority || "").trim().toLowerCase();
+  if (["rejected", "blocked", "conflicted"].includes(authorityState)) return false;
+  const conflictState = String(item?.conflictState || candidate.conflictState || candidate.provenance?.conflictState || candidate.provenance?.conflict || taskReference.conflictState || taskReference.conflict_state || taskReference.provenance?.conflictState || taskReference.provenance?.conflict || "").trim().toLowerCase();
+  if (["conflict", "conflicted", "rejected", "blocked"].includes(conflictState)) return false;
+  const excerpt = [
+    item?.excerpt, item?.text, item?.content, item?.evidence, item?.sourceSurface, item?.source_surface,
+    candidate?.excerpt, candidate?.text, candidate?.content, candidate?.evidence, candidate?.sourceSurface, candidate?.source_surface
+  ].map((value) => String(value || "").trim()).find(Boolean);
+  // Focused chat accepts vector-selected evidence without lexical/object/body
+  // overlap, but never admits a metadata-only or empty evidence shell.
+  if (!excerpt) return false;
+  if (chatSemanticActionFocusedPlan(profile)
+    && !chatSemanticCandidateActivePathAssociated(item, profile)) {
+    const intentBearing = semanticUnitIntentBearing(item);
+    if (intentBearing !== true || !chatSemanticCandidateActionProof(item)) return false;
+  }
+  return true;
 }
 
 function filterChatContextRowsForQuery(rows = [], prompt = "", source = {}, sourceContract = null, queryPlan = null) {
   const contract = sourceContract && typeof sourceContract === "object" ? sourceContract : {};
   const plan = queryPlan && typeof queryPlan === "object" ? queryPlan : contextQueryPlan(prompt, "chat");
-  const explicitStructuredExpansion = plan.mode === "chat"
+  const planMode = String(plan.mode || "chat").trim().toLowerCase();
+  const explicitStructuredExpansion = planMode === "chat"
     && (plan.broad === true || plan.history === true || plan.tasks === true || plan.portfolio === true);
-  if (explicitStructuredExpansion) {
-    return { rows: Array.isArray(rows) ? rows.slice() : [], droppedCount: 0, profile: null };
-  }
-  const activeSubjectText = stripGeneratedActionItemsSection(source?.selection || source?.text || "");
-  const subjectPrompt = [prompt, source?.title, activeSubjectText].filter(Boolean).join("\n");
-  const relevanceProfile = taskSemanticRelevanceProfile({
-    content: subjectPrompt,
-    semanticQuery: subjectPrompt,
-    description: subjectPrompt
-  }, source || {}, Object.assign({}, contract, {
-    facts: [], factRefs: [], fact_refs: [], factIds: [], fact_ids: []
-  }), { mode: "chat" });
-  if (relevanceProfile.hasSpecificAnchors !== true) {
-    return { rows: Array.isArray(rows) ? rows.slice() : [], droppedCount: 0, profile: relevanceProfile };
-  }
-  const admissionProfile = {
+  const admissionProfile = Object.assign({}, plan, {
     mode: "chat",
-    chatRelevanceProfile: relevanceProfile,
-    chatRelevanceSourceContract: contract,
-    source: source || {}
-  };
-  const selected = [];
+    sourceContract: Object.keys(contract).length ? contract : (source || {}),
+    source: source || {},
+    sourcePath: contract.path || contract.sourcePath || contract.source_path || source?.path || ""
+  });
+  const relevant = [];
   let droppedCount = 0;
   for (const row of Array.isArray(rows) ? rows : []) {
     if (!row || typeof row !== "object") continue;
-    const candidate = row.semanticExactRelevance?.available === true
-      ? row
-      : taskSemanticApplyExactEvidenceRelevance(row, relevanceProfile);
-    const reservationState = String(candidate.reservationState || row.reservationState || "").trim().toLowerCase();
-    const reservationMetadata = [
-      candidate.reservationReason,
-      row.reservationReason,
-      candidate.inclusionReason,
-      row.inclusionReason,
-      candidate.admissionReason,
-      row.admissionReason,
-      candidate.selectionReasonCode,
-      row.selectionReasonCode,
-      candidate.finalReasonCode,
-      row.finalReasonCode
-    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean).join(" ");
-    const mandatoryReservedTaskLane = (row.required === true || candidate.required === true)
-      && reservationState
-      && reservationState !== "unreserved"
-      && reservationState !== "unclassified"
-      && (
-        reservationState.includes("reserved")
-        || reservationState === "exact-current-open-identity"
-        || reservationMetadata.includes("reserved")
-        || reservationMetadata.includes("current-open")
-        || reservationMetadata.includes("mandatory-source")
-      );
-    if (mandatoryReservedTaskLane || chatSemanticCandidateQueryRelevant(candidate, admissionProfile)) {
-      selected.push(candidate);
+    if (chatSemanticCandidateQueryRelevant(row, admissionProfile)) {
+      relevant.push(row);
     } else {
       droppedCount += 1;
     }
   }
-  return { rows: selected, droppedCount, profile: relevanceProfile };
+  const admission = !explicitStructuredExpansion && relevant.length > 1
+    ? chatSemanticAdmissionPool(relevant, relevant.length, admissionProfile)
+    : { candidates: relevant };
+  const selected = admission.candidates || [];
+  droppedCount += Math.max(0, relevant.length - selected.length);
+  return {
+    rows: selected,
+    droppedCount,
+    profile: null,
+    expansion: explicitStructuredExpansion ? "structured" : "focused"
+  };
 }
 
 function chatSemanticQueryHandleIdentity(handle = {}) {
@@ -24259,14 +24985,12 @@ function chatSemanticAdmissionPool(candidates = [], requestedLimit = 8, profile 
   const rawInitial = Array.isArray(candidates) ? candidates.slice() : [];
   const explicitStructuredExpansion = profile.mode === "chat"
     && (profile.broad === true || profile.history === true || profile.tasks === true || profile.portfolio === true);
-  // Explicit structured expansion intentionally admits the broader corpus.
-  // Focused chat must still pass the exact subject-relevance gate.
-  const hasSpecificAnchors = profile?.chatRelevanceProfile?.hasSpecificAnchors === true
-    || profile?.relevanceProfile?.hasSpecificAnchors === true;
-  const initial = !explicitStructuredExpansion && hasSpecificAnchors
+  // Vector selection and structured evidence state own admission. Natural
+  // language/object/title/path overlap is never a focused-chat gate.
+  const initial = profile.mode === "chat"
     ? rawInitial.filter((item) => chatSemanticCandidateQueryRelevant(item, profile))
     : rawInitial;
-  const queryRelevanceDroppedCount = !explicitStructuredExpansion && hasSpecificAnchors
+  const queryRelevanceDroppedCount = profile.mode === "chat"
     ? Math.max(0, rawInitial.length - initial.length)
     : 0;
   if (profile.mode !== "chat" || explicitStructuredExpansion) {
@@ -24369,196 +25093,327 @@ function taskSemanticEvidenceItemLimit(maxItems = 6, profile = {}) {
   return ceiling;
 }
 
-const TASK_SEMANTIC_EXACT_RELEVANCE_VERSION = "task-semantic-exact-relevance-v1";
-const TASK_SEMANTIC_RELEVANCE_GENERIC_TERMS = new Set([
-  "action", "actions", "annual", "background", "complete", "completed", "completion", "concept", "context", "document", "documents",
-  "draft", "evidence", "file", "frontmatter", "generic", "heading", "information", "item", "items", "material", "note", "notes",
-  "automation", "automated", "copy", "email", "emails", "forward", "guide", "guidance", "inbox", "instruction", "instructions",
-  "mail", "mailbox", "message", "messages", "outcome", "process", "procedure", "procedural", "program", "project", "report", "reporting",
-  "request", "review", "route", "routing", "section", "status", "step", "steps", "sync", "task", "template", "todoist", "topic",
-  "update", "updates", "use", "using", "workflow", "work"
-]);
-const TASK_SEMANTIC_RELEVANCE_ACTION_TERMS = new Set([
-  "approve", "assess", "build", "check", "choose", "complete", "confirm", "coordinate", "create", "decide", "develop", "draft",
-  "edit", "evaluate", "finalize", "finish", "identify", "inspect", "prepare", "read", "reconcile", "respond", "review", "send",
-  "share", "submit", "update", "validate", "verify", "write"
-]);
-
-function taskSemanticRelevanceText(value = "", depth = 0) {
-  if (depth > 2 || value === undefined || value === null) return "";
-  if (typeof value === "string" || typeof value === "number") return String(value);
-  if (Array.isArray(value)) return value.slice(0, 32).map((entry) => taskSemanticRelevanceText(entry, depth + 1)).filter(Boolean).join(" ");
-  if (typeof value !== "object") return "";
-  return Object.values(value).slice(0, 32).map((entry) => taskSemanticRelevanceText(entry, depth + 1)).filter(Boolean).join(" ");
+function taskSemanticEvidenceBodyText(item = {}) {
+  const wrapper = item && typeof item === "object" ? item : {};
+  const chunk = wrapper.chunk && typeof wrapper.chunk === "object" ? wrapper.chunk : wrapper;
+  return [
+    wrapper.excerpt, wrapper.text, wrapper.content, wrapper.evidence,
+    wrapper.sourceSurface, wrapper.source_surface, wrapper.value,
+    chunk.excerpt, chunk.text, chunk.content, chunk.evidence,
+    chunk.sourceSurface, chunk.source_surface, chunk.value
+  ].map((value) => String(value || "").trim()).filter(Boolean).join(" ").trim();
 }
 
-function taskSemanticRelevanceTokens(value = "", { includeGeneric = false } = {}) {
-  return new Set(generatedTaskObjectTerms(value).filter((term) => includeGeneric || !TASK_SEMANTIC_RELEVANCE_GENERIC_TERMS.has(term)));
+function taskSemanticExactHistoricalBindingEligible(item = {}, taskId = "", scopeId = "") {
+  const source = item && typeof item === "object" ? item : {};
+  const temporalRelation = String(source.temporalRelation || source.temporal_relation || "").trim().toLowerCase();
+  const historical = temporalRelation === "historical" || source.current === false;
+  if (!historical || semanticMetadataOnlyUnit(source)) return false;
+  if (["rejected", "blocked", "conflict", "conflicted"].includes(String(source.authorityState || source.authority || "").toLowerCase())
+    || ["rejected", "conflict", "conflicted"].includes(String(source.conflictState || "").toLowerCase())) return false;
+  return taskSemanticSelectedEvidencePositive(source)
+    && taskWorkflowExactTaskScopeBindingEligible(source, taskId, scopeId);
 }
 
-function taskSemanticRelevanceActionTokens(value = "") {
-  return new Set(String(value || "").toLowerCase().match(/[a-z][a-z0-9-]{2,}/g)?.filter((term) => TASK_SEMANTIC_RELEVANCE_ACTION_TERMS.has(term)) || []);
-}
-
-function taskSemanticRelevanceTemporalTokens(value = "") {
-  const text = String(value || "").toLowerCase();
-  return new Set((text.match(/\b(?:20\d{2}(?:[-/]\d{1,2}(?:[-/]\d{1,2})?)?|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*[- ]?\d{1,2}(?:,?\s*20\d{2})?)\b/g) || []).map((token) => token.replace(/\s+/g, " ").trim()));
-}
-
-function taskSemanticRelevanceFieldTokens(values = []) {
-  return new Set((values || []).flatMap((value) => Array.from(taskSemanticRelevanceTokens(taskSemanticRelevanceText(value)))));
-}
-
-function taskSemanticRelevanceEntityTokens(value = "", fields = []) {
-  const text = [taskSemanticRelevanceText(value), ...fields.map(taskSemanticRelevanceText)].filter(Boolean).join(" ");
-  const entities = new Set();
-  try {
-    for (const token of taskDescriptionStakeholderTerms(text)) {
-      if (!TASK_SEMANTIC_RELEVANCE_GENERIC_TERMS.has(token)) entities.add(token);
-    }
-  } catch {
-    // The helper is declared later in the bundle; token overlap remains valid
-    // if an older provider-free fixture does not expose it during evaluation.
-  }
-  for (const field of fields) for (const token of taskSemanticRelevanceTokens(field)) entities.add(token);
-  return entities;
-}
-
-function taskSemanticRelevanceProfile(task = {}, source = {}, sourceContract = null, options = {}) {
-  const contract = sourceContract && typeof sourceContract === "object" ? sourceContract : {};
-  const taskText = [
-    task?.content, task?.title, task?.semanticQuery, task?.description, task?.action, task?.requestText,
-    task?.intent, task?.rationale, task?.purpose, taskSemanticRelevanceText(task?.labels), taskSemanticSubtaskText(task)
-  ].filter(Boolean).join(" ");
-  const scopedFacts = taskSemanticSourceFacts(task, contract).map((fact) => fact?.sourceSurface || fact?.value || fact?.text || "");
-  const actionQueries = options.evidenceRequest?.queryTextsByDimension?.["authoritative-source"] || [];
-  const objectTexts = [taskText, ...scopedFacts, ...actionQueries];
-  const objectTokens = taskSemanticRelevanceFieldTokens(objectTexts);
-  const structuredObjects = [task?.object, task?.objects, task?.artifact, task?.artifacts, task?.deliverable, task?.deliverables, task?.workObject, task?.work_object, task?.component, task?.components, task?.entity, task?.entities];
-  for (const token of taskSemanticRelevanceFieldTokens(structuredObjects)) objectTokens.add(token);
-  const recipientFields = [task?.recipient, task?.recipients, task?.reviewer, task?.reviewers, task?.stakeholder, task?.stakeholders, task?.owner, task?.owners, task?.people];
-  const entityTokens = taskSemanticRelevanceEntityTokens(taskText, [...recipientFields, ...structuredObjects]);
-  const recipientTokens = taskSemanticRelevanceFieldTokens(recipientFields);
-  const temporalTexts = [
-    taskText, source?.title, source?.path, contract?.title, contract?.path, task?.due, task?.deadline, task?.date,
-    task?.temporalRelation, task?.temporal_relation, task?.requestedNoteDateKeys, task?.requested_note_date_keys
-  ];
-  const temporalTokens = new Set(temporalTexts.flatMap((value) => Array.from(taskSemanticRelevanceTemporalTokens(taskSemanticRelevanceText(value)))));
-  const relationValues = new Set([task?.temporalRelation, task?.temporal_relation, options.temporalRelation].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean));
-  return Object.freeze({
-    version: TASK_SEMANTIC_EXACT_RELEVANCE_VERSION,
-    mode: String(options.mode || ""),
-    objectTokens: Object.freeze(Array.from(objectTokens)),
-    entityTokens: Object.freeze(Array.from(entityTokens)),
-    recipientTokens: Object.freeze(Array.from(recipientTokens)),
-    actionTokens: Object.freeze(Array.from(new Set(objectTexts.flatMap((value) => Array.from(taskSemanticRelevanceActionTokens(value)))))),
-    temporalTokens: Object.freeze(Array.from(temporalTokens)),
-    temporalRelations: Object.freeze(Array.from(relationValues)),
-    hasSpecificAnchors: objectTokens.size > 0 || entityTokens.size > 0 || recipientTokens.size > 0 || temporalTokens.size > 0
-  });
-}
-
-function taskSemanticExactEvidenceRelevance(item = {}, profile = {}) {
-  const chunk = item?.chunk && typeof item.chunk === "object" ? item.chunk : item;
-  const explicitFields = [
-    item?.action, item?.actionText, item?.actionObject, item?.action_object, item?.object, item?.objects,
-    item?.artifact, item?.artifacts, item?.deliverable, item?.deliverables, item?.entity, item?.entities,
-    item?.recipient, item?.recipients, item?.reviewer, item?.reviewers, item?.stakeholder, item?.stakeholders,
-    chunk?.action, chunk?.actionText, chunk?.actionObject, chunk?.action_object, chunk?.object, chunk?.objects,
-    chunk?.artifact, chunk?.artifacts, chunk?.deliverable, chunk?.deliverables, chunk?.entity, chunk?.entities,
-    chunk?.recipient, chunk?.recipients, chunk?.reviewer, chunk?.reviewers, chunk?.stakeholder, chunk?.stakeholders
-  ];
-  const body = [chunk?.title, chunk?.text, chunk?.content, chunk?.sourceSurface, chunk?.source_surface, ...explicitFields].map(taskSemanticRelevanceText).filter(Boolean).join(" ");
-  const candidateObjects = taskSemanticRelevanceTokens(body);
-  const candidateEntities = taskSemanticRelevanceEntityTokens(body, explicitFields);
-  const candidateRecipients = taskSemanticRelevanceFieldTokens([chunk?.recipient, chunk?.recipients, chunk?.reviewer, chunk?.reviewers, chunk?.stakeholder, chunk?.stakeholders, item?.recipient, item?.recipients]);
-  const candidateActions = taskSemanticRelevanceActionTokens(body);
-  const candidateTemporal = taskSemanticRelevanceTemporalTokens(body);
-  const profileObjects = new Set(profile.objectTokens || []);
-  const profileEntities = new Set(profile.entityTokens || []);
-  const profileRecipients = new Set(profile.recipientTokens || []);
-  const profileActions = new Set(profile.actionTokens || []);
-  const profileTemporal = new Set(profile.temporalTokens || []);
-  const intersect = (left, right) => Array.from(left).filter((value) => right.has(value));
-  const objectHits = intersect(candidateObjects, profileObjects);
-  const entityHits = intersect(candidateEntities, profileEntities);
-  const recipientHits = intersect(candidateRecipients, profileRecipients);
-  const actionHits = intersect(candidateActions, profileActions);
-  const temporalHits = intersect(candidateTemporal, profileTemporal);
-  const subjectHits = uniqueValues([...objectHits, ...entityHits, ...recipientHits]
-    .filter((term) => !TASK_SEMANTIC_RELEVANCE_GENERIC_TERMS.has(term)));
-  const temporalRelation = String(item?.temporalRelation || item?.temporal_relation || chunk?.temporalRelation || chunk?.temporal_relation || "")
-    .trim().toLowerCase();
-  const intentBearing = item?.intentBearing ?? chunk?.intentBearing;
-  const actionLaneSupported = item?.actionLaneSupported ?? chunk?.actionLaneSupported;
-  const genericHistoricalWorkflow = temporalRelation === "historical"
-    && intentBearing === false
-    && actionLaneSupported === false;
-  const metadataOnly = semanticMetadataOnlyUnit(item);
-  const available = Boolean(profile?.hasSpecificAnchors && body.trim());
-  const exactScore = Math.min(0.4,
-    objectHits.length * 0.13
-    + entityHits.length * 0.07
-    + recipientHits.length * 0.06
-    + temporalHits.length * 0.05
-    + actionHits.length * 0.015
+// Query-derived task/scope associations are advisory only. They may cross the
+// provider boundary only when the upstream fused selector supplied a complete
+// request-local proof; this never creates native ownership or taskReserved
+// state.
+function taskSemanticRequestScopedRelevanceEligible(item = {}, taskId = "", scopeId = "", facts = []) {
+  const source = item && typeof item === "object" ? item : {};
+  const chunk = source.chunk && typeof source.chunk === "object" ? source.chunk : source;
+  const normalizedTaskId = String(taskId || "");
+  const normalizedScopeId = String(scopeId || "");
+  const evidenceId = String(source.evidenceId || source.evidence_id || chunk.evidenceId || chunk.evidence_id || chunk.id || "").trim();
+  if (!normalizedTaskId || !normalizedScopeId || !evidenceId || semanticMetadataOnlyUnit(source)) return false;
+  const ownershipMetadata = taskDescriptionTaskScopeOwnershipMetadata(source);
+  if (!ownershipMetadata.queryOnly) return false;
+  const associations = uniqueTaskScopeAssociations([
+    ...(Array.isArray(source.taskScopeAssociations) ? source.taskScopeAssociations : []),
+    ...(Array.isArray(source.task_scope_associations) ? source.task_scope_associations : []),
+    ...(Array.isArray(chunk.taskScopeAssociations) ? chunk.taskScopeAssociations : []),
+    ...(Array.isArray(chunk.task_scope_associations) ? chunk.task_scope_associations : [])
+  ]);
+  const advisoryAssociations = associations.filter((association) => association.advisory === true);
+  const canonicalScopeTaskId = `scope:${normalizedScopeId}`;
+  if (!advisoryAssociations.length || advisoryAssociations.length !== associations.length) return false;
+  if (!advisoryAssociations.some((association) => String(association.taskId || association.task_id || "") === normalizedTaskId
+    && String(association.scopeId || association.scope_id || "") === normalizedScopeId)) return false;
+  if (advisoryAssociations.some((association) => {
+    const associationTaskId = String(association.taskId || association.task_id || "");
+    const associationScopeId = String(association.scopeId || association.scope_id || "");
+    return (associationScopeId && associationScopeId !== normalizedScopeId)
+      || (associationTaskId && associationTaskId !== normalizedTaskId && associationTaskId !== canonicalScopeTaskId);
+  })) return false;
+  const queryTaskId = String(source.queryTaskId || source.query_task_id || chunk.queryTaskId || chunk.query_task_id || "");
+  const queryScopeId = String(source.queryScopeId || source.query_scope_id || chunk.queryScopeId || chunk.query_scope_id || "");
+  if ((queryTaskId && queryTaskId !== normalizedTaskId && queryTaskId !== canonicalScopeTaskId)
+    || (queryScopeId && queryScopeId !== normalizedScopeId)) return false;
+  if (evidenceScopeIdsForChunk(source).some((candidate) => candidate !== normalizedScopeId)) return false;
+  if (!taskSemanticEvidenceBodyText(source)) return false;
+  const authority = String(source.authorityState || source.authority || chunk.authorityState || chunk.authority || "").trim().toLowerCase();
+  const conflict = String(source.conflictState || source.conflict_state || chunk.conflictState || chunk.conflict_state || "").trim().toLowerCase();
+  if (["rejected", "blocked", "conflict", "conflicted"].includes(authority)
+    || ["rejected", "conflict", "conflicted"].includes(conflict)) return false;
+  const positiveNumber = (...values) => values.map(Number).some((value) => Number.isFinite(value) && value > 0);
+  const positiveSemantic = positiveNumber(source.semanticBaseScore, source.semanticScore, source.semantic, chunk.semanticBaseScore, chunk.semanticScore, chunk.semantic);
+  const positiveRanking = positiveNumber(
+    source.semanticRankScore,
+    source.aggregateContribution,
+    source.weightedContribution,
+    source.dimensionScore,
+    source.winningLaneScore,
+    chunk.semanticRankScore,
+    chunk.aggregateContribution,
+    chunk.weightedContribution,
+    chunk.dimensionScore,
+    chunk.winningLaneScore,
+    ...Object.values(source.dimensionContributions || source.materialityContributions || chunk.dimensionContributions || chunk.materialityContributions || {})
   );
-  const weakObjectOverlap = Boolean(profileObjects.size && objectHits.length === 0);
-  const genericPenalty = weakObjectOverlap ? 0.16 : 0;
-  const structuralPenalty = metadataOnly ? 0.2 : 0;
-  const materialEligible = !available || metadataOnly ? false : subjectHits.length > 0;
-  return Object.freeze({
-    available,
-    exactScore,
-    adjustment: Math.max(-0.3, exactScore - genericPenalty - structuralPenalty),
-    objectHits: Object.freeze(objectHits),
-    entityHits: Object.freeze(entityHits),
-    recipientHits: Object.freeze(recipientHits),
-    actionHits: Object.freeze(actionHits),
-    temporalHits: Object.freeze(temporalHits),
-    subjectHits: Object.freeze(subjectHits),
-    genericHistoricalWorkflow,
-    weakObjectOverlap,
-    metadataOnly,
-    materialEligible,
-    reason: metadataOnly
-      ? "metadata-only"
-      : subjectHits.length
-        ? genericHistoricalWorkflow ? "historical-subject-associated" : "exact-task-evidence-overlap"
-        : genericHistoricalWorkflow ? "historical-generic-without-subject" : weakObjectOverlap ? "weak-object-overlap" : "no-specific-overlap"
-  });
+  if (!positiveSemantic || !positiveRanking) return false;
+  const fusedIdentityKey = String(source.fusedIdentityKey || source.fused_identity_key || chunk.fusedIdentityKey || chunk.fused_identity_key || "").trim();
+  if (!fusedIdentityKey) return false;
+  const reasonValues = [
+    source.selectionReasonCode, source.selection_reason_code,
+    source.admissionReason, source.admission_reason,
+    source.reservationReason, source.reservation_reason,
+    source.finalReasonCode, source.final_reason_code,
+    source.inclusionReason, source.inclusion_reason,
+    chunk.selectionReasonCode, chunk.selection_reason_code,
+    chunk.admissionReason, chunk.admission_reason,
+    chunk.reservationReason, chunk.reservation_reason,
+    chunk.finalReasonCode, chunk.final_reason_code,
+    chunk.inclusionReason, chunk.inclusion_reason
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  const fusedSelectionProof = reasonValues.some((reason) => /fused/.test(reason)
+    && /(?:selected|reserved|reservation|ceiling)/.test(reason));
+  const laneSelectionProof = reasonValues.some((reason) => reason === "task-semantic-lane-coverage-selected");
+  if (!fusedSelectionProof || !laneSelectionProof) return false;
+  const selectionOrder = Number(source.selectionOrder ?? source.selection_order ?? source.selectedOrder ?? source.selected_order ?? source.fusedRank ?? source.fused_rank ?? chunk.selectionOrder ?? chunk.selection_order ?? chunk.fusedRank ?? chunk.fused_rank);
+  if (!Number.isFinite(selectionOrder) || selectionOrder <= 0) return false;
+  const reservationState = String(source.reservationState || source.reservation_state || chunk.reservationState || chunk.reservation_state || "").trim().toLowerCase();
+  if (!reservationState || ["unreserved", "unclassified"].includes(reservationState)
+    || !/(?:reserved|selected|protected|mandatory)/.test(reservationState)) return false;
+  const sourceKind = String(source.sourceKind || source.source_kind || chunk.sourceKind || chunk.source_kind || "").trim().toLowerCase();
+  const temporalRelation = String(source.temporalRelation || source.temporal_relation || chunk.temporalRelation || chunk.temporal_relation || "").trim().toLowerCase();
+  const actionLaneContribution = Math.max(0, ...[
+    source.actionLaneContribution,
+    source.action_lane_contribution,
+    source.taskFocusContribution,
+    source.task_focus_contribution,
+    source.laneScores?.action,
+    chunk.actionLaneContribution,
+    chunk.action_lane_contribution,
+    chunk.taskFocusContribution,
+    chunk.task_focus_contribution,
+    chunk.laneScores?.action
+  ].map(Number).filter((value) => Number.isFinite(value)));
+  const actionProof = source.actionLaneSupported === true
+    || source.action_lane_supported === true
+    || chunk.actionLaneSupported === true
+    || chunk.action_lane_supported === true
+    || actionLaneContribution > 0;
+  const materialityState = String(source.materialityState || source.materiality_state || chunk.materialityState || chunk.materiality_state || "").trim().toLowerCase();
+  const materialityReason = String(source.materialityReason || source.materiality_reason || chunk.materialityReason || chunk.materiality_reason || "").trim();
+  const materialityContributions = Object.values(source.materialityContributions || source.materiality_contributions || source.dimensionContributions || source.dimension_contributions || chunk.materialityContributions || chunk.materiality_contributions || chunk.dimensionContributions || chunk.dimension_contributions || {})
+    .map(Number)
+    .filter((value) => Number.isFinite(value));
+  const materialityAnchorContrast = Math.max(0, ...[
+    source.materialityAnchorContrast,
+    source.materiality_anchor_contrast,
+    chunk.materialityAnchorContrast,
+    chunk.materiality_anchor_contrast
+  ].map(Number).filter((value) => Number.isFinite(value)));
+  const materialityProof = materialityState === "material-review-history-candidate"
+    && TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(materialityReason)
+    && (materialityContributions.some((value) => value > 0) || materialityAnchorContrast > 0);
+  const continuationProof = [
+    ...reasonValues,
+    String(source.materialityReason || source.materiality_reason || "").trim().toLowerCase(),
+    String(source.reservationReason || source.reservation_reason || "").trim().toLowerCase()
+  ].some((reason) => ["task-semantic-current-open-continuation-selected", "task-semantic-exact-current-open-identity"].includes(reason))
+    && taskDescriptionTaskReferenceSourceKind(sourceKind);
+  const exactTaskIdentity = String(source.canonicalTaskId || source.canonical_task_id || chunk.canonicalTaskId || chunk.canonical_task_id || "") === normalizedTaskId
+    || String(source.evidenceTaskId || source.evidence_task_id || chunk.evidenceTaskId || chunk.evidence_task_id || "") === normalizedTaskId;
+  const exactTaskProof = advisoryAssociations.some((association) => String(association.taskId || association.task_id || "") === normalizedTaskId
+    && String(association.scopeId || association.scope_id || "") === normalizedScopeId)
+    && queryTaskId
+    && (queryTaskId === normalizedTaskId || queryTaskId === canonicalScopeTaskId)
+    && queryScopeId === normalizedScopeId
+    && (source.semanticExactTaskAssociation === true
+      || source.exactTaskScopeBinding === true
+      || source.exact_task_scope_binding === true
+      || exactTaskIdentity);
+  // Lane/source reservations are coverage metadata, not task relevance. A
+  // query-only row must carry one positive semantic-index proof tied to this
+  // request before it can cross the provider boundary.
+  if (!actionProof && !materialityProof && !continuationProof && !exactTaskProof) return false;
+  const explicitMarginal = Math.max(0, ...[
+    source.marginalRelevance,
+    source.marginal_relevance,
+    source.marginalContribution,
+    source.marginal_contribution,
+    source.selectionMargin,
+    source.selection_margin,
+    source.semanticMargin,
+    source.semantic_margin,
+    source.taskRelativeRelevance,
+    source.task_relative_relevance,
+    chunk.marginalRelevance,
+    chunk.marginal_relevance,
+    chunk.marginalContribution,
+    chunk.marginal_contribution,
+    chunk.selectionMargin,
+    chunk.selection_margin,
+    chunk.semanticMargin,
+    chunk.semantic_margin,
+    chunk.taskRelativeRelevance,
+    chunk.task_relative_relevance
+  ].map(Number).filter((value) => Number.isFinite(value)));
+  const scoreDistributions = [source.scoreDistribution, source.score_distribution, chunk.scoreDistribution, chunk.score_distribution]
+    .filter((value) => value && typeof value === "object");
+  const topScore = Math.max(0, ...scoreDistributions.flatMap((distribution) => [distribution.topScore, distribution.top_score, distribution.maxScore, distribution.max_score]).map(Number).filter((value) => Number.isFinite(value)));
+  const distributionFloor = Math.max(0, ...scoreDistributions.flatMap((distribution) => [distribution.distributionFloor, distribution.distribution_floor]).map(Number).filter((value) => Number.isFinite(value)));
+  const relativeFloor = distributionFloor > 0 ? distributionFloor : topScore > 0 ? topScore * 0.5 : 0;
+  const distributionMarginal = relativeFloor > 0 && Number.isFinite(Number(source.semanticRankScore ?? source.semanticScore ?? source.semantic ?? chunk.semanticRankScore ?? chunk.semanticScore ?? chunk.semantic))
+    && Number(source.semanticRankScore ?? source.semanticScore ?? source.semantic ?? chunk.semanticRankScore ?? chunk.semanticScore ?? chunk.semantic) >= relativeFloor;
+  const secondLaneScore = Number(source.secondLaneScore ?? source.second_lane_score ?? chunk.secondLaneScore ?? chunk.second_lane_score);
+  const comparativeMarginal = Number.isFinite(secondLaneScore)
+    && Number(source.semanticRankScore ?? source.semanticScore ?? source.semantic ?? chunk.semanticRankScore ?? chunk.semanticScore ?? chunk.semantic) > secondLaneScore;
+  const proofBackedMarginal = Number.isFinite(selectionOrder)
+    && selectionOrder > 0
+    && positiveSemantic
+    && positiveRanking
+    && (actionProof || materialityProof || continuationProof || exactTaskProof);
+  if (!(explicitMarginal > 0 || distributionMarginal || comparativeMarginal || proofBackedMarginal)) return false;
+  const factRows = Array.isArray(facts) ? facts : [];
+  if (factRows.length && !factRows.some((fact) => {
+    const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "");
+    const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+    const factAuthority = String(fact?.authorityState || fact?.authority || "").trim().toLowerCase();
+    const factConflict = String(fact?.conflictState || "").trim().toLowerCase();
+    return factEvidenceId === evidenceId && factScopeId === normalizedScopeId
+      && !["rejected", "blocked", "conflict", "conflicted"].includes(factAuthority)
+      && !["rejected", "conflict", "conflicted"].includes(factConflict);
+  })) return false;
+  return true;
 }
 
-function taskSemanticApplyExactEvidenceRelevance(item = {}, profile = {}) {
-  if (!profile || profile.hasSpecificAnchors !== true) return item;
-  const relevance = taskSemanticExactEvidenceRelevance(item, profile);
-  return Object.assign({}, item, {
-    semanticExactRelevanceVersion: TASK_SEMANTIC_EXACT_RELEVANCE_VERSION,
-    semanticExactRelevanceScore: Number(relevance.exactScore || 0),
-    semanticExactRelevanceAdjustment: Number(relevance.adjustment || 0),
-    semanticExactRelevance: relevance,
-    semanticExactObjectOverlap: relevance.objectHits.length,
-    semanticExactEntityOverlap: relevance.entityHits.length,
-    semanticExactRecipientOverlap: relevance.recipientHits.length,
-    semanticExactTemporalOverlap: relevance.temporalHits.length,
-    semanticExactSubjectOverlap: relevance.subjectHits.length,
-    semanticExactMaterialEligible: relevance.materialEligible === true
-  });
+function taskSemanticTaskLocalRelevanceAccepted(item = {}) {
+  return item?.semanticExactTaskAssociation === true || item?.requestScopedSemanticRelevance === true;
 }
 
 function taskSemanticHistoryMaterialRelevanceEligible(source = {}, fusedCandidate = null, options = {}) {
-  if (options.exactRelevanceMode !== true) return true;
-  const relevance = source?.semanticExactRelevance || fusedCandidate?.semanticExactRelevance || source?.chunk?.semanticExactRelevance || fusedCandidate?.chunk?.semanticExactRelevance;
-  return !relevance || relevance.materialEligible === true;
+  // Semantic lane/materiality and ownership state own admission; no text
+  // overlap is consulted.
+  return true;
+}
+
+function taskSemanticSelectedEvidencePositive(item = {}) {
+  const source = item && typeof item === "object" ? item : {};
+  const chunk = source.chunk && typeof source.chunk === "object" ? source.chunk : source;
+  const evidenceId = String(source.evidenceId || source.evidence_id || chunk.evidenceId || chunk.evidence_id || chunk.id || "").trim();
+  if (!evidenceId || semanticMetadataOnlyUnit(source)) return false;
+  const body = taskSemanticEvidenceBodyText(source);
+  if (!body) return false;
+  const authority = String(source.authorityState || source.authority || chunk.authorityState || chunk.authority || "").toLowerCase();
+  const conflict = String(source.conflictState || source.conflict_state || chunk.conflictState || chunk.conflict_state || "").toLowerCase();
+  if (["rejected", "blocked", "conflict", "conflicted"].includes(authority)
+    || ["rejected", "conflict", "conflicted"].includes(conflict)) return false;
+  const numericSignals = [
+    source.semantic,
+    source.semanticScore,
+    source.semanticBaseScore,
+    source.semanticRankScore,
+    source.aggregateContribution,
+    source.weightedContribution,
+    source.dimensionScore,
+    source.semanticRecencyContribution,
+    chunk.semantic,
+    chunk.semanticScore,
+    chunk.semanticBaseScore,
+    chunk.semanticRankScore,
+    chunk.aggregateContribution,
+    chunk.weightedContribution,
+    chunk.dimensionScore
+  ].map(Number).filter(Number.isFinite);
+  const dimensionContributions = Object.values(source.dimensionContributions || source.materialityContributions || chunk.dimensionContributions || chunk.materialityContributions || {})
+    .map(Number)
+    .filter(Number.isFinite);
+  const materialityState = String(source.materialityState || source.materiality_state || chunk.materialityState || chunk.materiality_state || "").toLowerCase();
+  const reasonValues = [
+    source.selectionReasonCode,
+    source.selection_reason_code,
+    source.admissionReason,
+    source.admission_reason,
+    source.reservationReason,
+    source.reservation_reason,
+    source.inclusionReason,
+    source.inclusion_reason,
+    source.finalReasonCode,
+    source.final_reason_code,
+    chunk.selectionReasonCode,
+    chunk.selection_reason_code,
+    chunk.admissionReason,
+    chunk.admission_reason,
+    chunk.reservationReason,
+    chunk.reservation_reason,
+    chunk.inclusionReason,
+    chunk.inclusion_reason,
+    chunk.finalReasonCode,
+    chunk.final_reason_code
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  const positiveSelectionReasons = new Set([
+    "semantic-top-k-selected",
+    "task-relative-semantic-fused-selected",
+    "task-semantic-current-source-context-selected",
+    "task-semantic-current-open-continuation-selected",
+    "task-semantic-exact-current-open-identity",
+    "task-semantic-continuity-reserved",
+    "task-semantic-lane-coverage-selected",
+    "dimension-distinct-source-reserved",
+    "fused-selected",
+    "fused-reservation-selected",
+    "fused-weighted-ceiling-selected",
+    "material-history-reserved",
+    "task-reserved",
+    "scope-reserved"
+  ]);
+  const negativeSelectionReason = reasonValues.some((reason) => /(?:rejected|blocked|conflict|excluded|unselected|ineligible|dropped|ceiling-excluded)/.test(reason));
+  if (negativeSelectionReason) return false;
+  const positiveReason = reasonValues.some((reason) => positiveSelectionReasons.has(reason));
+  const reservationState = String(source.reservationState || source.reservation_state || chunk.reservationState || chunk.reservation_state || "").trim().toLowerCase();
+  const positiveState = ["selected", "admitted", "reserved", "protected", "mandatory"].includes(reservationState)
+    || /(?:^|-)reserved$/.test(reservationState)
+    || /(?:^|-)admitted$/.test(reservationState);
+  const selected = source.semanticSelectionAccepted === true
+    || chunk.semanticSelectionAccepted === true
+    || source.selected === true
+    || chunk.selected === true
+    || source.taskLocalProtected === true
+    || source.protectedTaskRow === true
+    || source.protected === true
+    || chunk.taskLocalProtected === true
+    || chunk.protectedTaskRow === true
+    || chunk.protected === true
+    || positiveReason
+    || positiveState
+    || (materialityState === "material-review-history-candidate" && dimensionContributions.some((value) => value > 0));
+  return selected
+    && (numericSignals.some((value) => value > 0)
+      || dimensionContributions.some((value) => value > 0)
+      || (materialityState === "material-review-history-candidate" && dimensionContributions.some((value) => value > 0)));
 }
 
 function taskDescriptionHistoricalMaterialityEligible(item = {}) {
   const source = item && typeof item === "object" ? item : {};
   const temporalRelation = String(source.temporalRelation || source.temporal_relation || "").trim().toLowerCase();
   if (temporalRelation !== "historical") return true;
-  const relevance = source.semanticExactRelevance || source.semantic_exact_relevance || source.provenance?.semanticExactRelevance || null;
-  if (relevance && relevance.available === true && relevance.materialEligible !== true) return false;
-  const scoreFields = ["semantic", "semanticScore", "semanticBaseScore", "semanticRankScore", "matchScore"];
+  const scoreFields = [
+    "semantic", "semanticScore", "semanticBaseScore", "semanticRankScore", "matchScore",
+    "aggregateContribution", "weightedContribution", "dimensionScore", "semanticRecencyContribution",
+    "actionLaneContribution", "action_lane_contribution", "winningLaneScore", "winning_lane_score"
+  ];
   const primaryScores = ["semantic", "semanticScore"]
     .filter((key) => source[key] !== undefined && source[key] !== null && source[key] !== "")
     .map((key) => Number(source[key]))
@@ -24568,7 +25423,12 @@ function taskDescriptionHistoricalMaterialityEligible(item = {}) {
     .filter((key) => source[key] !== undefined && source[key] !== null && source[key] !== "")
     .map((key) => Number(source[key]))
     .filter(Number.isFinite);
-  return !scores.length || Math.max(...scores) > 0;
+  const contributionValues = Object.values(source.dimensionContributions || source.materialityContributions || {})
+    .map(Number)
+    .filter(Number.isFinite);
+  return !scores.length
+    ? contributionValues.length === 0 || Math.max(...contributionValues) > 0
+    : Math.max(...scores) > 0 || contributionValues.some((value) => value > 0);
 }
 
 function taskDescriptionOptionalEvidenceAssociationEligible(item = {}) {
@@ -24576,9 +25436,7 @@ function taskDescriptionOptionalEvidenceAssociationEligible(item = {}) {
   const sourceKind = String(source.sourceKind || source.source_kind || "").trim().toLowerCase();
   if (sourceKind === "current-source" || source.primarySource === true
     || source.taskLocalProtected === true || source.protectedTaskRow === true || source.protected === true) return true;
-  const relevance = source.semanticExactRelevance || source.semantic_exact_relevance || source.provenance?.semanticExactRelevance || null;
-  if (relevance && relevance.available === true) return relevance.materialEligible === true;
-  if (source.semanticExactMaterialEligible === true) return true;
+  if (taskSemanticSelectedEvidencePositive(source)) return true;
   const materialityState = String(source.materialityState || source.materiality_state || "").trim();
   const materialityReason = String(source.materialityReason || source.materiality_reason || "").trim();
   const contributions = Object.values(source.materialityContributions || source.dimensionContributions || {})
@@ -24592,53 +25450,97 @@ function taskDescriptionOptionalEvidenceAssociationEligible(item = {}) {
 function taskDescriptionOptionalFactBackedAssociationEligible(item = {}) {
   const source = item && typeof item === "object" ? item : {};
   if (source.metadataOnly === true) return false;
-  const structuredFacts = Array.isArray(source.structuredFacts) ? source.structuredFacts : [];
-  return !structuredFacts.some((fact) => [fact?.kind, fact?.type]
-    .map((value) => String(value || "").trim().toLowerCase())
-    .includes("semantic-excerpt"));
+  return taskDescriptionOptionalEvidenceAssociationEligible(source);
 }
 
-function taskDescriptionEnsureExactEvidenceRelevance(item = {}, task = {}, sourceContract = {}, options = {}) {
+function taskDescriptionProviderOptionalFactBackedProjectionEligible(item = {}, factsById = new Map(), tasks = []) {
   const source = item && typeof item === "object" ? item : {};
-  const existing = source.semanticExactRelevance || source.semantic_exact_relevance || source.provenance?.semanticExactRelevance || null;
-  if (existing && existing.available === true) return source;
-  const profile = options.profile || taskDescriptionExactRelevanceProfile(task, sourceContract);
-  return profile?.hasSpecificAnchors === true
-    ? taskSemanticApplyExactEvidenceRelevance(source, profile)
-    : source;
-}
-
-function taskDescriptionExactRelevanceProfile(task = {}, sourceContract = {}) {
-  const rich = task?.taskLocalEvidence || {};
-  const protectedFactIds = new Set([
-    ...(rich.priorityFactRefs || rich.priority_fact_refs || []),
-    ...(rich.executionDetailFactRefs || rich.execution_detail_fact_refs || [])
-  ].map(String).filter(Boolean));
-  const facts = (sourceContract?.facts || []).filter((fact) => {
-    const factId = String(fact?.factId || fact?.fact_id || fact?.id || "");
-    const mandatory = Array.isArray(fact?.mandatoryFor)
-      && fact.mandatoryFor.some((target) => ["task", "description", "identity"].includes(String(target)));
-    const current = fact.current === true && String(fact.temporalRelation || "").toLowerCase() !== "historical";
-    const authority = String(fact.authorityState || fact.authority || "").toLowerCase();
-    const conflict = String(fact.conflictState || "").toLowerCase();
-    return current && (mandatory || protectedFactIds.has(factId))
-      && !["rejected", "blocked", "conflicted"].includes(authority)
-      && !["conflict", "conflicted", "rejected"].includes(conflict);
+  const evidenceId = String(source.evidenceId || source.evidence_id || source.id || "");
+  if (!evidenceId) return false;
+  const factRows = [
+    ...(Array.isArray(source.structuredFacts) ? source.structuredFacts : []),
+    ...Array.from(factsById?.values?.() || [])
+  ].filter((fact, index, rows) => {
+    const factId = String(fact?.factId || fact?.fact_id || "");
+    const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "");
+    return factId && factEvidenceId === evidenceId
+      && rows.findIndex((candidate) => String(candidate?.factId || candidate?.fact_id || "") === factId) === index
+      && !["rejected", "blocked", "conflicted"].includes(String(fact?.authorityState || fact?.authority || "").toLowerCase())
+      && !["conflict", "conflicted", "rejected"].includes(String(fact?.conflictState || "").toLowerCase());
   });
-  const factIds = facts.map((fact) => String(fact.factId || fact.fact_id || fact.id || "")).filter(Boolean);
-  const scopedTask = Object.assign({}, task, { fact_refs: factIds, factRefs: factIds });
-  const scopedContract = Object.assign({}, sourceContract, {
-    facts,
-    scopes: (sourceContract?.scopes || []).map((scope) => Object.assign({}, scope, {
-      factIds: (scope.factIds || []).filter((factId) => factIds.includes(String(factId)))
-    }))
+  const taskRows = Array.isArray(tasks) ? flattenTaskPlan(tasks) : [];
+  const requestScopedRelevance = factRows.length && taskRows.some((task) => {
+    const rich = task?.taskLocalEvidence || {};
+    const taskId = String(rich.taskId || task?.taskId || task?.id || "");
+    const scopeId = String(rich.scopeId || task?.scope_id || task?.scopeId || "");
+    return taskSemanticRequestScopedRelevanceEligible(source, taskId, scopeId, factRows);
   });
-  return taskSemanticRelevanceProfile(scopedTask, scopedContract, scopedContract, { mode: "description" });
+  if (requestScopedRelevance) return true;
+  const evidenceEligible = taskDescriptionOptionalFactBackedAssociationEligible(source);
+  if (!factRows.length) return evidenceEligible;
+  const currentOptional = source.current === true
+    && String(source.temporalRelation || source.temporal_relation || "").toLowerCase() !== "historical"
+    && String(source.authorityState || source.authority || source.provenance?.authority || "").toLowerCase() === "authoritative"
+    && !["conflict", "conflicted", "rejected"].includes(String(source.conflictState || "").toLowerCase());
+  if (currentOptional) return true;
+  const unclassifiedHistorical = (String(source.temporalRelation || source.temporal_relation || "").toLowerCase() === "historical"
+    || factRows.some((fact) => String(fact?.temporalRelation || fact?.temporal_relation || "").toLowerCase() === "historical"))
+    && String(source.materialityState || source.materiality_state || "").trim().toLowerCase() === "unclassified";
+  const mandatoryFact = (fact = {}) => {
+    const mandatoryFor = Array.isArray(fact.mandatoryFor) ? fact.mandatoryFor.map(String) : [];
+    return mandatoryFor.some((target) => ["task", "description", "identity"].includes(target))
+      || String(fact.role || "").toLowerCase() === "requested-action";
+  };
+  if (factRows.some(mandatoryFact)) return true;
+  const explicitFactTaskAssociation = factRows.some((fact) => {
+    const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+    const factTaskIds = [fact?.taskId, fact?.task_id, ...(fact?.taskIds || fact?.task_ids || [])]
+      .map(String)
+      .filter(Boolean);
+    const associations = uniqueTaskScopeAssociations(fact.taskScopeAssociations || fact.task_scope_associations || []);
+    return taskRows.some((task) => {
+      const rich = task?.taskLocalEvidence || {};
+      const taskId = String(rich.taskId || task?.taskId || task?.id || "");
+      const scopeId = String(rich.scopeId || task?.scope_id || task?.scopeId || "");
+      if (!taskId || !scopeId || factScopeId !== scopeId) return false;
+      return associations.some((association) => String(association.taskId || "") === taskId
+        && String(association.scopeId || "") === scopeId)
+        || factTaskIds.includes(taskId);
+    });
+  });
+  if (unclassifiedHistorical) return explicitFactTaskAssociation;
+  if (evidenceEligible) return true;
+  for (const task of taskRows) {
+    const rich = task?.taskLocalEvidence || {};
+    const taskId = String(rich.taskId || task?.taskId || task?.id || "");
+    const scopeId = String(rich.scopeId || task?.scope_id || task?.scopeId || "");
+    if (!taskId || !scopeId) continue;
+    const selectedEvidenceIds = new Set([
+      ...(rich.evidenceIds || rich.evidence_ids || []),
+      ...(rich.selectedSupportingEvidenceIds || []),
+      ...(task?.evidence_ids || task?.evidenceIds || [])
+    ].map(String).filter(Boolean));
+    if (!selectedEvidenceIds.has(evidenceId)) continue;
+    const exactBindings = [
+      ...(rich.factBindings || rich.fact_bindings || []),
+      ...(task?.fact_bindings || task?.factBindings || [])
+    ];
+    if (factRows.some((fact) => {
+      const factId = String(fact.factId || fact.fact_id || "");
+      const associations = uniqueTaskScopeAssociations(fact.taskScopeAssociations || fact.task_scope_associations || []);
+      const exactAssociation = associations.some((association) => String(association.taskId || "") === taskId
+        && String(association.scopeId || "") === scopeId);
+      const exactBinding = !unclassifiedHistorical && exactBindings.some((binding) => String(binding?.factId || binding?.fact_id || "") === factId
+        && String(binding?.evidenceId || binding?.evidence_id || "") === evidenceId
+        && String(binding?.scopeId || binding?.scope_id || "") === scopeId);
+      return exactAssociation || exactBinding;
+    })) return true;
+  }
+  return false;
 }
 
 function taskSemanticCandidateRankScore(item = {}) {
   const semantic = Number(item.semanticRankScore ?? item.semantic ?? item.semanticScore ?? item.matchScore ?? 0);
-  const exactAdjustment = Number(item.semanticExactRelevanceAdjustment || 0);
   const association = Math.min(0.08, Math.max(0, Number(item.scopeScore || 0)));
   const laneSupport = Object.keys(item?.laneScores || {}).filter(Boolean).length;
   // A candidate supported by multiple independent semantic query views is
@@ -24646,7 +25548,7 @@ function taskSemanticCandidateRankScore(item = {}) {
   // score remains primary while fused support can outrank an unrelated
   // single-lane result.
   const supportBonus = Math.min(0.2, Math.max(0, laneSupport - 1) * 0.1);
-  return (Number.isFinite(semantic) ? semantic : 0) + (Number.isFinite(exactAdjustment) ? exactAdjustment : 0) + association + supportBonus;
+  return (Number.isFinite(semantic) ? semantic : 0) + association + supportBonus;
 }
 
 function taskSemanticHistoricalCandidate(item = {}) {
@@ -24708,7 +25610,7 @@ function taskSemanticNativeOwnershipMetadata(item = {}) {
   const nativeAssociations = uniqueTaskScopeAssociations([
     ...(Array.isArray(chunk.taskScopeAssociations) ? chunk.taskScopeAssociations : []),
     ...(Array.isArray(chunk.task_scope_associations) ? chunk.task_scope_associations : [])
-  ]);
+  ]).filter((association) => association.advisory !== true);
   return { chunk, evidenceTaskId, evidenceScopeId, nativeAssociations };
 }
 
@@ -25874,15 +26776,11 @@ function evaluateTaskSemanticDimensions(request = {}, laneResults = [], accepted
 function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode = "top-two", options = {}) {
   const maxItems = Math.max(1, Number(limit || 1));
   const materialityAnchors = options.materialityAnchors || null;
-  const relevanceProfile = options.relevanceProfile || null;
-  const applyRelevance = (items = []) => relevanceProfile
-    ? (items || []).map((item) => taskSemanticApplyExactEvidenceRelevance(item, relevanceProfile))
-    : (items || []);
   const normalizedResults = (laneResults || []).map((result) => Object.assign({}, result, {
     origin: taskSemanticLaneOrigin(result),
     mandatory: taskSemanticLaneIsMandatory(result),
-    admitted: applyRelevance(result?.admitted || []),
-    candidateWindow: applyRelevance(result?.candidateWindow || result?.admitted || [])
+    admitted: result?.admitted || [],
+    candidateWindow: result?.candidateWindow || result?.admitted || []
   }));
   const actionResult = normalizedResults.find((result) => result?.origin === "action" || result?.lane === "action");
   const alignmentByLane = new Map();
@@ -26055,7 +26953,6 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     const relationshipChunk = relationshipEvidenceSource?.chunk || relationshipEvidenceSource || {};
     const semanticUnitKind = semanticCanonicalUnitKind(source);
     const intentBearing = semanticUnitIntentBearing(source);
-    const exactRelevance = source?.semanticExactRelevance || fusedCandidate?.semanticExactRelevance || null;
     const weights = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimensionEntries[dimension]?.candidate?.dimensionWeight
       || dimensionEntries[dimension]?.result?.normalizedWeight || 0)]));
     const contributions = Object.fromEntries(dimensions.map((dimension) => [dimension, Number(dimensionEntries[dimension]?.candidate?.weightedContribution || 0)]));
@@ -26066,11 +26963,6 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
       evidenceId: String(chunk.evidenceId || chunk.id || ""),
       semanticUnitKind,
       intentBearing: typeof intentBearing === "boolean" ? intentBearing : false,
-      exactObjectOverlap: Number(exactRelevance?.objectHits?.length || 0),
-      exactEntityOverlap: Number(exactRelevance?.entityHits?.length || 0),
-      exactRecipientOverlap: Number(exactRelevance?.recipientHits?.length || 0),
-      exactTemporalOverlap: Number(exactRelevance?.temporalHits?.length || 0),
-      exactRelevanceReason: String(exactRelevance?.reason || ""),
       taskFocusContribution: Number.isFinite(Number(taskFocusContribution))
         ? Number(taskFocusContribution)
         : Number(contributions["authoritative-source"] || 0),
@@ -26464,7 +27356,11 @@ function selectTaskSemanticLaneCoverage(laneResults = [], limit = 6, fusionMode 
     .slice(0, remainingSlots);
   const selectedKeys = new Set([...reserved, ...remaining].map((item) => semanticTaskCandidateStableKey(item)));
   const fusedViewsByKey = new Map(fused.map((item) => [semanticTaskCandidateStableKey(item), item]));
-  const selectedViews = allFused
+  // `fused` is the canonical deterministic aggregate order. Do not derive
+  // selectionOrder from `allFused` lane iteration: that order can differ from
+  // the fused/admission order and later metadata merges would preserve the
+  // incidental rank.
+  const selectedViews = fused
     .filter((item) => selectedKeys.has(semanticTaskCandidateStableKey(item)))
     .map((item) => fusedViewsByKey.get(semanticTaskCandidateStableKey(item)) || item);
   const droppedCount = Math.max(0, optionalFusedCandidates.length - remaining.length);
@@ -26989,10 +27885,7 @@ function taskSemanticSourceThreadTelemetry(laneResults = [], dimensionResults = 
 // fused admission still applies the normal task-relative ceiling.
 function taskSemanticLaneCandidateWindow(candidates = [], acceptedCeiling = 6, options = {}) {
   const origin = options.origin || candidates.find((item) => item?.origin)?.origin || candidates.find((item) => item?.lane)?.lane || "";
-  const relevanceCandidates = options.relevanceProfile
-    ? (candidates || []).map((item) => taskSemanticApplyExactEvidenceRelevance(item, options.relevanceProfile))
-    : candidates;
-  const recencyRanked = taskSemanticApplyRelativeRecency(relevanceCandidates, origin);
+  const recencyRanked = taskSemanticApplyRelativeRecency(candidates || [], origin);
   const ranked = rankTaskSemanticCandidates(recencyRanked)
     .filter((item) => Number(item?.semantic ?? item?.semanticScore ?? item?.matchScore ?? 0) > 0);
   if (!ranked.length) return { candidates: [], floor: 0, poolCount: 0, baseCount: 0, tailCount: 0, sourceCoverageReservationCount: 0, sourceCoverageReservationReason: "", sourceCoverageReservation: null, sourceThreadReservationCount: 0, sourceThreadReservationReason: "", sourceThreadReservations: [], sourceThreadCandidates: [], reasonCodes: ["lane-no-positive-candidates"] };
@@ -27883,12 +28776,11 @@ function rankContextCandidates(candidates = []) {
 }
 
 function contextCandidateRelevanceScore(item) {
-  const exactAdjustment = Number(item.semanticExactRelevanceAdjustment || 0);
-  if (item.semanticOnly) return (item.semantic || 0) * 0.92 + Math.min(0.42, item.scopeScore || 0) + (Number.isFinite(exactAdjustment) ? exactAdjustment : 0);
+  if (item.semanticOnly) return (item.semantic || 0) * 0.92 + Math.min(0.42, item.scopeScore || 0);
   return (item.semantic || 0) * 0.72 +
     Math.min(0.22, (item.lexical || 0) * 0.018) +
     Math.min(0.08, (item.title || 0) * 0.025) +
-    Math.min(0.42, item.scopeScore || 0) + (Number.isFinite(exactAdjustment) ? exactAdjustment : 0);
+    Math.min(0.42, item.scopeScore || 0);
 }
 
 function contextCandidateScore(item) {
@@ -28012,10 +28904,16 @@ function semanticStructuralNoiseUnit(value = {}) {
 
 function semanticMetadataOnlyUnit(value = {}) {
   const chunk = value?.chunk && typeof value.chunk === "object" ? value.chunk : value;
+  const sourceKind = String(value?.sourceKind || chunk?.sourceKind || chunk?.provenance?.sourceKind || chunk?.provenance?.source_kind || "")
+    .trim()
+    .toLowerCase();
   return value?.metadataOnly === true
     || chunk?.metadataOnly === true
     || String(value?.evidenceEligibility || chunk?.evidenceEligibility || "").toLowerCase() === "metadata-only"
     || String(value?.semanticUnitKind || chunk?.semanticUnitKind || "").toLowerCase() === "frontmatter"
+    || sourceKind === "frontmatter"
+    || sourceKind === "note-frontmatter"
+    || sourceKind.endsWith("-frontmatter")
     || semanticStructuralNoiseUnit(value);
 }
 
@@ -30491,17 +31389,45 @@ function taskWorkflowTaskLocalPrimarySourceExcerpt(primary = {}, facts = [], tas
   return slice.valid ? slice.excerpt : "";
 }
 
+function taskDescriptionTaskScopeOwnershipMetadata(item = {}) {
+  const associations = uniqueTaskScopeAssociations(item.taskScopeAssociations || item.task_scope_associations || []);
+  const nativeAssociations = associations.filter((association) => association.advisory !== true);
+  const advisoryAssociations = associations.filter((association) => association.advisory === true);
+  const evidenceTaskId = String(item.evidenceTaskId || item.evidence_task_id || "");
+  const evidenceScopeId = String(item.evidenceScopeId || item.evidence_scope_id || "");
+  const queryOnly = advisoryAssociations.length > 0
+    && nativeAssociations.length === 0
+    && !evidenceTaskId
+    && !evidenceScopeId;
+  return {
+    nativeAssociations,
+    queryOnly,
+    queryOnlyTaskIds: new Set(queryOnly ? [
+      item.queryTaskId,
+      item.query_task_id,
+      ...advisoryAssociations.map((association) => association.taskId)
+    ].map(String).filter(Boolean) : []),
+    queryOnlyScopeIds: new Set(queryOnly ? [
+      item.queryScopeId,
+      item.query_scope_id,
+      ...advisoryAssociations.map((association) => association.scopeId)
+    ].map(String).filter(Boolean) : [])
+  };
+}
+
 function taskDescriptionTaskScopeAssociationState(item = {}, taskId = "", scopeId = "") {
   const normalizedTaskId = String(taskId || "");
   const normalizedScopeId = String(scopeId || "");
-  const associations = uniqueTaskScopeAssociations(item.taskScopeAssociations || item.task_scope_associations || []);
+  const ownershipMetadata = taskDescriptionTaskScopeOwnershipMetadata(item);
+  const associations = ownershipMetadata.nativeAssociations;
   const scopeIds = uniqueValues([
     item.scopeId,
     item.scope_id,
     ...(item.scopeIds || []),
     ...(item.scope_ids || []),
     ...associations.map((association) => association.scopeId)
-  ].filter((value) => value !== undefined && value !== null && value !== "").map(String));
+  ].filter((value) => value !== undefined && value !== null && value !== "").map(String)
+    .filter((value) => !ownershipMetadata.queryOnlyScopeIds.has(value)));
   const exact = Boolean(normalizedTaskId && normalizedScopeId && associations.some((association) => (
     association.taskId === normalizedTaskId && association.scopeId === normalizedScopeId
   )));
@@ -30516,7 +31442,8 @@ function taskDescriptionTaskScopeAssociationState(item = {}, taskId = "", scopeI
     item.task_id,
     ...(item.taskIds || []),
     ...(item.task_ids || [])
-  ].filter((value) => value !== undefined && value !== null && value !== "").map(String));
+  ].filter((value) => value !== undefined && value !== null && value !== "").map(String)
+    .filter((value) => !ownershipMetadata.queryOnlyTaskIds.has(value)));
   const foreignTopLevelTask = Boolean(normalizedScopeId
     && scopeIds.includes(normalizedScopeId)
     && topLevelTaskIds.some((value) => value !== normalizedTaskId && value !== `scope:${normalizedScopeId}`));
@@ -30542,7 +31469,8 @@ function taskDescriptionTaskScopeAssociationState(item = {}, taskId = "", scopeI
 function taskDescriptionTaskLocalProjectionOwnershipState(item = {}, taskId = "", scopeId = "") {
   const normalizedTaskId = String(taskId || "");
   const normalizedScopeId = String(scopeId || "");
-  const associations = uniqueTaskScopeAssociations(item.taskScopeAssociations || item.task_scope_associations || []);
+  const ownershipMetadata = taskDescriptionTaskScopeOwnershipMetadata(item);
+  const associations = ownershipMetadata.nativeAssociations;
   const canonicalScopeTaskId = normalizedScopeId ? `scope:${normalizedScopeId}` : "";
   const targetAssociation = associations.some((association) => {
     const associationTaskId = String(association?.taskId || association?.task_id || "");
@@ -30558,9 +31486,11 @@ function taskDescriptionTaskLocalProjectionOwnershipState(item = {}, taskId = ""
       && (!associationTaskId || associationTaskId === normalizedTaskId || associationTaskId === canonicalScopeTaskId));
   });
   const topLevelTaskIds = uniqueValues([item.taskId, item.task_id, ...(item.taskIds || []), ...(item.task_ids || [])]
-    .filter((value) => value !== undefined && value !== null && value !== "").map(String));
+    .filter((value) => value !== undefined && value !== null && value !== "").map(String)
+    .filter((value) => !ownershipMetadata.queryOnlyTaskIds.has(value)));
   const topLevelScopeIds = uniqueValues([item.scopeId, item.scope_id, ...(item.scopeIds || []), ...(item.scope_ids || [])]
-    .filter((value) => value !== undefined && value !== null && value !== "").map(String));
+    .filter((value) => value !== undefined && value !== null && value !== "").map(String)
+    .filter((value) => !ownershipMetadata.queryOnlyScopeIds.has(value)));
   const exactTopLevelBinding = Boolean(normalizedTaskId && normalizedScopeId
     && topLevelScopeIds.includes(normalizedScopeId)
     && topLevelTaskIds.some((value) => value === normalizedTaskId || value === canonicalScopeTaskId));
@@ -30626,6 +31556,30 @@ function taskDescriptionTaskLocalProjectionOwnershipState(item = {}, taskId = ""
   };
 }
 
+function taskWorkflowExactTaskScopeBindingEligible(item = {}, taskId = "", scopeId = "") {
+  const normalizedTaskId = String(taskId || "");
+  const normalizedScopeId = String(scopeId || "");
+  if (!normalizedTaskId || !normalizedScopeId) return false;
+  const ownershipMetadata = taskDescriptionTaskScopeOwnershipMetadata(item);
+  const associations = ownershipMetadata.nativeAssociations;
+  const evidenceScopes = evidenceScopeIdsForChunk(item);
+  const canonicalScopeTaskId = `scope:${normalizedScopeId}`;
+  if (ownershipMetadata.queryOnly) return false;
+  const topLevelTaskIds = uniqueValues([
+    item.taskId, item.task_id, ...(item.taskIds || []), ...(item.task_ids || [])
+  ].filter((value) => value !== undefined && value !== null && value !== "").map(String)
+    .filter((value) => !ownershipMetadata.queryOnlyTaskIds.has(value)));
+  if (evidenceScopes.some((candidate) => candidate !== normalizedScopeId)) return false;
+  if (associations.some((association) => String(association?.scopeId || association?.scope_id || "") !== normalizedScopeId)) return false;
+  if (associations.some((association) => {
+    const associationTaskId = String(association?.taskId || association?.task_id || "");
+    return associationTaskId && associationTaskId !== normalizedTaskId && associationTaskId !== canonicalScopeTaskId;
+  })) return false;
+  if (topLevelTaskIds.some((candidate) => candidate !== normalizedTaskId && candidate !== canonicalScopeTaskId)) return false;
+  const projectionOwnership = taskDescriptionTaskLocalProjectionOwnershipState(item, normalizedTaskId, normalizedScopeId);
+  return projectionOwnership.allowed && !projectionOwnership.foreignAssociation;
+}
+
 function taskDescriptionSelectionMetadataMerge(item = {}, selectedMetadata = null, taskId = "", scopeId = "") {
   const base = item && typeof item === "object" ? item : {};
   const sidecar = selectedMetadata && typeof selectedMetadata === "object" ? selectedMetadata : {};
@@ -30656,7 +31610,10 @@ function taskDescriptionSelectionMetadataMerge(item = {}, selectedMetadata = nul
     && [baseScopeId, sidecarScopeId, ...scopeIds].map(String).includes(normalizedScopeId)) scopeIds.push(normalizedScopeId);
   const selectedForTask = [baseTaskId, sidecarTaskId, ...taskIds].map(String).includes(normalizedTaskId);
   const selectedForScope = [baseScopeId, sidecarScopeId, ...scopeIds].map(String).includes(normalizedScopeId);
-  if (normalizedTaskId && normalizedScopeId && selectedForTask && selectedForScope) {
+  const queryOnlySelection = taskScopeAssociations.length > 0
+    && taskScopeAssociations.every((association) => association.advisory === true)
+    && [base, sidecar].some((source) => source.queryId || source.query_id || source.queryTaskId || source.query_task_id || source.queryScopeId || source.query_scope_id);
+  if (normalizedTaskId && normalizedScopeId && selectedForTask && selectedForScope && !queryOnlySelection) {
     taskScopeAssociations.push({ taskId: normalizedTaskId, scopeId: normalizedScopeId });
   }
   if (taskScopeAssociations.length) normalized.taskScopeAssociations = taskScopeAssociations;
@@ -30692,8 +31649,6 @@ function taskDescriptionSelectionMetadataMerge(item = {}, selectedMetadata = nul
   if (structuredFactsByKey.size) normalized.structuredFacts = Array.from(structuredFactsByKey.values());
   const semanticMetadataFields = [
     "semantic", "semanticScore", "semanticBaseScore", "semanticRankScore", "semanticRecencyContribution",
-    "semanticExactRelevanceVersion", "semanticExactRelevanceScore", "semanticExactRelevanceAdjustment", "semanticExactRelevance",
-    "semanticExactObjectOverlap", "semanticExactEntityOverlap", "semanticExactRecipientOverlap", "semanticExactTemporalOverlap", "semanticExactMaterialEligible",
     "scopeScore", "scopeMatch", "scopeUnknown", "scopeOwnership", "scopeOwnershipReason",
     "winningLane", "winningLaneScore", "secondLane", "secondLaneScore", "selectionReasonCode",
     "selectionOrder", "admissionReason", "reservationState", "reservationReason", "finalReasonCode",
@@ -33358,6 +34313,85 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     requestCoverage,
     aiCalls: 0,
     elapsedMs: Math.max(0, Date.now() - startedAt)
+  };
+}
+
+// A singleton description may omit only its transport index while preserving
+// an otherwise complete response item. Normalize that unambiguous carrier
+// defect on a derived object; the caller retains the provider JSON unchanged
+// for raw-output observation and all semantic/evidence validation still runs.
+function normalizeSingletonTaskDescriptionResponse(parsedBatch = {}, targetMainTasks = []) {
+  const descriptions = Array.isArray(parsedBatch?.descriptions) ? parsedBatch.descriptions : [];
+  const targets = Array.isArray(targetMainTasks) ? targetMainTasks : [];
+  if (targets.length !== 1 || descriptions.length !== 1) return { descriptions, corrections: [] };
+  const item = descriptions[0];
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return { descriptions, corrections: [] };
+  }
+  const hasDescriptionBody = Array.isArray(item.description_sentences) && item.description_sentences.length > 0;
+  const hasRequiredSingletonFields = typeof item.task_id === "string" && item.task_id.trim().length > 0
+    && typeof item.scope_id === "string" && item.scope_id.trim().length > 0
+    && Array.isArray(item.evidence_ids) && item.evidence_ids.length > 0
+    && Array.isArray(item.fact_refs) && item.fact_refs.length > 0;
+  const taskIndex = Number(targets[0]?.index);
+  if (!hasDescriptionBody || !hasRequiredSingletonFields || !Number.isInteger(taskIndex) || taskIndex < 0) return { descriptions, corrections: [] };
+  const hasIndex = Object.prototype.hasOwnProperty.call(item, "index");
+  if (hasIndex && Number(item.index) !== taskIndex) return { descriptions, corrections: [] };
+  const target = targets[0] || {};
+  const expectedTaskId = String(target.taskId || target.task_id || target.taskLocalEvidence?.taskId || target.id || "");
+  const expectedScopeId = String(target.scopeId || target.scope_id || target.taskLocalEvidence?.scopeId || "");
+  if (!expectedTaskId || item.task_id !== expectedTaskId) return { descriptions, corrections: [] };
+  if (!expectedScopeId || item.scope_id !== expectedScopeId) return { descriptions, corrections: [] };
+  const allowedFactIds = uniqueValues([
+    ...(target.fact_refs || target.factRefs || []),
+    ...(target.taskLocalEvidence?.factRefs || []),
+    ...(target.taskLocalEvidence?.priorityFactRefs || []),
+    ...(target.taskLocalEvidence?.materialDescriptionFactRefs || []),
+    ...(target.taskLocalEvidence?.executionDetailFactRefs || []),
+    ...(target.evidenceBundle?.factRefs || target.evidenceBundle?.fact_refs || []),
+    ...(target.taskEvidenceBundle?.factRefs || target.taskEvidenceBundle?.fact_refs || []),
+    ...(target.taskLocalEvidence?.typedFacts || []).map((fact) => fact?.factId || fact?.fact_id)
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+  const allowedFactSet = new Set(allowedFactIds);
+  const normalizeFactRef = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw || allowedFactSet.has(raw) || !raw.includes("_")) return raw;
+    const normalized = raw.replace(/_/g, "-");
+    const matches = allowedFactIds.filter((factId) => factId.replace(/_/g, "-") === normalized);
+    return matches.length === 1 ? matches[0] : raw;
+  };
+  const repairedRefs = [];
+  const normalizeFactRefArray = (values) => (Array.isArray(values) ? values : []).map((value) => {
+    const raw = String(value || "").trim();
+    const normalized = normalizeFactRef(raw);
+    if (normalized !== raw) repairedRefs.push({ from: raw, to: normalized });
+    return normalized;
+  });
+  const normalizedItem = Object.assign({}, item);
+  normalizedItem.fact_refs = normalizeFactRefArray(item.fact_refs);
+  if (Array.isArray(item.factRefs)) normalizedItem.factRefs = normalizeFactRefArray(item.factRefs);
+  normalizedItem.description_sentences = item.description_sentences.map((sentence) => {
+    if (!sentence || typeof sentence !== "object" || Array.isArray(sentence)) return sentence;
+    const normalizedSentence = Object.assign({}, sentence);
+    if (Array.isArray(sentence.fact_refs)) normalizedSentence.fact_refs = normalizeFactRefArray(sentence.fact_refs);
+    if (Array.isArray(sentence.factRefs)) normalizedSentence.factRefs = normalizeFactRefArray(sentence.factRefs);
+    return normalizedSentence;
+  });
+  const corrections = hasIndex ? [] : [{
+    reasonCode: "singleton-missing-index-repaired",
+    taskIndex,
+    itemCount: 1,
+    rawIndexPresent: false
+  }];
+  if (repairedRefs.length) corrections.push({
+    reasonCode: "description-fact-ref-separator-repaired",
+    taskIndex,
+    repairedCount: repairedRefs.length,
+    repairedRefs: repairedRefs.slice(0, 32)
+  });
+  return {
+    descriptions: [Object.assign(normalizedItem, { index: taskIndex })],
+    corrections
   };
 }
 
@@ -36322,7 +37356,7 @@ function taskWorkflowEvidenceStableIdentity(record = {}, ordinal = 0) {
 
 const TASK_WORKFLOW_EVIDENCE_CANONICAL_FIELDS = Object.freeze([
   "sourceKind", "sourceId", "temporalRelation", "current", "currentState", "authorityState", "sourceAuthority", "conflictState",
-  "taskId", "scopeId", "queryId", "dimension", "semanticScore", "dimensionScore", "dimensionWeight", "weightedContribution", "aggregateContribution",
+  "taskId", "scopeId", "queryId", "dimension", "semanticScore", "semanticBaseScore", "semanticRecencyContribution", "semanticRankScore", "winningLane", "winningLaneScore", "secondLane", "secondLaneScore", "dimensionScore", "dimensionWeight", "weightedContribution", "aggregateContribution",
   "actionLaneSupported", "actionLaneContribution", "taskFocusContribution",
   "admissionReason", "reservationState", "reservationReason", "finalReasonCode", "inclusionReason", "exclusionReason", "fusedIdentityKey", "selectionOrder",
   "materialityState", "materialityReason", "selectionReasonCode"
@@ -36368,6 +37402,29 @@ function taskWorkflowMetadataCanonicalValue(key, records = [], strengths = []) {
   if (["actionLaneContribution", "taskFocusContribution"].includes(key)) {
     const positive = values.map(({ value }) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
     return positive.length ? Math.max(...positive) : 0;
+  }
+  if (["semanticBaseScore", "semanticRecencyContribution", "semanticRankScore", "winningLaneScore", "secondLaneScore"].includes(key)) {
+    const positive = values.map(({ value }) => Number(value)).filter((value) => Number.isFinite(value) && value > 0);
+    return positive.length ? Math.max(...positive) : 0;
+  }
+  if (key === "winningLane" || key === "secondLane") {
+    const scoreKey = key === "winningLane" ? "semanticRankScore" : "secondLaneScore";
+    const laneValues = values.map(({ value, index, strength }) => ({ value: String(value), index, strength, score: Number(records[index]?.[scoreKey] || 0), laneScore: Number(records[index]?.winningLaneScore || 0) }))
+      .filter(({ value }) => value);
+    if (!laneValues.length) return undefined;
+    laneValues.sort((left, right) => right.score - left.score || right.laneScore - left.laneScore || right.strength - left.strength || left.index - right.index);
+    return laneValues[0].value;
+  }
+  if (key === "selectionOrder") {
+    const selectedRows = records
+      .map((record, index) => ({ record, index, strength: strengths[index] || 0 }))
+      .filter(({ record }) => record?.fusedIdentityKey
+        || String(record?.finalReasonCode || "").startsWith("fused-")
+        || String(record?.admissionReason || "").startsWith("fused-"));
+    const selectedValues = selectedRows
+      .map(({ record }) => Number(record?.selectionOrder ?? record?.selection_order ?? record?.selectedOrder ?? record?.selected_order ?? record?.fusedRank ?? record?.fused_rank ?? record?.rank))
+      .filter((value) => Number.isFinite(value) && value >= 0);
+    return selectedValues.length ? Math.min(...selectedValues) : undefined;
   }
   const meaningful = values.filter(({ value }) => {
     if (["materialityState"].includes(key)) return String(value) !== "unclassified";
@@ -36527,12 +37584,19 @@ function uniqueTaskScopeAssociations(associations = []) {
       queryId: String(association.queryId || association.query_id || ""),
       sourceContractId: String(association.sourceContractId || association.source_contract_id || "")
     };
+    const advisory = association.native !== true
+      && association.advisory !== false
+      && (association.advisory === true
+        || association.queryDerived === true
+        || association.query_derived === true
+        || Boolean(normalized.queryId || normalized.sourceContractId));
+    if (advisory) normalized.advisory = true;
     if (!normalized.taskId && !normalized.scopeId && !normalized.queryId) continue;
     // A task/scope association is a logical relationship, not one row per
     // semantic lane. Keep the first query ID for provenance while collapsing
     // action/source/history/continuity lane duplicates.
     const key = normalized.taskId || normalized.scopeId || normalized.sourceContractId
-      ? `${normalized.taskId}|${normalized.scopeId}|${normalized.sourceContractId}`
+      ? `${normalized.taskId}|${normalized.scopeId}|${normalized.sourceContractId}|${normalized.advisory ? "advisory" : "native"}`
       : normalized.queryId;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -37029,18 +38093,20 @@ function taskWorkflowPrimaryContextAssociation(context = {}, marker = {}) {
   return { relatedToMarker: matchedTopicTerms.length > 0, matchedTopicTerms };
 }
 
-function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = [], settings = DEFAULT_SETTINGS) {
+function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = [], settings = DEFAULT_SETTINGS, sourceLineOffset = 0) {
   const lines = String(sourceText || "").split("\n");
   const records = [];
+  const lineOffset = Number.isSafeInteger(Number(sourceLineOffset)) ? Number(sourceLineOffset) : 0;
   const markerLineOrdinals = new Map();
   const markerPattern = noteActionMarkerRegex(settings);
   const markerPatternGlobal = noteActionMarkerRegex(settings, true);
   for (const marker of markerRecords || []) {
-    const lineIndex = Math.max(0, Number(marker.line || 1) - 1);
+    const localMarkerLine = Number(marker.localLine || marker.local_line || marker.line || 1);
+    const lineIndex = Math.max(0, localMarkerLine - 1);
     const rawLine = lines[lineIndex] || "";
     const matches = Array.from(rawLine.matchAll(markerPatternGlobal));
-    const ordinal = markerLineOrdinals.get(Number(marker.line)) || 0;
-    markerLineOrdinals.set(Number(marker.line), ordinal + 1);
+    const ordinal = markerLineOrdinals.get(localMarkerLine) || 0;
+    markerLineOrdinals.set(localMarkerLine, ordinal + 1);
     const match = matches[ordinal] || matches[0] || null;
     const nextMarkerIndex = matches[ordinal + 1]?.index;
     const inlineAction = match
@@ -37060,9 +38126,11 @@ function taskWorkflowPrimaryContextLineRecords(sourceText = "", markerRecords = 
     const add = (lineStart, lineEnd, surface, metadata = {}) => {
       const text = singleLine(surface || "");
       if (!text || /^[-*]\s*$/.test(text) || markerPattern.test(text)) return;
-      if (!scoped.some((entry) => entry.lineStart === lineStart && entry.lineEnd === lineEnd && entry.sourceSurface === text)) {
+      const absoluteLineStart = Number(lineStart) + lineOffset;
+      const absoluteLineEnd = Number(lineEnd) + lineOffset;
+      if (!scoped.some((entry) => entry.lineStart === absoluteLineStart && entry.lineEnd === absoluteLineEnd && entry.sourceSurface === text)) {
         const association = taskWorkflowPrimaryContextAssociation({ sourceSurface: text, ...metadata }, marker);
-        scoped.push({ line: lineStart, lineStart, lineEnd, sourceSurface: text, ...metadata, ...association });
+        scoped.push({ line: absoluteLineStart, lineStart: absoluteLineStart, lineEnd: absoluteLineEnd, sourceSurface: text, ...metadata, ...association });
       }
     };
     if (match && Number(match.index || 0) > 0) add(lineIndex + 1, lineIndex + 1, rawLine.slice(0, match.index), { inlinePrefix: true });
@@ -37105,7 +38173,12 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
   const sourceId = source.sourceContractId || source.source_contract_id || source.sourceId || source.source_id || `src-${shortHash(JSON.stringify({ sourceType, title, path, text: primaryText }))}`;
   const primaryEvidenceId = source.primaryEvidenceId || source.primary_evidence_id || source.evidenceId || source.evidence_id || `evidence-${shortHash(`${sourceId}:primary`)}`;
   const markers = sourceType === "note" ? explicitNoteActionMarkers(primaryText, settings).slice(0, 64) : [];
+  const sourceLineOffset = Number.isSafeInteger(Number(source.sourceLineOffset || source.source_line_offset))
+    ? Number(source.sourceLineOffset || source.source_line_offset)
+    : 0;
   const markerRecords = markers.map((marker, markerIndex) => Object.assign({}, marker, {
+    localLine: Number(marker.line || 0),
+    line: Number(marker.line || 0) + sourceLineOffset,
     markerIndex,
     markerRecordId: `marker-${markerIndex + 1}`
   }));
@@ -37196,7 +38269,7 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
     const scope = scopes.find((item) => item.scopeId === marker.scopeId);
     if (scope) scope.markerFactId = factId;
   }
-  const primaryContextRecords = taskWorkflowPrimaryContextLineRecords(primaryText, markerRecords, settings);
+  const primaryContextRecords = taskWorkflowPrimaryContextLineRecords(primaryText, markerRecords, settings, sourceLineOffset);
   for (const entry of primaryContextRecords) {
     const marker = entry.marker;
     for (const context of entry.records) {
@@ -37348,7 +38421,7 @@ function semanticExactExcerptFactsForItem(item = {}, forcedScopeId = "") {
   if (semanticMetadataOnlyUnit(item)) return [];
   if (["rejected", "blocked", "conflict", "conflicted"].includes(String(item.authorityState || "").toLowerCase())
     || ["rejected", "conflict", "conflicted"].includes(String(item.conflictState || "").toLowerCase())) return [];
-  const excerpt = String(item.excerpt || "").trim();
+  const excerpt = taskSemanticEvidenceBodyText(item);
   const evidenceId = String(item.evidenceId || "");
   const sourceId = String(item.provenance?.sourceId || item.sourceId || "");
   if (!excerpt || !evidenceId || !sourceId) return [];
@@ -37390,7 +38463,7 @@ function semanticExactExcerptFactsForItem(item = {}, forcedScopeId = "") {
   })).filter(Boolean);
 }
 
-function materializeSelectedTaskSemanticExcerptFact(item = {}, taskId = "", scopeId = "") {
+function materializeSelectedTaskSemanticExcerptFact(item = {}, taskId = "", scopeId = "", options = {}) {
   const normalizedTaskId = String(taskId || "");
   const normalizedScopeId = String(scopeId || "");
   const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
@@ -37398,11 +38471,27 @@ function materializeSelectedTaskSemanticExcerptFact(item = {}, taskId = "", scop
   if (String(item.sourceKind || "").toLowerCase() === "current-source") return item;
   if (["rejected", "blocked", "conflict", "conflicted"].includes(String(item.authorityState || "").toLowerCase())
     || ["rejected", "conflict", "conflicted"].includes(String(item.conflictState || "").toLowerCase())) return item;
-  if (!evidenceScopeIdsForChunk(item).includes(normalizedScopeId)) return item;
-  if (!taskWorkflowSemanticEvidenceForTask([item], normalizedTaskId, normalizedScopeId)) return item;
-  const associations = uniqueTaskScopeAssociations([...(item.taskScopeAssociations || []), { taskId: normalizedTaskId, scopeId: normalizedScopeId }]);
-  const scoped = Object.assign({}, item, { evidenceId, scopeId: normalizedScopeId, scopeIds: [normalizedScopeId], taskId: normalizedTaskId, taskScopeAssociations: associations });
-  const exactFacts = semanticExactExcerptFactsForItem(scoped, normalizedScopeId);
+  const relevanceSource = item;
+  const requestScopedRelevance = taskSemanticRequestScopedRelevanceEligible(relevanceSource, normalizedTaskId, normalizedScopeId, relevanceSource.structuredFacts || []);
+  if (!evidenceScopeIdsForChunk(relevanceSource).includes(normalizedScopeId)) return item;
+  if (!taskWorkflowSemanticEvidenceForTask([relevanceSource], normalizedTaskId, normalizedScopeId)) return item;
+  const associations = uniqueTaskScopeAssociations([
+    ...(relevanceSource.taskScopeAssociations || relevanceSource.task_scope_associations || []),
+    ...(requestScopedRelevance ? [] : [{ taskId: normalizedTaskId, scopeId: normalizedScopeId }])
+  ]);
+  const scoped = Object.assign({}, relevanceSource, {
+    evidenceId,
+    scopeId: normalizedScopeId,
+    scopeIds: [normalizedScopeId],
+    taskId: normalizedTaskId,
+    taskScopeAssociations: associations,
+    ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {})
+  });
+  const exactFacts = semanticExactExcerptFactsForItem(item, normalizedScopeId).map((fact) => Object.assign({}, fact, {
+    taskId: normalizedTaskId,
+    ...(requestScopedRelevance ? {} : { taskScopeAssociations: [{ taskId: normalizedTaskId, scopeId: normalizedScopeId }] }),
+    ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {})
+  }));
   const factsById = new Map();
   const existingExactFacts = (item.structuredFacts || []).filter((fact) => {
     const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
@@ -37419,7 +38508,16 @@ function materializeSelectedTaskSemanticExcerptFact(item = {}, taskId = "", scop
     const factId = String(fact?.factId || fact?.fact_id || "");
     if (factId && !factsById.has(factId)) factsById.set(factId, fact);
   }
-  const structuredFacts = Array.from(factsById.values());
+  const structuredFacts = Array.from(factsById.values()).map((fact) => Object.assign({}, fact, {
+    taskId: normalizedTaskId,
+    taskScopeAssociations: requestScopedRelevance
+      ? uniqueTaskScopeAssociations([...(fact.taskScopeAssociations || fact.task_scope_associations || [])])
+      : uniqueTaskScopeAssociations([
+        ...(fact.taskScopeAssociations || fact.task_scope_associations || []),
+        { taskId: normalizedTaskId, scopeId: normalizedScopeId }
+      ]),
+    ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {})
+  }));
   return Object.assign(scoped, { structuredFacts, factIds: uniqueValues(structuredFacts.map((fact) => String(fact.factId || "")).filter(Boolean)) });
 }
 
@@ -37491,11 +38589,16 @@ function materializeTaskScopedSemanticExcerptFacts(items = [], validScopeIds = [
   const validScopes = new Set((validScopeIds || []).map(String).filter(Boolean));
   for (const rows of taskWorkflowSemanticEvidenceRowsById(items).values()) {
     const aggregate = taskWorkflowSemanticEvidenceAggregate(rows);
-    if (semanticMetadataOnlyUnit(aggregate)) continue;
+    if (semanticMetadataOnlyUnit(aggregate)
+      || String(aggregate.sourceKind || "").toLowerCase() === "current-source"
+      || aggregate.primarySource === true) continue;
     const scopeIds = aggregate.scopeIds.filter((scopeId) => !validScopes.size || validScopes.has(scopeId));
     aggregate.scopeIds = scopeIds;
     const existingFacts = aggregate.structuredFacts || [];
-    const exactFacts = semanticExactExcerptFactsForItem(Object.assign({}, aggregate, { scopeIds }));
+    const exactFacts = semanticExactExcerptFactsForItem(aggregate, "").filter((fact) => {
+      const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+      return scopeIds.includes(factScopeId);
+    });
     const factsById = new Map();
     for (const fact of [...existingFacts, ...exactFacts]) {
       const factId = String(fact?.factId || "");
@@ -37504,8 +38607,12 @@ function materializeTaskScopedSemanticExcerptFacts(items = [], validScopeIds = [
     const structuredFacts = Array.from(factsById.values());
     const factIds = uniqueValues(structuredFacts.map((fact) => String(fact.factId || "")).filter(Boolean));
     for (const row of rows) {
-      row.scopeIds = scopeIds.slice();
-      row.taskScopeAssociations = aggregate.taskScopeAssociations.map((association) => Object.assign({}, association));
+      const rowScopeIds = evidenceScopeIdsForChunk(row).filter((scopeId) => !validScopes.size || validScopes.has(scopeId));
+      const rowAssociations = uniqueTaskScopeAssociations(row.taskScopeAssociations || []);
+      row.scopeIds = rowScopeIds.length ? rowScopeIds : scopeIds.slice();
+      row.taskScopeAssociations = rowAssociations.length
+        ? rowAssociations.map((association) => Object.assign({}, association))
+        : aggregate.taskScopeAssociations.map((association) => Object.assign({}, association));
       row.structuredFacts = structuredFacts.map((fact) => Object.assign({}, fact));
       row.factIds = uniqueValues([...(row.factIds || []), ...factIds]);
     }
@@ -37692,18 +38799,14 @@ function buildTaskEvidenceCatalog(sourceContract = null, semanticContext = [], s
     }
     if (chunk.provenance && typeof chunk.provenance === "object") semanticItem.provenance = Object.assign({}, semanticItem.provenance, chunk.provenance);
     semanticItem.structuredFacts = canonicalCatalogFacts(semanticItem.structuredFacts, semanticItem);
-    semanticItem.structuredFacts = canonicalCatalogFacts([
-      ...semanticItem.structuredFacts,
-      ...semanticExactExcerptFactsForItem(semanticItem)
-    ], semanticItem);
     semanticItem.factIds = uniqueValues([
       ...semanticItem.factIds,
       ...semanticItem.structuredFacts.map((fact) => fact.factId)
     ]).slice(0, 24);
     semanticItems.push(semanticItem);
   }
-  materializeTaskScopedSemanticExcerptFacts(semanticItems, contract.scopeIds || []);
   const items = [primary, ...semanticItems];
+  materializeTaskScopedSemanticExcerptFacts(items, contract.scopeIds);
   const manifest = {
     version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
     sourceId: contract.sourceId,
@@ -38107,7 +39210,59 @@ function attachTaskLocalSemanticFacts(task = {}, evidenceIds = [], evidenceCatal
 function taskWorkflowPreStructureSyntheticTask(record = {}, sourceContract = null, context = [], local = {}) {
   const taskId = String(record.taskId || `scope:${record.scopeId || ""}`);
   const scopeId = String(record.scopeId || "");
-  const selectedContext = (context || []).map((item) => materializeSelectedTaskSemanticExcerptFact(item, taskId, scopeId));
+  const relevanceTask = {
+    id: taskId,
+    taskId,
+    content: String(record.action || ""),
+    scope_id: scopeId
+  };
+  const shortlist = taskDescriptionSemanticShortlistForTask(context, sourceContract || {}, relevanceTask, {
+    contextBundle: { factsById: Object.fromEntries((sourceContract?.facts || []).map((fact) => [String(fact?.factId || ""), fact]).filter(([factId]) => factId)) }
+  });
+  const exactItems = shortlist.items.filter(taskSemanticTaskLocalRelevanceAccepted);
+  const explicitlyBoundHistory = (context || []).filter((item) => {
+    const materialState = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase();
+    const historical = String(item?.temporalRelation || item?.temporal_relation || "").toLowerCase() === "historical"
+      || item?.current === false
+      || materialState === "material-review-history-candidate";
+    const upstreamReserved = taskSemanticSelectedEvidencePositive(item)
+      && String(item?.reservationState || item?.reservation_state || "").trim().toLowerCase() !== "unreserved"
+      && (taskWorkflowExactTaskScopeBindingEligible(item, taskId, scopeId)
+        || taskSemanticRequestScopedRelevanceEligible(item, taskId, scopeId, item?.structuredFacts || []));
+    return historical
+      && (taskWorkflowExactTaskScopeBindingEligible(item, taskId, scopeId)
+        || taskSemanticRequestScopedRelevanceEligible(item, taskId, scopeId, item?.structuredFacts || []))
+      && (materialState === "material-review-history-candidate" || upstreamReserved);
+  });
+  const selectedCandidateItems = uniqueValues([...(exactItems || []), ...(explicitlyBoundHistory || [])]
+    .map((item) => String(item?.evidenceId || item?.id || ""))
+    .filter(Boolean))
+    .map((evidenceId) => (context || []).find((item) => String(item?.evidenceId || item?.id || "") === evidenceId))
+    .filter(Boolean);
+  const protectedCurrentRow = (item = {}) => {
+    const sourceKind = String(item?.sourceKind || item?.source_kind || "").toLowerCase();
+    const temporalRelation = String(item?.temporalRelation || item?.temporal_relation || "").toLowerCase();
+    return sourceKind === "current-source" || item?.primarySource === true || item?.current === true || temporalRelation === "current";
+  };
+  let optionalSelectedCount = 0;
+  const selectedOptionalItems = selectedCandidateItems.filter((item) => {
+    if (protectedCurrentRow(item)) return true;
+    if (optionalSelectedCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return false;
+    optionalSelectedCount += 1;
+    return true;
+  });
+  const selectedIds = new Set(uniqueValues([
+    sourceContract?.primaryEvidenceId,
+    record.fact?.evidenceId,
+    record.factId ? (sourceContract?.facts || []).find((fact) => String(fact?.factId || "") === String(record.factId))?.evidenceId : "",
+    ...selectedOptionalItems.map((item) => item?.evidenceId || item?.id)
+  ].map(String).filter(Boolean)));
+  const selectedContext = (context || [])
+    .filter((item) => selectedIds.has(String(item?.evidenceId || item?.evidence_id || item?.id || "")))
+    .map((item) => materializeSelectedTaskSemanticExcerptFact(item, taskId, scopeId, {
+    task: relevanceTask,
+    sourceContract
+  }));
   const selectedEvidenceIds = uniqueValues(selectedContext.map((item) => String(item?.evidenceId || item?.evidence_id || "")).filter(Boolean));
   const task = {
     id: taskId,
@@ -38177,13 +39332,99 @@ function attachTaskWorkflowSemanticEvidence(tasks = [], sourceContract = null, e
     if (!local && !preScope) continue;
     const preStructureContext = Array.isArray(preScope?.context) ? preScope.context : [];
     const postStructureContext = Array.isArray(local?.context) ? local.context : [];
+    const primaryEvidenceId = String(sourceContract?.primaryEvidenceId || "");
+    const taskLocalCurrentProtected = (item = {}) => {
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      const sourceKind = String(item?.sourceKind || item?.source_kind || "").trim().toLowerCase();
+      const authorityState = String(item?.authorityState || item?.authority || item?.provenance?.authority || "").trim().toLowerCase();
+      const conflictState = String(item?.conflictState || item?.conflict_state || "").trim().toLowerCase();
+      const current = item?.current === true
+        || sourceKind === "current-source"
+        || String(item?.temporalRelation || item?.temporal_relation || "").trim().toLowerCase() === "current";
+      return current
+        && !["rejected", "blocked", "conflicted"].includes(authorityState)
+        && !["conflict", "conflicted", "rejected"].includes(conflictState)
+        && (evidenceId === primaryEvidenceId
+          || item?.primarySource === true
+          || (sourceKind === "current-source" && (item?.taskLocalProtected === true
+            || item?.task_local_protected === true
+            || item?.protectedTaskRow === true
+            || item?.protected_task_row === true
+            || item?.protected === true)));
+    };
+    const taskLocalProviderBound = (item = {}, selectedContainer = false) => {
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      if (!evidenceId) return false;
+      if (taskLocalCurrentProtected(item)) return true;
+      const historical = String(item?.temporalRelation || item?.temporal_relation || "").trim().toLowerCase() === "historical"
+        || item?.current === false;
+      if (selectedContainer) {
+        const authorityState = String(item?.authorityState || item?.authority || item?.provenance?.authority || "").trim().toLowerCase();
+        const conflictState = String(item?.conflictState || item?.conflict_state || "").trim().toLowerCase();
+        const reservationState = String(item?.reservationState || item?.reservation_state || "").trim().toLowerCase();
+        if (reservationState === "unreserved") return false;
+        return !["rejected", "blocked", "conflicted", "completed", "closed", "stale", "superseded"].includes(authorityState)
+          && !["conflict", "conflicted", "rejected"].includes(conflictState)
+          && (taskWorkflowExactTaskScopeBindingEligible(item, localTaskId, scopeId)
+            || taskSemanticRequestScopedRelevanceEligible(item, localTaskId, scopeId, item?.structuredFacts || []));
+      }
+      // Provider closure trusts only routed semantic selection metadata. Exact
+      // Text overlap cannot grant or deny rows.
+      return historical
+        && taskSemanticSelectedEvidencePositive(item)
+        && (taskWorkflowExactTaskScopeBindingEligible(item, localTaskId, scopeId)
+          || taskSemanticRequestScopedRelevanceEligible(item, localTaskId, scopeId, item?.structuredFacts || []));
+    };
+    const catalogRowForTask = (evidenceId) => {
+      const rows = catalogRowsById.get(String(evidenceId || "")) || [];
+      const scoped = taskWorkflowSemanticEvidenceForTask(rows, localTaskId, scopeId)
+        || rows.find((row) => evidenceScopeIdsForChunk(row).includes(scopeId))
+        || catalogItems.get(String(evidenceId || ""))
+        || { evidenceId };
+      const scopedFacts = (scoped.structuredFacts || []).filter((fact) => String(fact?.scopeId || fact?.scope_id || "") === scopeId);
+      return Object.assign({}, scoped, {
+        scopeId,
+        scopeIds: [scopeId],
+        structuredFacts: scopedFacts,
+        factIds: uniqueValues(scopedFacts.map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean))
+      });
+    };
+    const preStructureAllowedEvidenceIds = new Set([
+      ...preStructureContext
+        .filter((item) => taskLocalProviderBound(item, true))
+        .map((item) => String(item?.evidenceId || item?.evidence_id || item?.id || "")),
+      ...(preScope?.evidenceIds || [])
+        .map((evidenceId) => catalogRowForTask(evidenceId))
+        .filter((item) => taskLocalProviderBound(item, true))
+        .map((item) => String(item?.evidenceId || item?.evidence_id || item?.id || ""))
+    ].filter(Boolean));
+    const postTask = Object.assign({}, task, {
+      taskId: localTaskId,
+      id: localTaskId,
+      scope_id: scopeId,
+      taskLocalEvidence: Object.assign({}, task?.taskLocalEvidence || {}, {
+        taskId: localTaskId,
+        scopeId: scopeId,
+        primarySourceEvidence: { evidenceId: String(sourceContract?.primaryEvidenceId || "") }
+      })
+    });
+    const postShortlist = postStructureContext.length
+      ? taskDescriptionSemanticShortlistForTask(postStructureContext, sourceContract || {}, postTask, {
+        contextBundle: { factsById: Object.fromEntries((sourceContract?.facts || []).map((fact) => [String(fact?.factId || ""), fact]).filter(([factId]) => factId)) }
+      })
+      : { items: [] };
+    const postExactEvidenceIds = new Set(postStructureContext.filter(taskLocalProviderBound)
+      .map((item) => String(item?.evidenceId || item?.evidence_id || item?.id || ""))
+      .concat(postShortlist.items
+      .filter((item) => taskSemanticTaskLocalRelevanceAccepted(item) && taskLocalProviderBound(item))
+      .map((item) => String(item?.evidenceId || item?.id || ""))
+      .filter(Boolean)));
     // The final task-local set is the stable-ID union of rows already selected
     // in both phases.  Keep the first phase order for unique IDs, but replace
     // duplicate rows with the post-structure metadata so downstream facts and
     // citations observe the latest selected record.
-    const hasPostStructureResult = Boolean(local && (Array.isArray(postStructureContext)
-      || Array.isArray(local.evidenceIds)
-      || Array.isArray(local.evidence_ids)));
+    const hasPostStructureResult = Boolean(local && (postStructureContext.length > 0
+      || (local.evidenceIds || local.evidence_ids || []).length > 0));
     const deterministicReplacement = Array.isArray(options.onlyMarkedActionFactIds);
     const phaseRowsById = new Map();
     const phaseOrder = [];
@@ -38248,18 +39489,28 @@ function attachTaskWorkflowSemanticEvidence(tasks = [], sourceContract = null, e
     };
     const addPhaseRow = (rawRow, phase, selectedIds) => {
       const evidenceId = String(rawRow?.evidenceId || rawRow?.evidence_id || rawRow?.id || "").trim();
+      const selectedContainer = phase === "pre" || phase === "post";
+      if (phase === "pre" && !taskLocalProviderBound(rawRow, selectedContainer)) return;
+      if (phase === "post"
+        && !preStructureAllowedEvidenceIds.has(evidenceId)
+        && !postExactEvidenceIds.has(evidenceId)
+        && !taskLocalProviderBound(rawRow, selectedContainer)) return;
       if (!evidenceId || !usableEvidenceForScope(evidenceId, scopeId, localTaskId)) return;
+      const scopedCatalogItem = catalogRowForTask(evidenceId);
+      const scopedCatalogFacts = (scopedCatalogItem?.structuredFacts || []).filter((fact) => String(fact?.scopeId || fact?.scope_id || "") === scopeId);
+      const scopedRawFacts = (rawRow?.structuredFacts || []).filter((fact) => String(fact?.scopeId || fact?.scope_id || "") === scopeId);
       if (!selectedIds.includes(evidenceId)) selectedIds.push(evidenceId);
       const row = Object.assign(
         {},
         catalogItems.get(evidenceId) || {},
+        scopedCatalogItem || {},
         Object.fromEntries(Object.entries(rawRow || {}).filter(([, value]) => value !== undefined && value !== null && value !== "")),
         { evidenceId }
       );
       row.structuredFacts = mergeStructuredFacts(
-        catalogItems.get(evidenceId)?.structuredFacts,
-        rawRow?.structuredFacts,
-        catalogItems.get(evidenceId)
+        scopedCatalogFacts,
+        scopedRawFacts,
+        scopedCatalogItem || catalogItems.get(evidenceId)
       );
       if (!phaseRowsById.has(evidenceId)) phaseOrder.push(evidenceId);
       phaseRowsById.set(evidenceId, mergePhaseRow(phaseRowsById.get(evidenceId), row, phase));
@@ -38268,81 +39519,183 @@ function attachTaskWorkflowSemanticEvidence(tasks = [], sourceContract = null, e
       for (const value of ids || []) {
         const evidenceId = String(value || "").trim();
         if (!evidenceId) continue;
-        const row = catalogItems.get(evidenceId) || { evidenceId };
+        const row = catalogRowForTask(evidenceId);
         addPhaseRow(row, phase, selectedIds);
       }
     };
+    const hasPreStructureRows = preStructureContext.length > 0 || (preScope?.evidenceIds || []).length > 0;
+    const hasPostStructureRows = postStructureContext.length > 0
+      || (local?.evidenceIds || local?.evidence_ids || []).length > 0;
+    const preserveExistingStableSelection = !hasPreStructureRows && !hasPostStructureRows;
     for (const row of preStructureContext) addPhaseRow(row, "pre", preSelectedIds);
     addPhaseIds(preScope?.evidenceIds, "pre", preSelectedIds);
     for (const row of postStructureContext) addPhaseRow(row, "post", postSelectedIds);
     addPhaseIds(local?.evidenceIds || local?.evidence_ids, "post", postSelectedIds);
-    const finalEvidenceIds = phaseOrder.slice();
+    if (preserveExistingStableSelection) {
+      // An empty retrieval result is not a replacement signal. Preserve the
+      // incoming stable IDs only after revalidating each ID against the
+      // current task scope and catalog ownership boundary.
+      addPhaseIds(task?.evidence_ids || task?.evidenceIds, "pre", preSelectedIds);
+    }
+    // Active-source retrieval intentionally excludes the source note. Seed its
+    // canonical catalog row into the final closure so optional retrieval cannot
+    // erase the marked action or its mandatory current facts.
+    const explicitPrimaryEvidence = uniqueValues([
+      ...(task?.evidence_ids || task?.evidenceIds || []),
+      ...(preScope?.evidenceIds || []),
+      ...(preStructureContext || []).map((item) => item?.evidenceId || item?.evidence_id || item?.id),
+      ...(postStructureContext || []).map((item) => item?.evidenceId || item?.evidence_id || item?.id),
+      ...(local?.evidenceIds || local?.evidence_ids || [])
+    ].map(String).filter(Boolean)).includes(primaryEvidenceId);
+    if (primaryEvidenceId && explicitPrimaryEvidence && !phaseRowsById.has(primaryEvidenceId)) {
+      let primaryRow = catalogItems.get(primaryEvidenceId) || null;
+      if (!primaryRow) {
+        const primaryFacts = (sourceContract?.facts || []).filter((fact) => String(fact?.evidenceId || fact?.evidence_id || "") === primaryEvidenceId);
+        if (primaryFacts.length) {
+          primaryRow = {
+            evidenceId: primaryEvidenceId,
+            sourceKind: "current-source",
+            current: true,
+            temporalRelation: "current",
+            authorityState: "authoritative",
+            conflictState: "none",
+            scopeIds: scopeId ? [scopeId] : [],
+            taskScopeAssociations: localTaskId && scopeId ? [{ taskId: localTaskId, scopeId }] : [],
+            structuredFacts: primaryFacts
+          };
+          catalogRowsById.set(primaryEvidenceId, [primaryRow]);
+          catalogItems.set(primaryEvidenceId, primaryRow);
+        }
+      }
+      if (primaryRow) addPhaseRow(primaryRow, "pre", preSelectedIds);
+    }
+    const finalEvidenceIds = primaryEvidenceId && phaseOrder.includes(primaryEvidenceId)
+      ? [primaryEvidenceId, ...phaseOrder.filter((evidenceId) => evidenceId !== primaryEvidenceId)]
+      : phaseOrder.slice();
     const localEvidenceIds = finalEvidenceIds.filter((evidenceId) => usableEvidenceForScope(evidenceId, scopeId, localTaskId));
     const finalContext = localEvidenceIds.map((evidenceId) => phaseRowsById.get(evidenceId)).filter(Boolean)
-      .map((item) => materializeSelectedTaskSemanticExcerptFact(item, localTaskId, scopeId));
-    // Empty post-structure retrieval is not permission to discard the model's
-    // current-source grounding. Replace optional task-local semantic rows only
-    // when the post phase selected valid evidence; otherwise retain existing
-    // stable IDs and union any valid pre/post rows.
-    const existingEvidenceIds = uniqueValues([...(task.evidence_ids || task.evidenceIds || [])].map(String).filter(Boolean));
+      .map((item) => materializeSelectedTaskSemanticExcerptFact(item, localTaskId, scopeId, {
+        task,
+        sourceContract
+      }));
+    // Recompute the task-local closure from the final bounded phase rows. Stale
+    // optional IDs/facts on the incoming task are not a provider permission.
     const existingFactRefs = uniqueValues([...(task.fact_refs || task.factRefs || [])].map(String).filter(Boolean));
     const existingFactBindings = Array.isArray(task.fact_bindings || task.factBindings)
       ? (task.fact_bindings || task.factBindings).slice()
       : [];
-    const currentSourceEvidenceIds = existingEvidenceIds.filter((evidenceId) => {
-      const item = catalogItems.get(evidenceId);
-      return item?.sourceKind === "current-source" || evidenceId === String(sourceContract?.primaryEvidenceId || "");
-    });
-    const currentSourceFactIds = existingFactRefs.filter((factId) => {
-      const fact = (sourceContract?.facts || []).find((entry) => String(entry?.factId || "") === factId);
-      return fact?.current === true
-        && fact?.authorityState === "authoritative"
-        && fact?.conflictState === "none"
-        && (!fact.evidenceId || fact.evidenceId === String(sourceContract?.primaryEvidenceId || ""));
-    });
-    const currentSourceFactBindings = existingFactBindings.filter((binding) => currentSourceFactIds.includes(String(binding?.factId || binding?.fact_id || "")));
-    const replaceExistingEvidence = postSelectedIds.length > 0 && !deterministicReplacement;
-    task.evidence_ids = replaceExistingEvidence
-      ? uniqueValues([...currentSourceEvidenceIds, ...localEvidenceIds])
-      : uniqueValues([...existingEvidenceIds, ...localEvidenceIds]);
-    if (replaceExistingEvidence) {
-      task.fact_refs = currentSourceFactIds.slice();
-      task.factRefs = currentSourceFactIds.slice();
-      task.fact_bindings = currentSourceFactBindings.slice();
-      task.factBindings = currentSourceFactBindings.slice();
+    const currentSourceEvidenceIds = uniqueValues(localEvidenceIds.filter((evidenceId) => taskLocalCurrentProtected(phaseRowsById.get(evidenceId) || {})));
+    const selectedEvidenceSet = new Set(localEvidenceIds);
+    const currentSourceFactIds = [];
+    const finalFactRefs = [];
+    const finalFactBindings = [];
+    const factIdsSeen = new Set();
+    const bindingKeysSeen = new Set();
+    const addFinalFact = (fact = {}, evidence = null, mandatory = false) => {
+      const factId = String(fact?.factId || fact?.fact_id || fact?.id || "");
+      const evidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || evidence?.evidenceId || evidence?.evidence_id || "");
+      const factScopeId = String(fact?.scopeId || fact?.scope_id || evidence?.scopeId || evidence?.scope_id || scopeId || "");
+      const sharedSourceScopeId = String(sourceContract?.sourceScopeId || sourceContract?.source_scope_id || "");
+      const sharedPrimaryFact = evidenceId === String(sourceContract?.primaryEvidenceId || "")
+        && sharedSourceScopeId
+        && factScopeId === sharedSourceScopeId;
+      const authorityState = String(fact?.authorityState || fact?.authority || "").toLowerCase();
+      const conflictState = String(fact?.conflictState || fact?.conflict_state || "").toLowerCase();
+      if (!factId || !evidenceId || !selectedEvidenceSet.has(evidenceId) || (factScopeId !== scopeId && !sharedPrimaryFact)
+        || ["rejected", "blocked", "conflict", "conflicted"].includes(authorityState)
+        || ["conflict", "conflicted", "rejected"].includes(conflictState)) return;
+      if (!factIdsSeen.has(factId)) {
+        factIdsSeen.add(factId);
+        finalFactRefs.push(factId);
+      }
+      if (mandatory && !currentSourceFactIds.includes(factId)) currentSourceFactIds.push(factId);
+      const binding = taskWorkflowFactBindingFromFact(fact, evidence, sharedPrimaryFact ? factScopeId : scopeId);
+      if (!binding) return;
+      const bindingKey = `${binding.factId}\u0000${binding.evidenceId}\u0000${binding.scopeId}`;
+      if (!bindingKeysSeen.has(bindingKey)) {
+        bindingKeysSeen.add(bindingKey);
+        finalFactBindings.push(binding);
+      }
+    };
+    const sourceFactsById = new Map((sourceContract?.facts || []).map((fact) => [String(fact?.factId || fact?.fact_id || fact?.id || ""), fact]).filter(([factId]) => factId));
+    for (const fact of sourceFactsById.values()) {
+      const factId = String(fact?.factId || fact?.fact_id || fact?.id || "");
+      const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
+      const mandatoryFor = Array.isArray(fact?.mandatoryFor) ? fact.mandatoryFor.map(String) : [];
+      const mandatory = fact?.current === true
+        && String(fact?.authorityState || fact?.authority || "").toLowerCase() === "authoritative"
+        && String(fact?.conflictState || "none").toLowerCase() === "none"
+        && currentSourceEvidenceIds.includes(evidenceId)
+        && (mandatoryFor.some((target) => ["task", "description", "identity"].includes(target))
+          || String(fact?.role || "").toLowerCase() === "requested-action"
+          || existingFactRefs.includes(factId));
+      if (mandatory) addFinalFact(fact, { evidenceId, scopeId }, true);
     }
+    for (const binding of existingFactBindings) {
+      const factId = String(binding?.factId || binding?.fact_id || "");
+      const fact = sourceFactsById.get(factId);
+      const bindingEvidenceId = String(binding?.evidenceId || binding?.evidence_id || fact?.evidenceId || fact?.evidence_id || "");
+      if (fact && (currentSourceFactIds.includes(factId)
+        || (preserveExistingStableSelection && selectedEvidenceSet.has(bindingEvidenceId)))) {
+        addFinalFact(fact, binding, currentSourceFactIds.includes(factId));
+      }
+    }
+    for (const item of finalContext) {
+      for (const fact of item?.structuredFacts || []) addFinalFact(fact, item, false);
+    }
+    task.evidence_ids = localEvidenceIds.slice();
+    task.fact_refs = finalFactRefs.slice();
+    task.factRefs = finalFactRefs.slice();
+    task.fact_bindings = finalFactBindings.slice();
+    task.factBindings = finalFactBindings.slice();
     task.evidenceIds = task.evidence_ids.slice();
-    attachTaskLocalSemanticFacts(task, localEvidenceIds, { items: finalContext }, scopeId, { replaceExisting: false });
-    const providerEligibleEvidenceIds = uniqueValues([
-      ...currentSourceEvidenceIds,
-      ...finalContext.filter((item) => {
-        const materialityState = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase();
-        const reasonCodes = [
-          item?.reservationReason,
-          item?.reservation_reason,
-          item?.selectionReasonCode,
-          item?.selection_reason_code,
-          item?.inclusionReason,
-          item?.inclusion_reason,
-          item?.finalReasonCode,
-          item?.final_reason_code,
-          item?.admissionReason,
-          item?.admission_reason
-        ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
-        const explicitlyRetained = reasonCodes.some((reason) => /(?:continuity|exact-current-open|material-history)/.test(reason));
-        const explicitlyMaterial = Boolean(materialityState && materialityState !== "unclassified")
-          || reasonCodes.some((reason) => TASK_DESCRIPTION_MATERIAL_ADMISSION_REASONS.has(reason));
-        const authoritativeCurrentMaterial = String(item?.sourceKind || "").toLowerCase() === "current-source-context"
-          && item?.current === true
-          && String(item?.authorityState || "").toLowerCase() === "authoritative"
-          && item?.actionLaneSupported === true
-          && Number(item?.actionLaneContribution || 0) > 0;
-        return explicitlyRetained || explicitlyMaterial || authoritativeCurrentMaterial;
-      }).map((item) => String(item?.evidenceId || item?.evidence_id || ""))
-    ].filter(Boolean));
-    task.providerEligibleEvidenceIds = providerEligibleEvidenceIds;
     const selectedContext = finalContext
       .filter((chunk) => usableEvidenceForScope(chunk?.evidenceId, scopeId, localTaskId));
+    const providerEligibleEvidenceIds = localEvidenceIds.slice();
+    task.providerEligibleEvidenceIds = providerEligibleEvidenceIds;
+    const boundedPhase = (phase = null) => {
+      if (!phase || typeof phase !== "object") return phase || null;
+      const phaseContext = Array.isArray(phase.context)
+        ? phase.context.filter((item) => selectedEvidenceSet.has(String(item?.evidenceId || item?.evidence_id || item?.id || "")))
+        : [];
+      const phaseEvidenceIds = uniqueValues([
+        ...(phase.evidenceIds || phase.evidence_ids || []),
+        ...phaseContext.map((item) => item?.evidenceId || item?.evidence_id || item?.id)
+      ].map(String).filter((evidenceId) => selectedEvidenceSet.has(evidenceId)));
+      return Object.assign({}, phase, {
+        evidenceIds: phaseEvidenceIds,
+        evidence_ids: phaseEvidenceIds.slice(),
+        context: phaseContext
+      });
+    };
+    const boundedPreStructure = boundedPhase(preScope);
+    const boundedRefinement = boundedPhase(local);
+    const existingTaskLocalEvidence = task?.taskLocalEvidence && typeof task.taskLocalEvidence === "object"
+      ? task.taskLocalEvidence
+      : {};
+    const primarySourceEvidence = Object.assign({}, existingTaskLocalEvidence.primarySourceEvidence || {}, {
+      evidenceId: primaryEvidenceId || String(existingTaskLocalEvidence.primarySourceEvidence?.evidenceId || ""),
+      taskId: localTaskId,
+      scopeId,
+      scopeIds: scopeId ? [scopeId] : [],
+      taskScopeAssociations: localTaskId && scopeId ? [{ taskId: localTaskId, scopeId }] : []
+    });
+    task.taskLocalEvidence = Object.assign({}, existingTaskLocalEvidence, {
+      taskId: localTaskId,
+      scopeId,
+      primarySourceEvidence,
+      evidenceIds: localEvidenceIds.slice(),
+      evidence_ids: localEvidenceIds.slice(),
+      factRefs: finalFactRefs.slice(),
+      fact_refs: finalFactRefs.slice(),
+      factBindings: finalFactBindings.slice(),
+      fact_bindings: finalFactBindings.slice(),
+      supportingSemanticEvidence: selectedContext.filter((item) => !taskLocalCurrentProtected(item)),
+      selectedSupportingEvidenceIds: selectedContext
+        .filter((item) => !taskLocalCurrentProtected(item))
+        .map((item) => String(item?.evidenceId || item?.evidence_id || item?.id || ""))
+        .filter(Boolean)
+    });
     const hasPreStructureEvidence = preSelectedIds.length > 0;
     const finalEvidencePhase = deterministicReplacement
       ? (hasPostStructureResult ? "pre-structure+post-structure-replacement" : "pre-structure-replacement")
@@ -38358,8 +39711,8 @@ function attachTaskWorkflowSemanticEvidence(tasks = [], sourceContract = null, e
       queryId: local?.queryId || preScope?.queryId || "",
       sourceContractId: sourceContract?.id || "",
       evidenceIds: localEvidenceIds,
-      preStructure: preScope || null,
-      refinement: local || null,
+      preStructure: boundedPreStructure,
+      refinement: boundedRefinement,
       context: selectedContext,
       telemetry: Object.assign({}, preScope?.telemetry || {}, local?.telemetry || {}, {
         finalEvidencePhase,
@@ -38851,20 +40204,61 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     ].map(String).filter(Boolean));
     return { taskId: String(rich.taskId || taskWorkflowOwnershipKey(task)), scopeId: String(rich.scopeId || task?.scope_id || task?.scopeId || ""), bindings, selectedEvidenceIds };
   };
+  const flattenedTasks = flattenTaskPlan(options.tasks || []);
   const exactTaskSemanticFactBindings = new Set();
-  for (const task of flattenTaskPlan(options.tasks || [])) {
+  const selectedEvidenceIdsAcrossTasks = new Set();
+  const bindingDiagnostics = {
+    flattenedTaskCount: flattenedTasks.length,
+    flattenedTaskIdPresentCount: 0,
+    flattenedScopeIdPresentCount: 0,
+    bindingCount: 0,
+    bindingTaskIdPresentCount: 0,
+    bindingScopeIdPresentCount: 0,
+    bindingEvidenceIdPresentCount: 0,
+    bindingFactIdPresentCount: 0,
+    bindingScopeMismatchCount: 0,
+    bindingTaskMismatchCount: 0,
+    bindingEvidenceSelectedMismatchCount: 0,
+    bindingFactMismatchCount: 0,
+    bindingFactEvidenceMismatchCount: 0,
+    bindingFactScopeMismatchCount: 0,
+    exactTaskSemanticFactBindingsCount: 0
+  };
+  for (const task of flattenedTasks) {
     const { taskId, scopeId, bindings, selectedEvidenceIds } = projectionTaskBindingState(task);
+    if (taskId) bindingDiagnostics.flattenedTaskIdPresentCount += 1;
+    if (scopeId) bindingDiagnostics.flattenedScopeIdPresentCount += 1;
+    for (const evidenceId of selectedEvidenceIds) selectedEvidenceIdsAcrossTasks.add(evidenceId);
     for (const binding of bindings) {
+      bindingDiagnostics.bindingCount += 1;
       const factId = String(binding?.factId || binding?.fact_id || "");
       const evidenceId = String(binding?.evidenceId || binding?.evidence_id || "");
       const bindingScopeId = String(binding?.scopeId || binding?.scope_id || "");
+      const bindingTaskId = String(binding?.taskId || binding?.task_id || "");
+      if (bindingTaskId) bindingDiagnostics.bindingTaskIdPresentCount += 1;
+      if (bindingScopeId) bindingDiagnostics.bindingScopeIdPresentCount += 1;
+      if (evidenceId) bindingDiagnostics.bindingEvidenceIdPresentCount += 1;
+      if (factId) bindingDiagnostics.bindingFactIdPresentCount += 1;
+      if (!bindingScopeId || bindingScopeId !== scopeId) bindingDiagnostics.bindingScopeMismatchCount += 1;
+      if (bindingTaskId && bindingTaskId !== taskId) bindingDiagnostics.bindingTaskMismatchCount += 1;
+      if (!evidenceId || !selectedEvidenceIds.has(evidenceId)) bindingDiagnostics.bindingEvidenceSelectedMismatchCount += 1;
+      const boundFact = factId ? factsById.get(factId) : null;
+      if (!factId || !boundFact) bindingDiagnostics.bindingFactMismatchCount += 1;
+      if (boundFact) {
+        const boundFactEvidenceId = String(boundFact.evidenceId || boundFact.evidence_id || "");
+        const boundFactScopeId = String(boundFact.scopeId || boundFact.scope_id || "");
+        if (boundFactEvidenceId && evidenceId && boundFactEvidenceId !== evidenceId) bindingDiagnostics.bindingFactEvidenceMismatchCount += 1;
+        if (boundFactScopeId && bindingScopeId && boundFactScopeId !== bindingScopeId) bindingDiagnostics.bindingFactScopeMismatchCount += 1;
+      }
       if (!taskId || !scopeId || bindingScopeId !== scopeId || !factId || !evidenceId || !selectedEvidenceIds.has(evidenceId)) continue;
       exactTaskSemanticFactBindings.add(`${taskId}\u0000${scopeId}\u0000${evidenceId}\u0000${factId}`);
     }
   }
-  const optionalSemanticFactBound = (item = {}) => {
+  bindingDiagnostics.selectedEvidenceCount = selectedEvidenceIdsAcrossTasks.size;
+  bindingDiagnostics.exactTaskSemanticFactBindingsCount = exactTaskSemanticFactBindings.size;
+  const optionalSemanticFactsForItem = (item = {}) => {
     const evidenceId = String(item.evidenceId || item.id || "");
-    const facts = [...(item.structuredFacts || []), ...Array.from(factsById.values())].filter((fact, index, rows) => {
+    return [...(item.structuredFacts || []), ...Array.from(factsById.values())].filter((fact, index, rows) => {
       const factId = String(fact?.factId || fact?.fact_id || "");
       const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || evidenceId);
       const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
@@ -38873,16 +40267,43 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
         && !["rejected", "conflict"].includes(String(fact?.authorityState || "").toLowerCase())
         && !["rejected", "conflict", "conflicted"].includes(String(fact?.conflictState || "").toLowerCase());
     });
-    if (!facts.length) return false;
-    for (const task of flattenTaskPlan(options.tasks || [])) {
+  };
+  const optionalSemanticFactBindingState = (item = {}) => {
+    const evidenceId = String(item.evidenceId || item.id || "");
+    const facts = optionalSemanticFactsForItem(item);
+    const exactFactIds = new Set();
+    for (const task of flattenedTasks) {
       const { taskId, scopeId, selectedEvidenceIds } = projectionTaskBindingState(task);
       if (!taskId || !scopeId || !selectedEvidenceIds.has(evidenceId)) continue;
-      if (facts.some((fact) => String(fact.scopeId || fact.scope_id || "") === scopeId && exactTaskSemanticFactBindings.has(`${taskId}\u0000${scopeId}\u0000${evidenceId}\u0000${String(fact.factId || fact.fact_id || "")}`))) return true;
+      for (const fact of facts) {
+        const factId = String(fact.factId || fact.fact_id || "");
+        if (String(fact.scopeId || fact.scope_id || "") === scopeId
+          && exactTaskSemanticFactBindings.has(`${taskId}\u0000${scopeId}\u0000${evidenceId}\u0000${factId}`)) exactFactIds.add(factId);
+      }
     }
-    return false;
+    return { facts, exactFactIds, bound: exactFactIds.size > 0 };
   };
-  const optionalCandidates = items.filter((item) => !protectedEvidenceIds.has(item.evidenceId));
+  const optionalCandidates = items
+    .filter((item) => !protectedEvidenceIds.has(item.evidenceId))
+    .filter((item) => !options.descriptionProjection
+      || taskDescriptionProviderOptionalFactBackedProjectionEligible(item, factsById, options.tasks || []));
   const requireExactTaskFactBinding = options.requireExactTaskFactBinding === true;
+  const optionalBindingStates = new Map();
+  let optionalFactsPresentCount = 0;
+  let optionalFactsPresentEvidenceCount = 0;
+  let optionalExactKeyMatchCount = 0;
+  let optionalExactKeyMissCount = 0;
+  let optionalExactKeyMissEvidenceCount = 0;
+  for (const item of optionalCandidates) {
+    const state = optionalSemanticFactBindingState(item);
+    optionalBindingStates.set(String(item.evidenceId || item.id || ""), state);
+    if (state.facts.length) optionalFactsPresentEvidenceCount += 1;
+    optionalFactsPresentCount += state.facts.length;
+    optionalExactKeyMatchCount += state.exactFactIds.size;
+    optionalExactKeyMissCount += Math.max(0, state.facts.length - state.exactFactIds.size);
+    if (state.facts.length && !state.bound) optionalExactKeyMissEvidenceCount += 1;
+  }
+  const optionalSemanticFactBound = (item = {}) => optionalBindingStates.get(String(item.evidenceId || item.id || ""))?.bound === true;
   const optionalItems = requireExactTaskFactBinding ? optionalCandidates.filter(optionalSemanticFactBound) : optionalCandidates;
   const unboundOptionalEvidenceIds = requireExactTaskFactBinding ? optionalCandidates.filter((item) => !optionalSemanticFactBound(item)).map((item) => item.evidenceId) : [];
   const coverageEligibleEvidenceIds = Array.isArray(options.coverageEligibleEvidenceIds)
@@ -39034,6 +40455,27 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     optionalCandidateCount: optionalCandidates.length,
     unboundOptionalCount: unboundOptionalEvidenceIds.length,
     unboundOptionalEvidenceIds,
+    flattenedTaskCount: bindingDiagnostics.flattenedTaskCount,
+    flattenedTaskIdPresentCount: bindingDiagnostics.flattenedTaskIdPresentCount,
+    flattenedScopeIdPresentCount: bindingDiagnostics.flattenedScopeIdPresentCount,
+    bindingCount: bindingDiagnostics.bindingCount,
+    bindingTaskIdPresentCount: bindingDiagnostics.bindingTaskIdPresentCount,
+    bindingScopeIdPresentCount: bindingDiagnostics.bindingScopeIdPresentCount,
+    bindingEvidenceIdPresentCount: bindingDiagnostics.bindingEvidenceIdPresentCount,
+    bindingFactIdPresentCount: bindingDiagnostics.bindingFactIdPresentCount,
+    selectedEvidenceCount: bindingDiagnostics.selectedEvidenceCount,
+    exactTaskSemanticFactBindingsCount: bindingDiagnostics.exactTaskSemanticFactBindingsCount,
+    bindingScopeMismatchCount: bindingDiagnostics.bindingScopeMismatchCount,
+    bindingTaskMismatchCount: bindingDiagnostics.bindingTaskMismatchCount,
+    bindingEvidenceSelectedMismatchCount: bindingDiagnostics.bindingEvidenceSelectedMismatchCount,
+    bindingFactMismatchCount: bindingDiagnostics.bindingFactMismatchCount,
+    bindingFactEvidenceMismatchCount: bindingDiagnostics.bindingFactEvidenceMismatchCount,
+    bindingFactScopeMismatchCount: bindingDiagnostics.bindingFactScopeMismatchCount,
+    optionalFactsPresentCount,
+    optionalFactsPresentEvidenceCount,
+    optionalExactKeyMatchCount,
+    optionalExactKeyMissCount,
+    optionalExactKeyMissEvidenceCount,
     providerEligibleOptionalCount: coverageEligibleOptionalItems.length,
     selectedOptionalCount: selectedOptional.length,
     selectedCount: projectedItems.length,
@@ -39087,6 +40529,8 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     const evidenceId = String(fact.evidenceId || fact.evidence_id || "");
     if (selectedEvidenceIds.has(evidenceId)) providerFactIds.add(String(fact.factId || fact.fact_id || ""));
   }
+  telemetry.selectedEvidenceIds = projectedItems.map((item) => String(item.evidenceId || item.id || "")).filter(Boolean);
+  telemetry.selectedFactIds = Array.from(providerFactIds).filter(Boolean);
   const projectionScopes = new Set();
   const protectedProjectionScopes = new Set();
   const addProjectionScope = (value, protectedScope = false) => {
@@ -39166,6 +40610,118 @@ function freezeTaskLocalProviderProjection(projection = {}) {
   return Object.freeze(frozen);
 }
 
+// Rewrite the provider-visible task-local closure from the exact serialized
+// projection. The retrieval/catalog closure remains available separately for
+// diagnostics, but stale pre-projection IDs are never sent downstream.
+function synchronizeTaskLocalEvidenceWithProviderProjection(task = {}, projection = {}, sourceContract = {}, options = {}) {
+  const rich = task?.taskLocalEvidence && typeof task.taskLocalEvidence === "object"
+    ? task.taskLocalEvidence
+    : {};
+  const projectedIds = new Set((projection.selectedEvidenceIds || []).map(String).filter(Boolean));
+  const taskId = String(rich.taskId || task.taskId || task.id || "");
+  const scopeId = String(rich.scopeId || task.scope_id || task.scopeId || "");
+  const taskKey = String(options.taskKey || taskWorkflowOwnershipKey(task, options.index) || taskId);
+  const refs = options.useProjectionAll === true
+    ? Array.from(projectedIds)
+    : uniqueValues([
+      ...(options.taskEvidenceRefs?.[taskKey] || []),
+      ...(task.providerEligibleEvidenceIds || []),
+      ...(task.evidence_ids || task.evidenceIds || []),
+      ...(rich.evidenceIds || rich.evidence_ids || [])
+    ].map(String).filter(Boolean));
+  const selectedIds = uniqueValues([
+    sourceContract.primaryEvidenceId,
+    ...refs
+  ].map(String).filter((evidenceId) => projectedIds.has(evidenceId)));
+  const byId = new Map(Object.entries(projection.providerEvidenceById || {}).map(([id, row]) => [String(id), row]));
+  for (const row of options.evidenceItems || []) {
+    const evidenceId = String(row?.evidenceId || row?.evidence_id || row?.id || "");
+    if (evidenceId && !byId.has(evidenceId)) byId.set(evidenceId, row);
+  }
+  const projectedItems = selectedIds.map((evidenceId) => byId.get(evidenceId)).filter(Boolean);
+  const factById = new Map();
+  const addFact = (fact = {}) => {
+    const factId = String(fact?.factId || fact?.fact_id || fact?.id || "");
+    if (factId && !factById.has(factId)) factById.set(factId, fact);
+  };
+  for (const fact of sourceContract.facts || []) addFact(fact);
+  for (const row of options.evidenceItems || []) for (const fact of row?.structuredFacts || []) addFact(fact);
+  for (const row of projectedItems) for (const fact of row?.structuredFacts || []) addFact(fact);
+  for (const fact of rich.typedFacts || []) addFact(fact);
+  const selectedFactIds = [];
+  const selectedFacts = [];
+  for (const fact of factById.values()) {
+    const evidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "");
+    const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+    if (!evidenceId || !selectedIds.includes(evidenceId) || (scopeId && factScopeId && factScopeId !== scopeId)) continue;
+    const factId = String(fact?.factId || fact?.fact_id || fact?.id || "");
+    if (!factId || selectedFactIds.includes(factId)) continue;
+    selectedFactIds.push(factId);
+    selectedFacts.push(fact);
+  }
+  const factBindings = selectedFacts.map((fact) => taskWorkflowFactBindingFromFact(fact, byId.get(String(fact.evidenceId || fact.evidence_id || "")) || {}, scopeId))
+    .filter(Boolean);
+  const existingLedgerByEvidence = new Map((rich.citationLedger || []).map((entry) => [
+    String(entry?.evidenceId || entry?.evidence_id || ""), entry
+  ]).filter(([evidenceId]) => evidenceId));
+  const citationLedger = projectedItems.map((item, index) => {
+    const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+    const existing = existingLedgerByEvidence.get(evidenceId) || {};
+    return Object.assign({}, existing, {
+      number: Number(existing.number || index + 1),
+      evidenceId,
+      section: String(existing.section || (String(item?.sourceKind || "").toLowerCase() === "current-source" ? "Source" : "Context")),
+      sourceId: String(existing.sourceId || item?.sourceId || item?.provenance?.sourceId || ""),
+      title: String(existing.title || item?.title || item?.provenance?.title || ""),
+      path: String(existing.path || item?.path || item?.provenance?.path || "")
+    });
+  });
+  const primaryEvidenceId = String(sourceContract.primaryEvidenceId || rich.primarySourceEvidence?.evidenceId || "");
+  const primarySourceEvidence = Object.assign({}, rich.primarySourceEvidence || projectedItems.find((item) => String(item?.evidenceId || "") === primaryEvidenceId) || {}, {
+    evidenceId: primaryEvidenceId,
+    taskId,
+    scopeId,
+    scopeIds: scopeId ? [scopeId] : [],
+    taskScopeAssociations: taskId && scopeId ? [{ taskId, scopeId }] : []
+  });
+  const supportingSemanticEvidence = projectedItems.filter((item) => String(item?.evidenceId || item?.id || "") !== primaryEvidenceId);
+  const nextRich = Object.assign({}, rich, {
+    taskId,
+    scopeId,
+    primarySourceEvidence,
+    supportingSemanticEvidence,
+    evidenceIds: selectedIds,
+    evidence_ids: selectedIds.slice(),
+    factRefs: selectedFactIds,
+    fact_refs: selectedFactIds.slice(),
+    typedFacts: selectedFacts,
+    factBindings,
+    fact_bindings: factBindings.slice(),
+    citationLedger,
+    selectedSupportingEvidenceIds: supportingSemanticEvidence.map((item) => String(item?.evidenceId || item?.id || "")).filter(Boolean),
+    providerEvidenceIds: selectedIds.slice(),
+    providerFactIds: selectedFactIds.slice()
+  });
+  const localSemantic = task.taskLocalSemanticEvidence && typeof task.taskLocalSemanticEvidence === "object"
+    ? Object.assign({}, task.taskLocalSemanticEvidence, {
+      taskId,
+      scopeId,
+      evidenceIds: selectedIds.slice(),
+      context: projectedItems
+    })
+    : null;
+  task.taskLocalEvidence = nextRich;
+  task.evidence_ids = selectedIds.slice();
+  task.evidenceIds = selectedIds.slice();
+  task.fact_refs = selectedFactIds.slice();
+  task.factRefs = selectedFactIds.slice();
+  task.fact_bindings = factBindings.slice();
+  task.factBindings = factBindings.slice();
+  task.providerEligibleEvidenceIds = selectedIds.slice();
+  if (localSemantic) task.taskLocalSemanticEvidence = localSemantic;
+  return task;
+}
+
 function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContract = {}, task = {}, options = {}) {
   const gateCounts = {
     candidate: 0,
@@ -39179,7 +40735,6 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
   const rich = task?.taskLocalEvidence || {};
   const taskId = String(rich.taskId || task.taskId || task.id || "");
   const scopeId = String(rich.scopeId || task.scope_id || task.scopeId || "");
-  const exactRelevanceProfile = options.relevanceProfile || taskDescriptionExactRelevanceProfile(task, sourceContract);
   if (!taskId || !scopeId) return { items: [], facts: [], gateCounts, selectedCount: 0, sidecarCount: 0, sidecarJoinCount: 0 };
   const primary = rich.primarySourceEvidence || {};
   const primaryEvidenceId = String(primary.evidenceId || primary.evidence_id || "");
@@ -39241,7 +40796,25 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
     .map((item) => [String(item?.evidenceId || item?.evidence_id || ""), item])
     .filter(([evidenceId]) => evidenceId));
   let sidecarJoinCount = 0;
-  const candidateStateAllowed = (item = {}) => {
+  const associationState = (item = {}) => taskDescriptionTaskScopeAssociationState(item, taskId, scopeId);
+  const exactHistoricalFactAssociation = (item = {}, facts = []) => {
+    // Semantic selection and explicit task/scope fact bindings own historical admission.
+    const historical = String(item.temporalRelation || item.temporal_relation || "").toLowerCase() === "historical"
+      || item.current === false;
+    if (!historical) return false;
+    if (!taskSemanticExactHistoricalBindingEligible(item, taskId, scopeId)) return false;
+    const evidenceId = String(item.evidenceId || item.evidence_id || item.id || "");
+    const result = facts.some((fact) => {
+      const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "");
+      const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+      if (!evidenceId || factEvidenceId !== evidenceId || factScopeId !== scopeId) return false;
+      if (["rejected", "blocked", "conflicted"].includes(String(fact?.authorityState || fact?.authority || "").toLowerCase())
+        || ["conflict", "conflicted", "rejected"].includes(String(fact?.conflictState || "").toLowerCase())) return false;
+      return taskWorkflowExactTaskScopeBindingEligible(fact, taskId, scopeId);
+    });
+    return result;
+  };
+  const candidateStateAllowed = (item = {}, facts = []) => {
     const authority = String(item.authorityState || item.authority || item.provenance?.authority || "").toLowerCase();
     const conflict = String(item.conflictState || "").toLowerCase();
     if (["rejected", "blocked", "conflicted"].includes(authority)
@@ -39249,6 +40822,7 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
     const state = taskDescriptionEvidenceCurrentState(item);
     if (["cancelled", "canceled", "closed", "completed", "deleted", "rejected", "stale", "superseded"].includes(state)) return false;
     const historical = String(item.temporalRelation || "").toLowerCase() === "historical" || item.current === false;
+    if (taskSemanticExactHistoricalBindingEligible(item, taskId, scopeId)) return true;
     if (!taskDescriptionOptionalEvidenceAssociationEligible(item)) return false;
     if (!historical) return item.current === true || String(item.temporalRelation || "").toLowerCase() === "current" || !item.temporalRelation;
     const materialityReason = String(item.materialityReason || item.materiality_reason || "").trim();
@@ -39259,7 +40833,6 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
       && TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(materialityReason)
       && contributions.some((value) => value > 0);
   };
-  const associationState = (item = {}) => taskDescriptionTaskScopeAssociationState(item, taskId, scopeId);
   const candidates = [];
   for (let index = 0; index < (sourceItems || []).length; index += 1) {
     const item = sourceItems[index];
@@ -39274,18 +40847,42 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
     }
     const selectedMetadata = selectedMetadataByEvidenceId.get(evidenceId) || null;
     if (selectedMetadata) sidecarJoinCount += 1;
-    const normalized = taskDescriptionEnsureExactEvidenceRelevance(
-      taskDescriptionSelectionMetadataMerge(item, selectedMetadata, taskId, scopeId),
-      task,
-      sourceContract,
-      { profile: exactRelevanceProfile }
-    );
-    const semanticValues = [normalized.semantic, normalized.semanticScore, normalized.semanticBaseScore, normalized.semanticRankScore, normalized.matchScore]
+    const normalizedInput = taskDescriptionSelectionMetadataMerge(item, selectedMetadata, taskId, scopeId);
+    const normalizedEvidenceId = String(normalizedInput?.evidenceId || normalizedInput?.evidence_id || normalizedInput?.id || evidenceId);
+    // Catalog aggregates may omit the routable body/source fields even when
+    // they retain a useful excerpt. Restore only the local evidence body and
+    // a stable provenance fallback needed for a synthetic excerpt fact; the
+    // original evidence ID/path remains the citation identity.
+    if (!String(normalizedInput.text || normalizedInput.content || normalizedInput.excerpt || normalizedInput.evidence || normalizedInput.sourceSurface || normalizedInput.source_surface || "").trim()) {
+      normalizedInput.text = String(item?.excerpt || item?.text || item?.content || item?.evidence || item?.sourceSurface || item?.source_surface || "");
+    }
+    if (!String(normalizedInput.sourceId || normalizedInput.source_id || normalizedInput.provenance?.sourceId || normalizedInput.provenance?.source_id || "").trim()) {
+      normalizedInput.sourceId = String(normalizedInput.path || normalizedInput.sourcePath || normalizedInput.source_path || `evidence:${normalizedEvidenceId}`);
+    }
+    const normalized = normalizedInput;
+    const semanticValues = [
+      normalized.semantic,
+      normalized.semanticScore,
+      normalized.semanticBaseScore,
+      normalized.semanticRankScore,
+      normalized.matchScore,
+      normalized.aggregateContribution,
+      normalized.weightedContribution,
+      normalized.dimensionScore,
+      normalized.semanticRecencyContribution,
+      normalized.actionLaneContribution,
+      normalized.action_lane_contribution,
+      normalized.winningLaneScore,
+      normalized.winning_lane_score,
+      ...Object.values(normalized.dimensionContributions || normalized.materialityContributions || {})
+    ]
       .map(Number)
       .filter((value) => Number.isFinite(value));
     const semantic = semanticValues.length ? Math.max(...semanticValues) : 0;
     Object.assign(normalized, { semantic, _descriptionSourceOrder: index });
-    const candidateFacts = allFactsByEvidenceId.get(evidenceId) || [];
+    let candidateFacts = allFactsByEvidenceId.get(evidenceId) || [];
+    const historical = String(normalized.temporalRelation || normalized.temporal_relation || "").toLowerCase() === "historical"
+      || normalized.current === false;
     const protectedTaskRow = protectedEvidenceIds.has(evidenceId)
       || normalized.taskLocalProtected === true
       || normalized.protectedTaskRow === true
@@ -39297,21 +40894,23 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
       && !["rejected", "blocked", "conflicted"].includes(String(normalized.authorityState || normalized.authority || normalized.provenance?.authority || "").toLowerCase())
       && !["conflict", "conflicted", "rejected"].includes(String(normalized.conflictState || "").toLowerCase())
       && !protectedTerminalState;
-    if (!protectedUsable && (!semanticCandidateIsAdmissible(normalized) || !candidateStateAllowed(normalized))) {
+    if (!protectedUsable && (!semanticCandidateIsAdmissible(normalized) || !candidateStateAllowed(normalized, candidateFacts))) {
       gateCounts.stateOrMateriality += 1;
       continue;
     }
     const facts = candidateFacts;
-    if (!facts.length) {
+    const requestScopedRelevance = taskSemanticRequestScopedRelevanceEligible(normalized, taskId, scopeId, facts);
+    if (!facts.length && !requestScopedRelevance) {
       gateCounts.noFact += 1;
       continue;
     }
+    const exactAssociation = exactHistoricalFactAssociation(normalized, candidateFacts);
     const association = associationState(normalized);
     const projectionOwnership = taskDescriptionTaskLocalProjectionOwnershipState(normalized, taskId, scopeId);
     const reservationOwnsAssociation = projectionOwnership.sharedOptionalReservation
       || projectionOwnership.materialHistoryReservation
       || projectionOwnership.currentMarkedAction;
-    if (!association.exact && !association.owningScope && !reservationOwnsAssociation) {
+    if (!association.exact && !association.owningScope && !reservationOwnsAssociation && !exactAssociation && !requestScopedRelevance) {
       if (association.rejection === "foreign-same-scope-task") gateCounts.foreignSameScopeTask += 1;
       else gateCounts.noOwningScope += 1;
       continue;
@@ -39320,9 +40919,29 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
       gateCounts.multiScopeOwnership = (gateCounts.multiScopeOwnership || 0) + 1;
       continue;
     }
+    if (exactAssociation) {
+      const taskScopeAssociation = { taskId, scopeId };
+      normalized.taskScopeAssociations = uniqueTaskScopeAssociations([
+        ...(normalized.taskScopeAssociations || normalized.task_scope_associations || []),
+        taskScopeAssociation
+      ]);
+      candidateFacts = candidateFacts.map((fact) => Object.assign({}, fact, {
+        taskId,
+        taskScopeAssociations: uniqueTaskScopeAssociations([
+          ...(fact.taskScopeAssociations || fact.task_scope_associations || []),
+          taskScopeAssociation
+        ])
+      }));
+      allFactsByEvidenceId.set(evidenceId, candidateFacts);
+      normalized.selectionReasonCode = "exact-task-relevance";
+      normalized.semanticExactTaskAssociation = true;
+    } else if (requestScopedRelevance) {
+      normalized.requestScopedSemanticRelevance = true;
+    }
     gateCounts.admitted += 1;
     candidates.push(Object.assign(normalized, {
       _descriptionExactAssociation: association.exact,
+      _descriptionRequestScopedRelevance: requestScopedRelevance,
       _descriptionFacts: facts,
       _descriptionProtected: protectedUsable,
       _descriptionSharedReservation: projectionOwnership.sharedOptionalReservation || projectionOwnership.materialHistoryReservation
@@ -39330,14 +40949,14 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
   }
   const protectedCandidates = candidates.filter((item) => item._descriptionProtected);
   const optionalCandidates = candidates.filter((item) => !item._descriptionProtected);
-  const exactCandidates = optionalCandidates.filter((item) => item._descriptionExactAssociation);
-  const owningPool = exactCandidates.length ? exactCandidates : optionalCandidates.filter((item) => !item._descriptionExactAssociation);
-  const admitted = taskRelativeSemanticAdmissionPool(owningPool, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
-  const diversified = diversifyContextCandidates(admitted, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
-  const admittedPool = [...protectedCandidates, ...diversified];
+  // The source rows are already upstream-semantic admissions. Preserve that
+  // order through the description closure; this boundary does not re-rank,
+  // diversify, or fill an arbitrary row target.
+  const admitted = optionalCandidates.slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+  const admittedPool = [...protectedCandidates, ...admitted];
   const admittedIds = new Set(admittedPool.map((item) => String(item.evidenceId || item.id || "")));
   const selectedEvidenceIds = new Set();
-  const items = [...protectedCandidates, ...owningPool]
+  const items = [...protectedCandidates, ...admitted]
     .filter((item) => {
       const evidenceId = String(item.evidenceId || item.id || "");
       if (!admittedIds.has(evidenceId) || selectedEvidenceIds.has(evidenceId)) return false;
@@ -39362,6 +40981,7 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
       const copy = Object.assign({}, item);
       delete copy._descriptionSourceOrder;
       delete copy._descriptionExactAssociation;
+      delete copy._descriptionRequestScopedRelevance;
       delete copy._descriptionFacts;
       delete copy._descriptionProtected;
       return copy;
@@ -39411,6 +41031,16 @@ function taskLocalProviderProjectionForDescriptionTask(finalItems = [], sourceCo
   const evidenceIsOwned = (item = {}) => {
     const state = associationState(item);
     const ownership = projectionOwnership(item);
+    const requestScopedRelevance = taskSemanticRequestScopedRelevanceEligible(
+      item,
+      taskId,
+      scopeId,
+      item?.structuredFacts || []
+    );
+    if (requestScopedRelevance) {
+      return !["rejected", "blocked", "conflicted"].includes(String(item.authorityState || item.authority || "").toLowerCase())
+        && !["conflict", "conflicted", "rejected"].includes(String(item.conflictState || "").toLowerCase());
+    }
     const reservationOwnsAssociation = ownership.sharedOptionalReservation
       || ownership.materialHistoryReservation
       || ownership.currentMarkedAction;
@@ -39663,18 +41293,22 @@ function taskLocalProviderProjectionForDescriptionTask(finalItems = [], sourceCo
   const selectedMetadataByEvidenceId = new Map((rich.selectedSemanticEvidenceMetadata || [])
     .map((item) => [String(item?.evidenceId || item?.evidence_id || ""), item])
     .filter(([evidenceId]) => evidenceId));
-  const localExactRelevanceProfile = options.relevanceProfile || taskDescriptionExactRelevanceProfile(task, sourceContract);
   const localItems = Array.from(itemsById.values()).filter((item) => {
     const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
     const selectedMetadata = selectedMetadataByEvidenceId.get(evidenceId) || null;
     const merged = selectedMetadata
       ? taskDescriptionSelectionMetadataMerge(item, selectedMetadata, taskId, scopeId)
       : item;
-    const relevanceAnnotated = taskDescriptionEnsureExactEvidenceRelevance(merged, task, sourceContract, { profile: localExactRelevanceProfile });
+    const relevanceAnnotated = merged;
+    const optionalFactBacked = optionalFactBackedEvidenceIds.has(evidenceId);
     return protectedLocalEvidenceIds.has(evidenceId)
-      || (optionalFactBackedEvidenceIds.has(evidenceId)
-        && taskDescriptionOptionalFactBackedAssociationEligible(relevanceAnnotated))
-      || taskDescriptionOptionalEvidenceAssociationEligible(relevanceAnnotated);
+      || (optionalFactBacked
+        ? taskDescriptionProviderOptionalFactBackedProjectionEligible(
+          relevanceAnnotated,
+          new Map(Object.entries(localFactsById)),
+          [task]
+        )
+        : taskDescriptionOptionalEvidenceAssociationEligible(relevanceAnnotated));
   });
   const baselineSelectedEvidenceIds = (options.baselineSelectedEvidenceIds || [])
     .map(String)
@@ -39779,6 +41413,50 @@ function openWebUIModelLoadTimeoutMs(settings = {}) {
 
 function normalizeOpenWebUIModelMetadata(value = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const OPENWEBUI_PROFILE_SCHEMA_VERSION = 5;
+  const OPENWEBUI_PROFILE_CAPABILITY_REVISION = "openwebui-structured-capability-v3";
+  const carriers = ["direct-schema", "direct-json", "wrapper-json"];
+  const normalizeText = (input, max = 160) => typeof input === "string" ? input.trim().slice(0, max) : "";
+  const normalizeModel = (input, fallback = "") => {
+    const candidate = normalizeText(input, 256) || normalizeText(fallback, 256);
+    return candidate.replace(/^openwebui(?:[:/])/i, "").trim();
+  };
+  const normalizeOperation = (input) => {
+    const operation = normalizeText(input, 64).toLowerCase().replace(/[_\s]+/g, "-");
+    if (["description", "task-description"].includes(operation)) return "task-description";
+    if (["task", "generation", "task-generation"].includes(operation)) return "task-generation";
+    if (["chat", "query", "chat-query"].includes(operation)) return "chat-query";
+    return operation || "task-description";
+  };
+  const keyParts = (value) => normalizeText(value, 512).split("|").map((part) => part.trim());
+  const profileObservedAt = (profile) => {
+    if (Number.isFinite(Number(profile?.__observedAt)) && Number(profile.__observedAt) > 0) return Number(profile.__observedAt);
+    for (const key of ["observedAt", "lastObservedAt", "updatedAt", "lastUpdatedAt", "timestamp"]) {
+      const parsed = Date.parse(normalizeText(profile?.[key], 64));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
+  };
+  const profileUsefulness = (profile) => {
+    const observations = Math.max(0, Math.min(32, Math.round(Number(profile.adaptiveConcurrencyObservations) || 0)));
+    const concurrency = Number.isSafeInteger(Number(profile.adaptiveConcurrencyLimit))
+      && Number(profile.adaptiveConcurrencyLimit) >= 1
+      && Number(profile.adaptiveConcurrencyLimit) <= 4 ? 1 : 0;
+    const grammarCarrier = profile.grammarRejected && profile.preferredCarrier === "direct-json" ? 2 : 0;
+    const carrier = profile.preferredCarrier === "direct-schema" ? 2 : profile.preferredCarrier === "direct-json" ? 1 : 0;
+    return [profileObservedAt(profile), observations, concurrency, grammarCarrier + carrier];
+  };
+  const isPreferredProfile = (candidate, incumbent) => {
+    if (!incumbent) return true;
+    const left = profileUsefulness(candidate);
+    const right = profileUsefulness(incumbent);
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    // Records are written newest-first; retaining the first equal candidate
+    // makes migration deterministic without persisting a new timestamp field.
+    return false;
+  };
   const normalized = {};
   for (const [id, row] of Object.entries(value).slice(0, 128)) {
     if (!row || typeof row !== "object" || Array.isArray(row)) continue;
@@ -39799,6 +41477,58 @@ function normalizeOpenWebUIModelMetadata(value = {}) {
       delete next.context_length;
       delete next.effectiveContextWindowTokens;
       next.contextSource = "unknown";
+    }
+    const profileValue = next.structuredCapabilityProfiles;
+    const profiles = Array.isArray(profileValue)
+      ? profileValue
+      : Array.isArray(profileValue?.records) ? profileValue.records : [];
+    const byIdentity = new Map();
+    profiles.forEach((profile) => {
+      if (!profile || typeof profile !== "object" || Array.isArray(profile)) return null;
+      const parts = keyParts(profile.key);
+      const provider = normalizeText(profile.provider || parts[0] || "openwebui", 32).toLowerCase() || "openwebui";
+      const model = normalizeModel(profile.model || parts[1], id);
+      const operation = normalizeOperation(profile.operation || parts[2]);
+      const schemaFingerprint = normalizeText(profile.schemaFingerprint || parts[3], 128);
+      const capabilityRevision = normalizeText(profile.capabilityRevision || parts[4], 128) || OPENWEBUI_PROFILE_CAPABILITY_REVISION;
+      const carrier = carriers.includes(profile.successfulCarrier) ? profile.successfulCarrier : "direct-schema";
+      const preferredCarrier = carriers.includes(profile.preferredCarrier) ? profile.preferredCarrier : carrier;
+      const record = {
+        schemaVersion: OPENWEBUI_PROFILE_SCHEMA_VERSION,
+        key: [provider, model, operation].join("|"),
+        provider,
+        model,
+        operation,
+        schemaFingerprint,
+        capabilityRevision,
+        metadataFingerprint: normalizeText(profile.metadataFingerprint, 128),
+        metadataRevision: normalizeText(profile.metadataRevision, 80),
+        grammarRejected: profile.grammarRejected === true || profile.grammarUnsupported === true,
+        successfulCarrier: carrier,
+        preferredCarrier,
+        adaptiveConcurrencyLimit: Number.isSafeInteger(Number(profile.adaptiveConcurrencyLimit))
+          && Number(profile.adaptiveConcurrencyLimit) >= 1
+          && Number(profile.adaptiveConcurrencyLimit) <= 4
+          ? Number(profile.adaptiveConcurrencyLimit)
+          : 0,
+        adaptiveConcurrencyReason: normalizeText(profile.adaptiveConcurrencyReason, 80),
+        adaptiveConcurrencyObservations: Number.isSafeInteger(Number(profile.adaptiveConcurrencyObservations))
+          ? Math.max(0, Math.min(32, Number(profile.adaptiveConcurrencyObservations)))
+          : 0
+      };
+      Object.defineProperty(record, "__observedAt", { value: profileObservedAt(profile), enumerable: false });
+      if (!record.provider || !record.model || !record.operation || !record.schemaFingerprint || !record.capabilityRevision) return;
+      const identity = `${record.provider}|${record.model}|${record.operation}`;
+      if (isPreferredProfile(record, byIdentity.get(identity))) byIdentity.set(identity, record);
+    });
+    const normalizedProfiles = Array.from(byIdentity.values());
+    if (normalizedProfiles.length) {
+      next.structuredCapabilityProfiles = {
+        schemaVersion: OPENWEBUI_PROFILE_SCHEMA_VERSION,
+        records: normalizedProfiles.slice(0, 64)
+      };
+    } else {
+      delete next.structuredCapabilityProfiles;
     }
     normalized[String(id)] = next;
   }
@@ -39874,16 +41604,23 @@ function taskDescriptionProviderModelMetadata(settings = {}, provider = "", mode
     metadata.metadataStaleness = profile.staleness;
     metadata.metadataRevision = profile.revision;
     if (profile.stale || profile.dynamicRouter) {
+      const dynamicContextLength = profile.dynamicRouter && !profile.stale
+        ? taskDescriptionProviderLimitValue([metadata], ["context_length"])
+        : 0;
       for (const key of [
         "context_length", "contextLength", "context_window", "contextWindow", "max_context_length", "maxContextLength",
         "inputTokenLimit", "input_token_limit", "inputTokensLimit", "input_tokens_limit", "max_input_tokens", "maxInputTokens",
         "outputTokenLimit", "output_token_limit", "outputTokensLimit", "output_tokens_limit", "max_output_tokens", "maxOutputTokens",
         "max_completion_tokens", "maxCompletionTokens"
-      ]) delete metadata[key];
+      ]) {
+        if (profile.dynamicRouter && !profile.stale && key === "context_length" && dynamicContextLength > 0) continue;
+        delete metadata[key];
+      }
       delete metadata.top_provider;
       metadata.capacitySource = profile.dynamicRouter ? "openrouter-dynamic-router" : "unknown";
-      metadata.contextSource = "unknown";
-      metadata.unknownReason = profile.dynamicRouter
+      metadata.contextSource = dynamicContextLength > 0 ? "openrouter-api-models" : "unknown";
+      if (dynamicContextLength > 0) delete metadata.unknownReason;
+      else metadata.unknownReason = profile.dynamicRouter
         ? "openrouter-dynamic-router-capacity-varies-by-request"
         : "openrouter-model-metadata-stale";
     }
@@ -39944,7 +41681,21 @@ function openRouterAdaptiveModelProfile(settings = {}, requestedModel = "", nowM
     ? metadata.supported_parameters.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
     : [];
   const supports = (aliases) => supported.some((value) => aliases.includes(value));
-  const limits = !dynamicRouter && !stale && metadata ? taskDescriptionProviderLimits(metadata, "openrouter") : {
+  const dynamicContextLength = dynamicRouter && !stale && metadata
+    ? taskDescriptionProviderLimitValue([metadata], ["context_length"])
+    : 0;
+  const limits = dynamicRouter && !stale && metadata
+    ? {
+      contextWindowTokens: dynamicContextLength,
+      effectiveContextWindowTokens: dynamicContextLength,
+      inputTokenLimitTokens: dynamicContextLength,
+      outputTokenLimitTokens: 0,
+      source: metadata.source || metadata.metadataSource || "openrouter-api-models",
+      contextSource: dynamicContextLength > 0 ? "openrouter-api-models" : "unknown",
+      contextValueKind: dynamicContextLength > 0 ? "provider-metadata" : "unknown",
+      unknownReason: dynamicContextLength > 0 ? "" : "openrouter-dynamic-router-capacity-varies-by-request"
+    }
+    : !stale && metadata ? taskDescriptionProviderLimits(metadata, "openrouter") : {
     contextWindowTokens: 0,
     effectiveContextWindowTokens: 0,
     inputTokenLimitTokens: 0,
@@ -39980,8 +41731,8 @@ function openRouterAdaptiveModelProfile(settings = {}, requestedModel = "", nowM
 function taskDescriptionProviderModelContextLength(metadata = {}, provider = "") {
   const normalizedProvider = String(provider || "").trim().toLowerCase();
   const nested = [
-    metadata,
     ...(normalizedProvider === "openrouter" ? [metadata?.top_provider] : [metadata?.per_request_limits]),
+    metadata,
     metadata?.limits,
     metadata?.info,
     metadata?.info?.meta,
@@ -40009,8 +41760,8 @@ function taskDescriptionProviderContextLength(metadata = {}, provider = "") {
 function taskDescriptionProviderLimits(metadata = {}, provider = "") {
   const normalizedProvider = String(provider || "").trim().toLowerCase();
   const nested = [
-    metadata,
     ...(normalizedProvider === "openrouter" ? [metadata?.top_provider] : [metadata?.per_request_limits]),
+    metadata,
     metadata?.limits,
     metadata?.info,
     metadata?.info?.meta,
@@ -40317,10 +42068,18 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
   const metadata = taskDescriptionProviderModelMetadata(settings, normalizedProvider, normalizedModel);
   const limits = taskDescriptionProviderLimits(metadata, normalizedProvider);
   const reported = Math.max(0, Number(limits.inputTokenLimitTokens || limits.contextWindowTokens || 0));
-  const contextWindowTokens = Math.max(0, Math.floor(Number(limits.contextWindowTokens || reported || 0)));
-  const known = contextWindowTokens > 0;
+  const exactContextWindowTokens = Math.max(0, Math.floor(Number(limits.contextWindowTokens || reported || 0)));
+  const providerProfileContextTokens = exactContextWindowTokens > 0 || normalizedProvider !== "openai" || !normalizedModel
+    ? 0
+    : OPENAI_PROVIDER_PROFILE_CONTEXT_MIN_TOKENS;
+  const contextWindowTokens = Math.max(exactContextWindowTokens, providerProfileContextTokens);
+  const known = exactContextWindowTokens > 0;
+  const profiled = providerProfileContextTokens > 0;
+  const capacityKnown = contextWindowTokens > 0;
   const contextSource = known
     ? String((limits.contextSource && limits.contextSource !== "unknown") ? limits.contextSource : limits.source || "provider-metadata")
+    : profiled
+      ? "openai-provider-profile"
     : "unknown";
   const contextFraction = contextWindowTokens <= 4096
     ? 0.8
@@ -40330,9 +42089,9 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
   const unknownOperationalTokens = normalizedProvider === "openwebui"
     ? openWebUIUnknownContextWindowTokens(settings)
     : CHAT_PROVIDER_UNKNOWN_INPUT_BUDGET_TOKENS;
-  const curveCeilingTokens = known ? Math.max(0, Math.floor(contextWindowTokens * contextFraction)) : unknownOperationalTokens;
+  const curveCeilingTokens = capacityKnown ? Math.max(0, Math.floor(contextWindowTokens * contextFraction)) : unknownOperationalTokens;
   const providerInputLimitTokens = Math.max(0, Math.floor(Number(limits.inputTokenLimitTokens || 0)));
-  const operationalInputLimitTokens = known
+  const operationalInputLimitTokens = capacityKnown
     ? Math.min(curveCeilingTokens, providerInputLimitTokens > 0 ? providerInputLimitTokens : curveCeilingTokens)
     : unknownOperationalTokens;
   return {
@@ -40345,13 +42104,18 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
     operationalInputLimit: operationalInputLimitTokens,
     providerContextLimit: contextWindowTokens,
     providerContextLimitTokens: contextWindowTokens,
+    hardContextWindowTokens: contextWindowTokens,
+    hardContextWindowKnown: capacityKnown,
+    contextWindowExact: known,
+    contextWindowProfiled: profiled,
     usableInputTokens: operationalInputLimitTokens,
     adaptiveTargetInputTokens: curveCeilingTokens,
     contextWindowKnown: known,
-    contextSource: known ? contextSource : normalizedProvider === "openwebui" ? "openwebui-operational-fallback" : contextSource,
-    contextValueKind: limits.contextValueKind,
-    source: known ? String(limits.source || "provider-metadata") : "unknown",
-    unknownReason: known ? "" : String(limits.unknownReason || "provider-discovery-did-not-report-context-limits"),
+    contextSource: known || profiled ? contextSource : normalizedProvider === "openwebui" ? "openwebui-operational-fallback" : contextSource,
+    contextValueKind: profiled ? "provider-profile" : limits.contextValueKind,
+    source: known ? String(limits.source || "provider-metadata") : profiled ? contextSource : "unknown",
+    unknownReason: known || profiled ? "" : String(limits.unknownReason || "provider-discovery-did-not-report-context-limits"),
+    unknownFallbackUsed: !capacityKnown,
     outputHeadroomTokens: CHAT_PROVIDER_OUTPUT_HEADROOM_TOKENS,
     reasoningHeadroomTokens: CHAT_PROVIDER_REASONING_HEADROOM_TOKENS
   };
@@ -40830,14 +42594,21 @@ function buildChatProviderContextProjection(options = {}) {
     contextWindowSource: limits.contextSource,
     providerContextLimit: limits.providerContextLimit,
     providerContextLimitTokens: limits.providerContextLimitTokens,
+    hardContextWindowTokens: limits.hardContextWindowTokens,
+    hardContextWindowKnown: limits.hardContextWindowKnown,
+    contextWindowExact: limits.contextWindowExact,
+    contextWindowProfiled: limits.contextWindowProfiled,
     operationalInputLimit: limits.operationalInputLimit,
     providerInputTokenLimitTokens: limits.reportedInputTokenLimitTokens,
     operationalInputTokenLimitTokens: limits.operationalInputTokenLimitTokens,
     usableInputTokens: limits.usableInputTokens,
     adaptiveTargetInputTokens: limits.adaptiveTargetInputTokens,
     source: limits.contextSource,
+    contextValueKind: limits.contextValueKind,
     contextWindowKnown: limits.contextWindowKnown,
-    unknownWindowBudgetTokens: limits.contextWindowKnown ? 0 : limits.operationalInputTokenLimitTokens,
+    unknownReason: limits.unknownReason,
+    unknownFallbackUsed: limits.unknownFallbackUsed,
+    unknownWindowBudgetTokens: limits.unknownFallbackUsed ? limits.operationalInputTokenLimitTokens : 0,
     outputHeadroomTokens: CHAT_PROVIDER_OUTPUT_HEADROOM_TOKENS,
     reasoningHeadroomTokens: CHAT_PROVIDER_REASONING_HEADROOM_TOKENS,
     availableInputTokens,
@@ -40941,13 +42712,20 @@ function chatProviderContextPreflight({ settings = DEFAULT_SETTINGS, provider = 
     contextWindowSource: limits.contextSource,
     providerContextLimit: limits.providerContextLimit,
     providerContextLimitTokens: limits.providerContextLimitTokens,
+    hardContextWindowTokens: limits.hardContextWindowTokens,
+    hardContextWindowKnown: limits.hardContextWindowKnown,
+    contextWindowExact: limits.contextWindowExact,
+    contextWindowProfiled: limits.contextWindowProfiled,
     operationalInputLimit: limits.operationalInputLimit,
     operationalInputTokenLimitTokens: limits.operationalInputTokenLimitTokens,
     usableInputTokens: limits.usableInputTokens,
     adaptiveTargetInputTokens: limits.adaptiveTargetInputTokens,
     source: limits.contextSource,
+    contextValueKind: limits.contextValueKind,
     contextWindowKnown: limits.contextWindowKnown,
-    unknownWindowBudgetTokens: limits.contextWindowKnown ? 0 : limits.operationalInputTokenLimitTokens,
+    unknownReason: limits.unknownReason,
+    unknownFallbackUsed: limits.unknownFallbackUsed,
+    unknownWindowBudgetTokens: limits.unknownFallbackUsed ? limits.operationalInputTokenLimitTokens : 0,
     outputHeadroomTokens: limits.outputHeadroomTokens,
     reasoningHeadroomTokens: limits.reasoningHeadroomTokens,
     promptCachePrefix: providerContextProjectionMetrics(prefix),
@@ -41015,12 +42793,6 @@ function taskDescriptionProviderContextPreflight({
   const nativeDescription = normalizedProvider === "openwebui"
     && ["description", "task-description"].includes(String(operation || ""))
     && settings.openwebuiModelMetadata?.[normalizedModel]?.ollamaBacked === true;
-  const nativeDescriptionCapability = nativeDescription && typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState === "function"
-    ? STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState(normalizedModel)
-    : null;
-  const descriptionCarrier = nativeDescription
-    ? nativeDescriptionCapability?.preferredCarrier === "wrapper-json" ? "wrapper-json" : nativeDescriptionCapability?.preferredCarrier === "direct-json" ? "direct-json" : "direct-schema"
-    : "";
   const consumerSchema = nativeDescription
     && originalSchema
     && typeof originalSchema === "object"
@@ -41030,6 +42802,26 @@ function taskDescriptionProviderContextPreflight({
     && !Array.isArray(originalSchema.properties.descriptions.items)
     ? originalSchema
     : schema;
+  const capabilityDescriptionSchema = nativeDescription && consumerSchema
+    ? STS_MULTI_PROVIDER.openWebUICompactDescriptionSchema(consumerSchema)
+    : null;
+  const capabilityDescriptionProjection = capabilityDescriptionSchema
+    ? STS_MULTI_PROVIDER.openWebUISchemaProjection(capabilityDescriptionSchema)
+    : null;
+  const capabilityDescriptionSchemaFingerprint = capabilityDescriptionProjection
+    ? STS_MULTI_PROVIDER.stableHash(JSON.stringify(capabilityDescriptionProjection.schema))
+    : "";
+  const nativeDescriptionCapability = nativeDescription && typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState === "function"
+    ? STS_MULTI_PROVIDER.openWebUISingletonDescriptionCapabilityState(normalizedModel, {
+      provider: "openwebui",
+      operation: "task-description",
+      schemaFingerprint: capabilityDescriptionSchemaFingerprint,
+      settings
+    })
+    : null;
+  const descriptionCarrier = nativeDescription
+    ? nativeDescriptionCapability?.preferredCarrier === "wrapper-json" ? "wrapper-json" : nativeDescriptionCapability?.preferredCarrier === "direct-json" ? "direct-json" : "direct-schema"
+    : "";
   const schemaForPreflight = nativeDescription && consumerSchema
     ? descriptionCarrier === "wrapper-json"
       ? STS_MULTI_PROVIDER.openWebUIDescriptionWrapperSchema(consumerSchema)
@@ -41074,6 +42866,10 @@ function taskDescriptionProviderContextPreflight({
     model: String(normalizedModel || ""),
     operation: String(operation || ""),
     contextWindowTokens: contextWindow,
+    hardContextWindowTokens: contextBudget.hardContextWindowTokens,
+    hardContextWindowKnown: contextBudget.hardContextWindowKnown,
+    contextWindowExact: contextBudget.contextWindowExact,
+    contextWindowProfiled: contextBudget.contextWindowProfiled,
     effectiveContextWindowTokens: limits.effectiveContextWindowTokens,
     contextWindowKnown: contextBudget.contextWindowKnown,
     inputTokenLimitTokens: inputTokenLimit,
@@ -41090,8 +42886,9 @@ function taskDescriptionProviderContextPreflight({
     contextWindowSource: contextBudget.contextSource,
     contextSource: contextBudget.contextSource,
     contextValueKind: contextBudget.contextValueKind,
-    unknownReason: contextBudget.contextWindowKnown ? "" : contextBudget.unknownReason,
-    unknownWindowBudgetTokens: contextBudget.contextWindowKnown ? 0 : contextBudget.operationalInputTokenLimitTokens,
+    unknownReason: contextBudget.contextWindowKnown || contextBudget.contextWindowProfiled ? "" : contextBudget.unknownReason,
+    unknownFallbackUsed: contextBudget.unknownFallbackUsed,
+    unknownWindowBudgetTokens: contextBudget.unknownFallbackUsed ? contextBudget.operationalInputTokenLimitTokens : 0,
     estimatedInputTokens,
     estimatedInputTokenCount: estimatedInputTokens,
     rawEstimatedInputTokens: envelopeEstimate.rawEstimatedInputTokens,
@@ -41140,6 +42937,7 @@ function taskDescriptionProviderContextPreflight({
     descriptionCarrier,
     descriptionCapabilityCacheHit: Boolean(nativeDescriptionCapability?.cacheHit),
     descriptionCapabilityPreference: nativeDescription ? descriptionCarrier : "",
+    descriptionCapabilitySchemaFingerprint: nativeDescription ? capabilityDescriptionSchemaFingerprint : "",
     descriptionGrammarLearned: Boolean(nativeDescriptionCapability?.grammarUnsupported)
   });
 }
@@ -41198,6 +42996,99 @@ function taskWorkflowPromptContextSuffix({
   return variableSections.filter(Boolean).join("\n\n");
 }
 
+function taskWorkflowProviderBaselineEvidenceEligible(item = {}) {
+  const sourceKind = String(item?.sourceKind || item?.source_kind || "").trim().toLowerCase();
+  const protectedSource = sourceKind === "current-source"
+    || item?.primarySource === true
+    || item?.taskLocalProtected === true
+    || item?.protectedTaskRow === true
+    || item?.protected === true;
+  if (protectedSource) return true;
+  const materialityState = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase();
+  const reasonCodes = [
+    item?.reservationReason,
+    item?.reservation_reason,
+    item?.selectionReasonCode,
+    item?.selection_reason_code,
+    item?.inclusionReason,
+    item?.inclusion_reason,
+    item?.finalReasonCode,
+    item?.final_reason_code,
+    item?.admissionReason,
+    item?.admission_reason,
+    item?.materialityReason,
+    item?.materiality_reason
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  const explicitlyRetained = reasonCodes.some((reason) => [
+    "continuity-reserved",
+    "exact-current-open-identity",
+    "task-semantic-continuity-reserved",
+    "task-semantic-current-open-continuation-selected",
+    "task-semantic-exact-current-open-identity"
+  ].includes(reason));
+  const materialityContributions = [
+    ...Object.values(item?.materialityContributions || item?.materiality_contributions || {}),
+    ...Object.values(item?.dimensionContributions || item?.dimension_contributions || {})
+  ].map(Number).filter(Number.isFinite);
+  const materialityAnchorContrast = Math.max(0, ...[
+    item?.materialityAnchorContrast,
+    item?.materiality_anchor_contrast
+  ].map(Number).filter(Number.isFinite));
+  const explicitlyMaterial = materialityState === "material-review-history-candidate"
+    && reasonCodes.some((reason) => TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(reason))
+    && (materialityContributions.some((value) => value > 0) || materialityAnchorContrast > 0);
+  const authoritativeCurrentMaterial = sourceKind === "current-source-context"
+    && item?.current === true
+    && String(item?.authorityState || "").toLowerCase() === "authoritative"
+    && item?.actionLaneSupported === true
+    && Number(item?.actionLaneContribution || 0) > 0;
+  return explicitlyRetained || explicitlyMaterial || authoritativeCurrentMaterial;
+}
+
+function taskWorkflowProviderReservationCoverageEligible(item = {}) {
+  const reservationState = String(item?.reservationState || item?.reservation_state || "").trim().toLowerCase();
+  const reasonCodes = [
+    item?.reservationReason,
+    item?.reservation_reason,
+    item?.inclusionReason,
+    item?.inclusion_reason,
+    item?.finalReasonCode,
+    item?.final_reason_code,
+    item?.selectionReasonCode,
+    item?.selection_reason_code
+  ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  const hasReservationMetadata = Boolean(reservationState && reservationState !== "unreserved")
+    || reasonCodes.some((reason) => [
+      "task-reserved",
+      "scope-reserved",
+      "material-history-reserved",
+      "continuity-reserved",
+      "dimension-distinct-source-reserved",
+      "dimension-source-thread-reserved",
+      "fused-reservation-selected"
+    ].includes(reason));
+  if (!hasReservationMetadata) return false;
+  const actionLaneContribution = Math.max(0, ...[
+    item?.actionLaneContribution,
+    item?.action_lane_contribution,
+    item?.laneScores?.action
+  ].map(Number).filter(Number.isFinite));
+  const actionProof = (item?.actionLaneSupported === true || item?.action_lane_supported === true)
+    && actionLaneContribution > 0;
+  const requestScopedProof = item?.requestScopedSemanticRelevance === true
+    || item?.semanticExactTaskAssociation === true;
+  const continuityProof = reasonCodes.some((reason) => [
+    "continuity-reserved",
+    "exact-current-open-identity",
+    "task-semantic-continuity-reserved",
+    "task-semantic-current-open-continuation-selected",
+    "task-semantic-exact-current-open-identity"
+  ].includes(reason));
+  const materialityProof = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase() === "material-review-history-candidate"
+    && taskWorkflowProviderBaselineEvidenceEligible(item);
+  return actionProof || requestScopedProof || continuityProof || materialityProof;
+}
+
 function taskWorkflowContextBundle(options = {}) {
   const settings = options.settings || DEFAULT_SETTINGS;
   const sourceSummary = String(options.sourceSummary || "").trim();
@@ -41225,7 +43116,252 @@ function taskWorkflowContextBundle(options = {}) {
     rejectedSemanticEvidence: Object.freeze(sourceEvidenceCatalog.telemetry?.rejectedSemanticEvidence || [])
   });
   const finalEvidenceDedup = deduplicateTaskWorkflowEvidenceRecords(catalogEvidencePartition.selected);
-  const finalItems = finalEvidenceDedup.records;
+  let finalItems = finalEvidenceDedup.records;
+  const workflowTasks = flattenTaskPlan(options.tasks || []);
+  const exactTaskSelectionByKey = new Map();
+  const taskRowsByEvidenceId = (rows = []) => {
+    const byId = new Map();
+    for (const row of rows || []) {
+      const evidenceId = String(row?.evidenceId || row?.evidence_id || row?.id || "");
+      if (!evidenceId) continue;
+      const existing = byId.get(evidenceId);
+      byId.set(evidenceId, existing ? mergeTaskWorkflowEvidenceMetadata([existing, row]) : row);
+    }
+    return Array.from(byId.values());
+  };
+  // Synthetic/pre-structure tasks are compiled against the complete
+  // provider-neutral catalog. Their local retrieval slice is only a seed;
+  // exact request-relative history may live in the global catalog instead.
+  const globalEvidenceRows = taskRowsByEvidenceId([
+    ...finalItems,
+    ...(sourceEvidenceCatalog.items || []),
+    ...catalogEvidencePartition.selected,
+    ...executionSemanticContext,
+    ...taskLocalSemanticRows
+  ]);
+  const taskCurrentRow = (row = {}) => {
+    const sourceKind = String(row?.sourceKind || row?.source_kind || "").toLowerCase();
+    const temporalRelation = String(row?.temporalRelation || row?.temporal_relation || "").toLowerCase();
+    return sourceKind === "current-source" || row?.primarySource === true || row?.current === true || temporalRelation === "current";
+  };
+  const taskFactsById = new Map();
+  for (const fact of [...(sourceContract.facts || []), ...finalItems.flatMap((item) => item?.structuredFacts || [])]) {
+    const factId = String(fact?.factId || fact?.fact_id || "");
+    if (factId && !taskFactsById.has(factId)) taskFactsById.set(factId, fact);
+  }
+  for (let index = 0; index < workflowTasks.length; index += 1) {
+    const task = workflowTasks[index] || {};
+    const taskId = String(task?.taskId || task?.id || taskWorkflowOwnershipKey(task, index) || `task-${index}`);
+    const scopeId = String(task?.scope_id || task?.scopeId || task?.taskLocalSemanticEvidence?.scopeId || "");
+    if (!taskId || !scopeId) continue;
+    const relevanceTask = Object.assign({}, task, {
+      id: taskId,
+      taskId,
+      scope_id: scopeId,
+      taskLocalEvidence: Object.assign({}, task?.taskLocalEvidence || {}, { taskId, scopeId })
+    });
+    const taskRows = taskRowsByEvidenceId([
+      ...globalEvidenceRows,
+      ...(task?.taskLocalSemanticEvidence?.context || [])
+    ]);
+    const shortlist = taskDescriptionSemanticShortlistForTask(taskRows, sourceContract, relevanceTask, {
+      contextBundle: { factsById: Object.fromEntries(taskFactsById) }
+    });
+    const syntheticBindings = [
+      ...(task?.fact_bindings || task?.factBindings || []),
+      ...(task?.taskLocalEvidence?.factBindings || task?.taskLocalEvidence?.fact_bindings || [])
+    ];
+    const syntheticHandoffCandidateIds = uniqueValues([
+      ...(task?.providerEligibleEvidenceIds || []),
+      ...(task?.taskLocalEvidence?.providerEligibleEvidenceIds || []),
+      ...(task?.taskLocalSemanticEvidence?.evidenceIds || task?.taskLocalSemanticEvidence?.evidence_ids || [])
+    ].map(String).filter(Boolean));
+    const syntheticHandoffRowsById = new Map(taskRowsByEvidenceId([
+      ...(task?.taskLocalSemanticEvidence?.context || []),
+      ...(task?.taskLocalEvidence?.supportingSemanticEvidence || [])
+    ]).map((item) => [String(item?.evidenceId || item?.evidence_id || item?.id || ""), item]).filter(([evidenceId]) => evidenceId));
+    const syntheticHandoffIds = syntheticHandoffCandidateIds
+      .map((evidenceId) => ({
+        evidenceId,
+        row: syntheticHandoffRowsById.get(evidenceId) || taskRows.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId)
+      }))
+      .filter(({ evidenceId, row }) => evidenceId !== String(sourceContract.primaryEvidenceId || "")
+        && row
+        && !taskCurrentRow(row))
+      .map(({ evidenceId }) => evidenceId);
+    const syntheticNativeBinding = (item = {}, evidenceId = "") => {
+      const rowFactIds = new Set((item?.structuredFacts || []).map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean));
+      return syntheticBindings.some((binding) => {
+        const bindingFactId = String(binding?.factId || binding?.fact_id || "");
+        const bindingEvidenceId = String(binding?.evidenceId || binding?.evidence_id || "");
+        const bindingScopeId = String(binding?.scopeId || binding?.scope_id || "");
+        const bindingTaskId = String(binding?.taskId || binding?.task_id || "");
+        return bindingFactId && rowFactIds.has(bindingFactId)
+          && bindingEvidenceId === evidenceId
+          && bindingScopeId === scopeId
+          && (!bindingTaskId || bindingTaskId === taskId || bindingTaskId === `scope:${scopeId}`);
+      });
+    };
+    const strictTaskLocalRow = (item = {}, allowCurrent = true) => {
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      if (!evidenceId) return false;
+      if (allowCurrent && taskCurrentRow(item)) return true;
+      const facts = item?.structuredFacts || [];
+      if (!facts.length) return false;
+      return syntheticNativeBinding(item, evidenceId)
+        || taskWorkflowExactTaskScopeBindingEligible(item, taskId, scopeId)
+        || taskSemanticRequestScopedRelevanceEligible(item, taskId, scopeId, facts);
+    };
+    const exactById = new Map();
+    let selectedOptionalCount = 0;
+    const addExactRow = (item, requireShortlistAcceptance = false) => {
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      if (!evidenceId || exactById.has(evidenceId)) return;
+      if (requireShortlistAcceptance && !taskSemanticTaskLocalRelevanceAccepted(item)) return;
+      if (!strictTaskLocalRow(item)) return;
+      const current = taskCurrentRow(item);
+      if (!current && selectedOptionalCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return;
+      const materialized = current
+        ? (finalItems.find((row) => String(row?.evidenceId || row?.id || "") === evidenceId) || item)
+        : materializeSelectedTaskSemanticExcerptFact(item, taskId, scopeId, {
+          task: relevanceTask,
+          sourceContract
+        });
+      if (!current && !(materialized?.structuredFacts || []).length) return;
+      exactById.set(evidenceId, materialized);
+      if (!current) selectedOptionalCount += 1;
+    };
+    for (const evidenceId of syntheticHandoffIds) {
+      const row = syntheticHandoffRowsById.get(evidenceId) || taskRows.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId);
+      if (row) addExactRow(row);
+    }
+    for (const item of shortlist.items || []) addExactRow(item, true);
+    exactTaskSelectionByKey.set(taskWorkflowOwnershipKey(task, index) || taskId, {
+      taskId,
+      scopeId,
+      rows: Array.from(exactById.values()),
+      evidenceIds: Array.from(exactById.keys()),
+      factIds: Array.from(new Set(Array.from(exactById.values()).flatMap((item) => (item.structuredFacts || []).map((fact) => String(fact?.factId || "")).filter(Boolean))))
+    });
+  }
+  if (exactTaskSelectionByKey.size) {
+    const mergedFinalItems = new Map(finalItems.map((item) => [String(item?.evidenceId || item?.id || ""), item]).filter(([evidenceId]) => evidenceId));
+    for (const selection of exactTaskSelectionByKey.values()) {
+      for (const row of selection.rows || []) {
+        const evidenceId = String(row?.evidenceId || row?.id || "");
+        if (!evidenceId) continue;
+        const existing = mergedFinalItems.get(evidenceId);
+        mergedFinalItems.set(evidenceId, existing
+          ? Object.assign({}, existing, row, { structuredFacts: row.structuredFacts?.length ? row.structuredFacts : existing.structuredFacts || [] })
+          : row);
+      }
+    }
+    finalItems = Array.from(mergedFinalItems.values());
+  }
+  const providerTasks = workflowTasks.map((task, index) => {
+    const key = taskWorkflowOwnershipKey(task, index) || String(task?.taskId || task?.id || `task-${index}`);
+    const selection = exactTaskSelectionByKey.get(key) || { taskId: String(task?.taskId || task?.id || key), scopeId: String(task?.scope_id || task?.scopeId || ""), rows: [], evidenceIds: [], factIds: [] };
+    const local = task?.taskLocalSemanticEvidence || {};
+    // Local retrieval remains available for diagnostics, but it is not an
+    // optional provider baseline. Only protected current rows and the fresh
+    // exact task shortlist may cross the provider boundary.
+    const currentRows = (local.context || []).filter(taskCurrentRow);
+    const freshSelectionIds = new Set((selection.rows || [])
+      .map((item) => String(item?.evidenceId || item?.evidence_id || item?.id || ""))
+      .filter(Boolean));
+    const primaryRow = finalItems.find((item) => String(item?.evidenceId || item?.id || "") === String(sourceContract.primaryEvidenceId || ""));
+    const taskSelectedRows = taskRowsByEvidenceId([
+      ...currentRows,
+      ...(selection.rows || [])
+    ]).filter((item) => {
+      if (taskCurrentRow(item)) return true;
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      if (!freshSelectionIds.has(evidenceId)) return false;
+      if (!taskWorkflowExactTaskScopeBindingEligible(item, selection.taskId, selection.scopeId)) return false;
+      const hasFacts = (item?.structuredFacts || []).some((fact) => String(fact?.scopeId || fact?.scope_id || "") === selection.scopeId);
+      // `selection.rows` is already the exact task-local shortlist. Do not
+      // reapply upstream reservation/materiality gates to its materialized
+      // rows; doing so can erase a valid fresh selection after fact binding.
+      return hasFacts;
+    });
+    const selectedContext = taskRowsByEvidenceId([
+      ...(primaryRow ? [primaryRow] : []),
+      ...currentRows,
+      ...taskSelectedRows,
+      ...(selection.rows || [])
+    ]);
+    const selectedEvidenceIds = uniqueValues(selectedContext.map((item) => String(item?.evidenceId || item?.id || "")).filter(Boolean));
+    const selectedFactIds = uniqueValues([
+      ...(sourceContract.facts || [])
+        .filter((fact) => selectedEvidenceIds.includes(String(fact?.evidenceId || "")) && fact?.current === true)
+        .map((fact) => String(fact?.factId || "")),
+      ...selectedContext.flatMap((item) => (item?.structuredFacts || []).map((fact) => String(fact?.factId || "")).filter(Boolean)),
+      ...(selection.factIds || [])
+    ].filter(Boolean));
+    const selectedEvidenceSet = new Set(selectedEvidenceIds);
+    const selectedFactSet = new Set(selectedFactIds);
+    const factBindings = (task?.fact_bindings || task?.factBindings || [])
+      .filter((binding) => selectedFactSet.has(String(binding?.factId || binding?.fact_id || "")) && selectedEvidenceSet.has(String(binding?.evidenceId || binding?.evidence_id || "")));
+    for (const row of selection.rows || []) for (const fact of row?.structuredFacts || []) {
+      const factId = String(fact?.factId || fact?.fact_id || "");
+      const evidenceId = String(fact?.evidenceId || fact?.evidence_id || row?.evidenceId || "");
+      if (factId && evidenceId && !factBindings.some((binding) => String(binding?.factId || binding?.fact_id || "") === factId)) {
+        factBindings.push({ factId, evidenceId, scopeId: selection.scopeId, taskId: selection.taskId, type: String(fact?.type || ""), role: String(fact?.role || "") });
+      }
+    }
+    const nextLocal = Object.assign({}, local, {
+      taskId: selection.taskId,
+      scopeId: selection.scopeId,
+      evidenceIds: selectedEvidenceIds,
+      factIds: selectedFactIds,
+      context: selectedContext,
+      factBindings,
+      selectedSupportingEvidenceIds: selectedEvidenceIds.slice()
+    });
+    const existingRichLocal = task?.taskLocalEvidence && typeof task.taskLocalEvidence === "object"
+      ? task.taskLocalEvidence
+      : {};
+    const existingPrimary = existingRichLocal.primarySourceEvidence && typeof existingRichLocal.primarySourceEvidence === "object"
+      ? existingRichLocal.primarySourceEvidence
+      : {};
+    const selectedPrimary = Object.keys(existingPrimary).length
+      ? existingPrimary
+      : primaryRow || currentRows.find(taskCurrentRow) || {};
+    const primarySourceEvidence = Object.assign({}, selectedPrimary, {
+      evidenceId: String(sourceContract.primaryEvidenceId || selectedPrimary.evidenceId || selectedPrimary.evidence_id || ""),
+      taskId: selection.taskId,
+      scopeId: selection.scopeId,
+      scopeIds: selection.scopeId ? [selection.scopeId] : [],
+      taskScopeAssociations: selection.taskId && selection.scopeId
+        ? [{ taskId: selection.taskId, scopeId: selection.scopeId }]
+        : []
+    });
+    const taskLocalEvidence = Object.assign({}, existingRichLocal, {
+      taskId: selection.taskId,
+      scopeId: selection.scopeId,
+      primarySourceEvidence,
+      evidenceIds: selectedEvidenceIds,
+      evidence_ids: selectedEvidenceIds.slice(),
+      factRefs: selectedFactIds,
+      fact_refs: selectedFactIds.slice(),
+      factBindings,
+      fact_bindings: factBindings.slice(),
+      selectedSupportingEvidenceIds: selectedEvidenceIds.slice()
+    });
+    const updates = {
+      evidence_ids: selectedEvidenceIds,
+      evidenceIds: selectedEvidenceIds,
+      fact_refs: selectedFactIds,
+      factRefs: selectedFactIds,
+      fact_bindings: factBindings,
+      factBindings,
+      providerEligibleEvidenceIds: selectedEvidenceIds,
+      taskLocalSemanticEvidence: nextLocal,
+      taskLocalEvidence
+    };
+    if (!Object.isFrozen(task)) Object.assign(task, updates);
+    return Object.assign({}, task, updates);
+  });
   const finalSemanticItems = finalItems.filter((item) => item.sourceKind !== "current-source");
   const evidenceCatalog = {
     version: sourceEvidenceCatalog.version || TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
@@ -41239,55 +43375,45 @@ function taskWorkflowContextBundle(options = {}) {
     })
   };
   evidenceCatalog.hash = taskWorkflowHash(evidenceCatalog);
-  const taskEvidenceRefs = options.taskEvidenceRefs || Object.fromEntries(Object.entries(options.evidenceBundlesByTask || {}).map(([taskId, bundle]) => [
+  const taskEvidenceRefs = Object.fromEntries(Object.entries(options.taskEvidenceRefs || options.evidenceBundlesByTask || {}).map(([taskId, bundle]) => [
     String(taskId),
-    uniqueValues((bundle?.evidenceIds || bundle?.evidence_ids || []).map(String).filter(Boolean))
+    uniqueValues((Array.isArray(bundle) ? bundle : (bundle?.evidenceIds || bundle?.evidence_ids || [])).map(String).filter(Boolean))
   ]));
-  const providerRetainedEvidenceIds = uniqueValues([
+  // Keep the broad local taskEvidenceRefs for diagnostics/ledger validation;
+  // provider coverage is rebuilt only from the fresh task-local selections.
+  const projectionTaskEvidenceRefs = {};
+  for (let index = 0; index < providerTasks.length; index += 1) {
+    const task = providerTasks[index] || {};
+    const key = taskWorkflowOwnershipKey(task, index) || String(task?.taskId || task?.id || `task-${index}`);
+    projectionTaskEvidenceRefs[key] = uniqueValues([
+      ...(projectionTaskEvidenceRefs[key] || []),
+      ...(task.providerEligibleEvidenceIds || [])
+    ].map(String).filter(Boolean));
+  }
+  const exactTaskEvidenceIds = Array.from(exactTaskSelectionByKey.values()).flatMap((selection) => selection.evidenceIds || []);
+  const baselineCandidateEvidenceIds = new Set([
     ...(options.providerEligibleEvidenceIds || []),
-    ...(options.tasks || []).flatMap((task) => task?.providerEligibleEvidenceIds || []),
-    ...finalItems.filter((item) => {
-      if (String(item?.sourceKind || "").toLowerCase() === "current-source" || item?.primarySource === true) return true;
-      const materialityState = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase();
-      const reasonCodes = [
-        item?.reservationReason,
-        item?.reservation_reason,
-        item?.selectionReasonCode,
-        item?.selection_reason_code,
-        item?.inclusionReason,
-        item?.inclusion_reason,
-        item?.finalReasonCode,
-        item?.final_reason_code,
-        item?.admissionReason,
-        item?.admission_reason
-      ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
-      const explicitlyRetained = reasonCodes.some((reason) => /(?:continuity|exact-current-open|material-history)/.test(reason));
-      const explicitlyMaterial = Boolean(materialityState && materialityState !== "unclassified")
-        || reasonCodes.some((reason) => TASK_DESCRIPTION_MATERIAL_ADMISSION_REASONS.has(reason));
-      const authoritativeCurrentMaterial = String(item?.sourceKind || "").toLowerCase() === "current-source-context"
-        && item?.current === true
-        && String(item?.authorityState || "").toLowerCase() === "authoritative"
-        && item?.actionLaneSupported === true
-        && Number(item?.actionLaneContribution || 0) > 0;
-      return explicitlyRetained || explicitlyMaterial || authoritativeCurrentMaterial;
-    }).map((item) => String(item?.evidenceId || item?.id || ""))
+    ...providerTasks.flatMap((task) => task?.providerEligibleEvidenceIds || []),
+    ...exactTaskEvidenceIds,
+    ...finalItems.map((item) => String(item?.evidenceId || item?.id || ""))
   ].map(String).filter(Boolean));
+  const providerRetainedEvidenceIds = uniqueValues(finalItems
+    .filter((item) => {
+      const evidenceId = String(item?.evidenceId || item?.id || "");
+      return taskWorkflowProviderBaselineEvidenceEligible(item)
+        && baselineCandidateEvidenceIds.has(evidenceId);
+    })
+    .map((item) => String(item?.evidenceId || item?.id || ""))
+    .filter(Boolean));
   const coverageEligibleEvidenceIds = uniqueValues([
     ...providerRetainedEvidenceIds,
-    ...finalItems.filter((item) => {
-      const reservationState = String(item?.reservationState || item?.reservation_state || "").trim().toLowerCase();
-      const reservationReason = String(item?.reservationReason || item?.reservation_reason || "").trim().toLowerCase();
-      const inclusionReason = String(item?.inclusionReason || item?.inclusion_reason || "").trim().toLowerCase();
-      const finalReasonCode = String(item?.finalReasonCode || item?.final_reason_code || "").trim().toLowerCase();
-      return Boolean(reservationState && reservationState !== "unreserved")
-        || [reservationReason, inclusionReason, finalReasonCode].some((reason) => /reserv/.test(reason));
-    }).map((item) => String(item?.evidenceId || item?.id || ""))
+    ...finalItems.filter(taskWorkflowProviderReservationCoverageEligible).map((item) => String(item?.evidenceId || item?.id || ""))
   ].map(String).filter(Boolean));
   const providerEvidenceProjection = taskWorkflowProviderEvidenceProjection(finalItems, {
     settings,
     sourceContract,
-    tasks: options.tasks || [],
-    taskEvidenceRefs,
+    tasks: providerTasks,
+    taskEvidenceRefs: projectionTaskEvidenceRefs,
     coverageEligibleEvidenceIds,
     baselineSelectedEvidenceIds: providerRetainedEvidenceIds,
     scopeSemanticEvidence: options.scopeSemanticEvidence,
@@ -41295,6 +43421,21 @@ function taskWorkflowContextBundle(options = {}) {
     contextBundle: options.contextBundle,
     requireExactTaskFactBinding: true
   });
+  const providerTaskEvidenceRefs = {};
+  // The projection is the provider boundary. Rewrite each task-local closure
+  // from its exact selected rows/facts/ledger before constructing any prompt
+  // payload, while retaining the broader catalog only for local diagnostics.
+  for (let index = 0; index < providerTasks.length; index += 1) {
+    const task = providerTasks[index] || {};
+    const key = taskWorkflowOwnershipKey(task, index) || String(task?.taskId || task?.id || `task-${index}`);
+    synchronizeTaskLocalEvidenceWithProviderProjection(task, providerEvidenceProjection, sourceContract, {
+      index,
+      taskKey: key,
+      taskEvidenceRefs: projectionTaskEvidenceRefs,
+      evidenceItems: finalItems
+    });
+    providerTaskEvidenceRefs[key] = uniqueValues((task.providerEligibleEvidenceIds || []).map(String).filter(Boolean));
+  }
   const providerEvidenceItems = finalItems.filter((item) => providerEvidenceProjection.selectedEvidenceIds.includes(String(item.evidenceId || item.id || "")));
   const providerEvidenceCatalog = Object.assign({}, evidenceCatalog, {
     items: providerEvidenceItems,
@@ -41344,6 +43485,11 @@ function taskWorkflowContextBundle(options = {}) {
     for (const evidenceId of refs || []) {
       const evidence = sharedEvidenceById[String(evidenceId)];
       if (!evidence) continue;
+      const sharedAuthoritativePrimary = String(evidenceId) === String(sourceContract.primaryEvidenceId || "")
+        && (String(evidence.sourceKind || "").toLowerCase() === "current-source" || evidence.primarySource === true)
+        && String(evidence.authorityState || evidence.authority || "authoritative").toLowerCase() === "authoritative"
+        && !["conflict", "conflicted", "rejected", "blocked"].includes(String(evidence.conflictState || "none").toLowerCase());
+      if (sharedAuthoritativePrimary) continue;
       const owners = uniqueValues([
         evidence.taskId,
         ...(evidence.taskIds || []),
@@ -41545,7 +43691,7 @@ function taskWorkflowContextBundle(options = {}) {
     promptEvidenceById,
     scopeSemanticPromptRefs,
     adaptiveTaskContext,
-    taskEvidenceRefs,
+    taskEvidenceRefs: providerTaskEvidenceRefs,
     evidenceLedger: options.evidenceLedger
   });
   const promptCachePrefix = projectedPromptOverrideApplied
@@ -41589,6 +43735,7 @@ function taskWorkflowContextBundle(options = {}) {
     providerEvidenceById: providerEvidenceProjection.providerEvidenceById,
     providerEvidenceProjection,
     taskEvidenceRefs,
+    providerTaskEvidenceRefs,
     chatEvidenceRefs,
     provenance: Object.fromEntries(finalItems.map((item) => {
       const evidenceId = String(item.evidenceId || item.id || "");
@@ -41733,32 +43880,149 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
     item?.scope_id,
     ...(item?.taskScopeAssociations || []).map((association) => association?.scopeId || association?.scope_id)
   ].map(String).filter(Boolean));
+  const taskRowsByEvidenceIdForBatch = (rows = []) => {
+    const byId = new Map();
+    for (const row of rows || []) {
+      const evidenceId = String(row?.evidenceId || row?.evidence_id || row?.id || "");
+      if (evidenceId && !byId.has(evidenceId)) byId.set(evidenceId, row);
+    }
+    return Array.from(byId.values());
+  };
   const prestructureTasks = [
     ...(options.prestructureTasks || []),
     ...Object.values(options.scopeSemanticEvidence || {}).map((bundle) => bundle?.syntheticTask).filter(Boolean)
   ];
+  const prestructureSelectedEvidenceByScope = new Map();
+  const prestructureDiagnosticsByScopeHash = new Map();
+  const prestructureFactById = new Map((scopedContract.facts || [])
+    .map((fact) => [String(fact?.factId || fact?.fact_id || fact?.id || ""), fact])
+    .filter(([factId]) => factId));
+  const prestructureDiagnosticIds = (values = []) => uniqueValues((values || []).map(String).filter(Boolean)).sort();
+  const prestructureDiagnosticForScope = (scopeId) => prestructureDiagnosticsByScopeHash.get(shortHash(String(scopeId || ""))) || null;
   const prestructureTaskForScope = (scopeId) => prestructureTasks.find((task) => {
     const taskScopeId = String(task?.scope_id || task?.scopeId || task?.taskLocalSemanticEvidence?.scopeId || "");
     return taskScopeId === String(scopeId || "");
   }) || null;
+  for (const task of prestructureTasks) {
+    const taskScopeId = String(task?.scope_id || task?.scopeId || task?.taskLocalSemanticEvidence?.scopeId || "");
+    if (!taskScopeId) continue;
+    const taskId = String(task?.taskId || task?.id || task?.taskLocalSemanticEvidence?.taskId || "");
+    const scopeBundle = Object.values(options.scopeSemanticEvidence || {}).find((bundle) => String(bundle?.scopeId || "") === taskScopeId) || {};
+    const relevanceTask = Object.assign({}, task, {
+      taskId,
+      id: taskId,
+      scope_id: taskScopeId,
+      content: String(task?.content || task?.title || scopeBundle?.action || ""),
+      taskLocalEvidence: Object.assign({}, task?.taskLocalEvidence || {}, {
+        taskId,
+        scopeId: taskScopeId,
+        primarySourceEvidence: { evidenceId: primaryEvidenceId }
+      })
+    });
+    const globalTaskContext = taskRowsByEvidenceIdForBatch([
+      ...(globalCatalog?.items || []),
+      ...(task?.taskLocalSemanticEvidence?.context || []),
+      ...(scopeBundle?.context || [])
+    ]);
+    const shortlist = taskDescriptionSemanticShortlistForTask(globalTaskContext, scopedContract, relevanceTask, {
+      contextBundle: { factsById: Object.fromEntries((scopedContract.facts || []).map((fact) => [String(fact?.factId || ""), fact]).filter(([factId]) => factId)) }
+    });
+    const exactItems = shortlist.items.filter(taskSemanticTaskLocalRelevanceAccepted);
+    const nativeExactHistorical = globalTaskContext.filter((item) => {
+      const temporalRelation = String(item?.temporalRelation || item?.temporal_relation || "").toLowerCase();
+      const historical = item?.current === false || temporalRelation === "historical";
+      if (!historical || !taskWorkflowExactTaskScopeBindingEligible(item, taskId, taskScopeId)) return false;
+      if (["rejected", "blocked", "conflict", "conflicted"].includes(String(item?.authorityState || item?.authority || "").toLowerCase())
+        || ["rejected", "conflict", "conflicted"].includes(String(item?.conflictState || item?.conflict_state || "").toLowerCase())) return false;
+      const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
+      return (item?.structuredFacts || []).some((fact) => String(fact?.evidenceId || fact?.evidence_id || evidenceId) === evidenceId
+        && String(fact?.scopeId || fact?.scope_id || "") === taskScopeId
+        && String(fact?.taskId || fact?.task_id || taskId) === taskId
+        && taskWorkflowExactTaskScopeBindingEligible(fact, taskId, taskScopeId));
+    });
+    const explicitlyBoundHistory = globalTaskContext.filter((item) => {
+      const materialState = String(item?.materialityState || item?.materiality_state || "").trim().toLowerCase();
+      const historical = String(item?.temporalRelation || item?.temporal_relation || "").toLowerCase() === "historical"
+        || item?.current === false
+        || materialState === "material-review-history-candidate";
+      return historical
+        && (materialState === "material-review-history-candidate"
+          || taskSemanticRequestScopedRelevanceEligible(item, taskId, taskScopeId, item?.structuredFacts || []))
+        && (taskWorkflowExactTaskScopeBindingEligible(item, taskId, taskScopeId)
+          || taskSemanticRequestScopedRelevanceEligible(item, taskId, taskScopeId, item?.structuredFacts || []));
+    });
+    const selected = uniqueValues([...(exactItems || []), ...(nativeExactHistorical || []), ...(explicitlyBoundHistory || [])]
+      .map((item) => String(item?.evidenceId || item?.id || ""))
+      .filter(Boolean))
+      .map((evidenceId) => globalTaskContext.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId))
+      .filter(Boolean);
+    const selectedIds = new Set(uniqueValues([
+      primaryEvidenceId,
+      ...selected.map((item) => item?.evidenceId || item?.id)
+    ].map(String).filter(Boolean)));
+    prestructureSelectedEvidenceByScope.set(taskScopeId, selectedIds);
+    const contextEvidenceIds = prestructureDiagnosticIds(globalTaskContext.map((item) => item?.evidenceId || item?.evidence_id || item?.id));
+    const syntheticEvidenceIds = prestructureDiagnosticIds([
+      ...(task?.evidence_ids || task?.evidenceIds || []),
+      ...(task?.providerEligibleEvidenceIds || []),
+      ...(task?.taskLocalSemanticEvidence?.evidenceIds || []),
+      ...(task?.taskLocalSemanticEvidence?.context || []).map((item) => item?.evidenceId || item?.evidence_id || item?.id)
+    ]);
+    const typedFactIds = prestructureDiagnosticIds([
+      ...(scopedContract.facts || [])
+        .filter((fact) => String(fact?.scopeId || fact?.scope_id || "") === taskScopeId)
+        .map((fact) => fact?.factId || fact?.fact_id || fact?.id),
+      ...globalTaskContext.flatMap((item) => item?.structuredFacts || [])
+        .filter((fact) => String(fact?.scopeId || fact?.scope_id || "") === taskScopeId)
+        .map((fact) => fact?.factId || fact?.fact_id || fact?.id)
+    ]);
+    const bindingKeys = prestructureDiagnosticIds(flattenTaskPlan([task]).flatMap((entry) => [
+      ...(entry?.fact_bindings || entry?.factBindings || [])
+    ].map((binding) => [
+      binding?.factId || binding?.fact_id || "",
+      binding?.evidenceId || binding?.evidence_id || "",
+      binding?.scopeId || binding?.scope_id || taskScopeId
+    ].map(String).join("\u0000"))));
+    const strongRequestScopedHelperEligibleCount = globalTaskContext.filter((item) =>
+      taskDescriptionProviderOptionalFactBackedProjectionEligible(item, prestructureFactById, [relevanceTask])).length;
+    prestructureDiagnosticsByScopeHash.set(shortHash(taskScopeId), {
+      scopeHash: shortHash(taskScopeId),
+      prestructureSyntheticTaskCount: 1,
+      prestructureContextRowCount: contextEvidenceIds.length,
+      strongRequestScopedHelperEligibleCount,
+      shortlistSelectedCount: Number(shortlist.selectedCount || 0),
+      materializedHistoryCount: 0,
+      syntheticTaskEvidenceIdCount: syntheticEvidenceIds.length,
+      typedFactCount: typedFactIds.length,
+      factBindingCount: bindingKeys.length,
+      syntheticTaskEvidenceHash: taskWorkflowHash(syntheticEvidenceIds),
+      typedFactHash: taskWorkflowHash(typedFactIds),
+      factBindingHash: taskWorkflowHash(bindingKeys),
+      providerExactTaskLocalAcceptedCount: 0,
+      providerEligibleOptionalCount: 0
+    });
+  }
   const exactPrestructureTaskScopeAssociation = (item, task, scopeId) => {
     const normalizedTaskId = String(task?.taskId || task?.id || "");
     const normalizedScopeId = String(scopeId || "");
     if (!normalizedTaskId || !normalizedScopeId) return false;
     const associations = uniqueTaskScopeAssociations(item?.taskScopeAssociations || []);
     const scopeTaskAlias = `scope:${normalizedScopeId}`;
-    const exactAssociation = associations.some((association) => {
+    const exactAssociation = associations.length === 1 && associations[0]?.advisory !== true && associations.some((association) => {
       const associationTaskId = String(association?.taskId || association?.task_id || "");
       const associationScopeId = String(association?.scopeId || association?.scope_id || "");
       return associationScopeId === normalizedScopeId
         && associationTaskId === normalizedTaskId
         && (normalizedTaskId !== scopeTaskAlias || associationTaskId === scopeTaskAlias);
     });
-    if (!exactAssociation || associations.some((association) => {
+    const requestScopedRelevance = taskSemanticRequestScopedRelevanceEligible(item, normalizedTaskId, normalizedScopeId, item?.structuredFacts || []);
+    const hasForeignOrAdvisoryAssociation = associations.some((association) => {
+      if (association.advisory === true) return true;
       const associationTaskId = String(association?.taskId || association?.task_id || "");
       const associationScopeId = String(association?.scopeId || association?.scope_id || "");
       return associationScopeId !== normalizedScopeId || associationTaskId !== normalizedTaskId;
-    })) return false;
+    });
+    if (!requestScopedRelevance && (!exactAssociation || hasForeignOrAdvisoryAssociation)) return false;
     const topLevelTaskIds = uniqueValues([item?.taskId, item?.task_id, ...(item?.taskIds || []), ...(item?.task_ids || [])]
       .map((value) => String(value || "").trim()).filter(Boolean));
     const topLevelScopeIds = itemScopeIds(item);
@@ -41782,21 +44046,59 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
     const executionRelevant = item?.intentBearing === true
       || item?.actionLaneSupported === true
       || contributions.some((value) => value > 0);
-    return sourceKind === "note"
+    const scopeId = itemScopeIds(item).find((value) => selectedScopeIds.has(String(value))) || "";
+    const task = prestructureTaskForScope(scopeId);
+    const requestScopedRelevance = Boolean(task)
+      && taskSemanticRequestScopedRelevanceEligible(item, String(task?.taskId || task?.id || ""), scopeId, item?.structuredFacts || []);
+    const nativeMaterialHistory = sourceKind === "note"
       && item?.current === false
       && temporalRelation === "historical"
       && materialityState === "material-review-history-candidate"
       && TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(materialityReason)
       && dimensions.length > 0
-      && executionRelevant
+      && executionRelevant;
+    return (requestScopedRelevance || nativeMaterialHistory)
       && !["rejected", "blocked", "conflict", "conflicted"].includes(String(item?.authorityState || "").toLowerCase())
       && !["rejected", "conflict", "conflicted"].includes(String(item?.conflictState || "").toLowerCase());
   };
   const materializePrestructureHistory = (item) => {
     const scopeId = itemScopeIds(item).find((value) => selectedScopeIds.has(String(value))) || "";
     const task = prestructureTaskForScope(scopeId);
+    const requestScopedRelevance = taskSemanticRequestScopedRelevanceEligible(item, String(task?.taskId || task?.id || ""), scopeId, item?.structuredFacts || []);
     if (!task || !materialHistoryEligible(item) || !exactPrestructureTaskScopeAssociation(item, task, scopeId)) return item;
     const taskId = String(task.taskId || task.id || "");
+    const existingFacts = (item.structuredFacts || []).filter((fact) => {
+      const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || item.evidenceId || "");
+      const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
+      return factEvidenceId === String(item.evidenceId || "") && factScopeId === scopeId;
+    }).map((fact) => Object.assign({}, fact, {
+      taskId: String(fact?.taskId || taskId),
+      scopeId,
+      evidenceId: String(fact?.evidenceId || item.evidenceId || ""),
+      current: fact?.current == null ? item?.current : fact.current,
+      temporalRelation: String(fact?.temporalRelation || fact?.temporal_relation || item?.temporalRelation || ""),
+      authorityState: String(fact?.authorityState || fact?.authority_state || item?.authorityState || ""),
+      conflictState: String(fact?.conflictState || fact?.conflict_state || item?.conflictState || "none"),
+      materialityState: String(fact?.materialityState || fact?.materiality_state || item?.materialityState || ""),
+      materialityReason: String(fact?.materialityReason || fact?.materiality_reason || item?.materialityReason || ""),
+      taskScopeAssociations: requestScopedRelevance
+        ? uniqueTaskScopeAssociations([...(fact?.taskScopeAssociations || fact?.task_scope_associations || [])])
+        : uniqueTaskScopeAssociations([...(fact?.taskScopeAssociations || []), { taskId, scopeId }]),
+      ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {})
+    }));
+    if (existingFacts.length) {
+      return Object.assign({}, item, {
+        taskId,
+        scopeId,
+        scopeIds: [scopeId],
+        taskScopeAssociations: requestScopedRelevance
+          ? uniqueTaskScopeAssociations([...(item.taskScopeAssociations || item.task_scope_associations || [])])
+          : uniqueTaskScopeAssociations([...(item.taskScopeAssociations || []), { taskId, scopeId }]),
+        ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {}),
+        structuredFacts: existingFacts,
+        factIds: uniqueValues([...(item.factIds || []), ...existingFacts.map((fact) => fact.factId)].map(String).filter(Boolean))
+      });
+    }
     const materialized = materializeSelectedTaskSemanticExcerptFact(item, taskId, scopeId);
     const structuredFacts = (materialized?.structuredFacts || []).map((fact) => Object.assign({}, fact, {
       taskId: String(fact?.taskId || taskId),
@@ -41808,7 +44110,10 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
       taskId,
       scopeId,
       scopeIds: [scopeId],
-      taskScopeAssociations: uniqueTaskScopeAssociations([...(materialized.taskScopeAssociations || []), { taskId, scopeId }]),
+      taskScopeAssociations: requestScopedRelevance
+        ? uniqueTaskScopeAssociations([...(materialized.taskScopeAssociations || materialized.task_scope_associations || [])])
+        : uniqueTaskScopeAssociations([...(materialized.taskScopeAssociations || []), { taskId, scopeId }]),
+      ...(requestScopedRelevance ? { requestScopedSemanticRelevance: true } : {}),
       structuredFacts,
       factIds: uniqueValues([...(materialized.factIds || []), ...structuredFacts.map((fact) => fact.factId)].map(String).filter(Boolean)),
       materialityState: item.materialityState,
@@ -41877,6 +44182,10 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
       projected.provenance = Object.assign({}, item.provenance || {}, { sourceId: scopedContract.sourceId, title: scopedContract.title, path: scopedContract.path });
       selectedItems.unshift(projected);
     } else {
+      const prestructureSelected = prestructureSelectedEvidenceByScope.get(
+        itemScopeIds(item).find((scopeId) => selectedScopeIds.has(String(scopeId))) || ""
+      );
+      if (prestructureSelected && prestructureSelected.size && !prestructureSelected.has(evidenceId)) continue;
       projected.scopeIds = itemScopeIds(item).filter((scopeId) => selectedScopeIds.has(scopeId));
       projected.taskScopeAssociations = (item.taskScopeAssociations || []).filter((association) => selectedScopeIds.has(String(association?.scopeId || association?.scope_id || "")));
       // Run the strict association gate against the unfiltered source row so a
@@ -41884,12 +44193,26 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
       // sibling metadata was removed from the projected catalog item.
       const materializationCandidate = Object.assign({}, item, { evidenceId });
       const materialized = materializePrestructureHistory(materializationCandidate);
+      delete projected.requestScopedSemanticRelevance;
+      delete projected.current;
       if (materialized !== materializationCandidate && (materialized.structuredFacts || []).length) {
         materializedHistoryCount += 1;
         materializedHistoryEvidenceIds.push(evidenceId);
         materializedHistoryFactIds.push(...materialized.structuredFacts.map((fact) => String(fact.factId || "")).filter(Boolean));
+        const materializedScopeId = itemScopeIds(item).find((value) => selectedScopeIds.has(String(value))) || "";
+        const scopeDiagnostic = prestructureDiagnosticForScope(materializedScopeId);
+        if (scopeDiagnostic) scopeDiagnostic.materializedHistoryCount += 1;
       }
+      const materializedRequestScoped = materialized?.requestScopedSemanticRelevance === true;
+      const materializedHistorical = String(materialized?.temporalRelation || materialized?.temporal_relation || "").toLowerCase() === "historical";
+      const materializedCurrentFalse = materializedRequestScoped && materializedHistorical
+        && (materialized.structuredFacts || []).some((fact) => fact?.current === false
+          && String(fact?.evidenceId || fact?.evidence_id || evidenceId) === evidenceId
+          && String(fact?.scopeId || fact?.scope_id || "") === String(materialized?.scopeId || "")
+          && String(fact?.taskId || fact?.task_id || "") === String(materialized?.taskId || ""));
       selectedItems.push(Object.assign(projected, {
+        ...(materializedRequestScoped ? { requestScopedSemanticRelevance: true } : {}),
+        ...(materializedCurrentFalse ? { current: false } : {}),
         structuredFacts: materialized.structuredFacts || projected.structuredFacts || [],
         factIds: materialized.factIds || projected.factIds || []
       }));
@@ -41931,7 +44254,16 @@ function taskGenerationBatchEvidenceCatalog(globalCatalog = {}, scopedContract =
       selectedScopeIds: Array.from(selectedScopeIds),
       materializedHistoryCount,
       materializedHistoryEvidenceIds: uniqueValues(materializedHistoryEvidenceIds),
-      materializedHistoryFactIds: uniqueValues(materializedHistoryFactIds)
+      materializedHistoryFactIds: uniqueValues(materializedHistoryFactIds),
+      prestructureDiagnostics: Array.from(prestructureDiagnosticsByScopeHash.values()).map((entry) => Object.assign({}, entry)),
+      prestructureSyntheticTaskCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.prestructureSyntheticTaskCount || 0), 0),
+      prestructureContextRowCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.prestructureContextRowCount || 0), 0),
+      strongRequestScopedHelperEligibleCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.strongRequestScopedHelperEligibleCount || 0), 0),
+      shortlistSelectedCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.shortlistSelectedCount || 0), 0),
+      syntheticTaskEvidenceIdCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.syntheticTaskEvidenceIdCount || 0), 0),
+      typedFactCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.typedFactCount || 0), 0),
+      factBindingCount: Array.from(prestructureDiagnosticsByScopeHash.values()).reduce((total, entry) => total + Number(entry.factBindingCount || 0), 0),
+      prestructureEvidenceHash: taskWorkflowHash(Array.from(prestructureDiagnosticsByScopeHash.values()).map((entry) => entry.syntheticTaskEvidenceHash).sort())
     })
   };
   catalog.hash = taskWorkflowHash(catalog);
@@ -41967,46 +44299,64 @@ function taskGenerationBatchProjection(options = {}) {
     return (evidenceCatalog.items || []).filter((item) => {
       const evidenceId = String(item?.evidenceId || item?.id || "");
       const associations = uniqueTaskScopeAssociations(item?.taskScopeAssociations || []);
-      const exactAssociation = associations.length === 1
+      const exactAssociation = associations.length === 1 && associations[0]?.advisory !== true
         && String(associations[0]?.taskId || "") === taskId
         && String(associations[0]?.scopeId || "") === scopeId;
+      const requestScopedAssociation = item?.requestScopedSemanticRelevance === true
+        && taskSemanticRequestScopedRelevanceEligible(item, taskId, scopeId, item?.structuredFacts || []);
       const sourceKind = String(item?.sourceKind || "").toLowerCase();
       const temporalRelation = String(item?.temporalRelation || "").toLowerCase();
       const materialityReason = String(item?.materialityReason || item?.materiality_reason || "").trim();
       const materializedFact = (item?.structuredFacts || []).some((fact) => {
         const factId = String(fact?.factId || fact?.fact_id || "");
-        return factId.startsWith("fact-semantic-")
+        return Boolean(factId)
           && String(fact?.evidenceId || fact?.evidence_id || evidenceId) === evidenceId
           && String(fact?.scopeId || fact?.scope_id || "") === scopeId
           && String(fact?.taskId || fact?.task_id || taskId) === taskId;
       });
-      return Boolean(evidenceId && exactAssociation && materializedFact
-        && sourceKind === "note"
-        && item?.current === false
+      const materialityEligible = exactAssociation
+        || requestScopedAssociation
+        || (String(item?.materialityState || item?.materiality_state || "") === "material-review-history-candidate"
+          && TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(materialityReason));
+      const historical = item?.current === false || temporalRelation === "historical";
+      return Boolean(evidenceId && (exactAssociation || requestScopedAssociation) && materializedFact
+        && (sourceKind === "note" || exactAssociation || requestScopedAssociation)
+        && historical
         && temporalRelation === "historical"
-        && String(item?.materialityState || item?.materiality_state || "") === "material-review-history-candidate"
-        && TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS.has(materialityReason));
+        && materialityEligible);
     });
   };
   const enrichedSyntheticTasks = syntheticTasks.map((task) => {
     const enriched = Object.assign({}, task);
     const taskId = String(enriched.taskId || enriched.id || "");
     const scopeId = String(enriched.scope_id || enriched.scopeId || "");
-    const materializedHistoryRows = materializedHistoryRowsForTask(enriched);
+    const materializedHistoryRows = materializedHistoryRowsForTask(enriched)
+      .slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
     const materializedHistoryEvidenceIds = materializedHistoryRows.map((item) => String(item.evidenceId || item.id || "")).filter(Boolean);
-    const selectedEvidenceIds = uniqueValues([
+    const candidateEvidenceIds = uniqueValues([
       ...(enriched.taskLocalSemanticEvidence?.evidenceIds || []),
       ...(enriched.providerEligibleEvidenceIds || []),
       ...(enriched.evidence_ids || []),
       ...materializedHistoryEvidenceIds
     ].map(String).filter(Boolean));
+    let optionalSelectedCount = 0;
+    const selectedEvidenceIds = candidateEvidenceIds.filter((evidenceId) => {
+      const row = evidenceCatalog.items.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId) || {};
+      const sourceKind = String(row?.sourceKind || row?.source_kind || "").toLowerCase();
+      const protectedCurrent = evidenceId === String(scoped.contract.primaryEvidenceId || "")
+        || sourceKind === "current-source"
+        || row?.primarySource === true
+        || row?.current === true
+        || String(row?.temporalRelation || row?.temporal_relation || "").toLowerCase() === "current";
+      if (protectedCurrent) return true;
+      if (optionalSelectedCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return false;
+      optionalSelectedCount += 1;
+      return true;
+    });
     if (taskId && scopeId) {
       enriched.evidence_ids = selectedEvidenceIds.slice();
       enriched.evidenceIds = selectedEvidenceIds.slice();
-      enriched.providerEligibleEvidenceIds = uniqueValues([
-        ...(enriched.providerEligibleEvidenceIds || []),
-        ...materializedHistoryEvidenceIds
-      ].map(String).filter(Boolean));
+      enriched.providerEligibleEvidenceIds = selectedEvidenceIds.slice();
       enriched.taskLocalSemanticEvidence = Object.assign({}, enriched.taskLocalSemanticEvidence || {}, {
         evidenceIds: uniqueValues([
           ...(enriched.taskLocalSemanticEvidence?.evidenceIds || []),
@@ -42015,7 +44365,7 @@ function taskGenerationBatchProjection(options = {}) {
         context: uniqueValues([
           ...(enriched.taskLocalSemanticEvidence?.context || []).map((item) => String(item?.evidenceId || item?.id || "")),
           ...materializedHistoryEvidenceIds
-        ]).map((evidenceId) => evidenceCatalog.items.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId)).filter(Boolean)
+        ]).filter((evidenceId) => selectedEvidenceIds.includes(evidenceId)).map((evidenceId) => evidenceCatalog.items.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId)).filter(Boolean)
       });
       attachTaskLocalSemanticFacts(enriched, selectedEvidenceIds, { items: evidenceCatalog.items }, scopeId);
     }
@@ -42037,6 +44387,19 @@ function taskGenerationBatchProjection(options = {}) {
     tasks: enrichedSyntheticTasks,
     settings: options.settings || DEFAULT_SETTINGS
   });
+  const prestructureTelemetry = evidenceCatalog.telemetry || {};
+  const providerTelemetry = contextBundle.providerEvidenceProjection?.telemetry || {};
+  const providerExactTaskLocalAcceptedCount = enrichedSyntheticTasks.reduce((total, task) => total + uniqueValues([
+    ...(task?.providerEligibleEvidenceIds || []),
+    ...(task?.taskLocalEvidence?.evidenceIds || []),
+    ...(task?.taskLocalSemanticEvidence?.evidenceIds || [])
+  ].map(String).filter(Boolean)).length, 0);
+  const providerProjectionTelemetry = Object.assign({}, prestructureTelemetry, {
+    providerExactTaskLocalAcceptedCount,
+    providerEligibleOptionalCount: Number(providerTelemetry.providerEligibleOptionalCount || 0),
+    providerProjectionSelectedCount: Number(providerTelemetry.selectedCount || 0),
+    providerProjectionSelectedOptionalCount: Number(providerTelemetry.selectedOptionalCount || 0)
+  });
   return Object.freeze({
     contextBundle,
     sourceContract: scoped.contract,
@@ -42044,7 +44407,8 @@ function taskGenerationBatchProjection(options = {}) {
     sourceSummary: scoped.sourceSummary,
     scopeIds: Array.from(selectedScopeIds),
     includeFullSource: options.includeFullSource === true,
-    syntheticTask: enrichedSyntheticTasks[0] || null
+    syntheticTask: enrichedSyntheticTasks[0] || null,
+    providerProjectionTelemetry: Object.freeze(providerProjectionTelemetry)
   });
 }
 
@@ -42147,11 +44511,168 @@ function taskGenerationProviderFinalScopeContract(batch = {}, workflowContext = 
   }, scopeTokens);
 }
 
+// The retrieval/context compiler owns this bounded set. Provider adapters only
+// receive the already-selected rows and facts; they never rank or admit new
+// evidence. Keep current typed facts authoritative in the final scope contract
+// and carry selected historical evidence as closed execution context.
+function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowContext = {}) {
+  const projection = workflowContext.providerEvidenceProjection
+    || workflowContext.taskLocalProviderEvidenceProjection
+    || batch.contextBundle?.providerEvidenceProjection
+    || {};
+  const selectedEvidenceIds = uniqueValues((projection.selectedEvidenceIds || []).map(String).filter(Boolean));
+  const batchEvidenceRows = [
+    ...(batch.evidenceCatalog?.items || []),
+    ...(batch.contextBundle?.evidenceCatalog?.items || []),
+    ...(workflowContext.evidenceCatalog?.items || [])
+  ];
+  const batchEvidenceById = new Map();
+  for (const row of batchEvidenceRows) {
+    const evidenceId = String(row?.evidenceId || row?.evidence_id || row?.id || "");
+    if (evidenceId && !batchEvidenceById.has(evidenceId)) batchEvidenceById.set(evidenceId, row);
+  }
+  const syntheticTask = batch.syntheticTask
+    || (batch.contextBundle?.tasks || []).find((task) => String(task?.taskId || task?.id || "") === String(batch.syntheticTaskId || ""))
+    || (workflowContext.tasks || []).find((task) => String(task?.taskId || task?.id || "") === String(batch.syntheticTaskId || ""));
+  const syntheticTaskEvidenceIds = uniqueValues([
+    ...(syntheticTask?.providerEligibleEvidenceIds || []),
+    ...(syntheticTask?.evidence_ids || syntheticTask?.evidenceIds || []),
+    ...(syntheticTask?.taskLocalEvidence?.evidenceIds || syntheticTask?.taskLocalEvidence?.evidence_ids || []),
+    ...(syntheticTask?.taskLocalSemanticEvidence?.evidenceIds || syntheticTask?.taskLocalSemanticEvidence?.evidence_ids || [])
+  ].map(String).filter(Boolean));
+  const syntheticTaskFactBindings = [
+    ...(syntheticTask?.fact_bindings || syntheticTask?.factBindings || []),
+    ...(syntheticTask?.taskLocalEvidence?.factBindings || syntheticTask?.taskLocalEvidence?.fact_bindings || [])
+  ];
+  const syntheticExactEvidenceIds = new Set([
+    ...(syntheticTask?.taskLocalSemanticEvidence?.context || []),
+    ...(syntheticTask?.taskLocalEvidence?.supportingSemanticEvidence || [])
+  ].filter((row) => taskSemanticTaskLocalRelevanceAccepted(row))
+    .map((row) => String(row?.evidenceId || row?.evidence_id || row?.id || ""))
+    .filter(Boolean));
+  const boundBatchEvidenceIds = syntheticTaskEvidenceIds.filter((evidenceId) => {
+    const row = batchEvidenceById.get(evidenceId);
+    if (!row) return false;
+    if (String(row.sourceKind || "").toLowerCase() === "current-source") return true;
+    if (!syntheticExactEvidenceIds.has(evidenceId)) return false;
+    const rowFactIds = new Set((row.structuredFacts || []).map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean));
+    return syntheticTaskFactBindings.some((binding) => {
+      const factId = String(binding?.factId || binding?.fact_id || "");
+      const bindingEvidenceId = String(binding?.evidenceId || binding?.evidence_id || "");
+      return factId && bindingEvidenceId === evidenceId && rowFactIds.has(factId);
+    });
+  });
+  const selectedEvidenceSet = new Set(selectedEvidenceIds);
+  const evidenceById = Object.assign({}, Object.fromEntries(batchEvidenceById), workflowContext.providerEvidenceById || {}, projection.providerEvidenceById || {});
+  const factById = new Map();
+  const syntheticBoundFactPairs = new Set(syntheticTaskFactBindings.map((binding) => [
+    String(binding?.factId || binding?.fact_id || ""),
+    String(binding?.evidenceId || binding?.evidence_id || "")
+  ].join("\u0000")));
+  const registerFact = (fact = {}) => {
+    const factId = String(fact.factId || fact.fact_id || "");
+    const evidenceId = String(fact.evidenceId || fact.evidence_id || fact.valueEvidenceId || fact.value_evidence_id || "");
+    if (!factId || !evidenceId || !selectedEvidenceSet.has(evidenceId) || factById.has(factId)) return;
+    const exactSyntheticFact = boundBatchEvidenceIds.includes(evidenceId)
+      && syntheticBoundFactPairs.has(`${factId}\u0000${evidenceId}`);
+    if (projection.providerFactIds?.length
+      && !projection.providerFactIds.map(String).includes(factId)
+      && !exactSyntheticFact) return;
+    factById.set(factId, fact);
+  };
+  for (const fact of Object.values(workflowContext.factsById || {})) registerFact(fact);
+  for (const fact of Object.values(batch.contextBundle?.factsById || {})) registerFact(fact);
+  for (const row of Object.values(evidenceById)) for (const fact of row?.structuredFacts || []) registerFact(fact);
+  const compactEvidence = selectedEvidenceIds.map((evidenceId) => {
+    const row = evidenceById[evidenceId] || {};
+    return {
+      evidenceId,
+      sourceId: String(row.sourceId || row.provenance?.sourceId || ""),
+      sourceKind: String(row.sourceKind || row.provenance?.sourceKind || ""),
+      title: singleLine(row.title || row.provenance?.title || ""),
+      path: String(row.path || row.provenance?.path || ""),
+      excerpt: String(row.excerpt || row.text || row.evidence || ""),
+      current: row.current === true,
+      authorityState: String(row.authorityState || row.authority || row.provenance?.authority || ""),
+      temporalRelation: String(row.temporalRelation || ""),
+      conflictState: String(row.conflictState || "none"),
+      materialityState: String(row.materialityState || row.materiality_state || ""),
+      materialityReason: String(row.materialityReason || row.materiality_reason || "")
+    };
+  });
+  const compactFacts = Array.from(factById.values()).map((fact) => ({
+    factId: String(fact.factId || fact.fact_id || ""),
+    evidenceId: String(fact.evidenceId || fact.evidence_id || fact.valueEvidenceId || fact.value_evidence_id || ""),
+    type: String(fact.type || fact.kind || "summary"),
+    role: String(fact.role || "supporting-context"),
+    value: String(fact.sourceSurface || fact.value || fact.text || ""),
+    current: fact.current === true,
+    authorityState: String(fact.authorityState || fact.authority || ""),
+    temporalRelation: String(fact.temporalRelation || ""),
+    conflictState: String(fact.conflictState || "none"),
+    materialityState: String(fact.materialityState || fact.materiality_state || ""),
+    materialityReason: String(fact.materialityReason || fact.materiality_reason || "")
+  }));
+  const taskClosures = flattenTaskPlan(workflowContext.tasks || batch.tasks || []).map((task) => {
+    const rich = task?.taskLocalEvidence || {};
+    const taskId = String(rich.taskId || task?.taskId || task?.id || "");
+    const scopeId = String(rich.scopeId || task?.scope_id || task?.scopeId || "");
+    const taskReferenceIds = new Set([
+      ...(task?.evidence_ids || task?.evidenceIds || []),
+      ...(rich.evidenceIds || rich.evidence_ids || []),
+      ...(task?.providerEligibleEvidenceIds || [])
+    ].map(String).filter(Boolean));
+    const evidenceIds = selectedEvidenceIds.filter((evidenceId) => {
+      if (taskReferenceIds.has(evidenceId)) return true;
+      const row = evidenceById[evidenceId] || {};
+      const associations = uniqueTaskScopeAssociations(row.taskScopeAssociations || []);
+      return associations.some((association) => String(association?.taskId || association?.task_id || "") === taskId
+        && String(association?.scopeId || association?.scope_id || "") === scopeId);
+    });
+    const evidenceSet = new Set(evidenceIds);
+    const factIds = uniqueValues(Array.from(factById.values())
+      .filter((fact) => evidenceSet.has(String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "")))
+      .map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean));
+    return { evidenceIds, factIds };
+  });
+  return {
+    version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+    evidenceIds: selectedEvidenceIds,
+    evidence: compactEvidence,
+    factIds: compactFacts.map((fact) => fact.factId),
+    facts: compactFacts,
+    taskClosures,
+    telemetry: {
+      selectedEvidenceCount: selectedEvidenceIds.length,
+      selectedFactCount: compactFacts.length,
+      bounded: true
+    }
+  };
+}
+
+function taskGenerationProviderEvidenceManifestMetadata(evidenceCatalog = {}) {
+  const manifest = evidenceCatalog?.manifest && typeof evidenceCatalog.manifest === "object"
+    ? evidenceCatalog.manifest
+    : {};
+  const metadata = {};
+  for (const key of [
+    "version", "sourceId", "sourceContractId", "primaryEvidenceIds", "evidenceIds",
+    "semanticEvidenceIds", "factIds", "scopeIds", "mode", "hash", "closureHash"
+  ]) {
+    if (manifest[key] !== undefined) metadata[key] = manifest[key];
+  }
+  return {
+    hash: String(evidenceCatalog?.hash || ""),
+    manifest: metadata
+  };
+}
+
 function taskGenerationProviderPromptContextSuffix(batch = {}, workflowContext = {}, scopeTokens = []) {
   const requiredBlock = workflowContext.requiredPromptBlock || {
     sourceContract: workflowContext.sourceContract || batch.sourceContract || {},
     evidenceCatalog: { manifest: workflowContext.providerEvidenceCatalog?.manifest || workflowContext.evidenceCatalog?.manifest || {} }
   };
+  const requiredEvidenceManifest = taskGenerationProviderEvidenceManifestMetadata(requiredBlock.evidenceCatalog || {});
   const payload = taskGenerationProviderIdentifierFreeValue({
     source: {
       summary: batch.sourceSummary || workflowContext.primarySource || "",
@@ -42159,7 +44680,11 @@ function taskGenerationProviderPromptContextSuffix(batch = {}, workflowContext =
       path: workflowContext.sourcePath || batch.sourceContract?.path || ""
     },
     contract: requiredBlock.sourceContract || batch.sourceContract || {},
-    evidenceCatalog: requiredBlock.evidenceCatalog || {},
+    // Evidence bodies/facts are carried exactly once by the provider
+    // projection below. The required block contributes only manifest IDs and
+    // hashes so it cannot duplicate the closed provider table.
+    evidenceCatalog: requiredEvidenceManifest,
+    providerEvidenceProjection: taskGenerationProviderClosedEvidenceProjection(batch, workflowContext),
     taskContext: workflowContext.taskContext || "",
     adaptiveTaskContext: workflowContext.adaptiveTaskContext || ""
   }, scopeTokens);
@@ -42492,6 +45017,7 @@ function taskGenerationBatchPlan(options = {}) {
       evidenceCatalog: candidate.evidenceCatalog,
       contextBundle: candidate.contextBundle,
       sourceSummary: candidate.sourceSummary,
+      providerProjectionTelemetry: candidate.providerProjectionTelemetry,
       preflight
     }));
   }
@@ -46850,11 +49376,31 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENROUTER_FREE_RATE_WINDOW_MS = 60_000;
   const OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
   const OPENROUTER_FREE_RATE_PROFILE = "openrouter-free-rolling-v1";
+  const OPENROUTER_RATE_LIMIT_PROFILE = "openrouter-rate-profile-v1";
   const classifyOpenRouterFreeModel = (provider, model) => {
     const normalizedProvider = normalizeProvider(provider, "");
     const normalizedModel = normalizeModel("openrouter", model).trim().toLowerCase();
     return normalizedProvider === "openrouter"
       && (normalizedModel === "openrouter/free" || /:free$/i.test(normalizedModel));
+  };
+  const openRouterRateLimitProfile = (settings = {}, model = "") => {
+    const free = classifyOpenRouterFreeModel("openrouter", model);
+    const modelClass = free ? "free" : "paid";
+    return Object.freeze({
+      profile: OPENROUTER_RATE_LIMIT_PROFILE,
+      modelClass,
+      class: modelClass,
+      limiterApplied: free,
+      providerManaged: !free,
+      limit: free ? OPENROUTER_FREE_RATE_LIMIT : 0,
+      requestsPerMinute: free ? OPENROUTER_FREE_RATE_LIMIT : 0,
+      windowMs: free ? OPENROUTER_FREE_RATE_WINDOW_MS : 0,
+      accountTier: "unknown",
+      tier: "unknown",
+      dailyQuota: 0,
+      dailyQuotaKnown: false,
+      dailyQuotaSource: "429-response"
+    });
   };
   const boundedRetryAfterValue = (value, now = Date.now(), unit = "seconds") => {
     const numeric = typeof value === "number" && Number.isFinite(value) ? value : Number(nonEmpty(value));
@@ -46900,6 +49446,33 @@ const STS_MULTI_PROVIDER = (() => {
       ...millisecondValues.map((value) => boundedRetryAfterValue(value, now, "milliseconds"))
     );
   };
+  const boundedRateLimitHeaderNumber = (value, maximum = 1e9) => {
+    if (value === undefined || value === null || nonEmpty(value) === "") return null;
+    const number = Number(nonEmpty(value));
+    return Number.isFinite(number) && number >= 0 ? Math.min(maximum, Math.round(number)) : null;
+  };
+  const openRouterRateLimitHeaders = (response) => {
+    const limit = boundedRateLimitHeaderNumber(openRouterResponseHeader?.(response, "x-ratelimit-limit"));
+    const remaining = boundedRateLimitHeaderNumber(openRouterResponseHeader?.(response, "x-ratelimit-remaining"));
+    const resetRaw = nonEmpty(openRouterResponseHeader?.(response, "x-ratelimit-reset"));
+    const resetNumber = resetRaw ? Number(resetRaw) : Number.NaN;
+    let resetMs = null;
+    if (Number.isFinite(resetNumber) && resetNumber >= 0) {
+      resetMs = resetNumber >= 1e12 ? Math.min(OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS, Math.round(resetNumber - Date.now()))
+        : resetNumber >= 1e9 ? Math.min(OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS, Math.round(resetNumber * 1000 - Date.now()))
+          : Math.min(OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS, Math.round(resetNumber * 1000));
+      resetMs = Math.max(0, resetMs);
+    } else if (resetRaw) {
+      const resetAt = Date.parse(resetRaw);
+      if (Number.isFinite(resetAt)) resetMs = Math.max(0, Math.min(OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS, Math.round(resetAt - Date.now())));
+    }
+    if (limit === null && remaining === null && resetMs === null) return null;
+    return Object.freeze({
+      ...(limit === null ? {} : { xRateLimitLimit: limit }),
+      ...(remaining === null ? {} : { xRateLimitRemaining: remaining }),
+      ...(resetMs === null ? {} : { xRateLimitResetMs: resetMs })
+    });
+  };
   const openRouterFreeRateKey = (settings = {}) => {
     const identity = nonEmpty(settings.openrouterAuthIdentity || settings.openrouterApiKey || "anonymous");
     return `openrouter:${stableHash(identity)}`;
@@ -46912,6 +49485,54 @@ const STS_MULTI_PROVIDER = (() => {
     depth: Math.max(0, Math.min(256, Math.round(Number(depth) || 0))),
     source: nonEmpty(source).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48) || "admission"
   });
+  const openRouterRateLimitTelemetry = (profile, value = {}, source = "provider") => {
+    const current = profile && typeof profile === "object" ? profile : openRouterRateLimitProfile({}, "");
+    const waitMs = Math.max(0, Math.min(3_600_000, Math.round(Number(value.waitMs) || 0)));
+    const depth = Math.max(0, Math.min(256, Math.round(Number(value.depth) || 0)));
+    const retryAfterMs = Math.max(0, Math.min(OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS, Math.round(Number(value.retryAfterMs) || 0)));
+    const xRateLimitLimit = boundedRateLimitHeaderNumber(value.xRateLimitLimit);
+    const xRateLimitRemaining = boundedRateLimitHeaderNumber(value.xRateLimitRemaining);
+    const xRateLimitResetMs = boundedRateLimitHeaderNumber(value.xRateLimitResetMs, OPENROUTER_FREE_RATE_MAX_RETRY_AFTER_MS);
+    const rateLimitReason = ["free-daily-quota", "free-rpm", "rate-limit"].includes(value.rateLimitReason) ? value.rateLimitReason : "";
+    return Object.freeze({
+      profile: String(current.profile || OPENROUTER_RATE_LIMIT_PROFILE).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64),
+      modelClass: current.modelClass === "free" ? "free" : "paid",
+      class: current.modelClass === "free" ? "free" : "paid",
+      limiterApplied: current.limiterApplied === true,
+      providerManaged: current.providerManaged === true,
+      limit: Math.max(0, Math.min(20, Math.round(Number(current.limit) || 0))),
+      windowMs: Math.max(0, Math.min(86_400_000, Math.round(Number(current.windowMs) || 0))),
+      accountTier: ["free", "paid", "unknown"].includes(current.accountTier) ? current.accountTier : "unknown",
+      tier: ["free", "paid", "unknown"].includes(current.tier) ? current.tier : "unknown",
+      dailyQuota: Math.max(0, Math.min(1_000_000, Math.round(Number(current.dailyQuota) || 0))),
+      dailyQuotaKnown: current.dailyQuotaKnown === true,
+      waitMs,
+      depth,
+      ...(retryAfterMs > 0 ? { retryAfterMs } : {}),
+      ...(xRateLimitLimit === null ? {} : { xRateLimitLimit }),
+      ...(xRateLimitRemaining === null ? {} : { xRateLimitRemaining }),
+      ...(xRateLimitResetMs === null ? {} : { xRateLimitResetMs }),
+      ...(rateLimitReason ? { rateLimitReason } : {}),
+      source: nonEmpty(source).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48) || "provider"
+    });
+  };
+  const attachOpenRouterRateLimitTelemetry = (error, profile, value = {}) => {
+    if (!error || typeof error !== "object") return error;
+    const diagnostic = error.providerError?.providerDiagnostic || error.providerDiagnostic || {};
+    const headers = value.rateLimitHeaders || error.openRouterRateLimitHeaders || diagnostic.rateLimitHeaders || {};
+    const telemetry = openRouterRateLimitTelemetry(profile, Object.assign({}, value, headers, {
+      retryAfterMs: value.retryAfterMs || error.rateLimitRetryAfterMs || diagnostic.retryAfterMs || error.rateLimit?.retryAfterMs,
+      rateLimitReason: value.rateLimitReason || error.rateLimitReason || diagnostic.rateLimitReason || error.rateLimit?.rateLimitReason
+    }), value.source || error.rateLimitSource || (profile.providerManaged ? "provider-429" : "provider-429"));
+    error.rateLimit = telemetry;
+    if (error.providerError && typeof error.providerError === "object") {
+      error.providerError.rateLimit = telemetry;
+      if (error.providerError.providerDiagnostic && typeof error.providerError.providerDiagnostic === "object") {
+        error.providerError.providerDiagnostic.rateLimit = telemetry;
+      }
+    }
+    return error;
+  };
   const createOpenRouterFreeRateLimiter = (options = {}) => {
     const now = typeof options.now === "function" ? options.now : () => Date.now();
     const schedule = typeof options.setTimeout === "function"
@@ -47101,7 +49722,17 @@ const STS_MULTI_PROVIDER = (() => {
     descriptionSchemaProfile = "",
     descriptionCompactSchemaHash = "",
     descriptionOriginalSchemaHash = "",
-    descriptionCarrier = ""
+    descriptionCarrier = "",
+    descriptionCarrierNormalized = false,
+    descriptionDeterministicCompletion = false,
+    descriptionCompletionAddedFields = [],
+    derivedChatCitationNormalization = false,
+    derivedChatCitationRemovedCount = 0,
+    derivedChatCitationReason = "",
+    schemaPatternNormalizationApplied = false,
+    schemaPatternNormalizationFieldCount = 0,
+    schemaPatternNormalizationPathClass = "",
+    schemaPatternNormalizationReason = ""
   } = {}) => ({
     profile,
     eventCount: Math.max(0, Math.min(OPENWEBUI_RESPONSE_MAX_EVENTS, Math.round(Number(eventCount) || 0))),
@@ -47127,7 +49758,18 @@ const STS_MULTI_PROVIDER = (() => {
     descriptionSchemaProfile: nonEmpty(descriptionSchemaProfile).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
     descriptionCompactSchemaHash: nonEmpty(descriptionCompactSchemaHash).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
     descriptionOriginalSchemaHash: nonEmpty(descriptionOriginalSchemaHash).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
-    descriptionCarrier: nonEmpty(descriptionCarrier).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48)
+    descriptionCarrier: nonEmpty(descriptionCarrier).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48),
+    descriptionCarrierNormalized: Boolean(descriptionCarrierNormalized),
+    descriptionDeterministicCompletion: Boolean(descriptionDeterministicCompletion),
+    descriptionCompletionAddedFields: (Array.isArray(descriptionCompletionAddedFields) ? descriptionCompletionAddedFields : [])
+      .filter((field) => ["index", "evidence_ids", "fact_refs"].includes(field)).slice(0, 3),
+    derivedChatCitationNormalization: Boolean(derivedChatCitationNormalization),
+    derivedChatCitationRemovedCount: Math.max(0, Math.min(OPENWEBUI_RESPONSE_MAX_EVENTS, Math.round(Number(derivedChatCitationRemovedCount) || 0))),
+    derivedChatCitationReason: nonEmpty(derivedChatCitationReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
+    schemaPatternNormalizationApplied: Boolean(schemaPatternNormalizationApplied),
+    schemaPatternNormalizationFieldCount: Math.max(0, Math.min(32, Math.round(Number(schemaPatternNormalizationFieldCount) || 0))),
+    schemaPatternNormalizationPathClass: nonEmpty(schemaPatternNormalizationPathClass).replace(/[^A-Za-z0-9.*_\[\],:-]/g, "").slice(0, 120),
+    schemaPatternNormalizationReason: nonEmpty(schemaPatternNormalizationReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80)
   });
   const openWebUIReasoningOnlyValidationResult = (accepted, reason, schemaHash = "") => ({
     accepted: Boolean(accepted),
@@ -47650,6 +50292,13 @@ const STS_MULTI_PROVIDER = (() => {
       structuredEnvelopeProfile: String(telemetry.structuredEnvelopeProfile || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
       structuredEnvelopeReason: String(telemetry.structuredEnvelopeReason || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
       finishReason: nonEmpty(telemetry.finishReason).slice(0, 48),
+      derivedChatCitationNormalization: Boolean(telemetry.derivedChatCitationNormalization),
+      derivedChatCitationRemovedCount: Math.max(0, Math.min(OPENWEBUI_RESPONSE_MAX_EVENTS, Math.round(Number(telemetry.derivedChatCitationRemovedCount || 0)))),
+      derivedChatCitationReason: nonEmpty(telemetry.derivedChatCitationReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
+      schemaPatternNormalizationApplied: Boolean(telemetry.schemaPatternNormalizationApplied),
+      schemaPatternNormalizationFieldCount: Math.max(0, Math.min(32, Math.round(Number(telemetry.schemaPatternNormalizationFieldCount || 0)))),
+      schemaPatternNormalizationPathClass: nonEmpty(telemetry.schemaPatternNormalizationPathClass).replace(/[^A-Za-z0-9.*_\[\],:-]/g, "").slice(0, 120),
+      schemaPatternNormalizationReason: nonEmpty(telemetry.schemaPatternNormalizationReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80),
       rawHash: stableHash(rawText),
       rawSha256: stableHash(rawText),
       rawUtf8Bytes: openWebUIUtf8ByteLength(rawText),
@@ -47680,7 +50329,7 @@ const STS_MULTI_PROVIDER = (() => {
         const token = stringValue.slice(0, 256).toLowerCase();
         if (/auth|unauthoriz|forbidden|credential|permission|login|jwt|token\b/.test(token)) matches.add("auth");
         if (/grammar|schema|json[_ -]?schema|response[_ -]?format|pattern\b|unsupported|capabilit|not[_ -]?support|unrecognized[_ -]?field|unknown[_ -]?field/.test(token)) matches.add("schema");
-        if (/grammar|failed\s+to\s+parse\s+grammar/.test(token)) matches.add("grammar");
+        if (/failed\s+to\s+parse\s+grammar(?:\s+from\s+[a-z0-9._-]+)?\b|unsupported\s+(?:response\s+)?grammar\b/.test(token)) matches.add("grammar");
         if (/bad[_ -]?request|request[_ -]?validation|validation|invalid[_ -]?request|malformed|missing[_ -]?field|size|too[_ -]?large|payload|length[_ -]?limit|token[_ -]?limit/.test(token)) matches.add("validation");
         if (/server|upstream|connection|connect|timeout|timed[_ -]?out|reset|closed|unavailable|overload|capacity|temporar/.test(token)) matches.add("transport");
         if (depth < 4 && stringValue.length <= 16 * 1024) {
@@ -47893,6 +50542,7 @@ const STS_MULTI_PROVIDER = (() => {
     ? clearTimeout
     : (typeof window !== "undefined" && typeof window.clearTimeout === "function" ? window.clearTimeout.bind(window) : null);
   const openWebUIModelBarriers = new Map();
+  const openWebUIAdaptiveConcurrencyMemory = new Map();
   const openWebUIQueueKey = (auth) => {
     let origin = "";
     try { origin = normalizeOpenWebUIBaseUrl(auth?.state?.baseUrl || "", true); } catch { origin = nonEmpty(auth?.state?.baseUrl).slice(0, 256); }
@@ -47919,6 +50569,10 @@ const STS_MULTI_PROVIDER = (() => {
     activeForModel: Math.max(1, Math.round(Number(item?.modelActiveAtStart) || 1)),
     maxActive: Math.max(1, Math.round(Math.max(Number(item?.transportMaxActive) || 0, Number(state?.maxActiveTransports) || 0))),
     maxActiveForModel: Math.max(1, Math.round(Math.max(Number(item?.modelMaxActive) || 0, Number(state?.maxActiveByModel?.get?.(item?.modelKey)) || 0))),
+    configuredLimit: Math.max(1, Math.min(OPENWEBUI_MODEL_CONCURRENCY_MAX, Math.round(Number(item?.configuredLimit) || Number(item?.limit) || OPENWEBUI_MODEL_CONCURRENCY_DEFAULT))),
+    adaptiveLimit: Math.max(1, Math.min(OPENWEBUI_MODEL_CONCURRENCY_MAX, Math.round(Number(item?.adaptiveLimit) || Number(item?.limit) || OPENWEBUI_MODEL_CONCURRENCY_DEFAULT))),
+    adaptiveProfileKeyHash: item?.adaptiveProfileKey ? stableHash(item.adaptiveProfileKey) : "",
+    adaptiveConcurrencyReason: nonEmpty(item?.adaptiveConcurrencyReason).slice(0, 80),
     transportSequence: Math.max(1, Math.round(Number(item?.transportSequence) || 1)),
     transportStartedAtMs: Math.max(0, Math.round(Number(item?.transportStartedAtMs) || 0)),
     transportFinishedAtMs: Math.max(0, Math.round(Number(transportFinishedAtMs) || 0)),
@@ -48007,6 +50661,34 @@ const STS_MULTI_PROVIDER = (() => {
         void (async () => {
       let timeoutHandle = null;
       let callerTimedOut = false;
+      const observeConcurrentTimeout = () => {
+        const profile = item.adaptiveProfile;
+        const profileObservationKey = nonEmpty(profile?.identity || profile?.key);
+        if (!profileObservationKey || item.limit <= 1 || state.adaptiveObservedProfiles.has(profileObservationKey)) return;
+        const activeForModel = state.activeByModel.get(item.modelKey) || 0;
+        if (activeForModel <= 1) return;
+        state.adaptiveObservedProfiles.add(profileObservationKey);
+        openWebUIAdaptiveConcurrencyMemory.set(profileObservationKey, 1);
+        item.adaptiveLimit = 1;
+        item.adaptiveConcurrencyReason = "concurrent-timeout";
+        for (const pending of state.pending) {
+          if (pending.adaptiveProfileKey === profileObservationKey) pending.limit = 1;
+        }
+        const observation = Object.assign({}, profile, {
+          model: item.modelKey,
+          configuredConcurrencyLimit: item.configuredLimit,
+          adaptiveConcurrencyLimit: 1,
+          effectiveConcurrencyLimit: 1,
+          adaptiveConcurrencyReason: "concurrent-timeout",
+          adaptiveConcurrencyObservations: 1,
+          observedActiveForModel: activeForModel,
+          observedActiveTransports: state.activeTransports,
+          transportSettled: false,
+          finalization: "draining"
+        });
+        try { void Promise.resolve(item.onAdaptiveObservation?.(observation)).catch(() => {}); } catch {}
+        drainOpenWebUIModelBarrier(key, state);
+      };
       const timeoutError = () => providerError("openwebui", null, "timeout", true, "", {
         source: "openwebui-error-metadata",
         classification: "transport",
@@ -48020,6 +50702,7 @@ const STS_MULTI_PROVIDER = (() => {
       if (item.timeoutMs > 0 && openWebUIScheduleTimer) {
         timeoutHandle = openWebUIScheduleTimer(() => {
           callerTimedOut = true;
+          observeConcurrentTimeout();
           item.reject(attachOpenWebUIQueueTelemetry(timeoutError(), openWebUIQueueTelemetry(key, state, item)));
         }, item.timeoutMs);
       }
@@ -48051,7 +50734,15 @@ const STS_MULTI_PROVIDER = (() => {
   const runOpenWebUIModelBarrier = async (auth, model, limit, fn, options = {}) => {
     const key = openWebUIQueueKey(auth);
     const modelKey = normalizeModel("openwebui", model);
-    const boundedLimit = Math.max(1, Math.min(OPENWEBUI_MODEL_CONCURRENCY_MAX, Math.round(Number(limit) || OPENWEBUI_MODEL_CONCURRENCY_DEFAULT)));
+    const configuredLimit = Math.max(1, Math.min(OPENWEBUI_MODEL_CONCURRENCY_MAX, Math.round(Number(limit) || OPENWEBUI_MODEL_CONCURRENCY_DEFAULT)));
+    const adaptiveProfile = options.adaptiveProfile && typeof options.adaptiveProfile === "object" ? options.adaptiveProfile : null;
+    const adaptiveProfileKey = nonEmpty(adaptiveProfile?.identity || adaptiveProfile?.key);
+    const adaptiveMemoryKey = adaptiveProfileKey;
+    const rememberedAdaptiveLimit = Number(openWebUIAdaptiveConcurrencyMemory.get(adaptiveMemoryKey) || 0);
+    const persistedAdaptiveLimit = Number(adaptiveProfile?.adaptiveConcurrencyLimit || 0);
+    const adaptiveLimit = Math.max(1, Math.min(OPENWEBUI_MODEL_CONCURRENCY_MAX,
+      Math.round(rememberedAdaptiveLimit || persistedAdaptiveLimit || configuredLimit)));
+    const boundedLimit = Math.min(configuredLimit, adaptiveLimit);
     const requestedWorkerCount = normalizeOpenWebUIWorkerCount(options.workerCount);
     let state = openWebUIModelBarriers.get(key);
     if (!state) {
@@ -48066,7 +50757,7 @@ const STS_MULTI_PROVIDER = (() => {
           maxActive: boundedLimit
         });
       }
-      state = { pending: [], draining: false, workerCount: requestedWorkerCount, lanes: Array.from({ length: requestedWorkerCount }, (_, id) => ({ id, modelKey: "", activeTransports: 0, maxActiveTransports: 0 })), activeTransports: 0, maxActiveTransports: 0, activeByModel: new Map(), maxActiveByModel: new Map(), transportSequence: 0, createdAt: Date.now(), lastActivityAt: Date.now() };
+      state = { pending: [], draining: false, workerCount: requestedWorkerCount, lanes: Array.from({ length: requestedWorkerCount }, (_, id) => ({ id, modelKey: "", activeTransports: 0, maxActiveTransports: 0 })), activeTransports: 0, maxActiveTransports: 0, activeByModel: new Map(), maxActiveByModel: new Map(), adaptiveObservedProfiles: new Set(), transportSequence: 0, createdAt: Date.now(), lastActivityAt: Date.now() };
       openWebUIModelBarriers.set(key, state);
     } else {
       state.workerCount = requestedWorkerCount;
@@ -48088,7 +50779,25 @@ const STS_MULTI_PROVIDER = (() => {
     const enqueuedAt = Date.now();
     state.lastActivityAt = enqueuedAt;
     const result = await new Promise((resolve, reject) => {
-      const item = { fn, resolve, reject, modelKey, limit: boundedLimit, depthAtEnqueue, queuePosition, enqueuedAt, timeoutMs: Math.max(0, Number(options.timeoutMs) || 0), signal: options.signal || null, abortListener: null };
+      const item = {
+        fn,
+        resolve,
+        reject,
+        modelKey,
+        limit: boundedLimit,
+        configuredLimit,
+        adaptiveLimit,
+        adaptiveProfile,
+        adaptiveProfileKey,
+        adaptiveConcurrencyReason: nonEmpty(adaptiveProfile?.adaptiveConcurrencyReason),
+        onAdaptiveObservation: options.onAdaptiveObservation,
+        depthAtEnqueue,
+        queuePosition,
+        enqueuedAt,
+        timeoutMs: Math.max(0, Number(options.timeoutMs) || 0),
+        signal: options.signal || null,
+        abortListener: null
+      };
       const abort = () => {
         const index = state.pending.indexOf(item);
         if (index < 0) return;
@@ -48130,17 +50839,31 @@ const STS_MULTI_PROVIDER = (() => {
 
   const runOpenRouterRequest = async (settings, options = {}, method, path, body = null, model = "") => {
     const normalizedModel = normalizeModel("openrouter", model || body?.model || "");
-    if (!classifyOpenRouterFreeModel("openrouter", normalizedModel)) {
-      return { value: await openRouterRequest(settings, options, method, path, body), rateLimit: null, limiter: null, key: "" };
+    const rateProfile = openRouterRateLimitProfile(settings, normalizedModel);
+    if (!rateProfile.limiterApplied) {
+      try {
+        const value = await openRouterRequest(settings, Object.assign({}, options, { rateLimitContext: { profile: rateProfile } }), method, path, body);
+        return { value, rateLimit: openRouterRateLimitTelemetry(rateProfile, {}, "provider-managed"), limiter: null, key: "" };
+      } catch (error) {
+        throw attachOpenRouterRateLimitTelemetry(error, rateProfile, { source: "provider-managed" });
+      }
     }
     const limiter = options.freeRateLimiter || defaultOpenRouterFreeRateLimiter;
     const key = openRouterFreeRateKey(settings);
     // Queue admission is part of the caller's overall attempt deadline; a
     // queued request may expire before the provider transport begins.
-    const result = await limiter.run(key, () => openRouterRequest(settings, Object.assign({}, options, {
-      rateLimitContext: { limiter, key }
-    }), method, path, body), { signal: options.signal, deadlineMs: options.attemptDeadlineMs || options.timeoutMs });
-    return Object.assign({}, result, { limiter, key });
+    try {
+      const result = await limiter.run(key, () => openRouterRequest(settings, Object.assign({}, options, {
+        rateLimitContext: { limiter, key, profile: rateProfile }
+      }), method, path, body), { signal: options.signal, deadlineMs: options.attemptDeadlineMs || options.timeoutMs });
+      return Object.assign({}, result, {
+        rateLimit: openRouterRateLimitTelemetry(rateProfile, result.rateLimit || {}, result.rateLimit?.source || "admission"),
+        limiter,
+        key
+      });
+    } catch (error) {
+      throw attachOpenRouterRateLimitTelemetry(error, rateProfile, { source: error?.rateLimit?.source || "provider-429" });
+    }
   };
   const openRouterRequest = async (settings, options = {}, method, path, body = null) => {
     const request = requestFunction(options.requestUrl);
@@ -48171,6 +50894,8 @@ const STS_MULTI_PROVIDER = (() => {
       const classification = auth ? "auth" : schema ? "schema" : validation ? "validation" : transport ? "transport" : "provider";
       const code = auth ? (status === 401 ? "auth-required" : "auth-failed") : schema ? "unsupported-schema" : validation ? "request-validation" : transport ? "transport" : "provider-error";
       const retryAfterMs = status === 429 ? retryAfterFromResponse(response, payload) : 0;
+      const rateLimitHeaders = status === 429 ? openRouterRateLimitHeaders(response) : null;
+      const rateLimitReason = status === 429 ? openRouterRateLimitReason(payload, response, options.rateLimitContext?.profile?.modelClass || "") : "";
       const responseText = typeof response?.text === "string" ? response.text : JSON.stringify(payload || {});
       const diagnostic = {
         source: "openrouter-error-metadata",
@@ -48182,9 +50907,12 @@ const STS_MULTI_PROVIDER = (() => {
         responseByteCount: openWebUIUtf8ByteLength(responseText),
         bodyHash: responseText ? stableHash(responseText.slice(0, 64 * 1024)) : "",
         diagnosticHash: stableHash([status, classification, metadata.slice(0, 160)].join("|")),
-        ...(retryAfterMs > 0 ? { retryAfterMs } : {})
+        ...(retryAfterMs > 0 ? { retryAfterMs } : {}),
+        ...(status === 429 ? { canonicalErrorType: openRouterCanonicalErrorType(payload?.error?.metadata?.error_type || payload?.error?.error_type || payload?.error?.type), rateLimitReason } : {}),
+        ...(rateLimitHeaders ? { rateLimitHeaders } : {})
       };
       const error = providerError("openrouter", status, code, classification === "transport", "", diagnostic);
+      if (rateLimitHeaders) error.openRouterRateLimitHeaders = rateLimitHeaders;
       if (status === 429 && retryAfterMs > 0) {
         error.rateLimitRetryAfterMs = retryAfterMs;
         error.rateLimitSource = "http-429";
@@ -48431,42 +51159,228 @@ const STS_MULTI_PROVIDER = (() => {
     };
   };
   const OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS = 64;
+  const OPENWEBUI_STRUCTURED_CAPABILITY_REVISION = "openwebui-structured-capability-v3";
+  const OPENWEBUI_STRUCTURED_CAPABILITY_MEMORY_SCHEMA_VERSION = 5;
   const openWebUISingletonDescriptionCapabilityMemory = new Map();
-  const openWebUISingletonDescriptionCapabilityState = (model) => {
-    const key = normalizeModel("openwebui", model);
-    const cached = key ? openWebUISingletonDescriptionCapabilityMemory.get(key) : null;
+  const openWebUISingletonDescriptionCapabilitySettingsOwners = new Map();
+  const openWebUICapabilityMetadataFingerprint = (metadata = {}) => {
+    // Durable carrier/concurrency identity follows static model capabilities,
+    // not the mutable allocation and usage observations returned by /ps.
+    const normalizeKey = (key) => String(key || "").replace(/[\s_-]/g, "").toLowerCase();
+    const dynamicKeys = new Set([
+      "allocation", "allocations", "allocated", "active", "isactive", "loaded", "isloaded", "running", "ready",
+      "status", "state", "loadstate", "loadstatus", "keepalive", "expiresat", "expiresin", "expiresins",
+      "contextsource", "contextlength", "contextwindow", "maxcontextlength", "numctx", "effectivecontextwindowtokens",
+      "size", "sizevram", "sizeinmemory", "memorysize", "memorybytes", "bytesinmemory", "usage", "observedusage",
+      "sizebytes", "modelsize", "modelbytes", "filesize", "diskbytes", "vrambytes", "refreshat", "refreshtimestamp",
+      "prompttokens", "completiontokens", "totaltokens", "prompttokencount", "completiontokencount", "totaltokencount",
+      "promptevalcount", "evalcount", "evaltokencount", "loadtime", "loadduration", "loaddurationns",
+      "promptduration", "promptevalduration", "evalduration", "totalduration", "totaldurationns", "latency",
+      "elapsed", "elapsedms", "runtime", "uptime", "ps", "process", "fetchedat", "updatedat", "lastseenat",
+      "refreshedat", "discoveredat", "retrievedat", "queriedat", "receivedat", "createdat",
+      "startedat", "completedat", "finishedat", "loadedat", "unloadedat", "lastupdated", "lastrefresh"
+    ]);
+    const dynamicKey = (key) => {
+      const normalized = normalizeKey(key);
+      return dynamicKeys.has(normalized)
+        || /^(?:fetched|updated|lastseen|refreshed|discovered|retrieved|queried|received|created|started|completed|finished|loaded|unloaded)(?:at|on|time|timestamp|date)$/.test(normalized)
+        || /^(?:operational|allocated|active)?context(?:window)?(?:source|length|tokens|value|limit)$/.test(normalized)
+        || /^(?:active|loaded|loading|unloaded|running|ready|idle|load|loadstate|loadstatus|modelloaded|modelstate)$/.test(normalized)
+        || /(?:duration|elapsed|latency|uptime|memory|inmemory|sizevram|observedusage)$/.test(normalized)
+        || /(?:usage|throughput|tokenspersecond)$/.test(normalized)
+        || /^(?:prompt|completion|total|eval)(?:tokens?|tokencount|evalcount|duration|durationns)$/.test(normalized);
+    };
+    const stripEphemeral = (value, depth = 0) => {
+      if (depth > 8 || value === null || value === undefined) return value;
+      if (Array.isArray(value)) return value.slice(0, 128).map((entry) => stripEphemeral(entry, depth + 1));
+      if (typeof value !== "object") return value;
+      const next = {};
+      for (const key of Object.keys(value).sort()) {
+        if (dynamicKey(key)) continue;
+        next[key] = stripEphemeral(value[key], depth + 1);
+      }
+      return next;
+    };
+    return stableHash(JSON.stringify(stripEphemeral(metadata)));
+  };
+  const openWebUICapabilityMetadataIdentity = (settings = {}, model = "") => {
+    const normalizedModel = normalizeModel("openwebui", model);
+    const metadata = settings?.openwebuiModelMetadata?.[normalizedModel];
+    const metadataPresent = Boolean(metadata && typeof metadata === "object" && !Array.isArray(metadata) && Object.keys(metadata).length);
+    const metadataForFingerprint = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? Object.fromEntries(Object.entries(metadata).filter(([key]) => key !== "structuredCapabilityProfiles"))
+      : {};
+    return {
+      metadataFingerprint: metadataPresent ? openWebUICapabilityMetadataFingerprint(metadataForFingerprint) : "",
+      metadataRevision: String(metadata?.metadataRevision || metadata?.revision || "").slice(0, 80),
+      metadataPresent
+    };
+  };
+  const openWebUIAdaptiveOperation = (value = "") => {
+    const normalized = nonEmpty(value).toLowerCase().replace(/[_\s]+/g, "-");
+    if (["description", "task-description"].includes(normalized)) return "task-description";
+    if (["task", "generation", "task-generation"].includes(normalized)) return "task-generation";
+    if (["chat", "query", "chat-query"].includes(normalized)) return "chat-query";
+    return normalized || "chat-query";
+  };
+  const openWebUIAdaptiveProfileIdentityMatches = (row, key) => {
+    if (!row || typeof row !== "object" || !key) return false;
+    if (String(row.key || "") === key) return true;
+    const provider = nonEmpty(row.provider || "openwebui").toLowerCase();
+    const model = normalizeModel(provider, row.model || "");
+    const operation = openWebUIAdaptiveOperation(row.operation || "task-description");
+    return [provider, model, operation].join("|") === key;
+  };
+  const openWebUISingletonDescriptionCapabilityKey = (model, options = {}) => {
+    const provider = nonEmpty(options.provider || "openwebui").toLowerCase();
+    const normalizedModel = normalizeModel(provider, model);
+    const operation = openWebUIAdaptiveOperation(options.operation || "task-description");
+    const capabilityRevision = nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION);
+    if (!provider || !normalizedModel || !operation || !capabilityRevision) return "";
+    return [provider, normalizedModel, operation].join("|");
+  };
+  const openWebUISingletonDescriptionCapabilityState = (model, options = {}) => {
+    const key = openWebUISingletonDescriptionCapabilityKey(model, options);
+    const metadataIdentity = openWebUICapabilityMetadataIdentity(options.settings || {}, model);
+    const metadata = options.settings?.openwebuiModelMetadata?.[normalizeModel("openwebui", model)] || {};
+    const profiles = Array.isArray(metadata?.structuredCapabilityProfiles)
+      ? metadata.structuredCapabilityProfiles
+      : Array.isArray(metadata?.structuredCapabilityProfiles?.records) ? metadata.structuredCapabilityProfiles.records : [];
+    const persisted = key && metadataIdentity.metadataPresent
+      ? profiles.find((row) => openWebUIAdaptiveProfileIdentityMatches(row, key)
+        && String(row.capabilityRevision || "") === nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION)
+        && String(row.metadataFingerprint || "") === metadataIdentity.metadataFingerprint
+        && String(row.metadataRevision || "") === metadataIdentity.metadataRevision)
+      : null;
+    const memoryCached = key ? openWebUISingletonDescriptionCapabilityMemory.get(key) : null;
+    const memoryOwner = key ? openWebUISingletonDescriptionCapabilitySettingsOwners.get(key) : null;
+    const memoryMatches = memoryCached && (!memoryOwner || memoryOwner === options.settings)
+      && metadataIdentity.metadataPresent
+      && String(memoryCached.capabilityRevision || "") === nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION)
+      && String(memoryCached.metadataFingerprint || "") === metadataIdentity.metadataFingerprint
+      && String(memoryCached.metadataRevision || "") === metadataIdentity.metadataRevision;
+    const cached = (memoryMatches ? memoryCached : null) || persisted;
+    const adaptiveConcurrencyLimit = Number(cached?.adaptiveConcurrencyLimit);
     return {
       cacheHit: Boolean(cached),
-      grammarUnsupported: Boolean(cached?.grammarUnsupported),
+      grammarUnsupported: Boolean(cached?.grammarRejected ?? cached?.grammarUnsupported),
       preferredCarrier: cached?.preferredCarrier === "wrapper-json"
         ? "wrapper-json"
-        : cached?.preferredCarrier === "direct-json" || cached?.grammarUnsupported
+        : cached?.preferredCarrier === "direct-json" || cached?.grammarRejected || cached?.grammarUnsupported
           ? "direct-json"
-          : "direct-schema"
+          : "direct-schema",
+      key,
+      metadataFingerprint: metadataIdentity.metadataFingerprint,
+      metadataRevision: metadataIdentity.metadataRevision,
+      capabilityRevision: nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION),
+      adaptiveConcurrencyLimit: Number.isSafeInteger(adaptiveConcurrencyLimit)
+        && adaptiveConcurrencyLimit >= 1
+        && adaptiveConcurrencyLimit <= OPENWEBUI_MODEL_CONCURRENCY_MAX
+        ? adaptiveConcurrencyLimit
+        : 0,
+      adaptiveConcurrencyReason: nonEmpty(cached?.adaptiveConcurrencyReason),
+      adaptiveConcurrencyObservations: Math.max(0, Math.min(32, Math.round(Number(cached?.adaptiveConcurrencyObservations) || 0))),
+      adaptiveProfileKey: key
+        ? [key, metadataIdentity.metadataFingerprint || "metadata-unknown", metadataIdentity.metadataRevision || "revision-unknown", nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION)].join("|")
+        : ""
     };
   };
   const openWebUIRecordSingletonDescriptionCapability = (model, patch = {}) => {
-    const key = normalizeModel("openwebui", model);
-    if (!key) return;
-    const current = openWebUISingletonDescriptionCapabilityMemory.get(key) || {
-      grammarUnsupported: false,
-      preferredCarrier: "direct-schema"
-    };
+    const key = openWebUISingletonDescriptionCapabilityKey(model, patch);
+    if (!key) return null;
+    const metadataIdentity = openWebUICapabilityMetadataIdentity(patch.settings || {}, model);
+    if (!metadataIdentity.metadataPresent) return null;
+    const cachedCurrent = openWebUISingletonDescriptionCapabilityMemory.get(key);
+    const current = cachedCurrent
+      && String(cachedCurrent.capabilityRevision || "") === nonEmpty(patch.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION)
+      && String(cachedCurrent.metadataFingerprint || "") === metadataIdentity.metadataFingerprint
+      && String(cachedCurrent.metadataRevision || "") === metadataIdentity.metadataRevision
+      ? cachedCurrent
+      : {};
+    const provider = nonEmpty(patch.provider || "openwebui").toLowerCase();
+    const operation = openWebUIAdaptiveOperation(patch.operation || "task-description");
+    const record = Object.freeze({
+      schemaVersion: OPENWEBUI_STRUCTURED_CAPABILITY_MEMORY_SCHEMA_VERSION,
+      key,
+      provider,
+      model: normalizeModel(provider, model),
+      operation,
+      schemaFingerprint: nonEmpty(patch.schemaFingerprint || patch.projectedSchemaFingerprint),
+      capabilityRevision: nonEmpty(patch.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION),
+      metadataFingerprint: metadataIdentity.metadataFingerprint,
+      metadataRevision: metadataIdentity.metadataRevision,
+      grammarRejected: Boolean(patch.grammarRejected ?? patch.grammarUnsupported ?? current.grammarRejected ?? current.grammarUnsupported),
+      successfulCarrier: patch.successfulCarrier === "wrapper-json" || patch.successfulCarrier === "direct-json" || patch.successfulCarrier === "direct-schema"
+        ? patch.successfulCarrier
+        : String(current.successfulCarrier || current.preferredCarrier || "direct-schema"),
+      preferredCarrier: patch.preferredCarrier === "wrapper-json" || patch.preferredCarrier === "direct-json" || patch.preferredCarrier === "direct-schema"
+        ? patch.preferredCarrier
+        : patch.successfulCarrier === "wrapper-json" || patch.successfulCarrier === "direct-json" || patch.successfulCarrier === "direct-schema"
+          ? patch.successfulCarrier
+          : String(current.preferredCarrier || "direct-schema"),
+      adaptiveConcurrencyLimit: Number.isSafeInteger(Number(patch.adaptiveConcurrencyLimit))
+        && Number(patch.adaptiveConcurrencyLimit) >= 1
+        && Number(patch.adaptiveConcurrencyLimit) <= OPENWEBUI_MODEL_CONCURRENCY_MAX
+        ? Number(patch.adaptiveConcurrencyLimit)
+        : Number.isSafeInteger(Number(current.adaptiveConcurrencyLimit))
+          && Number(current.adaptiveConcurrencyLimit) >= 1
+          && Number(current.adaptiveConcurrencyLimit) <= OPENWEBUI_MODEL_CONCURRENCY_MAX
+          ? Number(current.adaptiveConcurrencyLimit)
+          : 0,
+      adaptiveConcurrencyReason: nonEmpty(patch.adaptiveConcurrencyReason || current.adaptiveConcurrencyReason).slice(0, 80),
+      adaptiveConcurrencyObservations: Math.max(0, Math.min(32,
+        Math.round(Number(patch.adaptiveConcurrencyObservations ?? current.adaptiveConcurrencyObservations) || 0)))
+    });
     if (!openWebUISingletonDescriptionCapabilityMemory.has(key)
       && openWebUISingletonDescriptionCapabilityMemory.size >= OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS) {
       const oldest = openWebUISingletonDescriptionCapabilityMemory.keys().next().value;
-      if (oldest) openWebUISingletonDescriptionCapabilityMemory.delete(oldest);
+      if (oldest) {
+        openWebUISingletonDescriptionCapabilityMemory.delete(oldest);
+        openWebUISingletonDescriptionCapabilitySettingsOwners.delete(oldest);
+      }
     }
-    openWebUISingletonDescriptionCapabilityMemory.set(key, {
-      grammarUnsupported: Boolean(patch.grammarUnsupported ?? current.grammarUnsupported),
-      preferredCarrier: patch.preferredCarrier === "wrapper-json"
-        ? "wrapper-json"
-        : patch.preferredCarrier === "direct-json"
-          ? "direct-json"
-          : patch.preferredCarrier === "direct-schema"
-            ? "direct-schema"
-            : current.preferredCarrier
-    });
+    openWebUISingletonDescriptionCapabilityMemory.set(key, record);
+    if (patch.settings && typeof patch.settings === "object") openWebUISingletonDescriptionCapabilitySettingsOwners.set(key, patch.settings);
+    if (patch.settings && typeof patch.settings === "object") {
+      const metadataKey = normalizeModel("openwebui", model);
+      const metadata = patch.settings.openwebuiModelMetadata?.[metadataKey] || {};
+      const value = metadata.structuredCapabilityProfiles;
+      const rows = (Array.isArray(value) ? value : Array.isArray(value?.records) ? value.records : [])
+        .filter((row) => !openWebUIAdaptiveProfileIdentityMatches(row, key));
+      rows.unshift(record);
+      patch.settings.openwebuiModelMetadata ||= {};
+      patch.settings.openwebuiModelMetadata[metadataKey] = Object.assign({}, metadata, {
+        structuredCapabilityProfiles: {
+          schemaVersion: OPENWEBUI_STRUCTURED_CAPABILITY_MEMORY_SCHEMA_VERSION,
+          records: rows.slice(0, OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS)
+        }
+      });
+    }
+    return record;
+  };
+  const openWebUIDeleteSingletonDescriptionCapability = (model, operation, settings = null) => {
+    const key = openWebUISingletonDescriptionCapabilityKey(model, { operation });
+    if (!key) return false;
+    let changed = false;
+    if (openWebUISingletonDescriptionCapabilityMemory.delete(key)) changed = true;
+    openWebUISingletonDescriptionCapabilitySettingsOwners.delete(key);
+    if (!settings || typeof settings !== "object") return changed;
+    const metadataKey = normalizeModel("openwebui", model);
+    const metadata = settings.openwebuiModelMetadata?.[metadataKey];
+    const value = metadata?.structuredCapabilityProfiles;
+    const rows = Array.isArray(value) ? value : Array.isArray(value?.records) ? value.records : [];
+    const retained = rows.filter((row) => !openWebUIAdaptiveProfileIdentityMatches(row, key));
+    if (retained.length === rows.length) return changed;
+    changed = true;
+    if (retained.length) {
+      metadata.structuredCapabilityProfiles = {
+        schemaVersion: OPENWEBUI_STRUCTURED_CAPABILITY_MEMORY_SCHEMA_VERSION,
+        records: retained.slice(0, OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS)
+      };
+    } else {
+      delete metadata.structuredCapabilityProfiles;
+    }
+    return changed;
   };
   const openWebUISchemaGroundingText = (schemaOrProjection = null) => {
     if (!schemaOrProjection || typeof schemaOrProjection !== "object") return {
@@ -48484,9 +51398,21 @@ const STS_MULTI_PROVIDER = (() => {
       ? schemaOrProjection
       : openWebUISchemaProjection(schemaOrProjection);
     const schemaText = JSON.stringify(projection.schema);
+    const containsEvidenceEnum = (value, depth = 0, budget = { remaining: 4096 }) => {
+      if (depth > 12 || budget.remaining-- <= 0 || value === null || typeof value !== "object") return false;
+      if (Array.isArray(value)) return value.some((entry) => containsEvidenceEnum(entry, depth + 1, budget));
+      for (const [key, entry] of Object.entries(value)) {
+        if (key === "evidence_ids" && entry && typeof entry === "object" && !Array.isArray(entry)
+          && entry.items && typeof entry.items === "object" && Array.isArray(entry.items.enum)) return true;
+        if (containsEvidenceEnum(entry, depth + 1, budget)) return true;
+      }
+      return false;
+    };
+    const hasEvidenceEnum = containsEvidenceEnum(projection.schema);
     const text = [
       "OpenWebUI structured-output contract:",
       "Return exactly one JSON object matching this exact JSON Schema. Do not include markdown fences, commentary, reasoning, or fields outside the schema.",
+      ...(hasEvidenceEnum ? ["evidence_ids accepts only the exact enum values listed in this schema. fact-* identifiers are metadata only and never citation IDs or valid evidence_ids."] : []),
       schemaText
     ].join("\n");
     const bytes = openWebUIUtf8ByteLength(text);
@@ -48511,6 +51437,66 @@ const STS_MULTI_PROVIDER = (() => {
     }
     if ((typeof value !== "object" && !Array.isArray(value)) || !Object.prototype.hasOwnProperty.call(value, segment)) return [];
     return openWebUIValuesAtPath(value[segment], rest);
+  };
+  const OPENWEBUI_TASK_DATE_PATTERN_SOURCE = "^\\d{4}-\\d{2}-\\d{2}$";
+  const openWebUITaskDatePathClass = (path = []) => {
+    if (!Array.isArray(path)) return "";
+    const suffix = path.at(-1);
+    if (!["due_date", "deadline_date"].includes(suffix)) return "";
+    if (path.length === 3 && path[0] === "tasks" && path[1] === "*") return `tasks[*].${suffix}`;
+    if (path.length === 5 && path[0] === "tasks" && path[1] === "*" && path[2] === "subtasks" && path[3] === "*") return `tasks[*].subtasks[*].${suffix}`;
+    return "";
+  };
+  const openWebUITaskGenerationDateNormalization = (parsed, projection) => {
+    const result = { accepted: false, text: "", normalizedValue: null, fieldCount: 0, pathClass: "", pathClasses: [], reason: "" };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
+    const patterns = Array.isArray(projection?.patterns) ? projection.patterns : [];
+    if (!patterns.length) return result;
+    let normalizedValue;
+    try { normalizedValue = JSON.parse(JSON.stringify(parsed)); } catch { return result; }
+    const exactPattern = new RegExp(OPENWEBUI_TASK_DATE_PATTERN_SOURCE);
+    const correctedPaths = new Set();
+    const pathClasses = new Set();
+    const visit = (value, path, concretePath, callback) => {
+      if (!path.length) { callback(value, concretePath); return; }
+      if (value === null || value === undefined) return;
+      const [segment, ...rest] = path;
+      if (segment === "*") {
+        if (!Array.isArray(value)) return;
+        value.forEach((entry, index) => visit(entry, rest, concretePath.concat(index), callback));
+        return;
+      }
+      if (typeof value !== "object" || !Object.prototype.hasOwnProperty.call(value, segment)) return;
+      visit(value[segment], rest, concretePath.concat(segment), callback);
+    };
+    for (const entry of patterns) {
+      if (String(entry?.source || "") !== OPENWEBUI_TASK_DATE_PATTERN_SOURCE) continue;
+      const pathClass = openWebUITaskDatePathClass(entry?.path || []);
+      if (!pathClass) continue;
+      visit(normalizedValue, entry.path || [], [], (value, concretePath) => {
+        if (typeof value !== "string" || exactPattern.test(value)) return;
+        const pathKey = concretePath.join(".");
+        if (correctedPaths.has(pathKey)) return;
+        const parentPath = concretePath.slice(0, -1);
+        let parent = normalizedValue;
+        for (const segment of parentPath) parent = parent?.[segment];
+        if (!parent || typeof parent !== "object") return;
+        parent[concretePath.at(-1)] = null;
+        correctedPaths.add(pathKey);
+        pathClasses.add(pathClass);
+      });
+    }
+    if (!correctedPaths.size) return result;
+    try {
+      result.text = JSON.stringify(normalizedValue);
+    } catch { return result; }
+    result.accepted = true;
+    result.normalizedValue = normalizedValue;
+    result.fieldCount = Math.min(32, correctedPaths.size);
+    result.pathClasses = Array.from(pathClasses).slice(0, 4);
+    result.pathClass = result.pathClasses.join(",");
+    result.reason = "optional-date-to-null";
+    return result;
   };
   const validateOpenWebUIPatterns = (parsed, projection) => {
     const patterns = Array.isArray(projection?.patterns) ? projection.patterns : [];
@@ -48554,6 +51540,25 @@ const STS_MULTI_PROVIDER = (() => {
     if (responseJsonValue) return { payload: responseJsonValue, bodyText, parseStatus: "json-object", contentType, responseBytes };
     return { payload: null, bodyText, parseStatus: "empty-body", contentType, responseBytes };
   };
+  const OPENROUTER_CANONICAL_ERROR_TYPES = new Set([
+    "context_length_exceeded", "max_tokens_exceeded", "token_limit_exceeded", "string_too_long",
+    "authentication", "permission_denied", "payment_required", "rate_limit_exceeded",
+    "provider_overloaded", "provider_unavailable", "invalid_request", "invalid_prompt",
+    "not_found", "payload_too_large", "content_policy_violation", "refusal", "server", "timeout", "unmapped"
+  ]);
+  const openRouterCanonicalErrorType = (value) => {
+    const normalized = nonEmpty(value).toLowerCase().replace(/[\s-]+/g, "_");
+    return OPENROUTER_CANONICAL_ERROR_TYPES.has(normalized) ? normalized : "unmapped";
+  };
+  const openRouterRateLimitReason = (payload, response, modelClass = "") => {
+    const source = payload?.error && typeof payload.error === "object" ? payload.error : {};
+    const metadata = source.metadata && typeof source.metadata === "object" ? source.metadata : {};
+    const token = [source.code, source.type, source.error_type, metadata.code, metadata.error_type, source.message, metadata.message, response?.text]
+      .filter(Boolean).map((value) => String(value).replace(/\s+/g, " ").slice(0, 240)).join(" ").toLowerCase();
+    if (modelClass === "free" && /daily|per[_ -]?day|day[_ -]?quota|daily[_ -]?quota/.test(token)) return "free-daily-quota";
+    if (modelClass === "free" && /per[_ -]?(?:minute|min)|rpm|requests?\s*(?:per|\/)[ -]?minute/.test(token)) return "free-rpm";
+    return "rate-limit";
+  };
   const openRouterErrorMetadata = (payload, response) => {
     const choiceError = Array.isArray(payload?.choices) && payload.choices[0]?.error;
     const source = payload?.error && typeof payload.error === "object"
@@ -48569,6 +51574,7 @@ const STS_MULTI_PROVIDER = (() => {
     return {
       status: Number.isFinite(status) && status > 0 ? status : null,
       type,
+      canonicalType: openRouterCanonicalErrorType(type),
       message: message.slice(0, 240)
     };
   };
@@ -48594,6 +51600,7 @@ const STS_MULTI_PROVIDER = (() => {
       refusalPresent: Boolean(refusalValue),
       errorPresent: Boolean(errorValue),
       errorType: metadata.type,
+      canonicalErrorType: metadata.canonicalType,
       errorStatus: metadata.status,
       errorHash: errorText ? stableHash(errorText) : "",
       bodyHash: body?.bodyText ? stableHash(body.bodyText.slice(0, 64 * 1024)) : ""
@@ -48624,7 +51631,11 @@ const STS_MULTI_PROVIDER = (() => {
       ? "refusal-only"
       : choice?.finish_reason === "error" && !choice?.error && !payload?.error ? "finish-reason-error" : "";
     const status = metadata.status || statusOf(body?.response);
-    return { status, code, retryable: classification === "transport", retryAfterMs: status === 429 ? retryAfterFromResponse(body?.response, payload) : 0, diagnostic: openRouterResponseDiagnostic(body, requestedModel, { classification, capabilityCarrier: /require[_ -]?parameters|provider\s*parameter/i.test(token) ? "provider.require_parameters" : /response[_ -]?healing|plugins?/i.test(token) ? "plugins.response-healing" : "", ...(responseShape ? { responseShape } : {}) }) };
+    const retryAfterMs = status === 429 ? retryAfterFromResponse(body?.response, payload) : 0;
+    const rateLimitHeaders = status === 429 ? openRouterRateLimitHeaders(body?.response) : null;
+    const modelClass = classifyOpenRouterFreeModel("openrouter", requestedModel) ? "free" : "paid";
+    const rateLimitReason = status === 429 ? openRouterRateLimitReason(payload, body?.response, modelClass) : "";
+    return { status, code, retryable: classification === "transport", retryAfterMs, rateLimitHeaders, rateLimitReason, diagnostic: openRouterResponseDiagnostic(body, requestedModel, { classification, canonicalErrorType: metadata.canonicalType, ...(status === 429 ? { rateLimitReason } : {}), capabilityCarrier: /require[_ -]?parameters|provider\s*parameter/i.test(token) ? "provider.require_parameters" : /response[_ -]?healing|plugins?/i.test(token) ? "plugins.response-healing" : "", ...(responseShape ? { responseShape } : {}), ...(rateLimitHeaders ? { rateLimitHeaders } : {}) }) };
   };
   const openRouterShapeError = (body, requestedModel, responseShape) => {
     const error = providerError("openrouter", statusOf(body?.response), "invalid-response", false, "", openRouterResponseDiagnostic(body, requestedModel, { responseShape }));
@@ -48680,6 +51691,8 @@ const STS_MULTI_PROVIDER = (() => {
       error.rateLimitRetryAfterMs = classification.retryAfterMs;
       error.rateLimitSource = "inband-429";
     }
+    if (classification.status === 429) error.rateLimitReason = classification.rateLimitReason;
+    if (classification.rateLimitHeaders) error.openRouterRateLimitHeaders = classification.rateLimitHeaders;
     if (!classification.retryable) error.providerError.retryable = false;
     return error;
   };
@@ -48687,6 +51700,7 @@ const STS_MULTI_PROVIDER = (() => {
     const model = normalizeModel("openrouter", requestInput.model || settings.chatModel);
     if (!model || !model.includes("/")) throw providerError("openrouter", null, "model-required");
     const capabilities = openRouterCapabilities(settings, model);
+    const rateProfile = openRouterRateLimitProfile(settings, model);
     const schema = requestInput.jsonSchema;
     const operation = nonEmpty(requestInput.operation || "chat-query").toLowerCase();
     const reasoning = requestInput.reasoningConfig || {};
@@ -48900,8 +51914,9 @@ const STS_MULTI_PROVIDER = (() => {
           if (inBandError) {
             if (inBandError.rateLimitRetryAfterMs > 0 && limited.limiter) {
               limited.limiter.extend(limited.key, inBandError.rateLimitRetryAfterMs, "inband-429");
-              inBandError.rateLimit = rateLimitTelemetry(rateLimit?.waitMs || 0, rateLimit?.depth || 0, "inband-429");
+              inBandError.rateLimit = openRouterRateLimitTelemetry(rateProfile, Object.assign({}, rateLimit, { retryAfterMs: inBandError.rateLimitRetryAfterMs, rateLimitReason: inBandError.rateLimitReason, ...(inBandError.openRouterRateLimitHeaders || {}) }), "inband-429");
             }
+            if ((inBandError.providerError?.status === 429 || inBandError.status === 429) && !inBandError.rateLimit) inBandError.rateLimit = openRouterRateLimitTelemetry(rateProfile, Object.assign({}, rateLimit, { rateLimitReason: inBandError.rateLimitReason, ...(inBandError.openRouterRateLimitHeaders || {}) }), "provider-429");
             throw inBandError;
           }
           if (!Array.isArray(payload.choices)) throw openRouterShapeError(Object.assign({}, bodyMetadata, { response }), model, "missing-choices");
@@ -49040,6 +52055,7 @@ const STS_MULTI_PROVIDER = (() => {
     const model = normalizeModel("openrouter", settings.embeddingModel);
     if (!model || !model.includes("/")) throw providerError("openrouter", null, "model-required");
     const capabilities = openRouterCapabilities(settings, model);
+    const rateProfile = openRouterRateLimitProfile(settings, model);
     const dimension = Math.max(0, Number(settings.openrouterEmbeddingDimensions || 0));
     const body = { model, input: values };
     // OpenRouter optional embedding fields are sent only when discovery
@@ -49056,8 +52072,9 @@ const STS_MULTI_PROVIDER = (() => {
     if (inBandError) {
       if (inBandError.rateLimitRetryAfterMs > 0 && limited.limiter) {
         limited.limiter.extend(limited.key, inBandError.rateLimitRetryAfterMs, "inband-429");
-        inBandError.rateLimit = rateLimitTelemetry(limited.rateLimit?.waitMs || 0, limited.rateLimit?.depth || 0, "inband-429");
+        inBandError.rateLimit = openRouterRateLimitTelemetry(rateProfile, Object.assign({}, limited.rateLimit, { retryAfterMs: inBandError.rateLimitRetryAfterMs, rateLimitReason: inBandError.rateLimitReason, ...(inBandError.openRouterRateLimitHeaders || {}) }), "inband-429");
       }
+      if ((inBandError.providerError?.status === 429 || inBandError.status === 429) && !inBandError.rateLimit) inBandError.rateLimit = openRouterRateLimitTelemetry(rateProfile, Object.assign({}, limited.rateLimit, { rateLimitReason: inBandError.rateLimitReason, ...(inBandError.openRouterRateLimitHeaders || {}) }), "provider-429");
       throw inBandError;
     }
     const vectors = validateEmbeddings("openrouter", normalizeEmbeddingItems(payload), values.length, dimension);
@@ -49106,7 +52123,7 @@ const STS_MULTI_PROVIDER = (() => {
           name: nonEmpty(row?.name || row?.display_name || row?.displayName),
           description: nonEmpty(row?.description).slice(0, 240),
           architecture: row?.architecture && typeof row.architecture === "object" ? { output_modalities: Array.isArray(outputModalities) ? outputModalities.slice(0, 8).map(nonEmpty).filter(Boolean) : [] } : {},
-          context_length: dynamicRouter ? 0 : topProviderContext || catalogContext,
+          context_length: topProviderContext || catalogContext,
           fetchedAt
         };
         if (topProviderContext > 0 || topProviderOutput > 0) {
@@ -49230,7 +52247,13 @@ const STS_MULTI_PROVIDER = (() => {
           requestConfig.model,
           requestConfig.concurrencyLimit,
           execute,
-          { timeoutMs, signal: options.signal, workerCount: requestConfig.workerCount }
+          {
+            timeoutMs,
+            signal: options.signal,
+            workerCount: requestConfig.workerCount,
+            adaptiveProfile: requestConfig.adaptiveProfile,
+            onAdaptiveObservation: requestConfig.onAdaptiveObservation
+          }
         );
         const response = queued.value;
         if (response && typeof response === "object") {
@@ -49262,6 +52285,122 @@ const STS_MULTI_PROVIDER = (() => {
     else compatibility.options = Object.assign({}, strictBody?.options || {}, { format: "json" });
     return compatibility;
   };
+  const openWebUIChatCitationNormalization = (text, schema, originalSchema = schema) => {
+    const rawText = asString(text);
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch { return { accepted: false, reason: "not-json", removedCount: 0, text: rawText }; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.claims)) return { accepted: false, reason: "claims-shape", removedCount: 0, text: rawText };
+    const allowedEnum = schema?.properties?.claims?.items?.properties?.evidence_ids?.items?.enum;
+    const allowed = new Set(Array.isArray(allowedEnum) ? allowedEnum.filter((value) => typeof value === "string").map((value) => value.trim()).filter(Boolean) : []);
+    if (!allowed.size) return { accepted: false, reason: "evidence-enum-missing", removedCount: 0, text: rawText };
+    const normalized = JSON.parse(JSON.stringify(parsed));
+    let removedCount = 0;
+    for (let index = 0; index < parsed.claims.length; index += 1) {
+      const claim = parsed.claims[index];
+      if (!claim || typeof claim !== "object" || Array.isArray(claim) || !Array.isArray(claim.evidence_ids)) return { accepted: false, reason: "claim-shape", removedCount: 0, text: rawText };
+      if (claim.evidence_ids.some((value) => typeof value !== "string")) return { accepted: false, reason: "non-string-evidence-id", removedCount: 0, text: rawText };
+      const evidenceIds = claim.evidence_ids.map((value) => value.trim());
+      const invalidIds = evidenceIds.filter((value) => !allowed.has(value) || /^fact-/i.test(value));
+      if (!invalidIds.length) continue;
+      const retained = evidenceIds.filter((value) => allowed.has(value) && !/^fact-/i.test(value));
+      if (claim.established === true && !retained.length) return { accepted: false, reason: "established-claim-citationless", removedCount: 0, text: rawText };
+      normalized.claims[index].evidence_ids = retained;
+      removedCount += invalidIds.length;
+    }
+    if (!removedCount) return { accepted: false, reason: "no-safe-removal", removedCount: 0, text: rawText };
+    const normalizedText = JSON.stringify(normalized);
+    const validation = openWebUIReasoningOnlyJson(normalizedText, originalSchema || schema);
+    if (!validation.accepted) return { accepted: false, reason: "original-schema-rejected", removedCount: 0, text: rawText, validation };
+    return {
+      accepted: true,
+      reason: "removed-out-of-enum-evidence-ids",
+      removedCount,
+      text: normalizedText,
+      rawText,
+      validation
+    };
+  };
+  const openWebUIDescriptionSingletonCompletion = (text, carrier, carrierSchema, sharedSchema) => {
+    const rawText = asString(text);
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch { return { accepted: false, reason: "completion-not-json", rawText }; }
+    const item = carrier === "wrapper-json"
+      ? parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray(parsed.descriptions) && parsed.descriptions.length === 1 ? parsed.descriptions[0] : null
+      : parsed;
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { accepted: false, reason: "completion-shape", rawText };
+    const sentences = item.description_sentences;
+    if (!Array.isArray(sentences) || !sentences.length) return { accepted: false, reason: "completion-sentences-missing", rawText };
+    const union = (field) => {
+      const values = [];
+      const seen = new Set();
+      for (const sentence of sentences) {
+        if (!sentence || typeof sentence !== "object" || Array.isArray(sentence) || !Array.isArray(sentence[field])) return null;
+        if (sentence[field].some((value) => typeof value !== "string")) return null;
+        for (const value of sentence[field]) {
+          if (!seen.has(value)) { seen.add(value); values.push(value); }
+        }
+      }
+      return values;
+    };
+    const evidenceIds = union("evidence_ids");
+    const factRefs = union("fact_refs");
+    if (!evidenceIds || !factRefs) return { accepted: false, reason: "completion-sentence-ids-invalid", rawText };
+    const completedItem = Object.assign({}, item);
+    const addedFields = [];
+    if (!Object.prototype.hasOwnProperty.call(completedItem, "index")) { completedItem.index = 0; addedFields.push("index"); }
+    if (!Object.prototype.hasOwnProperty.call(completedItem, "evidence_ids")) { completedItem.evidence_ids = evidenceIds; addedFields.push("evidence_ids"); }
+    if (!Object.prototype.hasOwnProperty.call(completedItem, "fact_refs")) { completedItem.fact_refs = factRefs; addedFields.push("fact_refs"); }
+    if (!addedFields.length) return { accepted: false, reason: "completion-not-needed", rawText };
+    const completedValue = carrier === "wrapper-json" ? { descriptions: [completedItem] } : completedItem;
+    const completedText = JSON.stringify(completedValue);
+    const compactValidation = openWebUIReasoningOnlyJson(completedText, carrierSchema);
+    if (!compactValidation.accepted) return { accepted: false, reason: "completion-compact-schema-rejected", rawText, compactValidation };
+    try { validateOpenWebUIPatterns(completedValue, openWebUISchemaProjection(carrierSchema)); } catch { return { accepted: false, reason: "completion-compact-pattern-rejected", rawText, compactValidation }; }
+    const normalizedValue = { tasks: [], section_name: "", descriptions: [completedItem] };
+    const normalizedText = JSON.stringify(normalizedValue);
+    const fullValidation = openWebUIReasoningOnlyJson(normalizedText, sharedSchema);
+    if (!fullValidation.accepted) return { accepted: false, reason: "completion-full-schema-rejected", rawText, compactValidation, fullValidation };
+    try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch { return { accepted: false, reason: "completion-full-pattern-rejected", rawText, compactValidation, fullValidation }; }
+    return { accepted: true, carrier, rawText, text: completedText, normalizedText, normalizedValue, completedValue, addedFields, compactValidation, fullValidation };
+  };
+  const openWebUIDescriptionAlternateCarrierNormalization = (text, attemptCarrier, directSchema, wrapperSchema, sharedSchema) => {
+    const rawText = asString(text);
+    const alternateCarrier = attemptCarrier === "wrapper-json" ? "direct-schema" : "wrapper-json";
+    const alternateSchema = alternateCarrier === "wrapper-json" ? wrapperSchema : directSchema;
+    const completion = openWebUIDescriptionSingletonCompletion(rawText, alternateCarrier, alternateSchema, sharedSchema);
+    if (completion.accepted) return {
+      accepted: true,
+      carrier: alternateCarrier,
+      rawText,
+      text: completion.normalizedText,
+      normalizedValue: completion.normalizedValue,
+      alternateValidation: completion.compactValidation,
+      fullValidation: completion.fullValidation,
+      deterministicCompletion: true,
+      completionAddedFields: completion.addedFields
+    };
+    const alternateValidation = openWebUIReasoningOnlyJson(rawText, alternateSchema);
+    if (!alternateValidation.accepted) return { accepted: false, reason: "alternate-carrier-rejected", rawText };
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch { return { accepted: false, reason: "alternate-carrier-not-json", rawText }; }
+    try { validateOpenWebUIPatterns(parsed, openWebUISchemaProjection(alternateSchema)); } catch { return { accepted: false, reason: "alternate-carrier-pattern-rejected", rawText }; }
+    const item = alternateCarrier === "wrapper-json" ? parsed?.descriptions?.length === 1 ? parsed.descriptions[0] : null : parsed;
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { accepted: false, reason: "alternate-carrier-shape", rawText };
+    const normalizedValue = { tasks: [], section_name: "", descriptions: [item] };
+    const normalizedText = JSON.stringify(normalizedValue);
+    const fullValidation = openWebUIReasoningOnlyJson(normalizedText, sharedSchema);
+    if (!fullValidation.accepted) return { accepted: false, reason: "alternate-carrier-full-schema-rejected", rawText, alternateValidation, fullValidation };
+    try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch { return { accepted: false, reason: "alternate-carrier-full-pattern-rejected", rawText, alternateValidation, fullValidation }; }
+    return {
+      accepted: true,
+      carrier: alternateCarrier,
+      rawText,
+      text: normalizedText,
+      normalizedValue,
+      alternateValidation,
+      fullValidation
+    };
+  };
   const openWebUIGrammarCompatibilityEligible = (error, response, options = {}) => {
     if (options.ollamaBacked !== true) return false;
     const providerError = error?.providerError || {};
@@ -49287,6 +52426,10 @@ const STS_MULTI_PROVIDER = (() => {
     const code = String(error.providerError.code || "").toLowerCase();
     const shape = String(diagnostic.responseShape || "").toLowerCase();
     return openWebUIStructuredRetryResponseCodes.has(code) || openWebUIStructuredRetryResponseCodes.has(shape);
+  };
+  const openWebUICachedJsonAlternateCarrierRetryEligible = (error, response, requestProfile = "", options = {}) => {
+    if (options.cachedDirectJson !== true || requestProfile !== "local-schema-compatibility-json") return false;
+    return openWebUIGrammarCompatibilityEligible(error, response, options);
   };
   const openWebUIStructuredRetryRaw = (response) => {
     if (typeof response?.text === "string") {
@@ -49317,14 +52460,28 @@ const STS_MULTI_PROVIDER = (() => {
   const openWebUIChat = async (auth, settings, requestInput = {}, options = {}) => {
     const model = normalizeModel("openwebui", requestInput.model || settings.chatModel);
     if (!model) throw providerError("openwebui", null, "model-required");
+    const operation = openWebUIAdaptiveOperation(requestInput.operation || "chat-query");
     const metadata = settings.openwebuiModelMetadata?.[model] || {};
     const capabilities = openWebUICapabilities(metadata);
     const sharedSchema = requestInput.originalJsonSchema || requestInput.jsonSchema;
     const ollamaBacked = metadata.ollamaBacked === true;
-    const nativeDescription = ollamaBacked && ["description", "task-description"].includes(String(requestInput.operation || "")) && Boolean(sharedSchema);
+    const nativeDescription = ollamaBacked && operation === "task-description" && Boolean(sharedSchema);
     const schema = nativeDescription ? openWebUICompactDescriptionSchema(sharedSchema) : requestInput.jsonSchema;
     const wrapperSchema = nativeDescription ? openWebUIDescriptionWrapperSchema(sharedSchema) : null;
-    const descriptionCapability = nativeDescription ? openWebUISingletonDescriptionCapabilityState(model) : null;
+    const descriptionCapabilitySchemaProjection = nativeDescription
+      ? openWebUISchemaProjection(schema)
+      : null;
+    const descriptionCapabilitySchemaFingerprint = descriptionCapabilitySchemaProjection
+      ? stableHash(JSON.stringify(descriptionCapabilitySchemaProjection.schema))
+      : "";
+    const descriptionCapability = nativeDescription
+      ? openWebUISingletonDescriptionCapabilityState(model, {
+        provider: "openwebui",
+        operation: "task-description",
+        schemaFingerprint: descriptionCapabilitySchemaFingerprint,
+        settings
+      })
+      : null;
     const descriptionInitialCarrier = nativeDescription ? descriptionCapability.preferredCarrier : "";
     const descriptionAttemptMax = nativeDescription
       ? descriptionInitialCarrier === "direct-schema" ? 3 : descriptionInitialCarrier === "direct-json" ? 2 : 1
@@ -49332,6 +52489,45 @@ const STS_MULTI_PROVIDER = (() => {
     const transportSchema = nativeDescription && descriptionInitialCarrier === "wrapper-json" ? wrapperSchema : schema;
     const schemaProjection = transportSchema ? openWebUISchemaProjection(transportSchema) : null;
     const wrapperSchemaProjection = wrapperSchema ? openWebUISchemaProjection(wrapperSchema) : null;
+    const structuredCapabilitySchemaFingerprint = schemaProjection
+      ? stableHash(JSON.stringify(schemaProjection.schema))
+      : "";
+    const structuredCapability = schemaProjection && !nativeDescription
+      ? openWebUISingletonDescriptionCapabilityState(model, {
+        provider: "openwebui",
+        operation,
+        schemaFingerprint: structuredCapabilitySchemaFingerprint,
+        settings
+      })
+      : null;
+    const structuredInitialCarrier = !nativeDescription && ollamaBacked && structuredCapability?.preferredCarrier === "direct-json"
+      ? "direct-json"
+      : "direct-schema";
+    const adaptiveCapability = nativeDescription ? descriptionCapability : structuredCapability;
+    const adaptiveProfile = adaptiveCapability?.key
+      ? {
+        key: adaptiveCapability.key,
+        identity: adaptiveCapability.adaptiveProfileKey || adaptiveCapability.key,
+        provider: "openwebui",
+        model,
+        operation: nativeDescription ? "task-description" : operation,
+        schemaFingerprint: nativeDescription ? descriptionCapabilitySchemaFingerprint : structuredCapabilitySchemaFingerprint,
+        capabilityRevision: adaptiveCapability.capabilityRevision,
+        metadataFingerprint: adaptiveCapability.metadataFingerprint,
+        metadataRevision: adaptiveCapability.metadataRevision,
+        adaptiveConcurrencyLimit: adaptiveCapability.adaptiveConcurrencyLimit,
+        adaptiveConcurrencyReason: adaptiveCapability.adaptiveConcurrencyReason
+      }
+      : null;
+    const observeAdaptiveConcurrency = (observation) => {
+      if (typeof requestInput.onOpenWebUICapabilityObserved !== "function" || !adaptiveProfile) return false;
+      return requestInput.onOpenWebUICapabilityObserved(Object.assign({}, observation, adaptiveProfile, {
+        model,
+        operation: adaptiveProfile.operation,
+        schemaFingerprint: adaptiveProfile.schemaFingerprint,
+        capabilityRevision: adaptiveProfile.capabilityRevision
+      }));
+    };
     const schemaGrounding = schemaProjection ? openWebUISchemaGroundingText(schemaProjection) : openWebUISchemaGroundingText(null);
     const wrapperSchemaGrounding = wrapperSchemaProjection ? openWebUISchemaGroundingText(wrapperSchemaProjection) : openWebUISchemaGroundingText(null);
     const reasoningCapability = providerReasoningCapability(settings, "openwebui", model);
@@ -49391,7 +52587,9 @@ const STS_MULTI_PROVIDER = (() => {
     }
     if (schemaProjection) {
       if (ollamaBacked) {
-        body.format = nativeDescription && descriptionInitialCarrier !== "direct-schema" ? "json" : schemaProjection.schema;
+        body.format = nativeDescription
+          ? descriptionInitialCarrier !== "direct-schema" ? "json" : schemaProjection.schema
+          : structuredInitialCarrier === "direct-json" ? "json" : schemaProjection.schema;
         body.options = Object.assign({}, body.options || {}, { temperature: 0 });
       } else {
         body.temperature = 0;
@@ -49465,7 +52663,12 @@ const STS_MULTI_PROVIDER = (() => {
       descriptionCarrier: nativeDescription ? descriptionInitialCarrier : "",
       descriptionCapabilityCacheHit: nativeDescription ? descriptionCapability.cacheHit : false,
       descriptionCapabilityPreference: nativeDescription ? descriptionInitialCarrier : "",
+      descriptionCapabilitySchemaFingerprint: nativeDescription ? descriptionCapabilitySchemaFingerprint : "",
       descriptionGrammarLearned: nativeDescription ? descriptionCapability.grammarUnsupported : false,
+      structuredCapabilityCacheHit: Boolean(structuredCapability?.cacheHit),
+      structuredCapabilityPreference: structuredCapability ? structuredInitialCarrier : "",
+      structuredCapabilitySchemaFingerprint: structuredCapability ? structuredCapabilitySchemaFingerprint : "",
+      structuredGrammarLearned: Boolean(structuredCapability?.grammarUnsupported),
       descriptionAttemptOrdinal: nativeDescription ? 1 : 0,
       descriptionAttemptMax: nativeDescription ? descriptionAttemptMax : 0,
       descriptionWrapperFallbackEligible: false,
@@ -49540,7 +52743,9 @@ const STS_MULTI_PROVIDER = (() => {
     const requestProfile = capabilityDirectedCompatibility
       ? "local-schema-compatibility-capability"
       : schemaProjection
-        ? (ollamaBacked ? "strict-native-schema" : "strict-schema")
+        ? (ollamaBacked
+          ? structuredInitialCarrier === "direct-json" && !nativeDescription ? "local-schema-compatibility-json" : "strict-native-schema"
+          : "strict-schema")
         : "standard";
     let lastStructuredResponseDiagnostic = null;
     const structuredRetryState = {
@@ -49550,13 +52755,30 @@ const STS_MULTI_PROVIDER = (() => {
       retryReason: "",
       retryOrdinal: 0,
       descriptionNextCarrier: descriptionInitialCarrier,
+      structuredNextCarrier: structuredInitialCarrier,
       attempts: [],
       rawOutputs: []
+    };
+    const observeOpenWebUICapability = async ({ schemaFingerprint, operation: observedOperation, grammarRejected, successfulCarrier, preferredCarrier }) => {
+      const capabilitySettings = typeof requestInput.onOpenWebUICapabilityObserved === "function"
+        ? Object.assign({}, settings, { openwebuiModelMetadata: { [model]: Object.assign({}, metadata) } })
+        : settings;
+      const capabilityRecord = openWebUIRecordSingletonDescriptionCapability(model, {
+        provider: "openwebui",
+        operation: observedOperation,
+        schemaFingerprint,
+        grammarRejected: Boolean(grammarRejected),
+        successfulCarrier,
+        preferredCarrier,
+        settings: capabilitySettings
+      });
+      try { await requestInput.onOpenWebUICapabilityObserved?.(capabilityRecord); } catch {}
+      return capabilityRecord;
     };
     for (let structuredAttempt = 1; structuredAttempt <= (nativeDescription ? descriptionAttemptMax : 2); structuredAttempt += 1) {
       const attemptCarrier = nativeDescription
         ? structuredAttempt === 1 ? descriptionInitialCarrier : structuredRetryState.descriptionNextCarrier
-        : "";
+        : structuredAttempt === 1 ? structuredInitialCarrier : structuredRetryState.structuredNextCarrier;
       const attemptWrapper = nativeDescription && attemptCarrier === "wrapper-json";
       const attemptSchema = nativeDescription && attemptWrapper ? wrapperSchema : schema;
       const attemptSchemaProjection = nativeDescription && attemptWrapper ? wrapperSchemaProjection : schemaProjection;
@@ -49564,7 +52786,7 @@ const STS_MULTI_PROVIDER = (() => {
       const attemptSchemaHash = nativeDescription && attemptWrapper ? wrapperSchemaWireHash : nativeDescription ? directSchemaWireHash : schemaWireHash;
       const jsonModeCompatibility = ollamaBacked && (nativeDescription
         ? attemptCarrier === "direct-json" || attemptCarrier === "wrapper-json"
-        : structuredRetryState.retryOrdinal > 0);
+        : attemptCarrier === "direct-json");
       let attemptRequestBody = requestBody;
       if (jsonModeCompatibility && ollamaBacked) {
         attemptRequestBody = openWebUIJsonModeCompatibilityRequest(requestBody);
@@ -49574,11 +52796,19 @@ const STS_MULTI_PROVIDER = (() => {
             format: "json"
           });
         }
+      } else if (ollamaBacked && !nativeDescription && attemptCarrier === "direct-schema") {
+        attemptRequestBody = Object.assign({}, requestBody, {
+          format: attemptSchemaProjection?.schema || schemaProjection?.schema
+        });
       }
       const attemptRequestProfile = nativeDescription
         ? attemptCarrier === "wrapper-json" ? "local-schema-compatibility-description-wrapper-json"
           : attemptCarrier === "direct-json" ? "local-schema-compatibility-json" : "strict-native-schema"
-        : jsonModeCompatibility ? "local-schema-compatibility-json" : requestProfile;
+        : jsonModeCompatibility
+          ? "local-schema-compatibility-json"
+          : structuredInitialCarrier === "direct-json" && attemptCarrier === "direct-schema"
+            ? "strict-native-schema"
+            : requestProfile;
       const attemptSchemaSystemText = attemptSchemaGrounding.present ? attemptSchemaGrounding.text : "";
       const attemptSystemMessageCount = attemptRequestBody.messages?.filter?.((message) => message.role === "system").length || 0;
       const attemptProviderRequestTelemetry = requestTelemetryForBody(attemptRequestBody, attemptRequestProfile, structuredRetryState.retryReason, {
@@ -49595,7 +52825,12 @@ const STS_MULTI_PROVIDER = (() => {
         systemSchemaHash: attemptSchemaSystemText ? stableHash(attemptSchemaSystemText) : "",
         descriptionCarrier: nativeDescription ? attemptCarrier : "",
         descriptionCapabilityPreference: nativeDescription ? descriptionInitialCarrier : "",
+        descriptionCapabilitySchemaFingerprint: nativeDescription ? descriptionCapabilitySchemaFingerprint : "",
         descriptionGrammarLearned: nativeDescription ? descriptionCapability.grammarUnsupported : false,
+        structuredCapabilityCacheHit: Boolean(structuredCapability?.cacheHit),
+        structuredCapabilityPreference: structuredCapability ? structuredInitialCarrier : "",
+        structuredCapabilitySchemaFingerprint: structuredCapability ? structuredCapabilitySchemaFingerprint : "",
+        structuredGrammarLearned: Boolean(structuredCapability?.grammarUnsupported),
         descriptionAttemptOrdinal: nativeDescription ? structuredAttempt : 0,
         descriptionAttemptMax: nativeDescription ? descriptionAttemptMax : 0,
         descriptionWrapperFallbackAttempted: attemptWrapper
@@ -49615,7 +52850,9 @@ const STS_MULTI_PROVIDER = (() => {
           modelExecution: true,
           model,
           concurrencyLimit: openWebUIModelConcurrencyLimit(settings, model),
-          workerCount: openWebUIWorkerCount(settings)
+          workerCount: openWebUIWorkerCount(settings),
+          adaptiveProfile,
+          onAdaptiveObservation: observeAdaptiveConcurrency
         });
         queueTelemetry = response?.openWebUIQueueTelemetry || null;
         if (!successful(response)) throw providerError("openwebui", statusOf(response), "transport", retryableStatus(statusOf(response)));
@@ -49653,30 +52890,156 @@ const STS_MULTI_PROVIDER = (() => {
           throw truncationError;
         }
         let text = normalizedResponse.text;
+        let alternateDescriptionNormalization = null;
+        let deterministicDescriptionCompletion = null;
+        let taskGenerationDatePatternNormalization = null;
+        let chatStructuralNormalization = null;
         if (attemptSchema) {
-          const validation = openWebUIReasoningOnlyJson(text, attemptSchema);
+          if (operation === "chat-query" && !nativeDescription) {
+            const derived = normalizeChatEvidencePayloadForValidation(text);
+            if (derived.applied) {
+              chatStructuralNormalization = derived;
+              text = derived.text;
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                derivedChatStructuralNormalization: true,
+                derivedChatStructuralNormalizationCorrections: derived.corrections
+              });
+            }
+          }
+          let validation = openWebUIReasoningOnlyJson(text, attemptSchema);
           schemaValidationTelemetry = {
             profile: nativeDescription ? OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE : OPENWEBUI_REASONING_VALIDATION_PROFILE,
             reason: validation.reason,
             schemaHash: validation.schemaHash,
             accepted: validation.accepted,
             compactSchemaAccepted: nativeDescription ? validation.accepted : undefined,
-            compactSchemaHash: nativeDescription ? validation.schemaHash : ""
+            compactSchemaHash: nativeDescription ? validation.schemaHash : "",
+            derivedChatStructuralNormalization: Boolean(chatStructuralNormalization?.applied),
+            derivedChatStructuralNormalizationCorrections: chatStructuralNormalization?.corrections || []
           };
+          if (!validation.accepted
+            && validation.reason === "schema-pattern-mismatch"
+            && operation === "task-generation"
+            && attemptSchemaProjection) {
+            try {
+              const parsedCandidate = JSON.parse(text);
+              const correction = openWebUITaskGenerationDateNormalization(parsedCandidate, attemptSchemaProjection);
+              if (correction.accepted) {
+                const correctedValidation = openWebUIReasoningOnlyJson(correction.text, attemptSchema);
+                if (correctedValidation.accepted) {
+                  taskGenerationDatePatternNormalization = correction;
+                  text = correction.text;
+                  validation = correctedValidation;
+                  schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                    reason: "task-generation-date-pattern-normalization",
+                    schemaHash: correctedValidation.schemaHash,
+                    accepted: true,
+                    schemaPatternNormalizationApplied: true,
+                    schemaPatternNormalizationFieldCount: correction.fieldCount,
+                    schemaPatternNormalizationPathClass: correction.pathClass,
+                    schemaPatternNormalizationReason: correction.reason
+                  });
+                  normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                    schemaPatternNormalizationApplied: true,
+                    schemaPatternNormalizationFieldCount: correction.fieldCount,
+                    schemaPatternNormalizationPathClass: correction.pathClass,
+                    schemaPatternNormalizationReason: correction.reason
+                  });
+                }
+              }
+            } catch {}
+          }
+          if (!validation.accepted && nativeDescription) {
+            const completion = openWebUIDescriptionSingletonCompletion(text, attemptWrapper ? "wrapper-json" : "direct-schema", attemptSchema, sharedSchema);
+            if (completion.accepted) {
+              deterministicDescriptionCompletion = completion;
+              text = completion.text;
+              validation = completion.compactValidation;
+              schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                reason: "deterministic-singleton-completion",
+                schemaHash: completion.compactValidation.schemaHash,
+                accepted: true,
+                compactSchemaAccepted: true,
+                compactSchemaHash: completion.compactValidation.schemaHash,
+                deterministicCompletion: true,
+                completionAddedFields: completion.addedFields
+              });
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                descriptionDeterministicCompletion: true,
+                descriptionCompletionAddedFields: completion.addedFields
+              });
+            }
+          }
+          if (!validation.accepted && nativeDescription) {
+            const alternate = openWebUIDescriptionAlternateCarrierNormalization(text, attemptCarrier, schema, wrapperSchema, sharedSchema);
+            if (alternate.accepted) {
+              alternateDescriptionNormalization = alternate;
+              text = alternate.text;
+              validation = alternate.fullValidation;
+              schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                reason: "alternate-carrier-normalization",
+                schemaHash: alternate.fullValidation.schemaHash,
+                accepted: true,
+                compactSchemaAccepted: true,
+                compactSchemaHash: alternate.alternateValidation.schemaHash,
+                normalizedSchemaHash: alternate.fullValidation.schemaHash,
+                normalizedSchemaReason: alternate.fullValidation.reason,
+                normalizedSchemaAccepted: true,
+                fullSchemaHash: sharedSchemaHash,
+                fullSchemaAccepted: true
+              });
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                descriptionCompactSchemaPresent: true,
+                descriptionCompactAccepted: true,
+                descriptionEnvelopeAdded: true,
+                descriptionFullSchemaAccepted: true,
+                descriptionSchemaProfile: OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE,
+                descriptionCompactSchemaHash: alternate.alternateValidation.schemaHash,
+                descriptionOriginalSchemaHash: sharedSchemaHash,
+                descriptionCarrier: alternate.carrier,
+                descriptionCarrierNormalized: true,
+                descriptionDeterministicCompletion: Boolean(alternate.deterministicCompletion),
+                descriptionCompletionAddedFields: alternate.completionAddedFields || []
+              });
+            }
+          }
+          if (!validation.accepted && operation === "chat-query" && !nativeDescription) {
+            const derived = openWebUIChatCitationNormalization(text, attemptSchema, schema);
+            if (derived.accepted) {
+              text = derived.text;
+              validation = derived.validation;
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                derivedChatCitationNormalization: true,
+                derivedChatCitationRemovedCount: derived.removedCount,
+                derivedChatCitationReason: derived.reason
+              });
+              schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                reason: "derived-chat-citation-normalization",
+                schemaHash: validation.schemaHash,
+                accepted: true,
+                derivedChatCitationNormalization: true,
+                derivedChatCitationRemovedCount: derived.removedCount,
+                derivedChatCitationReason: derived.reason
+              });
+            }
+          }
           if (!validation.accepted) {
             const validationCode = validation.reason === "schema-pattern-mismatch" ? "schema-pattern-mismatch" : "invalid-response";
             throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), validationCode));
           }
           let parsedValue;
-          try { parsedValue = JSON.parse(text); } catch {
-            throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), "invalid-response"));
+          if (alternateDescriptionNormalization) parsedValue = alternateDescriptionNormalization.normalizedValue;
+          else {
+            try { parsedValue = JSON.parse(text); } catch {
+              throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), "invalid-response"));
+            }
           }
           try {
             validateOpenWebUIPatterns(parsedValue, attemptSchemaProjection);
           } catch (error) {
             throw preserveQueueTelemetry(error?.providerError ? error : providerError("openwebui", statusOf(response), "invalid-response"));
           }
-          if (nativeDescription) {
+          if (nativeDescription && !alternateDescriptionNormalization) {
             const parsedItem = attemptWrapper
               ? Array.isArray(parsedValue?.descriptions) && parsedValue.descriptions.length === 1
                 ? parsedValue.descriptions[0]
@@ -49698,6 +53061,9 @@ const STS_MULTI_PROVIDER = (() => {
             if (!fullValidation.accepted) {
               const validationCode = fullValidation.reason === "schema-pattern-mismatch" ? "schema-pattern-mismatch" : "invalid-response";
               throw preserveQueueTelemetry(providerError("openwebui", statusOf(response), validationCode));
+            }
+            try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch (error) {
+              throw preserveQueueTelemetry(error?.providerError ? error : providerError("openwebui", statusOf(response), "invalid-response"));
             }
             text = normalizedText;
             normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
@@ -49755,9 +53121,14 @@ const STS_MULTI_PROVIDER = (() => {
           descriptionCompactAccepted: Boolean(normalizedResponse.responseTelemetry?.descriptionCompactAccepted),
           descriptionEnvelopeAdded: Boolean(normalizedResponse.responseTelemetry?.descriptionEnvelopeAdded),
           descriptionFullSchemaAccepted: Boolean(normalizedResponse.responseTelemetry?.descriptionFullSchemaAccepted),
-          descriptionCarrier: String(attemptProviderRequestTelemetry.descriptionCarrier || "").slice(0, 48),
+          descriptionCarrier: String(alternateDescriptionNormalization?.carrier || attemptProviderRequestTelemetry.descriptionCarrier || "").slice(0, 48),
+          descriptionCarrierNormalized: Boolean(normalizedResponse.responseTelemetry?.descriptionCarrierNormalized),
           descriptionCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.descriptionCapabilityCacheHit),
           descriptionCapabilityPreference: String(attemptProviderRequestTelemetry.descriptionCapabilityPreference || "").slice(0, 48),
+          structuredCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.structuredCapabilityCacheHit),
+          structuredCapabilityPreference: String(attemptProviderRequestTelemetry.structuredCapabilityPreference || "").slice(0, 48),
+          structuredCapabilitySchemaFingerprint: String(attemptProviderRequestTelemetry.structuredCapabilitySchemaFingerprint || "").slice(0, 80),
+          structuredGrammarLearned: Boolean(attemptProviderRequestTelemetry.structuredGrammarLearned),
           descriptionGrammarLearned: Boolean(attemptProviderRequestTelemetry.descriptionGrammarLearned),
           descriptionAttemptOrdinal: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptOrdinal) || 0)),
           descriptionAttemptMax: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptMax) || 0)),
@@ -49774,12 +53145,28 @@ const STS_MULTI_PROVIDER = (() => {
           descriptionSchemaProfile: OPENWEBUI_DESCRIPTION_SCHEMA_PROFILE,
           descriptionCompactSchemaHash: attemptSchemaHash,
           descriptionOriginalSchemaHash: sharedSchemaHash,
-          descriptionCarrier: attemptCarrier
+          descriptionCarrier: alternateDescriptionNormalization?.carrier || attemptCarrier,
+          descriptionCarrierNormalized: Boolean(alternateDescriptionNormalization),
+          descriptionDeterministicCompletion: Boolean(deterministicDescriptionCompletion || alternateDescriptionNormalization?.deterministicCompletion),
+          descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || []
         } : {});
-        if (nativeDescription) {
-          openWebUIRecordSingletonDescriptionCapability(model, {
-            grammarUnsupported: descriptionCapability.grammarUnsupported,
-            preferredCarrier: attemptWrapper ? "wrapper-json" : descriptionCapability.grammarUnsupported ? "direct-json" : "direct-schema"
+        if (ollamaBacked && attemptSchemaProjection) {
+          const successfulCarrier = nativeDescription
+            ? alternateDescriptionNormalization?.carrier || (attemptWrapper ? "wrapper-json" : attemptCarrier === "direct-json" ? "direct-json" : "direct-schema")
+            : jsonModeCompatibility ? "direct-json" : "direct-schema";
+          const recoveredCachedJsonCarrier = !nativeDescription
+            && structuredRetryState.retryReason === "grammar-carrier-recovery"
+            && successfulCarrier === "direct-schema";
+          await observeOpenWebUICapability({
+            operation: nativeDescription ? "task-description" : operation,
+            schemaFingerprint: nativeDescription ? descriptionCapabilitySchemaFingerprint : structuredCapabilitySchemaFingerprint,
+            grammarRejected: recoveredCachedJsonCarrier
+              ? false
+              : nativeDescription ? descriptionCapability.grammarUnsupported : structuredCapability?.grammarUnsupported,
+            successfulCarrier,
+            preferredCarrier: recoveredCachedJsonCarrier
+              ? "direct-schema"
+              : nativeDescription ? successfulCarrier : structuredCapability?.grammarUnsupported ? "direct-json" : successfulCarrier
           });
         }
         return {
@@ -49800,10 +53187,26 @@ const STS_MULTI_PROVIDER = (() => {
             profile: attemptSchemaGrounding.profile,
             omittedPatternCount: attemptSchemaGrounding.omittedPatternCount,
             descriptionCompactSchemaHash: attemptSchemaHash,
-            descriptionCarrier: attemptCarrier
+            descriptionCarrier: alternateDescriptionNormalization?.carrier || attemptCarrier,
+            descriptionCarrierNormalized: Boolean(alternateDescriptionNormalization),
+            descriptionDeterministicCompletion: Boolean(deterministicDescriptionCompletion || alternateDescriptionNormalization?.deterministicCompletion),
+            descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || []
           }) : schemaGroundingTelemetry,
           responseProfile: normalizedResponse.responseTelemetry.profile,
           responseTelemetry: normalizedResponse.responseTelemetry,
+          providerDiagnostic: taskGenerationDatePatternNormalization ? {
+            source: "openwebui-derived-result-normalization",
+            classification: "schema-pattern-normalization",
+            schemaPatternNormalizationApplied: true,
+            schemaPatternNormalizationFieldCount: taskGenerationDatePatternNormalization.fieldCount,
+            schemaPatternNormalizationPathClass: taskGenerationDatePatternNormalization.pathClass,
+            schemaPatternNormalizationReason: taskGenerationDatePatternNormalization.reason
+          } : chatStructuralNormalization?.applied ? {
+            source: "openwebui-derived-chat-response-normalization",
+            classification: "schema-normalization",
+            derivedChatStructuralNormalization: true,
+            derivedChatStructuralNormalizationCorrections: chatStructuralNormalization.corrections
+          } : undefined,
           outputBudgetTelemetry,
           providerRequestTelemetry: attemptProviderRequestTelemetry,
           queueTelemetry,
@@ -49851,8 +53254,29 @@ const STS_MULTI_PROVIDER = (() => {
             && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
           if (nativeDescriptionGrammarFailure) {
             descriptionCapability.grammarUnsupported = true;
-            openWebUIRecordSingletonDescriptionCapability(model, { grammarUnsupported: true, preferredCarrier: "direct-json" });
             attemptProviderRequestTelemetry.descriptionGrammarLearned = true;
+            await observeOpenWebUICapability({
+              operation: "task-description",
+              schemaFingerprint: descriptionCapabilitySchemaFingerprint,
+              grammarRejected: true,
+              successfulCarrier: "direct-json",
+              preferredCarrier: "direct-json"
+            });
+          }
+          const structuredGrammarFailure = !nativeDescription
+            && structuredInitialCarrier === "direct-schema"
+            && structuredAttempt === 1
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+          if (structuredGrammarFailure && structuredCapability) {
+            structuredCapability.grammarUnsupported = true;
+            attemptProviderRequestTelemetry.structuredGrammarLearned = true;
+            await observeOpenWebUICapability({
+              operation,
+              schemaFingerprint: structuredCapabilitySchemaFingerprint,
+              grammarRejected: true,
+              successfulCarrier: "direct-json",
+              preferredCarrier: "direct-json"
+            });
           }
           const nativeDescriptionWrapperFallbackEligible = nativeDescription
             && attemptCarrier === "direct-json"
@@ -49905,6 +53329,10 @@ const STS_MULTI_PROVIDER = (() => {
             descriptionCarrier: String(attemptProviderRequestTelemetry.descriptionCarrier || "").slice(0, 48),
             descriptionCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.descriptionCapabilityCacheHit),
             descriptionCapabilityPreference: String(attemptProviderRequestTelemetry.descriptionCapabilityPreference || "").slice(0, 48),
+            structuredCapabilityCacheHit: Boolean(attemptProviderRequestTelemetry.structuredCapabilityCacheHit),
+            structuredCapabilityPreference: String(attemptProviderRequestTelemetry.structuredCapabilityPreference || "").slice(0, 48),
+            structuredCapabilitySchemaFingerprint: String(attemptProviderRequestTelemetry.structuredCapabilitySchemaFingerprint || "").slice(0, 80),
+            structuredGrammarLearned: Boolean(attemptProviderRequestTelemetry.structuredGrammarLearned),
             descriptionGrammarLearned: Boolean(attemptProviderRequestTelemetry.descriptionGrammarLearned),
             descriptionAttemptOrdinal: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptOrdinal) || 0)),
             descriptionAttemptMax: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptMax) || 0)),
@@ -49921,15 +53349,26 @@ const STS_MULTI_PROVIDER = (() => {
             structuredRetryState.descriptionNextCarrier = "wrapper-json";
             continue;
           }
-          if (structuredAttempt === 1
+          const cachedJsonAlternateCarrierRetry = !nativeDescription
+            && structuredAttempt === 1
+            && structuredInitialCarrier === "direct-json"
+            && openWebUICachedJsonAlternateCarrierRetryEligible(preserved, response, attemptRequestProfile, {
+              ollamaBacked,
+              cachedDirectJson: true
+            });
+          const standardStructuredRetry = structuredAttempt === 1
             && !capabilityDirectedCompatibility
             && (!nativeDescription || attemptCarrier === "direct-schema")
-            && openWebUIStructuredRetryEligible(preserved, attemptSchema, response, attemptRequestProfile, { ollamaBacked })) {
+            && openWebUIStructuredRetryEligible(preserved, attemptSchema, response, attemptRequestProfile, { ollamaBacked });
+          if (cachedJsonAlternateCarrierRetry || standardStructuredRetry) {
             structuredRetryState.retryEligible = true;
             structuredRetryState.retryAttempted = true;
-            structuredRetryState.retryReason = diagnostic.grammar === true ? "grammar-compatibility" : String(providerErrorValue.code || "invalid-response");
+            structuredRetryState.retryReason = cachedJsonAlternateCarrierRetry
+              ? "grammar-carrier-recovery"
+              : diagnostic.grammar === true ? "grammar-compatibility" : String(providerErrorValue.code || "invalid-response");
             structuredRetryState.retryOrdinal = 1;
             if (nativeDescription) structuredRetryState.descriptionNextCarrier = "direct-json";
+            else structuredRetryState.structuredNextCarrier = cachedJsonAlternateCarrierRetry ? "direct-schema" : "direct-json";
             continue;
           }
         }
@@ -50462,6 +53901,9 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUIWorkerCount,
     openWebUICapabilities,
     openWebUIRoleCapabilities,
+    openWebUICapabilityMetadataFingerprint,
+    openWebUICapabilityMetadataIdentity,
+    openWebUIAdaptiveOperation,
     stableHash,
     openWebUISchemaProjection,
     openWebUICompactDescriptionSchema,
@@ -50469,7 +53911,10 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUIReasoningOnlyJson,
     validateProviderStructuredJson: openWebUIReasoningOnlyJson,
     openWebUISingletonDescriptionCapabilityState,
+    openWebUIRecordSingletonDescriptionCapability,
+    openWebUIDeleteSingletonDescriptionCapability,
     openWebUISchemaGroundingText,
+    openWebUITaskGenerationDateNormalization,
     validateOpenWebUIPatterns,
     openWebUIAuth,
     runOpenWebUIModelBarrier,
@@ -50477,10 +53922,13 @@ const STS_MULTI_PROVIDER = (() => {
     providerError,
     normalizeUsage,
     classifyOpenRouterFreeModel,
+    openRouterRateLimitProfile,
     createOpenRouterFreeRateLimiter,
     openRouterFreeRateKey,
     rateLimitTelemetry,
+    openRouterRateLimitTelemetry,
     openWebUIResponseNormalize,
+    openWebUIChatCitationNormalization,
     sanitizeOpenRouterReasoningMetadata,
     openRouterCapabilities,
     openRouterChat,
@@ -50512,7 +53960,7 @@ const AI_GATEWAY_ATTEMPT_MIN_DEADLINE_MS = 1;
 const AI_GATEWAY_ATTEMPT_MAX_DEADLINE_MS = 600000;
 const AI_GATEWAY_ABORT_SETTLE_GRACE_MS = 25;
 const AI_GATEWAY_OPERATION_KINDS = Object.freeze(["generate", "embed", "discover", "setup-check"]);
-const AI_GATEWAY_EVENT_STEPS = Object.freeze(["plan-resolved", "preflight", "attempt-started", "provider-response", "attempt-observation", "attempt-failed", "fallback-decision", "completed"]);
+const AI_GATEWAY_EVENT_STEPS = Object.freeze(["plan-resolved", "preflight", "attempt-started", "provider-response", "attempt-observation", "attempt-failed", "fallback-decision", "recovery-decision", "completed"]);
 const AI_DEBUG_DIAGNOSTIC_CAPACITY = 128;
 const AI_DEBUG_DIAGNOSTIC_PROVIDERS = new Set(["openai", "gemini", "openrouter", "openwebui", "unknown"]);
 
@@ -50713,7 +54161,9 @@ function aiGatewayDiagnosticState(operation = "", phase = "") {
     code: "", retryable: false, status: "", elapsedMs: 0, callCount: 0, eventCount: 0,
     rawSha256: "", rawUtf8Bytes: 0, phase: String(phase || ""),
     parsedRootKeys: [], hasTasks: false, hasDescriptions: false, taskCount: 0, descriptionCount: 0,
-    parseStatus: "not-attempted"
+    parseStatus: "not-attempted", schemaPatternNormalizationApplied: false,
+    schemaPatternNormalizationFieldCount: 0, schemaPatternNormalizationPathClass: "",
+    schemaPatternNormalizationReason: ""
   };
   return {
     onEvent(event = {}) {
@@ -50729,6 +54179,11 @@ function aiGatewayDiagnosticState(operation = "", phase = "") {
         summary.status = String(event.status || summary.status).slice(0, 40);
         summary.elapsedMs = Math.max(summary.elapsedMs, Math.max(0, Number(event.elapsedMs) || 0));
         summary.eventCount = Math.min(64, summary.eventCount + 1);
+        const correction = event.providerDiagnostic && typeof event.providerDiagnostic === "object" ? event.providerDiagnostic : {};
+        if (correction.schemaPatternNormalizationApplied) summary.schemaPatternNormalizationApplied = true;
+        summary.schemaPatternNormalizationFieldCount = Math.max(summary.schemaPatternNormalizationFieldCount, Math.min(32, Math.round(Number(correction.schemaPatternNormalizationFieldCount) || 0)));
+        if (correction.schemaPatternNormalizationPathClass) summary.schemaPatternNormalizationPathClass = String(correction.schemaPatternNormalizationPathClass).replace(/[^A-Za-z0-9.*_\[\],:-]/g, "").slice(0, 120);
+        if (correction.schemaPatternNormalizationReason) summary.schemaPatternNormalizationReason = String(correction.schemaPatternNormalizationReason).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80);
         if (event.step === "attempt-started") summary.callCount = Math.min(8, summary.callCount + 1);
       } catch {}
     },
@@ -50799,6 +54254,9 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
     cacheCount: number(firstNumber(source.cacheCount, context.cacheHits, context.cacheHitCount, source.cacheHits)),
     retryCount: number(firstNumber(source.retryCount, source.retryOrdinal, observation.retryCount, source.dynamicRouterRetry?.retryOrdinal)),
     schemaName: token(source.schemaName || source.schemaProfile || observation.schemaProfile || requestTelemetry.schemaProfile, 48),
+    schemaPatternNormalizationApplied: Boolean(source.schemaPatternNormalizationApplied || rawDiagnostic.schemaPatternNormalizationApplied),
+    schemaPatternNormalizationFieldCount: number(firstNumber(source.schemaPatternNormalizationFieldCount, rawDiagnostic.schemaPatternNormalizationFieldCount), 32),
+    schemaPatternNormalizationPathClass: String(source.schemaPatternNormalizationPathClass || rawDiagnostic.schemaPatternNormalizationPathClass || "").replace(/[^A-Za-z0-9.*_\[\],:-]/g, "").slice(0, 120),
     carrier: token(source.carrier || requestTelemetry.jsonModeCarrier || requestTelemetry.thinkCarrier || "", 48),
     contextSource: token(source.contextSource || preflight.contextWindowSource || observation.effectiveContextSource || "", 56),
     inputTokens: number(firstNumber(source.inputTokens, usage.inputTokens, usage.input_tokens, preflight.adjustedEstimatedInputTokens)),
@@ -50819,26 +54277,49 @@ function aiGatewayBoundedRateLimit(value = null) {
   if (!value || typeof value !== "object") return null;
   const number = (input, maximum) => Math.max(0, Math.min(maximum, Math.round(Number(input) || 0)));
   const source = String(value.source || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48);
-  return Object.freeze({
+  const modelClass = value.modelClass === "free" ? "free" : value.modelClass === "paid" ? "paid" : "";
+  const accountTier = ["free", "paid", "unknown"].includes(value.accountTier) ? value.accountTier : "";
+  const bounded = {
     profile: String(value.profile || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64),
     limit: number(value.limit, 20),
     windowMs: number(value.windowMs, 86_400_000),
     waitMs: number(value.waitMs, 3_600_000),
     depth: number(value.depth, 256),
     source: source || "admission"
-  });
+  };
+  if (modelClass) {
+    bounded.modelClass = modelClass;
+    bounded.class = modelClass;
+  }
+  if (value.limiterApplied !== undefined) bounded.limiterApplied = Boolean(value.limiterApplied);
+  if (value.providerManaged !== undefined) bounded.providerManaged = Boolean(value.providerManaged);
+  if (accountTier) {
+    bounded.accountTier = accountTier;
+    bounded.tier = ["free", "paid", "unknown"].includes(value.tier) ? value.tier : accountTier;
+  }
+  if (value.dailyQuota !== undefined) bounded.dailyQuota = number(value.dailyQuota, 1_000_000);
+  if (value.dailyQuotaKnown !== undefined) bounded.dailyQuotaKnown = Boolean(value.dailyQuotaKnown);
+  if (["free-daily-quota", "free-rpm", "rate-limit"].includes(value.rateLimitReason)) bounded.rateLimitReason = value.rateLimitReason;
+  for (const key of ["retryAfterMs", "xRateLimitLimit", "xRateLimitRemaining", "xRateLimitResetMs"]) {
+    if (value[key] !== undefined && value[key] !== null) bounded[key] = number(value[key], key === "xRateLimitResetMs" || key === "retryAfterMs" ? 86_400_000 : 1e9);
+  }
+  return Object.freeze(bounded);
 }
 
 function aiGatewaySanitizeProviderDiagnostic(value = null) {
   if (!value || typeof value !== "object") return null;
   const diagnostic = {};
-  for (const key of ["status", "code", "classification", "transport", "timeoutMs", "incompleteReason", "reason", "schemaKeyword", "responseIdHash", "rawSha256", "rawHash", "rawUtf8Bytes", "diagnosticHash", "finalization", "responseShape", "servedModel", "finishReason", "contentType", "httpStatus", "errorType", "errorHash", "bodyHash", "responseProfile", "responseProfileClassification", "reasoningOnlyValidationProfile", "reasoningOnlyValidationReason", "reasoningOnlyValidationSchemaHash", "schemaValidationProfile", "schemaValidationReason", "schemaValidationSchemaHash", "schemaGroundingHash", "schemaGroundingProfile", "jsonModeValue", "jsonModeProfile", "jsonModeCarrier", "geminiRequestProfile", "capabilityRole", "capabilitySource"]) {
-    if (value[key] !== undefined && value[key] !== null && value[key] !== "") diagnostic[key] = typeof value[key] === "number" ? value[key] : String(value[key]).replace(/[^A-Za-z0-9._:/-]/g, "").slice(0, 160);
+  for (const key of ["status", "code", "classification", "transport", "timeoutMs", "incompleteReason", "reason", "schemaKeyword", "responseIdHash", "rawSha256", "rawHash", "rawUtf8Bytes", "diagnosticHash", "finalization", "responseShape", "servedModel", "finishReason", "contentType", "httpStatus", "errorType", "canonicalErrorType", "rateLimitReason", "retryAfterMs", "errorHash", "bodyHash", "responseProfile", "responseProfileClassification", "reasoningOnlyValidationProfile", "reasoningOnlyValidationReason", "reasoningOnlyValidationSchemaHash", "schemaValidationProfile", "schemaValidationReason", "schemaValidationSchemaHash", "schemaGroundingHash", "schemaGroundingProfile", "jsonModeValue", "jsonModeProfile", "jsonModeCarrier", "geminiRequestProfile", "capabilityRole", "capabilitySource", "schemaPatternNormalizationPathClass", "schemaPatternNormalizationReason"]) {
+    if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+      if (typeof value[key] === "number") diagnostic[key] = value[key];
+      else if (key === "schemaPatternNormalizationPathClass") diagnostic[key] = String(value[key]).replace(/[^A-Za-z0-9.*_\[\],:-]/g, "").slice(0, 120);
+      else diagnostic[key] = String(value[key]).replace(/[^A-Za-z0-9._:/-]/g, "").slice(0, 160);
+    }
   }
-  for (const key of ["draining", "settled", "abortRequested", "refusalPresent", "errorPresent", "reasoningOnlyCandidateUsed", "reasoningOnlyCandidateAccepted", "schemaGroundingPresent", "jsonModePresent", "deprecatedSamplingFieldsOmitted", "prefilledModelTurnOmitted"]) {
+  for (const key of ["draining", "settled", "abortRequested", "refusalPresent", "errorPresent", "reasoningOnlyCandidateUsed", "reasoningOnlyCandidateAccepted", "schemaGroundingPresent", "jsonModePresent", "deprecatedSamplingFieldsOmitted", "prefilledModelTurnOmitted", "schemaPatternNormalizationApplied"]) {
     if (value[key] !== undefined) diagnostic[key] = Boolean(value[key]);
   }
-  for (const key of ["choiceCount", "contentByteCount", "responseByteCount", "errorStatus", "eventCount", "doneCount", "usageEventCount", "reasoningContentExcludedChunks", "reasoningOnlyCandidateCount", "schemaGroundingBytes", "schemaGroundingTokens", "schemaGroundingOmittedPatternCount"]) {
+  for (const key of ["choiceCount", "contentByteCount", "responseByteCount", "errorStatus", "eventCount", "doneCount", "usageEventCount", "reasoningContentExcludedChunks", "reasoningOnlyCandidateCount", "schemaGroundingBytes", "schemaGroundingTokens", "schemaGroundingOmittedPatternCount", "schemaPatternNormalizationFieldCount"]) {
     if (value[key] !== undefined && value[key] !== null && Number.isFinite(Number(value[key]))) diagnostic[key] = Math.max(0, Math.min(1e9, Math.round(Number(value[key]))));
   }
   const rateLimit = aiGatewayBoundedRateLimit(value.rateLimit);
@@ -50864,6 +54345,46 @@ function aiGatewaySanitizeProviderDiagnostic(value = null) {
     }
   }
   return Object.keys(diagnostic).length ? Object.freeze(diagnostic) : null;
+}
+
+const AI_GATEWAY_CANONICAL_ERROR_TYPES = new Set([
+  "context_length_exceeded", "max_tokens_exceeded", "token_limit_exceeded", "string_too_long",
+  "authentication", "permission_denied", "payment_required", "rate_limit_exceeded",
+  "provider_overloaded", "provider_unavailable", "invalid_request", "invalid_prompt",
+  "not_found", "payload_too_large", "content_policy_violation", "refusal", "server", "timeout", "unmapped"
+]);
+
+function aiGatewayCanonicalErrorType(diagnostic = {}, code = "") {
+  for (const value of [diagnostic?.canonicalErrorType, diagnostic?.errorType, diagnostic?.error_type, code]) {
+    const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (AI_GATEWAY_CANONICAL_ERROR_TYPES.has(normalized)) return normalized;
+  }
+  return "unmapped";
+}
+
+function aiGatewayUserErrorMessage(provider = "", status = null, code = "", diagnostic = {}, rateLimit = null) {
+  const normalizedProvider = String(provider || "AI provider").trim();
+  const canonical = aiGatewayCanonicalErrorType(diagnostic, code);
+  const retryAfterMs = Math.max(0, Math.round(Number(rateLimit?.retryAfterMs || diagnostic?.retryAfterMs || 0)));
+  const retryHint = retryAfterMs > 0 ? ` Retry after about ${Math.max(1, Math.ceil(retryAfterMs / 1000))} seconds.` : "";
+  if (canonical === "authentication" || ["auth-required", "auth-failed", "missing-credential"].includes(String(code)) || Number(status) === 401) return `${normalizedProvider} authentication failed. Check the configured API key or connection.`;
+  if (canonical === "payment_required" || Number(status) === 402) return `${normalizedProvider} requires account credits or payment. Check the provider billing or credit balance.`;
+  if (canonical === "permission_denied" || Number(status) === 403) return `${normalizedProvider} denied access. Check account permissions and provider policy settings.`;
+  if (["context_length_exceeded", "max_tokens_exceeded", "token_limit_exceeded", "string_too_long"].includes(canonical) || Number(status) === 413) return `${normalizedProvider} rejected the request because it is too large. Reduce the supplied context or output requirements.`;
+  if (canonical === "payload_too_large") return `${normalizedProvider} rejected the request payload because it is too large. Reduce the supplied content.`;
+  if (canonical === "not_found" || Number(status) === 404) return `${normalizedProvider} could not find the requested route. Refresh model discovery or choose an available model.`;
+  if (canonical === "rate_limit_exceeded" || Number(status) === 429) {
+    const reason = String(rateLimit?.rateLimitReason || diagnostic?.rateLimitReason || "");
+    if (reason === "free-daily-quota") return `${normalizedProvider} free-model daily quota appears exhausted. Wait for the quota reset or use a paid variant.${retryHint}`;
+    if (reason === "free-rpm") return `${normalizedProvider} free-model request rate limit reached. Wait for the rolling window to clear.${retryHint}`;
+    return `${normalizedProvider} rate limit reached. Wait before trying again.${retryHint}`;
+  }
+  if (canonical === "timeout" || ["attempt-timeout", "timeout"].includes(String(code)) || [408, 504].includes(Number(status))) return `${normalizedProvider} timed out. Check the connection and try again.`;
+  if (["provider_overloaded", "provider_unavailable"].includes(canonical) || [500, 502, 503].includes(Number(status))) return `${normalizedProvider} is temporarily unavailable or overloaded. Try again later or use the configured fallback.`;
+  if (["content_policy_violation", "refusal"].includes(canonical) || String(code) === "provider-refusal") return `${normalizedProvider} refused the request because of content or policy constraints.`;
+  if (["invalid_request", "invalid_prompt"].includes(canonical) || ["request-validation", "unsupported-schema", "invalid-schema"].includes(String(code)) || [400, 422].includes(Number(status))) return `${normalizedProvider} rejected the request shape. Check the selected model capabilities and schema.`;
+  if (canonical === "server" || ["transport", "provider-error"].includes(String(code))) return `${normalizedProvider} returned a provider or transport error. Check provider status and try again.`;
+  return `${normalizedProvider} returned an error. Check the request and provider status, then try again.`;
 }
 
 function taskGenerationOutcome(state = "", details = {}) {
@@ -51028,12 +54549,35 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
   const metadata = taskDescriptionProviderModelMetadata(settings, provider, model);
   const limits = taskDescriptionProviderLimits(metadata, provider);
   const providerOutputLimitTokens = Math.max(0, Number(limits.outputTokenLimitTokens || 0));
-  const contextWindowTokens = Math.max(0, Number(preflight?.contextWindowTokens || limits.contextWindowTokens || 0));
+  const normalizedProviderForCapacity = String(provider || "").trim().toLowerCase();
+  const limitsContextWindowTokens = Math.max(0, Number(limits.contextWindowTokens || 0));
+  const preflightContextWindowTokens = Math.max(0, Number(preflight?.contextWindowTokens || 0));
+  const preflightHardContextWindowTokens = Math.max(0, Number(preflight?.hardContextWindowTokens || 0));
+  const preflightUnknownFallback = preflight?.unknownFallbackUsed === true
+    || (normalizedProviderForCapacity !== "openai"
+      && preflight?.contextWindowKnown === false
+      && preflight?.contextWindowProfiled !== true
+      && preflightHardContextWindowTokens <= 0
+      && preflightContextWindowTokens > 0);
+  const exactContextWindow = preflight?.contextWindowExact === true
+    || (!preflightUnknownFallback && preflight?.contextWindowKnown !== false && preflightContextWindowTokens > 0)
+    || (!preflight && limitsContextWindowTokens > 0);
+  const profileContextWindow = preflight?.contextWindowProfiled === true
+    || (!exactContextWindow && normalizedProviderForCapacity === "openai" && !preflightUnknownFallback && Boolean(String(model || "").trim()) && (Boolean(preflight) || limitsContextWindowTokens <= 0));
+  const contextWindowTokens = Math.max(
+    0,
+    preflightHardContextWindowTokens,
+    exactContextWindow ? preflightContextWindowTokens : 0,
+    profileContextWindow ? OPENAI_PROVIDER_PROFILE_CONTEXT_MIN_TOKENS : 0,
+    (!preflight && !preflightUnknownFallback) ? limitsContextWindowTokens : 0
+  );
   const adjustedInputTokens = Math.max(0, Number(preflight?.adjustedEstimatedInputTokens || preflight?.estimatedInputTokens || 0));
-  const contextAvailableTokens = contextWindowTokens > 0
+  const operationalInputLimitTokens = Math.max(0, Number(preflight?.availableInputTokens || preflight?.operationalInputTokenLimitTokens || 0));
+  const contextCapacityKnown = contextWindowTokens > 0;
+  const contextAvailableTokens = contextCapacityKnown
     ? Math.max(0, contextWindowTokens - adjustedInputTokens)
-    : Math.max(0, Number(preflight?.availableInputTokens || 0) - adjustedInputTokens);
-  const contextPreflightCapacityKnown = contextWindowTokens > 0 || Number(preflight?.availableInputTokens || 0) > 0;
+    : Math.max(0, operationalInputLimitTokens - adjustedInputTokens);
+  const contextPreflightCapacityKnown = contextCapacityKnown || operationalInputLimitTokens > 0;
   const constraints = [requestedOutputTokens];
   if (providerOutputLimitTokens > 0) constraints.push(providerOutputLimitTokens);
   if (contextPreflightCapacityKnown) constraints.push(contextAvailableTokens);
@@ -51071,6 +54615,12 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
     insufficientCapacity,
     providerOutputLimitTokens,
     contextWindowTokens,
+    hardContextWindowTokens: contextWindowTokens,
+    hardContextWindowKnown: contextCapacityKnown,
+    contextWindowExact: exactContextWindow,
+    contextWindowProfiled: profileContextWindow,
+    operationalInputLimitTokens,
+    operationalInputTargetTokens: Math.max(0, Number(preflight?.adaptiveTargetInputTokens || preflight?.operationalInputTokenLimitTokens || 0)),
     adjustedInputTokens,
     contextAvailableTokens,
     constrainedBy: maxOutputTokens === providerOutputLimitTokens && providerOutputLimitTokens > 0
@@ -51104,13 +54654,15 @@ function aiDynamicOutputBudgetRetry(outputBudget = null, preflight = null) {
   if (!outputBudget || outputBudget.dynamicRouter !== true) return null;
   const current = Math.max(1, Math.round(Number(outputBudget.maxOutputTokens || 0)));
   const ceiling = Math.max(current, Math.round(Number(outputBudget.outputCeilingTokens || 0)));
-  const contextAvailable = outputBudget.contextWindowTokens > 0
-    ? Math.max(0, Math.round(Number(outputBudget.contextWindowTokens || 0) - Number(preflight?.adjustedEstimatedInputTokens || 0)))
-    : Math.max(0, Math.round(Number(preflight?.availableInputTokens || 0) - Number(preflight?.adjustedEstimatedInputTokens || 0)));
+  const hardContextWindowTokens = Math.max(0, Math.round(Number(outputBudget.hardContextWindowTokens || outputBudget.contextWindowTokens || 0)));
+  const operationalInputLimitTokens = Math.max(0, Math.round(Number(outputBudget.operationalInputLimitTokens || preflight?.availableInputTokens || 0)));
+  const contextAvailable = hardContextWindowTokens > 0
+    ? Math.max(0, hardContextWindowTokens - Number(preflight?.adjustedEstimatedInputTokens || 0))
+    : Math.max(0, operationalInputLimitTokens - Number(preflight?.adjustedEstimatedInputTokens || 0));
   const providerLimit = Math.max(0, Math.round(Number(outputBudget.providerOutputLimitTokens || 0)));
   const bounds = [ceiling];
   if (providerLimit > 0) bounds.push(providerLimit);
-  if (outputBudget.contextWindowTokens > 0 || Number(preflight?.availableInputTokens || 0) > 0) bounds.push(contextAvailable);
+  if (hardContextWindowTokens > 0 || operationalInputLimitTokens > 0) bounds.push(contextAvailable);
   const boundedCeiling = Math.max(0, Math.min(...bounds));
   const headroom = Math.max(3072, Math.round(Number(outputBudget.reasoningHeadroomTokens || 0)));
   const next = Math.min(boundedCeiling, Math.max(current + headroom, Math.ceil(current * 1.25)));
@@ -51187,7 +54739,7 @@ function aiGatewayProviderError(error, provider = "") {
   const normalizedStatus = source.status == null ? null : Number(source.status);
   const normalizedCode = String(source.code || error?.code || "transport").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 120) || "transport";
   const normalizedRetryable = Boolean(source.retryable);
-  const safeMessage = STS_MULTI_PROVIDER.providerError(normalizedProvider || "openai", normalizedStatus, normalizedCode, normalizedRetryable).message;
+  const safeMessage = aiGatewayUserErrorMessage(normalizedProvider || "AI provider", normalizedStatus, normalizedCode, diagnostic || {}, rateLimit);
   return Object.freeze(Object.assign({
     provider: normalizedProvider,
     status: Number.isFinite(normalizedStatus) ? normalizedStatus : null,
@@ -51346,12 +54898,13 @@ function aiProviderFailureSummary(error) {
   if (diagnostics.schemaKeyword) parts.push(`schema ${diagnostics.schemaKeyword}`);
   if (diagnostics.incompleteReason) parts.push(`incomplete ${diagnostics.incompleteReason}`);
   if (diagnostics.preflight) parts.push(`preflight ${diagnostics.preflight.status} (${diagnostics.preflight.estimatedTokens}/${diagnostics.preflight.availableInputTokens} estimated tokens)`);
-  const safeMessage = STS_MULTI_PROVIDER.providerError(
-    error?.providerError?.provider || "openai",
+  const safeMessage = aiGatewayUserErrorMessage(
+    error?.providerError?.provider || "AI provider",
     diagnostics.status,
     diagnostics.code,
-    diagnostics.retryable
-  ).message;
+    diagnostics.providerDiagnostic || {},
+    diagnostics.rateLimit
+  );
   return `${diagnostics.provider} request failed (${parts.join("; ")}). ${safeMessage}`;
 }
 
@@ -51725,6 +55278,7 @@ function aiGatewayAttemptSnapshot(attempt = {}) {
     settled: Boolean(finalization.settled),
     draining: Boolean(finalization.draining || attempt.draining),
     abortRequested: Boolean(finalization.abortRequested),
+    drainWaitMs: Math.max(0, Math.round(Number(finalization.drainWaitMs || 0))),
     elapsedMs: Math.max(0, Math.round(Number(finalization.settledAt || now) - startedAt))
   });
 }
@@ -51749,7 +55303,97 @@ function aiGatewayAttemptTimeoutError(provider, attempt, timeoutMs, settled = fa
   return error;
 }
 
+const AI_GATEWAY_OPENROUTER_INVALID_RESPONSE_SHAPES = new Set([
+  "invalid-json", "invalid-json-content", "empty-body", "non-object", "missing-choices", "empty-choices",
+  "choice-shape", "message-missing", "tool-call-only", "content-missing", "content-empty", "content-array",
+  "content-native-shape", "sse-malformed", "truncated"
+]);
+
+function aiGatewayOpenRouterRecoveryReason({
+  reference = null,
+  normalizedError = null,
+  error = null,
+  attempt = null,
+  responseShape = "",
+  responseStatus = 0,
+  settledAttemptTimeout = false,
+  draining = false,
+  settledGatewayResponse = false
+} = {}) {
+  if (reference?.provider !== "openrouter" || !attempt?.finalization?.settled || draining) return "";
+  const providerDiagnostic = normalizedError?.providerDiagnostic && typeof normalizedError.providerDiagnostic === "object"
+    ? normalizedError.providerDiagnostic
+    : {};
+  const code = String(normalizedError?.code || error?.code || "").trim().toLowerCase();
+  const classification = String(providerDiagnostic.classification || "").trim().toLowerCase();
+  const canonicalType = String(providerDiagnostic.canonicalErrorType || "").trim().toLowerCase();
+  const status = Number(responseStatus || normalizedError?.status || providerDiagnostic.httpStatus || 0);
+  const rateLimitReason = String(
+    normalizedError?.rateLimit?.rateLimitReason
+      || providerDiagnostic.rateLimitReason
+      || error?.rateLimitReason
+      || ""
+  ).trim().toLowerCase();
+  const adapterRetryAttempted = error?.providerRetry?.retryAttempted === true
+    || normalizedError?.providerRetry?.retryAttempted === true;
+  if (adapterRetryAttempted || error?.aiGatewayEmbeddingContract) return "";
+
+  // A free daily quota is a durable account condition, not transient provider
+  // contention. Preserve its provider-wide quota error and do not spend a
+  // same-candidate recovery attempt. Free RPM and paid provider 429s remain
+  // transient and are retried once below.
+  if (rateLimitReason === "free-daily-quota" || canonicalType === "payment_required") return "";
+
+  if (settledAttemptTimeout || (code === "attempt-timeout" && error?.aiGatewayTimeoutSettled === true)) return "settled-timeout";
+
+  // Gateway-level singleton restoration is an explicit transport-shape seam;
+  // it remains eligible even though its consumer-schema diagnostic is marked
+  // `schema`. Other schema/validation failures are contract failures and must
+  // remain terminal after the adapter's own compatibility retry.
+  const contractFailure = [
+    "auth-required", "auth-failed", "missing-credential", "permission-denied", "payment-required", "not-found",
+    "unsupported-schema", "request-validation", "invalid-request", "invalid-prompt", "provider-refusal",
+    "context-length-exceeded", "max-tokens-exceeded", "token-limit-exceeded", "payload-too-large", "content-policy-violation"
+  ].includes(code) || ["auth", "schema", "validation", "refusal", "unsupported-capability", "preflight"].includes(classification);
+  const singletonShapeRecovery = settledGatewayResponse && code === "invalid-response";
+  if (contractFailure && !singletonShapeRecovery) return "";
+
+  const timeoutToken = [code, canonicalType, providerDiagnostic.transport, providerDiagnostic.reason]
+    .filter(Boolean).join(" ").toLowerCase();
+  if (code === "timeout" || canonicalType === "timeout" || /timed?[ _-]?out/.test(timeoutToken)) return "settled-timeout";
+
+  const normalizedShape = String(responseShape || providerDiagnostic.responseShape || "").trim().toLowerCase();
+  const invalidResponse = (code === "invalid-response" || code === "transport" || code === "provider-error")
+    && (status === 200 || settledGatewayResponse || AI_GATEWAY_OPENROUTER_INVALID_RESPONSE_SHAPES.has(normalizedShape));
+  if (invalidResponse) return "settled-invalid-response";
+
+  const transientStatusCode = status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+  const contentionCode = new Set(["transport", "provider-unavailable", "provider-error", "server", "timeout", "rate-limit", "rate-limit-exceeded"]);
+  const contentionClassification = new Set(["transport", "contention", "provider"]);
+  const contentionToken = [code, canonicalType, classification, providerDiagnostic.transport, providerDiagnostic.reason]
+    .filter(Boolean).join(" ").toLowerCase();
+  const explicitlyTransient = normalizedError?.retryable === true
+    || contentionClassification.has(classification)
+    || ["provider_overloaded", "provider_unavailable", "server", "timeout", "rate_limit_exceeded"].includes(canonicalType);
+  const providerContention = explicitlyTransient && (
+    transientStatusCode
+    || (contentionCode.has(code) && (status > 0 || contentionClassification.has(classification)))
+    || /contention|concurrent|overload|capacity|upstream|temporar(?:y|ily)|unavailable|rate[ _-]?limit|timed?[ _-]?out|connection|reset/.test(contentionToken)
+  );
+  if (!providerContention) return "";
+  return "settled-provider-contention";
+}
+
+function aiGatewayOpenRouterRecoveryStatus({ reference = null, attempt = null, normalizedError = null, initialStatus = 0 } = {}) {
+  if (reference?.provider !== "openrouter" || !attempt?.isRecovery) return 0;
+  const currentStatus = Number(normalizedError?.status || normalizedError?.providerDiagnostic?.httpStatus || 0);
+  if (Number.isFinite(currentStatus) && currentStatus > 0) return 0;
+  const originalStatus = Number(initialStatus);
+  return Number.isFinite(originalStatus) && originalStatus > 0 ? Math.round(originalStatus) : 0;
+}
+
 async function aiGatewayRunAttempt(adapter, operationRequest, { plan, attempt, preflight, now, timeoutMs } = {}) {
+  let resolveSettlement;
   const deadline = aiGatewayAttemptDeadlineMs({ attemptDeadlineMs: timeoutMs });
   const finalization = {
     state: "pending",
@@ -51758,7 +55402,10 @@ async function aiGatewayRunAttempt(adapter, operationRequest, { plan, attempt, p
     settled: false,
     draining: false,
     abortRequested: false,
-    settledAt: 0
+    settledAt: 0,
+    timeoutAt: 0,
+    drainWaitMs: 0,
+    settlementPromise: new Promise((resolve) => { resolveSettlement = resolve; })
   };
   attempt.finalization = finalization;
   attempt.deadlineMs = deadline;
@@ -51795,11 +55442,14 @@ async function aiGatewayRunAttempt(adapter, operationRequest, { plan, attempt, p
       settleGraceTimer = null;
     };
     const settle = (state) => {
+      if (finalization.settled) return;
       finalization.settled = true;
       finalization.settledAt = typeof now === "function" ? now() : Date.now();
       finalization.state = state;
       finalization.draining = false;
       attempt.draining = false;
+      if (finalization.timedOut && finalization.timeoutAt > 0) finalization.drainWaitMs = Math.max(0, finalization.settledAt - finalization.timeoutAt);
+      resolveSettlement?.({ state, settledAt: finalization.settledAt });
     };
     const rejectAfterTimeout = (settled) => {
       if (finalization.settled && !settled) return;
@@ -51845,6 +55495,7 @@ async function aiGatewayRunAttempt(adapter, operationRequest, { plan, attempt, p
       finalization.timedOut = true;
       finalization.draining = true;
       finalization.state = "draining";
+      finalization.timeoutAt = typeof now === "function" ? now() : Date.now();
       attempt.timedOut = true;
       attempt.draining = true;
       if (controller) {
@@ -52080,6 +55731,9 @@ class AIModelGateway {
     let lastNormalizedError = null;
     let dynamicRouterRetryUsed = false;
     let dynamicRouterRetryBudget = null;
+    let openRouterRecoveryRetryUsed = false;
+    let openRouterRecoveryRetryPending = false;
+    let openRouterRecoveryRetryBudget = null;
     let attemptOrdinal = 0;
     const dynamicRouterRetryTelemetry = {
       retryEligible: false,
@@ -52092,11 +55746,32 @@ class AIModelGateway {
       finalMaxOutputTokens: 0,
       limiterWaitMs: 0
     };
+    const openRouterRecoveryTelemetry = {
+      profile: "openrouter-settled-recovery-v1",
+      eligible: false,
+      retryAttempted: false,
+      retryOrdinal: 0,
+      maxAttempts: 2,
+      reason: "",
+      initialCode: "",
+      initialStatus: 0,
+      initialClassification: "",
+      initialCanonicalErrorType: "",
+      initialRateLimitReason: "",
+      initialResponseShape: "",
+      initialElapsedMs: 0,
+      transportDrainWaitMs: 0,
+      retryElapsedMs: 0,
+      retryUsage: null,
+      finalOutcome: "not-attempted"
+    };
     for (let index = 0; index < candidates.length; index += 1) {
       const reference = candidates[index];
       if (index > 0) dynamicRouterRetryBudget = null;
+      const recoveryAttempt = openRouterRecoveryRetryPending;
+      openRouterRecoveryRetryPending = false;
       const attemptDeadline = aiGatewayAttemptDeadlineResolution(request, reference);
-      const attempt = { attempt: ++attemptOrdinal, provider: reference.provider, model: reference.model, isFallback: index > 0 || request.fallbackOnly === true, startedAt: this.now(), deadlineSource: attemptDeadline.source };
+      const attempt = { attempt: ++attemptOrdinal, provider: reference.provider, model: reference.model, isFallback: index > 0 || request.fallbackOnly === true, isRecovery: recoveryAttempt, startedAt: this.now(), deadlineSource: attemptDeadline.source };
       const singletonDescription = aiGatewaySingletonDescriptionContract(plan.operation, request);
       const operationRequest = Object.assign({}, request, {
         kind: plan.kind,
@@ -52125,7 +55800,7 @@ class AIModelGateway {
         );
       }
       let preflight = null;
-      let outputBudget = dynamicRouterRetryBudget;
+      let outputBudget = recoveryAttempt ? openRouterRecoveryRetryBudget : dynamicRouterRetryBudget;
       let openWebUIAllocationNeeded = false;
       let openWebUIAllocationPollingHandle = null;
       try {
@@ -52203,7 +55878,7 @@ class AIModelGateway {
             model: reference.model,
             preflight
           });
-          outputBudget = dynamicRouterRetryBudget || derivedOutputBudget;
+          outputBudget = dynamicRouterRetryBudget || (recoveryAttempt ? openRouterRecoveryRetryBudget : derivedOutputBudget);
           if (outputBudget) {
             operationRequest.maxOutputTokens = outputBudget.maxOutputTokens;
             operationRequest.outputBudget = outputBudget;
@@ -52240,17 +55915,60 @@ class AIModelGateway {
           })
           : null;
         operationRequest.onOpenWebUIModelDispatch = () => openWebUIAllocationPollingHandle?.markDispatched?.();
+        // Adapter attempts receive a fresh mutable carrier. Rebuilding this
+        // shallow carrier after preflight preserves the complete immutable
+        // request/schema/cache/reasoning profile for a recovery retry while
+        // avoiding stale abort/finalization fields from the first transport.
+        const attemptRequest = Object.assign({}, operationRequest);
         let adapterResponse;
         try {
-          const runAttempt = () => aiGatewayRunAttempt(adapter, operationRequest, {
-            plan,
-            attempt,
-            preflight,
-            now: () => this.now(),
-            timeoutMs: attemptDeadline.deadlineMs
-          });
+          const runAttempt = async () => {
+            try {
+              return await aiGatewayRunAttempt(adapter, attemptRequest, {
+                plan,
+                attempt,
+                preflight,
+                now: () => this.now(),
+                timeoutMs: attemptDeadline.deadlineMs
+              });
+            } catch (error) {
+              // A non-abortable OpenRouter transport must keep its provider /
+              // model lane occupied until the underlying request settles.
+              // Waiting here also prevents a recovery retry or fallback from
+              // overlapping the first transport.
+              if (reference.provider === "openrouter"
+                && error?.aiGatewayTimeout
+                && attemptRequest._gatewayAttempt?.finalization?.settlementPromise) {
+                await attemptRequest._gatewayAttempt.finalization.settlementPromise;
+                error.aiGatewayTimeoutSettled = Boolean(attemptRequest._gatewayAttempt.finalization.settled);
+                error.aiGatewayDrainWaitMs = Math.max(0, Number(attemptRequest._gatewayAttempt.finalization.drainWaitMs || 0));
+                const value = error.providerError && typeof error.providerError === "object" ? error.providerError : null;
+                if (value) {
+                  const providerDiagnostic = value.providerDiagnostic && typeof value.providerDiagnostic === "object" ? value.providerDiagnostic : {};
+                  error.providerError = Object.assign({}, value, {
+                    retryable: true,
+                    providerDiagnostic: Object.assign({}, providerDiagnostic, {
+                      finalization: "drained",
+                      draining: false,
+                      settled: true,
+                      drainWaitMs: error.aiGatewayDrainWaitMs
+                    })
+                  });
+                  error.providerDiagnostic = error.providerError.providerDiagnostic;
+                }
+              }
+              throw error;
+            }
+          };
           adapterResponse = this.runtime?.runtimeWorkCoordinator
-            ? await this.runtime.runtimeWorkCoordinator.runProviderWork({ provider: reference.provider, model: reference.model, operation: plan.operation, execute: runAttempt })
+            ? await this.runtime.runtimeWorkCoordinator.runProviderWork({
+              provider: reference.provider,
+              model: reference.model,
+              operation: plan.operation,
+              workflowToken: request.workflowToken || null,
+              allowActiveIndex: Boolean(this.runtime.semanticIndexOperationActive),
+              execute: runAttempt
+            })
             : await runAttempt();
         } finally {
           try { openWebUIAllocationPollingHandle?.(); } catch {}
@@ -52259,6 +55977,7 @@ class AIModelGateway {
           ? aiGatewayNormalizeEmbeddingResponse(adapterResponse, reference, Array.isArray(request.texts) ? request.texts.length : 0)
           : typeof adapterResponse === "string" ? { text: adapterResponse } : (adapterResponse || {});
         if (singletonDescription && plan.kind === "generate") response = aiGatewayRestoreSingletonDescription(response, singletonDescription);
+        if (plan.kind === "generate" && plan.operation === "chat-query") response = normalizeChatProviderResponse(response).response;
         const rateLimit = aiGatewayBoundedRateLimit(response?.rateLimit);
         if (preflight && response.queueTelemetry) {
           preflight = Object.freeze(Object.assign({}, preflight, {
@@ -52336,13 +56055,23 @@ class AIModelGateway {
           finishReason: response?.finishReason,
           terminalCode: "ok"
         });
+        if (attempt.isRecovery) {
+          openRouterRecoveryTelemetry.retryElapsedMs = Math.max(0, this.now() - attempt.startedAt);
+          openRouterRecoveryTelemetry.retryUsage = usagePresent ? {
+            inputTokens: Number(usage.inputTokens || 0),
+            outputTokens: Number(usage.outputTokens || 0),
+            reasoningTokens: Number(usage.reasoningTokens || 0),
+            totalTokens: Number(usage.totalTokens || 0)
+          } : null;
+          openRouterRecoveryTelemetry.finalOutcome = "retry-succeeded";
+        }
         try {
           const retryRawOutputs = Array.isArray(response?.providerRetry?.rawOutputs) ? response.providerRetry.rawOutputs : [];
           if (retryRawOutputs.length) {
             for (const retryRaw of retryRawOutputs) hooks.onRawOutput?.(retryRaw);
           } else hooks.onRawOutput?.(raw);
         } catch {}
-        this._emit(events, plan, "provider-response", attempt, { status: "ok", boundary: "provider-response", hashes: rawMetadata, byteCounts: raw == null ? {} : { raw: rawMetadata.rawByteCount }, postDispatchRequestProfile, openWebUIAllocationPolling }, hooks);
+        this._emit(events, plan, "provider-response", attempt, { status: "ok", boundary: "provider-response", hashes: rawMetadata, byteCounts: raw == null ? {} : { raw: rawMetadata.rawByteCount }, postDispatchRequestProfile, openWebUIAllocationPolling, providerDiagnostic: response?.providerDiagnostic }, hooks);
         this._emit(events, plan, "attempt-observation", attempt, { status: "observed", boundary: "gateway-observation", attemptObservation }, hooks);
         try { hooks.onAttemptObservation?.(attemptObservation); } catch {}
         const result = {
@@ -52365,7 +56094,9 @@ class AIModelGateway {
           actualModel: String(response?.actualModel || response?.model || reference.model),
           dynamicRouter: Boolean(response?.dynamicRouter),
           dynamicRouterRetry: Object.freeze(Object.assign({}, dynamicRouterRetryTelemetry)),
+          openRouterRecoveryRetry: Object.freeze(Object.assign({}, openRouterRecoveryTelemetry)),
           providerRetry: response?.providerRetry || undefined,
+          providerDiagnostic: response?.providerDiagnostic || undefined,
           providerModelTelemetry,
           singletonDescriptionTelemetry: response?.singletonDescriptionTelemetry || undefined,
           ...(usagePresent ? { usage } : {}),
@@ -52430,7 +56161,7 @@ class AIModelGateway {
             } : null
           }));
         } catch {}
-        this._emit(events, plan, "completed", attempt, { status: "completed", boundary: "gateway", deadlineMs: attemptDeadline.deadlineMs, deadlineSource: attemptDeadline.source, openWebUIAllocationPolling: openWebUIAllocationPollingHandle?.snapshot?.() || openWebUIAllocationPolling }, hooks);
+        this._emit(events, plan, "completed", attempt, { status: "completed", boundary: "gateway", deadlineMs: attemptDeadline.deadlineMs, deadlineSource: attemptDeadline.source, openWebUIAllocationPolling: openWebUIAllocationPollingHandle?.snapshot?.() || openWebUIAllocationPolling, openRouterRecoveryRetry: Object.freeze(Object.assign({}, openRouterRecoveryTelemetry)) }, hooks);
         result.events = events.slice();
         return result;
       } catch (error) {
@@ -52458,7 +56189,19 @@ class AIModelGateway {
           );
         const settledAttemptTimeout = Boolean(error?.aiGatewayTimeout && error?.aiGatewayTimeoutSettled);
         const draining = Boolean((error?.aiGatewayTimeout && !settledAttemptTimeout) || adapterDraining || baseError.providerDiagnostic?.draining);
+        const recoveredOriginalHttpStatus = aiGatewayOpenRouterRecoveryStatus({
+          reference,
+          attempt,
+          normalizedError: baseError,
+          initialStatus: openRouterRecoveryTelemetry.initialStatus
+        });
         const normalizedError = Object.freeze(Object.assign({}, baseError,
+          recoveredOriginalHttpStatus > 0 ? {
+            status: recoveredOriginalHttpStatus,
+            providerDiagnostic: Object.freeze(Object.assign({}, baseError.providerDiagnostic || {}, {
+              httpStatus: recoveredOriginalHttpStatus
+            }))
+          } : {},
           gatewayOpenRouterRetryable && !draining && plan.fallbackEnabled ? { retryable: true } : {},
           draining ? {
             retryable: false,
@@ -52535,12 +56278,58 @@ class AIModelGateway {
           finishReason: normalizedError.providerDiagnostic?.finishReason,
           terminalCode: normalizedError.code
         });
-        const dynamicRouterTerminal = normalizedError.code === "output-truncated"
+      const dynamicRouterTerminal = normalizedError.code === "output-truncated"
           || (normalizedError.code === "invalid-response" && openRouterResponseShape === "content-missing");
         dynamicRouterRetryTelemetry.limiterWaitMs = Math.max(
           dynamicRouterRetryTelemetry.limiterWaitMs,
           Math.max(0, Number(error?.rateLimit?.waitMs || error?.providerError?.rateLimit?.waitMs || normalizedError.rateLimit?.waitMs || 0))
         );
+        const openRouterResponseStatus = Math.max(0, Number(normalizedError.status || normalizedError.providerDiagnostic?.httpStatus || 0));
+        const settledGatewayResponse = attempt.finalization?.settled === true
+          && !adapterDraining
+          && !baseError.providerDiagnostic?.draining
+          && ["singleton-description-item", "singleton-description-envelope"].includes(openRouterResponseShape);
+        const adapterRetryAttempted = error?.providerRetry?.retryAttempted === true
+          || baseError.providerRetry?.retryAttempted === true;
+        const dynamicRetryAttempted = error?.dynamicRouterRetry?.retryAttempted === true
+          || dynamicRouterRetryTelemetry.retryAttempted === true;
+        const openRouterRecoveryReason = !openRouterRecoveryRetryUsed
+          && !adapterRetryAttempted
+          && !dynamicRetryAttempted
+          ? aiGatewayOpenRouterRecoveryReason({
+            reference,
+            normalizedError,
+            error,
+            attempt,
+            responseShape: openRouterResponseShape,
+            responseStatus: openRouterResponseStatus,
+            settledAttemptTimeout,
+            draining,
+            settledGatewayResponse
+          })
+          : "";
+        const openRouterRecoveryEligible = Boolean(openRouterRecoveryReason)
+          && index === 0
+          && !attempt.isFallback;
+        if (openRouterRecoveryEligible) {
+          openRouterRecoveryTelemetry.eligible = true;
+          openRouterRecoveryTelemetry.retryAttempted = true;
+          openRouterRecoveryTelemetry.retryOrdinal = 1;
+          openRouterRecoveryTelemetry.reason = openRouterRecoveryReason;
+          openRouterRecoveryTelemetry.initialCode = normalizedError.code;
+          openRouterRecoveryTelemetry.initialStatus = openRouterResponseStatus;
+          openRouterRecoveryTelemetry.initialClassification = String(normalizedError.providerDiagnostic?.classification || "").slice(0, 48);
+          openRouterRecoveryTelemetry.initialCanonicalErrorType = String(normalizedError.providerDiagnostic?.canonicalErrorType || "").slice(0, 64);
+          openRouterRecoveryTelemetry.initialRateLimitReason = String(normalizedError.rateLimit?.rateLimitReason || normalizedError.providerDiagnostic?.rateLimitReason || "").slice(0, 48);
+          openRouterRecoveryTelemetry.initialResponseShape = String(openRouterResponseShape || "").slice(0, 64);
+          openRouterRecoveryTelemetry.initialElapsedMs = Math.max(0, this.now() - attempt.startedAt);
+          openRouterRecoveryTelemetry.transportDrainWaitMs = Math.max(0, Number(error?.aiGatewayDrainWaitMs || normalizedError.providerDiagnostic?.drainWaitMs || 0));
+          openRouterRecoveryRetryUsed = true;
+          openRouterRecoveryRetryPending = true;
+          openRouterRecoveryRetryBudget = outputBudget;
+        } else if (attempt.isRecovery) {
+          openRouterRecoveryTelemetry.finalOutcome = "retry-failed";
+        }
         const dynamicRetryEligible = !dynamicRouterRetryUsed
           && !attempt.isFallback
           && aiGatewayDynamicRouterReference(this.settings(), reference)
@@ -52571,7 +56360,7 @@ class AIModelGateway {
         }));
         lastNormalizedError = normalizedError;
         attempts.push({ attempt: attempt.attempt, provider: reference.provider, model: reference.model, isFallback: attempt.isFallback, status: "failed", code: normalizedError.code, retryable: normalizedError.retryable, finalization: aiGatewayAttemptSnapshot(attempt) });
-        this._emit(events, plan, "attempt-observation", attempt, { status: "observed", boundary: "gateway-observation", attemptObservation: error.attemptObservation }, hooks);
+        this._emit(events, plan, "attempt-observation", attempt, { status: "observed", boundary: "gateway-observation", attemptObservation: error.attemptObservation, openRouterRecoveryRetry: Object.freeze(Object.assign({}, openRouterRecoveryTelemetry)) }, hooks);
         try { hooks.onAttemptObservation?.(error.attemptObservation); } catch {}
         this._emit(events, plan, "attempt-failed", attempt, {
           status: "failed",
@@ -52587,9 +56376,26 @@ class AIModelGateway {
           postDispatchRequestProfile: error.postDispatchRequestProfile,
           attemptObservation: error.attemptObservation,
           dynamicRouterRetry: error.dynamicRouterRetry,
+          openRouterRecoveryRetry: Object.freeze(Object.assign({}, openRouterRecoveryTelemetry)),
           deadlineMs: attemptDeadline.deadlineMs,
           deadlineSource: attemptDeadline.source
         }, hooks);
+        if (openRouterRecoveryEligible) {
+          this._emit(events, plan, "recovery-decision", attempt, {
+            status: "selected",
+            boundary: "openrouter-recovery",
+            code: openRouterRecoveryTelemetry.reason,
+            retryable: true,
+            retryEligible: true,
+            retryAttempted: true,
+            retryOrdinal: 1,
+            openRouterRecoveryRetry: Object.freeze(Object.assign({}, openRouterRecoveryTelemetry))
+          }, hooks);
+          // Re-enter the same fixed provider/model candidate after the first
+          // transport has settled. This is a recovery attempt, not fallback.
+          index -= 1;
+          continue;
+        }
         if (dynamicRetryEligible && dynamicRouterRetryBudget) {
           this._emit(events, plan, "fallback-decision", attempt, {
             status: "selected",
@@ -52615,6 +56421,7 @@ class AIModelGateway {
     }
     const error = lastError || new Error("AI provider request failed.");
     error.providerError = lastNormalizedError || aiGatewayProviderError(error, plan.primary?.provider);
+    error.openRouterRecoveryRetry = Object.freeze(Object.assign({}, openRouterRecoveryTelemetry));
     error.aiGatewayPlan = plan;
     error.aiGatewayEvents = events.slice();
     throw error;
@@ -52635,6 +56442,8 @@ if (typeof module !== "undefined" && module.exports) {
     executeAiOperation: (gateway, request) => gateway.execute(request),
     selectAiModelReferences,
     aiGatewayProviderError,
+    aiGatewayUserErrorMessage,
+    aiGatewayCanonicalErrorType,
     aiGatewaySanitizeProviderDiagnostic,
     aiGatewayDiagnosticRoot,
     aiGatewaySha256,
@@ -52655,6 +56464,8 @@ if (typeof module !== "undefined" && module.exports) {
     geminiStructuredSchemaFieldRejected,
     geminiStructuredSchemaRetryEligible,
     chatResponseSchema,
+    normalizeChatEvidencePayloadForValidation,
+    normalizeChatProviderResponse,
     validateChatEvidencePayload,
     chatSourceLedger,
     buildChatProviderContextProjection,
@@ -52763,6 +56574,100 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
   stsMpPluginPrototype.openWebUIAuthStatus = function() {
     const auth = STS_MULTI_PROVIDER.openWebUIAuth(this.settings, { requestUrl: typeof requestUrl === "function" ? requestUrl : null });
     return { baseUrl: auth.state.baseUrl, authMode: auth.state.authMode, authIdentityHash: auth.state.identityHash, authenticated: auth.isAuthenticated(), expiresAt: auth.state.expiresAt };
+  };
+
+  stsMpPluginPrototype.postOpenWebUICapabilityObservationMessage = async function(record = {}) {
+    const model = STS_MULTI_PROVIDER.normalizeModel("openwebui", record.model || "");
+    if (!model) return false;
+    const operation = STS_MULTI_PROVIDER.openWebUIAdaptiveOperation(record.operation || "");
+    const operationLabel = ({
+      "chat-query": "Chat",
+      "task-description": "Task descriptions",
+      "task-generation": "Task generation"
+    })[operation] || operation;
+    const carrierLabel = ({
+      "direct-schema": "Native JSON Schema",
+      "direct-json": "JSON mode",
+      "wrapper-json": "Wrapped JSON"
+    })[record.preferredCarrier || record.successfulCarrier] || "Provider carrier";
+    const message = `Saved OpenWebUI profile · ${model} · ${operationLabel} · ${carrierLabel}.`;
+    try {
+      if (!this.app?.workspace?.getLeavesOfType) return false;
+      await this.openSidebar();
+      const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+      if (!view || typeof view.addMessage !== "function") return false;
+      view.addMessage("assistant", message);
+      return true;
+    } catch (error) {
+      try { this.logLocal?.("OpenWebUI profile chat message skipped", { error: error?.message || String(error) }); } catch {}
+      return false;
+    }
+  };
+
+  stsMpPluginPrototype.deleteOpenWebUICapabilityProfile = async function(profile = {}, operationOverride = "") {
+    const input = typeof profile === "string" ? { model: profile, operation: operationOverride } : profile || {};
+    const keyParts = String(input.key || "").split("|");
+    const model = STS_MULTI_PROVIDER.normalizeModel("openwebui", input.model || keyParts[1] || "");
+    const operation = STS_MULTI_PROVIDER.openWebUIAdaptiveOperation(input.operation || keyParts[2] || "");
+    if (!model || !operation || typeof STS_MULTI_PROVIDER.openWebUIDeleteSingletonDescriptionCapability !== "function") return false;
+    const changed = STS_MULTI_PROVIDER.openWebUIDeleteSingletonDescriptionCapability(model, operation, this.settings);
+    if (!changed) return false;
+    const persist = async () => this.saveSettings({
+      skipTaskReferenceSnapshot: true,
+      writeKind: "provider-derived-metadata",
+      provider: "openwebui",
+      changedKeys: ["openwebuiModelMetadata"]
+    });
+    const pending = Promise.resolve(this._openWebUICapabilityPersistence).catch(() => null).then(persist);
+    this._openWebUICapabilityPersistence = pending;
+    try {
+      await pending;
+    } finally {
+      if (this._openWebUICapabilityPersistence === pending) this._openWebUICapabilityPersistence = null;
+    }
+    return true;
+  };
+
+  stsMpPluginPrototype.recordOpenWebUICapabilityObservation = async function(observation = {}) {
+    if (!observation || typeof observation !== "object") return false;
+    const model = STS_MULTI_PROVIDER.normalizeModel("openwebui", observation.model || "");
+    const operation = String(observation.operation || "").trim().toLowerCase();
+    const carrier = String(observation.successfulCarrier || observation.preferredCarrier || "").trim();
+    const adaptiveConcurrencyLimit = Number(observation.adaptiveConcurrencyLimit ?? observation.effectiveConcurrencyLimit);
+    const adaptiveObservation = Number.isSafeInteger(adaptiveConcurrencyLimit)
+      && adaptiveConcurrencyLimit >= 1
+      && adaptiveConcurrencyLimit <= 4;
+    if (!model || !operation || (!adaptiveObservation && !["direct-schema", "direct-json", "wrapper-json"].includes(carrier))) return false;
+    const before = JSON.stringify(this.settings?.openwebuiModelMetadata?.[model]?.structuredCapabilityProfiles || {});
+    const record = STS_MULTI_PROVIDER.openWebUIRecordSingletonDescriptionCapability(model, Object.assign({}, observation, {
+      provider: "openwebui",
+      operation,
+      ...(carrier ? { successfulCarrier: carrier } : {}),
+      settings: this.settings
+    }));
+    if (!record) return false;
+    const changed = before !== JSON.stringify(this.settings?.openwebuiModelMetadata?.[model]?.structuredCapabilityProfiles || {});
+    if (changed) {
+      let persisted = false;
+      const persist = async () => {
+        try {
+          await this.saveSettings({
+            skipTaskReferenceSnapshot: true,
+            writeKind: "provider-derived-metadata",
+            provider: "openwebui",
+            changedKeys: ["openwebuiModelMetadata"]
+          });
+          persisted = true;
+        } catch {}
+      };
+      const pending = Promise.resolve(this._openWebUICapabilityPersistence).catch(() => null).then(persist);
+      this._openWebUICapabilityPersistence = pending;
+      try { await pending; } finally {
+        if (this._openWebUICapabilityPersistence === pending) this._openWebUICapabilityPersistence = null;
+      }
+      if (persisted) await this.postOpenWebUICapabilityObservationMessage(record);
+    }
+    return changed;
   };
 
 }
@@ -52901,7 +56806,8 @@ function stsCreateRuntimeAiModelGateway(plugin) {
             outputBudget: request.outputBudget,
             preflight: adapterContext.preflight,
             attemptDeadlineMs: request.attemptDeadlineMs,
-            attemptDeadlineSource: request.attemptDeadlineSource
+            attemptDeadlineSource: request.attemptDeadlineSource,
+            onOpenWebUICapabilityObserved: request.onOpenWebUICapabilityObserved
           }, requestOptions).then((response) => {
             if (!request._gatewayAttempt?.timedOut && response?.usage && typeof plugin.recordAiTokenUsage === "function") plugin.recordAiTokenUsage(request.operation, response.model || request.model, response.usage, "openwebui");
             return response;
@@ -52999,9 +56905,18 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
   };
   gatewayPrototype.applyOpenWebUIDiscovery = async function(models = {}, options = {}) {
     const fetchedAt = String(options.fetchedAt || deviceTimestamp());
+    const previousMetadata = this.settings.openwebuiModelMetadata || {};
+    const nextMetadata = models.metadata && typeof models.metadata === "object" ? models.metadata : {};
+    for (const [modelId, row] of Object.entries(nextMetadata)) {
+      const priorRow = previousMetadata?.[modelId]
+        || Object.entries(previousMetadata).find(([candidate]) => STS_MULTI_PROVIDER.modelIdentity("openwebui", candidate) === STS_MULTI_PROVIDER.modelIdentity("openwebui", modelId))?.[1];
+      const priorProfiles = priorRow?.structuredCapabilityProfiles;
+      if (!priorProfiles || !row || typeof row !== "object" || Array.isArray(row)) continue;
+      nextMetadata[modelId] = Object.assign({}, row, { structuredCapabilityProfiles: priorProfiles });
+    }
     this.settings.availableOpenWebUIModels = models.chat || [];
     this.settings.availableOpenWebUIEmbeddingModels = models.embeddings || [];
-    this.settings.openwebuiModelMetadata = models.metadata || {};
+    this.settings.openwebuiModelMetadata = nextMetadata;
     this.openWebUIContextTelemetry = models.contextTelemetry || null;
     this.settings.openwebuiModelsFetchedAt = fetchedAt;
     const repaired = STS_MULTI_PROVIDER.repairGenerationModelReferences(this.settings, "openwebui");
@@ -53459,8 +57374,15 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
         promptCacheKey: input.promptCacheKey || "",
         sessionId: input.workflowSessionId || ""
       },
+      onOpenWebUICapabilityObserved: (observation) => {
+        try { return this.recordOpenWebUICapabilityObservation?.(observation); } catch { return false; }
+      },
       hooks
     }));
+    try {
+      const observation = input.onGatewayResult?.(result);
+      if (observation && typeof observation.then === "function") observation.catch(() => {});
+    } catch {}
     this.lastAiResponseModel = `${result.provider}:${result.actualModel || result.model}`;
     this.lastAiResponseProfile = Object.freeze({
       provider: result.provider,
@@ -53480,7 +57402,11 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
   gatewayPrototype.refreshOpenAIModels = async function(showNotice = true) {
     const previousEmbeddingIdentity = embeddingIdentity(this.settings);
     let openRouterMetadataChanged = false;
+    const derivedChangedKeys = [];
     const roleRepairByProvider = {};
+    const previousRoleRepairProviders = this.providerModelRoleRepairTelemetry?.providers && typeof this.providerModelRoleRepairTelemetry.providers === "object"
+      ? this.providerModelRoleRepairTelemetry.providers
+      : {};
     const repairDiscoveredProvider = (provider) => {
       const repaired = STS_MULTI_PROVIDER.repairGenerationModelReferences(this.settings, provider);
       if (repaired.changed) Object.assign(this.settings, repaired.settings);
@@ -53493,32 +57419,62 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     if (this.settings.openrouterApiKey) providers.add("openrouter");
     if (this.settings.openwebuiBaseUrl) providers.add("openwebui");
     if (!providers.size) throw new Error("Add an OpenAI, Google Gemini, OpenRouter, or Open WebUI credential first.");
+    const orderedProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.filter((provider) => providers.has(provider));
     const loaded = { openai: 0, gemini: 0, openrouter: 0, openwebui: 0 };
-    for (const provider of providers) {
-      const result = await this.aiModelGateway().execute({ kind: "discover", operation: "model-discovery", primaryOverride: { provider, model: provider === "openwebui" ? (this.settings.availableOpenWebUIModels?.[0] || "") : (STS_MULTI_PROVIDER.providerDefaultModel(provider, "primary") || (provider === "gemini" ? this.settings.availableGeminiModels?.[0] : provider === "openrouter" ? this.settings.availableOpenRouterModels?.[0] : this.settings.availableChatModels?.[0]) || this.settings.chatModel) }, fallbackPolicy: "disabled" });
-      const models = result.models || result;
-      if (provider === "openai") { this.settings.availableChatModels = models.chat || []; this.settings.availableEmbeddingModels = models.embeddings || []; this.settings.openaiModelMetadata = models.metadata || {}; this.settings.modelsFetchedAt = deviceTimestamp(); repairDiscoveredProvider(provider); }
-      if (provider === "gemini") { this.settings.availableGeminiModels = models.chat?.length ? models.chat : DEFAULT_SETTINGS.availableGeminiModels; this.settings.availableGeminiEmbeddingModels = models.embeddings?.length ? models.embeddings : DEFAULT_SETTINGS.availableGeminiEmbeddingModels; this.settings.geminiModelMetadata = models.metadata || {}; this.settings.geminiModelsFetchedAt = deviceTimestamp(); repairDiscoveredProvider(provider); }
-      if (provider === "openrouter") {
-        const previousFingerprint = String(this.settings.openrouterMetadataFingerprint || "");
-        const nextFingerprint = String(models.metadataFingerprint || "").slice(0, 80);
-        openRouterMetadataChanged = Boolean(nextFingerprint && nextFingerprint !== previousFingerprint);
-        this.settings.availableOpenRouterModels = models.chat || [];
-        this.settings.availableOpenRouterEmbeddingModels = models.embeddings || [];
-        this.settings.openrouterModelMetadata = models.metadata || {};
-        this.settings.openrouterEmbeddingModelMetadata = models.embeddingMetadata || {};
-        this.settings.openrouterModelsFetchedAt = models.fetchedAt || deviceTimestamp();
-        this.settings.openrouterMetadataFingerprint = nextFingerprint;
-        if (openRouterMetadataChanged) this.settings.openrouterMetadataRevision = Math.min(1e9, Math.max(0, Math.round(Number(this.settings.openrouterMetadataRevision || 0))) + 1);
-        repairDiscoveredProvider(provider);
+    const successfulProviders = [];
+    const providerFailures = [];
+    const normalizedFailure = (provider, error) => {
+      const rawCode = error?.providerError?.code || error?.code || error?.providerDiagnostic?.code || "transport";
+      const code = String(rawCode).replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80) || "transport";
+      return Object.freeze({ provider, code });
+    };
+    for (const provider of orderedProviders) {
+      try {
+        const result = await this.aiModelGateway().execute({ kind: "discover", operation: "model-discovery", primaryOverride: { provider }, fallbackPolicy: "disabled" });
+        const models = result.models || result;
+        const chat = Array.isArray(models.chat) ? models.chat : [];
+        const embeddings = Array.isArray(models.embeddings) ? models.embeddings : [];
+        if (provider === "openai") {
+          this.settings.availableChatModels = chat;
+          this.settings.availableEmbeddingModels = embeddings;
+          this.settings.openaiModelMetadata = models.metadata || {};
+          this.settings.modelsFetchedAt = deviceTimestamp();
+          repairDiscoveredProvider(provider);
+        }
+        if (provider === "gemini") {
+          this.settings.availableGeminiModels = chat.length ? chat : DEFAULT_SETTINGS.availableGeminiModels;
+          this.settings.availableGeminiEmbeddingModels = embeddings.length ? embeddings : DEFAULT_SETTINGS.availableGeminiEmbeddingModels;
+          this.settings.geminiModelMetadata = models.metadata || {};
+          this.settings.geminiModelsFetchedAt = deviceTimestamp();
+          repairDiscoveredProvider(provider);
+        }
+        if (provider === "openrouter") {
+          const previousFingerprint = String(this.settings.openrouterMetadataFingerprint || "");
+          const nextFingerprint = String(models.metadataFingerprint || "").slice(0, 80);
+          openRouterMetadataChanged = openRouterMetadataChanged || Boolean(nextFingerprint && nextFingerprint !== previousFingerprint);
+          this.settings.availableOpenRouterModels = chat;
+          this.settings.availableOpenRouterEmbeddingModels = embeddings;
+          this.settings.openrouterModelMetadata = models.metadata || {};
+          this.settings.openrouterEmbeddingModelMetadata = models.embeddingMetadata || {};
+          this.settings.openrouterModelsFetchedAt = models.fetchedAt || deviceTimestamp();
+          this.settings.openrouterMetadataFingerprint = nextFingerprint;
+          if (nextFingerprint && nextFingerprint !== previousFingerprint) this.settings.openrouterMetadataRevision = Math.min(1e9, Math.max(0, Math.round(Number(this.settings.openrouterMetadataRevision || 0))) + 1);
+          derivedChangedKeys.push("availableOpenRouterModels", "availableOpenRouterEmbeddingModels", "openrouterModelMetadata", "openrouterEmbeddingModelMetadata", "openrouterModelsFetchedAt", "openrouterMetadataFingerprint", "openrouterMetadataRevision");
+          repairDiscoveredProvider(provider);
+        }
+        if (provider === "openwebui") {
+          await this.applyOpenWebUIDiscovery(models, { persist: false, configuredModelCount: openWebUIConfiguredContextModelIds(this.settings).length });
+          roleRepairByProvider[provider] = this.providerModelRoleRepairTelemetry || null;
+        }
+        loaded[provider] = chat.length + embeddings.length;
+        successfulProviders.push(provider);
+      } catch (error) {
+        providerFailures.push(normalizedFailure(provider, error));
       }
-      if (provider === "openwebui") {
-        await this.applyOpenWebUIDiscovery(models, { persist: false, configuredModelCount: openWebUIConfiguredContextModelIds(this.settings).length });
-        roleRepairByProvider[provider] = this.providerModelRoleRepairTelemetry || null;
-      }
-      loaded[provider] = (models.chat || []).length + (models.embeddings || []).length;
     }
-    const roleRepairEntries = Object.entries(roleRepairByProvider);
+    const roleRepairEntries = orderedProviders
+      .map((provider) => [provider, roleRepairByProvider[provider] || previousRoleRepairProviders[provider]])
+      .filter(([, diagnostics]) => diagnostics);
     this.providerModelRoleRepairTelemetry = Object.freeze({
       providers: Object.freeze(Object.fromEntries(roleRepairEntries)),
       changed: roleRepairEntries.some(([, diagnostics]) => diagnostics?.changed === true),
@@ -53526,17 +57482,45 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
       omittedFallbackCount: roleRepairEntries.reduce((count, [, diagnostics]) => count + (diagnostics?.omittedFallbacks?.length || 0), 0),
       unresolvedCount: roleRepairEntries.reduce((count, [, diagnostics]) => count + (diagnostics?.unresolved?.length || 0), 0)
     });
-    await this.saveSettings();
+    const failedSummary = providerFailures.map(({ provider, code }) => `${STS_MULTI_PROVIDER.providerDisplayName(provider)} (${code})`).join(", ");
+    const refreshResult = Object.freeze({
+      schemaVersion: "provider-discovery-refresh/v1",
+      status: successfulProviders.length === 0 ? "all-failed" : providerFailures.length ? "partial-failure" : "succeeded",
+      ok: successfulProviders.length > 0,
+      partialFailure: providerFailures.length > 0 && successfulProviders.length > 0,
+      allFailed: successfulProviders.length === 0,
+      attemptedProviders: Object.freeze(orderedProviders.slice()),
+      successfulProviders: Object.freeze(successfulProviders.slice()),
+      failedProviders: Object.freeze(providerFailures.map(({ provider }) => provider)),
+      providerFailures: Object.freeze(providerFailures.slice()),
+      loaded: Object.freeze(Object.assign({}, loaded)),
+      summary: providerFailures.length ? `Some provider model lists could not be refreshed: ${failedSummary}.` : ""
+    });
+    this.modelCatalogRefreshResult = refreshResult;
+    if (!successfulProviders.length) {
+      const aggregateError = new Error("No configured AI provider model list could be refreshed.");
+      aggregateError.name = "ProviderDiscoveryAggregateError";
+      aggregateError.code = "provider-discovery-all-failed";
+      aggregateError.providerFailures = refreshResult.providerFailures;
+      aggregateError.discoveryResult = refreshResult;
+      throw aggregateError;
+    }
+    await this.saveSettings(derivedChangedKeys.length ? { changedKeys: Array.from(new Set(derivedChangedKeys)) } : {});
     if (openRouterMetadataChanged) invalidateOpenRouterMetadataCaches(this);
     if (embeddingIdentity(this.settings) !== previousEmbeddingIdentity) this.queryEmbeddingCache?.clear?.();
     stsMpRefreshSearchableComboboxes();
-    if (showNotice) new Notice(`Loaded ${loaded.openai} OpenAI, ${loaded.gemini} Gemini, ${loaded.openrouter} OpenRouter, and ${loaded.openwebui} Open WebUI models.`);
+    if (showNotice) {
+      const loadedSummary = `Loaded ${loaded.openai} OpenAI, ${loaded.gemini} Gemini, ${loaded.openrouter} OpenRouter, and ${loaded.openwebui} Open WebUI models.`;
+      new Notice(providerFailures.length ? `${loadedSummary} ${refreshResult.summary}` : loadedSummary);
+    }
+    return refreshResult;
   };
   gatewayPrototype.validateAiSetup = async function(showNotice = true) {
     this.aiModelGateway().assertAccess("");
     await this.aiModelGateway().execute({ kind: "setup-check", operation: "setup-check", fallbackPolicy: "disabled" });
-    await this.refreshOpenAIModels(false);
-    if (showNotice) new Notice("AI provider connected and model list refreshed.");
+    const refreshResult = await this.refreshOpenAIModels(false);
+    if (showNotice) new Notice(refreshResult?.partialFailure ? `AI access connected, but ${refreshResult.summary}` : "AI provider connected and model list refreshed.");
+    return refreshResult;
   };
 }
 
@@ -54549,6 +58533,91 @@ function stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin) {
     textSetting(details, "Open WebUI custom header (optional)", "Use a validated custom header instead of Authorization Bearer in API-key mode.", plugin, "openwebuiCustomHeader");
   }
   return details;
+}
+
+function stsMpOpenWebUILearnedProfileRows(settings = {}) {
+  const rows = [];
+  const seen = new Set();
+  const operationLabels = {
+    "chat-query": "Chat",
+    "task-description": "Task descriptions",
+    "task-generation": "Task generation"
+  };
+  const carrierLabels = {
+    "direct-schema": "Native JSON Schema",
+    "direct-json": "JSON mode",
+    "wrapper-json": "Wrapped JSON"
+  };
+  for (const [metadataModel, metadata] of Object.entries(settings.openwebuiModelMetadata || {}).slice(0, 128)) {
+    const value = metadata?.structuredCapabilityProfiles;
+    const profiles = Array.isArray(value) ? value : Array.isArray(value?.records) ? value.records : [];
+    for (const profile of profiles) {
+      if (!profile || typeof profile !== "object" || Array.isArray(profile)) continue;
+      const model = STS_MULTI_PROVIDER.normalizeModel("openwebui", profile.model || metadataModel);
+      const operation = STS_MULTI_PROVIDER.openWebUIAdaptiveOperation(profile.operation || "");
+      const key = ["openwebui", model, operation].join("|");
+      if (!model || !operation || seen.has(key)) continue;
+      seen.add(key);
+      const carrier = profile.preferredCarrier || profile.successfulCarrier || "";
+      const concurrency = Number(profile.adaptiveConcurrencyLimit);
+      const concurrencyText = Number.isSafeInteger(concurrency) && concurrency >= 1 && concurrency <= 4
+        ? `Concurrency ${concurrency}`
+        : "Concurrency not learned";
+      rows.push({
+        key,
+        provider: "openwebui",
+        providerLabel: "Self-Hosted OpenWebUI",
+        model,
+        operation,
+        operationLabel: operationLabels[operation] || operation,
+        carrier,
+        carrierLabel: carrierLabels[carrier] || "Provider carrier",
+        concurrencyLimit: Number.isSafeInteger(concurrency) && concurrency >= 1 && concurrency <= 4 ? concurrency : 0,
+        behavior: `${carrierLabels[carrier] || "Provider carrier"} · ${concurrencyText}`
+      });
+    }
+  }
+  return rows.sort((left, right) => left.model.localeCompare(right.model) || left.operation.localeCompare(right.operation));
+}
+
+function stsMpRenderOpenWebUILearnedProfiles(containerEl, plugin, refreshDisplay = null) {
+  settingsHeading(containerEl, "Learned model profiles", "Durable content-free carrier and concurrency observations saved for exact provider/model and operation records.");
+  const list = containerEl.createDiv({
+    cls: "semantic-todoist-openwebui-learned-profiles",
+    attr: { "aria-label": "Learned OpenWebUI profiles" }
+  });
+  const rows = stsMpOpenWebUILearnedProfileRows(plugin.settings || {});
+  if (!rows.length) {
+    list.createDiv({ cls: "semantic-todoist-openwebui-learned-profiles-empty", text: "No saved model profiles yet." });
+    return list;
+  }
+  for (const row of rows) {
+    const setting = new Setting(list)
+      .setName(`${row.providerLabel} · ${row.model}`)
+      .setDesc(`${row.operationLabel} · ${row.behavior}`);
+    setting.settingEl.addClass("semantic-todoist-openwebui-learned-profile-row");
+    setting.settingEl.setAttribute("data-profile-key", row.key);
+    setting.addButton((button) => {
+      button.setButtonText("Delete").setWarning();
+      button.buttonEl?.setAttribute("aria-label", `Delete learned OpenWebUI profile ${row.model} ${row.operationLabel}`);
+      button.onClick(async () => {
+        button.setDisabled(true);
+        try {
+          const deleted = await plugin.deleteOpenWebUICapabilityProfile(row);
+          if (deleted) {
+            new Notice("OpenWebUI profile deleted.");
+            if (typeof refreshDisplay === "function") await refreshDisplay();
+          } else {
+            button.setDisabled(false);
+          }
+        } catch (error) {
+          button.setDisabled(false);
+          new Notice(`Could not delete OpenWebUI profile: ${error?.message || error}`);
+        }
+      });
+    });
+  }
+  return list;
 }
 
 function stsMpRenderProviderAccessSettings(containerEl, plugin, refreshDisplay = null) {

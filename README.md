@@ -115,25 +115,24 @@ only when you choose `Apply`, and the last applied schedule can be undone.
 
 ## Model validation snapshot
 
-This final two-note comparison gave every model the same evidence bundles.
-Scores are Sol/high judgments of evidence accuracy and actionability, not
-provider claims. No private note details are included.
+This final model comparison gave every model the same evidence bundles.
+Scores are GPT 5.6 Sol/high judgments of evidence accuracy and actionability, not
+provider claims.
 
-| Provider/model | Quality /100 | Passed | Avg input | Avg time | What we saw |
+| Provider/model | Quality /100 | Passed | Avg input (Tokens) | Avg time | What we saw |
 |---|---:|---:|---:|---:|---|
 | OpenAI GPT-5.6 Luna high | 95 | 6/6 | ~24.3K | ~42s | Most complete, precise, and grounded; final-evidence chat completed in one call. |
 | Gemini 3.5 Flash Lite high | 92 | 6/6 | ~24.5K | ~27s | Close quality and the fastest cloud option; occasionally broader than needed. |
 | OpenWebUI Qwen3.5 9B HF | 88 | 6/6 | ~26.5K | ~260s | Strongest local interpretation and broad historical/action coverage; slowest local option. |
-| OpenWebUI `gemma4:e4b` thinking | 82 | 6/6 | ~26.5K | ~93s | Reliable and concise after its learned JSON-mode profile, but omitted some useful July 6 threads. |
+| OpenWebUI `gemma4:e4b` thinking | 82 | 6/6 | ~26.5K | ~93s | Reliable and concise after its learned JSON-mode profile, but omitted some useful notes. |
 | OpenRouter `tencent/hy3` high | 79 | 6/6 | ~28.7K | ~88s | Strong tasks and descriptions, but chat was broader than the narrow action; one historical concurrent-description recovery is reflected in reliability/input. |
 | OpenWebUI Gemma 12B Agentic HF | 74 | 6/6 | ~26.5K | ~144s | Broader chat than E4B, but a task typo and unsupported timing/detail lowered semantic quality; minor wrapper/category repair had little impact. |
-| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; final July 6 chat needed one sequential retry after a 180s truncation/timeout and returned an over-narrow, mislabeled answer. |
+| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; chat needed one sequential retry after a 180s truncation/timeout and returned an over-narrow, mislabeled answer. |
 | OpenRouter `tencent/hy3:free` | 0 | 0/6 | n/a | 0.5s | Unavailable/404 in the tested catalog; the paid slug worked. |
 
 *Footnote: Avg input is the approximate average total input for a complete
-note workflow (chat + task + description across two live notes), not a per-call
-cap. Every individual measured or estimated provider call stayed under the 16K
-efficiency target. Scores are Sol/high judgments, not provider claims; minor
+note workflow (chat + task + description across two actual test notes), not a per-call
+cap. Scores are GPT 5.6 Sol/high judgments, not provider claims; minor
 wrapper/category repairs are reported separately from model quality.*
 
 ## Links

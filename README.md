@@ -16,10 +16,16 @@ The current 0.8 series makes everyday capture more flexible and more private.
    Searchable settings cover OpenAI, Gemini, OpenRouter, and local OpenWebUI/Ollama, with per-workflow choices and optional fallbacks.
 
 2. **More grounded output.**
-   Chat, tasks, and descriptions keep the current request and useful context together, so generated work is clearer and easier to act on.
+   Search keeps the full index available and uses one provider-neutral check before model choice to filter out action-only false matches. Chat also tidies simple recognized label aliases before checking an answer, so responses stay clearer without changing the original model output.
 
 3. **Smoother everyday control.**
    A clearer sidebar and searchable settings make task capture, scheduling previews, and duplicate review easier to manage.
+
+4. **Model learning that stays useful.**
+   Exact-model profiles save carrier and concurrency behavior. Chat only announces material new saves, while AI & Search shows a compact, scrollable list of exact-model operation memories with a Delete button that removes only that memory; the model relearns it next time.
+
+5. **Cleaner presentation.**
+   Obsidian no longer reports the `:has` CSS warning.
 
 ## Install
 
@@ -109,25 +115,26 @@ only when you choose `Apply`, and the last applied schedule can be undone.
 
 ## Model validation snapshot
 
-This current live-vault comparison gave every model the same two live-note
-evidence bundles. Scores are Sol/high judgments of evidence accuracy and
-actionability, not provider claims. No private note details are included.
+This final two-note comparison gave every model the same evidence bundles.
+Scores are Sol/high judgments of evidence accuracy and actionability, not
+provider claims. No private note details are included.
 
 | Provider/model | Quality /100 | Passed | Avg input | Avg time | What we saw |
 |---|---:|---:|---:|---:|---|
-| OpenAI GPT-5.6 Luna high | 95 | 6/6 | 4.6K est | 13.7s | Strongest and most consistently grounded. |
-| Gemini 3.5 Flash Lite | 91 | 6/6 | 4.6K est | 6.4s | Fast and reliable after compatible schema fallback; occasionally broader than needed. |
-| OpenRouter `tencent/hy3` high | 80 | 5/6 | 3.9K reported on successful calls | 90.7s across attempts | Strong tasks and one rich description; largest description timed out at 180s. |
-| OpenRouter `tencent/hy3:free` | 0 | 0/6 | n/a | 0.1s | Unavailable/404 during comparison. |
-| OpenRouter `openrouter/free` | 74 | 6/6 | 4.3K reported | 23.0s | Completed this run, but dynamic route quality varied and one task inferred an unsupported date. |
-| OpenWebUI `gemma4:e4b` | 66 | 4/6 | 5.4K reported on successful calls | 48.4s | Focused simple tasks, but inconsistent chat/description structure; not strong enough for a dependable full workflow. |
-| OpenWebUI Qwen3.5 9B HF | 69 | 5/6 | 4.2K reported on successful calls | 54.5s | Generally capable, but one description invented unsupported detail and one chat failed shape. |
-| OpenWebUI Gemma 12B Agentic HF | 61 | 4/6 | 4.1K reported on successful calls | 70.8s | Useful task/description output, but chat/task reliability and factual precision varied. |
+| OpenAI GPT-5.6 Luna high | 95 | 6/6 | ~24.3K | ~42s | Most complete, precise, and grounded; final-evidence chat completed in one call. |
+| Gemini 3.5 Flash Lite high | 92 | 6/6 | ~24.5K | ~27s | Close quality and the fastest cloud option; occasionally broader than needed. |
+| OpenWebUI Qwen3.5 9B HF | 88 | 6/6 | ~26.5K | ~260s | Strongest local interpretation and broad historical/action coverage; slowest local option. |
+| OpenWebUI `gemma4:e4b` thinking | 82 | 6/6 | ~26.5K | ~93s | Reliable and concise after its learned JSON-mode profile, but omitted some useful July 6 threads. |
+| OpenRouter `tencent/hy3` high | 79 | 6/6 | ~28.7K | ~88s | Strong tasks and descriptions, but chat was broader than the narrow action; one historical concurrent-description recovery is reflected in reliability/input. |
+| OpenWebUI Gemma 12B Agentic HF | 74 | 6/6 | ~26.5K | ~144s | Broader chat than E4B, but a task typo and unsupported timing/detail lowered semantic quality; minor wrapper/category repair had little impact. |
+| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; final July 6 chat needed one sequential retry after a 180s truncation/timeout and returned an over-narrow, mislabeled answer. |
+| OpenRouter `tencent/hy3:free` | 0 | 0/6 | n/a | 0.5s | Unavailable/404 in the tested catalog; the paid slug worked. |
 
-*Footnote: “est” means the provider omitted usage, so the identical bundle’s
-production preflight estimate was used. Reported averages use successful calls.
-16K is an efficiency target, and every measured or estimated average remained
-well below it.*
+*Footnote: Avg input is the approximate average total input for a complete
+note workflow (chat + task + description across two live notes), not a per-call
+cap. Every individual measured or estimated provider call stayed under the 16K
+efficiency target. Scores are Sol/high judgments, not provider claims; minor
+wrapper/category repairs are reported separately from model quality.*
 
 ## Links
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.2
+
+- Keeps each embedding provider's semantic index separate, so switching providers does not mix or discard local context.
+- Coordinates provider-local AI and index work so background updates and everyday requests stay predictable.
+- Improves local OpenWebUI/Ollama support with saved model profiles, request carriers, adaptive concurrency, and a shared 180-second operation limit.
+- Handles OpenRouter paid/free routes more clearly, including rate limits, errors, retries, and fallback behavior.
+- Adds searchable provider/model pickers and compact responsive settings/sidebar controls.
+- Keeps task-local semantic evidence focused and trims repeated context while retaining useful history.
+- Adds an optional safe date cleanup for generated tasks.
+- Replaces cryptic provider failures with plain-language messages and adds debug diagnostics for troubleshooting.
+- Lets you choose primary and fallback models by provider, with configurable workers where supported.
+- Saves carrier/concurrency observations per exact model, announces only material new saves in chat, and adds a compact AI & Search memory list with operation-level Delete; forgetting one memory affects only that item and lets it be learned again next time.
+- Makes semantic retrieval provider-neutral before model selection, removing action-classification-only false relevance while keeping the full semantic index available; chat also accepts simple recognized label aliases before validation without changing raw output.
+- Removes the Obsidian `:has` CSS warning.
+
 ## 0.8.1
 
 - Finalized adaptive Gemini and OpenRouter provider handling, including provider-aware model selection, bounded compatibility retries, request-sized output budgets, and 20-calls-per-minute free-router pacing.
@@ -56,7 +71,7 @@
 
 - Preserved semantic selector action-lane and task-focus metadata through final context deduplication, keeping exact-scope historical review facts available for grounded task descriptions.
 - Made descriptions detailed, task-specific narratives that use all materially useful local evidence. Blank descriptions block persistence, and one bounded retry is allowed only for a parseable model-output failure after the plugin confirms its prepared input is valid.
-- Fresh July 9 production-equivalent checks with Luna/High and Terra/Medium each accepted 6/6 descriptions without retry or cross-task evidence leakage.
+- Production-equivalent checks with Luna/High and Terra/Medium each accepted 6/6 descriptions without retry or cross-task evidence leakage.
 
 ## 0.7.15
 
@@ -196,10 +211,10 @@
 ## 0.6.37
 
 - Stopped same-batch duplicate checks from treating a shared note, person, Inbox section, label, or semantic context as sufficient duplicate evidence when generated tasks have different actionable scopes.
-- Added task-title identity checks, conflicting program-identifier detection, and sequential-action separation so BEAP, ESTMTA, GFP/PDF, Performance Goals delivery, and meeting-booking work remain distinct.
+- Added task-title identity checks, conflicting program-identifier detection, and sequential-action separation so distinct program, document, performance-review, and meeting-booking work remain separate.
 - Recognized `Book`, `Develop`, and other common concrete verbs as valid leading task actions, preventing malformed local repairs such as `Send Develop ...`.
 - Preserved grounded task titles when only their descriptions fail local validation; unsafe narrative text is removed and verified source links are retained instead of dropping the task.
-- Added the July 9 multi-topic touchbase as a generic regression fixture and verified all six main tasks, including the Aditi funding-opportunities-page review and Sophie handoff, plus the ESTMTA subtask continue without same-batch flags, merges, or AI duplicate calls.
+- Added a multi-topic touchbase regression fixture and verified all six main tasks, including a funding-opportunities-page review and stakeholder handoff, plus a related document subtask continue without same-batch flags, merges, or AI duplicate calls.
 
 ## 0.6.36
 

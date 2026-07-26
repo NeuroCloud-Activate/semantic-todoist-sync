@@ -127,13 +127,18 @@ provider claims.
 | OpenWebUI `gemma4:e4b` thinking | 82 | 6/6 | ~26.5K | ~93s | Reliable and concise after its learned JSON-mode profile, but omitted some useful notes. |
 | OpenRouter `tencent/hy3` high | 79 | 6/6 | ~28.7K | ~88s | Strong tasks and descriptions, but chat was broader than the narrow action; one historical concurrent-description recovery is reflected in reliability/input. |
 | OpenWebUI Gemma 12B Agentic HF | 74 | 6/6 | ~26.5K | ~144s | Broader chat than E4B, but a task typo and unsupported timing/detail lowered semantic quality; minor wrapper/category repair had little impact. |
-| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; chat needed one sequential retry after a 180s truncation/timeout and returned an over-narrow, mislabeled answer. |
+| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; chat needed one sequential retry after a bounded truncation/timeout and returned an over-narrow, mislabeled answer. |
+| OpenWebUI Google Gemma4 12B (`gemma4:12b`) | n/a | Could not complete within 300 seconds | ~23.2K attempted* | >300s | A simple test prompt completed in 33.6 seconds and a valid grounded task was produced, but the complete workflow could not finish on the test hardware, so no quality score was assigned. |
 | OpenRouter `tencent/hy3:free` | 0 | 0/6 | n/a | 0.5s | Unavailable/404 in the tested catalog; the paid slug worked. |
 
 *Footnote: Avg input is the approximate average total input for a complete
 note workflow (chat + task + description across two actual test notes), not a per-call
 cap. Scores are GPT 5.6 Sol/high judgments, not provider claims; minor
-wrapper/category repairs are reported separately from model quality.*
+wrapper/category repairs are reported separately from model quality. The
+`gemma4:12b` row shows one attempted workflow plus bounded diagnostics; the
+second workflow was not sent because chat and description remained incomplete.
+Local OpenWebUI/Ollama tests ran on an NVIDIA RTX 3070 GPU with 8 GB of VRAM;
+hardware can materially affect completion time.*
 
 ## Links
 

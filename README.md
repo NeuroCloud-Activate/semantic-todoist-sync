@@ -133,7 +133,6 @@ and actionability, not provider claims.
 | OpenRouter `openrouter/free` | 64 | 100% (6/6) | ~29.1K | $0 | ~124s | Completed the matrix but remained inconsistent and needed bounded recovery. |
 | Open WebUI `qwen3.5:4b` | 62 | 66.7% (4/6) | ~26.5K attempted | $0 API | ~332s | Both tasks and descriptions completed after the saved carrier fix; chat remained schema-inaccurate, and descriptions included more peripheral history than useful. |
 | OpenRouter Xiaomi MiMo-V2.5 | 60 | 50% (3/6) | ~34.5K attempted | ~$0.0235 | ~385s | Tasks were useful, but truncation and timeout behavior made chat and descriptions unreliable. |
-| Open WebUI Google Gemma4 12B (`gemma4:12b`) | n/a | 0% (0/6) | n/a | $0 API | <1s | Still advertised by the stale catalog but currently unavailable from the backend; this is not scored as a speed or quality failure. |
 | OpenRouter `tencent/hy3:free` | 0 | 0% (0/6) | n/a | $0 | ~0.5s | Unavailable/404 in the tested catalog; the paid model worked. |
 
 6/6 covers chat, task, and description across two actual/live notes, and every model received the same provider-neutral evidence bundles. Open WebUI advertised 30K, two workers, and one exact-model lane; every individual call stayed within the 16K efficiency target, while Avg Input is the mean three-operation note-workflow total rather than a cap. Local cost excludes hardware/electricity; local tests used an NVIDIA RTX3070 with 8GB VRAM; scores are GPT-5.6 Sol/high judgments, and minor local repair affects reliability, not semantic quality.

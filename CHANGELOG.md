@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.3
+
+- Makes self-hosted Open WebUI calls serial by default for each exact model while keeping separate lanes available for distinct models.
+- Raises the default local Open WebUI model timeout to 240 seconds while leaving cloud-provider defaults unchanged.
+- Persists exact-model Open WebUI grammar-carrier observations so one bounded compatibility retry can be reused for later chat and description calls.
+
 ## 0.8.2
 
 - Keeps each embedding provider's semantic index separate, so switching providers does not mix or discard local context.

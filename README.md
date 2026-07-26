@@ -13,7 +13,7 @@ you want to use.
 The current 0.8 series makes everyday capture more flexible and more private.
 
 1. **More provider and model choice.**
-   Searchable settings cover OpenAI, Gemini, OpenRouter, and local OpenWebUI/Ollama, with per-workflow choices and optional fallbacks.
+   Searchable settings cover OpenAI, Gemini, OpenRouter, and local Open WebUI/Ollama, with per-workflow choices and optional fallbacks.
 
 2. **More grounded output.**
    Search keeps the full index available and uses one provider-neutral check before model choice to filter out action-only false matches. Chat also tidies simple recognized label aliases before checking an answer, so responses stay clearer without changing the original model output.
@@ -60,7 +60,7 @@ The plugin supports:
 - OpenAI, with GPT-5.6 Luna at High reasoning as the default generation choice.
 - Google Gemini, with Gemini 3.5 Flash Lite as the default generation choice.
 - OpenRouter, including full native model IDs such as `openrouter/free`.
-- Self-hosted OpenWebUI connected to Ollama.
+- Self-hosted Open WebUI connected to Ollama.
 
 Each workflow has a searchable provider/model picker. You can choose models
 and reasoning levels independently for chat, task generation, descriptions,
@@ -68,7 +68,7 @@ and embeddings, then set an optional fallback. Embedding indexes stay tied to
 their selected provider and model, so switching providers does not mix
 incompatible data.
 
-If OpenWebUI is connected to Ollama, all AI work in this plugin—including
+If Open WebUI is connected to Ollama, all AI work in this plugin—including
 generation, embeddings, semantic search, chat, task generation, and
 descriptions—can run locally on your own machine or network. You do not need a
 cloud AI provider for that setup. Todoist, OpenAI, Gemini, OpenRouter, and
@@ -78,7 +78,7 @@ and use the related workflow.
 ## Quick setup
 
 1. Open `Settings > Semantic Todoist Sync` and choose an AI provider. Add its
-   credential, or configure your OpenWebUI endpoint and sign-in details.
+   credential, or configure your Open WebUI endpoint and sign-in details.
 2. Add your Todoist personal token and run the connection check.
 3. Choose models in the searchable operation settings. Add a fallback only if
    you want one.
@@ -115,30 +115,28 @@ only when you choose `Apply`, and the last applied schedule can be undone.
 
 ## Model validation snapshot
 
-This final model comparison gave every model the same evidence bundles.
-Scores are GPT 5.6 Sol/high judgments of evidence accuracy and actionability, not
-provider claims.
+The complete model comparison gave every model the same provider-neutral
+evidence bundles. Scores are GPT-5.6 Sol/high judgments of evidence accuracy
+and actionability, not provider claims.
 
-| Provider/model | Quality /100 | Passed | Avg input (Tokens) | Avg time | What we saw |
-|---|---:|---:|---:|---:|---|
-| OpenAI GPT-5.6 Luna high | 95 | 6/6 | ~24.3K | ~42s | Most complete, precise, and grounded; final-evidence chat completed in one call. |
-| Gemini 3.5 Flash Lite high | 92 | 6/6 | ~24.5K | ~27s | Close quality and the fastest cloud option; occasionally broader than needed. |
-| OpenWebUI Qwen3.5 9B HF | 88 | 6/6 | ~26.5K | ~260s | Strongest local interpretation and broad historical/action coverage; slowest local option. |
-| OpenWebUI `gemma4:e4b` thinking | 82 | 6/6 | ~26.5K | ~93s | Reliable and concise after its learned JSON-mode profile, but omitted some useful notes. |
-| OpenRouter `tencent/hy3` high | 79 | 6/6 | ~28.7K | ~88s | Strong tasks and descriptions, but chat was broader than the narrow action; one historical concurrent-description recovery is reflected in reliability/input. |
-| OpenWebUI Gemma 12B Agentic HF | 74 | 6/6 | ~26.5K | ~144s | Broader chat than E4B, but a task typo and unsupported timing/detail lowered semantic quality; minor wrapper/category repair had little impact. |
-| OpenRouter `openrouter/free` | 64 | 6/6 | ~29.1K | ~124s | Dynamic pool completed but was inconsistent; chat needed one sequential retry after a bounded truncation/timeout and returned an over-narrow, mislabeled answer. |
-| OpenWebUI Google Gemma4 12B (`gemma4:12b`) | n/a | Could not complete within 300 seconds | ~23.2K attempted* | >300s | A simple test prompt completed in 33.6 seconds and a valid grounded task was produced, but the complete workflow could not finish on the test hardware, so no quality score was assigned. |
-| OpenRouter `tencent/hy3:free` | 0 | 0/6 | n/a | 0.5s | Unavailable/404 in the tested catalog; the paid slug worked. |
+| Provider/Model | Quality / 100 | Percent Tasks Successfully Complete | Avg Input (Tokens) | Est Total Cost | Avg Time (to complete test run) | Sanitized Overall Assessment |
+|---|---:|---:|---:|---:|---:|---|
+| OpenAI GPT-5.6 Luna high | 95 | 100% (6/6) | ~24.3K | ~$0.10 | ~42s | Most complete, precise, and consistently grounded across chat, task, and description. |
+| Gemini 3.5 Flash Lite high | 92 | 100% (6/6) | ~24.5K | ~$0.04 | ~27s | Nearly as strong, fastest cloud result, with only occasional extra breadth. |
+| OpenRouter DeepSeek V4 Flash | 90 | 100% (6/6) | ~20.0K | ~$0.0089 | ~196s | Strong evidence use and descriptions; one chat was broader than necessary. |
+| OpenRouter Qwen 3.7 Plus | 89 | 100% (6/6) | ~20.7K | ~$0.0346 | ~159s | Consistently grounded and actionable, with good historical interpretation. |
+| Open WebUI Qwen3.5 9B HF | 84 | 50% (3/6) | ~26.5K attempted | $0 API | ~488s | Strongest local interpretation when it completed, including the best local historical description; two generation timeouts reduced reliability. |
+| OpenRouter `tencent/hy3` high | 79 | 100% (6/6) | ~28.7K | ~$0.01 | ~88s | Strong tasks and descriptions; chat sometimes widened beyond the selected action. |
+| Open WebUI `gemma4:e4b` thinking | 76 | 66.7% (4/6) | ~26.5K attempted | $0 API | ~317s | Accurate, concise tasks and usable chat, but both description calls exceeded the local deadline. |
+| Open WebUI Gemma 12B Agentic HF | 68 | 33.3% (2/6) | ~26.5K attempted | $0 API | ~427s | The completed task was accurate, but the description overpacked loosely related history and the other note timed out. |
+| Open WebUI Qwythos-9B-Claude-Mythos | 67 | 50% (3/6) | ~26.5K attempted | $0 API | ~426s | Grounded task titles and one useful description; chat was excessively broad and another description was too thin. |
+| OpenRouter `openrouter/free` | 64 | 100% (6/6) | ~29.1K | $0 | ~124s | Completed the matrix but remained inconsistent and needed bounded recovery. |
+| Open WebUI `qwen3.5:4b` | 62 | 66.7% (4/6) | ~26.5K attempted | $0 API | ~332s | Both tasks and descriptions completed after the saved carrier fix; chat remained schema-inaccurate, and descriptions included more peripheral history than useful. |
+| OpenRouter Xiaomi MiMo-V2.5 | 60 | 50% (3/6) | ~34.5K attempted | ~$0.0235 | ~385s | Tasks were useful, but truncation and timeout behavior made chat and descriptions unreliable. |
+| Open WebUI Google Gemma4 12B (`gemma4:12b`) | n/a | 0% (0/6) | n/a | $0 API | <1s | Still advertised by the stale catalog but currently unavailable from the backend; this is not scored as a speed or quality failure. |
+| OpenRouter `tencent/hy3:free` | 0 | 0% (0/6) | n/a | $0 | ~0.5s | Unavailable/404 in the tested catalog; the paid model worked. |
 
-*Footnote: Avg input is the approximate average total input for a complete
-note workflow (chat + task + description across two actual test notes), not a per-call
-cap. Scores are GPT 5.6 Sol/high judgments, not provider claims; minor
-wrapper/category repairs are reported separately from model quality. The
-`gemma4:12b` row shows one attempted workflow plus bounded diagnostics; the
-second workflow was not sent because chat and description remained incomplete.
-Local OpenWebUI/Ollama tests ran on an NVIDIA RTX 3070 GPU with 8 GB of VRAM;
-hardware can materially affect completion time.*
+6/6 covers chat, task, and description across two actual/live notes, and every model received the same provider-neutral evidence bundles. Open WebUI advertised 30K, two workers, and one exact-model lane; every individual call stayed within the 16K efficiency target, while Avg Input is the mean three-operation note-workflow total rather than a cap. Local cost excludes hardware/electricity; local tests used an NVIDIA RTX3070 with 8GB VRAM; scores are GPT-5.6 Sol/high judgments, and minor local repair affects reliability, not semantic quality.
 
 ## Links
 

@@ -253,7 +253,7 @@ const OPENWEBUI_ALLOCATION_POLL_INTERVAL_MS = 5 * 1000;
 const OPENWEBUI_ALLOCATION_POLL_SAMPLE_LIMIT = 32;
 const OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS = 120 * 1000;
 const OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS = 600 * 1000;
-const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 180 * 1000;
+const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 240 * 1000;
 const OPENWEBUI_CONTEXT_METADATA_FRESH_MS = 60 * 1000;
 const OPENROUTER_MODEL_METADATA_STALE_MS = 24 * 60 * 60 * 1000;
 const CHAT_PROVIDER_OUTPUT_HEADROOM_TOKENS = 1024;
@@ -2388,7 +2388,7 @@ class RuntimeWorkCoordinator {
       // OpenWebUI's shared model-affine lane pool owns both cross-model worker
       // capacity and same-model transport concurrency. A second coordinator
       // semaphore would double-throttle those calls and make workerCount=1
-      // incorrectly cap the selected model below its configured default of 2.
+      // incorrectly cap the selected model below an explicit per-model limit.
       if (normalizedProvider === "openwebui") return execute();
       const key = `provider:${normalizedProvider || "provider"}:${String(model || "model").trim().toLowerCase()}`;
       return this._runCapacity(key, this._providerConcurrency(provider, model), execute);
@@ -3882,17 +3882,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async migrateSettings() {
     let changed = false;
     // One-way OpenWebUI timeout migration. Release versions that persisted
-    // the former exact default (120s) are upgraded to the current 180s
+    // the former exact defaults (120s/180s) are upgraded to the current 240s
     // default once; a marker preserves genuinely custom values and makes the
     // migration idempotent on subsequent startups.
     const openWebUIModelLoadTimeoutMigrationVersion = Number(this.settings.openwebuiModelLoadTimeoutMigrationVersion || 0);
-    if (!Number.isSafeInteger(openWebUIModelLoadTimeoutMigrationVersion) || openWebUIModelLoadTimeoutMigrationVersion < 1) {
-      if (Number.isSafeInteger(this.settings.openwebuiModelLoadTimeoutMs) && this.settings.openwebuiModelLoadTimeoutMs === 120 * 1000) {
+    if (!Number.isSafeInteger(openWebUIModelLoadTimeoutMigrationVersion) || openWebUIModelLoadTimeoutMigrationVersion < 2) {
+      if (Number.isSafeInteger(this.settings.openwebuiModelLoadTimeoutMs) && [120, 180].includes(this.settings.openwebuiModelLoadTimeoutMs / 1000)) {
         this.settings.openwebuiModelLoadTimeoutMs = OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS;
         changed = true;
       }
-      if (this.settings.openwebuiModelLoadTimeoutMigrationVersion !== 1) {
-        this.settings.openwebuiModelLoadTimeoutMigrationVersion = 1;
+      if (this.settings.openwebuiModelLoadTimeoutMigrationVersion !== 2) {
+        this.settings.openwebuiModelLoadTimeoutMigrationVersion = 2;
         changed = true;
       }
     }
@@ -17919,7 +17919,7 @@ const SETTING_DESCRIPTIONS = {
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
   runtimeWorkerCount: "Bounded number of concurrent runtime AI/index jobs. The default is 2.",
-  aiModelConcurrency: "Bounded cloud-provider same-provider/same-model API call parallelism. The default is 10; OpenWebUI keeps its separate per-model default of 2 and provider/rate limits may override it.",
+  aiModelConcurrency: "Bounded cloud-provider same-provider/same-model API call parallelism. The default is 10; OpenWebUI keeps a separate per-model default of 1. Two OpenWebUI workers can represent two GPUs or Ollama instances, while one exact model uses one concurrent lane by default; provider limits may lower the effective value.",
   autoProcessEmails: "When enabled, Obsidian polls your Cloudflare Worker for forwarded emails while the app is open.",
   emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled. To protect the Cloudflare KV Free list limit, automatic polling is clamped to at least 420 seconds.",
   maxNoteChars: "Maximum characters read from a note as a task source. This is a note-ingestion bound, not a model-context display limit.",
@@ -48239,7 +48239,7 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS = 16384;
   const OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS = 120 * 1000;
   const OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS = 600 * 1000;
-  const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 180 * 1000;
+  const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 240 * 1000;
   const OPENWEBUI_THINKING_MODE_VALUES = Object.freeze(["enabled", "model-default"]);
   const DEFAULT_OPENWEBUI_THINKING_MODE = "enabled";
   const normalizeOpenWebUIThinkingMode = (value) => {
@@ -48358,7 +48358,7 @@ const STS_MULTI_PROVIDER = (() => {
   const unique = (values) => Array.from(new Set((values || []).map(nonEmpty).filter(Boolean)));
   const OPENWEBUI_MANUAL_CONTEXT_MAX_MODELS = 64;
   const OPENWEBUI_MANUAL_CONTEXT_MAX_TOKENS = 1_000_000_000;
-  const OPENWEBUI_MODEL_CONCURRENCY_DEFAULT = 2;
+  const OPENWEBUI_MODEL_CONCURRENCY_DEFAULT = 1;
   const OPENWEBUI_MODEL_CONCURRENCY_MAX = 4;
   const OPENWEBUI_WORKER_COUNT_DEFAULT = 1;
   const OPENWEBUI_WORKER_COUNT_MAX = 8;
@@ -49681,7 +49681,7 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENWEBUI_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
   const OPENWEBUI_RESPONSE_MAX_LINES = 8192;
   const OPENWEBUI_RESPONSE_MAX_EVENTS = 4096;
-  const OPENWEBUI_MODEL_EXECUTION_TIMEOUT_MS = 180000;
+  const OPENWEBUI_MODEL_EXECUTION_TIMEOUT_MS = 240000;
   const OPENWEBUI_REASONING_VALIDATION_PROFILE = "openwebui-reasoning-schema-v1";
   const OPENWEBUI_JSON_MODE_PROFILE = "openwebui-ollama-json-mode-v1";
   const OPENWEBUI_REASONING_VALIDATION_MAX_DEPTH = 64;
@@ -50117,7 +50117,7 @@ const STS_MULTI_PROVIDER = (() => {
           : {};
         const text = message.content;
         if (typeof text !== "string" || text.trim().length === 0) throw providerError("openwebui", status, "invalid-response");
-        const envelope = nativeDescription
+        const envelope = nativeDescription && !strictSchemaExpected
           ? { text, rawText: text, normalized: false, profile: "", reason: "native-description-raw" }
           : openWebUIStructuredContentEnvelope(text, strictSchemaExpected);
         const thinking = message.thinking;
@@ -51241,6 +51241,7 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const openWebUISingletonDescriptionCapabilityState = (model, options = {}) => {
     const key = openWebUISingletonDescriptionCapabilityKey(model, options);
+    const operation = openWebUIAdaptiveOperation(options.operation || "task-description");
     const metadataIdentity = openWebUICapabilityMetadataIdentity(options.settings || {}, model);
     const metadata = options.settings?.openwebuiModelMetadata?.[normalizeModel("openwebui", model)] || {};
     const profiles = Array.isArray(metadata?.structuredCapabilityProfiles)
@@ -51260,6 +51261,15 @@ const STS_MULTI_PROVIDER = (() => {
       && String(memoryCached.metadataFingerprint || "") === metadataIdentity.metadataFingerprint
       && String(memoryCached.metadataRevision || "") === metadataIdentity.metadataRevision;
     const cached = (memoryMatches ? memoryCached : null) || persisted;
+    // Ollama's native grammar compiler is not uniformly compatible with the
+    // projected schema.  Start chat/description calls in JSON mode until an
+    // exact, metadata-valid durable record proves a carrier preference.  Task
+    // generation remains schema-first because its current model set is known
+    // to accept the projected task schema.  A valid cached/persisted record
+    // always wins, including an explicit direct-schema preference.
+    const coldCarrier = metadata?.ollamaBacked === true && ["chat-query", "task-description"].includes(operation)
+      ? "direct-json"
+      : "direct-schema";
     const adaptiveConcurrencyLimit = Number(cached?.adaptiveConcurrencyLimit);
     return {
       cacheHit: Boolean(cached),
@@ -51268,7 +51278,7 @@ const STS_MULTI_PROVIDER = (() => {
         ? "wrapper-json"
         : cached?.preferredCarrier === "direct-json" || cached?.grammarRejected || cached?.grammarUnsupported
           ? "direct-json"
-          : "direct-schema",
+          : cached ? "direct-schema" : coldCarrier,
       key,
       metadataFingerprint: metadataIdentity.metadataFingerprint,
       metadataRevision: metadataIdentity.metadataRevision,
@@ -51288,6 +51298,14 @@ const STS_MULTI_PROVIDER = (() => {
   const openWebUIRecordSingletonDescriptionCapability = (model, patch = {}) => {
     const key = openWebUISingletonDescriptionCapabilityKey(model, patch);
     if (!key) return null;
+    const metadataKey = normalizeModel("openwebui", model);
+    if (patch.settings && typeof patch.settings === "object") {
+      patch.settings.openwebuiModelMetadata ||= {};
+      const existingMetadata = patch.settings.openwebuiModelMetadata[metadataKey];
+      if (!existingMetadata || typeof existingMetadata !== "object" || Array.isArray(existingMetadata) || !Object.keys(existingMetadata).length) {
+        patch.settings.openwebuiModelMetadata[metadataKey] = Object.assign({}, existingMetadata || {}, { source: "openwebui-observed" });
+      }
+    }
     const metadataIdentity = openWebUICapabilityMetadataIdentity(patch.settings || {}, model);
     if (!metadataIdentity.metadataPresent) return null;
     const cachedCurrent = openWebUISingletonDescriptionCapabilityMemory.get(key);
@@ -51342,7 +51360,6 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUISingletonDescriptionCapabilityMemory.set(key, record);
     if (patch.settings && typeof patch.settings === "object") openWebUISingletonDescriptionCapabilitySettingsOwners.set(key, patch.settings);
     if (patch.settings && typeof patch.settings === "object") {
-      const metadataKey = normalizeModel("openwebui", model);
       const metadata = patch.settings.openwebuiModelMetadata?.[metadataKey] || {};
       const value = metadata.structuredCapabilityProfiles;
       const rows = (Array.isArray(value) ? value : Array.isArray(value?.records) ? value.records : [])
@@ -51675,7 +51692,11 @@ const STS_MULTI_PROVIDER = (() => {
     retryOrdinal: Math.max(0, Math.round(Number(state.retryOrdinal) || 0)),
     maxAttempts: 2,
     attempts: Object.freeze((state.attempts || []).map((attempt) => Object.freeze(Object.assign({}, attempt)))),
-    ...(includeRawOutputs ? { rawOutputs: Object.freeze((state.rawOutputs || []).slice()) } : {})
+    ...(includeRawOutputs ? { rawOutputs: Object.freeze((state.rawOutputs || []).slice()) } : {}),
+    // HTTP failures are preserved separately from model output. Keep these
+    // exact response bodies available for bounded retry diagnosis without
+    // mixing provider errors into the raw model-output stream.
+    rawResponses: Object.freeze((state.rawResponses || []).slice())
   });
   const providerObserveStructuredRetryRaw = (state, options = {}) => {
     try {
@@ -52234,8 +52255,24 @@ const STS_MULTI_PROVIDER = (() => {
         throw providerError("openwebui", 401, "auth-required");
       }
       if (!successful(response)) {
-        const classification = classifyOpenWebUIError(await normalizeOpenWebUIFailureResponse(response));
-        throw providerError("openwebui", statusOf(response), classification.code, classification.retryable, "", classification.diagnostic);
+        const failureResponse = await normalizeOpenWebUIFailureResponse(response);
+        const classification = classifyOpenWebUIError(failureResponse);
+        const error = providerError("openwebui", statusOf(response), classification.code, classification.retryable, "", classification.diagnostic);
+        const rawResponseText = typeof failureResponse?.text === "string"
+          ? failureResponse.text
+          : failureResponse?.json !== undefined
+            ? (() => { try { return JSON.stringify(failureResponse.json); } catch { return ""; } })()
+            : "";
+        if (rawResponseText) {
+          try {
+            Object.defineProperty(error.providerError, "rawResponseText", {
+              value: rawResponseText,
+              enumerable: false,
+              configurable: true
+            });
+          } catch {}
+        }
+        throw error;
       }
       return response;
     };
@@ -52284,6 +52321,10 @@ const STS_MULTI_PROVIDER = (() => {
     if (nativeSchemaCarrier) compatibility.format = "json";
     else compatibility.options = Object.assign({}, strictBody?.options || {}, { format: "json" });
     return compatibility;
+  };
+  const openWebUISchemaCompatibilityRequest = (strictBody) => {
+    const { response_format: _responseFormat, ...withoutSchema } = strictBody || {};
+    return Object.assign({}, withoutSchema, { stream: false });
   };
   const openWebUIChatCitationNormalization = (text, schema, originalSchema = schema) => {
     const rawText = asString(text);
@@ -52402,7 +52443,6 @@ const STS_MULTI_PROVIDER = (() => {
     };
   };
   const openWebUIGrammarCompatibilityEligible = (error, response, options = {}) => {
-    if (options.ollamaBacked !== true) return false;
     const providerError = error?.providerError || {};
     if (providerError.provider !== "openwebui") return false;
     const diagnostic = providerError.providerDiagnostic || {};
@@ -52500,7 +52540,7 @@ const STS_MULTI_PROVIDER = (() => {
         settings
       })
       : null;
-    const structuredInitialCarrier = !nativeDescription && ollamaBacked && structuredCapability?.preferredCarrier === "direct-json"
+    const structuredInitialCarrier = !nativeDescription && structuredCapability?.preferredCarrier === "direct-json"
       ? "direct-json"
       : "direct-schema";
     const adaptiveCapability = nativeDescription ? descriptionCapability : structuredCapability;
@@ -52580,7 +52620,7 @@ const STS_MULTI_PROVIDER = (() => {
       messages,
       // Native Ollama envelopes are completed objects. Preserve the existing
       // Chat Completions streaming compatibility path for non-Ollama models.
-      stream: ollamaBacked ? false : Boolean(schemaProjection && !capabilityDirectedCompatibility)
+      stream: ollamaBacked ? false : Boolean(schemaProjection && !capabilityDirectedCompatibility && structuredInitialCarrier !== "direct-json")
     };
     if (ollamaThinking) {
       body.think = true;
@@ -52593,7 +52633,7 @@ const STS_MULTI_PROVIDER = (() => {
         body.options = Object.assign({}, body.options || {}, { temperature: 0 });
       } else {
         body.temperature = 0;
-        if (!capabilityDirectedCompatibility) body.response_format = { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema: schemaProjection.schema } };
+        if (!capabilityDirectedCompatibility && structuredInitialCarrier !== "direct-json") body.response_format = { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema: schemaProjection.schema } };
       }
     }
     // OpenWebUI accepts reasoning_effort only for explicitly advertised level
@@ -52745,7 +52785,7 @@ const STS_MULTI_PROVIDER = (() => {
       : schemaProjection
         ? (ollamaBacked
           ? structuredInitialCarrier === "direct-json" && !nativeDescription ? "local-schema-compatibility-json" : "strict-native-schema"
-          : "strict-schema")
+        : structuredInitialCarrier === "direct-json" ? "local-schema-compatibility-grammar" : "strict-schema")
         : "standard";
     let lastStructuredResponseDiagnostic = null;
     const structuredRetryState = {
@@ -52757,7 +52797,8 @@ const STS_MULTI_PROVIDER = (() => {
       descriptionNextCarrier: descriptionInitialCarrier,
       structuredNextCarrier: structuredInitialCarrier,
       attempts: [],
-      rawOutputs: []
+      rawOutputs: [],
+      rawResponses: []
     };
     const observeOpenWebUICapability = async ({ schemaFingerprint, operation: observedOperation, grammarRejected, successfulCarrier, preferredCarrier }) => {
       const capabilitySettings = typeof requestInput.onOpenWebUICapabilityObserved === "function"
@@ -52787,6 +52828,7 @@ const STS_MULTI_PROVIDER = (() => {
       const jsonModeCompatibility = ollamaBacked && (nativeDescription
         ? attemptCarrier === "direct-json" || attemptCarrier === "wrapper-json"
         : attemptCarrier === "direct-json");
+      const schemaCompatibility = !ollamaBacked && !nativeDescription && attemptCarrier === "direct-json";
       let attemptRequestBody = requestBody;
       if (jsonModeCompatibility && ollamaBacked) {
         attemptRequestBody = openWebUIJsonModeCompatibilityRequest(requestBody);
@@ -52796,6 +52838,13 @@ const STS_MULTI_PROVIDER = (() => {
             format: "json"
           });
         }
+      } else if (schemaCompatibility) {
+        attemptRequestBody = openWebUISchemaCompatibilityRequest(requestBody);
+      } else if (ollamaBacked && nativeDescription && attemptCarrier === "direct-schema") {
+        attemptRequestBody = Object.assign({}, requestBody, {
+          messages: messagesForGrounding(attemptSchemaGrounding),
+          format: attemptSchemaProjection?.schema || schemaProjection?.schema
+        });
       } else if (ollamaBacked && !nativeDescription && attemptCarrier === "direct-schema") {
         attemptRequestBody = Object.assign({}, requestBody, {
           format: attemptSchemaProjection?.schema || schemaProjection?.schema
@@ -52804,7 +52853,7 @@ const STS_MULTI_PROVIDER = (() => {
       const attemptRequestProfile = nativeDescription
         ? attemptCarrier === "wrapper-json" ? "local-schema-compatibility-description-wrapper-json"
           : attemptCarrier === "direct-json" ? "local-schema-compatibility-json" : "strict-native-schema"
-        : jsonModeCompatibility
+        : jsonModeCompatibility || schemaCompatibility
           ? "local-schema-compatibility-json"
           : structuredInitialCarrier === "direct-json" && attemptCarrier === "direct-schema"
             ? "strict-native-schema"
@@ -53150,10 +53199,10 @@ const STS_MULTI_PROVIDER = (() => {
           descriptionDeterministicCompletion: Boolean(deterministicDescriptionCompletion || alternateDescriptionNormalization?.deterministicCompletion),
           descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || []
         } : {});
-        if (ollamaBacked && attemptSchemaProjection) {
+        if (attemptSchemaProjection && (ollamaBacked || structuredRetryState.retryAttempted || structuredCapability?.cacheHit)) {
           const successfulCarrier = nativeDescription
             ? alternateDescriptionNormalization?.carrier || (attemptWrapper ? "wrapper-json" : attemptCarrier === "direct-json" ? "direct-json" : "direct-schema")
-            : jsonModeCompatibility ? "direct-json" : "direct-schema";
+            : jsonModeCompatibility || schemaCompatibility ? "direct-json" : "direct-schema";
           const recoveredCachedJsonCarrier = !nativeDescription
             && structuredRetryState.retryReason === "grammar-carrier-recovery"
             && successfulCarrier === "direct-schema";
@@ -53246,6 +53295,10 @@ const STS_MULTI_PROVIDER = (() => {
         const responseStatus = response ? statusOf(response) : Number(preserved?.providerError?.status) || 0;
         const rawOutput = responseStatus === 200 ? openWebUIStructuredRetryRaw(response) : "";
         if (responseStatus === 200) structuredRetryState.rawOutputs.push(rawOutput);
+        const rawResponseText = responseStatus !== 200 && typeof preserved?.providerError?.rawResponseText === "string"
+          ? preserved.providerError.rawResponseText
+          : "";
+        if (rawResponseText) structuredRetryState.rawResponses.push(rawResponseText);
         if (attemptSchemaProjection) {
           const providerErrorValue = preserved?.providerError || {};
           const diagnostic = providerErrorValue.providerDiagnostic || {};
@@ -53347,6 +53400,17 @@ const STS_MULTI_PROVIDER = (() => {
             structuredRetryState.retryReason = "description-wrapper-schema";
             structuredRetryState.retryOrdinal = structuredAttempt;
             structuredRetryState.descriptionNextCarrier = "wrapper-json";
+            continue;
+          }
+          const nativeDescriptionGrammarRetry = nativeDescription
+            && structuredAttempt === 1
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+          if (nativeDescriptionGrammarRetry) {
+            structuredRetryState.retryEligible = true;
+            structuredRetryState.retryAttempted = true;
+            structuredRetryState.retryReason = attemptCarrier === "direct-json" ? "grammar-carrier-recovery" : "grammar-compatibility";
+            structuredRetryState.retryOrdinal = 1;
+            structuredRetryState.descriptionNextCarrier = attemptCarrier === "direct-json" ? "direct-schema" : "direct-json";
             continue;
           }
           const cachedJsonAlternateCarrierRetry = !nativeDescription
@@ -53956,6 +54020,7 @@ if (typeof module !== "undefined" && module.exports) module.exports.__semanticIn
 const AI_GATEWAY_SCHEMA_VERSION = 1;
 const AI_GATEWAY_ATTEMPT_DEFAULT_DEADLINE_MS = 180000;
 const AI_GATEWAY_OPENROUTER_FREE_DEADLINE_MS = 180000;
+const AI_GATEWAY_OPENWEBUI_LOCAL_DEADLINE_MS = 240000;
 const AI_GATEWAY_ATTEMPT_MIN_DEADLINE_MS = 1;
 const AI_GATEWAY_ATTEMPT_MAX_DEADLINE_MS = 600000;
 const AI_GATEWAY_ABORT_SETTLE_GRACE_MS = 25;
@@ -55263,6 +55328,7 @@ function aiGatewayAttemptDeadlineResolution(request = {}, reference = null) {
   if (typeof STS_MULTI_PROVIDER !== "undefined" && STS_MULTI_PROVIDER.classifyOpenRouterFreeModel(provider, model)) {
     return Object.freeze({ deadlineMs: AI_GATEWAY_OPENROUTER_FREE_DEADLINE_MS, source: "openrouter-free-router" });
   }
+  if (provider === "openwebui") return Object.freeze({ deadlineMs: AI_GATEWAY_OPENWEBUI_LOCAL_DEADLINE_MS, source: "openwebui-local-default" });
   return Object.freeze({ deadlineMs: AI_GATEWAY_ATTEMPT_DEFAULT_DEADLINE_MS, source: "gateway-default" });
 }
 
@@ -58337,7 +58403,7 @@ function stsMpRenderOpenWebUIContextSettings(containerEl, plugin) {
   });
   const modelLoadTimeoutSetting = new Setting(containerEl)
     .setName("Model load timeout (seconds)")
-    .setDesc(`Maximum time to poll /ps after the first real model request starts. Allowed range: ${Math.round(OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS / 1000)}–${Math.round(OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS / 1000)} seconds.`);
+    .setDesc(`Maximum time to poll /ps after the first real model request starts. Default ${Math.round(OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS / 1000)} seconds; allowed range: ${Math.round(OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS / 1000)}–${Math.round(OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS / 1000)} seconds.`);
   modelLoadTimeoutSetting.settingEl?.addClass?.("semantic-todoist-provider-setting");
   modelLoadTimeoutSetting.addText((text) => {
     text.inputEl.type = "number";
@@ -58367,7 +58433,7 @@ function stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin) {
   selectedModel = STS_MULTI_PROVIDER.normalizeModel("openwebui", initialReference?.provider === "openwebui" ? initialReference.model : rows()[0]?.id || "");
   const effectiveSetting = new Setting(containerEl)
     .setName("OpenWebUI model concurrency")
-    .setDesc("Default 2 concurrent calls for the selected model; distinct loaded models use configurable model-affine worker lanes.");
+    .setDesc("Default 1 concurrent call for the selected model; distinct loaded models use configurable model-affine worker lanes.");
   effectiveSetting.settingEl?.addClass?.("semantic-todoist-provider-setting");
   const updateEffective = () => {
     const limit = STS_MULTI_PROVIDER.openWebUIModelConcurrencyLimit(currentSettings(), selectedModel);
@@ -58376,7 +58442,7 @@ function stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin) {
   };
   new Setting(containerEl)
     .setName("OpenWebUI worker lanes")
-    .setDesc("Number of model-affine OpenWebUI/Ollama workers. Default 1 keeps model operations sequential; use additional lanes for independently available GPUs or Ollama instances behind the same OpenWebUI endpoint. A lane keeps its model assigned until idle to avoid model eviction/thrashing or overwhelming one runtime; same-model calls may share the configured per-model limit.")
+    .setDesc("Number of model-affine OpenWebUI/Ollama workers. Default 1 keeps model operations sequential; two workers can represent two independently available GPUs or Ollama instances behind the same endpoint. One exact model uses one concurrent call by default; explicit per-model limits may raise that within the 1–4 range. A lane keeps its model assigned until idle to avoid model eviction/thrashing or overwhelming one runtime.")
     .addText((text) => {
       text.inputEl.type = "number";
       text.inputEl.min = "1";
@@ -58411,7 +58477,7 @@ function stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin) {
   });
   new Setting(containerEl)
     .setName("Concurrent calls for selected model")
-    .setDesc("Integer from 1 to 4. Leave blank to restore the default of 2.")
+    .setDesc("Integer from 1 to 4. Leave blank to restore the default of 1.")
     .addText((text) => {
       concurrencyInput = text;
       text.inputEl.type = "number";

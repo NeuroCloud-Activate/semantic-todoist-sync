@@ -77,7 +77,7 @@
   width: 100%;
 }
 
-.semantic-todoist-settings input,
+.semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]),
 .semantic-todoist-settings select,
 .semantic-todoist-settings textarea {
   max-width: 100%;
@@ -1241,7 +1241,7 @@
     flex-wrap: wrap;
   }
 
-  .semantic-todoist-settings .setting-item-control input,
+  .semantic-todoist-settings .setting-item-control input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-settings .setting-item-control select,
   .semantic-todoist-settings .setting-item-control textarea {
     width: 100%;
@@ -1852,12 +1852,6 @@
   width: auto;
 }
 
-.semantic-todoist-settings .setting-item-control input[type="checkbox"],
-.semantic-todoist-settings .setting-item-control input[type="radio"] {
-  max-width: max-content;
-  width: auto;
-}
-
 .semantic-todoist-settings .setting-item-control {
   display: flex;
   flex-wrap: wrap;
@@ -1866,19 +1860,27 @@
   max-width: 100%;
 }
 
-.semantic-todoist-settings .setting-item-control input,
+/* Obsidian's ToggleComponent owns the native checkbox overlay. Keep that
+ * input untouched and enlarge only its wrapper for keyboard/coarse-pointer
+ * access, instead of replacing it with a custom switch geometry. */
+.semantic-todoist-settings .semantic-todoist-toggle-setting .setting-item-control {
+  min-height: 44px;
+  align-items: center;
+}
+
+.semantic-todoist-settings .semantic-todoist-toggle-setting .checkbox-container {
+  min-width: 44px;
+  min-height: 44px;
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.semantic-todoist-settings .setting-item-control input:not([type="checkbox"]):not([type="radio"]),
 .semantic-todoist-settings .setting-item-control select,
 .semantic-todoist-settings .setting-item-control textarea,
 .semantic-todoist-settings .setting-item-control button {
   min-width: 0;
   max-width: 100%;
-}
-
-.semantic-todoist-settings .semantic-todoist-openwebui-unknown-context-fallback-input {
-  box-sizing: border-box;
-  min-height: 44px;
-  width: 100%;
-  max-width: 680px;
 }
 
 .semantic-todoist-settings .semantic-todoist-openwebui-model-load-timeout-input {

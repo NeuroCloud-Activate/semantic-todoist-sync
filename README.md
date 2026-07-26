@@ -27,6 +27,9 @@ The current 0.8 series makes everyday capture more flexible and more private.
 5. **Cleaner presentation.**
    Obsidian no longer reports the `:has` CSS warning.
 
+6. **Friendlier mobile setup.**
+   Settings toggles are back with easy-to-tap controls, Embeddings settings are gathered in one clear place, and the context fallback is easier to adjust when model details are unavailable. The default sidebar mode setting is gone, while chat and task tools remain.
+
 ## Install
 
 - [Install from Obsidian Community Plugins](https://obsidian.md/plugins?id=semantic-todoist-sync)

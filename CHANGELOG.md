@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.4
+
+- Restored iPad and mobile settings toggles with native touch targets, unified capability-aware Embeddings settings, and an editable global unknown-model context fallback while exact and provider-discovered metadata remain higher precedence.
+- Removed the obsolete default-sidebar-mode setting; the existing chat and task sidebar functions remain available.
+
 ## 0.8.3
 
 - Makes self-hosted Open WebUI calls serial by default for each exact model while keeping separate lanes available for distinct models.

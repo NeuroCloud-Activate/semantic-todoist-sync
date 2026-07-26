@@ -238,16 +238,14 @@ const TASK_DESCRIPTION_REASONING_HEADROOM_TOKENS = 1024;
 // Chat composition is provider-aware and fail-closed. Unknown provider
 // windows use a conservative explicit input budget rather than optimistic
 // truncation or an unbounded request.
-const CHAT_PROVIDER_UNKNOWN_INPUT_BUDGET_TOKENS = 16384;
+const UNKNOWN_MODEL_CONTEXT_WINDOW_MIN_TOKENS = 4096;
+const UNKNOWN_MODEL_CONTEXT_WINDOW_MAX_TOKENS = 1_000_000;
+const UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS_DEFAULT = 16384;
 // OpenAI model metadata can omit context capacity even though current
 // generation models support substantially more than the operational 16K
 // efficiency target. Keep that target as telemetry/selection guidance while
 // using a conservative provider-profile minimum for hard output feasibility.
 const OPENAI_PROVIDER_PROFILE_CONTEXT_MIN_TOKENS = 65536;
-const OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS = 4096;
-const OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS = 1_000_000;
-const OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS = 16384;
-const OPENWEBUI_UNKNOWN_CONTEXT_OPERATIONAL_TOKENS = OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS;
 const OPENWEBUI_CONTEXT_COLD_LOAD_WINDOW_MS = 120 * 1000;
 const OPENWEBUI_ALLOCATION_POLL_INTERVAL_MS = 5 * 1000;
 const OPENWEBUI_ALLOCATION_POLL_SAMPLE_LIMIT = 32;
@@ -1654,6 +1652,7 @@ const DEFAULT_SETTINGS = {
   fallbackAiModelProvider: "openai",
   aiOperationModels: {},
   embeddingModelReference: null,
+  embeddingDimensionOverrides: { "openai:text-embedding-3-large": 1024 },
   embeddingProvider: "openai",
   multiProviderModelMigrationVersion: 0,
   openrouterApiKey: "",
@@ -1664,7 +1663,6 @@ const DEFAULT_SETTINGS = {
   openrouterModelsFetchedAt: "",
   openrouterMetadataFingerprint: "",
   openrouterMetadataRevision: 0,
-  openrouterEmbeddingDimensions: 0,
   manualProviderGenerationModels: { openai: [], gemini: [], openrouter: ["openrouter/free"], openwebui: [] },
   manualProviderEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [] },
   openwebuiBaseUrl: "",
@@ -1681,13 +1679,11 @@ const DEFAULT_SETTINGS = {
   openwebuiModelMetadata: {},
   openwebuiThinkingMode: DEFAULT_OPENWEBUI_THINKING_MODE,
   openwebuiManualContextWindows: {},
-  openwebuiUnknownContextWindowTokens: OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS,
   openwebuiModelLoadTimeoutMs: OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS,
   openwebuiModelLoadTimeoutMigrationVersion: 0,
   openwebuiModelConcurrencyLimits: {},
   openwebuiWorkerCount: 1,
   openwebuiModelsFetchedAt: "",
-  openwebuiEmbeddingDimensions: 0,
   // Discovery APIs do not expose the same model capabilities. Keep provider
   // metadata separate so limits are never inferred across providers.
   openaiModelMetadata: {},
@@ -1701,9 +1697,8 @@ const DEFAULT_SETTINGS = {
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   debugDiagnosticsEnabled: false,
-  chatMode: "Vault QA",
+  unknownModelContextWindowTokens: UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS_DEFAULT,
   embeddingModel: "text-embedding-3-large",
-  openAiEmbeddingDimensions: 1024,
   availableChatModels: ["gpt-5.6-luna", "gpt-5.6-terra"],
   availableEmbeddingModels: ["text-embedding-3-large"],
   availableGeminiModels: ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
@@ -3881,6 +3876,56 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    // One-way 0.8.4 normalization: context and embedding dimensions are now
+    // provider-neutral exact-model settings. Legacy keys are consumed once,
+    // then removed so current runtime code never reads the old representation.
+    const hasCurrentUnknownContext = Object.prototype.hasOwnProperty.call(this.settings, "unknownModelContextWindowTokens");
+    const hasLegacyUnknownContext = Object.prototype.hasOwnProperty.call(this.settings, "openwebuiUnknownContextWindowTokens");
+    const currentUnknownContext = this.settings.unknownModelContextWindowTokens;
+    const legacyUnknownContext = hasLegacyUnknownContext
+      && (!hasCurrentUnknownContext || Number(currentUnknownContext) === UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS_DEFAULT)
+      ? this.settings.openwebuiUnknownContextWindowTokens
+      : currentUnknownContext;
+    const normalizedUnknownContext = normalizeUnknownModelContextWindowTokens(legacyUnknownContext);
+    if (this.settings.unknownModelContextWindowTokens !== normalizedUnknownContext) {
+      this.settings.unknownModelContextWindowTokens = normalizedUnknownContext;
+      changed = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(this.settings, "openwebuiUnknownContextWindowTokens")) {
+      delete this.settings.openwebuiUnknownContextWindowTokens;
+      changed = true;
+    }
+    const embeddingReference = typeof STS_MULTI_PROVIDER !== "undefined"
+      ? STS_MULTI_PROVIDER.embeddingModelReference(this.settings)
+      : { provider: this.settings.embeddingProvider || aiProviderForModel(this.settings.embeddingModel), model: this.settings.embeddingModel };
+    const normalizedOverrides = normalizeEmbeddingDimensionOverrides(this.settings.embeddingDimensionOverrides);
+    const legacyDimensionByProvider = {
+      openai: this.settings.openAiEmbeddingDimensions,
+      openrouter: this.settings.openrouterEmbeddingDimensions,
+      openwebui: this.settings.openwebuiEmbeddingDimensions
+    };
+    const selectedKey = normalizeEmbeddingDimensionOverrideKey(embeddingReference?.provider, embeddingReference?.model);
+    const legacyDimension = Number(legacyDimensionByProvider[embeddingReference?.provider]);
+    const existingDimension = Number(normalizedOverrides[selectedKey]);
+    const defaultDimension = Number(DEFAULT_SETTINGS.embeddingDimensionOverrides?.[selectedKey]);
+    const canMigrateLegacyDimension = Number.isSafeInteger(legacyDimension)
+      && legacyDimension > 0
+      && legacyDimension <= 32768
+      && (!Number.isSafeInteger(existingDimension) || existingDimension <= 0 || existingDimension === defaultDimension);
+    if (selectedKey && canMigrateLegacyDimension && existingDimension !== legacyDimension) {
+      normalizedOverrides[selectedKey] = legacyDimension;
+      changed = true;
+    }
+    if (JSON.stringify(this.settings.embeddingDimensionOverrides || {}) !== JSON.stringify(normalizedOverrides)) {
+      this.settings.embeddingDimensionOverrides = normalizedOverrides;
+      changed = true;
+    }
+    for (const legacyKey of ["openAiEmbeddingDimensions", "openrouterEmbeddingDimensions", "openwebuiEmbeddingDimensions", "chatMode"]) {
+      if (Object.prototype.hasOwnProperty.call(this.settings, legacyKey)) {
+        delete this.settings[legacyKey];
+        changed = true;
+      }
+    }
     // One-way OpenWebUI timeout migration. Release versions that persisted
     // the former exact defaults (120s/180s) are upgraded to the current 240s
     // default once; a marker preserves genuinely custom values and makes the
@@ -3956,15 +4001,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const retrievalDefaults = migrateRetrievalDefaultSettings(this.settings);
     for (const [key, value] of Object.entries(retrievalDefaults)) {
       this.settings[key] = value;
-      changed = true;
-    }
-    const normalizedEmbeddingDimensions = normalizeOpenAiEmbeddingDimensions(
-      this.settings.openAiEmbeddingDimensions,
-      this.settings.embeddingModel
-    );
-    if (supportsOpenAiEmbeddingDimensions(this.settings.embeddingModel)
-      && Number(this.settings.openAiEmbeddingDimensions) !== normalizedEmbeddingDimensions) {
-      this.settings.openAiEmbeddingDimensions = normalizedEmbeddingDimensions;
       changed = true;
     }
     if (!this.settings.chatModel) {
@@ -5912,18 +5948,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return loadIndex;
     }
     return false;
-  }
-
-  async setOpenAiEmbeddingDimensions(value) {
-    const next = normalizeOpenAiEmbeddingDimensions(value, this.settings.embeddingModel);
-    if (!next || Number(this.settings.openAiEmbeddingDimensions) === next) return false;
-    this.settings.openAiEmbeddingDimensions = next;
-    this.queryEmbeddingCache?.clear?.();
-    this.taskDeduplicationEmbeddingCache?.clear?.();
-    this.invalidateSemanticRetrievalCache();
-    this.semanticIndexPathMetaSnapshotFingerprint = "";
-    await this.saveSettings();
-    return true;
   }
 
   async setLegacyTodoistIdMode(value) {
@@ -16788,8 +16812,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     }
     this.refreshProviderStorageSummaries();
 
-    settingsHeading(containerEl, "Sidebar", "Choose how the sidebar starts and where it opens.");
-    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
+    settingsHeading(containerEl, "Sidebar", "Choose where the sidebar opens and which active-note context is included.");
     dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
     numberSetting(containerEl, "Chat font size", this.plugin, "chatFontSizePx");
     toggleSetting(containerEl, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
@@ -16803,18 +16826,16 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Runtime work coordinator workers", this.plugin, "runtimeWorkerCount");
     numberSetting(containerEl, "Same-model AI call concurrency", this.plugin, "aiModelConcurrency");
 
-    settingsHeading(containerEl, "Advanced indexing", "Advanced embedding and indexing limits. Rebuild after changing dimensions or chunking settings.");
-    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
-    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
+    settingsHeading(containerEl, "Advanced indexing", "Advanced indexing limits and chunking settings. Rebuild after changing chunking or precision settings.");
     numberSetting(containerEl, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
     numberSetting(containerEl, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
-    numberSetting(containerEl, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
     toggleSetting(containerEl, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
     numberSetting(containerEl, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
 
     settingsHeading(containerEl, "Context and prompt templates", "Choose context limits and reusable prompt actions.");
     numberSetting(containerEl, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
     numberSetting(containerEl, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
+    unknownModelContextWindowSetting(containerEl, this.plugin);
     textSetting(containerEl, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
     taskGenerationPromptTemplateSetting(containerEl, this.plugin);
     new Setting(containerEl).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
@@ -17904,7 +17925,7 @@ const SETTING_DESCRIPTIONS = {
   enableAiModelFallback: "Global gate for every provider and AI operation. When off, all operations stay primary-only while saved fallback provider/model selections are preserved.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
-  openAiEmbeddingDimensions: "Stored and queried dimensions for OpenAI text-embedding-3 indexes. The mobile-safe default is 1024. Changing this value requires a semantic-index rebuild; unsupported embedding models keep their native dimensions.",
+  unknownModelContextWindowTokens: "Provider-neutral positive integer estimate used only when exact model metadata, an exact model override, and any documented provider profile are unavailable; exact metadata and overrides take precedence.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
   workerToken: "Required only for Email-To-Todoist. This shared secret authorizes Obsidian to read queued emails from your Worker.",
@@ -18280,27 +18301,29 @@ function numberSetting(containerEl, name, plugin, key) {
   });
 }
 
-function openAiEmbeddingDimensionSetting(containerEl, plugin) {
-  const model = plugin.settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
-  if (!supportsOpenAiEmbeddingDimensions(model)) return;
-  const nativeDimension = openAiEmbeddingNativeDimension(model);
-  const current = normalizeOpenAiEmbeddingDimensions(plugin.settings.openAiEmbeddingDimensions, model);
-  const compatibility = semanticEmbeddingIndexCompatibility(plugin.settings, plugin.settings.semanticIndexMeta || {});
-  const suffix = compatibility.migrationRequired
-    ? ` The current index is ${compatibility.indexedDimension}d and remains available until a ${current}d rebuild succeeds.`
-    : "";
-  new Setting(containerEl)
-    .setName("OpenAI embedding dimensions")
-    .setDesc(`${SETTING_DESCRIPTIONS.openAiEmbeddingDimensions} Valid range for ${model}: 256-${nativeDimension}.${suffix}`)
-    .addText((text) => {
-      text.inputEl.type = "number";
-      text.inputEl.min = "256";
-      text.inputEl.max = String(nativeDimension);
-      text.inputEl.step = "1";
-      text.setValue(String(current)).onChange(async (value) => {
-        await plugin.setOpenAiEmbeddingDimensions(value);
-      });
+function unknownModelContextWindowSetting(containerEl, plugin) {
+  const setting = new Setting(containerEl)
+    .setName("Unknown model context window")
+    .setDesc("Provider-neutral positive integer estimate used only when exact model metadata, an exact model override, and any documented provider profile are unavailable; exact metadata and overrides take precedence. Editing allows an empty/intermediate value and saves the bounded value on blur.");
+  setting.settingEl?.addClass?.("semantic-todoist-unknown-context-setting");
+  setting.addText((text) => {
+    text.inputEl.type = "number";
+    text.inputEl.min = String(UNKNOWN_MODEL_CONTEXT_WINDOW_MIN_TOKENS);
+    text.inputEl.max = String(UNKNOWN_MODEL_CONTEXT_WINDOW_MAX_TOKENS);
+    text.inputEl.step = "1";
+    text.inputEl.setAttribute("aria-label", "Unknown model context window tokens");
+    text.inputEl.addClass?.("semantic-todoist-unknown-model-context-input");
+    text.setValue(String(unknownModelContextWindowTokens(plugin.settings || DEFAULT_SETTINGS)));
+    let pending = text.inputEl.value;
+    text.inputEl.addEventListener("input", () => { pending = text.inputEl.value; });
+    text.inputEl.addEventListener("blur", async () => {
+      const next = normalizeUnknownModelContextWindowTokens(pending);
+      plugin.settings.unknownModelContextWindowTokens = next;
+      text.setValue(String(next));
+      await plugin.saveSettings();
     });
+  });
+  return setting;
 }
 
 function timeSetting(containerEl, name, desc, plugin, key) {
@@ -18384,11 +18407,14 @@ function taskSectionTitleModeSetting(containerEl, plugin) {
 }
 
 function toggleSetting(containerEl, name, desc, plugin, key, afterChange = null) {
-  new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc)).addToggle((toggle) => toggle.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
+  const setting = new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc));
+  setting.settingEl?.addClass?.("semantic-todoist-toggle-setting");
+  setting.addToggle((toggle) => toggle.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
     plugin.settings[key] = value;
     await plugin.saveSettings();
     if (typeof afterChange === "function") await afterChange(value);
   }));
+  return setting;
 }
 
 function dropdownSetting(containerEl, name, plugin, key, options) {
@@ -41385,17 +41411,50 @@ function openWebUIModelContextValue(metadata = {}) {
   return openWebUIPositiveContextValue(metadata.effectiveContextWindowTokens || metadata.context_length);
 }
 
-function normalizeOpenWebUIUnknownContextWindowTokens(value) {
+function normalizeUnknownModelContextWindowTokens(value) {
   const number = Number(value);
   return Number.isSafeInteger(number)
-    && number >= OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS
-    && number <= OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS
+    && number >= UNKNOWN_MODEL_CONTEXT_WINDOW_MIN_TOKENS
+    && number <= UNKNOWN_MODEL_CONTEXT_WINDOW_MAX_TOKENS
     ? number
-    : OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS;
+    : UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS_DEFAULT;
 }
 
-function openWebUIUnknownContextWindowTokens(settings = {}) {
-  return normalizeOpenWebUIUnknownContextWindowTokens(settings?.openwebuiUnknownContextWindowTokens);
+function unknownModelContextWindowTokens(settings = {}) {
+  return normalizeUnknownModelContextWindowTokens(settings?.unknownModelContextWindowTokens);
+}
+
+function normalizeEmbeddingDimensionOverrideKey(provider = "", model = "") {
+  const normalizedProvider = typeof STS_MULTI_PROVIDER !== "undefined"
+    ? STS_MULTI_PROVIDER.normalizeProvider(provider, "")
+    : normalizeAiProvider(provider, "");
+  const normalizedModel = typeof STS_MULTI_PROVIDER !== "undefined"
+    ? STS_MULTI_PROVIDER.normalizeModel(normalizedProvider, model)
+    : String(model || "").trim();
+  return normalizedProvider && normalizedModel ? `${normalizedProvider}:${normalizedModel.toLowerCase()}` : "";
+}
+
+function normalizeEmbeddingDimensionOverrides(value = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const normalized = {};
+  for (const [key, raw] of Object.entries(source).slice(0, 128)) {
+    const separator = String(key || "").indexOf(":");
+    if (separator <= 0) continue;
+    const normalizedKey = normalizeEmbeddingDimensionOverrideKey(key.slice(0, separator), key.slice(separator + 1));
+    const dimension = Number(raw);
+    if (!normalizedKey || !Number.isSafeInteger(dimension) || dimension <= 0 || dimension > 32768) continue;
+    normalized[normalizedKey] = dimension;
+  }
+  return normalized;
+}
+
+function embeddingDimensionOverride(settings = {}, provider = "", model = "") {
+  if (typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.embeddingDimensionOverride === "function") {
+    try { return STS_MULTI_PROVIDER.embeddingDimensionOverride(settings, provider, model); } catch {}
+  }
+  const key = normalizeEmbeddingDimensionOverrideKey(provider, model);
+  const value = normalizeEmbeddingDimensionOverrides(settings?.embeddingDimensionOverrides)[key];
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 function normalizeOpenWebUIModelLoadTimeoutMs(value) {
@@ -42080,15 +42139,13 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
     ? String((limits.contextSource && limits.contextSource !== "unknown") ? limits.contextSource : limits.source || "provider-metadata")
     : profiled
       ? "openai-provider-profile"
-    : "unknown";
+      : "unknown";
   const contextFraction = contextWindowTokens <= 4096
     ? 0.8
     : contextWindowTokens >= 100000
       ? 0.5
       : 0.8 - 0.3 * ((contextWindowTokens - 4096) / (100000 - 4096));
-  const unknownOperationalTokens = normalizedProvider === "openwebui"
-    ? openWebUIUnknownContextWindowTokens(settings)
-    : CHAT_PROVIDER_UNKNOWN_INPUT_BUDGET_TOKENS;
+  const unknownOperationalTokens = unknownModelContextWindowTokens(settings);
   const curveCeilingTokens = capacityKnown ? Math.max(0, Math.floor(contextWindowTokens * contextFraction)) : unknownOperationalTokens;
   const providerInputLimitTokens = Math.max(0, Math.floor(Number(limits.inputTokenLimitTokens || 0)));
   const operationalInputLimitTokens = capacityKnown
@@ -42111,7 +42168,7 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
     usableInputTokens: operationalInputLimitTokens,
     adaptiveTargetInputTokens: curveCeilingTokens,
     contextWindowKnown: known,
-    contextSource: known || profiled ? contextSource : normalizedProvider === "openwebui" ? "openwebui-operational-fallback" : contextSource,
+    contextSource: known || profiled ? contextSource : "unknown-model-context-setting",
     contextValueKind: profiled ? "provider-profile" : limits.contextValueKind,
     source: known ? String(limits.source || "provider-metadata") : profiled ? contextSource : "unknown",
     unknownReason: known || profiled ? "" : String(limits.unknownReason || "provider-discovery-did-not-report-context-limits"),
@@ -45784,7 +45841,7 @@ function semanticIndexPartitionContract(settings = {}, options = {}) {
     : null;
   const provider = semanticIndexPartitionProvider(options.provider || configuredReference?.provider || meta.provider || semanticEmbeddingProviderForSettings(settings));
   const model = semanticIndexPartitionModel(provider, options.model || configuredReference?.model || meta.model || settings.embeddingModel || "");
-  const configuredDimension = Math.max(0, Number(options.configuredDimension || meta.targetDimension || semanticEmbeddingRequestDimension(settings, "document", meta) || (provider === "openwebui" ? settings.openwebuiEmbeddingDimensions : provider === "openrouter" ? settings.openrouterEmbeddingDimensions : settings.openAiEmbeddingDimensions) || 0));
+  const configuredDimension = Math.max(0, Number(options.configuredDimension || meta.targetDimension || embeddingDimensionOverride(settings, provider, model) || semanticEmbeddingRequestDimension(settings, "document", meta) || 0));
   const candidateActual = Number(options.actualDimension || meta.actualDimension || (meta.provider && modelIdentity(meta.model) === modelIdentity(model) && semanticIndexPartitionProvider(meta.provider) === provider ? meta.dimension : 0));
   const actualDimension = Math.max(0, Number(candidateActual || options.dimension || 0));
   const precision = Math.max(0, Number(options.precision || meta.embeddingPrecision || settings.semanticIndexEmbeddingPrecision || 0));
@@ -46017,24 +46074,32 @@ function supportsOpenAiEmbeddingDimensions(model = "") {
 function normalizeOpenAiEmbeddingDimensions(value, model = DEFAULT_SETTINGS.embeddingModel) {
   const nativeDimension = openAiEmbeddingNativeDimension(model);
   if (!nativeDimension) return 0;
-  const fallback = Math.min(nativeDimension, Number(DEFAULT_SETTINGS.openAiEmbeddingDimensions || 1024));
+  const fallback = Math.min(nativeDimension, 1024);
   const parsed = Math.round(Number(value));
   return Math.min(nativeDimension, Math.max(256, Number.isFinite(parsed) && parsed > 0 ? parsed : fallback));
 }
 function semanticEmbeddingTargetDimension(settings = DEFAULT_SETTINGS, model = settings.embeddingModel) {
-  if (!supportsOpenAiEmbeddingDimensions(model)) return 0;
-  return normalizeOpenAiEmbeddingDimensions(settings.openAiEmbeddingDimensions, model);
+  const provider = semanticEmbeddingProviderForSettings(settings, model);
+  const override = embeddingDimensionOverride(settings, provider, model);
+  const capability = typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.embeddingModelCapability === "function"
+    ? STS_MULTI_PROVIDER.embeddingModelCapability(settings, provider, model)
+    : null;
+  if (override > 0 && capability?.dimensionsConfigurable === true) return provider === "openai" && supportsOpenAiEmbeddingDimensions(model)
+    ? normalizeOpenAiEmbeddingDimensions(override, model)
+    : override;
+  return 0;
 }
 function semanticEmbeddingRequestDimension(settings = DEFAULT_SETTINGS, role = "document", meta = settings.semanticIndexMeta || {}) {
-  const model = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  const reference = typeof STS_MULTI_PROVIDER !== "undefined" ? STS_MULTI_PROVIDER.embeddingModelReference(settings) : null;
+  const provider = reference?.provider || semanticEmbeddingProviderForSettings(settings, settings.embeddingModel);
+  const model = reference?.model || settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
   const targetDimension = semanticEmbeddingTargetDimension(settings, model);
   if (!targetDimension) return 0;
   if (role !== "query") return targetDimension;
-  const indexedModel = normalizeOpenAIModelId(meta?.model || model);
-  const currentModel = normalizeOpenAIModelId(model);
+  const indexedModel = String(meta?.model || model).trim();
+  const currentModel = String(model || "").trim();
   const indexedDimension = Number(meta?.dimension || 0);
-  const nativeDimension = openAiEmbeddingNativeDimension(model);
-  if (indexedModel === currentModel && indexedDimension >= 256 && indexedDimension <= nativeDimension) return indexedDimension;
+  if (modelIdentity(indexedModel) === modelIdentity(currentModel) && indexedDimension > 0) return indexedDimension;
   return targetDimension;
 }
 function semanticMaterialityAnchorFingerprint(kind) {
@@ -48234,9 +48299,6 @@ const STS_MULTI_PROVIDER = (() => {
   // boundary as well as in the runtime helpers above.  Provider-only harnesses
   // evaluate this IIFE without the surrounding bundle, so exported settings
   // and allocation-poller functions must not depend on outer lexical state.
-  const OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS = 4096;
-  const OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS = 1_000_000;
-  const OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS = 16384;
   const OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS = 120 * 1000;
   const OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS = 600 * 1000;
   const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 240 * 1000;
@@ -48246,15 +48308,15 @@ const STS_MULTI_PROVIDER = (() => {
     const normalized = nonEmpty(value).toLowerCase();
     return OPENWEBUI_THINKING_MODE_VALUES.includes(normalized) ? normalized : DEFAULT_OPENWEBUI_THINKING_MODE;
   };
-  const normalizeOpenWebUIUnknownContextWindowTokens = (value) => {
+  const normalizeUnknownModelContextWindowTokens = (value) => {
     const number = Number(value);
     return Number.isSafeInteger(number)
-      && number >= OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS
-      && number <= OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS
+      && number >= 4096
+      && number <= 1_000_000
       ? number
-      : OPENWEBUI_DEFAULT_UNKNOWN_CONTEXT_TOKENS;
+      : 16384;
   };
-  const openWebUIUnknownContextWindowTokens = (settings = {}) => normalizeOpenWebUIUnknownContextWindowTokens(settings?.openwebuiUnknownContextWindowTokens);
+  const unknownModelContextWindowTokens = (settings = {}) => normalizeUnknownModelContextWindowTokens(settings?.unknownModelContextWindowTokens ?? settings?.openwebuiUnknownContextWindowTokens);
   const normalizeOpenWebUIModelLoadTimeoutMs = (value) => {
     const number = Number(value);
     return Number.isSafeInteger(number)
@@ -48591,6 +48653,63 @@ const STS_MULTI_PROVIDER = (() => {
   // Retain the old exported name for current harnesses while routing every
   // provider through the role-aware helper.
   const generationModelCapability = modelRoleCapability;
+  const builtInEmbeddingProfile = (provider, model) => {
+    const normalizedProvider = normalizeProvider(provider, "");
+    const normalizedModel = normalizeModel(normalizedProvider, model);
+    if (normalizedProvider !== "openai" || !normalizedModel) return null;
+    if (/^text-embedding-3(?:-|$)/i.test(normalizedModel)) {
+      const nativeDimension = normalizedModel.toLowerCase() === "text-embedding-3-large" ? 3072 : normalizedModel.toLowerCase() === "text-embedding-3-small" ? 1536 : 0;
+      return { role: "supported", source: "openai-official-embedding-profile", nativeDimension, dimensionsConfigurable: true, dimensionReason: "OpenAI text-embedding-3 models support dimensions." };
+    }
+    if (/^text-embedding-/i.test(normalizedModel)) {
+      return { role: "supported", source: "openai-official-embedding-profile", nativeDimension: 0, dimensionsConfigurable: false, dimensionReason: "This OpenAI embedding model uses its native result dimension." };
+    }
+    return null;
+  };
+  const embeddingModelCapability = (settings = {}, provider, model) => {
+    const normalizedProvider = normalizeProvider(provider, "");
+    const normalizedModel = normalizeModel(normalizedProvider, model);
+    const role = modelRoleCapability(settings, normalizedProvider, normalizedModel);
+    const profile = builtInEmbeddingProfile(normalizedProvider, normalizedModel);
+    const metadata = normalizedProvider === "openrouter"
+      ? settings.openrouterEmbeddingModelMetadata?.[normalizedModel] || settings.openrouterModelMetadata?.[normalizedModel] || {}
+      : normalizedProvider === "openwebui"
+        ? settings.openwebuiModelMetadata?.[normalizedModel] || {}
+        : normalizedProvider === "gemini"
+          ? settings.geminiModelMetadata?.[normalizedModel] || {}
+          : settings.openaiModelMetadata?.[normalizedModel] || {};
+    const supportedParameters = Array.isArray(metadata?.supported_parameters)
+      ? metadata.supported_parameters.map((value) => nonEmpty(value).toLowerCase())
+      : [];
+    const dimension = Number(metadata?.embedding_length || metadata?.embeddingLength || metadata?.embedding_dimension || metadata?.embeddingDimension || metadata?.output_dimension || metadata?.outputDimension || metadata?.output_dimensions || metadata?.dimensions || metadata?.dimension || metadata?.architecture?.embedding_length || metadata?.architecture?.embeddingLength || metadata?.architecture?.output_dimensions || metadata?.architecture?.dimensions || 0);
+    const inputLimit = Number(metadata?.inputTokenLimit || metadata?.input_token_limit || metadata?.inputTokenLimitTokens || metadata?.input_tokens || 0);
+    const contextLimit = Number(metadata?.context_length || metadata?.contextWindow || metadata?.contextWindowTokens || 0);
+    const embeddingSupported = profile?.role === "supported"
+      ? true
+      : profile?.role === "unsupported"
+        ? false
+        : role.embedding;
+    const dimensionsConfigurable = profile?.dimensionsConfigurable === true
+      ? true
+      : ["openrouter", "openwebui"].includes(normalizedProvider) && supportedParameters.some((value) => ["dimensions", "output_dimensions"].includes(value))
+        ? true
+        : typeof metadata?.dimensionsConfigurable === "boolean" ? metadata.dimensionsConfigurable : false;
+    const source = profile?.source || nonEmpty(metadata?.source || metadata?.metadataSource || metadata?.roleCapabilitySource) || role.source || "unknown";
+    return Object.freeze({
+      provider: normalizedProvider,
+      model: normalizedModel,
+      role: embeddingSupported === true ? "supported" : embeddingSupported === false ? "unsupported" : "unknown",
+      embeddingSupported,
+      source,
+      inputTokenLimit: Number.isSafeInteger(inputLimit) && inputLimit > 0 ? inputLimit : 0,
+      contextWindowTokens: Number.isSafeInteger(contextLimit) && contextLimit > 0 ? contextLimit : 0,
+      nativeDimension: profile?.nativeDimension || (Number.isSafeInteger(dimension) && dimension > 0 ? dimension : 0),
+      resultDimension: profile?.nativeDimension || (Number.isSafeInteger(dimension) && dimension > 0 ? dimension : 0),
+      dimensionsConfigurable,
+      dimensionReason: profile?.dimensionReason || (dimensionsConfigurable ? "Provider metadata confirms output dimensions." : dimension > 0 ? "The provider reports a native/result dimension; custom output is not confirmed." : "Custom output dimension is not reported."),
+      reported: Object.freeze(role.reported || [])
+    });
+  };
   const modelRoleFromCatalogRow = (row = {}) => {
     const capabilities = row.capabilities && typeof row.capabilities === "object" && !Array.isArray(row.capabilities) ? row.capabilities : {};
     if (typeof capabilities.generation === "boolean" || typeof capabilities.embedding === "boolean") {
@@ -49237,6 +49356,25 @@ const STS_MULTI_PROVIDER = (() => {
     migrated.embeddingProvider = normalized.provider;
     migrated.embeddingModel = normalized.model;
     return migrated;
+  };
+  const normalizeEmbeddingDimensionOverrides = (value = {}) => {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const normalized = {};
+    for (const [key, raw] of Object.entries(source).slice(0, 128)) {
+      const separator = nonEmpty(key).indexOf(":");
+      if (separator <= 0) continue;
+      const provider = normalizeProvider(key.slice(0, separator), "");
+      const model = normalizeModel(provider, key.slice(separator + 1));
+      const dimension = Number(raw);
+      if (!provider || !model || !Number.isSafeInteger(dimension) || dimension <= 0 || dimension > 32768) continue;
+      normalized[modelIdentity(provider, model)] = dimension;
+    }
+    return normalized;
+  };
+  const embeddingDimensionOverride = (settings = {}, provider, model) => {
+    const key = modelIdentity(provider, model);
+    const value = normalizeEmbeddingDimensionOverrides(settings.embeddingDimensionOverrides)[key];
+    return Number.isSafeInteger(value) && value > 0 ? value : 0;
   };
   const operationRequest = (settings = {}, operation = "chat-query", request = {}) => {
     const reference = operationModelReference(settings, operation);
@@ -50435,7 +50573,8 @@ const STS_MULTI_PROVIDER = (() => {
     normalized.availableOpenWebUIEmbeddingModels = unique(normalized.availableOpenWebUIEmbeddingModels || []);
     normalized.openwebuiModelMetadata = normalizeOpenWebUIModelMetadata(normalized.openwebuiModelMetadata);
     normalized.openwebuiManualContextWindows = normalizeOpenWebUIManualContextWindows(normalized.openwebuiManualContextWindows);
-    normalized.openwebuiUnknownContextWindowTokens = normalizeOpenWebUIUnknownContextWindowTokens(normalized.openwebuiUnknownContextWindowTokens);
+    normalized.unknownModelContextWindowTokens = normalizeUnknownModelContextWindowTokens(normalized.unknownModelContextWindowTokens ?? normalized.openwebuiUnknownContextWindowTokens);
+    delete normalized.openwebuiUnknownContextWindowTokens;
     normalized.openwebuiModelLoadTimeoutMs = normalizeOpenWebUIModelLoadTimeoutMs(normalized.openwebuiModelLoadTimeoutMs);
     normalized.openwebuiModelConcurrencyLimits = normalizeOpenWebUIModelConcurrencyLimits(normalized.openwebuiModelConcurrencyLimits);
     normalized.openwebuiWorkerCount = normalizeOpenWebUIWorkerCount(normalized.openwebuiWorkerCount);
@@ -52077,7 +52216,7 @@ const STS_MULTI_PROVIDER = (() => {
     if (!model || !model.includes("/")) throw providerError("openrouter", null, "model-required");
     const capabilities = openRouterCapabilities(settings, model);
     const rateProfile = openRouterRateLimitProfile(settings, model);
-    const dimension = Math.max(0, Number(settings.openrouterEmbeddingDimensions || 0));
+    const dimension = capabilities.dimensions === true ? embeddingDimensionOverride(settings, "openrouter", model) : 0;
     const body = { model, input: values };
     // OpenRouter optional embedding fields are sent only when discovery
     // explicitly advertises the parameter. Unknown capabilities must not
@@ -53533,7 +53672,9 @@ const STS_MULTI_PROVIDER = (() => {
     } : {});
     const contextLength = openWebUIContextValueFromModelInfo(payload);
     if (contextLength) openWebUIApplyModelContextMetadata(metadata, key, contextLength, "openwebui-api-model-limit");
-    return { capabilities, role, contextLength };
+    const embeddingLength = openWebUIEmbeddingLengthFromModelInfo(payload);
+    if (embeddingLength) metadata[key] = Object.assign({}, metadata[key] || {}, { embedding_length: embeddingLength });
+    return { capabilities, role, contextLength, embeddingLength };
   };
   const openWebUIContextValueFromModelInfo = (payload = {}) => {
     const modelInfo = payload?.model_info && typeof payload.model_info === "object" ? payload.model_info : {};
@@ -53549,6 +53690,29 @@ const STS_MULTI_PROVIDER = (() => {
       for (const [key, child] of Object.entries(value).slice(0, 64)) {
         const normalizedKey = String(key || "").toLowerCase();
         if (normalizedKey === "context_length" || /(?:^|[._-])context_length$/.test(normalizedKey)) values.push(openWebUIPositiveContextValue(child));
+        if (child && typeof child === "object") walk(child, depth + 1);
+      }
+    };
+    walk(modelInfo);
+    return values.find(Boolean) || 0;
+  };
+  const openWebUIEmbeddingLengthFromModelInfo = (payload = {}) => {
+    const modelInfo = payload?.model_info && typeof payload.model_info === "object" ? payload.model_info : {};
+    const values = [];
+    let visited = 0;
+    const walk = (value, depth = 0) => {
+      if (visited >= 160 || depth > 6 || value === null || typeof value !== "object") return;
+      visited += 1;
+      if (Array.isArray(value)) {
+        for (const entry of value.slice(0, 24)) walk(entry, depth + 1);
+        return;
+      }
+      for (const [key, child] of Object.entries(value).slice(0, 64)) {
+        const normalizedKey = String(key || "").toLowerCase();
+        if (normalizedKey === "embedding_length" || /(?:^|[._-])embedding_length$/.test(normalizedKey)) {
+          const number = typeof child === "number" ? child : Number(nonEmpty(child));
+          if (Number.isSafeInteger(number) && number > 0 && number <= 1_000_000) values.push(number);
+        }
         if (child && typeof child === "object") walk(child, depth + 1);
       }
     };
@@ -53857,8 +54021,11 @@ const STS_MULTI_PROVIDER = (() => {
     const model = normalizeModel("openwebui", settings.embeddingModel);
     if (!model) throw providerError("openwebui", null, "model-required");
     const body = { model, input: values, truncate: false };
-    const dimension = Math.max(0, Number(settings.openwebuiEmbeddingDimensions || 0));
-    if (dimension) body.dimensions = dimension;
+    const capability = typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.embeddingModelCapability === "function"
+      ? STS_MULTI_PROVIDER.embeddingModelCapability(settings, "openwebui", model)
+      : null;
+    const dimension = capability?.dimensionsConfigurable === true ? embeddingDimensionOverride(settings, "openwebui", model) : 0;
+    if (dimension && capability?.dimensionsConfigurable === true) body.dimensions = dimension;
     const response = await openWebUIRequest(auth, options, "POST", "/ollama/api/embed", body, {
       modelExecution: true,
       model,
@@ -53921,6 +54088,7 @@ const STS_MULTI_PROVIDER = (() => {
     providerDefaultModel,
     providerDefaultReasoning,
     modelRoleCapability,
+    embeddingModelCapability,
     generationModelCapability,
     normalizeProvider,
     normalizeModel,
@@ -53948,6 +54116,8 @@ const STS_MULTI_PROVIDER = (() => {
     setOperationReasoningReference,
     embeddingModelReference,
     setEmbeddingModelReference,
+    normalizeEmbeddingDimensionOverrides,
+    embeddingDimensionOverride,
     operationRequest,
     modelProfileForReference,
     normalizeOpenWebUIBaseUrl,
@@ -53955,8 +54125,8 @@ const STS_MULTI_PROVIDER = (() => {
     OPENWEBUI_THINKING_MODE_VALUES,
     normalizeOpenWebUISettings: openWebUISettings,
     normalizeOpenWebUIManualContextWindows,
-    normalizeOpenWebUIUnknownContextWindowTokens,
-    openWebUIUnknownContextWindowTokens,
+    normalizeUnknownModelContextWindowTokens,
+    unknownModelContextWindowTokens,
     normalizeOpenWebUIModelLoadTimeoutMs,
     openWebUIModelLoadTimeoutMs,
     normalizeOpenWebUIModelConcurrencyLimits,
@@ -54628,7 +54798,7 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
     || (!preflightUnknownFallback && preflight?.contextWindowKnown !== false && preflightContextWindowTokens > 0)
     || (!preflight && limitsContextWindowTokens > 0);
   const profileContextWindow = preflight?.contextWindowProfiled === true
-    || (!exactContextWindow && normalizedProviderForCapacity === "openai" && !preflightUnknownFallback && Boolean(String(model || "").trim()) && (Boolean(preflight) || limitsContextWindowTokens <= 0));
+    || (!exactContextWindow && !preflightUnknownFallback && normalizedProviderForCapacity === "openai" && Boolean(String(model || "").trim()) && (Boolean(preflight) || limitsContextWindowTokens <= 0));
   const contextWindowTokens = Math.max(
     0,
     preflightHardContextWindowTokens,
@@ -56914,11 +57084,7 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
   const gatewayPrototype = module.exports.prototype;
   const embeddingIdentity = (settings = {}) => {
     const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings) || {};
-    const dimension = reference.provider === "openrouter"
-      ? Math.max(0, Number(settings.openrouterEmbeddingDimensions || 0))
-      : reference.provider === "openwebui"
-        ? Math.max(0, Number(settings.openwebuiEmbeddingDimensions || 0))
-        : reference.provider === "openai" ? Math.max(0, Number(settings.openAiEmbeddingDimensions || 0)) : 0;
+    const dimension = embeddingDimensionOverride(settings, reference.provider, reference.model);
     return `${reference.provider || ""}:${reference.model || ""}:${dimension}`;
   };
   const invalidateOpenRouterMetadataCaches = (plugin) => {
@@ -57182,7 +57348,7 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     if (allocated) return { source: "openwebui-api-allocated", value: allocated };
     const manual = openWebUIPositiveContextValue(plugin?.settings?.openwebuiManualContextWindows?.[model]);
     if (manual) return { source: "openwebui-manual", value: manual };
-    return { source: "openwebui-operational-fallback", value: openWebUIUnknownContextWindowTokens(plugin?.settings || {}) };
+    return { source: "unknown-model-context-setting", value: unknownModelContextWindowTokens(plugin?.settings || {}) };
   };
   const openWebUIAllocationPollingSnapshot = (plugin, state = {}) => {
     const count = (value, max = 1_000_000) => Math.max(0, Math.min(max, Math.round(Number(value) || 0)));
@@ -58175,43 +58341,91 @@ function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) 
   });
 }
 
-function stsMpManualProviderModelsSetting(containerEl, plugin, key, name, desc) {
-  const values = plugin.settings?.[key] && typeof plugin.settings[key] === "object" ? plugin.settings[key] : {};
-  const flattened = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.flatMap((provider) => (values[provider] || []).map((model) => `${provider}:${model}`));
-  new Setting(containerEl)
-    .setName(name)
-    .setDesc(desc)
-    .addText((text) => {
-      text.setPlaceholder("provider:model, provider:model");
-      text.setValue(flattened.join(", "));
-      text.onChange(async (value) => {
-        const next = { openai: [], gemini: [], openrouter: [], openwebui: [] };
-        for (const token of String(value || "").split(",")) {
-          const parsed = stsMpParseProviderScopedValue(token.trim());
-          if (!parsed) continue;
-          if (!next[parsed.provider].includes(parsed.model)) next[parsed.provider].push(parsed.model);
-        }
-        plugin.settings[key] = next;
-        await plugin.saveSettings();
-      });
-    });
+function stsMpEmbeddingCapabilityRecord(settings = {}) {
+  const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings);
+  if (!reference) return Object.freeze({ provider: "", model: "", role: "unknown", source: "unknown", inputTokenLimit: 0, contextWindowTokens: 0, nativeDimension: 0, resultDimension: 0, dimensionsConfigurable: false, dimensionReason: "Select an exact provider:model to inspect capabilities." });
+  return STS_MULTI_PROVIDER.embeddingModelCapability(settings, reference.provider, reference.model);
 }
 
-function stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, provider, key) {
-  const name = `${STS_MULTI_PROVIDER.providerDisplayName(provider)} embedding dimension`;
-  const setting = new Setting(containerEl).setName(name).setDesc("0 uses the provider/native returned dimension; a positive value requests that dimension and becomes part of index compatibility.");
+function stsMpEmbeddingCapabilitySummary(record = {}) {
+  const role = record.role === "supported" ? "supported" : record.role === "unsupported" ? "unsupported" : "unknown";
+  const source = record.source || "unknown";
+  const limits = [
+    record.inputTokenLimit > 0 ? `input ${Number(record.inputTokenLimit).toLocaleString()} tokens` : "input limit not reported",
+    record.contextWindowTokens > 0 ? `context ${Number(record.contextWindowTokens).toLocaleString()} tokens` : "context limit not reported",
+    record.nativeDimension > 0 ? `native ${Number(record.nativeDimension).toLocaleString()}d` : "native dimension not reported",
+    record.resultDimension > 0 ? `result ${Number(record.resultDimension).toLocaleString()}d` : "result dimension not reported"
+  ];
+  const dimension = record.dimensionsConfigurable ? "custom dimensions supported" : `native/automatic dimensions (${record.dimensionReason || "custom output is not confirmed"})`;
+  return `Embedding role: ${role}. Source: ${source}. ${limits.join("; ")}. ${dimension}.`;
+}
+
+function stsMpEmbeddingDimensionOverrideSetting(containerEl, plugin, refreshDisplay = null) {
+  const settings = plugin.settings || DEFAULT_SETTINGS;
+  const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings);
+  const record = stsMpEmbeddingCapabilityRecord(settings);
+  if (!reference || record.dimensionsConfigurable !== true) {
+    const setting = new Setting(containerEl).setName("Embedding dimensions").setDesc(record.dimensionReason || "Native/automatic dimensions; the selected model has not confirmed custom output dimensions.");
+    setting.settingEl?.addClass?.("semantic-todoist-embedding-capability-summary");
+    return setting;
+  }
+  const key = normalizeEmbeddingDimensionOverrideKey(reference.provider, reference.model);
+  const current = embeddingDimensionOverride(settings, reference.provider, reference.model);
+  const setting = new Setting(containerEl)
+    .setName("Embedding dimensions")
+    .setDesc(`${record.dimensionReason || "Custom output dimensions are supported."} Exact-model override for ${reference.provider}:${reference.model}. Leave blank for native/automatic.`);
+  setting.settingEl?.addClass?.("semantic-todoist-embedding-dimension-setting");
   setting.addText((text) => {
     text.inputEl.type = "number";
-    text.inputEl.min = "0";
-    text.setValue(String(Math.max(0, Number(plugin.settings?.[key] || 0))));
-    text.onChange(async (value) => {
-      const dimension = Math.max(0, Math.round(Number(value) || 0));
-      plugin.settings[key] = dimension;
+    text.inputEl.min = "1";
+    if (record.nativeDimension > 0) text.inputEl.max = String(record.nativeDimension);
+    text.inputEl.step = "1";
+    text.inputEl.setAttribute("aria-label", "Embedding dimensions");
+    text.setValue(String(current || ""));
+    let pending = text.inputEl.value;
+    text.inputEl.addEventListener("input", () => { pending = text.inputEl.value; });
+    text.inputEl.addEventListener("blur", async () => {
+      const raw = String(pending || "").trim();
+      const overrides = normalizeEmbeddingDimensionOverrides(plugin.settings.embeddingDimensionOverrides);
+      const previous = overrides[key];
+      if (!raw) delete overrides[key];
+      else {
+        const parsed = Number(raw);
+        if (!Number.isSafeInteger(parsed) || parsed <= 0 || (record.nativeDimension > 0 && parsed > record.nativeDimension)) {
+          text.setValue(String(previous || ""));
+          pending = text.inputEl.value;
+          return;
+        }
+        overrides[key] = parsed;
+      }
+      if (previous === overrides[key] || (!previous && !Object.prototype.hasOwnProperty.call(overrides, key))) {
+        text.setValue(String(overrides[key] || ""));
+        pending = text.inputEl.value;
+        return;
+      }
+      plugin.settings.embeddingDimensionOverrides = overrides;
       plugin.queryEmbeddingCache?.clear?.();
+      plugin.taskDeduplicationEmbeddingCache?.clear?.();
       plugin.invalidateSemanticRetrievalCache?.();
       await plugin.saveSettings();
+      text.setValue(String(overrides[key] || ""));
+      pending = text.inputEl.value;
+      refreshDisplay?.();
     });
   });
+  return setting;
+}
+
+function stsMpRenderUnifiedEmbeddings(containerEl, plugin, refreshDisplay = null) {
+  settingsHeading(containerEl, "Embeddings", "One provider:model selector owns semantic-index compatibility, capability disclosure, dimensions, batching, and storage precision. Selection and editing make no provider call.");
+  stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay);
+  const summary = new Setting(containerEl)
+    .setName("Selected model capability")
+    .setDesc(stsMpEmbeddingCapabilitySummary(stsMpEmbeddingCapabilityRecord(plugin.settings || DEFAULT_SETTINGS)));
+  summary.settingEl?.addClass?.("semantic-todoist-embedding-capability-summary");
+  stsMpEmbeddingDimensionOverrideSetting(containerEl, plugin, refreshDisplay);
+  numberSetting(containerEl, "Embedding batch size", plugin, "embeddingBatchSize");
+  numberSetting(containerEl, "Storage precision", plugin, "semanticIndexEmbeddingPrecision");
 }
 
 const STS_MP_OPERATION_LABELS = Object.freeze({
@@ -58266,12 +58480,7 @@ function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay =
     stsMpFallbackModelSetting(body, plugin, operation, refreshDisplay, field("Fallback model", `${label} fallback model`));
     stsMpOperationReasoningSetting(body, plugin, operation, "fallback", refreshDisplay, field("Fallback reasoning", `${label} fallback reasoning`));
   });
-  settingsHeading(containerEl, "Embedding and manual provider catalogs", "Embedding selection, provider dimensions, and optional manual provider:model entries stay outside operation groups. These controls use the same searchable catalogs and persistence contracts.");
-  stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay);
-  stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, "openrouter", "openrouterEmbeddingDimensions");
-  stsMpProviderEmbeddingDimensionSetting(containerEl, plugin, "openwebui", "openwebuiEmbeddingDimensions");
-  stsMpManualProviderModelsSetting(containerEl, plugin, "manualProviderGenerationModels", "Manual generation models", "Optional provider:model entries retained in the grouped generation catalogs.");
-  stsMpManualProviderModelsSetting(containerEl, plugin, "manualProviderEmbeddingModels", "Manual embedding models", "Optional provider:model entries retained in the grouped embedding catalog.");
+  stsMpRenderUnifiedEmbeddings(containerEl, plugin, refreshDisplay);
 }
 
 function stsMpOpenWebUIContextRows(settings = {}) {
@@ -58332,13 +58541,12 @@ function stsMpRenderOpenWebUIContextSettings(containerEl, plugin) {
     const manual = settings.openwebuiManualContextWindows?.[selectedModel];
     const value = openWebUIOperationalContextValue(metadata) || openWebUIPositiveContextValue(manual);
     const modelContext = openWebUIModelContextValue(metadata);
-    const unknownFallback = openWebUIUnknownContextWindowTokens(settings);
     const source = openWebUIOperationalContextValue(metadata) > 0 ? metadata.contextSource : manual ? "openwebui-manual" : "unknown";
     effectiveValueSetting.setDesc(value > 0
       ? `${value.toLocaleString()} tokens (${stsMpOpenWebUIContextSourceLabel(source)}). Manual values and local estimates are not provider usage.`
       : modelContext > 0
         ? `Unknown allocation (${modelContext.toLocaleString()} token model maximum is informational only).`
-        : `Unknown (${stsMpOpenWebUIContextSourceLabel(source)}). Using ${unknownFallback.toLocaleString()} operational safety tokens; provider usage is reported only when returned by the provider.`);
+        : `Unknown (${stsMpOpenWebUIContextSourceLabel(source)}). Provider usage is reported only when returned by the provider.`);
   };
   stsMpSearchableCombobox(selectorSetting.controlEl, {
     accessibleLabel: "OpenWebUI context window model",
@@ -58377,26 +58585,6 @@ function stsMpRenderOpenWebUIContextSettings(containerEl, plugin) {
         map[selectedModel] = number;
       }
       plugin.settings.openwebuiManualContextWindows = STS_MULTI_PROVIDER.normalizeOpenWebUIManualContextWindows(map);
-      await plugin.saveSettings();
-      updateEffective();
-    });
-  });
-  const unknownFallbackSetting = new Setting(containerEl)
-    .setName("Unknown context fallback")
-    .setDesc(`Operational safety value used only when an active /ps allocation cannot be detected and no manual context is set. Allowed range: ${OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS.toLocaleString()}–${OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS.toLocaleString()} tokens.`);
-  unknownFallbackSetting.settingEl?.addClass?.("semantic-todoist-provider-setting");
-  unknownFallbackSetting.addText((text) => {
-    text.inputEl.type = "number";
-    text.inputEl.min = String(OPENWEBUI_UNKNOWN_CONTEXT_MIN_TOKENS);
-    text.inputEl.max = String(OPENWEBUI_UNKNOWN_CONTEXT_MAX_TOKENS);
-    text.inputEl.step = "1";
-    text.inputEl.setAttribute("aria-label", "Unknown OpenWebUI context fallback");
-    text.inputEl.addClass?.("semantic-todoist-openwebui-unknown-context-fallback-input");
-    text.setValue(String(openWebUIUnknownContextWindowTokens(currentSettings())));
-    text.onChange(async (value) => {
-      const next = normalizeOpenWebUIUnknownContextWindowTokens(value);
-      text.setValue(String(next));
-      plugin.settings.openwebuiUnknownContextWindowTokens = next;
       await plugin.saveSettings();
       updateEffective();
     });

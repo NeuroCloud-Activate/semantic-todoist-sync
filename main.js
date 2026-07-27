@@ -1651,6 +1651,7 @@ const DEFAULT_SETTINGS = {
   aiModelProvider: "openai",
   fallbackAiModelProvider: "openai",
   aiOperationModels: {},
+  enableMultiProviderOperationModels: false,
   embeddingModelReference: null,
   embeddingDimensionOverrides: { "openai:text-embedding-3-large": 1024 },
   embeddingProvider: "openai",
@@ -1945,6 +1946,17 @@ function modelReasoningConfig(model, configuredEffort) {
   return {};
 }
 
+function geminiExplicitThinkingSupport(settings = {}, model = "") {
+  const normalizedModel = normalizeGeminiModelId(model);
+  const metadataStore = settings?.geminiModelMetadata && typeof settings.geminiModelMetadata === "object"
+    ? settings.geminiModelMetadata
+    : {};
+  const metadata = metadataStore[normalizedModel]
+    || Object.entries(metadataStore).find(([id]) => normalizeGeminiModelId(id) === normalizedModel)?.[1]
+    || null;
+  return metadata && typeof metadata.thinking === "boolean" ? metadata.thinking : null;
+}
+
 function aiOperationReasoningEffort(configuredEffort, operation = "chat", optimizeStructured = true) {
   const configured = normalizeReasoningEffort(configuredEffort);
   if (!optimizeStructured || ["chat", "task-generation", "task-description", "description"].includes(operation)) return configured;
@@ -2098,7 +2110,7 @@ function openAiTerminalResponseDiagnostic(response = {}) {
     responseIdHash: response.id ? shortHash(String(response.id)) : "",
     incompleteReason,
     responseShape: code === "output-truncated" ? "truncated" : "",
-    schemaKeyword: singleLine(detail.message || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
+    schemaKeyword: singleLine(detail.message || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|exclusiveMinimum|exclusiveMaximum|multipleOf|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
     message: singleLine(redactSecrets(detail.message || response.incomplete_details?.reason || "")).slice(0, 500),
     usage: {
       inputTokens: Number(usage.input_tokens || 0),
@@ -2117,7 +2129,7 @@ function openAiHttpResponseDiagnostic(response = {}, phase = "request") {
     code: singleLine(detail.code || detail.type || `http-${Number(response.status || 0) || "error"}`).slice(0, 120),
     responseIdHash: response.json?.id ? shortHash(String(response.json.id)) : "",
     incompleteReason: "",
-    schemaKeyword: singleLine(detail.message || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
+    schemaKeyword: singleLine(detail.message || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|exclusiveMinimum|exclusiveMaximum|multipleOf|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
     message: singleLine(redactSecrets(detail.message || `${phase} returned HTTP ${Number(response.status || 0) || "error"}`)).slice(0, 500),
     usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, totalTokens: 0 }
   };
@@ -10031,9 +10043,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const capabilityProfileRevision = requestProfile.id || "gemini-generate-content-v2";
     const responseSchemaCapability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "responseSchema" });
     const responseJsonSchemaCapability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "responseJsonSchema" });
+    const thinkingSupported = geminiExplicitThinkingSupport(this.settings, modelId);
     const generationConfig = {};
     const geminiUser = [promptCachePrefix, providerContextSuffixJoin(promptContextSuffix, user)].filter(Boolean).join("\n\n");
-    if (reasoningConfig.gemini) generationConfig.thinkingConfig = reasoningConfig.gemini;
+    if (reasoningConfig.gemini && thinkingSupported === true) generationConfig.thinkingConfig = reasoningConfig.gemini;
     if (Number.isSafeInteger(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) generationConfig.maxOutputTokens = Math.round(Number(maxOutputTokens));
     if (requestProfile.deprecatedSamplingFieldsOmitted) {
       delete generationConfig.temperature;
@@ -10118,7 +10131,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const diagnostic = {
         status: `http-${Number(response.status || 0) || "error"}`,
         code: String(response.json?.error?.code || response.json?.error?.status || `http-${Number(response.status || 0) || "error"}`).slice(0, 120),
-        schemaKeyword: String(response.json?.error?.message || response.text || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
+        schemaKeyword: String(response.json?.error?.message || response.text || "").match(/\b(?:responseJsonSchema|responseSchema|additionalProperties|minItems|maxItems|pattern|exclusiveMinimum|exclusiveMaximum|multipleOf|anyOf|oneOf|allOf|union|discriminator)\b/i)?.[0] || "",
         responseIdHash: response.json?.responseId ? shortHash(String(response.json.responseId)) : "",
         incompleteReason: "",
         message: String(redactSecrets(response.json?.error?.message || response.text || `Gemini returned ${response.status}`)).replace(/\s+/g, " ").trim().slice(0, 500),
@@ -10161,7 +10174,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         schemaCompatibilityRetry: retryEligible,
         schemaCapabilityCacheHit: Boolean((preferredSchemaCarrier === "responseSchema" ? responseSchemaCapability : responseJsonSchemaCapability).cacheHit),
         schemaCapabilityState: (preferredSchemaCarrier === "responseSchema" ? responseSchemaCapability : responseJsonSchemaCapability).state,
-        schemaCapabilityProfileRevision: capabilityProfileRevision
+        schemaCapabilityProfileRevision: capabilityProfileRevision,
+        thinkingCapabilityState: thinkingSupported === true ? "supported" : thinkingSupported === false ? "unsupported" : "unknown"
       }
     };
   }
@@ -10266,6 +10280,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         name: String(model.displayName || model.name || id).replace(/^models\//i, ""),
         supportedGenerationMethods: Array.isArray(methods) ? methods.slice() : []
       };
+      if (typeof model.thinking === "boolean") modelMetadata.thinking = model.thinking;
       for (const key of ["inputTokenLimit", "outputTokenLimit"]) {
         if (Object.prototype.hasOwnProperty.call(model, key)) {
           const value = Number(model[key]);
@@ -12345,7 +12360,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           .filter((task) => !recoveryClosureValid(task, recoveryPayloads.get(task.index)))
           .map((task) => task.index);
         const fallbackReference = this.settings.enableAiModelFallback !== false
-          ? this.settings.aiOperationModels?.["task-description"]?.fallback
+          ? STS_MULTI_PROVIDER.operationModelReference(this.settings, "task-description")?.fallback
           : null;
         const recoveryDecision = invalidIndexes.length
           ? { dispatch: false, route: "none", reasonCode: "retry-closure-invalid", invalidIndexes }
@@ -16735,8 +16750,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     aiProviderSetting(containerEl, this.plugin, () => this.display());
     toggleSetting(containerEl, "Enable AI fallback globally", "Applies to every provider and AI operation. When off, every operation uses only its primary model; saved fallback selections are preserved for when you turn this back on.", this.plugin, "enableAiModelFallback", () => this.display());
     if (this.plugin.settings.enableAiModelFallback) fallbackAiProviderSetting(containerEl, this.plugin, () => this.display());
-    settingsHeading(containerEl, "Selected AI configuration", "Review provider-scoped primary, fallback, and reasoning selections.");
-    stsMpRenderSelectedAiConfiguration(containerEl, this.plugin.settings);
+    stsMpRenderUnifiedModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
     settingsHeading(containerEl, "Model catalog maintenance", "Refresh model lists or validate configured AI access.");
     const refreshState = this.plugin.modelCatalogRefreshState || { loading: false, error: "" };
     const refreshDescription = [
@@ -16786,13 +16800,12 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${aiProviderFailureSummary(error)}`); }
     }));
     settingsHeading(containerEl, "OpenAI", "Configure the OpenAI credential used by OpenAI operations.", { status: settingsProviderStatus(this.plugin, "openai") });
-    secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
+    stsMpProviderApiKeySetting(containerEl, "OpenAI API key", "Saved on blur. A changed non-empty key refreshes the OpenAI model list once; intermediate and empty values do not refresh.", this.plugin, "openaiApiKey", "openai");
     settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(this.plugin, "gemini") });
-    secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
+    stsMpProviderApiKeySetting(containerEl, "Google Gemini API key", "Saved on blur. A changed non-empty key refreshes the Gemini model list once; intermediate and empty values do not refresh.", this.plugin, "googleApiKey", "gemini");
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
       stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
       stsMpRenderOpenWebUILearnedProfiles(containerEl, this.plugin, () => this.display());
-      stsMpRenderOperationModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
     }
     settingsHeading(containerEl, "Semantic search and index", "Choose the vault scope and automatic index behavior, then inspect or rebuild each provider's local index.");
     textSetting(containerEl, "Indexed folders", "Comma-separated folders. Leave blank to index the whole vault.", this.plugin, "indexedFolders");
@@ -18288,6 +18301,98 @@ function secretSetting(containerEl, name, plugin, key) {
   });
 }
 
+function stsMpOpenWebUIBaseUrlComplete(plugin, value) {
+  const raw = String(value || "").trim();
+  if (!raw || !/^https?:\/\/[^\s/]+/i.test(raw)) return false;
+  try {
+    return Boolean(STS_MULTI_PROVIDER.normalizeOpenWebUIBaseUrl(raw, plugin.settings.openwebuiAllowInsecureHttp === true));
+  } catch { return false; }
+}
+
+function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", options = {}) {
+  if (!plugin || typeof plugin.refreshProviderModels !== "function") return Promise.resolve(null);
+  const settings = plugin.settings || {};
+  const normalizedProvider = STS_MULTI_PROVIDER.normalizeProvider(provider, "");
+  const credentialReady = normalizedProvider === "openwebui"
+    ? (stsMpOpenWebUIBaseUrlComplete(plugin, settings.openwebuiBaseUrl)
+      && (stsMpNormalizeOpenWebUIAuthMode(settings.openwebuiAuthMode) === "login" ? Boolean(String(settings.openwebuiJwt || "").trim()) : Boolean(String(settings.openwebuiApiKey || "").trim())))
+    : Boolean(String(settings[{ openai: "openaiApiKey", gemini: "googleApiKey", openrouter: "openrouterApiKey" }[normalizedProvider] || ""] || "").trim());
+  if (!normalizedProvider || !credentialReady) return Promise.resolve(null);
+  const queuedProviders = plugin.modelCatalogRefreshQueuedProviders || (plugin.modelCatalogRefreshQueuedProviders = Object.create(null));
+  const activePromise = plugin.modelCatalogRefreshPromise;
+  const activeProvider = String(plugin.modelCatalogRefreshProvider || "");
+  if (!options.fromQueue) {
+    if (activePromise && activeProvider === normalizedProvider) return activePromise;
+    if (queuedProviders[normalizedProvider]) return queuedProviders[normalizedProvider];
+    if (activePromise || plugin.modelCatalogRefreshQueueTail) {
+      const previous = plugin.modelCatalogRefreshQueueTail || activePromise;
+      const queued = Promise.resolve(previous).catch(() => null).then(() => {
+        if (queuedProviders[normalizedProvider] === queued) delete queuedProviders[normalizedProvider];
+        return stsMpRefreshOpenWebUIModelsAfterCommit(plugin, normalizedProvider, { fromQueue: true });
+      });
+      queuedProviders[normalizedProvider] = queued;
+      plugin.modelCatalogRefreshQueueTail = queued;
+      queued.finally(() => {
+        if (plugin.modelCatalogRefreshQueueTail === queued) plugin.modelCatalogRefreshQueueTail = null;
+      });
+      return queued;
+    }
+  }
+  const loadingState = { loading: true, error: "" };
+  plugin.modelCatalogRefreshState = loadingState;
+  stsMpSetSearchableComboboxCatalogState(loadingState);
+  plugin.modelCatalogRefreshProvider = normalizedProvider;
+  const run = (async () => {
+    try {
+      const result = await plugin.refreshProviderModels(normalizedProvider, false);
+      const error = result?.partialFailure ? String(result.summary || "Some provider model lists could not be refreshed.") : "";
+      plugin.modelCatalogRefreshState = { loading: false, error };
+      stsMpSetSearchableComboboxCatalogState(plugin.modelCatalogRefreshState);
+      if (error) new Notice(error);
+      return result;
+    } catch (error) {
+      const message = aiProviderFailureSummary(error);
+      plugin.modelCatalogRefreshState = { loading: false, error: message };
+      stsMpSetSearchableComboboxCatalogState(plugin.modelCatalogRefreshState);
+      new Notice(`Could not refresh ${STS_MULTI_PROVIDER.providerDisplayName(normalizedProvider)} models: ${message}`);
+      return null;
+    }
+  })();
+  const guarded = run.finally(() => {
+    if (plugin.modelCatalogRefreshPromise === guarded) {
+      plugin.modelCatalogRefreshPromise = null;
+      plugin.modelCatalogRefreshProvider = "";
+    }
+  });
+  plugin.modelCatalogRefreshPromise = guarded;
+  return guarded;
+}
+
+function stsMpOpenWebUICommittedTextSetting(containerEl, name, desc, plugin, key, normalizeValue, shouldRefresh = false, inputType = "text", provider = "openwebui") {
+  const setting = new Setting(containerEl).setName(name).setDesc(desc || "");
+  let pending = String(plugin.settings[key] || "");
+  let committed = pending;
+  setting.addText((text) => {
+    text.inputEl.type = inputType;
+    text.setValue(committed);
+    text.inputEl.addEventListener("input", () => { pending = text.inputEl.value; });
+    text.inputEl.addEventListener("blur", async () => {
+      const next = normalizeValue(pending);
+      if (next === committed) return;
+      committed = next;
+      plugin.settings[key] = next;
+      await plugin.saveSettings();
+      text.setValue(next);
+      if (shouldRefresh && (key !== "openwebuiBaseUrl" || stsMpOpenWebUIBaseUrlComplete(plugin, next))) await stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider);
+    });
+  });
+  return setting;
+}
+
+function stsMpProviderApiKeySetting(containerEl, name, desc, plugin, key, provider) {
+  return stsMpOpenWebUICommittedTextSetting(containerEl, name, desc, plugin, key, (value) => String(value || "").trim(), true, "password", provider);
+}
+
 function numberSetting(containerEl, name, plugin, key) {
   new Setting(containerEl).setName(name).setDesc(settingDescription(name, key)).addText((text) => {
     text.inputEl.type = "number";
@@ -19246,7 +19351,9 @@ function activeModelSummary(settings) {
 
 function stsMpSelectedAiConfigurationReference(settings = {}, operation = "") {
   const registry = typeof STS_MULTI_PROVIDER !== "undefined" ? STS_MULTI_PROVIDER : null;
-  const stored = settings?.aiOperationModels?.[operation];
+  const stored = registry && typeof registry.operationModelReference === "function"
+    ? registry.operationModelReference(settings, operation)
+    : settings?.aiOperationModels?.[operation];
   if (!registry || !stored?.primary || typeof registry.normalizeOperationModelReference !== "function") return null;
   const normalize = (value, isFallback) => {
     if (!value?.provider || !value?.model) return null;
@@ -46684,7 +46791,7 @@ function geminiCurrentSchema(schema) {
   const supportedKeys = new Set([
     "type", "format", "description", "title", "nullable", "enum",
     "properties", "required", "additionalProperties", "items", "minItems", "maxItems",
-    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"
+    "minimum", "maximum"
   ]);
   const out = {};
   for (const [key, value] of Object.entries(schema)) {
@@ -46723,7 +46830,7 @@ function geminiStructuredSchemaFieldRejected(response = {}) {
   const message = [detail.message, detail.status, detail.code, response?.json?.message, response?.text]
     .filter((value) => value !== undefined && value !== null).map(String).join(" ");
   const normalized = message.replace(/[_-]/g, "").toLowerCase();
-  const keyword = /(?:responsejsonschema|responseschema|jsonschema|additionalproperties|minitems|maxitems|pattern|anyof|oneof|allof|union|discriminator)/i.test(normalized);
+  const keyword = /(?:responsejsonschema|responseschema|jsonschema|additionalproperties|minitems|maxitems|pattern|exclusiveminimum|exclusivemaximum|multipleof|anyof|oneof|allof|union|discriminator)/i.test(normalized);
   const schemaField = /(?:responsejsonschema|responseschema|jsonschema|schema(?:field|keyword|property|constraint)?|unsupported|unknown|unrecognized|notsupported|notallowed|invalid)/i.test(normalized);
   return keyword && schemaField;
 }
@@ -48811,7 +48918,7 @@ const STS_MULTI_PROVIDER = (() => {
       const normalizedEfforts = efforts
         ? Array.from(new Set(efforts.map((effort) => normalizeReasoningEffort(effort, "")).filter((effort) => effort && effort !== DEFAULT_REASONING_EFFORT)))
         : null;
-      const flags = ["supportsReasoning", "supports_reasoning", "reasoningSupported", "reasoning_supported", "supportsThinking", "supports_thinking", "thinkingSupported", "thinking_supported"];
+      const flags = ["supportsReasoning", "supports_reasoning", "reasoningSupported", "reasoning_supported", "supportsThinking", "supports_thinking", "thinkingSupported", "thinking_supported", "thinking"];
       const flag = flags.map((key) => source[key]).find((value) => typeof value === "boolean");
       return { explicit: normalizedEfforts !== null || typeof flag === "boolean", efforts: normalizedEfforts, flag };
     };
@@ -48824,6 +48931,14 @@ const STS_MULTI_PROVIDER = (() => {
       const modelSupported = typeof supportedReasoningEffortsForModel === "function"
         ? supportedReasoningEffortsForModel(normalizedModel)
         : ["default"];
+      if (normalizedProvider === "gemini" && typeof metadata?.thinking !== "boolean") {
+        return {
+          known: false,
+          configurable: false,
+          supported: ["default"],
+          source: "unknown"
+        };
+      }
       const supported = metadataReasoning.efforts !== null
         ? ["default", ...metadataReasoning.efforts]
         : metadataReasoning.flag === false
@@ -49014,10 +49129,31 @@ const STS_MULTI_PROVIDER = (() => {
       || (migrationVersion >= 3 && configuredFallbackProvider)
       || legacyFallbackProvider;
     if (next.fallbackAiModelProvider !== fallbackAiModelProvider) changed = true;
+    const referenceMateriallyEquals = (left, right) => {
+      if (!left || !right) return !left && !right;
+      return modelIdentity(left.provider, left.model) === modelIdentity(right.provider, right.model)
+        && normalizeReasoningEffort(left.reasoningEffort, DEFAULT_REASONING_EFFORT) === normalizeReasoningEffort(right.reasoningEffort, DEFAULT_REASONING_EFFORT)
+        && normalizeReasoningSource(left.reasoningSource, "automatic") === normalizeReasoningSource(right.reasoningSource, "automatic");
+    };
+    const hasSavedOperationReferences = OPERATION_KEYS.some((operation) => {
+      const row = existing[operation];
+      return validModelReference(row?.primary) || validModelReference(row?.fallback);
+    });
+    const sharedChat = operationModels["chat-query"] || {};
+    const materiallyDifferentSavedMap = hasSavedOperationReferences && OPERATION_KEYS.some((operation) => {
+      if (operation === "chat-query") return false;
+      const row = operationModels[operation] || {};
+      return !referenceMateriallyEquals(row.primary, sharedChat.primary)
+        || !referenceMateriallyEquals(row.fallback, sharedChat.fallback);
+    });
+    const enableAdvanced = next.enableMultiProviderOperationModels === true
+      || (migrationVersion === 4 && materiallyDifferentSavedMap);
+    if (next.enableMultiProviderOperationModels !== enableAdvanced) changed = true;
+    next.enableMultiProviderOperationModels = enableAdvanced;
     next.aiOperationModels = operationModels;
     next.embeddingModelReference = embeddingReference;
     next.fallbackAiModelProvider = fallbackAiModelProvider;
-    next.multiProviderModelMigrationVersion = 4;
+    next.multiProviderModelMigrationVersion = 5;
     return { settings: next, changed };
   };
   const seedDefaultProvider = (settings = {}, provider = "openai", catalog = []) => {
@@ -49175,7 +49311,9 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const operationModelReference = (settings = {}, operation = "chat-query") => {
     const migrated = migrateOperationModelSettings(settings).settings;
-    const current = migrated.aiOperationModels?.[operation];
+    const current = migrated.enableMultiProviderOperationModels === true
+      ? migrated.aiOperationModels?.[operation]
+      : migrated.aiOperationModels?.["chat-query"];
     return current?.primary ? { primary: Object.assign({}, current.primary), fallback: current.fallback ? Object.assign({}, current.fallback) : null } : null;
   };
   const setOperationModelReference = (settings = {}, operation = "chat-query", primaryReference, fallbackReference = undefined) => {
@@ -49231,6 +49369,18 @@ const STS_MULTI_PROVIDER = (() => {
     migrated.aiOperationModels = Object.assign({}, migrated.aiOperationModels, { [operation]: Object.assign({ primary }, fallback ? { fallback } : {}) });
     if (operation === "deduplication") migrated.taskDeduplicationAiModel = primary.model;
     return migrated;
+  };
+  const setSharedGenerationReferences = (settings = {}, primaryReference, fallbackReference = undefined) => {
+    let next = migrateOperationModelSettings(settings).settings;
+    for (const operation of OPERATION_KEYS) next = setOperationModelReference(next, operation, primaryReference, fallbackReference);
+    next.enableMultiProviderOperationModels = false;
+    return next;
+  };
+  const setSharedGenerationReasoning = (settings = {}, role = "primary", value = "automatic") => {
+    let next = migrateOperationModelSettings(settings).settings;
+    for (const operation of OPERATION_KEYS) next = setOperationReasoningReference(next, operation, role, value);
+    next.enableMultiProviderOperationModels = false;
+    return next;
   };
   const repairGenerationModelReferences = (settings = {}, provider = "") => {
     const migrated = migrateOperationModelSettings(settings).settings;
@@ -54440,7 +54590,9 @@ const STS_MULTI_PROVIDER = (() => {
     applyProviderToOperationRole,
     operationModelReference,
     setOperationModelReference,
+    setSharedGenerationReferences,
     setOperationReasoningReference,
+    setSharedGenerationReasoning,
     embeddingModelReference,
     setEmbeddingModelReference,
     normalizeEmbeddingDimensionOverrides,
@@ -57026,6 +57178,7 @@ if (typeof module !== "undefined" && module.exports) {
     openRouterRecognizedPerRequestLimits,
     stsCreateRuntimeAiModelGateway,
     geminiCurrentSchema,
+    geminiExplicitThinkingSupport,
     geminiStructuredSchemaFieldRejected,
     geminiStructuredSchemaRetryEligible,
     chatResponseSchema,
@@ -57960,7 +58113,16 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     const result = await this.aiModelGateway().execute({ kind: "embed", operation: "embedding", texts: (texts || []).map((text) => String(text == null ? "" : text)), role });
     return result.vectors || [];
   };
-  gatewayPrototype.refreshOpenAIModels = async function(showNotice = true) {
+  gatewayPrototype.refreshOpenWebUIModels = async function(showNotice = true) {
+    return this.refreshOpenAIModels(showNotice, "openwebui");
+  };
+  gatewayPrototype.refreshProviderModels = async function(provider, showNotice = false) {
+    const normalized = STS_MULTI_PROVIDER.normalizeProvider(provider, "");
+    if (!STS_MULTI_PROVIDER.PROVIDERS.includes(normalized)) throw new Error("A valid AI provider is required.");
+    return this.refreshOpenAIModels(showNotice, normalized);
+  };
+  gatewayPrototype.refreshOpenAIModels = async function(showNotice = true, providerFilter = "") {
+    const normalizedProviderFilter = providerFilter ? STS_MULTI_PROVIDER.normalizeProvider(providerFilter, "") : "";
     const previousEmbeddingIdentity = embeddingIdentity(this.settings);
     let openRouterMetadataChanged = false;
     const derivedChangedKeys = [];
@@ -57980,7 +58142,7 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     if (this.settings.openrouterApiKey) providers.add("openrouter");
     if (this.settings.openwebuiBaseUrl) providers.add("openwebui");
     if (!providers.size) throw new Error("Add an OpenAI, Google Gemini, OpenRouter, or Open WebUI credential first.");
-    const orderedProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.filter((provider) => providers.has(provider));
+    const orderedProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.filter((provider) => providers.has(provider) && (!normalizedProviderFilter || provider === normalizedProviderFilter));
     const loaded = { openai: 0, gemini: 0, openrouter: 0, openwebui: 0 };
     const successfulProviders = [];
     const providerFailures = [];
@@ -58066,7 +58228,19 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
       aggregateError.discoveryResult = refreshResult;
       throw aggregateError;
     }
-    await this.saveSettings(derivedChangedKeys.length ? { changedKeys: Array.from(new Set(derivedChangedKeys)) } : {});
+    const providerDerivedKeys = normalizedProviderFilter === "openai"
+      ? ["availableChatModels", "availableEmbeddingModels", "openaiModelMetadata", "modelsFetchedAt"]
+      : normalizedProviderFilter === "gemini"
+        ? ["availableGeminiModels", "availableGeminiEmbeddingModels", "geminiModelMetadata", "geminiModelsFetchedAt"]
+        : normalizedProviderFilter === "openrouter"
+          ? ["availableOpenRouterModels", "availableOpenRouterEmbeddingModels", "openrouterModelMetadata", "openrouterEmbeddingModelMetadata", "openrouterModelsFetchedAt", "openrouterMetadataFingerprint", "openrouterMetadataRevision"]
+          : normalizedProviderFilter === "openwebui"
+            ? ["availableOpenWebUIModels", "availableOpenWebUIEmbeddingModels", "openwebuiModelMetadata", "openwebuiModelsFetchedAt"]
+            : [];
+    const changedKeys = Array.from(new Set([...derivedChangedKeys, ...providerDerivedKeys, ...(this.providerModelRoleRepairTelemetry?.changed ? ["aiOperationModels"] : [])]));
+    await this.saveSettings(normalizedProviderFilter
+      ? { skipTaskReferenceSnapshot: true, writeKind: "provider-derived-metadata", provider: normalizedProviderFilter, changedKeys }
+      : changedKeys.length ? { changedKeys } : {});
     if (openRouterMetadataChanged) invalidateOpenRouterMetadataCaches(this);
     if (embeddingIdentity(this.settings) !== previousEmbeddingIdentity) this.queryEmbeddingCache?.clear?.();
     stsMpRefreshSearchableComboboxes();
@@ -58510,6 +58684,75 @@ function stsMpSetOperationReference(plugin, operation, reference, fallback = nul
   return plugin.saveSettings();
 }
 
+function stsMpSetSharedGenerationReference(plugin, reference, fallback = undefined) {
+  plugin.settings = STS_MULTI_PROVIDER.setSharedGenerationReferences(plugin.settings, reference, fallback);
+  return plugin.saveSettings();
+}
+
+function stsMpSharedGenerationModelSetting(containerEl, plugin, refreshDisplay = null, options = {}) {
+  const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
+  const current = stsMpProviderScopedValue(options.fallback ? reference?.fallback : reference?.primary);
+  const setting = new Setting(containerEl)
+    .setName(options.name || (options.fallback ? "Shared fallback model" : "Shared primary model"))
+    .setDesc(options.desc || "Type to search the provider groups. The exact provider:model reference is applied to every generation operation; selection makes no provider call.");
+  setting.settingEl?.addClass?.("semantic-todoist-model-setting");
+  stsMpSearchableCombobox(setting.controlEl, {
+    accessibleLabel: options.accessibleLabel || (options.fallback ? "Shared fallback model" : "Shared primary model"),
+    rows: options.fallback
+      ? STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, stsMpCatalogForOperation(plugin.settings, "chat-query"))
+      : stsMpCatalogForOperation(plugin.settings, "chat-query"),
+    getRows: () => {
+      const latest = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
+      const rows = stsMpCatalogForOperation(plugin.settings, "chat-query");
+      return options.fallback ? STS_MULTI_PROVIDER.fallbackCatalogRows(latest?.primary, rows) : rows;
+    },
+    value: current,
+    automatic: Boolean(options.fallback),
+    automaticLabel: "Automatic fallback",
+    manualRowForQuery: (value) => {
+      const row = stsMpManualModelRow(value);
+      const primary = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query")?.primary;
+      if (row && options.fallback && primary && STS_MULTI_PROVIDER.modelIdentity(row.provider, row.id) === STS_MULTI_PROVIDER.modelIdentity(primary.provider, primary.model)) row.disabled = true;
+      return row;
+    },
+    onSelect: async (row) => {
+      const selected = row?.value ? stsMpParseProviderScopedValue(row.value) : null;
+      try {
+        if (selected && row?.source === "manual-entry") stsMpRememberManualProviderModel(plugin, "manualProviderGenerationModels", selected);
+        const primary = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query")?.primary;
+        await stsMpSetSharedGenerationReference(plugin, options.fallback ? primary : selected, options.fallback ? selected : undefined);
+        refreshDisplay?.();
+      } catch (error) { new Notice(error.message || String(error)); }
+    }
+  });
+}
+
+function stsMpSharedGenerationReasoningSetting(containerEl, plugin, role = "primary", refreshDisplay = null) {
+  const isFallback = role === "fallback";
+  const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
+  const target = isFallback ? reference?.fallback : reference?.primary;
+  const capability = target ? STS_MULTI_PROVIDER.providerReasoningCapability(plugin.settings, target.provider, target.model) : null;
+  if (!target || !capability?.configurable) return;
+  const options = STS_MULTI_PROVIDER.operationReasoningOptions(plugin.settings, target, isFallback);
+  if (!options.length) return;
+  const selected = target.reasoningSource === "explicit" ? target.reasoningEffort : "automatic";
+  const setting = new Setting(containerEl)
+    .setName(isFallback ? "Shared fallback reasoning" : "Shared primary reasoning")
+    .setDesc("Applied consistently to every generation operation; selection makes no provider call.");
+  setting.settingEl?.addClass?.("semantic-todoist-reasoning-setting");
+  setting.addDropdown((dropdown) => {
+    dropdown.addOptions(Object.fromEntries(options.map((option) => [option.value, option.label])));
+    dropdown.setValue(options.some((option) => option.value === selected) ? selected : "automatic");
+    dropdown.onChange(async (value) => {
+      try {
+        plugin.settings = STS_MULTI_PROVIDER.setSharedGenerationReasoning(plugin.settings, role, value);
+        await plugin.saveSettings();
+        refreshDisplay?.();
+      } catch (error) { new Notice(error.message || String(error)); }
+    });
+  });
+}
+
 function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
   const rows = stsMpCatalogForOperation(plugin.settings, operation);
@@ -58783,8 +59026,8 @@ function stsMpOperationDisplayHint(plugin, operation) {
   return `Primary: ${primaryText}; fallback: ${fallbackText}`;
 }
 
-function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay = null, operationOpenState = null) {
-  settingsHeading(containerEl, "Multi-provider operation models", "Each operation keeps its provider-scoped primary and optional fallback together. Open a group to edit only that operation; model selection still uses the shared catalogs and saves locally without a provider call.");
+function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay = null, operationOpenState = null, options = {}) {
+  if (options.heading !== false) settingsHeading(containerEl, "Multi-provider operation models", "Each operation keeps its provider-scoped primary and optional fallback together. Open a group to edit only that operation; model selection still uses the shared catalogs and saves locally without a provider call.");
   const groups = Object.entries(STS_MP_OPERATION_LABELS);
   groups.forEach(([operation, label], index) => {
     const details = containerEl.createEl("details", {
@@ -58809,7 +59052,29 @@ function stsMpRenderOperationModelSettings(containerEl, plugin, refreshDisplay =
     stsMpFallbackModelSetting(body, plugin, operation, refreshDisplay, field("Fallback model", `${label} fallback model`));
     stsMpOperationReasoningSetting(body, plugin, operation, "fallback", refreshDisplay, field("Fallback reasoning", `${label} fallback reasoning`));
   });
-  stsMpRenderUnifiedEmbeddings(containerEl, plugin, refreshDisplay);
+  if (options.includeEmbeddings !== false) stsMpRenderUnifiedEmbeddings(containerEl, plugin, refreshDisplay);
+}
+
+function stsMpRenderUnifiedModelSettings(containerEl, plugin, refreshDisplay = null, operationOpenState = null) {
+  const details = containerEl.createEl("details", { cls: "semantic-todoist-ai-models-disclosure" });
+  details.open = true;
+  const summary = details.createEl("summary", { cls: "semantic-todoist-ai-models-summary", text: "AI models" });
+  summary.setAttribute("aria-label", "AI models settings");
+  const body = details.createDiv({ cls: "semantic-todoist-ai-models-body" });
+  stsMpSharedGenerationModelSetting(body, plugin, refreshDisplay, { name: "Shared primary model", accessibleLabel: "Shared primary model" });
+  stsMpSharedGenerationReasoningSetting(body, plugin, "primary", refreshDisplay);
+  if (plugin.settings.enableAiModelFallback !== false) {
+    stsMpSharedGenerationModelSetting(body, plugin, refreshDisplay, { fallback: true, name: "Shared fallback model", accessibleLabel: "Shared fallback model" });
+    stsMpSharedGenerationReasoningSetting(body, plugin, "fallback", refreshDisplay);
+  }
+  toggleSetting(body, "Enable multi-provider operation models", "When off, the shared primary/fallback pair above applies to every generation operation. When on, each operation can use its own provider:model and reasoning settings.", plugin, "enableMultiProviderOperationModels", refreshDisplay);
+  stsMpRenderUnifiedEmbeddings(body, plugin, refreshDisplay);
+  settingsHeading(body, "Selected AI configuration", "Effective shared references are shown while multi-provider operation models are off; saved per-operation references are shown while it is on.");
+  stsMpRenderSelectedAiConfiguration(body, plugin.settings);
+  if (plugin.settings.enableMultiProviderOperationModels === true) {
+    stsMpRenderOperationModelSettings(body, plugin, refreshDisplay, operationOpenState, { heading: true, includeEmbeddings: false });
+  }
+  return details;
 }
 
 function stsMpOpenWebUIContextRows(settings = {}) {
@@ -59112,7 +59377,7 @@ function stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin) {
       }));
     });
   } else {
-    secretSetting(details, "Open WebUI API key", plugin, "openwebuiApiKey");
+    stsMpOpenWebUICommittedTextSetting(details, "Open WebUI API key", "Saved on blur. A changed non-empty key refreshes the current Open WebUI model list once; intermediate and empty values do not refresh.", plugin, "openwebuiApiKey", (value) => String(value || "").trim(), true, "password");
     textSetting(details, "Open WebUI custom header (optional)", "Use a validated custom header instead of Authorization Bearer in API-key mode.", plugin, "openwebuiCustomHeader");
   }
   return details;
@@ -59205,12 +59470,12 @@ function stsMpRenderOpenWebUILearnedProfiles(containerEl, plugin, refreshDisplay
 
 function stsMpRenderProviderAccessSettings(containerEl, plugin, refreshDisplay = null) {
   settingsHeading(containerEl, "OpenRouter", "Full provider/model slugs use the non-streaming Chat Completions and embeddings endpoints. Keys stay local and are never included in diagnostics.", { status: settingsProviderStatus(plugin, "openrouter") });
-  secretSetting(containerEl, "OpenRouter API key", plugin, "openrouterApiKey");
+    stsMpProviderApiKeySetting(containerEl, "OpenRouter API key", "Saved on blur. A changed non-empty key refreshes the OpenRouter model list once; intermediate and empty values do not refresh.", plugin, "openrouterApiKey", "openrouter");
   new Setting(containerEl)
     .setName("OpenRouter adaptive profiles")
     .setDesc(stsMpOpenRouterAdaptiveProfileSummary(plugin));
   settingsHeading(containerEl, "Self-Hosted OpenWebUI", "Open WebUI can use an API key or an explicit email/password login. Passwords are held only in the login action and discarded after authentication.", { status: settingsProviderStatus(plugin, "openwebui") });
-  textSetting(containerEl, "Open WebUI base URL", "HTTPS is required unless insecure HTTP is explicitly enabled. Embedded credentials, query strings, and fragments are rejected.", plugin, "openwebuiBaseUrl");
+  stsMpOpenWebUICommittedTextSetting(containerEl, "Open WebUI base URL", "Saved on blur. HTTPS is required unless insecure HTTP is explicitly enabled. A changed complete URL refreshes the current model list once; intermediate and empty values do not refresh.", plugin, "openwebuiBaseUrl", (value) => String(value || "").trim(), true);
   stsMpRenderOpenWebUIAuthModeSetting(containerEl, plugin, refreshDisplay);
   stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin);
   toggleSetting(containerEl, "Allow insecure Open WebUI HTTP", "Disabled by default. Enable only for a deliberately trusted local HTTP endpoint.", plugin, "openwebuiAllowInsecureHttp");

@@ -79,8 +79,34 @@
 
 .semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]),
 .semantic-todoist-settings select,
-.semantic-todoist-settings textarea {
+.semantic-todoist-settings textarea,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-input,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-selected-value,
+.semantic-todoist-searchable-combobox-popup {
+  background-color: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
   max-width: 100%;
+}
+
+.semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]):hover,
+.semantic-todoist-settings select:hover,
+.semantic-todoist-settings textarea:hover,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-input:hover,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-selected-value:hover {
+  background-color: var(--background-modifier-hover);
+  border-color: var(--background-modifier-border-hover);
+}
+
+.semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+.semantic-todoist-settings select:focus-visible,
+.semantic-todoist-settings textarea:focus-visible,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-input:focus-visible,
+.semantic-todoist-settings .semantic-todoist-searchable-combobox-selected-value:focus-visible {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--background-modifier-border-hover);
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
 }
 
 .semantic-todoist-setting .setting-item-name {
@@ -2251,6 +2277,16 @@
 
 .semantic-todoist-searchable-combobox-status.is-error {
   color: var(--text-error);
+}
+
+.semantic-todoist-selected-ai-configuration-header .semantic-todoist-selected-ai-configuration-cell {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+}
+
+.semantic-todoist-selected-ai-configuration-body .semantic-todoist-selected-ai-configuration-cell {
+  font-size: var(--font-ui-smaller);
 }
 
 @media (max-width: 700px) {

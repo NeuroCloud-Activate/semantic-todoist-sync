@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.5
+
+- Adds exact-model built-in Open WebUI scope profiles for the validated Qwen and Gemma models, keeping local chat, task, and description work focused.
+- Adds strict raw-preserving singleton citation-reference alignment for the exact agentic Gemma model when one sentence reference drifts from the supplied IDs.
+- Updates the two-note benchmark table with historical and optimized model rows, exact identifiers, completion rates, timing, and input totals.
+
 ## 0.8.4
 
 - Restored iPad and mobile settings toggles with native touch targets, unified capability-aware Embeddings settings, and an editable global unknown-model context fallback while exact and provider-discovered metadata remain higher precedence.

@@ -30,6 +30,9 @@ The current 0.8 series makes everyday capture more flexible and more private.
 6. **Friendlier mobile setup.**
    Settings toggles are back with easy-to-tap controls, Embeddings settings are gathered in one clear place, and the context fallback is easier to adjust when model details are unavailable. The default sidebar mode setting is gone, while chat and task tools remain.
 
+7. **Sharper local model profiles.**
+   Exact validated local-model profiles keep scope tighter and use raw-preserving citation alignment when a supported model needs it, so local runs finish more reliably without changing the original model output.
+
 ## Install
 
 - [Install from Obsidian Community Plugins](https://obsidian.md/plugins?id=semantic-todoist-sync)
@@ -124,21 +127,24 @@ and actionability, not provider claims.
 
 | Provider/Model | Quality / 100 | Percent Tasks Successfully Complete | Avg Input (Tokens) | Est Total Cost | Avg Time (to complete test run) | Sanitized Overall Assessment |
 |---|---:|---:|---:|---:|---:|---|
-| OpenAI GPT-5.6 Luna high | 95 | 100% (6/6) | ~24.3K | ~$0.10 | ~42s | Most complete, precise, and consistently grounded across chat, task, and description. |
-| Gemini 3.5 Flash Lite high | 92 | 100% (6/6) | ~24.5K | ~$0.04 | ~27s | Nearly as strong, fastest cloud result, with only occasional extra breadth. |
-| OpenRouter DeepSeek V4 Flash | 90 | 100% (6/6) | ~20.0K | ~$0.0089 | ~196s | Strong evidence use and descriptions; one chat was broader than necessary. |
-| OpenRouter Qwen 3.7 Plus | 89 | 100% (6/6) | ~20.7K | ~$0.0346 | ~159s | Consistently grounded and actionable, with good historical interpretation. |
-| Open WebUI Qwen3.5 9B HF | 84 | 50% (3/6) | ~26.5K attempted | $0 API | ~488s | Strongest local interpretation when it completed, including the best local historical description; two generation timeouts reduced reliability. |
-| OpenRouter `tencent/hy3` high | 79 | 100% (6/6) | ~28.7K | ~$0.01 | ~88s | Strong tasks and descriptions; chat sometimes widened beyond the selected action. |
+| OpenAI `gpt-5.6-luna` high | 95 | 100% (6/6) | ~24.3K | ~$0.10 | ~42s | Most complete, precise, and consistently grounded across chat, task, and description. |
+| Gemini `gemini-3.5-flash-lite` high | 92 | 100% (6/6) | ~24.5K | ~$0.04 | ~27s | Nearly as strong, fastest cloud result, with only occasional extra breadth. |
+| OpenRouter `deepseek/deepseek-v4-flash` | 90 | 100% (6/6) | ~20.0K | ~$0.0089 | ~196s | Strong evidence use and descriptions; one chat was broader than necessary. |
+| OpenRouter `qwen/qwen3.7-plus` | 89 | 100% (6/6) | ~20.7K | ~$0.0346 | ~159s | Consistently grounded and actionable, with good historical interpretation. |
+| Open WebUI `hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:IQ3_M` (RTX3070, 8 GB) | 84 | 50% (3/6) | ~26.5K attempted | $0 API | ~488s | Strongest local interpretation when it completed, including the best local historical description; two generation timeouts reduced reliability. |
+| OpenRouter `tencent/hy3` | 79 | 100% (6/6) | ~28.7K | ~$0.01 | ~88s | Strong tasks and descriptions; chat sometimes widened beyond the selected action. |
 | Open WebUI `gemma4:e4b` thinking | 76 | 66.7% (4/6) | ~26.5K attempted | $0 API | ~317s | Accurate, concise tasks and usable chat, but both description calls exceeded the local deadline. |
-| Open WebUI Gemma 12B Agentic HF | 68 | 33.3% (2/6) | ~26.5K attempted | $0 API | ~427s | The completed task was accurate, but the description overpacked loosely related history and the other note timed out. |
-| Open WebUI Qwythos-9B-Claude-Mythos | 67 | 50% (3/6) | ~26.5K attempted | $0 API | ~426s | Grounded task titles and one useful description; chat was excessively broad and another description was too thin. |
+| Open WebUI gemma4:e4b thinking - optimized | 76 | 100% (6/6) | ~17.3K | $0 API | ~33s | All operations completed directly and much faster; chat/tasks remained accurate, but one description narrated source metadata and the harder note still mixed sibling work, so reliability improved more than semantic quality. |
+| Open WebUI `hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:IQ3_M` (M4 Pro, 24 GB) | 75 | 100% (6/6) | ~15.0K | $0 API | ~109s | Structurally reliable and exact on one note; the built-in scope focus removed invented subtasks and shortened the run, but the harder note still mixed optional sibling context into its task and description, so semantic improvement was small. |
+| Open WebUI `hf.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF:Q3_K_M` (M4 Pro, 24 GB) - optimized | 72 | 100% (6/6) | ~15.5K | $0 API | ~140s | Structurally reliable and accurate on the simpler note; the harder note still attached the reviewer to sibling eligibility work and overinterpreted history, so the exact-model profile improved completion more than semantic quality. |
+| Open WebUI `hf.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF:Q3_K_M` | 68 | 33.3% (2/6) | ~26.5K attempted | $0 API | ~427s | The completed task was accurate, but the description overpacked loosely related history and the other note timed out. |
+| Open WebUI `hf.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF:Q4_K_M` | 67 | 50% (3/6) | ~26.5K attempted | $0 API | ~426s | Grounded task titles and one useful description; chat was excessively broad and another description was too thin. |
 | OpenRouter `openrouter/free` | 64 | 100% (6/6) | ~29.1K | $0 | ~124s | Completed the matrix but remained inconsistent and needed bounded recovery. |
 | Open WebUI `qwen3.5:4b` | 62 | 66.7% (4/6) | ~26.5K attempted | $0 API | ~332s | Both tasks and descriptions completed after the saved carrier fix; chat remained schema-inaccurate, and descriptions included more peripheral history than useful. |
-| OpenRouter Xiaomi MiMo-V2.5 | 60 | 50% (3/6) | ~34.5K attempted | ~$0.0235 | ~385s | Tasks were useful, but truncation and timeout behavior made chat and descriptions unreliable. |
+| OpenRouter `xiaomi/mimo-v2.5` | 60 | 50% (3/6) | ~34.5K attempted | ~$0.0235 | ~385s | Tasks were useful, but truncation and timeout behavior made chat and descriptions unreliable. |
 | OpenRouter `tencent/hy3:free` | 0 | 0% (0/6) | n/a | $0 | ~0.5s | Unavailable/404 in the tested catalog; the paid model worked. |
 
-6/6 covers chat, task, and description across two actual/live notes, and every model received the same provider-neutral evidence bundles. Open WebUI advertised 30K, two workers, and one exact-model lane; every individual call stayed within the 16K efficiency target, while Avg Input is the mean three-operation note-workflow total rather than a cap. Local cost excludes hardware/electricity; local tests used an NVIDIA RTX3070 with 8GB VRAM; scores are GPT-5.6 Sol/high judgments, and minor local repair affects reliability, not semantic quality.
+6/6 covers chat, task, and description across two actual/live notes, and every model received the same provider-neutral evidence bundles. Open WebUI advertised 30K, two workers, and one exact-model lane; every individual call stayed within the 16K efficiency target, while Avg Input is the mean three-operation note-workflow total rather than a cap. Local cost excludes hardware/electricity; Open WebUI local results used the RTX3070/8GB unless a row names different hardware, and the optimized Qwen and Gemma 12B Agentic rows used an Apple MacBook Pro M4 Pro with 24GB unified memory; scores are GPT-5.6 Sol/high judgments, and minor local repair affects reliability, not semantic quality.
 
 ## Links
 

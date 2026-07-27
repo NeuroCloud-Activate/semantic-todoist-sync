@@ -51300,6 +51300,54 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENWEBUI_SINGLETON_DESCRIPTION_CAPABILITY_MEMORY_MAX_MODELS = 64;
   const OPENWEBUI_STRUCTURED_CAPABILITY_REVISION = "openwebui-structured-capability-v3";
   const OPENWEBUI_STRUCTURED_CAPABILITY_MEMORY_SCHEMA_VERSION = 5;
+  const OPENWEBUI_QWEN_PROMPT_FOCUS_PROFILE = "semantic-scope-anchor-v1";
+  const OPENWEBUI_QWEN_PROMPT_FOCUS_MODEL = "hf.co/davidau/qwen3.5-9b-the-defiant-fable-uncensored-heretic-neo-imatrix-max-mtp-gguf:iq3_m";
+  const OPENWEBUI_QWEN_PROMPT_FOCUS_TEXT = Object.freeze({
+    "chat-query": "Focus: answer the exact query first. Optional sibling facts may support it, but cannot redirect or broaden it.",
+    "task-generation": "Focus: re-read and follow the final immutable scope contract. Preserve the requested actor, artifact, action, and required current facts; optional context cannot replace them. Create subtasks only when the final contract permits.",
+    "task-description": "Focus: anchor on the requested action and required current fact IDs. Omit optional facts about a separate actor, artifact, or action instead of merging them."
+  });
+  const OPENWEBUI_PROMPT_FOCUS_PROFILES = Object.freeze({
+    [OPENWEBUI_QWEN_PROMPT_FOCUS_MODEL]: Object.freeze({
+      profile: OPENWEBUI_QWEN_PROMPT_FOCUS_PROFILE,
+      text: OPENWEBUI_QWEN_PROMPT_FOCUS_TEXT,
+      placement: "after-schema"
+    }),
+    "gemma4:e4b": Object.freeze({
+      profile: "gemma4-e4b-scope-anchor-v1",
+      placement: "before-schema",
+      text: Object.freeze({
+        "chat-query": "Scope focus: answer the exact query with required and current evidence first. Omit unrelated actions; use optional history only when it changes the answer.",
+        "task-generation": "Scope focus: follow the final immutable contract exactly. Emit only the requested task; never combine optional sibling actions or turn them into subtasks.",
+        "task-description": "Scope focus: follow the response schema exactly. Write a concise brief for the requested action using required facts; omit source-path narration, sibling work, and non-material history."
+      })
+    }),
+    "hf.co/yuxinlu1/gemma-4-12b-agentic-fable5-composer2.5-v2-3.5x-tau2-gguf:q3_k_m": Object.freeze({
+      profile: "gemma4-12b-agentic-scope-anchor-v1",
+      placement: "before-schema",
+      text: Object.freeze({
+        "chat-query": "Scope focus: answer the exact query with required and current evidence first. Omit peripheral history unless it materially changes interpretation or action; do not invent unsupported conclusions.",
+        "task-generation": "Scope focus: follow the final immutable scope exactly. Preserve the requested actor, exact artifacts (including compound artifact names), action, and material timing; never replace them with note/date shorthand or merge sibling work.",
+        "task-description": "Scope focus: preserve the exact requested action, actor, and artifacts. Use material intent, current state, and action-relevant history; omit sibling actions and unsupported conclusions. Copy allowed evidence_ids and fact_refs verbatim."
+      })
+    })
+  });
+  const openWebUIPromptFocusRecord = (model, operation = "") => {
+    const normalizedModel = normalizeModel("openwebui", model).toLowerCase();
+    const normalizedOperation = openWebUIAdaptiveOperation(operation);
+    const record = OPENWEBUI_PROMPT_FOCUS_PROFILES[normalizedModel];
+    return record && Object.prototype.hasOwnProperty.call(record.text, normalizedOperation) ? record : null;
+  };
+  const openWebUIPromptFocusProfile = (model, operation = "") => {
+    return openWebUIPromptFocusRecord(model, operation)?.profile || "";
+  };
+  const openWebUIPromptFocusText = (model, operation = "") => {
+    const record = openWebUIPromptFocusRecord(model, operation);
+    return record ? record.text[openWebUIAdaptiveOperation(operation)] : "";
+  };
+  const openWebUIPromptFocusPlacement = (model, operation = "") => {
+    return openWebUIPromptFocusRecord(model, operation)?.placement || "";
+  };
   const openWebUISingletonDescriptionCapabilityMemory = new Map();
   const openWebUISingletonDescriptionCapabilitySettingsOwners = new Map();
   const openWebUICapabilityMetadataFingerprint = (metadata = {}) => {
@@ -51429,6 +51477,9 @@ const STS_MULTI_PROVIDER = (() => {
         : 0,
       adaptiveConcurrencyReason: nonEmpty(cached?.adaptiveConcurrencyReason),
       adaptiveConcurrencyObservations: Math.max(0, Math.min(32, Math.round(Number(cached?.adaptiveConcurrencyObservations) || 0))),
+      ...(openWebUIPromptFocusProfile(model, operation)
+        ? { promptFocusProfile: openWebUIPromptFocusProfile(model, operation) }
+        : {}),
       adaptiveProfileKey: key
         ? [key, metadataIdentity.metadataFingerprint || "metadata-unknown", metadataIdentity.metadataRevision || "revision-unknown", nonEmpty(options.capabilityRevision || OPENWEBUI_STRUCTURED_CAPABILITY_REVISION)].join("|")
         : ""
@@ -52543,6 +52594,145 @@ const STS_MULTI_PROVIDER = (() => {
     try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch { return { accepted: false, reason: "completion-full-pattern-rejected", rawText, compactValidation, fullValidation }; }
     return { accepted: true, carrier, rawText, text: completedText, normalizedText, normalizedValue, completedValue, addedFields, compactValidation, fullValidation };
   };
+  const openWebUIGemmaSingletonSentenceReferenceCompletion = (text, carrier, carrierSchema, sharedSchema, model) => {
+    const profile = openWebUIPromptFocusProfile(model, "task-description");
+    if (profile !== "gemma4-e4b-scope-anchor-v1") return { accepted: false, applicable: false, reason: "not-exact-gemma-profile" };
+    const rawText = asString(text);
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-not-json", rawText };
+    }
+    const item = carrier === "wrapper-json"
+      ? parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray(parsed.descriptions) && parsed.descriptions.length === 1 ? parsed.descriptions[0] : null
+      : parsed;
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { accepted: false, applicable: true, reason: "gemma-singleton-reference-shape", rawText };
+    const sentences = item.description_sentences;
+    if (!Array.isArray(sentences) || sentences.length !== 1) return { accepted: false, applicable: true, reason: "gemma-singleton-reference-sentence-count", rawText };
+    const sentence = sentences[0];
+    if (!sentence || typeof sentence !== "object" || Array.isArray(sentence) || typeof sentence.text !== "string" || !sentence.text.trim()) {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-sentence-shape", rawText };
+    }
+    if (Object.prototype.hasOwnProperty.call(sentence, "evidence_ids") || Object.prototype.hasOwnProperty.call(sentence, "fact_refs")) {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-sentence-fields-present", rawText };
+    }
+    const validTopLevelRefs = (field) => {
+      const values = item[field];
+      return Object.prototype.hasOwnProperty.call(item, field)
+        && Array.isArray(values)
+        && values.length > 0
+        && values.every((value) => typeof value === "string");
+    };
+    if (!validTopLevelRefs("evidence_ids") || !validTopLevelRefs("fact_refs")) {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-top-level-refs-invalid", rawText };
+    }
+    const completedItem = JSON.parse(JSON.stringify(item));
+    const completedSentence = completedItem.description_sentences[0];
+    completedSentence.evidence_ids = completedItem.evidence_ids.slice();
+    completedSentence.fact_refs = completedItem.fact_refs.slice();
+    const completedValue = carrier === "wrapper-json" ? { descriptions: [completedItem] } : completedItem;
+    const completedText = JSON.stringify(completedValue);
+    const compactValidation = openWebUIReasoningOnlyJson(completedText, carrierSchema);
+    if (!compactValidation.accepted) return { accepted: false, applicable: true, reason: "gemma-singleton-reference-compact-schema-rejected", rawText, compactValidation };
+    try { validateOpenWebUIPatterns(completedValue, openWebUISchemaProjection(carrierSchema)); } catch {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-compact-pattern-rejected", rawText, compactValidation };
+    }
+    const normalizedValue = { tasks: [], section_name: "", descriptions: [completedItem] };
+    const normalizedText = JSON.stringify(normalizedValue);
+    const fullValidation = openWebUIReasoningOnlyJson(normalizedText, sharedSchema);
+    if (!fullValidation.accepted) return { accepted: false, applicable: true, reason: "gemma-singleton-reference-full-schema-rejected", rawText, compactValidation, fullValidation };
+    try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch {
+      return { accepted: false, applicable: true, reason: "gemma-singleton-reference-full-pattern-rejected", rawText, compactValidation, fullValidation };
+    }
+    return {
+      accepted: true,
+      applicable: true,
+      carrier,
+      rawText,
+      rawHash: stableHash(rawText),
+      rawByteCount: openWebUIUtf8ByteLength(rawText),
+      rawSentenceCount: 1,
+      normalizationProfile: "gemma-singleton-sentence-reference-completion-v1",
+      addedFields: ["description_sentences[0].evidence_ids", "description_sentences[0].fact_refs"],
+      text: completedText,
+      normalizedText,
+      normalizedValue,
+      completedValue,
+      compactValidation,
+      fullValidation
+    };
+  };
+  const openWebUIAgenticGemmaSingletonSentenceReferenceNormalization = (text, carrier, carrierSchema, sharedSchema, model) => {
+    const profile = openWebUIPromptFocusProfile(model, "task-description");
+    if (profile !== "gemma4-12b-agentic-scope-anchor-v1") return { accepted: false, applicable: false, reason: "not-agentic-gemma-profile" };
+    const rawText = asString(text);
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch {
+      return { accepted: false, applicable: true, reason: "agentic-gemma-reference-not-json", rawText };
+    }
+    const item = carrier === "wrapper-json"
+      ? parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray(parsed.descriptions) && parsed.descriptions.length === 1 ? parsed.descriptions[0] : null
+      : parsed;
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { accepted: false, applicable: true, reason: "agentic-gemma-reference-shape", rawText };
+    const sentences = item.description_sentences;
+    if (!Array.isArray(sentences) || sentences.length !== 1) return { accepted: false, applicable: true, reason: "agentic-gemma-reference-sentence-count", rawText };
+    const sentence = sentences[0];
+    if (!sentence || typeof sentence !== "object" || Array.isArray(sentence) || typeof sentence.text !== "string" || !sentence.text.trim()) {
+      return { accepted: false, applicable: true, reason: "agentic-gemma-reference-sentence-shape", rawText };
+    }
+    const uniqueStringArray = (value) => Array.isArray(value)
+      && value.length > 0
+      && value.every((entry) => typeof entry === "string" && entry.length > 0)
+      && new Set(value).size === value.length;
+    if (!uniqueStringArray(item.evidence_ids) || !uniqueStringArray(item.fact_refs)) {
+      return { accepted: false, applicable: true, reason: "agentic-gemma-reference-top-level-refs-invalid", rawText };
+    }
+    const sentenceFields = ["evidence_ids", "fact_refs"];
+    for (const field of sentenceFields) {
+      if (Object.prototype.hasOwnProperty.call(sentence, field)
+        && (!Array.isArray(sentence[field]) || sentence[field].some((entry) => typeof entry !== "string"))) {
+        return { accepted: false, applicable: true, reason: "agentic-gemma-reference-sentence-refs-invalid", rawText };
+      }
+    }
+    const differs = sentenceFields.some((field) => !Array.isArray(sentence[field])
+      || sentence[field].length !== item[field].length
+      || sentence[field].some((entry, index) => entry !== item[field][index]));
+    if (!differs) return { accepted: false, applicable: true, reason: "agentic-gemma-reference-no-normalization-needed", rawText };
+    const completedItem = JSON.parse(JSON.stringify(item));
+    const completedSentence = completedItem.description_sentences[0];
+    completedSentence.evidence_ids = completedItem.evidence_ids.slice();
+    completedSentence.fact_refs = completedItem.fact_refs.slice();
+    const completedValue = carrier === "wrapper-json" ? { descriptions: [completedItem] } : completedItem;
+    const completedText = JSON.stringify(completedValue);
+    const compactValidation = openWebUIReasoningOnlyJson(completedText, carrierSchema);
+    if (!compactValidation.accepted) return { accepted: false, applicable: true, reason: "agentic-gemma-reference-compact-schema-rejected", rawText, compactValidation };
+    try { validateOpenWebUIPatterns(completedValue, openWebUISchemaProjection(carrierSchema)); } catch {
+      return { accepted: false, applicable: true, reason: "agentic-gemma-reference-compact-pattern-rejected", rawText, compactValidation };
+    }
+    const normalizedValue = { tasks: [], section_name: "", descriptions: [completedItem] };
+    const normalizedText = JSON.stringify(normalizedValue);
+    const fullValidation = openWebUIReasoningOnlyJson(normalizedText, sharedSchema);
+    if (!fullValidation.accepted) return { accepted: false, applicable: true, reason: "agentic-gemma-reference-full-schema-rejected", rawText, compactValidation, fullValidation };
+    try { validateOpenWebUIPatterns(normalizedValue, openWebUISchemaProjection(sharedSchema)); } catch {
+      return { accepted: false, applicable: true, reason: "agentic-gemma-reference-full-pattern-rejected", rawText, compactValidation, fullValidation };
+    }
+    return {
+      accepted: true,
+      applicable: true,
+      carrier,
+      rawText,
+      rawHash: stableHash(rawText),
+      rawByteCount: openWebUIUtf8ByteLength(rawText),
+      rawSentenceCount: 1,
+      normalizationProfile: "gemma4-12b-agentic-sentence-reference-alignment-v1",
+      alignedFields: ["description_sentences[0].evidence_ids", "description_sentences[0].fact_refs"],
+      text: completedText,
+      normalizedText,
+      normalizedValue,
+      completedValue,
+      compactValidation,
+      fullValidation
+    };
+  };
   const openWebUIDescriptionAlternateCarrierNormalization = (text, attemptCarrier, directSchema, wrapperSchema, sharedSchema) => {
     const rawText = asString(text);
     const alternateCarrier = attemptCarrier === "wrapper-json" ? "direct-schema" : "wrapper-json";
@@ -52640,6 +52830,9 @@ const STS_MULTI_PROVIDER = (() => {
     const model = normalizeModel("openwebui", requestInput.model || settings.chatModel);
     if (!model) throw providerError("openwebui", null, "model-required");
     const operation = openWebUIAdaptiveOperation(requestInput.operation || "chat-query");
+    const promptFocusProfile = openWebUIPromptFocusProfile(model, operation);
+    const promptFocusText = openWebUIPromptFocusText(model, operation);
+    const promptFocusPlacement = openWebUIPromptFocusPlacement(model, operation);
     const metadata = settings.openwebuiModelMetadata?.[model] || {};
     const capabilities = openWebUICapabilities(metadata);
     const sharedSchema = requestInput.originalJsonSchema || requestInput.jsonSchema;
@@ -52734,13 +52927,21 @@ const STS_MULTI_PROVIDER = (() => {
     const user = [requestInput.promptCachePrefix, providerContextSuffixJoin(requestInput.promptContextSuffix, requestInput.user)].filter((value) => value != null && asString(value) !== "").map(asString).join("\n\n");
     const messagesForGrounding = (grounding) => {
       const groundingText = grounding?.present ? grounding.text : "";
-      const systemParts = [businessSystemText, groundingText].filter(Boolean);
+      const systemParts = promptFocusPlacement === "before-schema"
+        ? [businessSystemText, promptFocusText, groundingText].filter(Boolean)
+        : [businessSystemText, groundingText, promptFocusText].filter(Boolean);
       const next = [];
       if (ollamaBacked) {
         if (systemParts.length) next.push({ role: "system", content: systemParts.join("\n\n") });
       } else {
         if (businessSystemText) next.push({ role: "system", content: businessSystemText });
-        if (groundingText) next.push({ role: "system", content: groundingText });
+        if (promptFocusPlacement === "before-schema") {
+          if (promptFocusText) next.push({ role: "system", content: promptFocusText });
+          if (groundingText) next.push({ role: "system", content: groundingText });
+        } else {
+          if (groundingText) next.push({ role: "system", content: groundingText });
+          if (promptFocusText) next.push({ role: "system", content: promptFocusText });
+        }
       }
       if (user) next.push({ role: "user", content: user });
       return next;
@@ -52848,6 +53049,10 @@ const STS_MULTI_PROVIDER = (() => {
       structuredCapabilityPreference: structuredCapability ? structuredInitialCarrier : "",
       structuredCapabilitySchemaFingerprint: structuredCapability ? structuredCapabilitySchemaFingerprint : "",
       structuredGrammarLearned: Boolean(structuredCapability?.grammarUnsupported),
+      ...(promptFocusProfile ? {
+        promptFocusProfile,
+        promptFocusPlacement
+      } : {}),
       descriptionAttemptOrdinal: nativeDescription ? 1 : 0,
       descriptionAttemptMax: nativeDescription ? descriptionAttemptMax : 0,
       descriptionWrapperFallbackEligible: false,
@@ -53080,6 +53285,8 @@ const STS_MULTI_PROVIDER = (() => {
         let text = normalizedResponse.text;
         let alternateDescriptionNormalization = null;
         let deterministicDescriptionCompletion = null;
+        let gemmaSingletonSentenceReferenceCompletion = null;
+        let agenticGemmaSingletonSentenceReferenceNormalization = null;
         let taskGenerationDatePatternNormalization = null;
         let chatStructuralNormalization = null;
         if (attemptSchema) {
@@ -53136,6 +53343,74 @@ const STS_MULTI_PROVIDER = (() => {
                 }
               }
             } catch {}
+          }
+          if (!validation.accepted && nativeDescription) {
+            const agenticGemmaNormalization = openWebUIAgenticGemmaSingletonSentenceReferenceNormalization(text, attemptWrapper ? "wrapper-json" : "direct-schema", attemptSchema, sharedSchema, model);
+            if (agenticGemmaNormalization.accepted) {
+              agenticGemmaSingletonSentenceReferenceNormalization = agenticGemmaNormalization;
+              text = agenticGemmaNormalization.text;
+              validation = agenticGemmaNormalization.compactValidation;
+              schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                reason: agenticGemmaNormalization.normalizationProfile,
+                schemaHash: agenticGemmaNormalization.compactValidation.schemaHash,
+                accepted: true,
+                compactSchemaAccepted: true,
+                compactSchemaHash: agenticGemmaNormalization.compactValidation.schemaHash,
+                normalizedSchemaHash: agenticGemmaNormalization.fullValidation.schemaHash,
+                normalizedSchemaReason: agenticGemmaNormalization.fullValidation.reason,
+                normalizedSchemaAccepted: true,
+                fullSchemaHash: sharedSchemaHash,
+                fullSchemaAccepted: true,
+                agenticGemmaSingletonSentenceReferenceNormalization: true,
+                agenticGemmaSingletonSentenceReferenceNormalizationProfile: agenticGemmaNormalization.normalizationProfile,
+                agenticGemmaSingletonSentenceReferenceNormalizationAlignedFields: agenticGemmaNormalization.alignedFields,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawHash: agenticGemmaNormalization.rawHash,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawByteCount: agenticGemmaNormalization.rawByteCount,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawSentenceCount: agenticGemmaNormalization.rawSentenceCount
+              });
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                agenticGemmaSingletonSentenceReferenceNormalization: true,
+                agenticGemmaSingletonSentenceReferenceNormalizationProfile: agenticGemmaNormalization.normalizationProfile,
+                agenticGemmaSingletonSentenceReferenceNormalizationAlignedFields: agenticGemmaNormalization.alignedFields,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawHash: agenticGemmaNormalization.rawHash,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawByteCount: agenticGemmaNormalization.rawByteCount,
+                agenticGemmaSingletonSentenceReferenceNormalizationRawSentenceCount: agenticGemmaNormalization.rawSentenceCount
+              });
+            }
+          }
+          if (!validation.accepted && nativeDescription) {
+            const gemmaCompletion = openWebUIGemmaSingletonSentenceReferenceCompletion(text, attemptWrapper ? "wrapper-json" : "direct-schema", attemptSchema, sharedSchema, model);
+            if (gemmaCompletion.accepted) {
+              gemmaSingletonSentenceReferenceCompletion = gemmaCompletion;
+              text = gemmaCompletion.text;
+              validation = gemmaCompletion.compactValidation;
+              schemaValidationTelemetry = Object.assign({}, schemaValidationTelemetry, {
+                reason: gemmaCompletion.normalizationProfile,
+                schemaHash: gemmaCompletion.compactValidation.schemaHash,
+                accepted: true,
+                compactSchemaAccepted: true,
+                compactSchemaHash: gemmaCompletion.compactValidation.schemaHash,
+                normalizedSchemaHash: gemmaCompletion.fullValidation.schemaHash,
+                normalizedSchemaReason: gemmaCompletion.fullValidation.reason,
+                normalizedSchemaAccepted: true,
+                fullSchemaHash: sharedSchemaHash,
+                fullSchemaAccepted: true,
+                gemmaSingletonSentenceReferenceCompletion: true,
+                gemmaSingletonSentenceReferenceCompletionProfile: gemmaCompletion.normalizationProfile,
+                gemmaSingletonSentenceReferenceCompletionAddedFields: gemmaCompletion.addedFields,
+                gemmaSingletonSentenceReferenceCompletionRawHash: gemmaCompletion.rawHash,
+                gemmaSingletonSentenceReferenceCompletionRawByteCount: gemmaCompletion.rawByteCount,
+                gemmaSingletonSentenceReferenceCompletionRawSentenceCount: gemmaCompletion.rawSentenceCount
+              });
+              normalizedResponse.responseTelemetry = Object.assign({}, normalizedResponse.responseTelemetry, {
+                gemmaSingletonSentenceReferenceCompletion: true,
+                gemmaSingletonSentenceReferenceCompletionProfile: gemmaCompletion.normalizationProfile,
+                gemmaSingletonSentenceReferenceCompletionAddedFields: gemmaCompletion.addedFields,
+                gemmaSingletonSentenceReferenceCompletionRawHash: gemmaCompletion.rawHash,
+                gemmaSingletonSentenceReferenceCompletionRawByteCount: gemmaCompletion.rawByteCount,
+                gemmaSingletonSentenceReferenceCompletionRawSentenceCount: gemmaCompletion.rawSentenceCount
+              });
+            }
           }
           if (!validation.accepted && nativeDescription) {
             const completion = openWebUIDescriptionSingletonCompletion(text, attemptWrapper ? "wrapper-json" : "direct-schema", attemptSchema, sharedSchema);
@@ -53322,6 +53597,18 @@ const STS_MULTI_PROVIDER = (() => {
           descriptionAttemptMax: Math.max(0, Math.round(Number(attemptProviderRequestTelemetry.descriptionAttemptMax) || 0)),
           descriptionWrapperFallbackEligible: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackEligible),
           descriptionWrapperFallbackAttempted: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackAttempted),
+          gemmaSingletonSentenceReferenceCompletion: Boolean(gemmaSingletonSentenceReferenceCompletion),
+          gemmaSingletonSentenceReferenceCompletionProfile: String(gemmaSingletonSentenceReferenceCompletion?.normalizationProfile || "").slice(0, 96),
+          gemmaSingletonSentenceReferenceCompletionAddedFields: gemmaSingletonSentenceReferenceCompletion?.addedFields || [],
+          gemmaSingletonSentenceReferenceCompletionRawHash: String(gemmaSingletonSentenceReferenceCompletion?.rawHash || "").slice(0, 96),
+          gemmaSingletonSentenceReferenceCompletionRawByteCount: Math.max(0, Math.round(Number(gemmaSingletonSentenceReferenceCompletion?.rawByteCount) || 0)),
+          gemmaSingletonSentenceReferenceCompletionRawSentenceCount: Math.max(0, Math.round(Number(gemmaSingletonSentenceReferenceCompletion?.rawSentenceCount) || 0)),
+          agenticGemmaSingletonSentenceReferenceNormalization: Boolean(agenticGemmaSingletonSentenceReferenceNormalization),
+          agenticGemmaSingletonSentenceReferenceNormalizationProfile: String(agenticGemmaSingletonSentenceReferenceNormalization?.normalizationProfile || "").slice(0, 96),
+          agenticGemmaSingletonSentenceReferenceNormalizationAlignedFields: agenticGemmaSingletonSentenceReferenceNormalization?.alignedFields || [],
+          agenticGemmaSingletonSentenceReferenceNormalizationRawHash: String(agenticGemmaSingletonSentenceReferenceNormalization?.rawHash || "").slice(0, 96),
+          agenticGemmaSingletonSentenceReferenceNormalizationRawByteCount: Math.max(0, Math.round(Number(agenticGemmaSingletonSentenceReferenceNormalization?.rawByteCount) || 0)),
+          agenticGemmaSingletonSentenceReferenceNormalizationRawSentenceCount: Math.max(0, Math.round(Number(agenticGemmaSingletonSentenceReferenceNormalization?.rawSentenceCount) || 0)),
           httpStatus: statusOf(response),
           retryReason: structuredRetryState.retryReason,
           retryOrdinal: structuredRetryState.retryOrdinal,
@@ -53336,7 +53623,19 @@ const STS_MULTI_PROVIDER = (() => {
           descriptionCarrier: alternateDescriptionNormalization?.carrier || attemptCarrier,
           descriptionCarrierNormalized: Boolean(alternateDescriptionNormalization),
           descriptionDeterministicCompletion: Boolean(deterministicDescriptionCompletion || alternateDescriptionNormalization?.deterministicCompletion),
-          descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || []
+          descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || [],
+          gemmaSingletonSentenceReferenceCompletion: Boolean(gemmaSingletonSentenceReferenceCompletion),
+          gemmaSingletonSentenceReferenceCompletionProfile: gemmaSingletonSentenceReferenceCompletion?.normalizationProfile || "",
+          gemmaSingletonSentenceReferenceCompletionAddedFields: gemmaSingletonSentenceReferenceCompletion?.addedFields || [],
+          gemmaSingletonSentenceReferenceCompletionRawHash: gemmaSingletonSentenceReferenceCompletion?.rawHash || "",
+          gemmaSingletonSentenceReferenceCompletionRawByteCount: gemmaSingletonSentenceReferenceCompletion?.rawByteCount || 0,
+          gemmaSingletonSentenceReferenceCompletionRawSentenceCount: gemmaSingletonSentenceReferenceCompletion?.rawSentenceCount || 0,
+          agenticGemmaSingletonSentenceReferenceNormalization: Boolean(agenticGemmaSingletonSentenceReferenceNormalization),
+          agenticGemmaSingletonSentenceReferenceNormalizationProfile: agenticGemmaSingletonSentenceReferenceNormalization?.normalizationProfile || "",
+          agenticGemmaSingletonSentenceReferenceNormalizationAlignedFields: agenticGemmaSingletonSentenceReferenceNormalization?.alignedFields || [],
+          agenticGemmaSingletonSentenceReferenceNormalizationRawHash: agenticGemmaSingletonSentenceReferenceNormalization?.rawHash || "",
+          agenticGemmaSingletonSentenceReferenceNormalizationRawByteCount: agenticGemmaSingletonSentenceReferenceNormalization?.rawByteCount || 0,
+          agenticGemmaSingletonSentenceReferenceNormalizationRawSentenceCount: agenticGemmaSingletonSentenceReferenceNormalization?.rawSentenceCount || 0
         } : {});
         if (attemptSchemaProjection && (ollamaBacked || structuredRetryState.retryAttempted || structuredCapability?.cacheHit)) {
           const successfulCarrier = nativeDescription
@@ -53378,7 +53677,19 @@ const STS_MULTI_PROVIDER = (() => {
             descriptionCarrier: alternateDescriptionNormalization?.carrier || attemptCarrier,
             descriptionCarrierNormalized: Boolean(alternateDescriptionNormalization),
             descriptionDeterministicCompletion: Boolean(deterministicDescriptionCompletion || alternateDescriptionNormalization?.deterministicCompletion),
-            descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || []
+            descriptionCompletionAddedFields: deterministicDescriptionCompletion?.addedFields || alternateDescriptionNormalization?.completionAddedFields || [],
+            gemmaSingletonSentenceReferenceCompletion: Boolean(gemmaSingletonSentenceReferenceCompletion),
+            gemmaSingletonSentenceReferenceCompletionProfile: gemmaSingletonSentenceReferenceCompletion?.normalizationProfile || "",
+            gemmaSingletonSentenceReferenceCompletionAddedFields: gemmaSingletonSentenceReferenceCompletion?.addedFields || [],
+            gemmaSingletonSentenceReferenceCompletionRawHash: gemmaSingletonSentenceReferenceCompletion?.rawHash || "",
+            gemmaSingletonSentenceReferenceCompletionRawByteCount: gemmaSingletonSentenceReferenceCompletion?.rawByteCount || 0,
+            gemmaSingletonSentenceReferenceCompletionRawSentenceCount: gemmaSingletonSentenceReferenceCompletion?.rawSentenceCount || 0,
+            agenticGemmaSingletonSentenceReferenceNormalization: Boolean(agenticGemmaSingletonSentenceReferenceNormalization),
+            agenticGemmaSingletonSentenceReferenceNormalizationProfile: agenticGemmaSingletonSentenceReferenceNormalization?.normalizationProfile || "",
+            agenticGemmaSingletonSentenceReferenceNormalizationAlignedFields: agenticGemmaSingletonSentenceReferenceNormalization?.alignedFields || [],
+            agenticGemmaSingletonSentenceReferenceNormalizationRawHash: agenticGemmaSingletonSentenceReferenceNormalization?.rawHash || "",
+            agenticGemmaSingletonSentenceReferenceNormalizationRawByteCount: agenticGemmaSingletonSentenceReferenceNormalization?.rawByteCount || 0,
+            agenticGemmaSingletonSentenceReferenceNormalizationRawSentenceCount: agenticGemmaSingletonSentenceReferenceNormalization?.rawSentenceCount || 0
           }) : schemaGroundingTelemetry,
           responseProfile: normalizedResponse.responseTelemetry.profile,
           responseTelemetry: normalizedResponse.responseTelemetry,
@@ -53394,6 +53705,22 @@ const STS_MULTI_PROVIDER = (() => {
             classification: "schema-normalization",
             derivedChatStructuralNormalization: true,
             derivedChatStructuralNormalizationCorrections: chatStructuralNormalization.corrections
+          } : gemmaSingletonSentenceReferenceCompletion ? {
+            source: "openwebui-derived-description-normalization",
+            classification: "schema-normalization",
+            normalizationProfile: gemmaSingletonSentenceReferenceCompletion.normalizationProfile,
+            addedFields: gemmaSingletonSentenceReferenceCompletion.addedFields,
+            rawHash: gemmaSingletonSentenceReferenceCompletion.rawHash,
+            rawByteCount: gemmaSingletonSentenceReferenceCompletion.rawByteCount,
+            rawSentenceCount: gemmaSingletonSentenceReferenceCompletion.rawSentenceCount
+          } : agenticGemmaSingletonSentenceReferenceNormalization ? {
+            source: "openwebui-derived-description-normalization",
+            classification: "schema-normalization",
+            normalizationProfile: agenticGemmaSingletonSentenceReferenceNormalization.normalizationProfile,
+            alignedFields: agenticGemmaSingletonSentenceReferenceNormalization.alignedFields,
+            rawHash: agenticGemmaSingletonSentenceReferenceNormalization.rawHash,
+            rawByteCount: agenticGemmaSingletonSentenceReferenceNormalization.rawByteCount,
+            rawSentenceCount: agenticGemmaSingletonSentenceReferenceNormalization.rawSentenceCount
           } : undefined,
           outputBudgetTelemetry,
           providerRequestTelemetry: attemptProviderRequestTelemetry,
@@ -54138,6 +54465,8 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUICapabilityMetadataFingerprint,
     openWebUICapabilityMetadataIdentity,
     openWebUIAdaptiveOperation,
+    openWebUIPromptFocusProfile,
+    openWebUIPromptFocusText,
     stableHash,
     openWebUISchemaProjection,
     openWebUICompactDescriptionSchema,

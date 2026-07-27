@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.6
+
+- Unified default models across operations while keeping per-operation model choices available as an opt-in.
+- Coalesced provider credential and base-URL model-list refreshes to avoid duplicate discovery work.
+- Fixed compact native toggle geometry and mobile sizing for reliable touch controls.
+- Hardened Gemini structured-schema and thinking capability handling so unsupported request fields are omitted and HTTP 400s are avoided.
+
 ## 0.8.5
 
 - Adds exact-model built-in Open WebUI scope profiles for the validated Qwen and Gemma models, keeping local chat, task, and description work focused.

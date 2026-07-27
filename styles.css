@@ -1500,13 +1500,13 @@
     min-height: 32px;
   }
 
-  .semantic-todoist-view input,
+  .semantic-todoist-view input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-view select,
   .semantic-todoist-view textarea,
-  .semantic-todoist-settings input,
+  .semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-settings select,
   .semantic-todoist-settings textarea,
-  .semantic-todoist-modal input,
+  .semantic-todoist-modal input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-modal select,
   .semantic-todoist-modal textarea {
     font-size: max(16px, var(--font-ui-small));
@@ -1846,7 +1846,6 @@
   width: 100%;
 }
 
-.semantic-todoist-settings .setting-item-control .checkbox-container,
 .semantic-todoist-settings .setting-item-control .clickable-icon {
   flex: 0 0 auto;
   width: auto;
@@ -1866,13 +1865,6 @@
 .semantic-todoist-settings .semantic-todoist-toggle-setting .setting-item-control {
   min-height: 44px;
   align-items: center;
-}
-
-.semantic-todoist-settings .semantic-todoist-toggle-setting .checkbox-container {
-  min-width: 44px;
-  min-height: 44px;
-  width: auto;
-  flex: 0 0 auto;
 }
 
 .semantic-todoist-settings .setting-item-control input:not([type="checkbox"]):not([type="radio"]),
@@ -1974,10 +1966,10 @@
     touch-action: manipulation;
   }
 
-  .semantic-todoist-settings input,
+  .semantic-todoist-settings input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-settings select,
   .semantic-todoist-settings textarea,
-  .semantic-todoist-view input,
+  .semantic-todoist-view input:not([type="checkbox"]):not([type="radio"]),
   .semantic-todoist-view select,
   .semantic-todoist-view textarea {
     min-height: 44px;

@@ -1653,6 +1653,9 @@ const DEFAULT_SETTINGS = {
   aiOperationModels: {},
   enableMultiProviderOperationModels: false,
   embeddingModelReference: null,
+  embeddingFallbackModelReference: null,
+  embeddingFallbackProvider: "openai",
+  enableEmbeddingFallback: false,
   embeddingDimensionOverrides: { "openai:text-embedding-3-large": 1024 },
   embeddingProvider: "openai",
   multiProviderModelMigrationVersion: 0,
@@ -3652,7 +3655,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: "semantic-index-unavailable", repairQueued: true });
       }
     }
-    return this.withSemanticIndexOperation("task-reference-repair", async () => {
+    const repairResult = await this.withSemanticIndexOperation("task-reference-repair", async () => {
       const repairStartRevision = this.taskReferenceStateRevision;
       this.taskReferenceRepairInProgress = true;
       const previousIndex = this.semanticIndex || [];
@@ -3671,7 +3674,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       this.requireAiAccess("embedding");
       const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
-      const embedded = await this.embedSemanticChunks(repaired.chunks, reuseMap, "task-reference repair");
+      const embedded = await this.embedSemanticChunks(repaired.chunks, reuseMap, "task-reference repair", { fallbackPolicy: "disabled" });
       const indexedTaskChunks = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
       const candidate = previousIndex.filter((chunk) => !semanticTaskReferenceChunkSelected(chunk)).concat(indexedTaskChunks);
       const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(
@@ -3702,12 +3705,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.taskReferenceIntegrity = previousIntegrity;
       this.taskReferenceRepairFollowUp = true;
       this.logLocal("Task-reference repair deferred", { reason: options.reason || "integrity", error: error.message || String(error) });
+      if (semanticEmbeddingFallbackEligible(error, this.settings)) {
+        return Object.assign(semanticOperationResult({ ok: true, reasonCode: "embedding-fallback-required", repairQueued: true }), {
+          embeddingFallbackRequired: true
+        });
+      }
       return semanticOperationResult({ ok: false, reasonCode: "task-reference-repair-failed", repairQueued: true });
     } finally {
       this.taskReferenceRepairInProgress = false;
       await this.consumeSemanticTaskReferenceRepairFollowUp("snapshot-fingerprint-mismatch");
     }
     });
+    if (repairResult?.embeddingFallbackRequired) {
+      const rebuilt = await this.rebuildSemanticIndex(false);
+      if (!rebuilt?.ok) throw new Error(rebuilt?.reasonCode || "embedding-fallback-rebuild-failed");
+      return semanticOperationResult({ ok: true, changed: true, changedCount: rebuilt.changedCount, reasonCode: "rebuilt-embedding-fallback", repairQueued: rebuilt.repairQueued });
+    }
+    return repairResult;
   }
 
   markTaskReferenceStateDirty() {
@@ -6353,7 +6367,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async rebuildSemanticIndex(showNotice) {
     if (!this.semanticIndexOperationActive) return this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(showNotice));
-    if (this.semanticIndexInProgress && this.semanticIndexOperationOwner !== "rebuild") {
+    const nestedIncrementalFallbackRebuild = this.semanticIndexOperationOwner === "incremental-flush";
+    if (this.semanticIndexInProgress && this.semanticIndexOperationOwner !== "rebuild" && !nestedIncrementalFallbackRebuild) {
       if (showNotice) new Notice("Semantic indexing is already running.");
       return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths?.size || 0, reasonCode: "semantic-index-busy", repairQueued: true });
     }
@@ -6418,8 +6433,37 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.taskReferenceIntegrity = taskReferenceIntegrity;
 
       const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
-      const embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks");
-      const materialityAnchors = await this.embedSemanticMaterialityAnchors();
+      let embedded;
+      let materialityAnchors;
+      let embeddingFallbackUsed = false;
+      let embeddingFallbackReference = null;
+      try {
+        // The ordinary candidate is primary-only so compatible primary rows
+        // remain reusable and a late failure cannot publish mixed vectors.
+        embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks", { fallbackPolicy: "disabled" });
+        materialityAnchors = await this.embedSemanticMaterialityAnchors({
+          fallbackOnly: false,
+          embeddingIdentity: embedded.embeddingIdentity
+        });
+      } catch (error) {
+        if (!semanticEmbeddingFallbackEligible(error, this.settings)) throw error;
+        embeddingFallbackReference = semanticEmbeddingFallbackReference(this.settings);
+        embedded = await this.embedSemanticChunks(chunks, new Map(), "vault chunks (fallback candidate)", Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), {
+          embeddingIdentity: null
+        }));
+        embeddingFallbackUsed = true;
+        materialityAnchors = await this.embedSemanticMaterialityAnchors({
+          fallbackOnly: true,
+          explicitFallback: embeddingFallbackReference,
+          embeddingIdentity: embedded.embeddingIdentity
+        });
+      }
+      if (embedded.embeddingIdentity && materialityAnchors.embeddingIdentity
+        && (embedded.embeddingIdentity.provider !== materialityAnchors.embeddingIdentity.provider
+          || String(embedded.embeddingIdentity.model).toLowerCase() !== String(materialityAnchors.embeddingIdentity.model).toLowerCase()
+          || embedded.embeddingIdentity.dimension !== materialityAnchors.embeddingIdentity.dimension)) {
+        throw new Error("Embedding provider/model/dimension changed between candidate vectors and materiality anchors.");
+      }
       const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
       const indexedTaskReferenceChunks = indexed.filter((chunk) => semanticTaskReferenceChunkSelected(chunk));
       const indexedTaskReferenceIntegrity = semanticTaskReferenceCorpusIntegrity(
@@ -6435,9 +6479,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticChunkTermCache?.clear?.();
       this.contextQueryProfileCache?.clear?.();
       this.queueSemanticIndexWarmup();
+      const indexedEmbedding = indexed.find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length) || {};
+      const indexedEmbeddingModel = String(indexedEmbedding.embeddingModel || indexedEmbedding.indexMetadata?.model || this.settings.embeddingModel || "");
+      const indexedEmbeddingProvider = String(indexedEmbedding.embeddingProvider || indexedEmbedding.indexMetadata?.provider || semanticEmbeddingProviderForSettings(this.settings));
       this.settings.semanticIndexMeta = {
-        model: this.settings.embeddingModel,
-        provider: semanticEmbeddingProviderForSettings(this.settings),
+        model: indexedEmbeddingModel,
+        provider: indexedEmbeddingProvider,
         rebuiltAt: deviceTimestamp(),
         chunks: indexed.length,
         dimension: Number(indexed.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
@@ -6448,6 +6495,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         maxChunksPerNote: this.settings.semanticIndexMaxChunksPerNote,
         embeddingPrecision: this.settings.semanticIndexEmbeddingPrecision,
         embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+        embeddingFallbackUsed,
+        embeddingIdentity: embedded.embeddingIdentity || null,
         embeddingRequestTelemetry: {
           inputRecords: embedded.inputRecords,
           providerInputs: embedded.providerInputs,
@@ -6628,6 +6677,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           this.setSidebarStatus(`Indexing changed note ${index + 1}/${paths.length}...`);
           await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
           const operation = await this.reindexFile(path);
+          if (operation?.embeddingFallbackRequired) {
+            const rebuilt = await this.rebuildSemanticIndex(false);
+            if (!rebuilt?.ok) throw new Error(rebuilt?.reasonCode || "embedding-fallback-rebuild-failed");
+            this.pendingIndexPaths.clear();
+            return semanticOperationResult({ ok: true, changed: true, changedCount: Math.max(1, changedFiles), reasonCode: "rebuilt-embedding-fallback" });
+          }
           if (!operation?.ok) throw new Error(operation?.reasonCode || "semantic-reindex-failed");
           if (operation.changed) changedFiles += 1;
           await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
@@ -6638,12 +6693,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         if (this.taskReferenceIntegrity && this.taskReferenceIntegrity.ok === false) throw new Error("incremental-integrity");
         const taskReferenceHealth = semanticTaskReferenceHealthFromChunks(this.semanticIndex || []);
+        const indexedEmbedding = (this.semanticIndex || []).find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length) || {};
+        const indexedEmbeddingModel = String(indexedEmbedding.embeddingModel || indexedEmbedding.indexMetadata?.model || this.settings.embeddingModel || "");
+        const indexedEmbeddingProvider = String(indexedEmbedding.embeddingProvider || indexedEmbedding.indexMetadata?.provider || semanticEmbeddingProviderForSettings(this.settings));
         this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta, {
           rebuiltAt: this.settings.semanticIndexMeta?.rebuiltAt || "",
           updatedAt: deviceTimestamp(),
           chunks: (this.semanticIndex || []).length,
-          model: this.settings.embeddingModel,
-          provider: semanticEmbeddingProviderForSettings(this.settings),
+          model: indexedEmbeddingModel,
+          provider: indexedEmbeddingProvider,
           dimension: Number((this.semanticIndex || []).find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
           targetDimension: semanticEmbeddingTargetDimension(this.settings),
           embeddingMigrationRequired: false,
@@ -6708,7 +6766,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         const reuseMap = buildSemanticChunkReuseMap(previousIndex || [], this.settings, this.settings.semanticIndexMeta || {});
-        const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`);
+        const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`, { fallbackPolicy: "disabled" });
         const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
         const activeTaskReferenceRecords = taskReferenceChunks.taskReferenceRecords || semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex);
         const candidateIndex = (previousIndex || []).filter((chunk) => {
@@ -6741,12 +6799,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
         this.pendingIndexPaths?.add?.(path);
+        if (semanticEmbeddingFallbackEligible(error, this.settings)) {
+          return Object.assign(semanticOperationResult({ ok: true, queued: 1, reasonCode: "embedding-fallback-required" }), {
+            embeddingFallbackRequired: true
+          });
+        }
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: String(error?.message || "semantic-reindex-failed").split("\n")[0].slice(0, 120), repairQueued: Boolean(this.scheduleSemanticTaskReferenceRepair?.("incremental-integrity")) });
       }
     }, { paths: [path], coalesceKey: `semantic-index:reindex-file:${String(path || "")}` });
   }
 
-  async embedSemanticChunks(chunks, reuseMap = new Map(), label = "semantic chunks") {
+  async embedSemanticTextsWithProvenance(texts, role = "document", options = {}) {
+    // Provider-free fixtures may replace the legacy array-returning method on
+    // the instance. Production uses the provenance-bearing gateway method.
+    const legacyOverride = Object.prototype.hasOwnProperty.call(this, "embedTexts")
+      && typeof this.embedTexts === "function"
+      && !Object.prototype.hasOwnProperty.call(this, "embedTextsWithProvenance");
+    if (legacyOverride) {
+      const vectors = await this.embedTexts(texts, role);
+      return {
+        vectors: Array.isArray(vectors) ? vectors : [],
+        provider: semanticEmbeddingProviderForSettings(this.settings),
+        model: this.settings.embeddingModel || "",
+        dimension: Array.isArray(vectors?.[0]) ? vectors[0].length : 0,
+        attempts: []
+      };
+    }
+    return this.embedTextsWithProvenance(texts, role, options);
+  }
+
+  async embedSemanticChunks(chunks, reuseMap = new Map(), label = "semantic chunks", options = {}) {
+    const fallbackOnly = options.fallbackOnly === true;
+    // Only a deliberately restarted fallback candidate disables reuse. The
+    // ordinary primary-only candidate keeps compatible vectors when healthy.
+    if (fallbackOnly) reuseMap = new Map();
     const indexed = new Array(chunks.length);
     const pending = [];
     let reused = 0;
@@ -6776,13 +6862,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const batchSize = semanticEmbeddingBatchSize(this.settings);
     let embedded = 0;
     let providerInputs = 0;
+    let embeddingIdentity = options.embeddingIdentity && typeof options.embeddingIdentity === "object"
+      ? Object.assign({}, options.embeddingIdentity)
+      : null;
     if (!pendingGroups.length) this.setSidebarStatus(`Reusing ${reused} unchanged ${label}...`);
     for (let i = 0; i < pendingGroups.length; i += batchSize) {
       const batch = pendingGroups.slice(i, i + batchSize);
       this.setSidebarStatus(`Embedding ${label} ${Math.min(providerInputs + batch.length, pendingGroups.length)}/${pendingGroups.length}${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
-      const embeddings = await this.embedTexts(batch.map((group) => group.items.length > 1
+      const embeddingResult = await this.embedSemanticTextsWithProvenance(batch.map((group) => group.items.length > 1
         ? semanticChunkSharedEmbeddingInput(group.chunk)
-        : semanticChunkEmbeddingInput(group.chunk)), "document");
+        : semanticChunkEmbeddingInput(group.chunk)), "document", fallbackOnly
+        ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity })
+        : { fallbackPolicy: "disabled" });
+      const embeddings = Array.isArray(embeddingResult?.vectors) ? embeddingResult.vectors : [];
+      const embeddingProvider = String(embeddingResult?.provider || semanticEmbeddingProviderForSettings(this.settings)).trim().toLowerCase();
+      const embeddingModel = String(embeddingResult?.actualModel || embeddingResult?.model || this.settings.embeddingModel || "").trim();
+      const embeddingDimension = Number(embeddings[0]?.length || embeddingResult?.dimension || 0);
+      const batchIdentity = { provider: embeddingProvider, model: embeddingModel, dimension: embeddingDimension };
+      if (embeddingIdentity && (embeddingIdentity.provider !== batchIdentity.provider
+        || String(embeddingIdentity.model).toLowerCase() !== String(batchIdentity.model).toLowerCase()
+        || (embeddingIdentity.dimension > 0 && batchIdentity.dimension > 0 && embeddingIdentity.dimension !== batchIdentity.dimension))) {
+        const error = new Error("Embedding provider/model/dimension changed during one candidate build.");
+        error.code = "embedding-candidate-identity-mismatch";
+        throw error;
+      }
+      embeddingIdentity = embeddingIdentity || batchIdentity;
       for (let j = 0; j < batch.length; j += 1) {
         const group = batch[j];
         const embedding = compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision);
@@ -6790,8 +6894,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         for (const item of group.items) {
           indexed[item.index] = Object.assign({}, item.chunk, {
             embedding,
-            embeddingProvider: semanticEmbeddingProviderForSettings(this.settings),
-            embeddingModel: this.settings.embeddingModel,
+            embeddingProvider,
+            embeddingModel,
             embeddingDimension: embedding.length,
             embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
             embeddingRequestFingerprint: group.requestKey,
@@ -6799,8 +6903,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             indexMetadata: {
               schemaVersion: 1,
               contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
-              provider: semanticEmbeddingProviderForSettings(this.settings),
-              model: this.settings.embeddingModel,
+              provider: embeddingProvider,
+              model: embeddingModel,
               dimension: embedding.length,
               requestFingerprint: group.requestKey,
               ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {})
@@ -6818,14 +6922,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       reused,
       providerInputs,
       deduplicatedInputs: Math.max(0, pending.length - pendingGroups.length),
-      inputRecords: pending.length
+      inputRecords: pending.length,
+      fallbackOnly,
+      embeddingIdentity
     };
   }
 
-  async embedSemanticMaterialityAnchors() {
+  async embedSemanticMaterialityAnchors(options = {}) {
     const startedAt = Date.now();
     const texts = SEMANTIC_MATERIALITY_ANCHOR_KEYS.map((kind) => SEMANTIC_MATERIALITY_ANCHOR_TEXTS[kind]);
-    const vectors = await this.embedTexts(texts, "document");
+    const embeddingResult = await this.embedSemanticTextsWithProvenance(texts, "document", options.fallbackOnly
+      ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity: options.embeddingIdentity || null })
+      : { fallbackPolicy: "disabled" });
+    const vectors = Array.isArray(embeddingResult?.vectors) ? embeddingResult.vectors : [];
+    const embeddingProvider = String(embeddingResult?.provider || semanticEmbeddingProviderForSettings(this.settings)).trim().toLowerCase();
+    const embeddingModel = String(embeddingResult?.actualModel || embeddingResult?.model || this.settings.embeddingModel || "").trim();
     const compacted = Object.fromEntries(SEMANTIC_MATERIALITY_ANCHOR_KEYS.map((kind, index) => [
       kind,
       compactEmbedding(vectors[index], this.settings.semanticIndexEmbeddingPrecision)
@@ -6834,11 +6945,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!dimension || SEMANTIC_MATERIALITY_ANCHOR_KEYS.some((kind) => !Array.isArray(compacted[kind]) || compacted[kind].length !== dimension)) {
       throw new Error("Semantic materiality anchor embedding dimension mismatch.");
     }
+    const embeddingIdentity = { provider: embeddingProvider, model: embeddingModel, dimension };
+    if (options.embeddingIdentity && (options.embeddingIdentity.provider !== embeddingIdentity.provider
+      || String(options.embeddingIdentity.model).toLowerCase() !== String(embeddingIdentity.model).toLowerCase()
+      || (options.embeddingIdentity.dimension > 0 && options.embeddingIdentity.dimension !== embeddingIdentity.dimension))) {
+      const error = new Error("Embedding provider/model/dimension changed between candidate vectors and materiality anchors.");
+      error.code = "embedding-candidate-identity-mismatch";
+      throw error;
+    }
     return {
       version: SEMANTIC_MATERIALITY_ANCHOR_VERSION,
-      provider: semanticEmbeddingProviderForSettings(this.settings),
-      model: this.settings.embeddingModel,
+      provider: embeddingProvider,
+      model: embeddingModel,
       dimension,
+      embeddingIdentity,
       fingerprints: Object.fromEntries(SEMANTIC_MATERIALITY_ANCHOR_KEYS.map((kind) => [kind, semanticMaterialityAnchorFingerprint(kind)])),
       vectors: compacted,
       telemetry: {
@@ -6942,7 +7062,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async refreshTaskReferenceSemanticIndex(previousRecords = [], nextRecords = [], options = {}) {
-    return this.withSemanticIndexOperation("task-reference-refresh", async () => {
+    const refreshResult = await this.withSemanticIndexOperation("task-reference-refresh", async () => {
       const previousById = new Map((previousRecords || []).map((record) => [String(record.sourceId || ""), record]));
       const nextById = new Map((nextRecords || []).map((record) => [String(record.sourceId || ""), record]));
       const changedIds = new Set();
@@ -6985,7 +7105,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const previousIntegrity = this.taskReferenceIntegrity;
       try {
         const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, this.settings.semanticIndexMeta || {});
-        const embedded = refreshChunks.length ? await this.embedSemanticChunks(refreshChunks, reuseMap, "task-reference refresh") : { indexed: [], embedded: 0, reused: 0 };
+        const embedded = refreshChunks.length
+          ? await this.embedSemanticChunks(refreshChunks, reuseMap, "task-reference refresh", { fallbackPolicy: "disabled" })
+          : { indexed: [], embedded: 0, reused: 0 };
         const indexed = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
         const candidateIndex = previousIndex.filter((chunk) => {
           if (!semanticTaskReferenceChunkSelected(chunk)) return true;
@@ -7031,6 +7153,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           window.clearTimeout(this.semanticIndexTimer);
           this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
         }
+        if (semanticEmbeddingFallbackEligible(error, this.settings)) {
+          result.ok = true;
+          result.reasonCode = "embedding-fallback-required";
+          result.degradedReason = result.reasonCode;
+          result.repairQueued = true;
+          result.embeddingFallbackRequired = true;
+          return result;
+        }
         result.ok = false;
         result.reasonCode = "task-reference-refresh-failed";
         result.degradedReason = result.reasonCode;
@@ -7039,6 +7169,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       return result;
     });
+    if (refreshResult?.embeddingFallbackRequired) {
+      const rebuilt = await this.rebuildSemanticIndex(false);
+      if (!rebuilt?.ok) throw new Error(rebuilt?.reasonCode || "embedding-fallback-rebuild-failed");
+      return semanticOperationResult({ ok: true, changed: true, changedCount: rebuilt.changedCount, reasonCode: "rebuilt-embedding-fallback" });
+    }
+    return refreshResult;
   }
 
   semanticTaskReferenceChunks(pathFilter = "", locationIndex = null, options = {}) {
@@ -7275,8 +7411,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const currentTaskChunks = this.semanticTaskReferenceChunks && locationIndex
           ? this.semanticTaskReferenceChunks("", locationIndex, { removedPath: normalizedPath })
           : previousIndex.filter((chunk) => semanticTaskReferenceChunkSelected(chunk));
+        const taskEmbedding = currentTaskChunks.length && this.embedSemanticChunks
+          ? await this.embedSemanticChunks(currentTaskChunks, buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta), "task-reference path cleanup", { fallbackPolicy: "disabled" })
+          : { indexed: [], embedded: 0, reused: 0, fallbackOnly: false };
         const taskChunks = currentTaskChunks.length && this.embedSemanticChunks
-          ? normalizeSemanticIndexPaths(await this.embedSemanticChunks(currentTaskChunks, buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta), "task-reference path cleanup").then((embedded) => embedded.indexed || []), this.app, this.semanticIndexRevision)
+          ? normalizeSemanticIndexPaths(taskEmbedding.indexed || [], this.app, this.semanticIndexRevision)
           : currentTaskChunks;
         const candidateIndex = previousIndex.filter((chunk) => {
           if (semanticTaskReferenceChunkSelected(chunk)) return false;
@@ -7322,6 +7461,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (typeof window !== "undefined") {
           window.clearTimeout(this.semanticIndexTimer);
           this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
+        }
+        if (semanticEmbeddingFallbackEligible(error, this.settings)) {
+          return Object.assign(semanticOperationResult({ ok: true, queued: 1, reasonCode: "embedding-fallback-required" }), {
+            embeddingFallbackRequired: true
+          });
         }
         const repairQueued = Boolean(this.scheduleSemanticTaskReferenceRepair?.("path-removal-integrity"));
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: String(error?.message || "path-removal-failed").split("\n")[0].slice(0, 120), repairQueued });
@@ -16750,6 +16894,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     aiProviderSetting(containerEl, this.plugin, () => this.display());
     toggleSetting(containerEl, "Enable AI fallback globally", "Applies to every provider and AI operation. When off, every operation uses only its primary model; saved fallback selections are preserved for when you turn this back on.", this.plugin, "enableAiModelFallback", () => this.display());
     if (this.plugin.settings.enableAiModelFallback) fallbackAiProviderSetting(containerEl, this.plugin, () => this.display());
+    toggleSetting(containerEl, "Enable embedding fallback", "Independent from generation fallback. When on, an explicit accessible embedding provider/model may be used after a primary embedding failure; the complete semantic-index candidate is rebuilt in one vector space. Saved embedding fallback selections remain preserved while off.", this.plugin, "enableEmbeddingFallback", () => this.display());
     stsMpRenderUnifiedModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
     settingsHeading(containerEl, "Model catalog maintenance", "Refresh model lists or validate configured AI access.");
     const refreshState = this.plugin.modelCatalogRefreshState || { loading: false, error: "" };
@@ -17935,7 +18080,8 @@ const SETTING_DESCRIPTIONS = {
   openwebuiThinkingMode: "Controls the native OpenWebUI/Ollama thinking carrier when the exact model advertises thinking. Enabled sends think: true; Model default omits every think field and leaves the model/server default unchanged.",
   optimizeStructuredAiUsage: "Reduces reasoning-token usage for simple scheduler and policy calls while preserving the selected reasoning effort for chat, task extraction, and descriptions. AI duplicate checks use their own reasoning setting.",
   enableOpenAiPromptCaching: "Enabled by default. Uses explicit provider caching where supported for stable structured-output schemas and system instructions only. Dynamic user, note, email, vault, and Todoist context remains outside the cached portion. Turning this off disables cache reads and writes.",
-  enableAiModelFallback: "Global gate for every provider and AI operation. When off, all operations stay primary-only while saved fallback provider/model selections are preserved.",
+  enableAiModelFallback: "Global gate for generation operations. When off, generation stays primary-only while saved generation fallback provider/model selections are preserved.",
+  enableEmbeddingFallback: "Independent embedding fallback gate. When off, embeddings stay primary-only while any saved explicit embedding fallback provider/model selection is preserved.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
   embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
   unknownModelContextWindowTokens: "Provider-neutral positive integer estimate used only when exact model metadata, an exact model override, and any documented provider profile are unavailable; exact metadata and overrides take precedence.",
@@ -19383,7 +19529,11 @@ function stsMpSelectedAiConfigurationRows(settings = {}) {
   if (registry && typeof registry.embeddingModelReference === "function") {
     try { embedding = registry.embeddingModelReference(settings); } catch { embedding = null; }
   }
-  rows.push({ key: "embedding", label: "Embeddings", primary: embedding, fallback: null, embedding: true });
+  let embeddingFallback = null;
+  if (registry && typeof registry.embeddingFallbackModelReference === "function") {
+    try { embeddingFallback = registry.embeddingFallbackModelReference(settings); } catch { embeddingFallback = null; }
+  }
+  rows.push({ key: "embedding", label: "Embeddings", primary: embedding, fallback: embeddingFallback, embedding: true });
   return rows;
 }
 
@@ -19403,7 +19553,9 @@ function stsMpSelectedAiConfigurationReferenceText(reference, embedding = false,
 
 function stsMpRenderSelectedAiConfiguration(containerEl, settings = {}) {
   if (!containerEl || typeof containerEl.createDiv !== "function") return null;
-  const fallbackEnabled = settings.enableAiModelFallback !== false;
+  const generationFallbackEnabled = settings.enableAiModelFallback !== false;
+  const embeddingFallbackEnabled = settings.enableEmbeddingFallback === true;
+  const fallbackEnabled = generationFallbackEnabled || embeddingFallbackEnabled;
   const rows = stsMpSelectedAiConfigurationRows(settings);
   const wrapper = containerEl.createDiv({ cls: "semantic-todoist-selected-ai-configuration" });
   wrapper.setAttribute?.("role", "group");
@@ -19420,19 +19572,22 @@ function stsMpRenderSelectedAiConfiguration(containerEl, settings = {}) {
     Object.assign(cell.style || {}, { minWidth: "0", overflowWrap: "anywhere", wordBreak: "break-word", fontWeight: emphasis ? "600" : "" });
     return cell;
   };
-  const header = table.createDiv({ cls: "semantic-todoist-selected-ai-configuration-row" });
+  const header = table.createDiv({ cls: "semantic-todoist-selected-ai-configuration-row semantic-todoist-selected-ai-configuration-header" });
   header.setAttribute?.("role", "row");
   Object.assign(header.style || {}, { display: "grid", gridTemplateColumns: columns, gap: "8px", width: "100%", minWidth: "0" });
   addCell(header, "Operation", "columnheader", true);
   addCell(header, "Primary", "columnheader", true);
   if (fallbackEnabled) addCell(header, "Fallback", "columnheader", true);
   for (const item of rows) {
-    const row = table.createDiv({ cls: "semantic-todoist-selected-ai-configuration-row" });
+    const row = table.createDiv({ cls: "semantic-todoist-selected-ai-configuration-row semantic-todoist-selected-ai-configuration-body" });
     row.setAttribute?.("role", "row");
     Object.assign(row.style || {}, { display: "grid", gridTemplateColumns: columns, gap: "8px", width: "100%", minWidth: "0", borderTop: "1px solid var(--background-modifier-border)" });
     addCell(row, item.label, "rowheader", true);
     addCell(row, stsMpSelectedAiConfigurationReferenceText(item.primary, item.embedding, settings), "cell");
-    if (fallbackEnabled) addCell(row, item.embedding ? "—" : stsMpSelectedAiConfigurationReferenceText(item.fallback, false, settings), "cell");
+    if (fallbackEnabled) {
+      const enabled = item.embedding ? embeddingFallbackEnabled : generationFallbackEnabled;
+      addCell(row, enabled ? stsMpSelectedAiConfigurationReferenceText(item.fallback, item.embedding, settings) : "Off / —", "cell");
+    }
   }
   return wrapper;
 }
@@ -20763,6 +20918,9 @@ function normalizeSchedulerMemoryEntry(value, fallbackKey = "") {
     semanticSourceIds: uniqueValues(value.semanticSourceIds || []).slice(-32),
     semanticScopeId: String(value.semanticScopeId || ""),
     semanticIndexRevision: Number(value.semanticIndexRevision || 0),
+    semanticQueryProvider: String(value.semanticQueryProvider || "").trim().toLowerCase(),
+    semanticQueryModel: String(value.semanticQueryModel || "").trim(),
+    semanticQueryDimension: Math.max(0, Number(value.semanticQueryDimension || 0)),
     semanticQueryEmbedding: schedulerCompactSemanticEmbedding(value.semanticQueryEmbedding || [], 128),
     priority: Object.assign({ last: 1, max: 1, samples: 0 }, value.priority || {}),
     duration: Object.assign({ last: 0, average: 0, samples: 0, source: "" }, value.duration || {}),
@@ -21167,17 +21325,31 @@ function schedulerMemoryEntry(memory, task) {
 
 function schedulerMemoryForCandidate(memory, candidate) {
   if (!memory?.entries || !candidate) return null;
-  const exact = schedulerMemoryExactMatch(memory, candidate);
-  if (exact?.entry) return Object.assign({}, exact.entry, { exact: true });
   const bundle = candidate.schedulerSemanticBundle;
+  const exact = schedulerMemoryExactMatch(memory, candidate);
+  if (exact?.entry && schedulerMemoryIdentityMatchesBundle(exact.entry, bundle)) return Object.assign({}, exact.entry, { exact: true });
   if (!bundle || bundle.degradedReason) return null;
   let best = null;
   for (const entry of Object.values(memory.entries || {})) {
+    if (!schedulerMemoryIdentityMatchesBundle(entry, bundle)) continue;
     const score = schedulerMemorySemanticSimilarity(entry, bundle);
     if (!best || score > best.score) best = { entry, score };
   }
   if (!best || best.score < 0.62) return null;
   return Object.assign({}, best.entry, { exact: false, similarity: best.score });
+}
+
+function schedulerMemoryIdentityMatchesBundle(entry, bundle) {
+  if (!bundle || bundle.degradedReason) return true;
+  const provider = String(bundle.provider || "").trim().toLowerCase();
+  const model = String(bundle.model || "").trim().toLowerCase();
+  const dimension = Math.max(0, Number(bundle.dimension || 0));
+  if (!provider || !model) return true;
+  if (!entry) return false;
+  if (String(entry.semanticQueryProvider || "").trim().toLowerCase() !== provider) return false;
+  if (String(entry.semanticQueryModel || "").trim().toLowerCase() !== model) return false;
+  const storedDimension = Math.max(0, Number(entry.semanticQueryDimension || 0));
+  return dimension <= 0 || storedDimension === dimension;
 }
 
 function schedulerMemoryExactMatch(memory, task) {
@@ -21288,6 +21460,9 @@ function updateSchedulerMemoryEntry(entry, task, observation = {}) {
     entry.semanticSourceIds = schedulerAppendUnique(entry.semanticSourceIds, bundle.sourceIds || [], 32);
     entry.semanticScopeId = String(bundle.scopeId || entry.semanticScopeId || "");
     entry.semanticIndexRevision = Number(bundle.indexRevision || entry.semanticIndexRevision || 0);
+    entry.semanticQueryProvider = String(bundle.provider || entry.semanticQueryProvider || "").trim().toLowerCase();
+    entry.semanticQueryModel = String(bundle.model || entry.semanticQueryModel || "").trim();
+    entry.semanticQueryDimension = Math.max(0, Number(bundle.dimension || entry.semanticQueryDimension || 0));
     entry.semanticQueryEmbedding = schedulerCompactSemanticEmbedding(bundle.queryEmbedding || [], 128);
   }
   entry.priority = entry.priority || { last: 1, max: 1, samples: 0 };
@@ -22414,6 +22589,24 @@ function syncWorkerCount(settings = DEFAULT_SETTINGS) {
 
 function semanticEmbeddingBatchSize(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(96, parseInt(settings.embeddingBatchSize, 10) || DEFAULT_SETTINGS.embeddingBatchSize || 16));
+}
+
+function semanticEmbeddingFallbackReference(settings = {}) {
+  if (settings?.enableEmbeddingFallback !== true || typeof STS_MULTI_PROVIDER === "undefined") return null;
+  try { return STS_MULTI_PROVIDER.embeddingFallbackModelReference(settings); } catch { return null; }
+}
+
+function semanticEmbeddingFallbackEligible(error, settings = {}) {
+  return Boolean(semanticEmbeddingFallbackReference(settings)
+    && error?.providerError?.retryable === true
+    && error?.aiGatewayEmbeddingContract !== true);
+}
+
+function semanticEmbeddingFallbackRequest(settings = {}) {
+  const reference = semanticEmbeddingFallbackReference(settings);
+  return reference
+    ? { fallbackOnly: true, fallbackPolicy: "explicit", explicitFallback: reference }
+    : null;
 }
 
 function geminiEmbeddingConcurrency(settings = DEFAULT_SETTINGS) {
@@ -48581,6 +48774,25 @@ const STS_MULTI_PROVIDER = (() => {
     if (candidate === "openai") return "openai";
     return PROVIDERS.includes(fallback) ? fallback : "openai";
   };
+  const providerAccessReady = (settings = {}, provider) => {
+    const normalizedProvider = normalizeProvider(provider, "");
+    if (!PROVIDERS.includes(normalizedProvider)) return false;
+    if (normalizedProvider === "openai") return Boolean(nonEmpty(settings.openaiApiKey));
+    if (normalizedProvider === "gemini") return Boolean(nonEmpty(settings.googleApiKey));
+    if (normalizedProvider === "openrouter") return Boolean(nonEmpty(settings.openrouterApiKey));
+    try {
+      const baseUrl = normalizeOpenWebUIBaseUrl(settings.openwebuiBaseUrl, settings.openwebuiAllowInsecureHttp === true);
+      if (!baseUrl) return false;
+      const mode = nonEmpty(settings.openwebuiAuthMode).toLowerCase() === "login" ? "login" : "api-key";
+      if (mode === "login") {
+        const expiresAt = normalizeExpiry(settings.openwebuiJwtExpiresAt);
+        return Boolean(nonEmpty(settings.openwebuiJwt)) && (!expiresAt || expiresAt > Date.now());
+      }
+      return Boolean(nonEmpty(settings.openwebuiApiKey));
+    } catch {
+      return false;
+    }
+  };
   const providerDisplayName = (provider) => ({ openai: "OpenAI", gemini: "Gemini", openrouter: "OpenRouter", openwebui: "Self-Hosted OpenWebUI" })[normalizeProvider(provider)];
   const stripModelPrefix = (model, provider) => {
     const value = nonEmpty(model);
@@ -48872,7 +49084,9 @@ const STS_MULTI_PROVIDER = (() => {
       openrouter: lists.openrouter || settings.availableOpenRouterModels || [],
       openwebui: lists.openwebui || settings.availableOpenWebUIModels || []
     };
-    return PROVIDER_DISPLAY_ORDER.flatMap((provider) => unique(values[provider]).sort((a, b) => a.localeCompare(b)).map((model) => modelOption(provider, model)));
+    return PROVIDER_DISPLAY_ORDER
+      .filter((provider) => providerAccessReady(settings, provider))
+      .flatMap((provider) => unique(values[provider]).sort((a, b) => a.localeCompare(b)).map((model) => modelOption(provider, model)));
   };
   const REASONING_SOURCE_VALUES = Object.freeze(["automatic", "explicit"]);
   const validModelReference = (reference) => Boolean(reference && ["gemini", "openai", "openrouter", "openwebui"].includes(nonEmpty(reference.provider).toLowerCase().replace(/[-_\s]/g, "")) && nonEmpty(reference.model));
@@ -49067,6 +49281,9 @@ const STS_MULTI_PROVIDER = (() => {
     const existing = next.aiOperationModels && typeof next.aiOperationModels === "object" ? next.aiOperationModels : {};
     const operationModels = {};
     let changed = false;
+    const embeddingFallbackEnabled = next.enableEmbeddingFallback === true;
+    if (next.enableEmbeddingFallback !== embeddingFallbackEnabled) changed = true;
+    next.enableEmbeddingFallback = embeddingFallbackEnabled;
     const manualGenerationSource = next.manualProviderGenerationModels && typeof next.manualProviderGenerationModels === "object" ? next.manualProviderGenerationModels : {};
     const manualProviderGenerationModels = Object.fromEntries(PROVIDERS.map((provider) => [
       provider,
@@ -49109,6 +49326,7 @@ const STS_MULTI_PROVIDER = (() => {
     }
     const embeddingReference = normalizeModelReference(next.embeddingModelReference)
       || inheritedModelReference(next, next.embeddingModel, next.embeddingProvider || next.aiModelProvider);
+    const embeddingFallbackReference = normalizeModelReference(next.embeddingFallbackModelReference);
     if (JSON.stringify(operationModels) !== JSON.stringify(existing)) changed = true;
     if (next.embeddingModelReference?.provider !== embeddingReference?.provider || next.embeddingModelReference?.model !== embeddingReference?.model) changed = true;
     const consistentFallbackProvider = explicitFallbackProviders.length > 0
@@ -49152,6 +49370,18 @@ const STS_MULTI_PROVIDER = (() => {
     next.enableMultiProviderOperationModels = enableAdvanced;
     next.aiOperationModels = operationModels;
     next.embeddingModelReference = embeddingReference;
+    const nextEmbeddingFallbackReference = embeddingFallbackReference
+      && (!embeddingReference || modelIdentity(embeddingFallbackReference.provider, embeddingFallbackReference.model) !== modelIdentity(embeddingReference.provider, embeddingReference.model))
+      ? embeddingFallbackReference
+      : null;
+    if (next.embeddingFallbackModelReference?.provider !== nextEmbeddingFallbackReference?.provider || next.embeddingFallbackModelReference?.model !== nextEmbeddingFallbackReference?.model) changed = true;
+    next.embeddingFallbackModelReference = nextEmbeddingFallbackReference;
+    const embeddingFallbackProvider = normalizeProvider(
+      embeddingFallbackReference?.provider || next.embeddingFallbackProvider || embeddingReference?.provider,
+      embeddingReference?.provider || "openai"
+    );
+    if (next.embeddingFallbackProvider !== embeddingFallbackProvider) changed = true;
+    next.embeddingFallbackProvider = embeddingFallbackProvider;
     next.fallbackAiModelProvider = fallbackAiModelProvider;
     next.multiProviderModelMigrationVersion = 5;
     return { settings: next, changed };
@@ -49200,6 +49430,7 @@ const STS_MULTI_PROVIDER = (() => {
     const append = (row, source = "manual") => {
       const rowProvider = row && typeof row === "object" ? row.provider : normalizedProvider;
       if (rowProvider !== undefined && normalizeProvider(rowProvider, "") !== normalizedProvider) return;
+      if (!providerAccessReady(settings, normalizedProvider)) return;
       const value = row && typeof row === "object" ? (row.id || row.model || row.value || "") : row;
       const id = normalizeModel(normalizedProvider, value);
       if (!id) return;
@@ -49496,6 +49727,11 @@ const STS_MULTI_PROVIDER = (() => {
     const provider = nonEmpty(settings.embeddingProvider);
     return provider ? normalizeModelReference({ provider, model: settings.embeddingModel }) : null;
   };
+  const embeddingFallbackModelReference = (settings = {}) => {
+    const reference = normalizeModelReference(settings.embeddingFallbackModelReference);
+    const primary = embeddingModelReference(settings);
+    return reference && (!primary || modelIdentity(reference.provider, reference.model) !== modelIdentity(primary.provider, primary.model)) ? reference : null;
+  };
   const setEmbeddingModelReference = (settings = {}, reference) => {
     const migrated = migrateOperationModelSettings(settings).settings;
     const normalized = normalizeModelReference(reference);
@@ -49507,6 +49743,24 @@ const STS_MULTI_PROVIDER = (() => {
     migrated.embeddingModel = normalized.model;
     return migrated;
   };
+  const setEmbeddingFallbackModelReference = (settings = {}, reference) => {
+    const migrated = migrateOperationModelSettings(settings).settings;
+    if (reference === null || reference === undefined || reference === "") {
+      migrated.embeddingFallbackModelReference = null;
+      return migrated;
+    }
+    const normalized = normalizeModelReference(reference);
+    if (!normalized) throw providerError(reference?.provider || migrated.embeddingProvider || "openai", null, "model-required");
+    if (!providerAccessReady(migrated, normalized.provider)) throw providerError(normalized.provider, null, "provider-access-required", false, "Configure provider access before selecting an embedding fallback.");
+    const primary = embeddingModelReference(migrated);
+    if (primary && modelIdentity(primary.provider, primary.model) === modelIdentity(normalized.provider, normalized.model)) throw providerError(normalized.provider, null, "fallback-same-primary");
+    const capability = modelRoleCapability(migrated, normalized.provider, normalized.model);
+    if (capability.embedding === false) throw providerError(normalized.provider, null, "embedding-capability-unsupported");
+    migrated.embeddingFallbackModelReference = normalized;
+    migrated.embeddingFallbackProvider = normalized.provider;
+    return migrated;
+  };
+  const clearEmbeddingFallbackModelReference = (settings = {}) => setEmbeddingFallbackModelReference(settings, null);
   const normalizeEmbeddingDimensionOverrides = (value = {}) => {
     const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
     const normalized = {};
@@ -49566,6 +49820,9 @@ const STS_MULTI_PROVIDER = (() => {
     const seen = new Set();
     const add = (provider, id, sourceName = "discovery") => {
       const normalizedProvider = normalizeProvider(provider, "");
+      // Only accessible providers contribute selectable model rows. Provider
+      // dropdowns remain provider-neutral and are rendered separately.
+      if (!providerAccessReady(settings, normalizedProvider)) return;
       const normalized = normalizeModel(normalizedProvider, id);
       if (!normalized) return;
       const identity = modelIdentity(normalizedProvider, normalized);
@@ -54562,6 +54819,7 @@ const STS_MULTI_PROVIDER = (() => {
     GENERATION_DEFAULTS,
     INDEX_FILES,
     providerDisplayName,
+    providerAccessReady,
     providerDefaultModel,
     providerDefaultReasoning,
     modelRoleCapability,
@@ -54594,7 +54852,10 @@ const STS_MULTI_PROVIDER = (() => {
     setOperationReasoningReference,
     setSharedGenerationReasoning,
     embeddingModelReference,
+    embeddingFallbackModelReference,
     setEmbeddingModelReference,
+    setEmbeddingFallbackModelReference,
+    clearEmbeddingFallbackModelReference,
     normalizeEmbeddingDimensionOverrides,
     embeddingDimensionOverride,
     operationRequest,
@@ -54730,21 +54991,10 @@ function aiGatewayReference(value, settings, isFallback = false, operation = "",
   });
 }
 
-function aiGatewayEmbeddingAutomaticFallback(settings, primary, operation = "") {
-  if (!primary?.provider || !primary?.model) return null;
-  const provider = primary.provider;
-  const lists = {
-    openai: settings.availableEmbeddingModels || [],
-    gemini: settings.availableGeminiEmbeddingModels || [],
-    openrouter: settings.availableOpenRouterEmbeddingModels || [],
-    openwebui: settings.availableOpenWebUIEmbeddingModels || []
-  };
-  const candidate = (lists[provider] || [])
-    .map((model) => STS_MULTI_PROVIDER.normalizeModel(provider, model))
-    .find((model) => model
-      && STS_MULTI_PROVIDER.modelIdentity(provider, model) !== STS_MULTI_PROVIDER.modelIdentity(primary.provider, primary.model)
-      && STS_MULTI_PROVIDER.modelRoleCapability(settings, provider, model).embedding !== false);
-  return candidate ? aiGatewayReference({ provider, model: candidate }, settings, true, operation) : null;
+function aiGatewayEmbeddingAutomaticFallback() {
+  // Embedding fallbacks are explicit settings only. Automatic alternates can
+  // silently mix vector dimensions/providers and are intentionally disabled.
+  return null;
 }
 
 // Pure selection helper used by production planning and deterministic tests.
@@ -54756,21 +55006,24 @@ function selectAiModelReferences(settings = {}, selection = {}) {
   const operation = aiGatewayOperationForRequest(selection);
   const modelLessKind = kind === "discover" || kind === "setup-check";
   const current = kind === "embed"
-    ? { primary: STS_MULTI_PROVIDER.embeddingModelReference(migrated), fallback: null }
+    ? { primary: STS_MULTI_PROVIDER.embeddingModelReference(migrated), fallback: STS_MULTI_PROVIDER.embeddingFallbackModelReference(migrated) }
     : STS_MULTI_PROVIDER.operationModelReference(migrated, operation) || (kind === "generate" ? {} : STS_MULTI_PROVIDER.operationModelReference(migrated, "chat-query") || {});
   const explicitPrimary = selection.primaryOverride || selection.primary;
   const primary = aiGatewayReference(explicitPrimary || current.primary, migrated, false, operation, modelLessKind);
   const primaryOnlyOverride = Boolean(explicitPrimary) && selection.fallbackPolicy === undefined;
   const fallbackPolicy = modelLessKind ? "disabled" : String(selection.fallbackPolicy || "settings").trim().toLowerCase();
+  const fallbackAllowed = kind === "embed"
+    ? migrated.enableEmbeddingFallback === true
+    : migrated.enableAiModelFallback !== false;
   let fallback = null;
-  if (!primaryOnlyOverride && migrated.enableAiModelFallback !== false && fallbackPolicy !== "disabled") {
+  if (!primaryOnlyOverride && fallbackAllowed && fallbackPolicy !== "disabled") {
     if (fallbackPolicy === "explicit") fallback = aiGatewayReference(selection.explicitFallback || selection.fallback, migrated, true, operation);
-    else if (fallbackPolicy === "settings") fallback = aiGatewayReference(current.fallback, migrated, true, operation) || (kind === "embed" ? aiGatewayEmbeddingAutomaticFallback(migrated, primary, operation) : STS_MULTI_PROVIDER.automaticFallbackReference(migrated, primary, operation));
+    else if (fallbackPolicy === "settings") fallback = aiGatewayReference(current.fallback, migrated, true, operation) || (kind === "embed" ? null : STS_MULTI_PROVIDER.automaticFallbackReference(migrated, primary, operation));
   }
   if (selection.fallbackOnly) {
-    if (migrated.enableAiModelFallback === false) return Object.freeze({ settings: migrated, kind, operation, primary: null, fallback: null, fallbackEnabled: false, fallbackPolicy: "disabled", fallbackOnly: true });
+    if (!fallbackAllowed) return Object.freeze({ settings: migrated, kind, operation, primary: null, fallback: null, fallbackEnabled: false, fallbackPolicy: "disabled", fallbackOnly: true });
     const fallbackReference = fallback || aiGatewayReference(selection.explicitFallback || selection.fallback || current.fallback, migrated, true, operation)
-      || (kind === "embed" ? aiGatewayEmbeddingAutomaticFallback(migrated, primary, operation) : STS_MULTI_PROVIDER.automaticFallbackReference(migrated, primary, operation));
+      || (kind === "embed" ? null : STS_MULTI_PROVIDER.automaticFallbackReference(migrated, primary, operation));
     return Object.freeze({
       settings: migrated,
       kind,
@@ -54789,7 +55042,7 @@ function selectAiModelReferences(settings = {}, selection = {}) {
     operation,
     primary,
     fallback,
-    fallbackEnabled: Boolean(fallback && migrated.enableAiModelFallback !== false && fallbackPolicy !== "disabled"),
+    fallbackEnabled: Boolean(fallback && fallbackAllowed && fallbackPolicy !== "disabled"),
     fallbackPolicy: ["disabled", "explicit", "settings"].includes(fallbackPolicy) ? fallbackPolicy : "settings"
   });
 }
@@ -58109,8 +58362,21 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     }
     return result.text !== undefined ? result.text : result.rawText;
   };
+  gatewayPrototype.embedTextsWithProvenance = async function(texts, role = "document", options = {}) {
+    return this.aiModelGateway().execute(Object.assign({}, options || {}, {
+      kind: "embed",
+      operation: "embedding",
+      texts: (texts || []).map((text) => String(text == null ? "" : text)),
+      role
+    }));
+  };
   gatewayPrototype.embedTexts = async function(texts, role = "document") {
-    const result = await this.aiModelGateway().execute({ kind: "embed", operation: "embedding", texts: (texts || []).map((text) => String(text == null ? "" : text)), role });
+    const result = await this.aiModelGateway().execute({
+      kind: "embed",
+      operation: "embedding",
+      texts: (texts || []).map((text) => String(text == null ? "" : text)),
+      role
+    });
     return result.vectors || [];
   };
   gatewayPrototype.refreshOpenWebUIModels = async function(showNotice = true) {
@@ -58273,9 +58539,10 @@ function stsMpParseProviderScopedValue(value) {
   return STS_MULTI_PROVIDER.normalizeModelReference({ provider, model: raw.slice(separator + 1).trim() });
 }
 
-function stsMpManualModelRow(value, allowedProviders = STS_MULTI_PROVIDER.PROVIDERS) {
+function stsMpManualModelRow(value, allowedProviders = STS_MULTI_PROVIDER.PROVIDERS, settings = null) {
   const reference = stsMpParseProviderScopedValue(value);
   if (!reference || !(allowedProviders || []).includes(reference.provider)) return null;
+  if (settings && !STS_MULTI_PROVIDER.providerAccessReady(settings, reference.provider)) return null;
   const scoped = `${reference.provider}:${reference.model}`;
   return {
     provider: reference.provider,
@@ -58297,12 +58564,13 @@ function stsMpRememberManualProviderModel(plugin, key, reference) {
   plugin.settings[key] = next;
 }
 
-function stsMpCatalogForOperation(settings, operation) {
+function stsMpCatalogForOperation(settings, operation, provider = "") {
   const manual = [];
   const current = STS_MULTI_PROVIDER.operationModelReference(settings, operation);
   if (current?.primary) manual.push(current.primary);
   if (current?.fallback) manual.push(current.fallback);
-  return STS_MULTI_PROVIDER.catalogRows(settings, {}, manual);
+  const rows = STS_MULTI_PROVIDER.catalogRows(settings, {}, manual);
+  return provider ? rows.filter((row) => row.provider === provider) : rows;
 }
 
 const stsMpSearchableComboboxInstances = new Set();
@@ -58411,9 +58679,10 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
   let renderedRows = [];
   const selectedLabel = () => {
     const selected = rows.find((row) => asText(row.value || `${row.provider}:${row.id}`) === selectedValue);
-    if (selected) return asText(selected.label || selected.value);
+    if (selected && selected.unavailable !== true) return asText(selected.label || selected.value);
+    if (selected?.unavailable === true) return `${asText(selected.label || selected.value)} (Unavailable / incompatible)`;
     return selectedValue
-      ? `Manual: ${selectedValue}`
+      ? `Manual: ${selectedValue} (Unavailable / incompatible)`
       : (config.automatic ? asText(config.automaticLabel || "Automatic fallback") : asText(config.placeholder || "Select a model"));
   };
   const updateSelectedValuePresentation = () => {
@@ -58432,16 +58701,15 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
       seen.add(value);
       return Object.assign({}, row, { value });
     }).filter(Boolean);
-    return providerOrder.flatMap((provider) => source
+    const selectableSource = source.filter((row) => row.unavailable !== true);
+    return providerOrder.flatMap((provider) => selectableSource
       .filter((row) => normalize(row.provider) === normalize(provider))
       .sort((a, b) => asText(a.label || a.value).localeCompare(asText(b.label || b.value))));
   };
   const ensureSelectedRow = () => {
     if (!selectedValue || rows.some((row) => asText(row.value || `${row.provider}:${row.id}`) === selectedValue)) return;
-    const separator = selectedValue.indexOf(":");
-    const provider = separator > 0 ? selectedValue.slice(0, separator) : "";
-    const id = separator > 0 ? selectedValue.slice(separator + 1) : selectedValue;
-    rows.push({ provider, id, value: selectedValue, label: `Manual: ${selectedValue} (Unavailable / incompatible)`, source: "manual", unavailable: true });
+    // Keep a saved but inaccessible selection visible in the closed control;
+    // never inject it into the popup option list.
   };
   const isMatch = (row) => {
     if (!query) return true;
@@ -58692,6 +58960,9 @@ function stsMpSetSharedGenerationReference(plugin, reference, fallback = undefin
 function stsMpSharedGenerationModelSetting(containerEl, plugin, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
   const current = stsMpProviderScopedValue(options.fallback ? reference?.fallback : reference?.primary);
+  const selectedProvider = options.fallback
+    ? STS_MULTI_PROVIDER.normalizeProvider(reference?.fallback?.provider || plugin.settings.fallbackAiModelProvider, "")
+    : STS_MULTI_PROVIDER.normalizeProvider(reference?.primary?.provider || plugin.settings.aiModelProvider, "");
   const setting = new Setting(containerEl)
     .setName(options.name || (options.fallback ? "Shared fallback model" : "Shared primary model"))
     .setDesc(options.desc || "Type to search the provider groups. The exact provider:model reference is applied to every generation operation; selection makes no provider call.");
@@ -58699,19 +58970,26 @@ function stsMpSharedGenerationModelSetting(containerEl, plugin, refreshDisplay =
   stsMpSearchableCombobox(setting.controlEl, {
     accessibleLabel: options.accessibleLabel || (options.fallback ? "Shared fallback model" : "Shared primary model"),
     rows: options.fallback
-      ? STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, stsMpCatalogForOperation(plugin.settings, "chat-query"))
-      : stsMpCatalogForOperation(plugin.settings, "chat-query"),
+      ? STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, stsMpCatalogForOperation(plugin.settings, "chat-query", selectedProvider))
+      : stsMpCatalogForOperation(plugin.settings, "chat-query", selectedProvider),
     getRows: () => {
       const latest = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
-      const rows = stsMpCatalogForOperation(plugin.settings, "chat-query");
+      const provider = options.fallback
+        ? STS_MULTI_PROVIDER.normalizeProvider(latest?.fallback?.provider || plugin.settings.fallbackAiModelProvider, "")
+        : STS_MULTI_PROVIDER.normalizeProvider(latest?.primary?.provider || plugin.settings.aiModelProvider, "");
+      const rows = stsMpCatalogForOperation(plugin.settings, "chat-query", provider);
       return options.fallback ? STS_MULTI_PROVIDER.fallbackCatalogRows(latest?.primary, rows) : rows;
     },
     value: current,
     automatic: Boolean(options.fallback),
     automaticLabel: "Automatic fallback",
     manualRowForQuery: (value) => {
-      const row = stsMpManualModelRow(value);
-      const primary = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query")?.primary;
+      const latest = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, "chat-query");
+      const provider = options.fallback
+        ? STS_MULTI_PROVIDER.normalizeProvider(latest?.fallback?.provider || plugin.settings.fallbackAiModelProvider, "")
+        : STS_MULTI_PROVIDER.normalizeProvider(latest?.primary?.provider || plugin.settings.aiModelProvider, "");
+      const row = stsMpManualModelRow(value, provider ? [provider] : [], plugin.settings);
+      const primary = latest?.primary;
       if (row && options.fallback && primary && STS_MULTI_PROVIDER.modelIdentity(row.provider, row.id) === STS_MULTI_PROVIDER.modelIdentity(primary.provider, primary.model)) row.disabled = true;
       return row;
     },
@@ -58766,7 +59044,7 @@ function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDispl
     rows,
     getRows: () => stsMpCatalogForOperation(plugin.settings, operation),
     value: current,
-    manualRowForQuery: (value) => stsMpManualModelRow(value),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, STS_MULTI_PROVIDER.PROVIDERS, plugin.settings),
     onSelect: async (row) => {
       const selected = stsMpParseProviderScopedValue(row?.value || "");
       if (!selected) return;
@@ -58800,7 +59078,7 @@ function stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDispla
     automatic: true,
     automaticLabel: "Automatic fallback",
     manualRowForQuery: (value) => {
-      const row = stsMpManualModelRow(value);
+      const row = stsMpManualModelRow(value, STS_MULTI_PROVIDER.PROVIDERS, plugin.settings);
       const primary = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation)?.primary;
       if (row && primary && STS_MULTI_PROVIDER.modelIdentity(row.provider, row.id) === STS_MULTI_PROVIDER.modelIdentity(primary.provider, primary.model)) row.disabled = true;
       return row;
@@ -58853,21 +59131,34 @@ function stsMpOperationReasoningSetting(containerEl, plugin, operation, role = "
   });
 }
 
-function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) {
-  const settings = plugin.settings || {};
-  const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings);
-  const manual = reference ? [reference] : [];
+function stsMpEmbeddingCatalog(settings = {}, extraReferences = []) {
   const manualByProvider = settings.manualProviderEmbeddingModels && typeof settings.manualProviderEmbeddingModels === "object" ? settings.manualProviderEmbeddingModels : {};
+  const manual = [];
+  for (const reference of [
+    STS_MULTI_PROVIDER.embeddingModelReference(settings),
+    STS_MULTI_PROVIDER.embeddingFallbackModelReference(settings),
+    ...(extraReferences || [])
+  ]) if (reference) manual.push(reference);
   for (const provider of STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER) {
     for (const model of manualByProvider[provider] || []) manual.push({ provider, model });
   }
-  const catalogSettings = Object.assign({}, settings, { manualProviderGenerationModels: manualByProvider });
-  const catalog = STS_MULTI_PROVIDER.catalogRows(catalogSettings, {
-    gemini: settings.availableGeminiEmbeddingModels || [],
-    openai: settings.availableEmbeddingModels || [],
-    openrouter: settings.availableOpenRouterEmbeddingModels || [],
-    openwebui: settings.availableOpenWebUIEmbeddingModels || []
-  }, manual, "embedding");
+  return STS_MULTI_PROVIDER.catalogRows(
+    Object.assign({}, settings, { manualProviderGenerationModels: manualByProvider }),
+    {
+      gemini: settings.availableGeminiEmbeddingModels || [],
+      openai: settings.availableEmbeddingModels || [],
+      openrouter: settings.availableOpenRouterEmbeddingModels || [],
+      openwebui: settings.availableOpenWebUIEmbeddingModels || []
+    },
+    manual,
+    "embedding"
+  );
+}
+
+function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) {
+  const settings = plugin.settings || {};
+  const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings);
+  const catalog = stsMpEmbeddingCatalog(settings);
   const current = stsMpProviderScopedValue(reference);
   const setting = new Setting(containerEl)
     .setName("Embedding index model")
@@ -58878,26 +59169,10 @@ function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) 
     rows: catalog,
     getRows: () => {
       const latestSettings = plugin.settings || {};
-      const latestReference = STS_MULTI_PROVIDER.embeddingModelReference(latestSettings);
-      const latestManual = latestReference ? [latestReference] : [];
-      const latestManualByProvider = latestSettings.manualProviderEmbeddingModels && typeof latestSettings.manualProviderEmbeddingModels === "object" ? latestSettings.manualProviderEmbeddingModels : {};
-      for (const provider of STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER) {
-        for (const model of latestManualByProvider[provider] || []) latestManual.push({ provider, model });
-      }
-      return STS_MULTI_PROVIDER.catalogRows(
-        Object.assign({}, latestSettings, { manualProviderGenerationModels: latestManualByProvider }),
-        {
-          gemini: latestSettings.availableGeminiEmbeddingModels || [],
-          openai: latestSettings.availableEmbeddingModels || [],
-          openrouter: latestSettings.availableOpenRouterEmbeddingModels || [],
-          openwebui: latestSettings.availableOpenWebUIEmbeddingModels || []
-        },
-        latestManual,
-        "embedding"
-      );
+      return stsMpEmbeddingCatalog(latestSettings);
     },
     value: current,
-    manualRowForQuery: (value) => stsMpManualModelRow(value),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, STS_MULTI_PROVIDER.PROVIDERS, plugin.settings),
     onSelect: async (row) => {
       const selected = stsMpParseProviderScopedValue(row?.value || "");
       if (!selected) return;
@@ -58911,6 +59186,66 @@ function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) 
       }
     }
   });
+}
+
+function stsMpEmbeddingFallbackModelSetting(containerEl, plugin, refreshDisplay = null) {
+  const settings = plugin.settings || {};
+  const primary = STS_MULTI_PROVIDER.embeddingModelReference(settings);
+  const current = STS_MULTI_PROVIDER.embeddingFallbackModelReference(settings);
+  const provider = STS_MULTI_PROVIDER.normalizeProvider(current?.provider || settings.embeddingFallbackProvider || primary?.provider, "openai");
+  const providerSetting = new Setting(containerEl)
+    .setName("Embedding fallback provider")
+    .setDesc("Choose the provider scope for the explicit embedding fallback selector. The fallback is never synthesized automatically.");
+  providerSetting.settingEl?.addClass?.("semantic-todoist-provider-setting");
+  providerSetting.addDropdown((dropdown) => {
+    for (const candidate of STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER) dropdown.addOption(candidate, STS_MULTI_PROVIDER.providerDisplayName(candidate));
+    dropdown.setValue(provider || STS_MULTI_PROVIDER.normalizeProvider(primary?.provider, "openai"));
+    dropdown.onChange(async (value) => {
+      try {
+        plugin.settings.embeddingFallbackProvider = STS_MULTI_PROVIDER.normalizeProvider(value, "openai");
+        plugin.settings = STS_MULTI_PROVIDER.clearEmbeddingFallbackModelReference(plugin.settings);
+        await plugin.saveSettings();
+        refreshDisplay?.();
+      } catch (error) { new Notice(error.message || String(error)); }
+    });
+  });
+  const rows = stsMpEmbeddingCatalog(settings).filter((row) => row.provider === provider);
+  const setting = new Setting(containerEl)
+    .setName("Embedding fallback model")
+    .setDesc("Select an explicit accessible provider:model. Primary and fallback identities stay separate; a fallback rebuilds the complete semantic candidate in its own provider/model/dimension space. Use Clear to remove it.");
+  setting.settingEl?.addClass?.("semantic-todoist-model-setting");
+  stsMpSearchableCombobox(setting.controlEl, {
+    accessibleLabel: "Embedding fallback model",
+    rows: STS_MULTI_PROVIDER.fallbackCatalogRows(primary, rows),
+    getRows: () => {
+      const latest = plugin.settings || {};
+      const latestPrimary = STS_MULTI_PROVIDER.embeddingModelReference(latest);
+      const latestFallback = STS_MULTI_PROVIDER.embeddingFallbackModelReference(latest);
+      const fallbackProvider = STS_MULTI_PROVIDER.normalizeProvider(latestFallback?.provider || latest.embeddingFallbackProvider || provider, "openai");
+      return STS_MULTI_PROVIDER.fallbackCatalogRows(latestPrimary, stsMpEmbeddingCatalog(latest).filter((row) => row.provider === fallbackProvider));
+    },
+    value: stsMpProviderScopedValue(current),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, provider ? [provider] : STS_MULTI_PROVIDER.PROVIDERS, plugin.settings),
+    onSelect: async (row) => {
+      const selected = stsMpParseProviderScopedValue(row?.value || "");
+      if (!selected) return;
+      if (row?.source === "manual-entry") stsMpRememberManualProviderModel(plugin, "manualProviderEmbeddingModels", selected);
+      try {
+        plugin.settings = STS_MULTI_PROVIDER.setEmbeddingFallbackModelReference(plugin.settings, selected);
+        await plugin.saveSettings();
+        refreshDisplay?.();
+      } catch (error) { new Notice(error.message || String(error)); }
+    }
+  });
+  const clear = new Setting(containerEl)
+    .setName("Embedding fallback selection")
+    .setDesc(current ? `Saved fallback: ${current.provider}:${current.model}.` : "No explicit embedding fallback saved.");
+  clear.settingEl?.addClass?.("semantic-todoist-settings-action-setting");
+  clear.addButton((button) => button.setButtonText("Clear").setDisabled(!current).onClick(async () => {
+    plugin.settings = STS_MULTI_PROVIDER.clearEmbeddingFallbackModelReference(plugin.settings);
+    await plugin.saveSettings();
+    refreshDisplay?.();
+  }));
 }
 
 function stsMpEmbeddingCapabilityRecord(settings = {}) {
@@ -58991,6 +59326,7 @@ function stsMpEmbeddingDimensionOverrideSetting(containerEl, plugin, refreshDisp
 function stsMpRenderUnifiedEmbeddings(containerEl, plugin, refreshDisplay = null) {
   settingsHeading(containerEl, "Embeddings", "One provider:model selector owns semantic-index compatibility, capability disclosure, dimensions, batching, and storage precision. Selection and editing make no provider call.");
   stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay);
+  if (plugin.settings.enableEmbeddingFallback === true) stsMpEmbeddingFallbackModelSetting(containerEl, plugin, refreshDisplay);
   const summary = new Setting(containerEl)
     .setName("Selected model capability")
     .setDesc(stsMpEmbeddingCapabilitySummary(stsMpEmbeddingCapabilityRecord(plugin.settings || DEFAULT_SETTINGS)));
@@ -59147,7 +59483,7 @@ function stsMpRenderOpenWebUIContextSettings(containerEl, plugin) {
     rows: rows(),
     getRows: rows,
     value: selectedModel ? `openwebui:${selectedModel}` : "",
-    manualRowForQuery: (value) => stsMpManualModelRow(value, ["openwebui"]),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, ["openwebui"], plugin.settings),
     onSelect: (row) => {
       selectedModel = STS_MULTI_PROVIDER.normalizeModel("openwebui", row?.id || "");
       if (selectedModel && row?.source === "manual-entry") stsMpRememberManualProviderModel(plugin, "manualProviderGenerationModels", { provider: "openwebui", model: selectedModel });
@@ -59249,7 +59585,7 @@ function stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin) {
     rows: rows(),
     getRows: rows,
     value: selectedModel ? `openwebui:${selectedModel}` : "",
-    manualRowForQuery: (value) => stsMpManualModelRow(value, ["openwebui"]),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, ["openwebui"], plugin.settings),
     onSelect: (row) => {
       selectedModel = STS_MULTI_PROVIDER.normalizeModel("openwebui", row?.id || "");
       if (selectedModel && row?.source === "manual-entry") stsMpRememberManualProviderModel(plugin, "manualProviderGenerationModels", { provider: "openwebui", model: selectedModel });

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.7
+
+- Keeps model pickers limited to configured providers, with shared primary/fallback choices unless advanced per-operation mode is enabled.
+- Clarifies settings fields and makes embedding fallback a separate optional toggle that is off by default.
+- Keeps fallback embedding rebuilds index-safe and atomic.
+
 ## 0.8.6
 
 - Unified default models across operations while keeping per-operation model choices available as an opt-in.

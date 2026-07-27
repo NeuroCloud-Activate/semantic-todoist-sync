@@ -72,7 +72,10 @@ Each workflow has a searchable provider/model picker. You can choose models
 and reasoning levels independently for chat, task generation, descriptions,
 and embeddings, then set an optional fallback. Embedding indexes stay tied to
 their selected provider and model, so switching providers does not mix
-incompatible data.
+incompatible data. Clearer settings fields keep model pickers limited to
+configured providers; advanced multi-provider mode can expose different choices
+per operation, while separate embedding fallback remains off by default and
+keeps fallback rebuilds safe and atomic.
 
 If Open WebUI is connected to Ollama, all AI work in this plugin—including
 generation, embeddings, semantic search, chat, task generation, and

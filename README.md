@@ -33,8 +33,12 @@ The current 0.8 series makes everyday capture more flexible and more private.
 7. **Sharper local model profiles.**
    Exact validated local-model profiles keep scope tighter and use raw-preserving citation alignment when a supported model needs it, so local runs finish more reliably without changing the original model output.
 
-8. **A more helpful chat.**
-   Chat stays read-only while handling everyday questions, mixed questions, and vault-aware questions naturally; links appear only for details drawn from your notes.
+8. **Opt-in Internet Search and Deep Research in chat.**
+   The sidebar globe is off for every new view and cycles `off → Internet Search → Deep Research → off` per request. Internet Search combines vault and web evidence in one paragraph; Deep Research uses the same bounded native web request, one local title-seeded retrieval pass, and two bounded provider generations (analysis then final answer) before returning two or three paragraphs. Cited external source titles become clickable links. Successful cited research is saved by default as `YYYY-MM-DD - Research Subject.md` under `Semantic Todoist Sync/Research`, with sanitized YAML frontmatter; the independent `Save Internet Search research` setting can turn that capture off.
+   When Deep analysis finds a material evidence gap, it may request one bounded
+   expansion round: up to one additional local retrieval and one aggregated
+   follow-up web request. New evidence is deduplicated and appended without
+   replacing the evidence already analyzed.
 
 9. **Automatic search recovery.**
    If the local search index is missing when Obsidian starts, it quietly rebuilds it for you.
@@ -50,7 +54,17 @@ and iPad.
 ## What it does
 
 - **Search and chat:** Ask questions across your notes with relevant semantic
-  context and links back to the source.
+  context and links back to the source. Optional Internet Search and Deep
+  Research are request-local, default-off modes: each adds one low-context
+  provider request with bounded native search use, while Deep Research adds one
+  local retrieval pass seeded only by the question and admitted web-source
+  titles plus a bounded analysis generation before its final answer generation.
+  That analysis can request one bounded local/web evidence-expansion round when
+  the existing bundle leaves a material gap; it does not create an open-ended
+  search loop.
+  Successful cited answers can be saved as sanitized research notes in
+   `Semantic Todoist Sync/Research`; frontmatter records the topic, mode,
+   provider/model, query/source counts, and optional active-note path.
 - **Notes to Todoist:** Turn a meeting note, project note, or selection into
   main tasks and subtasks. The generated work keeps the requested action,
   people, deliverables, criteria, dates, and dependencies when they are
@@ -81,7 +95,9 @@ their selected provider and model, so switching providers does not mix
 incompatible data. Clearer settings fields keep model pickers limited to
 configured providers; advanced multi-provider mode can expose different choices
 per operation, while separate embedding fallback remains off by default and
-keeps fallback rebuilds safe and atomic.
+keeps fallback rebuilds safe and atomic. Internet Search has its own
+provider/model selector in AI & Search and uses only that provider's existing
+credential; it never copies or falls back to another provider key.
 
 If Open WebUI is connected to Ollama, all AI work in this plugin—including
 generation, embeddings, semantic search, chat, task generation, and

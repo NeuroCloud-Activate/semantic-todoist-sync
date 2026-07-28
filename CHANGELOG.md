@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.10
+
+- Added opt-in three-state Internet Search and Deep Research chat, combining provider-native grounded web evidence with vault context and cited narrative answers.
+- Added phased Deep Research with provider-cache-compatible evidence reuse and one bounded request for additional vault/web evidence, including compact handling for Open WebUI and local models.
+- Saved successful cited research by default as safe dated notes in the Research folder, with research saving independently disableable from Internet Search.
+- Improved the responsive globe and touch controls for accessibility, and expanded provider, privacy, and validation coverage.
+
 ## 0.8.9
 
 - Made Chat a more natural personal assistant for general, mixed, and vault-aware questions; citations appear only on claims drawn from vault sources.

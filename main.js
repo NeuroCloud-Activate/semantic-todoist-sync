@@ -265,6 +265,20 @@ const AI_DYNAMIC_ROUTER_RETRY_RESERVE_TOKENS = 1024;
 const CHAT_PROVIDER_MAX_HISTORY_MESSAGES = 8;
 const CHAT_PROVIDER_MAX_HISTORY_CHARS = 6000;
 const CHAT_PROVIDER_MAX_EVIDENCE_ROWS = 24;
+const WEB_SEARCH_PROVIDER_VALUES = Object.freeze(["gemini", "openai", "openrouter"]);
+const WEB_SEARCH_MODE_VALUES = Object.freeze(["off", "concise", "deep"]);
+const WEB_SEARCH_PROVIDER_DEFAULT_MODELS = Object.freeze({
+  gemini: "gemini-3.5-flash-lite",
+  openai: "gpt-5.6",
+  openrouter: "openrouter/free"
+});
+const WEB_SEARCH_MAX_RESULTS = 5;
+const WEB_SEARCH_MAX_QUERY_CHARS = 800;
+const WEB_SEARCH_MAX_ACTIVE_CHARS = 1800;
+const WEB_SEARCH_MAX_EVIDENCE_CHARS = 700;
+const WEB_SEARCH_MAX_REQUEST_CHARS = 7000;
+const WEB_SEARCH_SEARCH_CONTEXT_SIZE = "low";
+const WEB_SEARCH_MAX_OUTPUT_TOKENS = 5000;
 const PROVIDER_INPUT_ESTIMATE_SAFETY_FACTOR = 1.10;
 const PROVIDER_INPUT_WRAPPER_BASE_BYTES = 512;
 const PROVIDER_INPUT_WRAPPER_MAX_BYTES = 2048;
@@ -1704,6 +1718,9 @@ const DEFAULT_SETTINGS = {
   openaiModelMetadata: {},
   geminiModelMetadata: {},
   chatModel: "gpt-5.6-luna",
+  chatWebSearchProvider: "gemini",
+  chatWebSearchModel: "gemini-3.5-flash-lite",
+  chatWebSaveResearch: true,
   chatReasoningEffort: "high",
   chatFallbackModel: "gpt-5.6-terra",
   chatFallbackReasoningEffort: "medium",
@@ -3916,6 +3933,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    const rawChatWebSaveResearch = this.settings.chatWebSaveResearch;
+    const normalizedChatWebSaveResearch = typeof rawChatWebSaveResearch === "string"
+      ? rawChatWebSaveResearch.trim().toLowerCase() !== "false"
+      : rawChatWebSaveResearch !== false;
+    if (this.settings.chatWebSaveResearch !== normalizedChatWebSaveResearch) {
+      this.settings.chatWebSaveResearch = normalizedChatWebSaveResearch;
+      changed = true;
+    }
+    const normalizedWebSearchProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
+    const normalizedWebSearchModel = normalizeWebSearchModel(this.settings.chatWebSearchModel, normalizedWebSearchProvider);
+    if (this.settings.chatWebSearchProvider !== normalizedWebSearchProvider) {
+      this.settings.chatWebSearchProvider = normalizedWebSearchProvider;
+      changed = true;
+    }
+    if (this.settings.chatWebSearchModel !== normalizedWebSearchModel) {
+      this.settings.chatWebSearchModel = normalizedWebSearchModel;
+      changed = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(this.settings, "chatWebSearchApiKey")) {
+      delete this.settings.chatWebSearchApiKey;
+      changed = true;
+    }
     // One-way prompt-contract migration: the task and description guidance is
     // provider-neutral and no longer user-configurable. Remove the former
     // model-labelled settings so runtime state contains only the current
@@ -6724,11 +6763,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   isIndexablePath(path, include, exclude) {
+    const normalizedPath = trimSlashes(path);
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
-    if (isEmailLogPath(path, this.settings)) return false;
-    if (includeFolders.length && !includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
-    if (this.isExcludedPath(path, excludeFolders)) return false;
+    const researchRoot = `${PLUGIN_DATA_FOLDER}/Research`;
+    const researchPath = normalizedPath === researchRoot || normalizedPath.startsWith(`${researchRoot}/`);
+    if (isEmailLogPath(normalizedPath, this.settings)) return false;
+    if (normalizedPath === PLUGIN_DATA_FOLDER || (normalizedPath.startsWith(`${PLUGIN_DATA_FOLDER}/`) && !researchPath)) return false;
+    if (includeFolders.length && !includeFolders.some((folder) => normalizedPath === folder || normalizedPath.startsWith(`${folder}/`))) return false;
+    const effectiveExcludeFolders = excludeFolders.filter((folder) => !(researchPath && trimSlashes(folder) === PLUGIN_DATA_FOLDER));
+    if (this.isExcludedPath(normalizedPath, effectiveExcludeFolders)) return false;
     return true;
   }
 
@@ -9876,7 +9920,115 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return [];
   }
 
-  async chat(prompt, activeOverride = null, history = [], modelOperation = "chat-query") {
+  async runWebSearch(request = {}, options = {}) {
+    const provider = normalizeWebSearchProvider(request.provider || this.settings.chatWebSearchProvider);
+    const model = normalizeWebSearchModel(request.model || this.settings.chatWebSearchModel, provider);
+    const mode = normalizeWebSearchMode(request.mode);
+    const apiKey = String({ gemini: this.settings.googleApiKey, openai: this.settings.openaiApiKey, openrouter: this.settings.openrouterApiKey }[provider] || "").trim();
+    if (!apiKey) {
+      const error = new Error(`Internet Search needs the ${provider} API key. Add it under Settings → AI & Search.`);
+      error.code = "web-search-missing-credential";
+      error.webSearch = true;
+      throw error;
+    }
+    const requestFn = options.requestUrl || requestUrl;
+    const body = provider === "gemini"
+      ? {
+        contents: [{ role: "user", parts: [{ text: request.query }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { maxOutputTokens: WEB_SEARCH_MAX_OUTPUT_TOKENS, thinkingConfig: { thinkingLevel: mode === "deep" ? "high" : "medium" } }
+      }
+      : provider === "openai"
+        ? {
+          model,
+          reasoning: { effort: mode === "deep" ? "high" : "medium" },
+          tools: [{ type: "web_search", search_context_size: WEB_SEARCH_SEARCH_CONTEXT_SIZE }],
+          input: request.query
+        }
+        : {
+          model,
+          messages: [{ role: "user", content: request.query }],
+          tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", max_results: 3, max_total_results: 6, max_uses: 3, search_context_size: WEB_SEARCH_SEARCH_CONTEXT_SIZE } }]
+        };
+    const transport = provider === "gemini"
+      ? {
+        url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        headers: { "x-goog-api-key": apiKey, "content-type": "application/json" }
+      }
+      : provider === "openai"
+        ? { url: "https://api.openai.com/v1/responses", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" } }
+        : { url: "https://openrouter.ai/api/v1/chat/completions", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" } };
+    let response;
+    try {
+      response = await requestFn({ url: transport.url, method: "POST", headers: transport.headers, body: JSON.stringify(body), throw: false });
+    } catch {
+      response = null;
+    }
+    if (!response || Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
+      const result = Object.assign(webSearchFailureResult(provider, model, response ? `http-${Number(response.status || 0) || "error"}` : "transport-error", response?.json || response?.text || null), { mode });
+      this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "transport", status: "failed", provider, model, resultCount: 0, queryCount: 0, searchRequests: 0, reason: Object.keys(result.reasons)[0] });
+      return result;
+    }
+    const rawResponse = response.json || {};
+    const extracted = provider === "gemini" ? extractGeminiWebEvidence(rawResponse) : provider === "openai" ? extractOpenAIWebEvidence(rawResponse) : extractOpenRouterWebEvidence(rawResponse);
+    const normalized = normalizeWebEvidenceRows(provider, model, extracted.candidates, this.settings);
+    const tokenUsage = normalizeWebSearchUsage(provider, rawResponse);
+    const result = {
+      status: normalized.rows.length ? "searched" : "no-evidence",
+      provider,
+      model,
+      mode,
+      queryCount: Math.max(0, Math.round(Math.max(Number(extracted.queryCount || 0), Number(tokenUsage.searchRequests || 0)))),
+      resultCount: normalized.rows.length,
+      tokenUsage,
+      rawResponse,
+      rawMetadata: provider === "gemini" ? extracted.metadata : null,
+      evidence: normalized.rows,
+      reasons: normalized.reasons
+    };
+    this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "terminal", status: result.status, provider, model, queryCount: result.queryCount, resultCount: result.resultCount, searchRequests: tokenUsage.searchRequests, rejected: Object.values(normalized.reasons).reduce((sum, count) => sum + Number(count || 0), 0) });
+    return result;
+  }
+
+  async saveChatWebResearch({ prompt = "", active = null, answer = "", subject = "", mode = "concise", webSearchResult = {}, citationTelemetry = {} } = {}) {
+    if (this.settings.chatWebSaveResearch === false || (typeof this.settings.chatWebSaveResearch === "string" && this.settings.chatWebSaveResearch.trim().toLowerCase() === "false")) return { status: "disabled", reason: "setting-disabled" };
+    const status = String(webSearchResult.status || "");
+    const citedWebEvidenceCount = Number(citationTelemetry.citedWebEvidenceCount || 0);
+    const schemaInvalidCount = Number(citationTelemetry.schemaInvalidCount || 0);
+    if (status !== "searched" || !String(answer || "").trim() || citedWebEvidenceCount < 1 || schemaInvalidCount > 0) {
+      return { status: "not-eligible", reason: status !== "searched" ? `search-${status || "missing"}` : citedWebEvidenceCount < 1 ? "no-cited-web-evidence" : schemaInvalidCount > 0 ? "citation-validation-failed" : "empty-answer" };
+    }
+    if (!this.app?.vault?.create || !this.app?.vault?.getAbstractFileByPath) return { status: "failed", reason: "vault-unavailable" };
+    const folder = `${PLUGIN_DATA_FOLDER}/Research`;
+    const question = redactWebContext(String(prompt == null ? "" : prompt));
+    const normalizedSubject = normalizeResearchSubject(subject, question);
+    const titleSeed = safeMarkdownFileName(normalizedSubject.value, 120) || "Research Subject";
+    const title = `${new Date().toISOString().slice(0, 10)} - ${titleSeed}`;
+    try {
+      const path = uniqueMarkdownPath(this.app, folder, title);
+      const markdown = buildChatResearchMarkdown({
+        prompt: question,
+        subject: normalizedSubject.value,
+        mode,
+        answer,
+        provider: webSearchResult.provider,
+        model: webSearchResult.model,
+        queryCount: webSearchResult.queryCount,
+        resultCount: webSearchResult.resultCount,
+        citedWebEvidenceCount,
+        activePath: active?.path || ""
+      });
+      await ensureVaultFolder(this.app, folder);
+      await this.app.vault.create(path, markdown);
+      this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "research-save", status: "saved", provider: webSearchResult.provider, model: webSearchResult.model, queryCount: Number(webSearchResult.queryCount || 0), resultCount: Number(webSearchResult.resultCount || 0), citedWebEvidenceCount, path: "research-note" });
+      return { status: "saved", path, subject: normalizedSubject.value, subjectFallback: normalizedSubject.fallback };
+    } catch (error) {
+      this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "research-save", status: "failed", provider: webSearchResult.provider, model: webSearchResult.model, queryCount: Number(webSearchResult.queryCount || 0), resultCount: Number(webSearchResult.resultCount || 0), citedWebEvidenceCount, reason: "vault-create-failed" });
+      return { status: "failed", reason: "vault-create-failed" };
+    }
+  }
+
+  async chat(prompt, activeOverride = null, history = [], modelOperation = "chat-query", options = {}) {
     const requestedChatOperation = String(modelOperation || "chat-query").trim().toLowerCase();
     const chatDispatchOperation = requestedChatOperation === "prompt-response" ? "prompt-response" : "chat-query";
     if (chatDispatchOperation === "chat-query") {
@@ -9887,6 +10039,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ? classifyChatConversationRequest(prompt)
       : null;
     if (conversationRequest) return this.chatConversation(prompt, conversationRequest, history);
+    const requestedWebSearchMode = normalizeWebSearchMode(options?.webSearchMode || (options?.webSearchEnabled === true ? "concise" : "off"));
+    const webSearchMode = chatDispatchOperation === "chat-query" ? requestedWebSearchMode : "off";
+    const webSearchEnabled = webSearchMode !== "off";
     this.requireAiAccess("chat-query");
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
@@ -10048,7 +10203,102 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const requiredEvidenceIds = uniqueValues((reservedTaskEvidence?.sharedEvidence || [])
       .map((entry) => String(entry?.evidenceId || entry?.evidence_id || "")).filter(Boolean));
-    const sourceLedger = chatSourceLedger(active, context, this.settings, sourceContract, { requiredEvidenceIds, prompt });
+    let webSearchResult = { status: "disabled", provider: "", model: "", mode: webSearchMode, queryCount: 0, resultCount: 0, tokenUsage: { searchRequests: 0 }, evidence: [], reasons: {} };
+    if (webSearchEnabled) {
+      const webProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
+      const webModel = normalizeWebSearchModel(this.settings.chatWebSearchModel, webProvider);
+      const webRequest = buildWebSearchRequest({ provider: webProvider, model: webModel, mode: webSearchMode, prompt, active, context });
+      webSearchResult = await this.runWebSearch(webRequest);
+    }
+    let deepLocalPassTelemetry = {
+      mode: webSearchMode,
+      attempted: false,
+      status: webSearchMode === "deep" ? "pending" : "not-requested",
+      addedCount: 0,
+      duplicateCount: 0,
+      capDroppedCount: 0,
+      failureReason: "",
+      externalQueryEmbeddingCalls: 0,
+      runtimeExternalCalls: 0
+    };
+    if (webSearchMode === "deep" && webSearchResult.status === "searched") {
+      deepLocalPassTelemetry.attempted = true;
+      if (reservedTaskEvidence) {
+        deepLocalPassTelemetry.status = "skipped-reserved-task-evidence";
+      } else {
+        try {
+          const deepQuery = buildDeepWebLocalRetrievalQuery(prompt, webSearchResult.evidence || []);
+          const deepContext = deepQuery
+            ? await this.retrieveAdaptiveSemanticContext(deepQuery, "chat", this.settings.maxChatContextChunks, deepQuery, { sourceContract })
+            : [];
+          const deepRows = Array.isArray(deepContext) ? deepContext : [];
+          deepLocalPassTelemetry.externalQueryEmbeddingCalls = Number(deepContext?.semanticRetrieval?.telemetry?.externalQueryEmbeddingCalls || 0);
+          deepLocalPassTelemetry.runtimeExternalCalls = Number(deepContext?.semanticRetrieval?.telemetry?.runtimeExternalCalls || 0);
+          if (deepLocalPassTelemetry.externalQueryEmbeddingCalls > 0 || deepLocalPassTelemetry.runtimeExternalCalls > 0) {
+            const externalError = new Error("deep-local-retrieval-external-call");
+            externalError.code = "deep-local-retrieval-external-call";
+            throw externalError;
+          }
+          const mergedContext = mergeDeepWebLocalContext(context, deepRows);
+          deepLocalPassTelemetry.addedCount = Math.max(0, mergedContext.length - (Array.isArray(context) ? context.length : 0));
+          deepLocalPassTelemetry.duplicateCount = Number(mergedContext.deepMergeTelemetry?.duplicateCount || 0);
+          deepLocalPassTelemetry.capDroppedCount = Number(mergedContext.deepMergeTelemetry?.capDroppedCount || 0);
+          deepLocalPassTelemetry.status = deepLocalPassTelemetry.addedCount ? "merged" : "no-additions";
+          if (deepLocalPassTelemetry.addedCount) {
+            const mergedRows = mergedContext.slice();
+            const mergedRetrievalTelemetry = Object.assign({}, context.semanticRetrieval?.telemetry || {}, {
+              deepLocalPassAttempted: true,
+              deepLocalPassStatus: deepLocalPassTelemetry.status,
+              deepLocalPassAddedCount: deepLocalPassTelemetry.addedCount,
+              deepLocalPassDuplicateCount: deepLocalPassTelemetry.duplicateCount,
+              deepLocalPassCapDroppedCount: deepLocalPassTelemetry.capDroppedCount,
+              deepLocalPassFailureReason: ""
+            });
+            const mergedSemanticRetrieval = context.semanticRetrieval || deepContext.semanticRetrieval;
+            if (mergedSemanticRetrieval) mergedSemanticRetrieval.telemetry = mergedRetrievalTelemetry;
+            const mergedBundle = buildChatContextBundle({
+              context: mergedRows,
+              prompt,
+              queryPlan: contextQueryPlan(prompt, "chat"),
+              chatReservedEvidenceIds: chatContextBundle?.chatReservedEvidenceIds || [],
+              chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
+              source,
+              sourceType: source?.type || "note",
+              sourceTitle: source?.title || "",
+              telemetry: mergedRetrievalTelemetry,
+              retrievalTelemetry: mergedRetrievalTelemetry,
+              moduleInfluenceTelemetry: mergedRetrievalTelemetry.moduleInfluenceTelemetry
+            });
+            chatContextBundle = mergedBundle;
+            context = mergedRows.map((row) => Object.assign({}, row, { text: row.text || row.excerpt || row.content || "" }));
+            context.semanticRetrieval = mergedSemanticRetrieval;
+          }
+        } catch (error) {
+          deepLocalPassTelemetry.status = "failed";
+          deepLocalPassTelemetry.failureReason = String(error?.code || error?.message || "local-retrieval-failed").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96) || "local-retrieval-failed";
+        }
+      }
+    }
+    if (webSearchMode === "deep" && !deepLocalPassTelemetry.attempted) deepLocalPassTelemetry.status = "not-run-search-not-successful";
+    webSearchResult.deepLocalPass = deepLocalPassTelemetry;
+    let webEvidenceRows = (webSearchResult.evidence || []).map((row) => Object.assign({}, row, {
+      evidenceId: String(row.evidenceId),
+      sourceId: String(row.url),
+      title: row.title,
+      text: row.excerpt,
+      evidenceText: row.excerpt,
+      role: "Internet Search source",
+      required: true,
+      url: row.url,
+      markdown: `[${markdownLinkText(row.title)}](${row.url})`
+    }));
+    let sourceLedger = chatSourceLedger(active, context, this.settings, sourceContract, {
+      requiredEvidenceIds,
+      prompt,
+      maxRows: Math.max(1, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - webEvidenceRows.length)
+    }).concat(webEvidenceRows);
+    const initialWebEvidenceRows = webEvidenceRows.slice();
+    const initialSourceLedger = sourceLedger.slice();
     const taskContext = reservedTaskEvidence ? "" : await this.buildTaskContext(active, context, prompt);
     const adaptivePack = this.buildAdaptiveContextPack({
       mode: "chat",
@@ -10073,6 +10323,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       chatReservedEvidenceIds: chatContextBundle?.chatReservedEvidenceIds || [],
       chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
       requiredEvidenceIds,
+      webEvidenceRows,
       retrievalTelemetry: chatRetrievalDegraded || context?.semanticRetrieval?.telemetry || {},
       requireCitableEvidence: Boolean(activeText || (context || []).length || requiredEvidenceIds.length),
       adaptivePack,
@@ -10080,29 +10331,319 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       provider: modelChoice.provider,
       model: modelChoice.model
     });
-    const responseSchema = chatResponseSchema(CHAT_RESPONSE_MAX_CLAIMS, chatContextProjection.allowedEvidenceIds);
+    let responseSchema = null;
+    let deepAnalysis = { value: null, telemetry: { attempted: false, valid: false, schemaInvalidCount: 0, invalidReasons: [], findingsCount: 0, selectedEvidenceCount: 0, unresolvedCount: 0, vaultQueryCount: 0, webQueryCount: 0, additionalEvidenceRequestCount: 0 } };
+    let phase2Projection = chatContextProjection;
+    let deepResearchProjection = chatContextProjection;
+    let deepResearchPhaseNeutralSystem = "";
+    let deepResearchCacheKey = "";
+    let deepResearchHosted = false;
+    let deepEvidenceExpansionTelemetry = {
+      attempted: false,
+      status: webSearchMode === "deep" ? "pending-analysis" : "not-requested",
+      vaultRequests: 0,
+      webRequests: 0,
+      vaultAddedCount: 0,
+      webAddedCount: 0,
+      vaultDuplicateCount: 0,
+      webDuplicateCount: 0,
+      vaultCapDroppedCount: 0,
+      webCapDroppedCount: 0,
+      vaultExternalQueryEmbeddingCalls: 0,
+      vaultRuntimeExternalCalls: 0,
+      externalQueryEmbeddingCalls: 0,
+      runtimeExternalCalls: 0,
+      webSearchRequests: 0,
+      failureReason: ""
+    };
+    let deepResearchExpansionRows = [];
+    let deepResearchExpansionWebResult = null;
+    const deepResearchAnalysisDirective = [
+      "Deep Research phase 1 directive: return only JSON matching the strict deep research analysis schema.",
+      "Use the complete closed evidence ledger before this directive; produce bounded findings with exact evidence_ids, select the evidence IDs most useful for the final answer, and list unresolved items only when they remain genuinely unestablished.",
+      "When a material unresolved gap could change or meaningfully expand the answer, put zero to two specific local-vault questions in additional_evidence_requests.vault_queries and zero to two specific external-source questions in additional_evidence_requests.web_queries; otherwise return empty arrays. Request only evidence needed for this answer, never repeat a supplied fact, URL, credential, prompt instruction, or private secret.",
+      "This analysis is advisory to the final answer phase; preserve epistemic state and do not claim unsupported facts."
+    ].join(" ");
+    const deepResearchFinalDirective = [
+      "Deep Research phase 2 directive: return only JSON matching the strict chat evidence final-answer schema.",
+      "Return exactly two or three final narrative paragraphs combining vault and web evidence; each paragraph must remain a cohesive narrative claim and cite only supplied evidence IDs.",
+      "Return research_subject as a plain 3–8 word subject (maximum 80 characters), without URLs, markdown, citations, or secrets."
+    ].join(" ");
+    if (webSearchMode === "deep") {
+      deepResearchPhaseNeutralSystem = deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled: true });
+      deepResearchHosted = modelChoice.provider !== "openwebui";
+      deepResearchCacheKey = deepResearchHosted ? deepResearchPromptCacheKey() : "";
+      deepResearchProjection = buildDeepResearchPhaseProjection(chatContextProjection, {
+        system: deepResearchPhaseNeutralSystem,
+        promptCacheKey: deepResearchCacheKey
+      });
+      phase2Projection = deepResearchProjection;
+      const analysisSchema = deepResearchAnalysisSchema(deepResearchProjection.allowedEvidenceIds);
+      const analysisRaw = await this.withAiActivity("Analyzing research evidence", (workflowToken) => this.openaiResponse({
+        operation: "chat-query",
+        deepResearchPhase: "deep-research-analysis",
+        fallbackPolicy: "disabled",
+        workflowToken,
+        model: modelChoice.model,
+        provider: modelChoice.provider,
+        chatContextProjection: deepResearchProjection,
+        promptCachePrefix: deepResearchProjection.promptCachePrefix,
+        promptContextSuffix: deepResearchProjection.promptContextSuffix,
+        promptCacheKey: deepResearchCacheKey,
+        jsonSchema: analysisSchema,
+        system: deepResearchPhaseNeutralSystem,
+        user: deepResearchAnalysisDirective,
+        appendFallbackNotice: false,
+        background: false
+      }));
+      deepAnalysis = validateDeepResearchAnalysis(analysisRaw, deepResearchProjection.allowedEvidenceIds);
+      deepAnalysis.telemetry = Object.assign({}, deepAnalysis.telemetry, {
+        attempted: true,
+        phase: "deep-research-analysis",
+        projectionEvidenceCount: deepResearchProjection.sourceLedger.length,
+        phase1InputBytes: utf8ByteLength([deepResearchProjection.promptCachePrefix, deepResearchAnalysisDirective].filter(Boolean).join("\n\n")),
+        promptCachePrefixHash: providerContextProjectionHash(deepResearchProjection.promptCachePrefix),
+        promptContextSuffixHash: providerContextProjectionHash(deepResearchProjection.promptContextSuffix),
+        phase1SystemHash: providerContextProjectionHash(deepResearchPhaseNeutralSystem),
+        phase1EvidencePrefixHash: providerContextProjectionHash(deepResearchProjection.promptCachePrefix),
+        phase1PromptCacheKey: deepResearchCacheKey
+      });
+      if (deepAnalysis.valid) {
+        const additionalRequests = deepAnalysis.value.additional_evidence_requests || {};
+        const vaultQueries = Array.isArray(additionalRequests.vault_queries) ? additionalRequests.vault_queries : [];
+        const webQueries = Array.isArray(additionalRequests.web_queries) ? additionalRequests.web_queries : [];
+        deepEvidenceExpansionTelemetry.vaultRequests = vaultQueries.length;
+        deepEvidenceExpansionTelemetry.webRequests = webQueries.length;
+        deepEvidenceExpansionTelemetry.attempted = Boolean(vaultQueries.length || webQueries.length);
+        deepEvidenceExpansionTelemetry.status = deepEvidenceExpansionTelemetry.attempted ? "pending" : "no-requests";
+        let deepExpansionLocalRows = [];
+        if (vaultQueries.length) {
+          if (reservedTaskEvidence) {
+            deepEvidenceExpansionTelemetry.vaultStatus = "skipped-reserved-task-evidence";
+          } else {
+            try {
+              const expansionQuery = buildDeepEvidenceExpansionVaultQuery(prompt, vaultQueries);
+              const expansionContext = expansionQuery
+                ? await this.retrieveAdaptiveSemanticContext(expansionQuery, "chat", this.settings.maxChatContextChunks, expansionQuery, { sourceContract })
+                : [];
+              deepEvidenceExpansionTelemetry.vaultExternalQueryEmbeddingCalls = Number(expansionContext?.semanticRetrieval?.telemetry?.externalQueryEmbeddingCalls || 0);
+              deepEvidenceExpansionTelemetry.vaultRuntimeExternalCalls = Number(expansionContext?.semanticRetrieval?.telemetry?.runtimeExternalCalls || 0);
+              deepEvidenceExpansionTelemetry.externalQueryEmbeddingCalls = deepEvidenceExpansionTelemetry.vaultExternalQueryEmbeddingCalls;
+              deepEvidenceExpansionTelemetry.runtimeExternalCalls = deepEvidenceExpansionTelemetry.vaultRuntimeExternalCalls;
+              if (deepEvidenceExpansionTelemetry.vaultExternalQueryEmbeddingCalls > 0 || deepEvidenceExpansionTelemetry.vaultRuntimeExternalCalls > 0) {
+                const externalError = new Error("deep-evidence-expansion-external-call");
+                externalError.code = "deep-evidence-expansion-external-call";
+                throw externalError;
+              }
+              const expansionRows = Array.isArray(expansionContext) ? expansionContext.slice(0, 4) : [];
+              deepEvidenceExpansionTelemetry.vaultCapDroppedCount = Math.max(0, (Array.isArray(expansionContext) ? expansionContext.length : 0) - expansionRows.length);
+              const mergedContext = mergeDeepWebLocalContext(context, expansionRows);
+              const priorKeys = new Set((Array.isArray(context) ? context : []).map((row) => String(row?.evidenceId || row?.evidence_id || row?.sourceId || row?.path || shortHash(singleLine(row?.text || "")))));
+              deepExpansionLocalRows = mergedContext.filter((row) => !priorKeys.has(String(row?.evidenceId || row?.evidence_id || row?.sourceId || row?.path || shortHash(singleLine(row?.text || "")))));
+              const mergedTelemetry = mergedContext.deepMergeTelemetry || {};
+              deepEvidenceExpansionTelemetry.vaultDuplicateCount = Number(mergedTelemetry.duplicateCount || 0);
+              if (deepExpansionLocalRows.length) {
+                const mergedRows = mergedContext.slice();
+                const mergedRetrievalTelemetry = Object.assign({}, context.semanticRetrieval?.telemetry || {}, {
+                  deepEvidenceExpansionAttempted: true,
+                  deepEvidenceExpansionVaultAddedCount: deepExpansionLocalRows.length,
+                  deepEvidenceExpansionVaultDuplicateCount: deepEvidenceExpansionTelemetry.vaultDuplicateCount,
+                  deepEvidenceExpansionVaultCapDroppedCount: deepEvidenceExpansionTelemetry.vaultCapDroppedCount
+                });
+                const mergedSemanticRetrieval = context.semanticRetrieval || expansionContext.semanticRetrieval;
+                if (mergedSemanticRetrieval) mergedSemanticRetrieval.telemetry = mergedRetrievalTelemetry;
+                chatContextBundle = buildChatContextBundle({
+                  context: mergedRows,
+                  prompt,
+                  queryPlan: contextQueryPlan(prompt, "chat"),
+                  chatReservedEvidenceIds: chatContextBundle?.chatReservedEvidenceIds || [],
+                  chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
+                  source,
+                  sourceType: source?.type || "note",
+                  sourceTitle: source?.title || "",
+                  telemetry: mergedRetrievalTelemetry,
+                  retrievalTelemetry: mergedRetrievalTelemetry,
+                  moduleInfluenceTelemetry: mergedRetrievalTelemetry.moduleInfluenceTelemetry
+                });
+                context = mergedRows.map((row) => Object.assign({}, row, { text: row.text || row.excerpt || row.content || "" }));
+                context.semanticRetrieval = mergedSemanticRetrieval;
+              }
+              deepEvidenceExpansionTelemetry.vaultStatus = deepExpansionLocalRows.length ? "merged" : "no-additions";
+            } catch (error) {
+              deepEvidenceExpansionTelemetry.vaultStatus = "failed";
+              deepEvidenceExpansionTelemetry.failureReason = String(error?.code || error?.message || "vault-expansion-failed").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96) || "vault-expansion-failed";
+            }
+          }
+        }
+        let deepExpansionWebRows = [];
+        if (webQueries.length) {
+          deepEvidenceExpansionTelemetry.webSearchRequests = 1;
+          try {
+            const expansionPrompt = buildDeepEvidenceExpansionWebQuery({ prompt, webQueries, webEvidenceRows: initialWebEvidenceRows });
+            const expansionRequest = buildWebSearchRequest({
+              provider: normalizeWebSearchProvider(this.settings.chatWebSearchProvider),
+              model: normalizeWebSearchModel(this.settings.chatWebSearchModel, this.settings.chatWebSearchProvider),
+              mode: "deep",
+              prompt: expansionPrompt,
+              active: null,
+              context: []
+            });
+            deepResearchExpansionWebResult = await this.runWebSearch(expansionRequest);
+            const admitted = admitDeepWebExpansionRows(initialWebEvidenceRows, deepResearchExpansionWebResult.evidence || [], 3);
+            deepExpansionWebRows = admitted.rows;
+            deepEvidenceExpansionTelemetry.webDuplicateCount = admitted.duplicateCount;
+            deepEvidenceExpansionTelemetry.webCapDroppedCount = admitted.capDroppedCount;
+            deepEvidenceExpansionTelemetry.webStatus = deepExpansionWebRows.length ? "merged" : deepResearchExpansionWebResult.status === "searched" ? "no-additions" : "failed";
+            if (!deepExpansionWebRows.length && deepResearchExpansionWebResult.status !== "searched") deepEvidenceExpansionTelemetry.failureReason = deepEvidenceExpansionTelemetry.failureReason || "web-expansion-unavailable";
+          } catch (error) {
+            deepEvidenceExpansionTelemetry.webStatus = "failed";
+            deepEvidenceExpansionTelemetry.failureReason = deepEvidenceExpansionTelemetry.failureReason || String(error?.code || error?.message || "web-expansion-failed").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96) || "web-expansion-failed";
+          }
+        }
+        const localExpansionLedger = chatSourceLedger(null, deepExpansionLocalRows, this.settings, sourceContract, { prompt, maxRows: CHAT_PROVIDER_MAX_EVIDENCE_ROWS });
+        const availableExpansionSlots = Math.max(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - initialSourceLedger.length);
+        const admittedLocalLedger = localExpansionLedger.slice(0, availableExpansionSlots);
+        const admittedWebRows = deepExpansionWebRows.slice(0, Math.max(0, availableExpansionSlots - admittedLocalLedger.length));
+        deepEvidenceExpansionTelemetry.vaultCapDroppedCount += Math.max(0, localExpansionLedger.length - admittedLocalLedger.length);
+        deepEvidenceExpansionTelemetry.webCapDroppedCount += Math.max(0, deepExpansionWebRows.length - admittedWebRows.length);
+        deepEvidenceExpansionTelemetry.vaultAddedCount = admittedLocalLedger.length;
+        deepEvidenceExpansionTelemetry.webAddedCount = admittedWebRows.length;
+        deepResearchExpansionRows = [...admittedLocalLedger, ...admittedWebRows];
+        if (deepResearchExpansionRows.length) {
+          sourceLedger = [...initialSourceLedger, ...deepResearchExpansionRows];
+          webEvidenceRows = [...initialWebEvidenceRows, ...admittedWebRows];
+        }
+        if (!deepEvidenceExpansionTelemetry.attempted) deepEvidenceExpansionTelemetry.status = "no-requests";
+        else if (deepResearchExpansionRows.length) deepEvidenceExpansionTelemetry.status = deepEvidenceExpansionTelemetry.failureReason ? "partial" : "merged";
+        else if (deepEvidenceExpansionTelemetry.failureReason || deepEvidenceExpansionTelemetry.vaultStatus === "failed" || deepEvidenceExpansionTelemetry.webStatus === "failed") deepEvidenceExpansionTelemetry.status = "failed";
+        else if (deepEvidenceExpansionTelemetry.vaultStatus === "skipped-reserved-task-evidence" && !webQueries.length) deepEvidenceExpansionTelemetry.status = "skipped-reserved-task-evidence";
+        else deepEvidenceExpansionTelemetry.status = "no-additions";
+        deepAnalysis.telemetry.additionalEvidenceExpansion = deepEvidenceExpansionTelemetry;
+      } else {
+        deepEvidenceExpansionTelemetry.status = "skipped-invalid-analysis";
+        deepAnalysis.telemetry.additionalEvidenceExpansion = deepEvidenceExpansionTelemetry;
+      }
+      if (modelChoice.provider === "openwebui" && deepAnalysis.valid) {
+        const selectedIds = deepAnalysis.value.selected_evidence_ids || [];
+        const selectedContextRows = context.filter((row) => selectedIds.includes(String(row?.evidenceId || row?.evidence_id || "")));
+        const expansionContextRows = deepResearchExpansionRows
+          .filter((row) => !webEvidenceRows.some((webRow) => webRow.evidenceId === row.evidenceId))
+          .map((row) => Object.assign({}, row, { text: row.text || row.evidenceText || row.excerpt || "", required: true }));
+        const compactRows = [...selectedContextRows, ...expansionContextRows];
+        const compactLedger = sourceLedger.filter((entry) => selectedIds.includes(String(entry?.evidenceId || ""))
+          || webEvidenceRows.some((row) => row.evidenceId === entry.evidenceId)
+          || deepResearchExpansionRows.some((row) => row.evidenceId === entry.evidenceId));
+        phase2Projection = buildChatProviderContextProjection({
+          prompt,
+          active: selectedIds.includes(String(deepResearchProjection.sourceLedger.find((entry) => entry.role === "Active note")?.evidenceId || "")) ? active : null,
+          history,
+          context: compactRows,
+          sourceContract,
+          sourceLedger: compactLedger,
+          reservedTaskEvidence,
+          chatReservedEvidenceIds: (chatContextBundle?.chatReservedEvidenceIds || []).filter((id) => selectedIds.includes(id)),
+          chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
+          requiredEvidenceIds: requiredEvidenceIds.filter((id) => selectedIds.includes(id)),
+          webEvidenceRows,
+          retrievalTelemetry: chatRetrievalDegraded || context?.semanticRetrieval?.telemetry || {},
+          requireCitableEvidence: Boolean(compactRows.length || requiredEvidenceIds.length),
+          adaptivePack,
+          settings: this.settings,
+          provider: modelChoice.provider,
+          model: modelChoice.model
+        });
+        phase2Projection = buildDeepResearchPhaseProjection(phase2Projection, {
+          system: deepResearchPhaseNeutralSystem,
+          promptCacheKey: ""
+        });
+        deepAnalysis.telemetry.compactPhase2 = true;
+        deepAnalysis.telemetry.compactDeliveredEvidenceCount = phase2Projection.sourceLedger.length;
+        deepAnalysis.telemetry.compactOmittedEvidenceCount = Math.max(0, deepResearchProjection.sourceLedger.length - phase2Projection.sourceLedger.length);
+      } else {
+        deepAnalysis.telemetry.compactPhase2 = false;
+        deepAnalysis.telemetry.compactDeliveredEvidenceCount = deepResearchProjection.sourceLedger.length;
+        deepAnalysis.telemetry.compactOmittedEvidenceCount = 0;
+      }
+      if (!deepAnalysis.valid) {
+        phase2Projection = deepResearchProjection;
+        deepAnalysis.telemetry.degradedAnalysis = true;
+      }
+      if (deepResearchHosted && deepAnalysis.valid && deepResearchExpansionRows.length) {
+        phase2Projection = appendDeepResearchExpansionProjection(phase2Projection, {
+          sourceLedger,
+          allowedEvidenceIds: sourceLedger.map((entry) => entry?.evidenceId).filter(Boolean),
+          expansionRows: deepResearchExpansionRows
+        });
+      }
+      if (deepResearchExpansionWebResult) {
+        const initialUsage = webSearchResult.tokenUsage || {};
+        const followupUsage = deepResearchExpansionWebResult.tokenUsage || {};
+        const tokenUsage = Object.assign({}, initialUsage);
+        for (const key of new Set([...Object.keys(initialUsage), ...Object.keys(followupUsage)])) {
+          tokenUsage[key] = Number(initialUsage[key] || 0) + Number(followupUsage[key] || 0);
+        }
+        webSearchResult = Object.assign({}, webSearchResult, {
+          status: webEvidenceRows.length ? "searched" : (webSearchResult.status || deepResearchExpansionWebResult.status),
+          queryCount: Number(webSearchResult.queryCount || 0) + Number(deepResearchExpansionWebResult.queryCount || 0),
+          resultCount: webEvidenceRows.length,
+          tokenUsage,
+          evidence: webEvidenceRows,
+          deepEvidenceExpansion: deepEvidenceExpansionTelemetry
+        });
+      }
+      webSearchResult = Object.assign({}, webSearchResult, { deepEvidenceExpansion: deepEvidenceExpansionTelemetry });
+    }
+    responseSchema = chatResponseSchema(CHAT_RESPONSE_MAX_CLAIMS, phase2Projection.allowedEvidenceIds, webSearchMode);
+    const deepResearchExpansionSuffix = webSearchMode === "deep" && deepAnalysis.valid
+      ? buildDeepResearchExpansionSuffix(deepResearchExpansionRows)
+      : "";
+    const phase2User = webSearchMode === "deep"
+      ? [deepResearchExpansionSuffix, deepResearchFinalDirective, "Validated phase-1 research analysis (use only as a bounded planning aid; the closed evidence ledger remains authoritative):", JSON.stringify(deepAnalysis.value || { findings: [], selected_evidence_ids: [], unresolved: [], additional_evidence_requests: { vault_queries: [], web_queries: [] } })].filter(Boolean).join("\n\n")
+      : phase2Projection.user;
+    if (webSearchMode === "deep") {
+      deepAnalysis.telemetry.phase2ProjectionEvidenceCount = phase2Projection.sourceLedger.length;
+      deepAnalysis.telemetry.phase2InputBytes = utf8ByteLength([phase2Projection.promptCachePrefix, phase2Projection.promptContextSuffix, phase2User].filter(Boolean).join("\n\n"));
+      deepAnalysis.telemetry.phase2PromptCachePrefixHash = providerContextProjectionHash(phase2Projection.promptCachePrefix);
+      deepAnalysis.telemetry.phase2SystemHash = providerContextProjectionHash(deepResearchPhaseNeutralSystem);
+      deepAnalysis.telemetry.phase2EvidencePrefixHash = providerContextProjectionHash(phase2Projection.promptCachePrefix);
+      deepAnalysis.telemetry.phase2PromptCacheKey = deepResearchHosted ? deepResearchCacheKey : "";
+      deepAnalysis.telemetry.sameProjectionForHosted = deepResearchHosted && phase2Projection === deepResearchProjection;
+      deepAnalysis.telemetry.cacheCompatibility = deepResearchHosted
+        && Boolean(deepResearchCacheKey)
+        && deepAnalysis.telemetry.phase1SystemHash === deepAnalysis.telemetry.phase2SystemHash
+        && deepAnalysis.telemetry.phase1EvidencePrefixHash === deepAnalysis.telemetry.phase2EvidencePrefixHash
+        && deepAnalysis.telemetry.phase1PromptCacheKey === deepAnalysis.telemetry.phase2PromptCacheKey;
+    }
     let response = await this.withAiActivity("Answering question", (workflowToken) => this.openaiResponse({
       operation: chatDispatchOperation,
+      ...(webSearchMode === "deep" ? { fallbackPolicy: "disabled" } : {}),
       workflowToken,
       model: modelChoice.model,
       provider: modelChoice.provider,
-      chatContextProjection,
-      promptCachePrefix: chatContextProjection.promptCachePrefix,
-      promptContextSuffix: chatContextProjection.promptContextSuffix,
+      chatContextProjection: phase2Projection,
+      promptCachePrefix: phase2Projection.promptCachePrefix,
+      promptContextSuffix: phase2Projection.promptContextSuffix,
+      promptCacheKey: webSearchMode === "deep" ? phase2Projection.promptCacheKey : "",
       jsonSchema: responseSchema,
-      system: [
+      system: webSearchMode === "deep" ? deepResearchPhaseNeutralSystem : [
         "You are a concise Obsidian sidebar assistant.",
         PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
         OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION,
         PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION,
         "Return only JSON matching the supplied chat evidence schema. Each claim must be one cohesive narrative paragraph, not a bullet or heading.",
-        "Answer the exact question in the first sentence, usually in one paragraph and never more than three paragraphs.",
+        webSearchMode === "concise"
+          ? "Internet Search mode requires exactly one final narrative paragraph combining vault and web evidence."
+          : webSearchMode === "deep"
+            ? "Deep Research mode requires exactly two or three final narrative paragraphs combining vault and web evidence."
+            : "Answer the exact question in the first sentence, usually in one paragraph and never more than three paragraphs.",
+        ...(webSearchEnabled ? ["Return research_subject as a plain 3–8 word subject (maximum 80 characters), without URLs, markdown, citations, or secrets."] : []),
         "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the paragraph's evidence_ids; keep the sentence order natural.",
         "Return exactly one category per paragraph. A general conversational answer uses category=conversation, established=false, and no evidence_ids. A vault-specific missing element uses category=unsupported, established=false, and no evidence_ids. Keep conversation, supported, and unsupported paragraphs distinct and never combine supported and unsupported details in one paragraph.",
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
         "Treat the active note as the primary supplied evidence. Set established=true only when a vault-specific claim is supported by one or more supplied evidence_ids. General reasoning, advice, greetings, and explanations may use category=conversation with established=false and no evidence_ids; do not present those as vault facts.",
         "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
+        ...(webSearchEnabled ? ["When Internet Search sources are supplied, every externally established claim must cite one or more supplied web-* evidence IDs. Never write or invent a URL yourself, and do not imply that the web was checked when the search status is unavailable or no-evidence."] : []),
         "evidence_ids accepts only the exact enum values listed in the supplied schema. fact-* identifiers are metadata only and never citation IDs; never put fact-* values in evidence_ids.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
         "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
@@ -10123,15 +10664,36 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "When referring to an existing task, include its supplied Todoist task link when available after explaining the relevant note-based evidence.",
         "Avoid long preambles."
       ].join(" "),
-      user: chatContextProjection.user,
+      user: phase2User,
       appendFallbackNotice: false,
       background: false
     }));
-    const citationResult = validateChatEvidenceCitations(response, chatContextProjection.sourceLedger, {
-      retrievalTelemetry: context.semanticRetrieval?.telemetry
+    const citationResult = validateChatEvidenceCitations(response, phase2Projection.sourceLedger, {
+      retrievalTelemetry: context.semanticRetrieval?.telemetry,
+      webEvidenceIds: webEvidenceRows.map((row) => row.evidenceId),
+      webSearchStatus: webSearchResult.status,
+      mode: webSearchMode,
+      prompt
     });
     response = citationResult.answer;
     this.lastChatCitationTelemetry = citationResult.telemetry;
+    const researchSave = webSearchEnabled
+      ? await this.saveChatWebResearch({ prompt, active, answer: response, subject: citationResult.researchSubject, mode: webSearchMode, webSearchResult, citationTelemetry: citationResult.telemetry })
+      : { status: "disabled", reason: "search-disabled" };
+    const renderedWebSearchStatus = webSearchStatusMessage(webSearchResult);
+    const deepLocalStatusSuffix = webSearchMode === "deep"
+      ? ` Deep local pass: ${deepLocalPassTelemetry.status}${deepLocalPassTelemetry.addedCount ? ` (+${deepLocalPassTelemetry.addedCount})` : ""}.`
+      : "";
+    const deepEvidenceExpansionStatusSuffix = webSearchMode === "deep" && deepEvidenceExpansionTelemetry.attempted
+      ? ` Evidence expansion: ${deepEvidenceExpansionTelemetry.status}${deepEvidenceExpansionTelemetry.vaultAddedCount || deepEvidenceExpansionTelemetry.webAddedCount ? ` (+${deepEvidenceExpansionTelemetry.vaultAddedCount + deepEvidenceExpansionTelemetry.webAddedCount})` : ""}.`
+      : "";
+    const researchStatusSuffix = researchSave.status === "saved"
+      ? ` Research saved: ${researchSave.path}.`
+      : researchSave.status === "failed"
+        ? " Research save failed; answer preserved."
+        : researchSave.status === "disabled"
+          ? " Research saving is off."
+          : " Research not saved for this answer.";
     return {
       answer: response,
       context,
@@ -10143,7 +10705,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       contextBundleId: adaptivePack.contextBundleHash || "",
       promptBundleId: adaptivePack.promptBundleId || adaptivePack.contextBundleHash || "",
       validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || "",
-      chatContextPreflight: chatContextProjection.telemetry,
+      chatContextPreflight: phase2Projection.telemetry,
+      deepResearchAnalysis: deepAnalysis.telemetry,
+      deepEvidenceExpansion: deepEvidenceExpansionTelemetry,
+      webSearch: Object.assign({}, webSearchResult, { rawResponse: webSearchResult.rawResponse || null }),
+      webSearchStatus: `${renderedWebSearchStatus}${deepLocalStatusSuffix}${deepEvidenceExpansionStatusSuffix}${webSearchEnabled ? researchStatusSuffix : ""}`,
+      researchSave,
       contextBundle: chatContextBundle || reservedTaskEvidence || null
     };
   }
@@ -16652,6 +17219,8 @@ class SemanticTodoistView extends ItemView {
     this.statusDisplayEntries = new Map();
     this.statusRefreshTimer = null;
     this.indexStatus = "";
+    this.webSearchMode = "off";
+    this.webSearchEnabled = false;
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -16773,6 +17342,14 @@ class SemanticTodoistView extends ItemView {
     askButton.onclick = async () => {
       await this.ask();
     };
+    this.webSearchToggleEl = toolbar.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": "Internet Search off", title: "Internet Search off", "aria-pressed": "false", "data-web-search-mode": "off" } });
+    setIcon(this.webSearchToggleEl, "globe-2");
+    this.webSearchToggleEl.onclick = () => {
+      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
+      this.webSearchEnabled = this.webSearchMode !== "off";
+      this.updateWebSearchToggleState();
+    };
+    this.updateWebSearchToggleState();
     const tasksButton = toolbar.createEl("button", { cls: "semantic-todoist-tasks-button", attr: { "aria-label": "Generate Semantic Todoist Sync tasks", title: "Generate Todoist tasks from the selected or active note" }, text: "Tasks" });
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
@@ -16797,7 +17374,7 @@ class SemanticTodoistView extends ItemView {
       this.addMessage("assistant", "Thinking...", operationId);
       const active = await this.getSelectedActiveContext();
       if (this.promptEl) this.promptEl.value = "";
-      const result = await this.plugin.chat(prompt, active, history);
+      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode });
       this.renderRelevantNotes(result.context);
       if (typeof this.plugin.enqueueResponseApplication === "function") {
         const application = await this.plugin.enqueueResponseApplication({
@@ -16812,7 +17389,7 @@ class SemanticTodoistView extends ItemView {
         });
         if (application.status !== "applied") throw new Error(application.conflict?.code || application.error?.message || "Chat response application did not complete.");
       } else this.replaceAssistantMessage(operationId, result.answer);
-      this.setStatus("Ready");
+      this.setStatus(result.webSearchStatus || "Ready");
     } catch (error) {
       console.error(error);
       const failure = aiProviderFailureSummary(error);
@@ -16820,6 +17397,21 @@ class SemanticTodoistView extends ItemView {
       this.setStatus(`Chat failed: ${failure}`);
       new Notice(`Chat failed: ${failure}`);
     }
+  }
+
+  updateWebSearchToggleState() {
+    if (!this.webSearchToggleEl) return;
+    const mode = normalizeWebSearchMode(this.webSearchMode);
+    this.webSearchMode = mode;
+    this.webSearchEnabled = mode !== "off";
+    this.webSearchToggleEl.classList.toggle("is-enabled", mode !== "off");
+    this.webSearchToggleEl.classList.toggle("is-concise", mode === "concise");
+    this.webSearchToggleEl.classList.toggle("is-deep", mode === "deep");
+    this.webSearchToggleEl.setAttribute("aria-pressed", mode === "off" ? "false" : "true");
+    this.webSearchToggleEl.setAttribute("data-web-search-mode", mode);
+    const label = mode === "deep" ? "Deep Research" : mode === "concise" ? "Internet Search" : "Internet Search off";
+    this.webSearchToggleEl.setAttribute("aria-label", label);
+    this.webSearchToggleEl.setAttribute("title", `${label}; click to cycle`);
   }
 
   async runDefaultTaskPrompt() {
@@ -17406,6 +17998,23 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     stsMpProviderApiKeySetting(containerEl, "OpenAI API key", "Saved on blur. A changed non-empty key refreshes the OpenAI model list once; intermediate and empty values do not refresh.", this.plugin, "openaiApiKey", "openai");
     settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(this.plugin, "gemini") });
     stsMpProviderApiKeySetting(containerEl, "Google Gemini API key", "Saved on blur. A changed non-empty key refreshes the Gemini model list once; intermediate and empty values do not refresh.", this.plugin, "googleApiKey", "gemini");
+    settingsHeading(containerEl, "Internet Search", "Optional sidebar search. The globe is off by default; search uses only the selected provider's existing API key and never copies credentials between providers.");
+    const webProvider = normalizeWebSearchProvider(this.plugin.settings.chatWebSearchProvider);
+    new Setting(containerEl)
+      .setName("Internet Search provider")
+      .setDesc("Choose Google Gemini, OpenAI, or OpenRouter. Changing provider selects that provider's default search model; its existing provider key remains separate from other providers.")
+      .addDropdown((dropdown) => {
+        for (const provider of WEB_SEARCH_PROVIDER_VALUES) dropdown.addOption(provider, provider === "gemini" ? "Google Gemini" : provider === "openai" ? "OpenAI" : "OpenRouter");
+        dropdown.setValue(webProvider).onChange(async (value) => {
+          const nextProvider = normalizeWebSearchProvider(value);
+          this.plugin.settings.chatWebSearchProvider = nextProvider;
+          this.plugin.settings.chatWebSearchModel = webSearchProviderDefaultModel(nextProvider);
+          await this.plugin.saveSettings();
+          this.display();
+        });
+    });
+    textSetting(containerEl, "Internet Search model", "Provider-specific model used only for the opt-in search request; no model discovery runs here.", this.plugin, "chatWebSearchModel");
+    toggleSetting(containerEl, "Save Internet Search research", "When enabled, a successful cited answer is saved as one sanitized note under Semantic Todoist Sync/Research. This is independent of the sidebar search toggle.", this.plugin, "chatWebSaveResearch");
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
       stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
       stsMpRenderOpenWebUILearnedProfiles(containerEl, this.plugin, () => this.display());
@@ -18671,6 +19280,426 @@ function isHttpsUrl(value) {
   } catch {
     return false;
   }
+}
+
+function normalizeWebSearchProvider(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return WEB_SEARCH_PROVIDER_VALUES.includes(normalized) ? normalized : "gemini";
+}
+
+function normalizeWebSearchMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return WEB_SEARCH_MODE_VALUES.includes(normalized) ? normalized : "off";
+}
+
+function webSearchModeLabel(value) {
+  const mode = normalizeWebSearchMode(value);
+  return mode === "deep" ? "Deep Research" : mode === "concise" ? "Internet Search" : "Internet Search off";
+}
+
+function webSearchProviderDefaultModel(provider) {
+  return WEB_SEARCH_PROVIDER_DEFAULT_MODELS[normalizeWebSearchProvider(provider)] || WEB_SEARCH_PROVIDER_DEFAULT_MODELS.gemini;
+}
+
+function normalizeWebSearchModel(value, provider) {
+  const normalized = String(value || "").trim();
+  return normalized || webSearchProviderDefaultModel(provider);
+}
+
+function redactWebContextLine(value) {
+  const text = redactSecrets(String(value || "").trim());
+  if (!text) return "";
+  return text.replace(/(^|[.;|])([ \t]*(?:password|passcode|token|api[\s_-]*key|secret|authorization)[ \t]*(?::|=|is)[ \t]*)[^.;|]*/gi, "$1$2[redacted]");
+}
+
+function redactWebContext(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map(redactWebContextLine)
+    .filter(Boolean)
+    .join(" ");
+}
+
+function canonicalWebSearchUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) return "";
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function boundedWebExcerpt(value, maxChars = WEB_SEARCH_MAX_EVIDENCE_CHARS) {
+  return truncateAtWord(stripExcludedLinks(redactWebContext(value).replace(/\s+/g, " ").trim()), maxChars);
+}
+
+function buildWebSearchRequest(options = {}) {
+  const provider = normalizeWebSearchProvider(options.provider);
+  const model = normalizeWebSearchModel(options.model, provider);
+  const mode = normalizeWebSearchMode(options.mode);
+  const prompt = String(options.prompt || "");
+  const searchPrompt = truncateAtWord(redactWebContext(prompt), WEB_SEARCH_MAX_QUERY_CHARS);
+  const active = options.active && typeof options.active === "object" ? options.active : {};
+  const activeText = boundedWebExcerpt(active.selection || active.text || "", WEB_SEARCH_MAX_ACTIVE_CHARS);
+  const context = (Array.isArray(options.context) ? options.context : []).slice(0, 4).map((row) => ({
+    title: redactWebContext(singleLine(row?.title || row?.path || "")).slice(0, 160),
+    excerpt: boundedWebExcerpt(row?.text || row?.excerpt || row?.content || "", WEB_SEARCH_MAX_EVIDENCE_CHARS)
+  })).filter((row) => row.title || row.excerpt);
+  const request = {
+    provider,
+    model,
+    mode,
+    prompt,
+    searchPrompt,
+    activeSource: activeText ? { title: redactWebContext(singleLine(active.title || active.path || "")).slice(0, 160), excerpt: activeText } : null,
+    localEvidence: context,
+    constraints: {
+      searchContextSize: WEB_SEARCH_SEARCH_CONTEXT_SIZE,
+      maxQueries: 3,
+      maxResults: WEB_SEARCH_MAX_RESULTS
+    }
+  };
+  request.query = [
+    `${mode === "deep" ? "Deep Research" : "Internet Search"} is enabled: execute the best single vault-informed native web search before answering; do not answer from model memory alone. Use at most three provider-native searches only when material ambiguity, a missing authoritative source, or a distinct required subquestion remains. Return at most five safe useful sources across those searches.`,
+    "The bounded user request is:", searchPrompt,
+    activeText ? `Active source context:\n${activeText}` : "",
+    context.length ? `Admitted local evidence:\n${context.map((row) => `- ${row.title}: ${row.excerpt}`).join("\n")}` : ""
+  ].filter(Boolean).join("\n\n");
+  if (request.query.length > WEB_SEARCH_MAX_REQUEST_CHARS) {
+    request.query = [
+      `${mode === "deep" ? "Deep Research" : "Internet Search"} is enabled: execute the best single vault-informed native web search before answering; do not answer from model memory alone. Use at most three provider-native searches only when material ambiguity, a missing authoritative source, or a distinct required subquestion remains. Return at most five safe useful sources across those searches.`,
+      "The bounded user request is:", searchPrompt,
+      activeText ? `Active source context:\n${activeText.slice(0, 600)}` : "",
+      context.length ? `Admitted local evidence:\n${context.slice(0, 1).map((row) => `- ${row.title}: ${row.excerpt.slice(0, 240)}`).join("\n")}` : ""
+    ].filter(Boolean).join("\n\n");
+  }
+  return request;
+}
+
+function buildDeepWebLocalRetrievalQuery(prompt = "", webEvidenceRows = []) {
+  const titles = uniqueValues((Array.isArray(webEvidenceRows) ? webEvidenceRows : [])
+    .map((row) => redactWebContext(singleLine(row?.title || "")).slice(0, 160))
+    .filter(Boolean)).slice(0, WEB_SEARCH_MAX_RESULTS);
+  return [redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS), titles.length ? `Web source titles:\n${titles.map((title) => `- ${title}`).join("\n")}` : ""]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function mergeDeepWebLocalContext(baseContext = [], deepContext = []) {
+  const base = Array.isArray(baseContext) ? baseContext : [];
+  const additions = Array.isArray(deepContext) ? deepContext : [];
+  const merged = [];
+  const seen = new Set();
+  let duplicateCount = 0;
+  let capDroppedCount = 0;
+  const keyFor = (row) => {
+    const evidenceId = String(row?.evidenceId || row?.evidence_id || "").trim();
+    if (evidenceId) return `evidence:${evidenceId}`;
+    const sourceId = String(row?.sourceId || row?.source_id || row?.path || "").trim();
+    if (sourceId) return `source:${sourceId}`;
+    return `text:${shortHash(singleLine(row?.text || row?.excerpt || row?.content || ""))}`;
+  };
+  for (const row of [...base, ...additions]) {
+    if (!row || typeof row !== "object") continue;
+    const key = keyFor(row);
+    if (seen.has(key)) {
+      duplicateCount += 1;
+      continue;
+    }
+    seen.add(key);
+    if (merged.length >= CHAT_PROVIDER_MAX_EVIDENCE_ROWS) {
+      capDroppedCount += 1;
+      continue;
+    }
+    merged.push(row);
+  }
+  merged.deepMergeTelemetry = { duplicateCount, capDroppedCount };
+  return merged;
+}
+
+function buildDeepEvidenceExpansionVaultQuery(prompt = "", vaultQueries = []) {
+  const requests = (Array.isArray(vaultQueries) ? vaultQueries : [])
+    .map((value) => redactWebContext(value).trim())
+    .filter(Boolean)
+    .slice(0, 2);
+  if (!requests.length) return "";
+  return truncateAtWord([
+    "Deep Research local evidence follow-up. Retrieve only unresolved vault evidence needed for the original request.",
+    `Original user request: ${redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS)}`,
+    `Unresolved vault questions:\n${requests.map((value) => `- ${value.slice(0, 240)}`).join("\n")}`
+  ].join("\n\n"), WEB_SEARCH_MAX_REQUEST_CHARS);
+}
+
+function buildDeepEvidenceExpansionWebQuery({ prompt = "", webQueries = [], webEvidenceRows = [] } = {}) {
+  const requests = (Array.isArray(webQueries) ? webQueries : [])
+    .map((value) => redactWebContext(value).trim())
+    .filter(Boolean)
+    .slice(0, 2);
+  if (!requests.length) return "";
+  const titles = uniqueValues((Array.isArray(webEvidenceRows) ? webEvidenceRows : [])
+    .map((row) => redactWebContext(singleLine(row?.title || "")).slice(0, 160))
+    .filter(Boolean)).slice(0, WEB_SEARCH_MAX_RESULTS);
+  return truncateAtWord([
+    "Deep Research web evidence follow-up. Search only the unresolved subquestions below; do not answer from model memory.",
+    `Original user request: ${redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS)}`,
+    `Unresolved web questions:\n${requests.map((value) => `- ${value.slice(0, 240)}`).join("\n")}`,
+    titles.length ? `Admitted source titles (titles only):\n${titles.map((title) => `- ${title}`).join("\n")}` : ""
+  ].filter(Boolean).join("\n\n"), WEB_SEARCH_MAX_REQUEST_CHARS);
+}
+
+function admitDeepWebExpansionRows(initialRows = [], candidates = [], maxRows = 3) {
+  const initial = Array.isArray(initialRows) ? initialRows : [];
+  const rows = [];
+  const seenUrls = new Set(initial.map((row) => canonicalWebSearchUrl(row?.url)).filter(Boolean));
+  let duplicateCount = 0;
+  let capDroppedCount = 0;
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const url = canonicalWebSearchUrl(candidate?.url);
+    if (!url || seenUrls.has(url)) {
+      if (url && seenUrls.has(url)) duplicateCount += 1;
+      continue;
+    }
+    if (rows.length >= Math.max(0, Math.min(3, Number(maxRows) || 0))) {
+      capDroppedCount += 1;
+      continue;
+    }
+    seenUrls.add(url);
+    const evidenceId = `web-followup-${rows.length + 1}`;
+    rows.push(Object.assign({}, candidate, {
+      evidenceId,
+      sourceId: url,
+      url,
+      expansion: true,
+      text: candidate.excerpt,
+      evidenceText: candidate.excerpt,
+      role: "Internet Search follow-up source",
+      required: true,
+      markdown: `[${markdownLinkText(candidate.title)}](${url})`
+    }));
+  }
+  return { rows, duplicateCount, capDroppedCount };
+}
+
+function buildDeepResearchExpansionSuffix(rows = [], maxChars = 7000) {
+  const entries = (Array.isArray(rows) ? rows : []).filter((row) => row && typeof row === "object");
+  if (!entries.length) return "";
+  const lines = ["Deep Research expansion evidence admitted after phase 1:"];
+  for (const row of entries) {
+    const id = String(row.evidenceId || "").trim();
+    if (!id) continue;
+    const title = singleLine(redactWebContext(row.title || row.path || row.sourceId || "")).slice(0, 180);
+    const text = boundedWebExcerpt(row.text || row.evidenceText || row.excerpt || row.content || "", 560);
+    const source = canonicalWebSearchUrl(row.url) || vaultRelativePath(row.path || "");
+    lines.push(`- evidence_id=${id}; title=${title}; source=${source}; text=${text}`);
+  }
+  return truncateAtWord(lines.join("\n"), maxChars);
+}
+
+function appendDeepResearchExpansionProjection(projection, { sourceLedger = [], allowedEvidenceIds = [], expansionRows = [] } = {}) {
+  const source = projection && typeof projection === "object" ? projection : {};
+  const nextLedger = Array.isArray(sourceLedger) ? sourceLedger.slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS) : [];
+  const nextAllowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [])
+    .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
+  const suffix = buildDeepResearchExpansionSuffix(expansionRows);
+  const telemetry = Object.assign({}, source.telemetry || {}, {
+    promptCachePrefix: providerContextProjectionMetrics(source.promptCachePrefix || ""),
+    promptContextSuffix: providerContextProjectionMetrics(""),
+    promptCachePrefixHash: providerContextProjectionHash(source.promptCachePrefix || ""),
+    promptContextSuffixHash: providerContextProjectionHash(""),
+    promptCachePrefixBytes: utf8ByteLength(source.promptCachePrefix || ""),
+    promptContextSuffixBytes: 0,
+    deepResearchExpansionSuffix: providerContextProjectionMetrics(suffix),
+    deepResearchExpansionSuffixHash: providerContextProjectionHash(suffix)
+  });
+  return Object.freeze(Object.assign({}, source, {
+    sourceLedger: Object.freeze(nextLedger),
+    allowedEvidenceIds: Object.freeze(nextAllowedIds),
+    user: "",
+    promptContextSuffix: "",
+    telemetry: Object.freeze(telemetry)
+  }));
+}
+
+function webSearchFailureResult(provider = "", model = "", reasonCode = "provider-error", rawResponse = null) {
+  return {
+    status: "unavailable",
+    provider: normalizeWebSearchProvider(provider),
+    model: normalizeWebSearchModel(model, provider),
+    queryCount: 0,
+    resultCount: 0,
+    tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, searchRequests: 0 },
+    rawResponse,
+    evidence: [],
+    reasons: { [reasonCode]: 1 }
+  };
+}
+
+function webSearchStatusMessage(result = {}) {
+  const status = String(result.status || "disabled");
+  const label = normalizeWebSearchMode(result.mode) === "deep" ? "Deep Research" : "Internet Search";
+  const sourceCount = Number(result.resultCount || 0);
+  const searchCount = Number(result.queryCount || result.tokenUsage?.searchRequests || 0);
+  if (status === "searched") return `${label}: ${sourceCount} source${sourceCount === 1 ? "" : "s"} admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}.`;
+  if (status === "disabled") return "Internet Search: off.";
+  if (status === "no-evidence") return `${label}: ${sourceCount} sources admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}; local context only.`;
+  return `${label}: unavailable; ${sourceCount} sources admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}; local context only.`;
+}
+
+function normalizeResearchSubject(value = "", fallback = "Research Subject") {
+  const clean = (input) => redactWebContext(singleLine(input || ""))
+    .replace(/[\\/#^[\]|:?*<>"]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80)
+    .replace(/[. ]+$/g, "");
+  const candidate = clean(value);
+  const words = candidate ? candidate.split(/\s+/).filter(Boolean) : [];
+  if (candidate && words.length >= 3 && words.length <= 8) return { value: candidate, fallback: false };
+  const fallbackValue = clean(fallback) || "Research Subject";
+  const fallbackWords = fallbackValue.split(/\s+/).filter(Boolean).slice(0, 8);
+  return { value: fallbackWords.join(" ").slice(0, 80) || "Research Subject", fallback: true };
+}
+
+function yamlResearchScalar(value = "") {
+  return JSON.stringify(singleLine(redactWebContext(value || "")));
+}
+
+function buildChatResearchMarkdown({ subject = "", mode = "concise", prompt = "", answer = "", provider = "", model = "", queryCount = 0, resultCount = 0, citedWebEvidenceCount = 0, activePath = "" } = {}) {
+  const relativeActivePath = vaultRelativePath(activePath);
+  const activeDisplayTitle = safeMarkdownFileName(markdownTitleFromPath(relativeActivePath), 120) || "Active note";
+  const activeLink = relativeActivePath && !relativeActivePath.startsWith("@todoist/")
+    ? `\nActive note: [[${relativeActivePath}|${activeDisplayTitle}]]`
+    : "";
+  const createdAt = new Date().toISOString();
+  const created = createdAt.slice(0, 10);
+  const normalizedSubject = normalizeResearchSubject(subject, prompt).value;
+  return [
+    "---",
+    `type: ${yamlResearchScalar("semantic-todoist-sync-research")}`,
+    `created: ${yamlResearchScalar(created)}`,
+    `created_at: ${yamlResearchScalar(createdAt)}`,
+    `topic: ${yamlResearchScalar(normalizedSubject)}`,
+    `research_mode: ${yamlResearchScalar(normalizeWebSearchMode(mode))}`,
+    `search_provider: ${yamlResearchScalar(provider || "unknown")}`,
+    `search_model: ${yamlResearchScalar(model || "unknown")}`,
+    `search_queries: ${Math.max(0, Math.round(Number(queryCount) || 0))}`,
+    `admitted_sources: ${Math.max(0, Math.round(Number(resultCount) || 0))}`,
+    `cited_web_sources: ${Math.max(0, Math.round(Number(citedWebEvidenceCount) || 0))}`,
+    ...(relativeActivePath && !relativeActivePath.startsWith("@todoist/") ? [`active_note: ${yamlResearchScalar(relativeActivePath)}`] : []),
+    "---",
+    `# ${normalizedSubject}`,
+    `Question: ${redactWebContext(String(prompt || ""))}${activeLink}`,
+    "",
+    "## Answer",
+    String(answer || "").replace(/\r\n?/g, "\n").split("\n").map((line) => redactWebContext(line)).join("\n").trim()
+  ].join("\n").trim() + "\n";
+}
+
+function normalizeWebSearchUsage(provider, response = {}) {
+  const normalizedProvider = normalizeWebSearchProvider(provider);
+  const usage = normalizedProvider === "gemini" ? (response?.usageMetadata || response?.usage || {}) : (response?.usage || {});
+  const outputItems = Array.isArray(response?.output) ? response.output : [];
+  const outputWebSearchCalls = outputItems.filter((item) => String(item?.type || "").toLowerCase() === "web_search_call").length;
+  const geminiMetadata = response?.candidates?.[0]?.groundingMetadata || response?.candidates?.[0]?.grounding_metadata || {};
+  const geminiQueryCount = Array.isArray(geminiMetadata.webSearchQueries || geminiMetadata.web_search_queries)
+    ? (geminiMetadata.webSearchQueries || geminiMetadata.web_search_queries).length
+    : 0;
+  const usageSearchRequests = Number(
+    usage?.server_tool_use?.web_search_requests
+      ?? usage?.web_search_requests
+      ?? usage?.webSearchRequests
+      ?? response?.usageMetadata?.webSearchRequests
+      ?? 0
+  );
+  const searchRequests = Math.max(0, Math.round(Math.max(outputWebSearchCalls, geminiQueryCount, Number.isFinite(usageSearchRequests) ? usageSearchRequests : 0)));
+  const inputTokens = Math.max(0, Math.round(Number(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount ?? 0) || 0));
+  const outputTokens = Math.max(0, Math.round(Number(usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount ?? 0) || 0));
+  const totalTokens = Math.max(0, Math.round(Number(usage.total_tokens ?? usage.totalTokenCount ?? (inputTokens + outputTokens)) || 0));
+  return { inputTokens, outputTokens, totalTokens, searchRequests, provider: normalizedProvider };
+}
+
+function normalizeWebEvidenceRows(provider, model, candidates = [], settings = DEFAULT_SETTINGS) {
+  const rows = [];
+  const seen = new Set();
+  const reasons = {};
+  const reject = (code) => { reasons[code] = Number(reasons[code] || 0) + 1; };
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const url = canonicalWebSearchUrl(candidate?.url || candidate?.uri);
+    if (!url) { reject("missing-or-unsafe-url"); continue; }
+    if (isExcludedUrl(url, settings)) { reject("excluded-domain"); continue; }
+    if (seen.has(url)) { reject("duplicate-url"); continue; }
+    const excerpt = boundedWebExcerpt(candidate?.excerpt || candidate?.text || "");
+    if (!excerpt) { reject("missing-grounding-support"); continue; }
+    seen.add(url);
+    rows.push(Object.freeze({
+      evidenceId: `web-${rows.length + 1}`,
+      sourceKind: "web",
+      epistemicStatus: "external",
+      provider: normalizeWebSearchProvider(provider),
+      model: String(model || ""),
+      url,
+      title: singleLine(candidate?.title || url).slice(0, 240),
+      excerpt
+    }));
+    if (rows.length >= WEB_SEARCH_MAX_RESULTS) break;
+  }
+  if (rows.length >= WEB_SEARCH_MAX_RESULTS && (Array.isArray(candidates) ? candidates.length : 0) > rows.length) reject("max-results");
+  return { rows, reasons };
+}
+
+function extractGeminiWebEvidence(response = {}) {
+  const metadata = response?.candidates?.[0]?.groundingMetadata || response?.candidates?.[0]?.grounding_metadata || {};
+  const chunks = Array.isArray(metadata.groundingChunks || metadata.grounding_chunks) ? (metadata.groundingChunks || metadata.grounding_chunks) : [];
+  const supports = Array.isArray(metadata.groundingSupports || metadata.grounding_supports) ? (metadata.groundingSupports || metadata.grounding_supports) : [];
+  const candidates = [];
+  for (const support of supports) {
+    const segment = support?.segment || {};
+    const excerpt = String(segment.text || "").trim();
+    const indices = Array.isArray(support?.groundingChunkIndices || support?.grounding_chunk_indices) ? (support.groundingChunkIndices || support.grounding_chunk_indices) : [];
+    for (const index of indices) {
+      const web = chunks[Number(index)]?.web;
+      if (web?.uri) candidates.push({ url: web.uri, title: web.title, excerpt });
+    }
+  }
+  return { candidates, queryCount: Array.isArray(metadata.webSearchQueries || metadata.web_search_queries) ? (metadata.webSearchQueries || metadata.web_search_queries).length : 0, metadata };
+}
+
+function extractOpenAIWebEvidence(response = {}) {
+  const candidates = [];
+  const output = Array.isArray(response?.output) ? response.output : [];
+  for (const item of output) for (const content of Array.isArray(item?.content) ? item.content : []) {
+    const text = String(content?.text || "");
+    for (const annotation of Array.isArray(content?.annotations) ? content.annotations : []) {
+      const citation = annotation?.url_citation || annotation;
+      if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
+      const start = Number(citation?.start_index ?? citation?.startIndex ?? 0);
+      const end = Number(citation?.end_index ?? citation?.endIndex ?? text.length);
+      candidates.push({ url: citation?.url, title: citation?.title, excerpt: text.slice(Math.max(0, start), Math.max(start, end)) || text });
+    }
+  }
+  const queryCount = output.filter((item) => String(item?.type || "").toLowerCase() === "web_search_call").length;
+  return { candidates, queryCount };
+}
+
+function extractOpenRouterWebEvidence(response = {}) {
+  const message = response?.choices?.[0]?.message || {};
+  const text = String(message?.content || "");
+  const candidates = [];
+  for (const annotation of Array.isArray(message?.annotations) ? message.annotations : []) {
+    const citation = annotation?.url_citation || annotation;
+    if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
+    const start = Number(citation?.start_index ?? citation?.startIndex ?? 0);
+    const end = Number(citation?.end_index ?? citation?.endIndex ?? text.length);
+    candidates.push({ url: citation?.url, title: citation?.title, excerpt: text.slice(Math.max(0, start), Math.max(start, end)) || text });
+  }
+  return { candidates, queryCount: Number(response?.usage?.server_tool_use?.web_search_requests || 0) };
 }
 
 function normalizeHttpsUrl(value) {
@@ -20404,6 +21433,11 @@ function formatBytes(bytes) {
 
 function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenceIds = [], mode = "evidence") {
   const conversationMode = String(mode || "").trim().toLowerCase() === "conversation";
+  const normalizedMode = String(mode || "").trim().toLowerCase();
+  const researchMode = ["off", "concise", "deep"].includes(normalizedMode)
+    ? normalizedMode
+    : "off";
+  const webMode = researchMode !== "off";
   const allowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
     .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
   const claimCategories = conversationMode
@@ -20427,33 +21461,171 @@ function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenc
     { type: "boolean", description: conversationMode ? "Must be false for a conversation claim." : "True only when the claim is supported by every listed evidence_id; false only for one missing or unestablished element." },
     conversationMode ? { enum: [false] } : {}
   );
+  const claimLimit = conversationMode ? 1 : webMode
+    ? researchMode === "concise" ? 1 : 3
+    : Math.max(1, Math.min(3, Number(maxClaims) || CHAT_RESPONSE_MAX_CLAIMS));
+  const claimMinimum = conversationMode ? 1 : webMode && researchMode === "deep" ? 2 : 1;
+  const properties = {
+    claims: {
+      type: "array",
+      minItems: claimMinimum,
+      maxItems: claimLimit,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          text: { type: "string", minLength: 1, maxLength: CHAT_RESPONSE_MAX_TEXT_CHARS, description: conversationMode ? "Concise, friendly natural prose answering the standalone conversation request directly." : "One cohesive narrative paragraph for one dominant category; keep supported and unsupported details separate." },
+          established,
+          evidence_ids: claimEvidenceIds,
+          category: {
+            type: "string",
+            enum: claimCategories,
+            description: conversationMode ? "The only valid conversation category." : "Exactly one category; use unsupported only for a single missing or unestablished element."
+          }
+        },
+        required: ["text", "established", "evidence_ids", "category"]
+      }
+    }
+  };
+  if (webMode) properties.research_subject = {
+    type: "string",
+    minLength: 1,
+    maxLength: 80,
+    description: "A plain 3–8 word research subject; no URLs, markdown, citations, or secrets."
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties,
+    required: webMode ? ["claims", "research_subject"] : ["claims"]
+  };
+}
+
+function deepResearchAnalysisSchema(allowedEvidenceIds = []) {
+  const allowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
+    .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
+  const idArray = (maxItems, description) => ({
+    type: "array",
+    maxItems,
+    items: Object.assign({ type: "string" }, allowedIds.length ? { enum: allowedIds } : {}),
+    description
+  });
   return {
     type: "object",
     additionalProperties: false,
     properties: {
-      claims: {
+      findings: {
         type: "array",
         minItems: 1,
-        maxItems: conversationMode ? 1 : Math.max(1, Math.min(3, Number(maxClaims) || CHAT_RESPONSE_MAX_CLAIMS)),
+        maxItems: 5,
         items: {
           type: "object",
           additionalProperties: false,
           properties: {
-            text: { type: "string", minLength: 1, maxLength: CHAT_RESPONSE_MAX_TEXT_CHARS, description: conversationMode ? "Concise, friendly natural prose answering the standalone conversation request directly." : "One cohesive narrative paragraph for one dominant category; keep supported and unsupported details separate." },
-            established,
-            evidence_ids: claimEvidenceIds,
-            category: {
-              type: "string",
-              enum: claimCategories,
-              description: conversationMode ? "The only valid conversation category." : "Exactly one category; use unsupported only for a single missing or unestablished element."
-            }
+            text: { type: "string", minLength: 1, maxLength: 1200 },
+            evidence_ids: idArray(CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM, "Exact IDs from the closed evidence ledger supporting this finding.")
           },
-          required: ["text", "established", "evidence_ids", "category"]
+          required: ["text", "evidence_ids"]
         }
+      },
+      selected_evidence_ids: idArray(CHAT_PROVIDER_MAX_EVIDENCE_ROWS, "Exact ledger IDs to retain for final answer composition."),
+      unresolved: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 600 } },
+      additional_evidence_requests: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          vault_queries: { type: "array", minItems: 0, maxItems: 2, items: { type: "string", minLength: 1, maxLength: 240 } },
+          web_queries: { type: "array", minItems: 0, maxItems: 2, items: { type: "string", minLength: 1, maxLength: 240 } }
+        },
+        required: ["vault_queries", "web_queries"]
       }
     },
-    required: ["claims"]
+    required: ["findings", "selected_evidence_ids", "additional_evidence_requests"]
   };
+}
+
+function deepResearchEvidenceRequestUnsafe(value = "") {
+  const text = String(value || "");
+  return /[\u0000-\u001f\u007f]|(?:https?:\/\/|javascript:|data:|<script\b)|(?:sk-[A-Za-z0-9]|AIza[A-Za-z0-9_-]{20,}|Bearer\s+|api[_ -]?key|password|token\s*[:=])|(?:ignore\s+(?:all|any|the|previous)|system\s+prompt|developer\s+message)/i.test(text);
+}
+
+function deepResearchEvidenceRequestArray(value, field, telemetry) {
+  if (!Array.isArray(value) || value.length > 2) {
+    telemetry.invalidReasons.push(`analysis-additional-${field}-invalid`);
+    return [];
+  }
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== "string" || !item.trim() || item.length > 240) {
+      telemetry.invalidReasons.push(`analysis-additional-${field}-item-invalid`);
+      continue;
+    }
+    if (deepResearchEvidenceRequestUnsafe(item)) {
+      telemetry.invalidReasons.push(`analysis-additional-${field}-item-unsafe`);
+      continue;
+    }
+    const key = item.trim().toLocaleLowerCase();
+    if (seen.has(key)) telemetry.invalidReasons.push(`analysis-additional-${field}-duplicate`);
+    seen.add(key);
+  }
+  return value;
+}
+
+function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = []) {
+  const parsed = (() => {
+    try { return JSON.parse(extractJsonPayload(String(value || ""))); } catch { return null; }
+  })();
+  const allowed = new Set((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds]).map((id) => String(id || "").trim()).filter(Boolean));
+  const telemetry = {
+    valid: false,
+    findingsCount: 0,
+    selectedEvidenceCount: 0,
+    unresolvedCount: 0,
+    schemaInvalidCount: 0,
+    invalidReasons: [],
+    vaultQueryCount: 0,
+    webQueryCount: 0,
+    additionalEvidenceRequestCount: 0
+  };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    telemetry.schemaInvalidCount = 1;
+    telemetry.invalidReasons.push("analysis-not-object");
+    return { valid: false, value: null, telemetry };
+  }
+  const topLevel = Object.keys(parsed);
+  if (topLevel.some((key) => !["findings", "selected_evidence_ids", "unresolved", "additional_evidence_requests"].includes(key))) telemetry.invalidReasons.push("analysis-unknown-field");
+  if (!Array.isArray(parsed.findings) || parsed.findings.length < 1 || parsed.findings.length > 5) telemetry.invalidReasons.push("analysis-findings-invalid");
+  if (!Array.isArray(parsed.selected_evidence_ids) || parsed.selected_evidence_ids.length > CHAT_PROVIDER_MAX_EVIDENCE_ROWS) telemetry.invalidReasons.push("analysis-selected-evidence-invalid");
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  findings.forEach((finding, index) => {
+    if (!finding || typeof finding !== "object" || Array.isArray(finding)) return telemetry.invalidReasons.push(`analysis-finding-${index + 1}-not-object`);
+    if (Object.keys(finding).some((key) => !["text", "evidence_ids"].includes(key))) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-unknown-field`);
+    if (typeof finding.text !== "string" || !finding.text.trim() || finding.text.length > 1200) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-text-invalid`);
+    if (!Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-invalid`);
+    if (Array.isArray(finding.evidence_ids) && new Set(finding.evidence_ids).size !== finding.evidence_ids.length) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-duplicate`);
+    for (const id of finding.evidence_ids || []) if (typeof id !== "string" || !allowed.has(id)) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-not-allowed`);
+  });
+  for (const id of parsed.selected_evidence_ids || []) if (typeof id !== "string" || !allowed.has(id)) telemetry.invalidReasons.push("analysis-selected-evidence-not-allowed");
+  if (Array.isArray(parsed.selected_evidence_ids) && new Set(parsed.selected_evidence_ids).size !== parsed.selected_evidence_ids.length) telemetry.invalidReasons.push("analysis-selected-evidence-duplicate");
+  if (parsed.unresolved !== undefined && (!Array.isArray(parsed.unresolved) || parsed.unresolved.length > 3 || parsed.unresolved.some((item) => typeof item !== "string" || !item.trim() || item.length > 600))) telemetry.invalidReasons.push("analysis-unresolved-invalid");
+  const requests = parsed.additional_evidence_requests;
+  if (!requests || typeof requests !== "object" || Array.isArray(requests)) {
+    telemetry.invalidReasons.push("analysis-additional-evidence-requests-invalid");
+  } else {
+    if (Object.keys(requests).some((key) => !["vault_queries", "web_queries"].includes(key))) telemetry.invalidReasons.push("analysis-additional-evidence-requests-unknown-field");
+    const vaultQueries = deepResearchEvidenceRequestArray(requests.vault_queries, "vault-queries", telemetry);
+    const webQueries = deepResearchEvidenceRequestArray(requests.web_queries, "web-queries", telemetry);
+    telemetry.vaultQueryCount = vaultQueries.length;
+    telemetry.webQueryCount = webQueries.length;
+    telemetry.additionalEvidenceRequestCount = vaultQueries.length + webQueries.length;
+    if (!Object.prototype.hasOwnProperty.call(requests, "vault_queries") || !Object.prototype.hasOwnProperty.call(requests, "web_queries")) telemetry.invalidReasons.push("analysis-additional-evidence-requests-missing-field");
+  }
+  telemetry.findingsCount = findings.length;
+  telemetry.selectedEvidenceCount = Array.isArray(parsed.selected_evidence_ids) ? parsed.selected_evidence_ids.length : 0;
+  telemetry.unresolvedCount = Array.isArray(parsed.unresolved) ? parsed.unresolved.length : 0;
+  telemetry.schemaInvalidCount = telemetry.invalidReasons.length ? 1 : 0;
+  telemetry.valid = telemetry.schemaInvalidCount === 0;
+  return { valid: telemetry.valid, value: telemetry.valid ? parsed : null, telemetry };
 }
 
 function taskWorkflowSchemaVocabularyFromProjection(projection = null, sourceContract = {}) {
@@ -24807,8 +25979,15 @@ function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTING
     throw error;
   }
   const protectedKeys = new Set(protectedEntries.map((entry) => entry.key));
+  const maxRows = Math.max(1, Math.min(CHAT_PROVIDER_MAX_EVIDENCE_ROWS, Number(options.maxRows || CHAT_PROVIDER_MAX_EVIDENCE_ROWS)));
+  if (protectedEntries.length > maxRows) {
+    const error = new Error(`Chat citable evidence exceeds the ${maxRows}-row protected limit.`);
+    error.code = "chat-citable-evidence-overflow";
+    error.protectedEvidenceCount = protectedEntries.length;
+    throw error;
+  }
   const selected = [...protectedEntries, ...entries.filter((entry) => !protectedKeys.has(entry.key))
-    .slice(0, Math.max(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - protectedEntries.length))];
+    .slice(0, Math.max(0, maxRows - protectedEntries.length))];
   const selectedEvidenceIds = new Set(selected.map((entry) => entry.evidenceId).filter(Boolean));
   const missingRequiredEvidenceIds = [...requiredEvidenceIds].filter((evidenceId) => !selectedEvidenceIds.has(evidenceId));
   if (missingRequiredEvidenceIds.length) {
@@ -25046,13 +26225,20 @@ function normalizeChatProviderResponse(response = {}) {
 
 function validateChatEvidencePayload(parsed = null, options = {}) {
   const conversationMode = String(options.mode || "").trim().toLowerCase() === "conversation";
-  const maximumClaims = conversationMode ? 1 : CHAT_RESPONSE_MAX_CLAIMS;
+  const normalizedMode = String(options.mode || "").trim().toLowerCase();
+  const researchMode = ["off", "concise", "deep"].includes(normalizedMode)
+    ? normalizedMode
+    : "off";
+  const webMode = researchMode !== "off";
+  const maximumClaims = conversationMode ? 1 : webMode ? researchMode === "concise" ? 1 : 3 : CHAT_RESPONSE_MAX_CLAIMS;
+  const minimumClaims = conversationMode ? 1 : webMode && researchMode === "deep" ? 2 : 1;
   const allowedEvidenceIds = Array.isArray(options.allowedEvidenceIds)
     ? new Set(options.allowedEvidenceIds.map((value) => String(value || "").trim()).filter(Boolean))
     : null;
   const result = {
     valid: false,
-    mode: conversationMode ? "conversation" : "evidence",
+    mode: conversationMode ? "conversation" : webMode ? researchMode : "evidence",
+    researchSubject: "",
     claims: [],
     claimCount: 0,
     paragraphCount: 0,
@@ -25067,13 +26253,19 @@ function validateChatEvidencePayload(parsed = null, options = {}) {
     return result;
   }
   const topLevelKeys = Object.keys(parsed);
-  if (topLevelKeys.some((key) => key !== "claims")) result.reasons.push("unknown-top-level-field");
+  const allowedTopLevelKeys = webMode ? ["claims", "research_subject"] : ["claims"];
+  if (topLevelKeys.some((key) => !allowedTopLevelKeys.includes(key))) result.reasons.push("unknown-top-level-field");
   if (!Array.isArray(parsed.claims)) result.reasons.push("claims-not-array");
+  if (webMode) {
+    if (typeof parsed.research_subject !== "string" || !parsed.research_subject.trim() || parsed.research_subject.length > 80) result.reasons.push("research-subject-invalid");
+    else result.researchSubject = parsed.research_subject;
+  }
   if (result.reasons.length) return result;
   result.claimCount = parsed.claims.length;
   result.paragraphCount = parsed.claims.length;
   result.truncatedClaimCount = Math.max(0, parsed.claims.length - maximumClaims);
   if (!parsed.claims.length) result.reasons.push("claims-empty");
+  if (parsed.claims.length < minimumClaims) result.reasons.push("claims-below-mode-minimum");
   if (result.truncatedClaimCount > 0) result.reasons.push("claims-truncated");
   const claims = parsed.claims.slice(0, maximumClaims);
   claims.forEach((claim, index) => {
@@ -25152,6 +26344,30 @@ function chatEvidenceUtilizationTelemetry(ledger = [], citedIds = [], usedIds = 
   };
 }
 
+function chatWebEvidenceTelemetry(ledger = [], citedIds = [], options = {}) {
+  const webEvidenceIds = new Set(uniqueValues((options.webEvidenceIds || []).map((value) => String(value || "").trim()).filter(Boolean)));
+  const deliveredWebEvidenceIds = uniqueValues((Array.isArray(ledger) ? ledger : [])
+    .map((entry) => String(entry?.evidenceId || ""))
+    .filter((evidenceId) => evidenceId && webEvidenceIds.has(evidenceId)));
+  const citedSet = new Set(uniqueValues((citedIds || []).map((value) => String(value || "").trim()).filter(Boolean)));
+  const citedWebEvidenceIds = deliveredWebEvidenceIds.filter((evidenceId) => citedSet.has(evidenceId));
+  const unusedWebEvidenceIds = deliveredWebEvidenceIds.filter((evidenceId) => !citedSet.has(evidenceId));
+  const webSearchStatus = String(options.webSearchStatus || "disabled");
+  const webSearchReasonCodes = webSearchStatus === "searched" && deliveredWebEvidenceIds.length > 0 && citedWebEvidenceIds.length === 0
+    ? ["web-search-searched-zero-cited-evidence"]
+    : [];
+  return {
+    deliveredWebEvidenceCount: deliveredWebEvidenceIds.length,
+    citedWebEvidenceCount: citedWebEvidenceIds.length,
+    unusedWebEvidenceCount: unusedWebEvidenceIds.length,
+    webSearchStatus,
+    webSearchReasonCodes,
+    webEvidenceIds: deliveredWebEvidenceIds,
+    citedWebEvidenceIds,
+    unusedWebEvidenceIds
+  };
+}
+
 function chatClaimEvidenceIds(claims = []) {
   return uniqueValues((claims || []).flatMap((claim) => Array.isArray(claim?.evidence_ids) ? claim.evidence_ids : [])
     .map((value) => typeof value === "string" ? value.trim() : "")
@@ -25164,6 +26380,7 @@ function invalidChatEvidenceResponseTelemetry(ledger = [], options = {}, validat
   const schemaInvalidReasons = uniqueValues((validation.reasons || []).map((reason) => String(reason || "")).filter(Boolean));
   const truncatedClaimCount = Math.max(0, Number(validation.truncatedClaimCount || 0));
   const evidenceUtilization = chatEvidenceUtilizationTelemetry(entries, chatClaimEvidenceIds(validation.claims || []), []);
+  const webTelemetry = chatWebEvidenceTelemetry(entries, chatClaimEvidenceIds(validation.claims || []), options);
   return {
     schemaVersion: 5,
     responseSchema: "chat-evidence-v2",
@@ -25172,6 +26389,7 @@ function invalidChatEvidenceResponseTelemetry(ledger = [], options = {}, validat
     usedSourceCount: evidenceUtilization.usedEvidenceCount,
     missingSourceCount: evidenceUtilization.uncitedEvidenceCount,
     ...evidenceUtilization,
+    ...webTelemetry,
     removedInventedLinkCount: 0,
     removedLinkCount: 0,
     claimCount,
@@ -25192,7 +26410,7 @@ function invalidChatEvidenceResponseTelemetry(ledger = [], options = {}, validat
     schemaInvalidCount: 1,
     schemaInvalidReasons,
     droppedReasonCounts: Object.fromEntries(schemaInvalidReasons.map((reason) => [reason, 1])),
-    reasonCodes: uniqueValues(["schema-invalid", ...schemaInvalidReasons]),
+    reasonCodes: uniqueValues(["schema-invalid", ...schemaInvalidReasons, ...webTelemetry.webSearchReasonCodes]),
     mixedSupportRejectedCount: Math.max(0, Number(validation.mixedSupportRejectedCount || 0)),
     repairCallCount: 0,
     degraded: Boolean(options.degraded || options.retrievalTelemetry?.degraded),
@@ -25206,6 +26424,7 @@ function invalidChatEvidenceResponseTelemetry(ledger = [], options = {}, validat
 function chatClaimBody(value = "") {
   return String(value || "")
     .replace(/\[([^\]\n]+)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/[^\s<>)\]]+/gi, "")
     .replace(/\s*\(\s*\d+\s*\)/g, "")
     .replace(/\[\s*\d+\s*\]/g, "")
     .replace(/(^|\n)\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/g, "$1")
@@ -25235,7 +26454,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const parsed = parseChatEvidenceResponse(value);
   const entries = Array.isArray(ledger) ? ledger.filter((entry) => entry?.url && entry?.evidenceId) : [];
   const normalized = normalizeChatEvidencePayload(parsed, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId) });
-  const validation = validateChatEvidencePayload(normalized.value, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId) });
+  const validation = validateChatEvidencePayload(normalized.value, { allowedEvidenceIds: entries.map((entry) => entry.evidenceId), mode: options.mode });
   const byEvidenceId = new Map(entries.map((entry) => [String(entry.evidenceId), entry]));
   const reasonCodes = normalized.corrections.map((correction) => correction.reasonCode);
   const renderedClaims = [];
@@ -25256,7 +26475,8 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
       telemetry: Object.assign(invalidTelemetry, {
         normalizationCorrections: normalized.corrections,
         reasonCodes: uniqueValues([...(invalidTelemetry.reasonCodes || []), ...normalized.corrections.map((correction) => correction.reasonCode)])
-      })
+      }),
+      researchSubject: ""
     };
   }
   for (const claim of validation.claims) {
@@ -25319,12 +26539,15 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     unsupportedClaimCount += 1;
     reasonCodes.push("structured-response-empty");
   }
-  const composedAnswer = renderedClaims.join(" ").trim();
-  renderedParagraphCount = composedAnswer ? 1 : 0;
+  const deepMode = options.mode === "deep";
+  const composedAnswer = renderedClaims.join(deepMode ? "\n\n" : " ").trim();
+  renderedParagraphCount = deepMode ? renderedClaims.filter(Boolean).length : (composedAnswer ? 1 : 0);
   const evidenceUtilization = chatEvidenceUtilizationTelemetry(entries, [...citedEvidenceIds], [...usedEvidenceIds]);
+  const webTelemetry = chatWebEvidenceTelemetry(entries, [...citedEvidenceIds], options);
   const retrievalTelemetry = options.retrievalTelemetry || {};
   const degraded = Boolean(options.degraded || retrievalTelemetry.degraded || retrievalTelemetry.indexState === "degraded-source-only" || retrievalTelemetry.indexState === "failed");
   if (degraded) reasonCodes.push("degraded-source-only");
+  reasonCodes.push(...webTelemetry.webSearchReasonCodes);
   if (!reasonCodes.length) reasonCodes.push("structured-claims-rendered");
   const telemetry = {
     schemaVersion: 5,
@@ -25334,6 +26557,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     usedSourceCount: evidenceUtilization.usedEvidenceCount,
     missingSourceCount: evidenceUtilization.uncitedEvidenceCount,
     ...evidenceUtilization,
+    ...webTelemetry,
     removedInventedLinkCount: 0,
     removedLinkCount: 0,
     normalizationCorrections: normalized.corrections,
@@ -25368,7 +26592,12 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
     sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
   };
-  return { answer: composedAnswer, telemetry };
+  const subject = options.mode && options.mode !== "off"
+    ? normalizeResearchSubject(validation.researchSubject, options.prompt || "Research Subject")
+    : { value: "", fallback: false };
+  telemetry.researchSubject = subject.value;
+  telemetry.researchSubjectFallback = subject.fallback;
+  return { answer: composedAnswer, telemetry, researchSubject: subject.value };
 }
 
 function renderStructuredChatConversationResponse(value = "") {
@@ -43587,6 +44816,75 @@ function chatQueryRequestsGeneratedTaskSection(prompt = "", queryPlan = null) {
   return /\b(?:tasks?|todoist|schedules?|scheduling|due\s+dates?|deadlines?|action\s+items?|next\s+steps?)\b/i.test(String(prompt || ""));
 }
 
+function deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled = true } = {}) {
+  return [
+    "You are a concise Obsidian sidebar assistant working through a bounded Deep Research workflow.",
+    PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
+    OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION,
+    PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION,
+    "Use the complete closed evidence ledger supplied in the immutable context projection; never invent, alter, or cite an evidence ID that is not supplied.",
+    "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the supplied evidence IDs; keep the sentence order natural.",
+    "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
+    "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
+    "Treat the active note as the primary supplied evidence. General reasoning, advice, greetings, and explanations must not be presented as vault facts.",
+    "For every supported factual statement, use only the exact supplied evidence IDs. The plugin renders allowed source-title hyperlinks deterministically; never invent URLs, Markdown links, numbered citations, or a source list.",
+    ...(webSearchEnabled ? ["When Internet Search sources are supplied, every externally established statement must cite one or more supplied web-* evidence IDs. Never imply that the web was checked when search is unavailable or no web evidence was admitted."] : []),
+    "Support each factual statement with one specific supplied note, task record, or web source. Never fuse unrelated details from different sources into one event, decision, task, or explanation.",
+    "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
+    "Preserve exact proper names and quoted terms from the evidence. For every supported statement, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
+    "Keep grammatical or contextual misuse distinct from avoidance or prohibition: a usage-quality warning is not an instruction to avoid or ban a term, and an instruction to avoid an exact phrase applies only to that phrase.",
+    "For change-history questions, present supported changes in chronological order and separate historical state, later changes, and current state. For project-task questions, keep open tasks separate from completed work and omit tasks from other projects.",
+    "For actionable or task questions, use supplied task-local card details when established: current/open/completed state, owner/person, recipient, reviewer, deliverable, dependency, next step, timing, criteria, parent/root/child relationships, evidence IDs, fact refs, and eligible note locations. Do not infer missing details.",
+    "Keep current typed source-contract facts in their separate authoritative/current lane; do not merge them with supporting task snapshots or historical context.",
+    "Keep reserved task lanes independent and resolve their evidence references through the shared evidence table; the separately supplied active note remains authoritative current context.",
+    "Describe supported task evidence as a compact execution narrative rather than a lexical keyword dump, and distinguish current state from historical or conflicting evidence.",
+    "Never upgrade planned, possible, requested, or suggested work into a confirmed booking, invitation, approval, contact, completion, or other proof unless that exact state is established by supplied evidence IDs.",
+    "Preserve the source's epistemic state exactly: intent is not a scheduled, confirmed, approved, or otherwise stronger status. Assert a stronger status only when an explicit supplied bound fact supports that exact state.",
+    "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
+    "Treat task context as the local reference table for generated and synced Todoist tasks; task references should confirm or point to actions, not replace note evidence.",
+    "Task-context Todoist links and note links are allowed sources even when the note is not listed in semantic source links.",
+    "Avoid long preambles."
+  ].join(" ");
+}
+
+function deepResearchPromptCacheKey() {
+  const requestScope = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `semantic-todoist-deep-${shortHash(requestScope)}`.slice(0, 64);
+}
+
+function buildDeepResearchPhaseProjection(projection, { system = "", promptCacheKey = "" } = {}) {
+  const source = projection && typeof projection === "object" ? projection : {};
+  const evidencePrefix = [source.promptCachePrefix, source.promptContextSuffix || source.user]
+    .filter(Boolean)
+    .join("\n\n");
+  const normalizedKey = String(promptCacheKey || "").slice(0, 160);
+  const deepResearchCache = Object.freeze({
+    systemHash: providerContextProjectionHash(system),
+    evidencePrefixHash: providerContextProjectionHash(evidencePrefix),
+    requestKeyHash: providerContextProjectionHash(normalizedKey),
+    requestKeyPresent: Boolean(normalizedKey),
+    explicitControlsRequested: Boolean(normalizedKey)
+  });
+  const telemetry = Object.assign({}, source.telemetry || {}, {
+    promptCachePrefix: providerContextProjectionMetrics(evidencePrefix),
+    promptContextSuffix: providerContextProjectionMetrics(""),
+    promptCachePrefixHash: providerContextProjectionHash(evidencePrefix),
+    promptContextSuffixHash: providerContextProjectionHash(""),
+    promptCachePrefixBytes: utf8ByteLength(evidencePrefix),
+    promptContextSuffixBytes: 0,
+    deepResearchCache
+  });
+  return Object.freeze(Object.assign({}, source, {
+    version: Math.max(4, Number(source.version) || 0),
+    system: String(system || ""),
+    user: "",
+    promptCachePrefix: evidencePrefix,
+    promptContextSuffix: "",
+    promptCacheKey: normalizedKey,
+    telemetry: Object.freeze(telemetry)
+  }));
+}
+
 function buildChatProviderContextProjection(options = {}) {
   const prompt = String(options.prompt || "");
   const active = options.active || {};
@@ -43596,7 +44894,8 @@ function buildChatProviderContextProjection(options = {}) {
   const reservedTaskEvidence = options.reservedTaskEvidence || null;
   const sourceRows = [
     ...(Array.isArray(options.context) ? options.context : []),
-    ...(Array.isArray(reservedTaskEvidence?.sharedEvidence) ? reservedTaskEvidence.sharedEvidence : [])
+    ...(Array.isArray(reservedTaskEvidence?.sharedEvidence) ? reservedTaskEvidence.sharedEvidence : []),
+    ...(Array.isArray(options.webEvidenceRows) ? options.webEvidenceRows : [])
   ];
   const sourceLedger = Array.isArray(options.sourceLedger) ? options.sourceLedger : [];
   const citableLedgerRows = sourceLedger.map((entry) => {
@@ -43674,7 +44973,8 @@ function buildChatProviderContextProjection(options = {}) {
   const chatReservedEvidenceIdSet = new Set(chatReservedEvidenceIds);
   const requiredEvidenceIds = new Set(([
     ...(options.requiredEvidenceIds || options.chatEvidenceRefs || []),
-    ...chatReservedEvidenceIds
+    ...chatReservedEvidenceIds,
+    ...(Array.isArray(options.webEvidenceRows) ? options.webEvidenceRows.map((row) => row?.evidenceId) : [])
   ])
     .flatMap((value) => Array.isArray(value) ? value : [value]).map(String).filter(Boolean));
   const isRequiredEvidenceRow = (row, id = "") => Boolean(

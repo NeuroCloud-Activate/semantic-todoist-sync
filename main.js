@@ -146,9 +146,11 @@ const ADAPTIVE_CONTEXT_MODE_BUDGETS = {
   schedule: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 18, maxNotes: 6, maxTasks: 16, maxProjects: 6 }
 };
 const CHAT_RESPONSE_MAX_CLAIMS = 3;
+const CHAT_CONVERSATION_RESPONSE_CATEGORY = "conversation";
+const CHAT_CONVERSATION_RESPONSE_SCHEMA = "chat-conversation-v1";
 const CHAT_RESPONSE_CATEGORIES = Object.freeze([
   "fact", "intent", "current-state", "history", "owner", "recipient", "deliverable",
-  "dependency", "next-step", "timing", "criteria", "hierarchy", "unsupported"
+  "dependency", "next-step", "timing", "criteria", "hierarchy", "unsupported", "conversation"
 ]);
 const CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM = 16;
 const CHAT_RESPONSE_MAX_TEXT_CHARS = 4000;
@@ -1740,6 +1742,7 @@ const DEFAULT_SETTINGS = {
   excludedFolders: PLUGIN_DATA_FOLDER,
   semanticIndexMeta: {},
   autoUpdateSemanticIndex: true,
+  autoRebuildMissingSemanticIndex: true,
   semanticIndexDelaySeconds: 30,
   todoistInboxProjectId: "",
   todoistTaskProjectId: "",
@@ -1823,8 +1826,6 @@ const DEFAULT_SETTINGS = {
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
-  taskGenerationPromptProfileMode: "auto",
-  taskGenerationPromptProfile: "default",
   taskSectionTitleMode: "local",
   chatFontSizePx: 13,
   taskContextSummaryMaxNotes: 5,
@@ -1993,54 +1994,19 @@ function openAiPromptCacheKey(operation = "chat") {
 
 const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
 const TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE = "Semantic disambiguation: when current terminology is ambiguous and same-scope semantic history identifies a legacy named term being phased out and its replacement, state the direction as use the replacement and avoid the legacy proper name; never invert that direction or prohibit the replacement. Treat the exact terminology and replacement direction as material. When the current action is to review an artifact, treat same-artifact prior reviewer edits or comments as materially useful if evidence says they remain to be reviewed or addressed, unless newer evidence supersedes or closes them.";
-const TASK_GENERATION_PROMPT_PROFILE_VERSION = 1;
-const TASK_GENERATION_PROMPT_PROFILE_MODES = ["auto", "manual"];
-const TASK_GENERATION_PROMPT_PROFILES = ["default", "gpt-5.6-luna", "gpt-5.6-terra"];
-const TASK_GENERATION_PROMPT_PROFILE_NAMES = Object.freeze({
-  "default": "Default",
-  "gpt-5.6-luna": "GPT 5.6 Luna",
-  "gpt-5.6-terra": "GPT 5.6 Terra"
-});
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. Optional priority, material-history, execution-detail, and candidate-supporting evidence are advisory: use relevant rows when they materially clarify execution, but omission alone must not reject, retry, or rewrite a valid task. Never use merely same-topic history to satisfy execution-detail coverage.";
 const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = "Descriptions must be complete and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. Do not use unrelated same-topic evidence merely to satisfy an execution-detail rule. Action/requested-action facts and current-source grounding are required. Optional priority, material-history, execution-detail, and candidate-supporting evidence are advisory: state relevant rows when they materially clarify execution, but omission alone must not reject, retry, or rewrite a structurally valid description. Never use merely same-topic history to satisfy execution-detail coverage.";
-const TASK_GENERATION_PROMPT_PROFILE_GUIDANCE = Object.freeze({
-  "default": Object.freeze({ taskGuidance: TASK_GENERATION_SHARED_TASK_GUIDANCE, descriptionGuidance: TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE }),
-  "gpt-5.6-luna": Object.freeze({
-    taskGuidance: `${TASK_GENERATION_SHARED_TASK_GUIDANCE} Before stopping at the first useful fact, inspect supported material dependencies, handoffs, and reviewer history for this exact scope.`,
-    descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Inspect supported material dependencies, handoffs, and reviewer history before stopping at the first useful fact.`
-  }),
-  "gpt-5.6-terra": Object.freeze({
-    taskGuidance: TASK_GENERATION_SHARED_TASK_GUIDANCE,
-    descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Do not compress a supported execution brief into a one-line title or action restatement; integrate multiple materially useful facts when available, while treating optional evidence omission as advisory rather than a validation failure.`
-  })
+const TASK_GENERATION_PROMPT_CONTRACT_ID = "semantic-todoist-task-generation";
+const TASK_GENERATION_PROMPT_CONTRACT_VERSION = 1;
+const TASK_GENERATION_PROMPT_CONTRACT = Object.freeze({
+  id: TASK_GENERATION_PROMPT_CONTRACT_ID,
+  version: TASK_GENERATION_PROMPT_CONTRACT_VERSION,
+  taskGuidance: `${TASK_GENERATION_SHARED_TASK_GUIDANCE} Before stopping at the first useful fact, inspect supported exact-scope dependencies, handoffs, and reviewer history.`,
+  descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Inspect supported exact-scope dependencies, handoffs, and reviewer history before stopping at the first useful fact. Do not compress a supported execution brief into a one-line title or action restatement; integrate multiple materially useful facts when available, while treating optional evidence omission as advisory rather than a validation failure.`
 });
 
-function normalizeTaskGenerationPromptProfileMode(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return TASK_GENERATION_PROMPT_PROFILE_MODES.includes(normalized) ? normalized : "auto";
-}
-
-function normalizeTaskGenerationPromptProfile(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return TASK_GENERATION_PROMPT_PROFILES.includes(normalized) ? normalized : "default";
-}
-
-function resolveTaskGenerationPromptProfile({ mode = "auto", profile = "default", selectedModel = "", phase = "" } = {}) {
-  const normalizedMode = normalizeTaskGenerationPromptProfileMode(mode);
-  const normalizedProfile = normalizeTaskGenerationPromptProfile(profile);
-  const modelId = String(selectedModel || "").trim().toLowerCase();
-  const id = normalizedMode === "manual"
-    ? normalizedProfile
-    : modelId === "gpt-5.6-luna" || modelId === "gpt-5.6-terra"
-      ? modelId
-      : "default";
-  const guidance = TASK_GENERATION_PROMPT_PROFILE_GUIDANCE[id] || TASK_GENERATION_PROMPT_PROFILE_GUIDANCE.default;
-  return Object.freeze({
-    id,
-    version: TASK_GENERATION_PROMPT_PROFILE_VERSION,
-    taskGuidance: guidance.taskGuidance,
-    descriptionGuidance: guidance.descriptionGuidance
-  });
+function taskGenerationPromptContract() {
+  return TASK_GENERATION_PROMPT_CONTRACT;
 }
 
 function taskWorkflowSystemInstruction() {
@@ -3950,6 +3916,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    // One-way prompt-contract migration: the task and description guidance is
+    // provider-neutral and no longer user-configurable. Remove the former
+    // model-labelled settings so runtime state contains only the current
+    // contract.
+    for (const legacyKey of ["taskGenerationPromptProfileMode", "taskGenerationPromptProfile"]) {
+      if (Object.prototype.hasOwnProperty.call(this.settings, legacyKey)) {
+        delete this.settings[legacyKey];
+        changed = true;
+      }
+    }
     // One-way 0.8.4 normalization: context and embedding dimensions are now
     // provider-neutral exact-model settings. Legacy keys are consumed once,
     // then removed so current runtime code never reads the old representation.
@@ -4056,16 +4032,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const normalizedTaskSectionTitleMode = normalizeTaskSectionTitleMode(this.settings.taskSectionTitleMode);
     if (this.settings.taskSectionTitleMode !== normalizedTaskSectionTitleMode) {
       this.settings.taskSectionTitleMode = normalizedTaskSectionTitleMode;
-      changed = true;
-    }
-    const normalizedPromptProfileMode = normalizeTaskGenerationPromptProfileMode(this.settings.taskGenerationPromptProfileMode);
-    const normalizedPromptProfile = normalizeTaskGenerationPromptProfile(this.settings.taskGenerationPromptProfile);
-    if (this.settings.taskGenerationPromptProfileMode !== normalizedPromptProfileMode) {
-      this.settings.taskGenerationPromptProfileMode = normalizedPromptProfileMode;
-      changed = true;
-    }
-    if (this.settings.taskGenerationPromptProfile !== normalizedPromptProfile) {
-      this.settings.taskGenerationPromptProfile = normalizedPromptProfile;
       changed = true;
     }
     if ((parseInt(this.settings.emailPollIntervalSeconds, 10) || 0) < MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS) {
@@ -4385,6 +4351,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return state === "queued" || state === "running";
   }
 
+  queueAutomaticMissingSemanticIndexRebuild(loadResult = {}) {
+    if (loadResult?.reasonCode !== "semantic-index-missing") return false;
+    if (this.isUnloading || this.settings?.autoRebuildMissingSemanticIndex !== true) return false;
+    if (this.semanticIndexCompatibilityRefreshPending?.()) return false;
+    const settings = this.settings || DEFAULT_SETTINGS;
+    const meta = settings.semanticIndexMeta || {};
+    return this.queueSemanticIndexCompatibilityRefresh({
+      reasonCode: "missing-index",
+      reasonCodes: ["missing-index"],
+      key: semanticIndexCompatibilityRefreshKey(settings, meta, ""),
+      meta,
+      persistedGeneration: "",
+      storageFingerprint: ""
+    });
+  }
+
   queueSemanticIndexCompatibilityRefresh(classification = {}) {
     if (this.isUnloading) return false;
     if (this.semanticIndexCompatibilityRefreshPending?.()) return false;
@@ -4410,12 +4392,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       attempts: Number(this.semanticIndexCompatibilityRefresh?.attempts || 0) + 1,
       error: ""
     });
-    this.logLocal("Semantic index compatibility rebuild queued", {
+    this.logLocal(queued.reasonCode === "missing-index"
+      ? "Automatic semantic index rebuild queued"
+      : "Semantic index compatibility rebuild queued", {
       reason: queued.reasonCode,
       key: queued.key,
       generation: queued.persistedGeneration || ""
     });
-    this.setSidebarIndexStatus("Semantic index compatibility rebuild queued...");
+    this.setSidebarIndexStatus(queued.reasonCode === "missing-index"
+      ? "Semantic index missing; automatic rebuild queued..."
+      : "Semantic index compatibility rebuild queued...");
     const start = () => {
       const current = this.semanticIndexCompatibilityRefresh || {};
       if (this.isUnloading || current.key !== key || current.state !== "queued") return;
@@ -4424,11 +4410,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           this.semanticIndexCompatibilityRefreshTimer = null;
           start();
         }, 30000);
-        this.setSidebarIndexStatus("Semantic index compatibility rebuild remains queued until idle...");
+        this.setSidebarIndexStatus(current.reasonCode === "missing-index"
+          ? "Automatic semantic index rebuild remains queued until idle..."
+          : "Semantic index compatibility rebuild remains queued until idle...");
         return;
       }
       this.updateSemanticIndexCompatibilityRefresh({ state: "running", startedAt: deviceTimestamp() });
-      this.setSidebarIndexStatus("Rebuilding semantic index compatibility...");
+      this.setSidebarIndexStatus(current.reasonCode === "missing-index"
+        ? "Building missing semantic index..."
+        : "Rebuilding semantic index compatibility...");
       let operation;
       try {
         operation = this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(false));
@@ -4446,7 +4436,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             completedAt: deviceTimestamp(),
             error: ok ? "" : reasonCode
           });
-          this.logLocal(ok ? "Semantic index compatibility rebuild complete" : "Semantic index compatibility rebuild failed", {
+          this.logLocal(ok
+            ? (queued.reasonCode === "missing-index" ? "Automatic semantic index rebuild complete" : "Semantic index compatibility rebuild complete")
+            : (queued.reasonCode === "missing-index" ? "Automatic semantic index rebuild failed" : "Semantic index compatibility rebuild failed"), {
             reason: reasonCode,
             key
           });
@@ -4547,9 +4539,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let settingsChanged = false;
       let loadedFromDisk = false;
       let compatibilityRefreshCandidate = null;
+      let missingIndex = false;
       const rememberCompatibilityRefresh = (error) => {
         if (error?.code !== "semantic-index-compatibility-refresh-required") return;
         compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
+      };
+      const rememberMissingIndex = (error) => {
+        if (error?.code === "semantic-index-missing") missingIndex = true;
       };
       const applyLoaded = async (loaded, file, extraMeta = {}) => {
         this.semanticIndexStats = loaded.stats;
@@ -4589,6 +4585,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         loadedFromDisk = true;
       } catch (error) {
         rememberCompatibilityRefresh(error);
+        rememberMissingIndex(error);
         if (!compatibilityRefreshCandidate && !this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
           this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app, this.semanticIndexRevision);
           this.invalidateSemanticRetrievalCache();
@@ -4616,7 +4613,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       if (!loadedFromDisk) {
         restorePreviousState();
-        this.semanticIndexLoadFailure = "semantic-index-no-validated-generation";
+        this.semanticIndexLoadFailure = missingIndex ? "semantic-index-missing" : "semantic-index-no-validated-generation";
         this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure });
         return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
       }
@@ -4683,7 +4680,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       completed: false,
       error: ""
     });
-    const startupPromise = Promise.resolve().then(() => this.loadSemanticIndex());
+    const startupPromise = Promise.resolve()
+      .then(() => this.loadSemanticIndex())
+      .then((result) => {
+        this.queueAutomaticMissingSemanticIndexRebuild?.(result);
+        return result;
+      });
     let sharedPromise;
     sharedPromise = startupPromise.finally(() => {
       if (this.semanticIndexStartupCompatibilityPromise === sharedPromise) this.semanticIndexStartupCompatibilityPromise = null;
@@ -4861,7 +4863,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     const storageDir = options.storageDir || this.semanticIndexStorageDir(options);
     const settings = options.settings && typeof options.settings === "object" ? options.settings : this.settings;
-    const raw = await this.app.vault.adapter.read(`${storageDir}/${normalizedPluginBasename(indexFile, "semantic-index manifest")}`);
+    const manifestPath = `${storageDir}/${normalizedPluginBasename(indexFile, "semantic-index manifest")}`;
+    const adapter = this.app.vault.adapter;
+    if (typeof adapter.exists === "function" && !(await adapter.exists(manifestPath))) throw semanticIndexMissingError(manifestPath);
+    let raw;
+    try {
+      raw = await adapter.read(manifestPath);
+    } catch (error) {
+      if (typeof adapter.exists !== "function" && String(error?.code || "").toUpperCase() === "ENOENT") throw semanticIndexMissingError(manifestPath);
+      throw error;
+    }
     const parsed = JSON.parse(raw);
     const preflightCompatibility = parsed && typeof parsed === "object" && parsed.meta
       ? semanticIndexCompatibilityRefreshClassification(settings, parsed.meta, "")
@@ -9872,6 +9883,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const schedulerMemoryUpdate = await this.tryUpdateSchedulerMemoryFromChat(prompt);
       if (schedulerMemoryUpdate) return { answer: schedulerMemoryUpdate, context: [], operation: "scheduler-policy" };
     }
+    const conversationRequest = chatDispatchOperation === "chat-query"
+      ? classifyChatConversationRequest(prompt)
+      : null;
+    if (conversationRequest) return this.chatConversation(prompt, conversationRequest, history);
     this.requireAiAccess("chat-query");
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
@@ -9890,22 +9905,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     } : null;
     const sourceContract = source ? buildTaskSourceContract(source, activeText, this.settings) : null;
     const requestedTaskScopes = chatRequestedTaskScopeRecords(prompt, source, sourceContract, this.settings);
+    let chatRetrievalDegraded = null;
     const failClosedChatRetrieval = (telemetry = null) => {
-      if (!telemetry?.degraded && !telemetry?.degradedReason) return;
+      if (!telemetry?.degraded && !telemetry?.degradedReason) return null;
       const reasonCode = String(telemetry.degradedReason || "semantic-evidence-unavailable")
         .replace(/[^a-z0-9._-]+/gi, "-")
         .slice(0, 96) || "semantic-evidence-unavailable";
-      const error = new Error(`Chat semantic retrieval unavailable (${reasonCode}).`);
-      error.code = "chat-semantic-retrieval-unavailable";
-      error.reasonCode = reasonCode;
-      error.retrievalTelemetry = {
+      const degraded = {
         indexState: String(telemetry.indexState || "degraded-source-only"),
         degraded: true,
         degradedReason: reasonCode,
         externalQueryEmbeddingCalls: Number(telemetry.externalQueryEmbeddingCalls || 0),
         runtimeExternalCalls: Number(telemetry.runtimeExternalCalls || 0)
       };
-      throw error;
+      chatRetrievalDegraded = Object.assign({}, chatRetrievalDegraded || {}, degraded);
+      return chatRetrievalDegraded;
     };
     let context;
     let reservedTaskEvidence = null;
@@ -9936,47 +9950,73 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           subtasks: []
         };
       }), source || {}, sourceContract, { limit: perScopeLimit, mode: "chat" });
-      failClosedChatRetrieval(taskScopeRetrieval.telemetry);
-      const taskSeparatedGroups = requestedTaskScopes.map((record, requestIndex) => {
-        const key = taskScopeRetrieval.taskKeyByIndex?.[String(requestIndex)] || record.taskId;
-        return taskScopeRetrieval.byTask?.[key]?.context || [];
-      });
-      reservedTaskEvidence = buildTaskReservedSemanticEvidenceBundle(requestedTaskScopes, taskSeparatedGroups, source, sourceContract, this.settings);
-      assertTaskReservedSemanticEvidenceDelivery(reservedTaskEvidence);
-      const taskSeparatedInterleaved = [];
-      const maxGroupLength = Math.max(0, ...taskSeparatedGroups.map((group) => group.length));
-      for (let itemIndex = 0; itemIndex < maxGroupLength; itemIndex += 1) {
-        for (const group of taskSeparatedGroups) if (group[itemIndex]) taskSeparatedInterleaved.push(group[itemIndex]);
+      const taskRetrievalDegraded = failClosedChatRetrieval(taskScopeRetrieval.telemetry);
+      if (taskRetrievalDegraded) {
+        const taskDegradedPlan = contextQueryPlan(prompt, "chat");
+        taskDegradedPlan.sourceContractId = sourceContract?.id || "";
+        taskDegradedPlan.sourceContract = sourceContract || null;
+        taskDegradedPlan.queryId = taskScopeRetrieval.telemetry?.queryId || `query:${shortHash(query)}`;
+        const request = semanticRetrievalRequestMetadata(query, 0, taskDegradedPlan, this.settings);
+        context = attachSemanticRetrievalMetadata([], request, Object.assign({}, taskRetrievalDegraded, {
+          indexRevision: taskScopeRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0,
+          candidateCount: taskScopeRetrieval.telemetry?.indexHealth?.validCount || 0,
+          indexHealth: taskScopeRetrieval.telemetry?.indexHealth,
+          elapsedMs: taskScopeRetrieval.telemetry?.elapsedMs || 0
+        }));
+        Object.assign(context.semanticRetrieval.telemetry, {
+          taskSeparated: true,
+          taskCount: requestedTaskScopes.length,
+          scopeIds: requestedTaskScopes.map((record) => record.scopeId),
+          embeddingBatchCount: taskScopeRetrieval.telemetry?.embeddingBatchCount || 0,
+          embeddingCalls: taskScopeRetrieval.telemetry?.embeddingCalls || 0,
+          embeddingCacheHits: taskScopeRetrieval.telemetry?.embeddingCacheHits || 0,
+          embeddingCacheMisses: taskScopeRetrieval.telemetry?.embeddingCacheMisses || 0,
+          selectedEvidenceByTask: taskScopeRetrieval.telemetry?.selectedEvidenceByTask || {},
+          rejectedEvidenceByTask: taskScopeRetrieval.telemetry?.rejectedEvidenceByTask || {}
+        });
+        this.lastSemanticRetrievalTelemetry = context.semanticRetrieval.telemetry;
+      } else {
+        const taskSeparatedGroups = requestedTaskScopes.map((record, requestIndex) => {
+          const key = taskScopeRetrieval.taskKeyByIndex?.[String(requestIndex)] || record.taskId;
+          return taskScopeRetrieval.byTask?.[key]?.context || [];
+        });
+        reservedTaskEvidence = buildTaskReservedSemanticEvidenceBundle(requestedTaskScopes, taskSeparatedGroups, source, sourceContract, this.settings);
+        assertTaskReservedSemanticEvidenceDelivery(reservedTaskEvidence);
+        const taskSeparatedInterleaved = [];
+        const maxGroupLength = Math.max(0, ...taskSeparatedGroups.map((group) => group.length));
+        for (let itemIndex = 0; itemIndex < maxGroupLength; itemIndex += 1) {
+          for (const group of taskSeparatedGroups) if (group[itemIndex]) taskSeparatedInterleaved.push(group[itemIndex]);
+        }
+        // Reserved chat lanes already perform the final shared-table merge;
+        // retain their ordered refs here without a second collapse.
+        const taskSeparatedChunks = taskSeparatedInterleaved;
+        const taskSeparatedPlan = contextQueryPlan(prompt, "chat");
+        taskSeparatedPlan.sourceContractId = sourceContract?.id || "";
+        taskSeparatedPlan.sourceContract = sourceContract || null;
+        taskSeparatedPlan.queryId = taskScopeRetrieval.telemetry?.queryId || `query:${shortHash(query)}`;
+        const request = semanticRetrievalRequestMetadata(query, taskSeparatedChunks.length || perScopeLimit, taskSeparatedPlan, this.settings);
+        context = attachSemanticRetrievalMetadata(taskSeparatedChunks, request, {
+          indexState: taskScopeRetrieval.telemetry?.indexState || "ready",
+          degradedReason: taskScopeRetrieval.telemetry?.degradedReason || "",
+          indexRevision: taskScopeRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0,
+          candidateCount: taskScopeRetrieval.telemetry?.indexHealth?.validCount || (this.semanticIndex || []).length,
+          indexHealth: taskScopeRetrieval.telemetry?.indexHealth,
+          elapsedMs: taskScopeRetrieval.telemetry?.elapsedMs || 0
+        });
+        Object.assign(context.semanticRetrieval.telemetry, {
+          taskSeparated: true,
+          taskCount: requestedTaskScopes.length,
+          scopeIds: requestedTaskScopes.map((record) => record.scopeId),
+          embeddingBatchCount: taskScopeRetrieval.telemetry?.embeddingBatchCount || 0,
+          embeddingCalls: taskScopeRetrieval.telemetry?.embeddingCalls || 0,
+          embeddingCacheHits: taskScopeRetrieval.telemetry?.embeddingCacheHits || 0,
+          embeddingCacheMisses: taskScopeRetrieval.telemetry?.embeddingCacheMisses || 0,
+          selectedEvidenceByTask: taskScopeRetrieval.telemetry?.selectedEvidenceByTask || {},
+          rejectedEvidenceByTask: taskScopeRetrieval.telemetry?.rejectedEvidenceByTask || {},
+          reservedEvidenceDelivery: reservedTaskEvidence.telemetry
+        });
+        this.lastSemanticRetrievalTelemetry = context.semanticRetrieval.telemetry;
       }
-      // Reserved chat lanes already perform the final shared-table merge;
-      // retain their ordered refs here without a second collapse.
-      const taskSeparatedChunks = taskSeparatedInterleaved;
-      const taskSeparatedPlan = contextQueryPlan(prompt, "chat");
-      taskSeparatedPlan.sourceContractId = sourceContract?.id || "";
-      taskSeparatedPlan.sourceContract = sourceContract || null;
-      taskSeparatedPlan.queryId = taskScopeRetrieval.telemetry?.queryId || `query:${shortHash(query)}`;
-      const request = semanticRetrievalRequestMetadata(query, taskSeparatedChunks.length || perScopeLimit, taskSeparatedPlan, this.settings);
-      context = attachSemanticRetrievalMetadata(taskSeparatedChunks, request, {
-        indexState: taskScopeRetrieval.telemetry?.indexState || "ready",
-        degradedReason: taskScopeRetrieval.telemetry?.degradedReason || "",
-        indexRevision: taskScopeRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0,
-        candidateCount: taskScopeRetrieval.telemetry?.indexHealth?.validCount || (this.semanticIndex || []).length,
-        indexHealth: taskScopeRetrieval.telemetry?.indexHealth,
-        elapsedMs: taskScopeRetrieval.telemetry?.elapsedMs || 0
-      });
-      Object.assign(context.semanticRetrieval.telemetry, {
-        taskSeparated: true,
-        taskCount: requestedTaskScopes.length,
-        scopeIds: requestedTaskScopes.map((record) => record.scopeId),
-        embeddingBatchCount: taskScopeRetrieval.telemetry?.embeddingBatchCount || 0,
-        embeddingCalls: taskScopeRetrieval.telemetry?.embeddingCalls || 0,
-        embeddingCacheHits: taskScopeRetrieval.telemetry?.embeddingCacheHits || 0,
-        embeddingCacheMisses: taskScopeRetrieval.telemetry?.embeddingCacheMisses || 0,
-        selectedEvidenceByTask: taskScopeRetrieval.telemetry?.selectedEvidenceByTask || {},
-        rejectedEvidenceByTask: taskScopeRetrieval.telemetry?.rejectedEvidenceByTask || {},
-        reservedEvidenceDelivery: reservedTaskEvidence.telemetry
-      });
-      this.lastSemanticRetrievalTelemetry = context.semanticRetrieval.telemetry;
     } else {
       context = await this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt, { sourceContract });
       failClosedChatRetrieval(context?.semanticRetrieval?.telemetry);
@@ -10033,6 +10073,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       chatReservedEvidenceIds: chatContextBundle?.chatReservedEvidenceIds || [],
       chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
       requiredEvidenceIds,
+      retrievalTelemetry: chatRetrievalDegraded || context?.semanticRetrieval?.telemetry || {},
       requireCitableEvidence: Boolean(activeText || (context || []).length || requiredEvidenceIds.length),
       adaptivePack,
       settings: this.settings,
@@ -10056,11 +10097,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION,
         "Return only JSON matching the supplied chat evidence schema. Each claim must be one cohesive narrative paragraph, not a bullet or heading.",
         "Answer the exact question in the first sentence, usually in one paragraph and never more than three paragraphs.",
-        "Synthesize directly related current state, history, timing, handoffs, and next steps only when every statement is supported by the paragraph's evidence_ids; keep the sentence order natural.",
-        "Return exactly one category per paragraph. A paragraph with established=false must use category=unsupported, have no evidence_ids, and state only one genuinely missing or unestablished requested element; keep it separate from supported paragraphs and never combine supported and unsupported details in one paragraph.",
+        "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the paragraph's evidence_ids; keep the sentence order natural.",
+        "Return exactly one category per paragraph. A general conversational answer uses category=conversation, established=false, and no evidence_ids. A vault-specific missing element uses category=unsupported, established=false, and no evidence_ids. Keep conversation, supported, and unsupported paragraphs distinct and never combine supported and unsupported details in one paragraph.",
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-        "Treat the active note as the primary supplied evidence. Set established=true only when the claim is supported by one or more supplied evidence_ids; otherwise set established=false and say that the element is not established.",
+        "Treat the active note as the primary supplied evidence. Set established=true only when a vault-specific claim is supported by one or more supplied evidence_ids. General reasoning, advice, greetings, and explanations may use category=conversation with established=false and no evidence_ids; do not present those as vault facts.",
         "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
         "evidence_ids accepts only the exact enum values listed in the supplied schema. fact-* identifiers are metadata only and never citation IDs; never put fact-* values in evidence_ids.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
@@ -10074,7 +10115,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Describe supported task evidence as a compact execution narrative rather than a lexical keyword dump, and distinguish current state from historical or conflicting evidence.",
         "Never upgrade planned, possible, requested, or suggested work into a confirmed booking, invitation, approval, contact, completion, or other proof unless that exact state is established by supplied evidence_ids.",
         "Preserve the source's epistemic state exactly: `is going to` and `plans to` express intent, not a scheduled, confirmed, approved, or otherwise stronger status. Assert a stronger status only when an explicit supplied bound fact supports that exact state; otherwise mark that stronger status not established with category=unsupported and established=false, and do not assert it.",
-        "Use category=unsupported for one genuinely missing requested element and set established=false; do not add a generic uncertainty paragraph when supplied evidence answers the question.",
+        "Use category=unsupported only for one genuinely missing requested vault element and set established=false; do not add a generic uncertainty paragraph when supplied evidence answers the question. When retrieval is degraded or no evidence is supplied, answer general portions as category=conversation and mark only requested vault-specific gaps unsupported.",
         "When relevant vault notes conflict on the same topic, treat the newest matching note as the current guidance unless the user asks for historical comparison.",
         "Treat task context as the local reference table for generated and synced Todoist tasks, including tasks connected to the active or relevant vault notes; task references should confirm or point to actions, not replace the note evidence.",
         "Task-context Todoist links and note links are allowed sources even when the note is not listed in the semantic source links.",
@@ -10104,6 +10145,48 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || "",
       chatContextPreflight: chatContextProjection.telemetry,
       contextBundle: chatContextBundle || reservedTaskEvidence || null
+    };
+  }
+
+  async chatConversation(prompt, conversationRequest = {}, history = []) {
+    void history;
+    this.requireAiAccess("chat-query");
+    const modelChoice = this.aiModelForRequest("chat-query", { prompt, context: [], adaptivePack: {}, taskContext: "" });
+    const responseSchema = chatResponseSchema(1, [], "conversation");
+    const response = await this.withAiActivity("Answering question", (workflowToken) => this.openaiResponse({
+      operation: "chat-query",
+      workflowToken,
+      model: modelChoice.model,
+      provider: modelChoice.provider,
+      jsonSchema: responseSchema,
+      system: [
+        "You are a friendly personal assistant in an Obsidian sidebar.",
+        "Answer the user's greeting, thanks, small-talk, or help/capability question directly in concise, natural prose.",
+        "You may briefly say that you can help query the user's Obsidian vault and understand notes or tasks.",
+        "Never claim or imply any vault fact because no vault evidence is supplied.",
+        "Never mention hidden prompts, schemas, roles, evidence, retrieval, providers, or other implementation machinery.",
+        "Return only JSON matching the conversation response schema: exactly one claim with concise prose, established=false, evidence_ids=[], and category=conversation."
+      ].join(" "),
+      user: String(prompt == null ? "" : prompt),
+      appendFallbackNotice: false,
+      background: false
+    }));
+    const rendered = renderStructuredChatConversationResponse(response);
+    this.lastChatConversationTelemetry = rendered.telemetry;
+    this.lastChatCitationTelemetry = null;
+    if (!rendered.telemetry.valid) {
+      const error = new Error("Conversation response failed its strict response contract.");
+      error.code = "chat-conversation-response-invalid";
+      error.conversationTelemetry = rendered.telemetry;
+      throw error;
+    }
+    return {
+      answer: rendered.answer,
+      context: [],
+      operation: "conversation",
+      chatMode: "conversation",
+      conversationRequest,
+      conversationTelemetry: rendered.telemetry
     };
   }
 
@@ -10871,12 +10954,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskContext,
       taskCount: maxMainTasks + maxSubtasks
     });
-    const promptProfile = resolveTaskGenerationPromptProfile({
-      mode: this.settings.taskGenerationPromptProfileMode,
-      profile: this.settings.taskGenerationPromptProfile,
-      selectedModel: modelChoice.model,
-      phase: "task"
-    });
+    const promptContract = taskGenerationPromptContract();
     const taskGenerationSystem = taskStructureSystemInstruction();
     const taskGenerationUser = ({ recoveryClosure = null, scopeRecovery = null, fallbackOnly = false, batch = null } = {}) => {
       const taskLimit = Math.max(1, Math.min(maxMainTasks, Number(batch?.taskLimit || maxMainTasks)));
@@ -10905,7 +10983,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             ? "Create exactly one main task tree for the supplied source action. Do not create, repeat, or reference any sibling action."
             : "Create Todoist task structure from the shared workflow context.",
         activeInstructions,
-        `Prompt profile guidance: ${promptProfile.taskGuidance}`,
+        `Provider-neutral prompt guidance: ${promptContract.taskGuidance}`,
         TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
         source.type === "email" ? "For emails, preserve the current/latest message as authoritative and create the user's next unresolved review, reply, follow-up, decision, or completion action." : "For notes, cover every distinct marked action before adding additional clearly user-owned actions from the source and matching context.",
         "Follow the configured main-task, subtask, date, deadline, label, priority, and source-type instructions.",
@@ -12017,18 +12095,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       context,
       taskCount: mainTasks.length
     });
-    const promptProfile = resolveTaskGenerationPromptProfile({
-      mode: this.settings.taskGenerationPromptProfileMode,
-      profile: this.settings.taskGenerationPromptProfile,
-      selectedModel: modelChoice.model,
-      phase: "description"
-    });
+    const promptContract = taskGenerationPromptContract();
     const singletonDescriptionCachePrefix = [
       "Description phase cache prefix (stable, evidence-free):",
       "Dynamic request-local schema fields: index, task_id, description_sentences, scope_id, evidence_ids, and fact_refs. Exact singleton enum values are supplied only in the request-local schema; provider current scalars and fact_bindings are not part of the description output contract.",
       "Description instructions:",
       descriptionInstructions || "",
-      `Selected prompt-profile delta: ${promptProfile.descriptionGuidance}`,
+      `Provider-neutral prompt guidance: ${promptContract.descriptionGuidance}`,
       `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
       "Context-note citation rule:",
       contextCitationInstructions(citeContextNotes, structuredEvidence),
@@ -17342,6 +17415,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     folderListSetting(containerEl, "Excluded folders", "Folders ignored by semantic search and indexing.", this.plugin, "excludedFolders");
     textSetting(containerEl, "Excluded link domains", "Comma-separated web domains omitted from prompts and descriptions.", this.plugin, "excludedLinkDomains");
     toggleSetting(containerEl, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
+    toggleSetting(containerEl, "Build a missing index automatically", "After startup confirms that the selected embedding index does not exist, rebuild it once in the background.", this.plugin, "autoRebuildMissingSemanticIndex");
     new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)));
     const providerRows = this.providerStorageSummaries || SEMANTIC_INDEX_PARTITION_PROVIDERS.map((provider) => ({ provider, displayName: providerDisplayName(provider), hasIndex: false, state: "no-index", partitions: 0, shards: 0, bytes: 0 }));
     for (const row of providerRows) {
@@ -17394,7 +17468,6 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     secretSetting(containerEl, "Todoist API token", this.plugin, "todoistToken");
     todoistProjectSetting(containerEl, this.plugin, () => this.display());
     settingsHeading(containerEl, "Task defaults", "Limits and formatting rules shared by note and email task generation.");
-    taskGenerationPromptProfileSettings(containerEl, this.plugin);
     taskSectionTitleModeSetting(containerEl, this.plugin);
     numberSetting(containerEl, "Maximum main tasks", this.plugin, "maxGeneratedMainTasks");
     numberSetting(containerEl, "Maximum subtasks per main task", this.plugin, "maxGeneratedSubtasksPerMainTask");
@@ -18453,8 +18526,6 @@ const SETTING_DESCRIPTIONS = {
   maxTaskContextChunks: "Maximum local semantic results per task for note and email workflows (48 by default); provider input uses one deduplicated shared optional pool per generation batch, not 48 rows per task, plus protected source/fact evidence.",
   promptTemplatesFolder: "Markdown files in this folder become reusable prompt actions. Frontmatter can set createTasks, insertResponse, syncTasks, and action: schedule-today.",
   taskGenerationPromptTemplate: "Default task-generation prompt used by the Create Todoist tasks command.",
-  taskGenerationPromptProfileMode: "Choose whether task and description prompt guidance follows the configured primary model or a manually selected profile.",
-  taskGenerationPromptProfile: "Manual task-generation prompt profile. This changes only variable task and description user-prompt guidance.",
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
   googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
   aiModelProvider: "Changing Primary AI Provider updates the primary provider and model reference for every generation operation. Embedding selection remains independent.",
@@ -18482,6 +18553,7 @@ const SETTING_DESCRIPTIONS = {
   semanticIndexEmbeddingPrecision: "Number of decimal places retained in stored embeddings. Lower is smaller; higher is more precise.",
   useNoteCreatedTimeForSemanticIndex: "Uses a note frontmatter created value, for example created: [\"2026-05-20 13:43\"], as the meeting/date signal in semantic ranking. When disabled, only file metadata is used.",
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
+  autoRebuildMissingSemanticIndex: "When enabled, startup rebuilds the selected embedding index once after confirming its manifest is missing; transient or corrupt reads do not trigger a rebuild.",
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
   runtimeWorkerCount: "Bounded number of concurrent runtime AI/index jobs. The default is 2.",
   aiModelConcurrency: "Bounded cloud-provider same-provider/same-model API call parallelism. The default is 10; OpenWebUI keeps a separate per-model default of 1. Two OpenWebUI workers can represent two GPUs or Ollama instances, while one exact model uses one concurrent lane by default; provider limits may lower the effective value.",
@@ -18763,30 +18835,6 @@ function taskGenerationPromptTemplateSetting(containerEl, plugin) {
         dropdown.setValue(values.has(current) ? current : (candidates[0]?.source || candidates[0]?.name || current));
       }).catch((error) => {
         console.error("Could not load task generation templates", error);
-      });
-    });
-}
-
-function taskGenerationPromptProfileSettings(containerEl, plugin) {
-  new Setting(containerEl)
-    .setName("Task-generation prompt profile mode")
-    .setDesc(settingDescription("Task-generation prompt profile mode", "taskGenerationPromptProfileMode", "Auto follows the exact configured primary model when it is GPT 5.6 Luna or GPT 5.6 Terra; Manual uses the saved profile below."))
-    .addDropdown((dropdown) => {
-      dropdown.addOption("auto", "Auto");
-      dropdown.addOption("manual", "Manual");
-      dropdown.setValue(normalizeTaskGenerationPromptProfileMode(plugin.settings.taskGenerationPromptProfileMode)).onChange(async (value) => {
-        plugin.settings.taskGenerationPromptProfileMode = normalizeTaskGenerationPromptProfileMode(value);
-        await plugin.saveSettings();
-      });
-    });
-  new Setting(containerEl)
-    .setName("Task-generation prompt profile")
-    .setDesc(settingDescription("Task-generation prompt profile", "taskGenerationPromptProfile", "Choose the bounded task and description guidance used when prompt profile mode is Manual."))
-    .addDropdown((dropdown) => {
-      for (const profile of TASK_GENERATION_PROMPT_PROFILES) dropdown.addOption(profile, TASK_GENERATION_PROMPT_PROFILE_NAMES[profile]);
-      dropdown.setValue(normalizeTaskGenerationPromptProfile(plugin.settings.taskGenerationPromptProfile)).onChange(async (value) => {
-        plugin.settings.taskGenerationPromptProfile = normalizeTaskGenerationPromptProfile(value);
-        await plugin.saveSettings();
       });
     });
 }
@@ -20354,9 +20402,31 @@ function formatBytes(bytes) {
   return `${value} B`;
 }
 
-function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenceIds = []) {
+function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenceIds = [], mode = "evidence") {
+  const conversationMode = String(mode || "").trim().toLowerCase() === "conversation";
   const allowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
     .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
+  const claimCategories = conversationMode
+    ? [CHAT_CONVERSATION_RESPONSE_CATEGORY]
+    : CHAT_RESPONSE_CATEGORIES.slice();
+  const claimEvidenceIds = conversationMode
+    ? {
+      type: "array",
+      minItems: 0,
+      maxItems: 0,
+      items: { type: "string" },
+      description: "Conversation claims never cite vault evidence and must return an empty evidence_ids array."
+    }
+    : {
+      type: "array",
+      maxItems: allowedIds.length ? Math.min(CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM, allowedIds.length) : 0,
+      items: Object.assign({ type: "string" }, allowedIds.length ? { enum: allowedIds } : {}),
+      description: "Exact supplied IDs for an established claim; empty for category=unsupported."
+    };
+  const established = Object.assign(
+    { type: "boolean", description: conversationMode ? "Must be false for a conversation claim." : "True only when the claim is supported by every listed evidence_id; false only for one missing or unestablished element." },
+    conversationMode ? { enum: [false] } : {}
+  );
   return {
     type: "object",
     additionalProperties: false,
@@ -20364,23 +20434,18 @@ function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenc
       claims: {
         type: "array",
         minItems: 1,
-        maxItems: Math.max(1, Math.min(3, Number(maxClaims) || CHAT_RESPONSE_MAX_CLAIMS)),
+        maxItems: conversationMode ? 1 : Math.max(1, Math.min(3, Number(maxClaims) || CHAT_RESPONSE_MAX_CLAIMS)),
         items: {
           type: "object",
           additionalProperties: false,
           properties: {
-            text: { type: "string", minLength: 1, maxLength: CHAT_RESPONSE_MAX_TEXT_CHARS, description: "One cohesive narrative paragraph for one dominant category; keep supported and unsupported details separate." },
-            established: { type: "boolean", description: "True only when the claim is supported by every listed evidence_id; false only for one missing or unestablished element." },
-            evidence_ids: {
-              type: "array",
-              maxItems: allowedIds.length ? Math.min(CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM, allowedIds.length) : 0,
-              items: Object.assign({ type: "string" }, allowedIds.length ? { enum: allowedIds } : {}),
-              description: "Exact supplied IDs for an established claim; empty for category=unsupported."
-            },
+            text: { type: "string", minLength: 1, maxLength: CHAT_RESPONSE_MAX_TEXT_CHARS, description: conversationMode ? "Concise, friendly natural prose answering the standalone conversation request directly." : "One cohesive narrative paragraph for one dominant category; keep supported and unsupported details separate." },
+            established,
+            evidence_ids: claimEvidenceIds,
             category: {
               type: "string",
-              enum: CHAT_RESPONSE_CATEGORIES.slice(),
-              description: "Exactly one category; use unsupported only for a single missing or unestablished element."
+              enum: claimCategories,
+              description: conversationMode ? "The only valid conversation category." : "Exactly one category; use unsupported only for a single missing or unestablished element."
             }
           },
           required: ["text", "established", "evidence_ids", "category"]
@@ -24980,14 +25045,18 @@ function normalizeChatProviderResponse(response = {}) {
 }
 
 function validateChatEvidencePayload(parsed = null, options = {}) {
+  const conversationMode = String(options.mode || "").trim().toLowerCase() === "conversation";
+  const maximumClaims = conversationMode ? 1 : CHAT_RESPONSE_MAX_CLAIMS;
   const allowedEvidenceIds = Array.isArray(options.allowedEvidenceIds)
     ? new Set(options.allowedEvidenceIds.map((value) => String(value || "").trim()).filter(Boolean))
     : null;
   const result = {
     valid: false,
+    mode: conversationMode ? "conversation" : "evidence",
     claims: [],
     claimCount: 0,
     paragraphCount: 0,
+    conversationClaimCount: 0,
     unsupportedParagraphCount: 0,
     mixedSupportRejectedCount: 0,
     truncatedClaimCount: 0,
@@ -25003,10 +25072,10 @@ function validateChatEvidencePayload(parsed = null, options = {}) {
   if (result.reasons.length) return result;
   result.claimCount = parsed.claims.length;
   result.paragraphCount = parsed.claims.length;
-  result.truncatedClaimCount = Math.max(0, parsed.claims.length - 3);
+  result.truncatedClaimCount = Math.max(0, parsed.claims.length - maximumClaims);
   if (!parsed.claims.length) result.reasons.push("claims-empty");
   if (result.truncatedClaimCount > 0) result.reasons.push("claims-truncated");
-  const claims = parsed.claims.slice(0, CHAT_RESPONSE_MAX_CLAIMS);
+  const claims = parsed.claims.slice(0, maximumClaims);
   claims.forEach((claim, index) => {
     const prefix = `claim-${index + 1}`;
     if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
@@ -25022,10 +25091,17 @@ function validateChatEvidencePayload(parsed = null, options = {}) {
     if (!Array.isArray(claim.evidence_ids) || claim.evidence_ids.length > CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM || claim.evidence_ids.some((id) => typeof id !== "string" || !id.trim())) result.reasons.push(`${prefix}-evidence-ids-invalid`);
     if (Array.isArray(claim.evidence_ids) && new Set(claim.evidence_ids).size !== claim.evidence_ids.length) result.reasons.push(`${prefix}-evidence-ids-duplicate`);
     if (allowedEvidenceIds && Array.isArray(claim.evidence_ids) && claim.evidence_ids.some((id) => !allowedEvidenceIds.has(String(id)))) result.reasons.push(`${prefix}-evidence-id-not-allowed`);
-    if (typeof claim.category !== "string" || !CHAT_RESPONSE_CATEGORIES.includes(claim.category)) result.reasons.push(`${prefix}-category-invalid`);
-    if (claim.established === true && (claim.category === "unsupported" || !Array.isArray(claim.evidence_ids) || claim.evidence_ids.length === 0)) result.reasons.push(`${prefix}-established-shape-invalid`);
-    if (claim.established === false && (claim.category !== "unsupported" || !Array.isArray(claim.evidence_ids) || claim.evidence_ids.length !== 0)) result.reasons.push(`${prefix}-unsupported-shape-invalid`);
-    if (claim.established === false) result.unsupportedParagraphCount += 1;
+    const conversationClaim = claim.category === CHAT_CONVERSATION_RESPONSE_CATEGORY;
+    if (conversationMode || conversationClaim) {
+      if (typeof claim.category !== "string" || claim.category !== CHAT_CONVERSATION_RESPONSE_CATEGORY) result.reasons.push(`${prefix}-conversation-category-invalid`);
+      if (claim.established !== false || !Array.isArray(claim.evidence_ids) || claim.evidence_ids.length !== 0) result.reasons.push(`${prefix}-conversation-shape-invalid`);
+      if (conversationClaim && claim.established === false && Array.isArray(claim.evidence_ids) && claim.evidence_ids.length === 0) result.conversationClaimCount += 1;
+    } else {
+      if (typeof claim.category !== "string" || !CHAT_RESPONSE_CATEGORIES.includes(claim.category)) result.reasons.push(`${prefix}-category-invalid`);
+      if (claim.established === true && (claim.category === "unsupported" || !Array.isArray(claim.evidence_ids) || claim.evidence_ids.length === 0)) result.reasons.push(`${prefix}-established-shape-invalid`);
+      if (claim.established === false && (claim.category !== "unsupported" || !Array.isArray(claim.evidence_ids) || claim.evidence_ids.length !== 0)) result.reasons.push(`${prefix}-unsupported-shape-invalid`);
+      if (claim.established === false) result.unsupportedParagraphCount += 1;
+    }
   });
   if (result.unsupportedParagraphCount > 1) result.reasons.push("unsupported-paragraph-count");
   result.claims = claims;
@@ -25164,6 +25240,8 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const reasonCodes = normalized.corrections.map((correction) => correction.reasonCode);
   const renderedClaims = [];
   let invalidClaimCount = 0;
+  let conversationClaimCount = 0;
+  let conversationParagraphCount = 0;
   let unsupportedClaimCount = 0;
   let supportedParagraphCount = 0;
   let renderedParagraphCount = 0;
@@ -25193,9 +25271,12 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     const validEntries = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
     const allEvidenceValid = evidenceIds.length > 0 && validEntries.length === evidenceIds.length;
     const category = String(claim?.category || "");
-    const categoryShapeValid = claim?.established === true
-      ? category !== "unsupported"
-      : category === "unsupported" && evidenceIds.length === 0;
+    const conversationClaim = category === CHAT_CONVERSATION_RESPONSE_CATEGORY;
+    const categoryShapeValid = conversationClaim
+      ? claim?.established === false && evidenceIds.length === 0
+      : claim?.established === true
+        ? category !== "unsupported"
+        : category === "unsupported" && evidenceIds.length === 0;
     const established = claim?.established === true && categoryShapeValid && allEvidenceValid;
     if (!categoryShapeValid) reasonCodes.push("claim-category-shape-invalid");
     if (claim?.established === true && !established) {
@@ -25203,7 +25284,18 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
       if (!evidenceIds.length) reasonCodes.push("established-claim-missing-evidence");
       else if (!allEvidenceValid) reasonCodes.push("invalid-evidence-id");
     }
-    if (claim?.established !== true && !categoryShapeValid) invalidClaimCount += 1;
+    if (!conversationClaim && claim?.established !== true && !categoryShapeValid) invalidClaimCount += 1;
+    if (conversationClaim) {
+      if (categoryShapeValid) {
+        renderedClaims.push(paragraph);
+        renderedParagraphCount += 1;
+        conversationClaimCount += 1;
+        conversationParagraphCount += 1;
+      } else if (claim?.established !== true) {
+        invalidClaimCount += 1;
+      }
+      continue;
+    }
     if (!established) unsupportedClaimCount += 1;
     if (established) {
       const links = validEntries.map(chatLedgerEntryMarkdown).filter(Boolean);
@@ -25247,6 +25339,9 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     normalizationCorrections: normalized.corrections,
     claimCount: parsed.claims.length,
     semanticClaimCount: parsed.claims.length,
+    conversationClaimCount,
+    conversationParagraphCount,
+    conversationCitationCount: 0,
     paragraphCount: renderedParagraphCount,
     renderedParagraphCount,
     supportedParagraphCount,
@@ -25274,6 +25369,54 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
   };
   return { answer: composedAnswer, telemetry };
+}
+
+function renderStructuredChatConversationResponse(value = "") {
+  const parsed = parseChatEvidenceResponse(value);
+  const normalized = normalizeChatEvidencePayload(parsed);
+  const validation = validateChatEvidencePayload(normalized.value, { mode: "conversation" });
+  const reasonCodes = normalized.corrections.map((correction) => correction.reasonCode);
+  const baseTelemetry = {
+    schemaVersion: 1,
+    responseSchema: CHAT_CONVERSATION_RESPONSE_SCHEMA,
+    mode: "conversation",
+    valid: false,
+    claimCount: Math.max(0, Number(validation.claimCount || 0)),
+    conversationClaimCount: 0,
+    renderedParagraphCount: 0,
+    citationCount: 0,
+    unsupportedClaimCount: 0,
+    missingEvidenceCount: 0,
+    schemaInvalidCount: validation.valid ? 0 : 1,
+    schemaInvalidReasons: Array.isArray(validation.reasons) ? validation.reasons.slice() : ["structured-response-invalid"],
+    normalizationCorrections: normalized.corrections,
+    reasonCodes: uniqueValues(reasonCodes.concat(validation.reasons || []))
+  };
+  if (!validation.valid || validation.claims.length !== 1) {
+    return { answer: "", telemetry: baseTelemetry };
+  }
+  const answer = finalizeStructuredChatParagraph(validation.claims[0]?.text);
+  if (!answer) {
+    return {
+      answer: "",
+      telemetry: Object.assign({}, baseTelemetry, {
+        schemaInvalidCount: 1,
+        schemaInvalidReasons: ["conversation-text-empty"],
+        reasonCodes: uniqueValues([...baseTelemetry.reasonCodes, "conversation-text-empty"])
+      })
+    };
+  }
+  return {
+    answer,
+    telemetry: Object.assign({}, baseTelemetry, {
+      valid: true,
+      conversationClaimCount: 1,
+      renderedParagraphCount: 1,
+      schemaInvalidCount: 0,
+      schemaInvalidReasons: [],
+      reasonCodes: uniqueValues([...baseTelemetry.reasonCodes, "conversation-rendered"])
+    })
+  };
 }
 
 function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
@@ -25351,6 +25494,25 @@ const CONTEXT_QUERY_TASK_SCOPE_RE = /\b(?:all\s+(?:my\s+)?(?:open\s+)?tasks?|my\
 // matching evidence text, titles, paths, or people.
 const CONTEXT_QUERY_ACTION_RE = /\b(?:what\s+(?:action|actions)\s+(?:is|are)\s+(?:requested|needed)|requested\s+action|remaining\s+action|what\s+(?:should|needs\s+to)\s+happen\s+next|what(?:'s|\s+is)\s+next|next\s+steps?|how\s+should\s+(?:i|we)\s+proceed|task\s+(?:status|state)|(?:status|state)\s+of\s+(?:this|the|my)\s+task)\b/i;
 const CONTEXT_QUERY_BROAD_RE = /\b(?:across\s+(?:the\s+)?(?:vault|notes?|work)|all\s+(?:my\s+)?(?:notes?|work|projects?|tasks?|items?)|whole\s+vault|everything|overall\s+(?:portfolio|projects?|work)|compare\s+(?:across|all|the\s+vault)|rank\s+(?:across|all)|top\s+priorit(?:y|ies)|most\s+important\s+across|priorit(?:ies|ize)\s+across|where\s+(?:work|projects?)\s+stand\s+across)\b/i;
+
+function classifyChatConversationRequest(prompt = "") {
+  const normalized = String(prompt == null ? "" : prompt)
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || normalized.length > 120) return null;
+  const text = normalized.replace(/[.!?]+$/g, "").trim().toLowerCase();
+  const patterns = [
+    ["greeting", /^(?:hi|hello|hey|hey there|hello there|good morning|good afternoon|good evening)$/],
+    ["thanks", /^(?:thanks|thank you|thanks so much|thank you so much|much appreciated|appreciate it)$/],
+    ["small-talk", /^(?:how are you|how(?:'|’)s it going|how is it going|what(?:'|’)s up|what is up|nice to meet you)$/],
+    ["help", /^(?:help|what can you do|what can you help(?: me)? with|how can you help(?: me)?|can you help me|what do you do|can you query my vault|can you search my vault|can you help with my notes|can you help with my tasks)$/]
+  ];
+  const match = patterns.find(([, pattern]) => pattern.test(text));
+  return match
+    ? Object.freeze({ mode: "conversation", category: CHAT_CONVERSATION_RESPONSE_CATEGORY, subtype: match[0] })
+    : null;
+}
 
 function classifyContextQueryIntent(prompt = "") {
   const text = singleLine(prompt || "");
@@ -43469,6 +43631,14 @@ function buildChatProviderContextProjection(options = {}) {
   const citableLedgerByEvidenceId = new Map(citableLedgerRows.map((entry) => [String(entry.evidenceId), entry]));
   const adaptivePack = options.adaptivePack || {};
   const settings = options.settings || DEFAULT_SETTINGS;
+  const retrievalTelemetry = options.retrievalTelemetry || {};
+  const retrievalDegraded = Boolean(retrievalTelemetry.degraded
+    || retrievalTelemetry.indexState === "degraded-source-only"
+    || retrievalTelemetry.indexState === "failed"
+    || retrievalTelemetry.degradedReason);
+  const retrievalDegradedReason = String(retrievalTelemetry.degradedReason || "semantic-evidence-unavailable")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .slice(0, 96) || "semantic-evidence-unavailable";
   const model = options.model || "";
   const provider = options.provider || aiProviderForModel(model, settings);
   const limits = chatProviderContextWindow(settings, provider, model);
@@ -43804,6 +43974,9 @@ function buildChatProviderContextProjection(options = {}) {
   ].join("\n") : "";
   const requiredSections = [
     "Active note context:", normalizedActiveText || "No active note context.",
+    "Retrieval state:", retrievalDegraded
+      ? `Degraded/source-only (${retrievalDegradedReason}). General conversation answers remain allowed, but do not imply vault-specific facts without exact supplied evidence; identify genuinely missing requested vault facts as unsupported.`
+      : "Ready. Use exact supplied evidence IDs for vault-specific facts; general conversation claims may be answered without citations.",
     "Current typed source-contract facts (authoritative/current):",
     facts.length ? facts.map((fact) => `- fact_id=${fact.id} evidence_id=${fact.evidenceId} type=${fact.type} role=${fact.role} temporal=${fact.temporalRelation} current=${fact.current} authority=${fact.authority} conflict=${fact.conflictState} | value=${fact.value}`).join("\n") : "- No typed current source-contract facts were established.",
     "Selected semantic evidence (accepted rows; required for provider context):",
@@ -43928,7 +44101,9 @@ function buildChatProviderContextProjection(options = {}) {
     preflightStatus: overflow ? "overflow" : "ok",
     overflow,
     provider: limits.provider,
-    model: limits.model
+    model: limits.model,
+    retrievalDegraded,
+    retrievalDegradedReason: retrievalDegraded ? retrievalDegradedReason : ""
   };
   const prefixMetrics = providerContextProjectionMetrics(promptCachePrefix);
   const suffixMetrics = providerContextProjectionMetrics(promptContextSuffix);
@@ -47519,6 +47694,12 @@ function semanticIndexCompatibilityRefreshError(classification = {}) {
   const error = new Error(`Semantic-index compatibility refresh required: ${String(classification.reasonCode || "incompatible-generation")}.`);
   error.code = "semantic-index-compatibility-refresh-required";
   error.compatibilityRefresh = classification;
+  return error;
+}
+function semanticIndexMissingError(indexFile = "") {
+  const error = new Error("Semantic-index manifest is missing.");
+  error.code = "semantic-index-missing";
+  error.indexFile = String(indexFile || "");
   return error;
 }
 function schedulerDurationEstimateModel(settings = DEFAULT_SETTINGS) {
@@ -59054,9 +59235,11 @@ if (typeof module !== "undefined" && module.exports) {
     geminiNormalizeRequestError,
     geminiTransientRetrySnapshot,
     chatResponseSchema,
+    classifyChatConversationRequest,
     normalizeChatEvidencePayloadForValidation,
     normalizeChatProviderResponse,
     validateChatEvidencePayload,
+    renderStructuredChatConversationResponse,
     chatSourceLedger,
     buildChatProviderContextProjection,
     chatProviderContextPreflight,

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.9
+
+- Made Chat a more natural personal assistant for general, mixed, and vault-aware questions; citations appear only on claims drawn from vault sources.
+- Kept Chat read-only while it uses available local context and stays helpful when the local index is unavailable.
+- Unified task and description prompt guidance under one provider-neutral contract and quietly removed obsolete branded prompt settings during upgrade.
+- Added default-on startup recovery for an exactly missing semantic index, queued behind the worker barrier so normal startup remains safe.
+- Improved source-card title readability and wrapping on narrow screens.
+
 ## 0.8.8
 
 - Made chat answers and task descriptions concise, natural narratives grounded in the evidence for that task.

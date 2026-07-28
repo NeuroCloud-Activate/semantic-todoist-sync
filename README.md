@@ -33,6 +33,12 @@ The current 0.8 series makes everyday capture more flexible and more private.
 7. **Sharper local model profiles.**
    Exact validated local-model profiles keep scope tighter and use raw-preserving citation alignment when a supported model needs it, so local runs finish more reliably without changing the original model output.
 
+8. **A more helpful chat.**
+   Chat stays read-only while handling everyday questions, mixed questions, and vault-aware questions naturally; links appear only for details drawn from your notes.
+
+9. **Automatic search recovery.**
+   If the local search index is missing when Obsidian starts, it quietly rebuilds it for you.
+
 ## Install
 
 - [Install from Obsidian Community Plugins](https://obsidian.md/plugins?id=semantic-todoist-sync)

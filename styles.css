@@ -507,6 +507,11 @@
   overflow: hidden;
   overflow-wrap: anywhere;
   white-space: normal;
+  font-size: max(11px, calc(var(--font-ui-small) - 2px));
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   cursor: var(--cursor-link);
 }
 
@@ -1373,7 +1378,7 @@
   }
 
   .semantic-todoist-source-card {
-    font-size: var(--font-ui-smaller);
+    font-size: max(11px, calc(var(--font-ui-small) - 2px));
     line-height: 1.15;
     min-height: 23px;
     padding: 2px 5px;

@@ -278,12 +278,6 @@
   overflow-wrap: anywhere;
 }
 
-.semantic-todoist-header button {
-  border-radius: 6px;
-  flex: 0 0 auto;
-  max-width: 100%;
-}
-
 .semantic-todoist-header-icon {
   align-items: center;
   display: inline-flex;
@@ -307,10 +301,26 @@
   display: flex;
   gap: 8px;
   justify-content: flex-start;
+  flex-wrap: nowrap;
   min-width: 0;
   width: 100%;
   max-width: 100%;
-  flex-wrap: wrap;
+}
+
+.semantic-todoist-note-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  margin-inline-start: auto;
+  min-width: 0;
+}
+
+.semantic-todoist-note-actions button {
+  border-radius: 6px;
+  flex: 0 0 auto;
+  max-width: 100%;
+  min-height: 34px;
 }
 
 .semantic-todoist-note-label {
@@ -551,21 +561,13 @@
   min-width: 0;
 }
 
-.semantic-todoist-chat-composer {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-  width: 100%;
-  max-width: 100%;
-}
-
 .semantic-todoist-web-search-modifier {
   align-items: center;
+  border-inline-end: 1px solid var(--background-modifier-border);
   display: flex;
+  min-height: 34px;
   min-width: 0;
-  width: 100%;
-  max-width: 100%;
+  padding-inline-end: 6px;
 }
 
 .semantic-todoist-web-search-toggle {
@@ -577,30 +579,19 @@
   color: var(--text-muted);
   display: inline-flex;
   flex: 0 0 auto;
-  font-size: var(--font-ui-smaller);
-  font-weight: 600;
-  gap: 4px;
+  height: 28px;
   justify-content: center;
   line-height: 1;
-  max-width: 100%;
   min-height: 28px;
-  min-width: 0;
-  padding: 4px 7px;
-  text-align: left;
-  white-space: nowrap;
-  width: max-content;
+  min-width: 28px;
+  padding: 0;
+  width: 28px;
 }
 
 .semantic-todoist-web-search-toggle svg {
   flex: 0 0 auto;
   height: 14px;
   width: 14px;
-}
-
-.semantic-todoist-web-search-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .semantic-todoist-web-search-toggle.is-enabled {
@@ -642,7 +633,7 @@
   align-items: center;
   display: grid;
   gap: 6px;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: max-content auto minmax(0, 1fr);
   min-width: 0;
   width: 100%;
   max-width: 100%;
@@ -656,6 +647,7 @@
 }
 
 .semantic-todoist-action-row select {
+  font-size: var(--font-ui-smaller);
   border-radius: 6px;
   min-height: 34px;
   min-width: 0;
@@ -1393,7 +1385,7 @@
     width: 100%;
   }
 
-  .semantic-todoist-header button,
+  .semantic-todoist-note-actions button,
   .semantic-todoist-toolbar button {
     box-sizing: border-box;
     flex: 0 0 auto;
@@ -1412,6 +1404,10 @@
 
   .semantic-todoist-note-row {
     gap: 2px;
+  }
+
+  .semantic-todoist-note-actions {
+    gap: 4px;
   }
 
   .semantic-todoist-note-label {
@@ -1586,11 +1582,12 @@
 @media (hover: none), (pointer: coarse) {
   .semantic-todoist-tabs button,
   .semantic-todoist-toolbar button,
-  .semantic-todoist-header button,
+  .semantic-todoist-note-actions button,
   .semantic-todoist-settings button,
   .semantic-todoist-modal button,
   .semantic-todoist-web-search-toggle {
     min-height: 44px;
+    min-width: 44px;
     touch-action: manipulation;
   }
 
@@ -1625,7 +1622,12 @@
   min-height: 0;
 }
 
-.is-mobile .semantic-todoist-header button,
+.is-mobile .semantic-todoist-note-actions button {
+  min-height: 44px;
+  min-width: 44px;
+  padding-block: 4px;
+}
+
 .is-mobile .semantic-todoist-toolbar button {
   min-height: 34px;
   padding-block: 4px;
@@ -2531,7 +2533,7 @@
 }
 
 @media (max-width: 520px) and (pointer: coarse) {
-  .semantic-todoist-header button {
+  .semantic-todoist-note-actions button {
     min-height: 44px;
     min-width: 44px;
   }
@@ -2555,7 +2557,7 @@
     width: 100%;
   }
 
-  .semantic-todoist-header button {
+  .semantic-todoist-note-actions button {
     box-sizing: border-box;
     flex: 0 0 auto;
     max-width: 100%;

@@ -1847,10 +1847,9 @@
  * settings surface. Narrow panes switch to a stacked layout below. */
 .semantic-todoist-settings .setting-item {
   align-items: start;
-  column-gap: clamp(16px, 3vw, 36px);
   display: grid;
+  gap: 8px clamp(16px, 3vw, 36px);
   grid-template-columns: minmax(0, 1fr) minmax(15rem, min(42%, 28rem));
-  row-gap: 8px;
 }
 
 .semantic-todoist-settings .setting-item-info,

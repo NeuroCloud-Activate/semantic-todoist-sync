@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.8
+
+- Made chat answers and task descriptions concise, natural narratives grounded in the evidence for that task.
+- Kept evidence tied to the right source sections, with stable duplicate handling and pending-reference links so related work stays together.
+- Made index and reference saves safer by keeping the last good copy available and queueing recovery when a write needs another try.
+- Added a short, bounded retry for temporary Gemini interruptions.
+- Improved Open WebUI exact-model descriptions with a structured retry and more headroom for native thinking.
+- Added a built-in Open WebUI EmbeddingGemma profile for efficient, compatible local semantic indexing without relying on learned model memory.
+- Made concurrent AI and index activity easier to follow, and polished settings and layout compatibility.
+
 ## 0.8.7
 
 - Keeps model pickers limited to configured providers, with shared primary/fallback choices unless advanced per-operation mode is enabled.

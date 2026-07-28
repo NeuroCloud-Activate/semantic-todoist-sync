@@ -17266,7 +17266,16 @@ class SemanticTodoistView extends ItemView {
     container.style.setProperty("--semantic-todoist-chat-font-size", `${this.plugin.settings.chatFontSizePx || DEFAULT_SETTINGS.chatFontSizePx}px`);
     const header = container.createDiv({ cls: "semantic-todoist-header" });
     header.createEl("h3", { text: "Semantic Todoist Sync" });
-    const indexButton = header.createEl("button", { text: "Index" });
+    const noteRow = container.createDiv({ cls: "semantic-todoist-note-row" });
+    const noteHeader = noteRow.createDiv({ cls: "semantic-todoist-note-header" });
+    const noteLabel = noteHeader.createSpan({ cls: "semantic-todoist-note-label", text: "Active note" });
+    this.noteChatToggleEl = noteLabel.createEl("label", { cls: "semantic-todoist-note-chat-toggle", attr: { title: "Include active note in chat search", "aria-label": "Include active note in chat search" } });
+    const includeCheckbox = this.noteChatToggleEl.createEl("input", { type: "checkbox", attr: { "aria-label": "Include active note in chat search" } });
+    this.noteChatCheckboxEl = includeCheckbox;
+    includeCheckbox.checked = this.includeActiveNote;
+    this.noteChatToggleTextEl = this.noteChatToggleEl.createSpan({ text: this.includeActiveNote ? "On" : "Off" });
+    const noteActions = noteHeader.createDiv({ cls: "semantic-todoist-note-actions" });
+    const indexButton = noteActions.createEl("button", { text: "Index" });
     indexButton.onclick = async () => {
       this.setStatus("Indexing vault...");
       try {
@@ -17277,17 +17286,9 @@ class SemanticTodoistView extends ItemView {
         new Notice(`Index failed: ${error.message || error}`);
       }
     };
-    const headerNewChatButton = header.createEl("button", { cls: "semantic-todoist-header-icon", attr: { "aria-label": "New chat", title: "New chat" } });
+    const headerNewChatButton = noteActions.createEl("button", { cls: "semantic-todoist-header-icon", attr: { "aria-label": "New chat", title: "New chat" } });
     setIcon(headerNewChatButton, "message-square-plus");
     headerNewChatButton.onclick = () => this.newChat();
-    const noteRow = container.createDiv({ cls: "semantic-todoist-note-row" });
-    const noteHeader = noteRow.createDiv({ cls: "semantic-todoist-note-header" });
-    const noteLabel = noteHeader.createSpan({ cls: "semantic-todoist-note-label", text: "Active note" });
-    this.noteChatToggleEl = noteLabel.createEl("label", { cls: "semantic-todoist-note-chat-toggle", attr: { title: "Include active note in chat search", "aria-label": "Include active note in chat search" } });
-    const includeCheckbox = this.noteChatToggleEl.createEl("input", { type: "checkbox", attr: { "aria-label": "Include active note in chat search" } });
-    this.noteChatCheckboxEl = includeCheckbox;
-    includeCheckbox.checked = this.includeActiveNote;
-    this.noteChatToggleTextEl = this.noteChatToggleEl.createSpan({ text: this.includeActiveNote ? "On" : "Off" });
     const picker = noteRow.createDiv({ cls: "semantic-todoist-note-picker" });
     const pickerLine = picker.createDiv({ cls: "semantic-todoist-note-picker-line" });
     this.noteInputEl = pickerLine.createEl("input", { type: "search", cls: "semantic-todoist-note-select semantic-todoist-note-search", placeholder: "Search or select note..." });
@@ -17336,24 +17337,22 @@ class SemanticTodoistView extends ItemView {
     this.relevantEl = container.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = container.createDiv({ cls: "semantic-todoist-conversation" });
-    const chatComposer = container.createDiv({ cls: "semantic-todoist-chat-composer" });
-    const webSearchModifier = chatComposer.createDiv({ cls: "semantic-todoist-web-search-modifier" });
-    this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: webSearchModeLabel("off"), "aria-pressed": "false", "data-web-search-mode": "off" } });
-    setIcon(this.webSearchToggleEl, "globe-2");
-    this.webSearchToggleLabelEl = this.webSearchToggleEl.createSpan({ cls: "semantic-todoist-web-search-label", text: webSearchModeLabel("off") });
-    this.webSearchToggleEl.onclick = () => {
-      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
-      this.webSearchEnabled = this.webSearchMode !== "off";
-      this.updateWebSearchToggleState();
-    };
-    this.updateWebSearchToggleState();
-    this.promptEl = chatComposer.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt...", attr: { "aria-label": "Semantic Todoist Sync chat question", title: "Semantic Todoist Sync chat question" } });
+    this.promptEl = container.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt...", attr: { "aria-label": "Semantic Todoist Sync chat question", title: "Semantic Todoist Sync chat question" } });
     this.promptEl.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       event.preventDefault();
       this.ask();
     });
     const actionRow = container.createDiv({ cls: "semantic-todoist-action-row" });
+    const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
+    this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
+    setIcon(this.webSearchToggleEl, "globe-2");
+    this.webSearchToggleEl.onclick = () => {
+      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
+      this.webSearchEnabled = this.webSearchMode !== "off";
+      this.updateWebSearchToggleState();
+    };
+    this.updateWebSearchToggleState();
     actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Run:" });
     this.actionSelectEl = actionRow.createEl("select", { cls: "semantic-todoist-action-select", attr: { "aria-label": "Action prompt to run", title: "Choose a scheduler action or prompt template" } });
     this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
@@ -17423,7 +17422,6 @@ class SemanticTodoistView extends ItemView {
     this.webSearchToggleEl.setAttribute("aria-pressed", mode === "off" ? "false" : "true");
     this.webSearchToggleEl.setAttribute("data-web-search-mode", mode);
     const label = webSearchModeLabel(mode);
-    this.webSearchToggleLabelEl?.setText(label);
     this.webSearchToggleEl.setAttribute("aria-label", label);
     this.webSearchToggleEl.setAttribute("title", `${label}; click to cycle`);
   }
@@ -19309,7 +19307,7 @@ function normalizeWebSearchMode(value) {
 
 function webSearchModeLabel(value) {
   const mode = normalizeWebSearchMode(value);
-  return mode === "deep" ? "Deep Research" : mode === "concise" ? "Internet Search" : "Internet Search off";
+  return mode === "deep" ? "Deep Research ON" : mode === "concise" ? "Internet Search ON" : "Internet Search OFF";
 }
 
 function webSearchProviderDefaultModel(provider) {

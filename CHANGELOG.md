@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.12
+
+- Moved the globe-only three-state Internet Search modifier into the Run row with explicit `Internet Search OFF`, `Internet Search ON`, and `Deep Research ON` tooltips and accessible labels.
+- Kept the Active note label/toggle, Index, and New chat controls in one compact responsive row, with smaller desktop Run selector text and safe coarse/mobile touch targets.
+
 ## 0.8.11
 
 - Added a compact labeled Internet Search globe modifier above the chat input; Ask, Tasks, and Run remain the action controls.

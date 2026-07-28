@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.11
+
+- Added a compact labeled Internet Search globe modifier above the chat input; Ask, Tasks, and Run remain the action controls.
+- Added calm event-boundary status stages in plain language with stable completion summaries for local Ask, web search, Deep Research, and research saving.
+
 ## 0.8.10
 
 - Added opt-in three-state Internet Search and Deep Research chat, combining provider-native grounded web evidence with vault context and cited narrative answers.

@@ -10208,6 +10208,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const webProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
       const webModel = normalizeWebSearchModel(this.settings.chatWebSearchModel, webProvider);
       const webRequest = buildWebSearchRequest({ provider: webProvider, model: webModel, mode: webSearchMode, prompt, active, context });
+      this.setSidebarStatus("Searching the web");
       webSearchResult = await this.runWebSearch(webRequest);
     }
     let deepLocalPassTelemetry = {
@@ -10228,6 +10229,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       } else {
         try {
           const deepQuery = buildDeepWebLocalRetrievalQuery(prompt, webSearchResult.evidence || []);
+          this.setSidebarStatus("Combining sources");
           const deepContext = deepQuery
             ? await this.retrieveAdaptiveSemanticContext(deepQuery, "chat", this.settings.maxChatContextChunks, deepQuery, { sourceContract })
             : [];
@@ -10379,7 +10381,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       phase2Projection = deepResearchProjection;
       const analysisSchema = deepResearchAnalysisSchema(deepResearchProjection.allowedEvidenceIds);
-      const analysisRaw = await this.withAiActivity("Analyzing research evidence", (workflowToken) => this.openaiResponse({
+      this.setSidebarStatus("Ready");
+      const analysisRaw = await this.withAiActivity("Reviewing sources", (workflowToken) => this.openaiResponse({
         operation: "chat-query",
         deepResearchPhase: "deep-research-analysis",
         fallbackPolicy: "disabled",
@@ -10416,6 +10419,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         deepEvidenceExpansionTelemetry.webRequests = webQueries.length;
         deepEvidenceExpansionTelemetry.attempted = Boolean(vaultQueries.length || webQueries.length);
         deepEvidenceExpansionTelemetry.status = deepEvidenceExpansionTelemetry.attempted ? "pending" : "no-requests";
+        if (deepEvidenceExpansionTelemetry.attempted) this.setSidebarStatus("Checking evidence gaps");
         let deepExpansionLocalRows = [];
         if (vaultQueries.length) {
           if (reservedTaskEvidence) {
@@ -10479,6 +10483,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (webQueries.length) {
           deepEvidenceExpansionTelemetry.webSearchRequests = 1;
           try {
+            this.setSidebarStatus("Searching the web");
             const expansionPrompt = buildDeepEvidenceExpansionWebQuery({ prompt, webQueries, webEvidenceRows: initialWebEvidenceRows });
             const expansionRequest = buildWebSearchRequest({
               provider: normalizeWebSearchProvider(this.settings.chatWebSearchProvider),
@@ -10614,7 +10619,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         && deepAnalysis.telemetry.phase1EvidencePrefixHash === deepAnalysis.telemetry.phase2EvidencePrefixHash
         && deepAnalysis.telemetry.phase1PromptCacheKey === deepAnalysis.telemetry.phase2PromptCacheKey;
     }
-    let response = await this.withAiActivity("Answering question", (workflowToken) => this.openaiResponse({
+    this.setSidebarStatus("Ready");
+    let response = await this.withAiActivity("Writing the answer", (workflowToken) => this.openaiResponse({
       operation: chatDispatchOperation,
       ...(webSearchMode === "deep" ? { fallbackPolicy: "disabled" } : {}),
       workflowToken,
@@ -10677,23 +10683,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     response = citationResult.answer;
     this.lastChatCitationTelemetry = citationResult.telemetry;
+    const researchSaveEligible = webSearchEnabled
+      && this.settings.chatWebSaveResearch !== false
+      && !(typeof this.settings.chatWebSaveResearch === "string" && this.settings.chatWebSaveResearch.trim().toLowerCase() === "false")
+      && webSearchResult.status === "searched"
+      && String(response || "").trim()
+      && Number(citationResult.telemetry.citedWebEvidenceCount || 0) >= 1
+      && Number(citationResult.telemetry.schemaInvalidCount || 0) <= 0;
+    if (researchSaveEligible) this.setSidebarStatus("Saving research");
     const researchSave = webSearchEnabled
       ? await this.saveChatWebResearch({ prompt, active, answer: response, subject: citationResult.researchSubject, mode: webSearchMode, webSearchResult, citationTelemetry: citationResult.telemetry })
       : { status: "disabled", reason: "search-disabled" };
     const renderedWebSearchStatus = webSearchStatusMessage(webSearchResult);
-    const deepLocalStatusSuffix = webSearchMode === "deep"
-      ? ` Deep local pass: ${deepLocalPassTelemetry.status}${deepLocalPassTelemetry.addedCount ? ` (+${deepLocalPassTelemetry.addedCount})` : ""}.`
-      : "";
-    const deepEvidenceExpansionStatusSuffix = webSearchMode === "deep" && deepEvidenceExpansionTelemetry.attempted
-      ? ` Evidence expansion: ${deepEvidenceExpansionTelemetry.status}${deepEvidenceExpansionTelemetry.vaultAddedCount || deepEvidenceExpansionTelemetry.webAddedCount ? ` (+${deepEvidenceExpansionTelemetry.vaultAddedCount + deepEvidenceExpansionTelemetry.webAddedCount})` : ""}.`
-      : "";
     const researchStatusSuffix = researchSave.status === "saved"
-      ? ` Research saved: ${researchSave.path}.`
+      ? " · Research saved"
       : researchSave.status === "failed"
-        ? " Research save failed; answer preserved."
-        : researchSave.status === "disabled"
-          ? " Research saving is off."
-          : " Research not saved for this answer.";
+        ? " · Research save failed"
+        : "";
+    const finalStatus = `${renderedWebSearchStatus}${researchStatusSuffix}`;
+    this.setSidebarStatus(finalStatus);
     return {
       answer: response,
       context,
@@ -10709,7 +10717,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       deepResearchAnalysis: deepAnalysis.telemetry,
       deepEvidenceExpansion: deepEvidenceExpansionTelemetry,
       webSearch: Object.assign({}, webSearchResult, { rawResponse: webSearchResult.rawResponse || null }),
-      webSearchStatus: `${renderedWebSearchStatus}${deepLocalStatusSuffix}${deepEvidenceExpansionStatusSuffix}${webSearchEnabled ? researchStatusSuffix : ""}`,
+      webSearchStatus: finalStatus,
       researchSave,
       contextBundle: chatContextBundle || reservedTaskEvidence || null
     };
@@ -10720,7 +10728,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.requireAiAccess("chat-query");
     const modelChoice = this.aiModelForRequest("chat-query", { prompt, context: [], adaptivePack: {}, taskContext: "" });
     const responseSchema = chatResponseSchema(1, [], "conversation");
-    const response = await this.withAiActivity("Answering question", (workflowToken) => this.openaiResponse({
+    this.setSidebarStatus("Ready");
+    const response = await this.withAiActivity("Writing the answer", (workflowToken) => this.openaiResponse({
       operation: "chat-query",
       workflowToken,
       model: modelChoice.model,
@@ -10747,6 +10756,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       error.conversationTelemetry = rendered.telemetry;
       throw error;
     }
+    this.setSidebarStatus("Answer ready");
     return {
       answer: rendered.answer,
       context: [],
@@ -17326,7 +17336,18 @@ class SemanticTodoistView extends ItemView {
     this.relevantEl = container.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = container.createDiv({ cls: "semantic-todoist-conversation" });
-    this.promptEl = container.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt...", attr: { "aria-label": "Semantic Todoist Sync chat question", title: "Semantic Todoist Sync chat question" } });
+    const chatComposer = container.createDiv({ cls: "semantic-todoist-chat-composer" });
+    const webSearchModifier = chatComposer.createDiv({ cls: "semantic-todoist-web-search-modifier" });
+    this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: webSearchModeLabel("off"), "aria-pressed": "false", "data-web-search-mode": "off" } });
+    setIcon(this.webSearchToggleEl, "globe-2");
+    this.webSearchToggleLabelEl = this.webSearchToggleEl.createSpan({ cls: "semantic-todoist-web-search-label", text: webSearchModeLabel("off") });
+    this.webSearchToggleEl.onclick = () => {
+      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
+      this.webSearchEnabled = this.webSearchMode !== "off";
+      this.updateWebSearchToggleState();
+    };
+    this.updateWebSearchToggleState();
+    this.promptEl = chatComposer.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt...", attr: { "aria-label": "Semantic Todoist Sync chat question", title: "Semantic Todoist Sync chat question" } });
     this.promptEl.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       event.preventDefault();
@@ -17342,14 +17363,6 @@ class SemanticTodoistView extends ItemView {
     askButton.onclick = async () => {
       await this.ask();
     };
-    this.webSearchToggleEl = toolbar.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": "Internet Search off", title: "Internet Search off", "aria-pressed": "false", "data-web-search-mode": "off" } });
-    setIcon(this.webSearchToggleEl, "globe-2");
-    this.webSearchToggleEl.onclick = () => {
-      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
-      this.webSearchEnabled = this.webSearchMode !== "off";
-      this.updateWebSearchToggleState();
-    };
-    this.updateWebSearchToggleState();
     const tasksButton = toolbar.createEl("button", { cls: "semantic-todoist-tasks-button", attr: { "aria-label": "Generate Semantic Todoist Sync tasks", title: "Generate Todoist tasks from the selected or active note" }, text: "Tasks" });
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
@@ -17368,7 +17381,7 @@ class SemanticTodoistView extends ItemView {
     try {
       const prompt = this.promptEl.value.trim();
       if (!prompt) return;
-      this.setStatus("Asking AI...");
+      this.setStatus("Finding vault context");
       const history = this.messages.slice(-8);
       this.addMessage("user", prompt);
       this.addMessage("assistant", "Thinking...", operationId);
@@ -17409,7 +17422,8 @@ class SemanticTodoistView extends ItemView {
     this.webSearchToggleEl.classList.toggle("is-deep", mode === "deep");
     this.webSearchToggleEl.setAttribute("aria-pressed", mode === "off" ? "false" : "true");
     this.webSearchToggleEl.setAttribute("data-web-search-mode", mode);
-    const label = mode === "deep" ? "Deep Research" : mode === "concise" ? "Internet Search" : "Internet Search off";
+    const label = webSearchModeLabel(mode);
+    this.webSearchToggleLabelEl?.setText(label);
     this.webSearchToggleEl.setAttribute("aria-label", label);
     this.webSearchToggleEl.setAttribute("title", `${label}; click to cycle`);
   }
@@ -17545,6 +17559,7 @@ class SemanticTodoistView extends ItemView {
   setStatus(message = "Ready", options = {}) {
     if (options.owner === "index") this.indexStatus = /^ready$/i.test(singleLine(message || "")) ? "" : (message || "");
     else this.currentStatus = message || "Ready";
+    if (options.owner !== "index" && /^ready$/i.test(singleLine(message || "")) && this.plugin?.aiActivity) this.statusDisplayEntries.delete("status");
     if (!this.statusEl) return;
     const { items, nextDelay } = this.statusItemsForDisplay();
     this.renderStatusItems(items);
@@ -19543,13 +19558,11 @@ function webSearchFailureResult(provider = "", model = "", reasonCode = "provide
 
 function webSearchStatusMessage(result = {}) {
   const status = String(result.status || "disabled");
-  const label = normalizeWebSearchMode(result.mode) === "deep" ? "Deep Research" : "Internet Search";
   const sourceCount = Number(result.resultCount || 0);
-  const searchCount = Number(result.queryCount || result.tokenUsage?.searchRequests || 0);
-  if (status === "searched") return `${label}: ${sourceCount} source${sourceCount === 1 ? "" : "s"} admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}.`;
-  if (status === "disabled") return "Internet Search: off.";
-  if (status === "no-evidence") return `${label}: ${sourceCount} sources admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}; local context only.`;
-  return `${label}: unavailable; ${sourceCount} sources admitted; ${searchCount} search${searchCount === 1 ? "" : "es"}; local context only.`;
+  if (status === "searched") return `Answer ready · ${sourceCount} web source${sourceCount === 1 ? "" : "s"}`;
+  if (status === "disabled") return "Answer ready";
+  if (status === "no-evidence") return "Answer ready · No web sources found";
+  return "Answer ready · Web search unavailable";
 }
 
 function normalizeResearchSubject(value = "", fallback = "Research Subject") {

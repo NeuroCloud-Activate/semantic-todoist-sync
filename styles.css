@@ -538,7 +538,7 @@
 
 .semantic-todoist-toolbar {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   align-items: center;
   min-width: 0;
@@ -549,6 +549,37 @@
 .semantic-todoist-toolbar button {
   border-radius: 6px;
   min-width: 0;
+}
+
+.semantic-todoist-web-search-toggle {
+  min-height: 44px !important;
+  min-width: 44px !important;
+  padding: 0 !important;
+  color: var(--text-muted);
+}
+
+.semantic-todoist-web-search-toggle.is-enabled {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.semantic-todoist-web-search-toggle.is-concise {
+  background: transparent;
+  border-color: var(--text-normal);
+  color: var(--text-normal);
+}
+
+.semantic-todoist-web-search-toggle.is-deep {
+  background: transparent;
+  border-color: #7867d9;
+  color: #7867d9;
+  box-shadow: 0 0 0 1px rgba(120, 103, 217, 0.35);
+}
+
+.semantic-todoist-web-search-toggle:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
 }
 
 .semantic-todoist-toolbar button {

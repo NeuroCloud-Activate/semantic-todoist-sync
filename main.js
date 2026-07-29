@@ -10842,7 +10842,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         "Return exactly one category per paragraph. A general conversational answer uses category=conversation, established=false, and no evidence_ids. A vault-specific missing element uses category=unsupported, established=false, and no evidence_ids. Keep conversation, supported, and unsupported paragraphs distinct and never combine supported and unsupported details in one paragraph.",
         ...webSearchFinalEvidenceAuthorityInstructions(webSearchEnabled),
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-        "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
+        webSearchEnabled
+          ? "For every supported claim, return the exact supplied evidence_ids. The plugin will render deterministic numbered citations and one canonical References list; do not write Markdown links, numbered citations, or a source list yourself."
+          : "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
         ...(webSearchEnabled ? [webResearchEvidenceRuleInstruction()] : []),
         "evidence_ids accepts only the exact enum values listed in the supplied schema. fact-* identifiers are metadata only and never citation IDs; never put fact-* values in evidence_ids.",
         "Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
@@ -26987,6 +26989,10 @@ function invalidChatEvidenceResponseTelemetry(ledger = [], options = {}, validat
     unsupportedParagraphCount: Math.max(0, Number(validation.unsupportedParagraphCount || 0)),
     paragraphCitationGroupCount: 0,
     suppressedRepeatedLinkCount: 0,
+    citationStyle: options.mode === "concise" || options.mode === "deep" ? "numbered" : "inline-source-links",
+    inlineCitationMarkerCount: 0,
+    citationReferenceCount: 0,
+    citationSourceDedupedCount: 0,
     supportedClaimCount: 0,
     acceptedClaimCount: 0,
     droppedClaimCount: claimCount,
@@ -27032,6 +27038,88 @@ function chatLedgerEntryMarkdown(entry = {}) {
   return `[${title}](${url})`;
 }
 
+function chatCanonicalCitationUrl(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = "";
+    parsed.protocol = parsed.protocol.toLowerCase();
+    parsed.hostname = parsed.hostname.toLowerCase();
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString();
+  } catch {
+    return raw.replace(/#.*$/, "").replace(/\/+$/, "");
+  }
+}
+
+function chatCitationSourceIdentity(entry = {}) {
+  const sourceKind = String(entry?.sourceKind || "").trim().toLowerCase();
+  const sourceId = String(entry?.sourceId || "").trim();
+  const path = vaultRelativePath(entry?.path || "");
+  const taskId = String(entry?.taskId || entry?.taskReference?.todoistId || entry?.taskReference?.taskId || "").trim();
+  const url = chatCanonicalCitationUrl(entry?.url || "");
+  const kind = taskId || sourceKind.includes("todoist") || sourceId.startsWith("todoist://")
+    ? "todoist-task"
+    : sourceKind === "web" || /^https?:\/\//i.test(sourceId)
+      ? "web"
+      : "vault-note";
+  return {
+    kind,
+    url,
+    sourceId: chatCanonicalCitationUrl(sourceId) || sourceId,
+    path,
+    taskId
+  };
+}
+
+function chatCitationSourcesMatch(left = {}, right = {}) {
+  if (left.url && right.url && left.url === right.url) return true;
+  if (left.sourceId && right.sourceId && left.sourceId === right.sourceId) return true;
+  if (left.taskId && right.taskId && left.taskId === right.taskId) return true;
+  return Boolean(left.kind === "vault-note" && right.kind === "vault-note" && left.path && right.path && left.path === right.path);
+}
+
+function chatFactualSentenceSegments(value = "") {
+  const text = String(value || "");
+  if (!text.trim()) return [];
+  try {
+    if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+      const segmented = Array.from(new Intl.Segmenter("en", { granularity: "sentence" }).segment(text), (item) => item.segment);
+      if (segmented.length && segmented.join("") === text) return segmented;
+    }
+  } catch {}
+  const segments = [];
+  const boundary = /[.!?](?:["'’”»›)\]}]+)?(?=\s|$)/g;
+  let start = 0;
+  let match;
+  try {
+    while ((match = boundary.exec(text))) {
+      const end = match.index + match[0].length;
+      segments.push(text.slice(start, end));
+      start = end;
+    }
+  } catch {
+    return [text];
+  }
+  if (!segments.length || start < text.length) segments.push(text.slice(start));
+  return segments.filter((segment) => segment.trim());
+}
+
+function renderChatFactualParagraph(value = "", citationNumbers = []) {
+  const text = String(value || "").trim();
+  const numbers = uniqueValues((citationNumbers || []).map((number) => Number(number)).filter(Number.isFinite));
+  if (!text || !numbers.length) return { text, sentenceCount: 0, markerCount: 0 };
+  const markerGroup = numbers.map((number) => `(${number})`).join(" ");
+  const segments = chatFactualSentenceSegments(text);
+  if (!segments.length) return { text, sentenceCount: 1, markerCount: numbers.length };
+  return {
+    text: segments.map((segment) => `${segment.trim()} ${markerGroup}`).join(" ").trim(),
+    sentenceCount: segments.length,
+    markerCount: segments.length * numbers.length
+  };
+}
+
 function finalizeStructuredChatParagraph(value = "") {
   const text = chatClaimBody(value);
   if (!text) return "";
@@ -27054,6 +27142,10 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   let renderedParagraphCount = 0;
   let paragraphCitationGroupCount = 0;
   let suppressedRepeatedLinkCount = 0;
+  let inlineCitationMarkerCount = 0;
+  let citedSourceReferenceCount = 0;
+  const numberedCitationMode = options.mode === "concise" || options.mode === "deep";
+  const citationSources = [];
   const citedEvidenceIds = new Set();
   const usedEvidenceIds = new Set();
   if (!validation.valid) {
@@ -27106,12 +27198,33 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     }
     if (!established) unsupportedClaimCount += 1;
     if (established) {
-      const links = validEntries.map(chatLedgerEntryMarkdown).filter(Boolean);
-      const uniqueLinks = uniqueValues(links);
-      suppressedRepeatedLinkCount += Math.max(0, links.length - uniqueLinks.length);
-      if (uniqueLinks.length) paragraphCitationGroupCount += 1;
       evidenceIds.forEach((evidenceId) => usedEvidenceIds.add(evidenceId));
-      renderedClaims.push(`${paragraph}${uniqueLinks.length ? ` ${uniqueLinks.join(" ")}` : ""}`.trim());
+      if (numberedCitationMode) {
+        const citationNumbers = [];
+        const paragraphSources = [];
+        for (const entry of validEntries) {
+          citedSourceReferenceCount += 1;
+          const identity = chatCitationSourceIdentity(entry);
+          let record = citationSources.find((candidate) => chatCitationSourcesMatch(candidate.identity, identity));
+          if (!record) {
+            record = { number: citationSources.length + 1, identity, entry };
+            citationSources.push(record);
+          }
+          if (!paragraphSources.includes(record)) paragraphSources.push(record);
+          if (!citationNumbers.includes(record.number)) citationNumbers.push(record.number);
+        }
+        suppressedRepeatedLinkCount += Math.max(0, validEntries.length - paragraphSources.length);
+        if (citationNumbers.length) paragraphCitationGroupCount += 1;
+        const renderedParagraph = renderChatFactualParagraph(paragraph, citationNumbers);
+        inlineCitationMarkerCount += renderedParagraph.markerCount;
+        renderedClaims.push(renderedParagraph.text || paragraph);
+      } else {
+        const links = validEntries.map(chatLedgerEntryMarkdown).filter(Boolean);
+        const uniqueLinks = uniqueValues(links);
+        suppressedRepeatedLinkCount += Math.max(0, links.length - uniqueLinks.length);
+        if (uniqueLinks.length) paragraphCitationGroupCount += 1;
+        renderedClaims.push(`${paragraph}${uniqueLinks.length ? ` ${uniqueLinks.join(" ")}` : ""}`.trim());
+      }
       supportedParagraphCount += 1;
       renderedParagraphCount += 1;
     } else {
@@ -27128,7 +27241,20 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     reasonCodes.push("structured-response-empty");
   }
   const deepMode = options.mode === "deep";
-  const composedAnswer = renderedClaims.join(deepMode ? "\n\n" : " ").trim();
+  let composedAnswer = renderedClaims.join(deepMode ? "\n\n" : " ").trim();
+  if (numberedCitationMode && citationSources.length) {
+    const references = citationSources
+      .map((record) => chatLedgerEntryMarkdown(Object.assign({}, record.entry, {
+        markdown: "",
+        url: record.identity.url || record.entry.url
+      })))
+      .filter(Boolean)
+      .map((markdown, index) => `${index + 1}. ${markdown}`);
+    if (references.length) {
+      const referenceBlock = ["References:", references.join("\n")].join("\n");
+      composedAnswer = [composedAnswer, referenceBlock].filter(Boolean).join("\n\n").trim();
+    }
+  }
   renderedParagraphCount = deepMode ? renderedClaims.filter(Boolean).length : (composedAnswer ? 1 : 0);
   const evidenceUtilization = chatEvidenceUtilizationTelemetry(entries, [...citedEvidenceIds], [...usedEvidenceIds]);
   const webTelemetry = chatWebEvidenceTelemetry(entries, [...citedEvidenceIds], options);
@@ -27160,6 +27286,10 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     unsupportedParagraphCount: unsupportedClaimCount,
     paragraphCitationGroupCount,
     suppressedRepeatedLinkCount,
+    citationStyle: numberedCitationMode ? "numbered" : "inline-source-links",
+    inlineCitationMarkerCount,
+    citationReferenceCount: citationSources.length,
+    citationSourceDedupedCount: Math.max(0, citedSourceReferenceCount - citationSources.length),
     supportedClaimCount: supportedParagraphCount,
     acceptedClaimCount: supportedParagraphCount,
     droppedClaimCount: invalidClaimCount,
@@ -45425,7 +45555,7 @@ function deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled = true, mo
     "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the supplied evidence IDs; keep the sentence order natural.",
     ...webSearchFinalEvidenceAuthorityInstructions(webSearchEnabled),
     "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-    "For every supported factual statement, use only the exact supplied evidence IDs. The plugin renders allowed source-title hyperlinks deterministically; never invent URLs, Markdown links, numbered citations, or a source list.",
+    "For every supported factual statement, use only the exact supplied evidence IDs. Concise and Deep Research answers receive deterministic numbered citations and one canonical References list from the plugin; never invent URLs, Markdown links, numbered citations, or a source list.",
     ...(webSearchEnabled ? [webResearchEvidenceRuleInstruction()] : []),
     ...(webSearchEnabled ? [webResearchClaimCalibrationInstruction()] : []),
     "Never fuse unrelated details from different sources into one event, decision, task, or explanation.",

@@ -24,6 +24,7 @@ const SCHEDULER_MEMORY_FILE = "scheduler-memory.json";
 const SCHEDULER_MEMORY_MAX_ENTRIES = 500;
 const SCHEDULER_MEMORY_MAX_CONTEXT_PATHS = 12;
 const SCHEDULE_PREVIEW_SUGGESTION_LIMIT = 10;
+const SCHEDULE_MANUAL_GRACE_MINUTES = 60;
 const SCHEDULE_AI_DURATION_MAX_TASKS = 18;
 const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID = "people-followup-minimum-duration";
 const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
@@ -18614,6 +18615,7 @@ class ScheduleTodayModal extends Modal {
     const header = contentEl.createDiv({ cls: "semantic-todoist-schedule-header" });
     header.createEl("h2", { text: "Schedule Today's Tasks" });
     header.createDiv({ text: `${formatDeviceDate(config.today)} | ${formatDeviceTime(minutesToClock(config.startMinutes))}-${formatDeviceTime(minutesToClock(config.endMinutes))} | ${config.chunkMinutes} min chunks` });
+    header.createDiv({ cls: "semantic-todoist-schedule-manual-hint", text: "Manual moves can start up to 1 hour earlier." });
     if (this.preview.message) contentEl.createDiv({ cls: "semantic-todoist-schedule-empty", text: this.preview.message });
     const summary = contentEl.createDiv({ cls: "semantic-todoist-schedule-summary" });
     const removedItems = removedScheduleItems(this.preview);
@@ -18834,38 +18836,45 @@ class ScheduleTodayModal extends Modal {
 
   swapInSuggestion(id, targetId = "", preferredStartMinutes = null) {
     const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    const hasManualRequestedStart = preferredStartMinutes != null && Number.isFinite(Number(preferredStartMinutes));
+    const manualPlacementRequested = Boolean(targetId) || hasManualRequestedStart;
+    const placementConfig = manualPlacementRequested ? scheduleManualPlacementConfig(config) : config;
     this.preview.config = config;
     refreshScheduleSuggestions(this.preview);
     const suggestion = this.findSuggestion(id);
     if (!suggestion) return;
+    if (hasManualRequestedStart && snapScheduleStart(Number(preferredStartMinutes), placementConfig) < schedulePlanningStartMinutes(placementConfig)) {
+      new Notice("That task cannot be placed earlier than the one-hour manual grace window.");
+      return;
+    }
     const target = targetId ? this.movableItem(targetId) : null;
     if (targetId && !target) {
       new Notice("Fixed tasks cannot be swapped out from this preview.");
       return;
     }
     if (!targetId) {
-      const addPlan = bestScheduleAddSlot(suggestion, this.preview, config, preferredStartMinutes);
+      const addPlan = bestScheduleAddSlot(suggestion, this.preview, placementConfig, preferredStartMinutes);
       if (addPlan) {
-        this.addSuggestionToSchedule(suggestion, addPlan);
+        this.addSuggestionToSchedule(suggestion, addPlan, { placementConfig, manualAdjustment: manualPlacementRequested });
         return;
       }
     }
-    const bumped = target || bestScheduleSwapCandidate(suggestion, this.preview, config);
+    const bumped = target || bestScheduleSwapCandidate(suggestion, this.preview, placementConfig);
     if (!bumped) {
       new Notice("That task no longer fits by swapping one scheduled block.");
       return;
     }
-    const blockDuration = suggestionScheduleBlockMinutes(suggestion, config, target);
-    const desiredStart = Number.isFinite(Number(preferredStartMinutes)) ? Number(preferredStartMinutes) : bumped.startMinutes;
-    const boundedStart = this.boundedStart(desiredStart, blockDuration);
+    const blockDuration = suggestionScheduleBlockMinutes(suggestion, placementConfig, target);
+    const desiredStart = hasManualRequestedStart ? Number(preferredStartMinutes) : bumped.startMinutes;
+    const boundedStart = this.boundedStart(desiredStart, blockDuration, placementConfig);
     if (boundedStart == null) {
       new Notice("That task no longer fits in today's open slots.");
       return;
     }
-    const blocksWithoutBumped = scheduleBlocksForPreview(this.preview, config, { excludeId: bumped.id });
-    const start = this.canPlaceScheduleBlock(bumped.id, boundedStart, blockDuration)
+    const blocksWithoutBumped = scheduleBlocksForPreview(this.preview, placementConfig, { excludeId: bumped.id });
+    const start = this.canPlaceScheduleBlock(bumped.id, boundedStart, blockDuration, placementConfig)
         ? boundedStart
-        : findNearestOpenScheduleSlot(blocksWithoutBumped, blockDuration, config, boundedStart);
+        : findNearestOpenScheduleSlot(blocksWithoutBumped, blockDuration, placementConfig, boundedStart);
     if (start == null) {
       new Notice("That task no longer fits in today's open slots.");
       return;
@@ -18880,6 +18889,7 @@ class ScheduleTodayModal extends Modal {
     });
     const scheduledSuggestion = schedulePreviewItem(suggestion, start, blockDuration, config, {
       promotedFromSuggestion: true,
+      manualAdjustment: true,
       previewOrderChanged: true,
       scheduleBlockMinutes: blockDuration,
       totalDurationMinutes: suggestion.totalDurationMinutes || suggestion.durationMinutes || blockDuration
@@ -18907,11 +18917,12 @@ class ScheduleTodayModal extends Modal {
     this.render();
   }
 
-  addSuggestionToSchedule(suggestion, addPlan) {
+  addSuggestionToSchedule(suggestion, addPlan, options = {}) {
     const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    const placementConfig = options.placementConfig || config;
     const blockDuration = addPlan.durationMinutes || suggestionScheduleBlockMinutes(suggestion, config);
     const startMinutes = Number(addPlan?.startMinutes);
-    if (!Number.isFinite(startMinutes) || !Number.isFinite(blockDuration) || startMinutes < schedulePlanningStartMinutes(config) || startMinutes + blockDuration > Number(config.endMinutes) || !this.canPlaceScheduleBlock(suggestion?.id, startMinutes, blockDuration)) {
+    if (!Number.isFinite(startMinutes) || !Number.isFinite(blockDuration) || startMinutes < schedulePlanningStartMinutes(placementConfig) || startMinutes + blockDuration > Number(placementConfig.endMinutes) || !this.canPlaceScheduleBlock(suggestion?.id, startMinutes, blockDuration, placementConfig)) {
       new Notice("No open slot fits that task block.");
       return false;
     }
@@ -18921,6 +18932,7 @@ class ScheduleTodayModal extends Modal {
     this.preview.splitSubtasks = (this.preview.splitSubtasks || []).filter((item) => String(item.sourceTaskId || "") !== String(suggestion.id));
     const scheduledSuggestion = schedulePreviewItem(suggestion, startMinutes, blockDuration, config, {
       promotedFromSuggestion: true,
+      manualAdjustment: Boolean(options.manualAdjustment),
       previewOrderChanged: true,
       addedFromOpenWindow: true,
       scheduleBlockMinutes: blockDuration,
@@ -18966,20 +18978,22 @@ class ScheduleTodayModal extends Modal {
 
   restoreRemovedItem(id) {
     const config = this.preview.config || scheduleTodayConfig(this.plugin.settings);
+    const placementConfig = scheduleManualPlacementConfig(config);
     this.preview.config = config;
     const target = String(id || "");
     const item = removedScheduleItems(this.preview).find((removed) => String(removed.id) === target);
     if (!item) return;
-    const duration = suggestionScheduleBlockMinutes(item, config);
+    const duration = suggestionScheduleBlockMinutes(item, placementConfig);
     const preferredStart = Number.isFinite(Number(item.removedAtMinutes)) ? Number(item.removedAtMinutes) : Number(item.originalStartMinutes);
-    const boundedStart = this.boundedStart(Number.isFinite(preferredStart) ? preferredStart : config.startMinutes, duration);
+    const restoreStart = Number.isFinite(preferredStart) ? preferredStart : schedulePlanningStartMinutes(placementConfig);
+    const boundedStart = this.boundedStart(restoreStart, duration, placementConfig);
     if (boundedStart == null) {
       new Notice("No open slot fits that removed task.");
       return;
     }
-    const start = this.canPlaceScheduleBlock(item.id, boundedStart, duration)
+    const start = this.canPlaceScheduleBlock(item.id, boundedStart, duration, placementConfig)
       ? boundedStart
-      : findNearestOpenScheduleSlot(scheduleBlocksForPreview(this.preview, config, { excludeId: item.id }), duration, config, boundedStart);
+      : findNearestOpenScheduleSlot(scheduleBlocksForPreview(this.preview, placementConfig, { excludeId: item.id }), duration, placementConfig, boundedStart);
     if (start == null) {
       new Notice("No open slot fits that removed task.");
       return;
@@ -18988,6 +19002,7 @@ class ScheduleTodayModal extends Modal {
     this.preview.bumped = (this.preview.bumped || []).filter((removed) => String(removed.id) !== target);
     const restored = schedulePreviewItem(item, start, duration, config, {
       restoredFromRemoved: true,
+      manualAdjustment: true,
       previewOrderChanged: true,
       scheduleBlockMinutes: duration,
       totalDurationMinutes: item.totalDurationMinutes || item.durationMinutes || duration
@@ -19075,8 +19090,8 @@ class ScheduleTodayModal extends Modal {
     this.dropScheduledAt(item.id, startMinutes);
   }
 
-  boundedStart(startMinutes, durationMinutesValue) {
-    const config = this.preview.config;
+  boundedStart(startMinutes, durationMinutesValue, placementConfig = this.preview.config) {
+    const config = placementConfig;
     const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
     const planningStart = schedulePlanningStartMinutes(config);
     const maxStart = Number(config.endMinutes) - duration;
@@ -19084,11 +19099,12 @@ class ScheduleTodayModal extends Modal {
     const raw = Number(startMinutes);
     const start = snapScheduleStart(Number.isFinite(raw) ? raw : planningStart, config);
     if (!Number.isFinite(start)) return null;
+    if (config.manualPlacement && start < planningStart) return null;
     return Math.max(planningStart, Math.min(maxStart, start));
   }
 
-  canPlaceScheduleBlock(excludeId, startMinutes, durationMinutesValue) {
-    const config = this.preview.config;
+  canPlaceScheduleBlock(excludeId, startMinutes, durationMinutesValue, placementConfig = this.preview.config) {
+    const config = placementConfig;
     const duration = roundToScheduleChunk(durationMinutesValue, config) || config.minBlockMinutes;
     if (!Number.isFinite(startMinutes) || startMinutes < schedulePlanningStartMinutes(config) || startMinutes + duration > config.endMinutes) return false;
     return !scheduleBlocksForPreview(this.preview, config, { excludeId }).some((block) => rangesOverlap(startMinutes, startMinutes + duration, block.startMinutes, block.endMinutes));
@@ -19096,25 +19112,28 @@ class ScheduleTodayModal extends Modal {
 
   fitDurationAtStart(item, desiredMinutes) {
     const config = this.preview.config;
+    const placementConfig = item?.manualAdjustment ? scheduleManualPlacementConfig(config) : config;
     const step = scheduleDurationStepMinutes(config);
     let duration = Math.max(config.minBlockMinutes, Math.min(config.maxBlockMinutes, roundToScheduleChunk(desiredMinutes, config)));
     while (duration >= config.minBlockMinutes) {
-      if (this.canPlaceScheduleBlock(item.id, item.startMinutes, duration)) return duration;
+      if (this.canPlaceScheduleBlock(item.id, item.startMinutes, duration, placementConfig)) return duration;
       duration -= step;
     }
     return item.durationMinutes;
   }
 
-  placeScheduleItem(item, startMinutes) {
-    const config = this.preview.config;
+  placeScheduleItem(item, startMinutes, placementConfig = this.preview.config) {
+    const config = placementConfig;
     const duration = Number(item?.durationMinutes);
     if (!item || !Number.isFinite(duration) || duration <= 0) return false;
-    const bounded = this.boundedStart(startMinutes, duration);
+    const previousStart = Number(item.startMinutes);
+    const bounded = this.boundedStart(startMinutes, duration, config);
     if (bounded == null || bounded + duration > Number(config.endMinutes)) return false;
     item.startMinutes = bounded;
     item.endMinutes = bounded + duration;
     item.scheduledDateTime = localDateTimeString(config.today, bounded);
     item.overlapsLunch = rangesOverlap(item.startMinutes, item.endMinutes, config.lunchStartMinutes, config.lunchEndMinutes);
+    if (config.manualPlacement && Number.isFinite(previousStart) && previousStart !== bounded) item.manualAdjustment = true;
     item.previewOrderChanged = item.startMinutes !== item.originalStartMinutes;
     return true;
   }
@@ -19122,25 +19141,26 @@ class ScheduleTodayModal extends Modal {
   dropScheduledAt(id, startMinutes) {
     const item = this.movableItem(id);
     if (!item) return false;
-    const bounded = this.boundedStart(startMinutes, item.durationMinutes);
+    const placementConfig = scheduleManualPlacementConfig(this.preview.config);
+    const bounded = this.boundedStart(startMinutes, item.durationMinutes, placementConfig);
     if (bounded == null) {
       new Notice("No open slot fits that task block.");
       return false;
     }
     const direction = bounded >= item.startMinutes ? 1 : -1;
-    if (this.placeScheduledWithDisplacement(item.id, bounded, direction)) {
+    if (this.placeScheduledWithDisplacement(item.id, bounded, direction, { placementConfig, manualAdjustment: true })) {
       return true;
     }
     new Notice("No open slot fits that task block.");
     return false;
   }
 
-  placeScheduledWithDisplacement(id, startMinutes, direction = 1) {
-    const config = this.preview.config;
+  placeScheduledWithDisplacement(id, startMinutes, direction = 1, options = {}) {
+    const config = options.placementConfig || this.preview.config;
     const item = this.movableItem(id);
     if (!item) return false;
     const snapshot = this.snapshotScheduledItems();
-    const anchorStart = this.boundedStart(startMinutes, item.durationMinutes);
+    const anchorStart = this.boundedStart(startMinutes, item.durationMinutes, config);
     if (anchorStart == null) return false;
     const anchorDuration = roundToScheduleChunk(item.durationMinutes, config) || config.minBlockMinutes;
     const anchorEnd = anchorStart + anchorDuration;
@@ -19163,8 +19183,8 @@ class ScheduleTodayModal extends Modal {
     const sequence = withoutSource.slice();
     sequence.splice(insertIndex, 0, source);
     const anchorIndex = sequence.findIndex((scheduled) => String(scheduled.id) === String(source.id));
-    if (!this.placeScheduleItem(source, anchorStart)) return false;
-    const ok = this.packScheduledSequenceAroundAnchor(sequence, anchorIndex);
+    if (!this.placeScheduleItem(source, anchorStart, config)) return false;
+    const ok = this.packScheduledSequenceAroundAnchor(sequence, anchorIndex, config);
     if (!ok) {
       this.restoreScheduledSnapshot(snapshot);
       return false;
@@ -19172,12 +19192,13 @@ class ScheduleTodayModal extends Modal {
     this.preview.scheduled = sequence
       .slice()
       .sort((a, b) => a.startMinutes - b.startMinutes || String(a.content).localeCompare(String(b.content)));
+    if (options.manualAdjustment) source.manualAdjustment = true;
     this.render();
     return true;
   }
 
-  packScheduledSequenceAroundAnchor(sequence, anchorIndex) {
-    const config = this.preview.config;
+  packScheduledSequenceAroundAnchor(sequence, anchorIndex, placementConfig = this.preview.config) {
+    const config = placementConfig;
     const anchor = sequence?.[anchorIndex];
     if (!anchor) return false;
     const planningStart = schedulePlanningStartMinutes(config);
@@ -19194,7 +19215,7 @@ class ScheduleTodayModal extends Modal {
       const desired = Math.min(Number(item.startMinutes || config.startMinutes), beforeCursor - duration);
       const start = latestOpenScheduleStartBefore(beforeBlocks, duration, config, desired, beforeCursor);
       if (start == null) return false;
-      if (!this.placeScheduleItem(item, start)) return false;
+      if (!this.placeScheduleItem(item, start, config)) return false;
       beforeBlocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
       beforeCursor = item.startMinutes;
     }
@@ -19207,7 +19228,7 @@ class ScheduleTodayModal extends Modal {
       const desired = Math.max(Number(item.startMinutes || config.startMinutes), afterCursor);
       const start = earliestOpenScheduleStartAfter(afterBlocks, duration, config, desired, afterCursor);
       if (start == null) return false;
-      if (!this.placeScheduleItem(item, start)) return false;
+      if (!this.placeScheduleItem(item, start, config)) return false;
       afterBlocks.push({ startMinutes: item.startMinutes, endMinutes: item.endMinutes, id: item.id, type: "scheduled" });
       afterCursor = item.endMinutes;
     }
@@ -19220,6 +19241,7 @@ class ScheduleTodayModal extends Modal {
       startMinutes: item.startMinutes,
       endMinutes: item.endMinutes,
       scheduledDateTime: item.scheduledDateTime,
+      manualAdjustment: item.manualAdjustment,
       overlapsLunch: item.overlapsLunch,
       previewOrderChanged: item.previewOrderChanged
     }));
@@ -19230,6 +19252,7 @@ class ScheduleTodayModal extends Modal {
       state.item.startMinutes = state.startMinutes;
       state.item.endMinutes = state.endMinutes;
       state.item.scheduledDateTime = state.scheduledDateTime;
+      state.item.manualAdjustment = state.manualAdjustment;
       state.item.overlapsLunch = state.overlapsLunch;
       state.item.previewOrderChanged = state.previewOrderChanged;
     }
@@ -19239,11 +19262,12 @@ class ScheduleTodayModal extends Modal {
     const item = this.movableItem(id);
     if (!item) return;
     const config = this.preview.config;
+    const placementConfig = scheduleManualPlacementConfig(config);
     const step = deltaMinutes >= 0 ? config.chunkMinutes : -config.chunkMinutes;
-    const minStart = schedulePlanningStartMinutes(config);
+    const minStart = schedulePlanningStartMinutes(placementConfig);
     const maxStart = config.endMinutes - item.durationMinutes;
     for (let start = item.startMinutes + step; step > 0 ? start <= maxStart : start >= minStart; start += step) {
-      if (this.placeScheduledWithDisplacement(item.id, start, step >= 0 ? 1 : -1)) return;
+      if (this.placeScheduledWithDisplacement(item.id, start, step >= 0 ? 1 : -1, { placementConfig, manualAdjustment: true })) return;
     }
     new Notice(step > 0 ? "No later open slot fits that task block." : "No earlier open slot fits that task block.");
   }
@@ -23795,6 +23819,29 @@ function schedulePlanningStartMinutes(config = {}) {
   return Math.max(start, Number.isFinite(lowerBound) ? lowerBound : start);
 }
 
+function scheduleManualGraceStartMinutes(config = {}, injectableNow = null) {
+  const start = Number(config.startMinutes || 0);
+  const end = Math.max(start, Number(config.endMinutes) || start);
+  const chunk = Math.max(1, Number(config.chunkMinutes) || 1);
+  if (injectableNow == null && Number.isFinite(Number(config.manualGraceStartMinutes))) {
+    return Math.max(start, Math.min(end, Number(config.manualGraceStartMinutes)));
+  }
+  const now = scheduleTodayNowDate(injectableNow);
+  const currentMinutes = ((now.getHours() * 60 + now.getMinutes()) * 60 + now.getSeconds()) / 60 + now.getMilliseconds() / 60000;
+  const targetMinutes = currentMinutes - SCHEDULE_MANUAL_GRACE_MINUTES;
+  const gridStart = start + Math.ceil((targetMinutes - start) / chunk) * chunk;
+  return Math.max(start, Math.min(end, gridStart));
+}
+
+function scheduleManualPlacementConfig(config = {}) {
+  const manualStart = scheduleManualGraceStartMinutes(config);
+  return Object.assign({}, config, {
+    currentTimeLowerBoundMinutes: manualStart,
+    planningStartMinutes: manualStart,
+    manualPlacement: true
+  });
+}
+
 function scheduleLocalDateTimeDate(value) {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?/.exec(String(value || ""));
   if (!match) return null;
@@ -23804,11 +23851,16 @@ function scheduleLocalDateTimeDate(value) {
 
 function schedulePreviewStaleState(preview = {}, injectableNow = null) {
   const now = scheduleTodayNowDate(injectableNow);
+  const config = preview?.config || {};
+  const liveGraceStart = scheduleManualGraceStartMinutes(config, now);
+  const hasConfigBounds = Number.isFinite(Number(config.startMinutes)) && Number.isFinite(Number(config.endMinutes)) && Number.isFinite(Number(config.chunkMinutes));
+  const graceDate = hasConfigBounds ? scheduleLocalDateTimeDate(localDateTimeString(deviceDateString(now), liveGraceStart)) : null;
   const movable = (preview?.scheduled || []).filter((item) => item?.id && !item.fixed);
   const staleItems = movable.filter((item) => {
     const scheduled = scheduleLocalDateTimeDate(item.scheduledDateTime)
-      || (preview?.config?.today && Number.isFinite(Number(item.startMinutes)) ? scheduleLocalDateTimeDate(localDateTimeString(preview.config.today, item.startMinutes)) : null);
-    return !scheduled || scheduled.getTime() < now.getTime();
+      || (config.today && Number.isFinite(Number(item.startMinutes)) ? scheduleLocalDateTimeDate(localDateTimeString(config.today, item.startMinutes)) : null);
+    const manualWithinGrace = Boolean(item.manualAdjustment) && scheduled && graceDate && scheduled.getTime() >= graceDate.getTime();
+    return !scheduled || (scheduled.getTime() < now.getTime() && !manualWithinGrace);
   });
   if (!staleItems.length) return { stale: false, noWrite: false, code: "", notice: "", itemIds: [] };
   return {
@@ -23834,6 +23886,7 @@ function scheduleTodayConfig(settings = DEFAULT_SETTINGS, injectableNow = null) 
   const now = scheduleTodayNowDate(injectableNow);
   const todayDate = deviceDateString(now);
   const currentTimeLowerBoundMinutes = scheduleCurrentTimeLowerBoundMinutes(now, startMinutes, safeEnd, chunkMinutes);
+  const manualGraceStartMinutes = scheduleManualGraceStartMinutes({ startMinutes, endMinutes: safeEnd, chunkMinutes }, now);
   return {
     today: todayDate,
     nextWorkday: nextWorkdayDate(todayDate),
@@ -23849,6 +23902,7 @@ function scheduleTodayConfig(settings = DEFAULT_SETTINGS, injectableNow = null) 
     durationStepMinutes,
     currentTimeLowerBoundMinutes,
     planningStartMinutes: currentTimeLowerBoundMinutes,
+    manualGraceStartMinutes,
     dueWindowDays: Math.max(0, parseInt(settings.scheduleTodayDueWindowDays, 10) || DEFAULT_SETTINGS.scheduleTodayDueWindowDays || 2),
     excludedLabels: new Set(splitList(settings.scheduleTodayExcludedLabels).map(cleanLabel).map((label) => label.toLowerCase()).filter(Boolean)),
     weights: scheduleTodayWeights(settings)
@@ -24171,6 +24225,7 @@ function schedulePreviewItem(candidate, startMinutes, durationMinutesValue, conf
   return Object.assign({}, candidate, extra, {
     startMinutes,
     originalStartMinutes: candidate.originalStartMinutes ?? startMinutes,
+    manualAdjustment: Boolean(extra.manualAdjustment || candidate.manualAdjustment),
     durationMinutes: duration,
     originalDurationMinutes: candidate.originalDurationMinutes || duration,
     scheduledDateTime: localDateTimeString(config.today, startMinutes),

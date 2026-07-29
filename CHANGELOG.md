@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.17
+
+- Scheduling stays out of the past automatically, while deliberate drag, arrow, swap, add-at-time, and restore moves can use up to one hour of earlier grid time; automatic adds and duration-only edits cannot, and stale or out-of-window previews write nothing.
+
 ## 0.8.16
 
 - Made Schedule Today's Tasks safer and easier to scan: movable work cannot be placed before the current local time, stale previews write nothing, and the Desktop timeline defaults to a five-hour scrollable window with a readable time gutter, compact long titles, and visible time/duration metadata.

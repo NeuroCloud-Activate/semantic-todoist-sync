@@ -10506,6 +10506,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         analysisRaw = await this.withAiActivity("Reviewing sources", (workflowToken) => this.openaiResponse({
           operation: "chat-query",
           deepResearchPhase: "deep-research-analysis",
+          deepResearchMode: webSearchMode,
           fallbackPolicy: "disabled",
           workflowToken,
           primaryOverride: deepResearchPrimaryOverride || undefined,
@@ -10656,6 +10657,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           adequacyRaw = await this.withAiActivity("Checking evidence gaps", (workflowToken) => this.openaiResponse({
           operation: "chat-query",
           deepResearchPhase: "evidence-adequacy",
+          deepResearchMode: webSearchMode,
           fallbackPolicy: "disabled",
           workflowToken,
           primaryOverride: deepResearchPrimaryOverride || undefined,
@@ -10813,6 +10815,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let response = await this.withAiActivity("Writing the answer", (workflowToken) => this.openaiResponse({
       operation: chatDispatchOperation,
       ...(webSearchEnabled ? { fallbackPolicy: "disabled" } : {}),
+      ...(webSearchEnabled ? { deepResearchPhase: "deep-research-synthesis" } : {}),
+      ...(webSearchEnabled ? { deepResearchMode: webSearchMode } : {}),
       workflowToken,
       ...(webSearchEnabled ? { primaryOverride: deepResearchPrimaryOverride || undefined } : {}),
       model: modelChoice.model,
@@ -18275,18 +18279,37 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     const webProvider = normalizeWebSearchProvider(this.plugin.settings.chatWebSearchProvider);
     new Setting(containerEl)
       .setName("Internet Search provider")
-      .setDesc("Choose Google Gemini, OpenAI, or OpenRouter. Changing provider selects that provider's default search model; its existing provider key remains separate from other providers.")
+      .setDesc("Choose Google Gemini, OpenAI, or OpenRouter. The model selector lists only loaded generation models for this provider; changing provider re-scopes it and selects that provider's accessible default or first model. Its existing provider key remains separate from other providers.")
       .addDropdown((dropdown) => {
         for (const provider of WEB_SEARCH_PROVIDER_VALUES) dropdown.addOption(provider, provider === "gemini" ? "Google Gemini" : provider === "openai" ? "OpenAI" : "OpenRouter");
         dropdown.setValue(webProvider).onChange(async (value) => {
           const nextProvider = normalizeWebSearchProvider(value);
           this.plugin.settings.chatWebSearchProvider = nextProvider;
-          this.plugin.settings.chatWebSearchModel = webSearchProviderDefaultModel(nextProvider);
+          this.plugin.settings.chatWebSearchModel = stsMpWebSearchModelSelection(this.plugin.settings, nextProvider);
           await this.plugin.saveSettings();
           this.display();
         });
     });
-    textSetting(containerEl, "Internet Search model", "Provider-specific model used only for the opt-in search request; no model discovery runs here.", this.plugin, "chatWebSearchModel");
+    const webModelSetting = new Setting(containerEl)
+      .setName("Internet Search model")
+      .setDesc("Models for the selected Internet Search provider. Type to filter the loaded provider catalog; opening or typing never discovers models.");
+    webModelSetting.settingEl?.addClass?.("semantic-todoist-model-setting");
+    stsMpSearchableCombobox(webModelSetting.controlEl, {
+      accessibleLabel: "Internet Search model",
+      rows: stsMpWebSearchModelCatalog(this.plugin.settings, webProvider),
+      getRows: () => stsMpWebSearchModelCatalog(this.plugin.settings, normalizeWebSearchProvider(this.plugin.settings.chatWebSearchProvider)),
+      value: (() => {
+        const model = stsMpWebSearchModelSelection(this.plugin.settings, webProvider);
+        return model ? `${webProvider}:${model}` : "";
+      })(),
+      onSelect: async (row) => {
+        const provider = normalizeWebSearchProvider(this.plugin.settings.chatWebSearchProvider);
+        if (!row?.id || row.provider !== provider) return;
+        this.plugin.settings.chatWebSearchModel = row.id;
+        await this.plugin.saveSettings();
+        this.display();
+      }
+    });
     toggleSetting(containerEl, "Save Internet Search research", "When enabled, a successful cited answer is saved as one sanitized note under Semantic Todoist Sync/Research. This is independent of the sidebar search toggle.", this.plugin, "chatWebSaveResearch");
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
       stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
@@ -55387,6 +55410,29 @@ const STS_MULTI_PROVIDER = (() => {
     if (["chat", "query", "chat-query"].includes(normalized)) return "chat-query";
     return normalized || "chat-query";
   };
+  const OPENWEBUI_DEEP_RESEARCH_PHASES = Object.freeze([
+    "deep-research-analysis",
+    "evidence-adequacy",
+    "deep-research-synthesis"
+  ]);
+  const OPENWEBUI_DEEP_RESEARCH_MODES = Object.freeze(["concise", "deep"]);
+  const openWebUIDeepResearchPhase = (value = "") => {
+    const normalized = nonEmpty(value).toLowerCase().replace(/[_\s]+/g, "-");
+    return OPENWEBUI_DEEP_RESEARCH_PHASES.includes(normalized) ? normalized : "";
+  };
+  const openWebUIDeepResearchMode = (value = "") => {
+    const normalized = nonEmpty(value).toLowerCase();
+    return OPENWEBUI_DEEP_RESEARCH_MODES.includes(normalized) ? normalized : "concise";
+  };
+  const openWebUIDeepResearchPhaseProfile = (phase, mode) => `openwebui-web-research-phase-v2:${openWebUIDeepResearchPhase(phase)}:${openWebUIDeepResearchMode(mode)}`;
+  const openWebUIDeepResearchPhaseFocusText = (value = "", modeValue = "") => {
+    const phase = openWebUIDeepResearchPhase(value);
+    const mode = openWebUIDeepResearchMode(modeValue);
+    if (phase === "deep-research-analysis") return `Web research analysis focus (${mode}): return only JSON matching the supplied strict evidence-analysis schema. Top-level keys must be exactly findings, selected_evidence_ids, unresolved, and additional_evidence_requests; always emit all four keys even when arrays are empty, and emit unresolved as [] when none; never emit coverage_status or coverage_reason. Each finding must contain only text and evidence_ids${mode === "deep" ? " plus status" : ""}; ${mode === "deep" ? "return exactly 3 to 5 findings" : "return 1 to 5 bounded findings"}. additional_evidence_requests must contain only vault_queries and web_queries, with web_queries always an empty array. Use exact supplied evidence IDs, request at most the allowed existing-index-only vault questions, never request or perform a web search, and do not write final narrative prose.`;
+    if (phase === "evidence-adequacy") return "Web research evidence-adequacy focus: return only JSON matching the supplied strict evidence-adequacy schema. Top-level keys must be exactly coverage_status, coverage_reason, findings, selected_evidence_ids, and unresolved; always emit all five keys even when arrays are empty, and emit unresolved as [] when none; never emit additional_evidence_requests. Each finding contains only text, status, and exact supplied evidence_ids. selected_evidence_ids must include the exact union of every finding evidence_ids. Do not retrieve, search, embed, mutate evidence, retry, or switch models.";
+    if (phase === "deep-research-synthesis") return `Web research synthesis focus (${mode}): return only JSON matching the supplied strict final chat schema. Top-level keys must be exactly claims and research_subject, with research_subject required. The claims array must contain exactly ${mode === "deep" ? "2 to 3 claims" : "1 claim"}; each claim follows the supplied schema and cites only exact supplied evidence IDs. Follow the request's concise/deep paragraph directive exactly. Preserve every supplied proper name and acronym exactly; never substitute, expand, or rename them. Do not import any ordinary-chat focus text; follow only this research phase schema and mode cardinality.`;
+    return "";
+  };
   const openWebUIAdaptiveProfileIdentityMatches = (row, key) => {
     if (!row || typeof row !== "object" || !key) return false;
     if (String(row.key || "") === key) return true;
@@ -56836,9 +56882,13 @@ const STS_MULTI_PROVIDER = (() => {
     const model = normalizeModel("openwebui", requestInput.model || settings.chatModel);
     if (!model) throw providerError("openwebui", null, "model-required");
     const operation = openWebUIAdaptiveOperation(requestInput.operation || "chat-query");
+    const deepResearchPhase = openWebUIDeepResearchPhase(requestInput.deepResearchPhase);
+    const deepResearchMode = deepResearchPhase ? openWebUIDeepResearchMode(requestInput.deepResearchMode) : "";
     const promptFocusProfile = openWebUIPromptFocusProfile(model, operation);
     const promptFocusText = openWebUIPromptFocusText(model, operation);
-    const promptFocusPlacement = openWebUIPromptFocusPlacement(model, operation);
+    const phaseFocusText = openWebUIDeepResearchPhaseFocusText(deepResearchPhase, deepResearchMode);
+    const effectivePromptFocusText = phaseFocusText || promptFocusText;
+    const promptFocusPlacement = phaseFocusText ? "after-schema" : openWebUIPromptFocusPlacement(model, operation);
     const metadata = settings.openwebuiModelMetadata?.[model] || {};
     const capabilities = openWebUICapabilities(metadata);
     const sharedSchema = requestInput.originalJsonSchema || requestInput.jsonSchema;
@@ -56911,7 +56961,7 @@ const STS_MULTI_PROVIDER = (() => {
     const qwenDescriptionCardinalityHint = String(model || "").trim().toLowerCase() === OPENWEBUI_QWEN_PROMPT_FOCUS_MODEL && operation === "task-description"
       ? openWebUIQwenDescriptionCardinalityHint(descriptionCapabilitySchemaProjection || schemaProjection)
       : null;
-    const promptFocusTextWithDescriptionCardinalityHint = [promptFocusText, qwenDescriptionCardinalityHint?.text].filter(Boolean).join("\n\n");
+    const promptFocusTextWithDescriptionCardinalityHint = [effectivePromptFocusText, qwenDescriptionCardinalityHint?.text].filter(Boolean).join("\n\n");
     const reasoningCapability = providerReasoningCapability(settings, "openwebui", model);
     const thinkingMode = normalizeOpenWebUIThinkingMode(settings.openwebuiThinkingMode);
     const reportedOllamaThinking = Array.isArray(metadata.ollamaCapabilities)
@@ -57059,8 +57109,15 @@ const STS_MULTI_PROVIDER = (() => {
       structuredCapabilityPreference: structuredCapability ? structuredInitialCarrier : "",
       structuredCapabilitySchemaFingerprint: structuredCapability ? structuredCapabilitySchemaFingerprint : "",
       structuredGrammarLearned: Boolean(structuredCapability?.grammarUnsupported),
-      ...(promptFocusProfile ? {
+      ...(promptFocusProfile && !deepResearchPhase ? {
         promptFocusProfile,
+        promptFocusPlacement
+      } : {}),
+      ...(deepResearchPhase ? {
+        deepResearchPhase,
+        deepResearchMode,
+        deepResearchPhaseFocus: Boolean(phaseFocusText),
+        deepResearchPhaseFocusProfile: phaseFocusText ? openWebUIDeepResearchPhaseProfile(deepResearchPhase, deepResearchMode) : "",
         promptFocusPlacement
       } : {}),
       descriptionCardinalityHintProfile: qwenDescriptionCardinalityHint?.profile || "",
@@ -58605,6 +58662,10 @@ const STS_MULTI_PROVIDER = (() => {
     openWebUICapabilityMetadataFingerprint,
     openWebUICapabilityMetadataIdentity,
     openWebUIAdaptiveOperation,
+    openWebUIDeepResearchPhase,
+    openWebUIDeepResearchMode,
+    openWebUIDeepResearchPhaseProfile,
+    openWebUIDeepResearchPhaseFocusText,
     openWebUIPromptFocusProfile,
     openWebUIPromptFocusText,
     openWebUIExactModelProfile,
@@ -62585,6 +62646,14 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
       aggregateError.discoveryResult = refreshResult;
       throw aggregateError;
     }
+    const webProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
+    if (!normalizedProviderFilter || normalizedProviderFilter === webProvider) {
+      const webModel = stsMpWebSearchModelSelection(this.settings, webProvider);
+      if (this.settings.chatWebSearchModel !== webModel) {
+        this.settings.chatWebSearchModel = webModel;
+        derivedChangedKeys.push("chatWebSearchModel");
+      }
+    }
     const providerDerivedKeys = normalizedProviderFilter === "openai"
       ? ["availableChatModels", "availableEmbeddingModels", "openaiModelMetadata", "modelsFetchedAt"]
       : normalizedProviderFilter === "gemini"
@@ -62662,6 +62731,23 @@ function stsMpCatalogForOperation(settings, operation, provider = "") {
   if (current?.fallback) manual.push(current.fallback);
   const rows = STS_MULTI_PROVIDER.catalogRows(settings, {}, manual);
   return provider ? rows.filter((row) => row.provider === provider) : rows;
+}
+
+function stsMpWebSearchModelCatalog(settings = {}, provider = "") {
+  const normalizedProvider = normalizeWebSearchProvider(provider || settings.chatWebSearchProvider);
+  if (!WEB_SEARCH_PROVIDER_VALUES.includes(normalizedProvider) || typeof STS_MULTI_PROVIDER === "undefined" || typeof STS_MULTI_PROVIDER.catalogRows !== "function") return [];
+  return STS_MULTI_PROVIDER.catalogRows(settings, {}, [], "generation")
+    .filter((row) => row?.provider === normalizedProvider);
+}
+
+function stsMpWebSearchModelSelection(settings = {}, provider = "") {
+  const normalizedProvider = normalizeWebSearchProvider(provider || settings.chatWebSearchProvider);
+  const rows = stsMpWebSearchModelCatalog(settings, normalizedProvider);
+  const current = String(settings.chatWebSearchModel || "").trim();
+  const selected = rows.find((row) => String(row.id || "").trim() === current);
+  if (selected) return selected.id;
+  const preferred = webSearchProviderDefaultModel(normalizedProvider).toLowerCase();
+  return rows.find((row) => String(row.id || "").trim().toLowerCase() === preferred)?.id || rows[0]?.id || "";
 }
 
 const stsMpSearchableComboboxInstances = new Set();

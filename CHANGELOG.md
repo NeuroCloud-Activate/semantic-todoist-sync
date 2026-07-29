@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.15
+
+- Internet Search and Deep Research now use numbered inline citations with a final deduplicated References list and sentence-level traceability.
+
 ## 0.8.14
 
 - Added a searchable Internet Search model picker that filters models by their configured provider.

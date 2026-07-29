@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.14
+
+- Added a searchable Internet Search model picker that filters models by their configured provider.
+- Improved Open WebUI web research prompts with phase- and mode-specific instructions and exact evidence relationships in the required response schema.
+
 ## 0.8.13
 
 - Gave Deep Research a broader first search plus a model-only evidence check, while keeping its answer to two or three useful paragraphs and avoiding repeat searches.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.16
+
+- Made Schedule Today's Tasks safer and easier to scan: movable work cannot be placed before the current local time, stale previews write nothing, and the Desktop timeline defaults to a five-hour scrollable window with a readable time gutter, compact long titles, and visible time/duration metadata.
+
 ## 0.8.15
 
 - Internet Search and Deep Research now use numbered inline citations with a final deduplicated References list and sentence-level traceability.

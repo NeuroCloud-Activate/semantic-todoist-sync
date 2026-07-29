@@ -993,7 +993,7 @@
 }
 
 .semantic-todoist-schedule-modal {
-  width: min(520px, calc(100vw - 24px));
+  width: min(760px, calc(100vw - 32px));
 }
 
 .semantic-todoist-schedule-modal .semantic-todoist-modal-content {
@@ -1033,8 +1033,9 @@
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
-  max-height: min(42vh, 360px);
-  min-height: 120px;
+  --schedule-time-gutter-width: 64px;
+  max-height: min(70vh, var(--schedule-timeline-viewport-height, 400px));
+  min-height: 200px;
   overflow-x: hidden;
   overflow-y: auto;
   position: relative;
@@ -1057,12 +1058,15 @@
 }
 
 .semantic-todoist-schedule-time {
+  box-sizing: border-box;
   color: var(--text-faint);
   display: inline-block;
   font-size: 10px;
   line-height: var(--schedule-slot-height);
-  padding-left: 5px;
-  width: 46px;
+  font-variant-numeric: tabular-nums;
+  padding-left: 8px;
+  white-space: nowrap;
+  width: var(--schedule-time-gutter-width, 64px);
 }
 
 .semantic-todoist-schedule-block {
@@ -1075,7 +1079,7 @@
   display: grid;
   gap: 4px;
   grid-template-columns: minmax(0, 1fr) auto;
-  left: 48px;
+  left: calc(var(--schedule-time-gutter-width, 64px) + 2px);
   min-height: 24px;
   overflow: hidden;
   padding: 3px 4px;
@@ -1113,9 +1117,10 @@
 }
 
 .semantic-todoist-schedule-block-title {
-  font-size: var(--font-ui-small);
+  font-size: 11px;
   font-weight: 600;
   line-height: 1.08;
+  max-height: 2.25em;
   overflow: hidden;
   overflow-wrap: anywhere;
   text-overflow: clip;
@@ -1127,9 +1132,8 @@
 }
 
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-title {
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.05;
+  max-height: 2.1em;
 }
 
 .semantic-todoist-schedule-block-meta {
@@ -1142,7 +1146,8 @@
 }
 
 .semantic-todoist-schedule-block.is-short .semantic-todoist-schedule-block-meta {
-  display: none;
+  font-size: 9px;
+  line-height: 1;
 }
 
 .semantic-todoist-schedule-block-controls {
@@ -1510,16 +1515,18 @@
 
   .semantic-todoist-schedule-timeline {
     border-radius: 6px;
+    --schedule-time-gutter-width: 52px;
     max-height: 38vh;
+    min-height: 160px;
   }
 
   .semantic-todoist-schedule-time {
-    width: 40px;
+    width: 52px;
   }
 
   .semantic-todoist-schedule-block {
     border-radius: 7px;
-    left: 42px;
+    left: calc(var(--schedule-time-gutter-width, 52px) + 2px);
     padding: 3px 4px;
     right: 4px;
   }

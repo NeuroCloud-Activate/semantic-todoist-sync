@@ -24,23 +24,16 @@ The current 0.8 series makes everyday capture more flexible and more private.
 4. **Model learning that stays useful.**
    Exact-model profiles save carrier and concurrency behavior. Chat only announces material new saves, while AI & Search shows a compact, scrollable list of exact-model operation memories with a Delete button that removes only that memory; the model relearns it next time.
 
-5. **Cleaner presentation.**
-   Obsidian no longer reports the `:has` CSS warning.
-
-6. **Friendlier mobile setup.**
+5. **Friendlier mobile setup.**
    Settings toggles are back with easy-to-tap controls, Embeddings settings are gathered in one clear place, and the context fallback is easier to adjust when model details are unavailable. The default sidebar mode setting is gone, while chat and task tools remain.
 
-7. **Sharper local model profiles.**
+6. **Sharper local model profiles.**
    Exact validated local-model profiles keep scope tighter and use raw-preserving citation alignment when a supported model needs it, so local runs finish more reliably without changing the original model output.
 
-8. **Opt-in Internet Search and Deep Research in chat.**
-   The sidebar shows a compact globe-only Internet Search modifier immediately before the `Run:` prompt selector; it is off for every new view and cycles `off → Internet Search → Deep Research → off` per request. Internet Search combines vault and web evidence in one paragraph; Deep Research uses the same bounded native web request, one local title-seeded retrieval pass, and two bounded provider generations (analysis then final answer) before returning two or three paragraphs. Cited external source titles become clickable links. Successful cited research is saved by default as `YYYY-MM-DD - Research Subject.md` under `Semantic Todoist Sync/Research`, with sanitized YAML frontmatter; the independent `Save Internet Search research` setting can turn that capture off.
-   When Deep analysis finds a material evidence gap, it may request one bounded
-   expansion round: up to one additional local retrieval and one aggregated
-   follow-up web request. New evidence is deduplicated and appended without
-   replacing the evidence already analyzed.
+7. **Opt-in Internet Search and Deep Research in chat.**
+   The sidebar shows a compact globe-only Internet Search modifier immediately before the `Run:` prompt selector; it is off for every new view and cycles `off → Internet Search → Deep Research → off` per request. Both modes combine vault and web evidence, then check that the evidence really answers the question without running another search. Internet Search uses two or three focused searches and keeps the answer to one concise paragraph. Deep Research uses three or four, checks more angles, and returns two or three more detailed paragraphs. Every fact presented keeps its supporting citations, and unused results stay out of the answer. Compatible cloud context can be reused when available, keeping repeated research lighter without losing citations. Successful cited research is saved by default as `YYYY-MM-DD - Research Subject.md` under `Semantic Todoist Sync/Research`, with sanitized YAML frontmatter; the independent `Save Internet Search research` setting can turn that capture off.
 
-9. **Automatic search recovery.**
+8. **Automatic search recovery.**
    If the local search index is missing when Obsidian starts, it quietly rebuilds it for you.
 
 ## Install
@@ -55,13 +48,12 @@ and iPad.
 
 - **Search and chat:** Ask questions across your notes with relevant semantic
   context and links back to the source. Optional Internet Search and Deep
-  Research are request-local, default-off modes: each adds one low-context
-  provider request with bounded native search use, while Deep Research adds one
-  local retrieval pass seeded only by the question and admitted web-source
-  titles plus a bounded analysis generation before its final answer generation.
-  That analysis can request one bounded local/web evidence-expansion round when
-  the existing bundle leaves a material gap; it does not create an open-ended
-  search loop.
+  Research are request-local, default-off modes. Both use one bounded web
+  request, blend it with useful vault context, and run a model-only evidence
+  check before answering. Internet Search returns one concise paragraph. Deep
+  Research starts with a broader search and returns two or three detailed
+  paragraphs. Neither mode repeats the web search or creates an open-ended
+  loop, and every factual statement presented keeps its supporting citations.
   Successful cited answers can be saved as sanitized research notes in
    `Semantic Todoist Sync/Research`; frontmatter records the topic, mode,
    provider/model, query/source counts, and optional active-note path.

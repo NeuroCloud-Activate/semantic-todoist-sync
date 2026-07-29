@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.13
+
+- Gave Deep Research a broader first search plus a model-only evidence check, while keeping its answer to two or three useful paragraphs and avoiding repeat searches.
+- Gave concise Internet Search the same evidence check with two or three focused searches in one request, a one-paragraph answer, and citations for every fact presented.
+- Added provider-neutral cloud prompt caching: OpenAI uses explicit cache controls, Gemini uses explicit cached content when eligible and implicit reuse otherwise, and OpenRouter keeps compatible routed requests together so provider caching can happen automatically.
+- Made web research more token-efficient by reusing compact context, preserving citations for the claims they support, and leaving unused results out of final answers.
+- Corrected Open WebUI failures so a model missing from the active backend is reported clearly instead of being mistaken for a schema problem.
+
 ## 0.8.12
 
 - Moved the globe-only three-state Internet Search modifier into the Run row with explicit `Internet Search OFF`, `Internet Search ON`, and `Deep Research ON` tooltips and accessible labels.

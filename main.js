@@ -265,6 +265,7 @@ const AI_DYNAMIC_ROUTER_RETRY_RESERVE_TOKENS = 1024;
 const CHAT_PROVIDER_MAX_HISTORY_MESSAGES = 8;
 const CHAT_PROVIDER_MAX_HISTORY_CHARS = 6000;
 const CHAT_PROVIDER_MAX_EVIDENCE_ROWS = 24;
+const DEEP_RESEARCH_RESERVED_EVIDENCE_ROWS = 8;
 const WEB_SEARCH_PROVIDER_VALUES = Object.freeze(["gemini", "openai", "openrouter"]);
 const WEB_SEARCH_MODE_VALUES = Object.freeze(["off", "concise", "deep"]);
 const WEB_SEARCH_PROVIDER_DEFAULT_MODELS = Object.freeze({
@@ -272,13 +273,34 @@ const WEB_SEARCH_PROVIDER_DEFAULT_MODELS = Object.freeze({
   openai: "gpt-5.6",
   openrouter: "openrouter/free"
 });
-const WEB_SEARCH_MAX_RESULTS = 5;
-const WEB_SEARCH_MAX_QUERY_CHARS = 800;
-const WEB_SEARCH_MAX_ACTIVE_CHARS = 1800;
-const WEB_SEARCH_MAX_EVIDENCE_CHARS = 700;
-const WEB_SEARCH_MAX_REQUEST_CHARS = 7000;
-const WEB_SEARCH_SEARCH_CONTEXT_SIZE = "low";
-const WEB_SEARCH_MAX_OUTPUT_TOKENS = 5000;
+const WEB_SEARCH_MODE_PROFILES = Object.freeze({
+  concise: Object.freeze({
+    searchContextSize: "high",
+    thinkingEffort: "high",
+    maxResults: 10,
+    maxOutputTokens: 8000,
+    maxQueryChars: 1800,
+    maxActiveChars: 3600,
+    maxEvidenceChars: 1400,
+    maxRequestChars: 16000,
+    maxLocalEvidenceRows: 8,
+    maxQueries: 3,
+    openrouter: Object.freeze({ max_results: 6, max_total_results: 12, max_uses: 3, max_characters: 4000 })
+  }),
+  deep: Object.freeze({
+    searchContextSize: "high",
+    thinkingEffort: "high",
+    maxResults: 12,
+    maxOutputTokens: 8000,
+    maxQueryChars: 1800,
+    maxActiveChars: 3600,
+    maxEvidenceChars: 1400,
+    maxRequestChars: 16000,
+    maxLocalEvidenceRows: 8,
+    maxQueries: 4,
+    openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 })
+  })
+});
 const PROVIDER_INPUT_ESTIMATE_SAFETY_FACTOR = 1.10;
 const PROVIDER_INPUT_WRAPPER_BASE_BYTES = 512;
 const PROVIDER_INPUT_WRAPPER_MAX_BYTES = 2048;
@@ -1725,7 +1747,7 @@ const DEFAULT_SETTINGS = {
   chatFallbackModel: "gpt-5.6-terra",
   chatFallbackReasoningEffort: "medium",
   optimizeStructuredAiUsage: true,
-  enableOpenAiPromptCaching: true,
+  enableProviderPromptCaching: true,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   debugDiagnosticsEnabled: false,
@@ -1909,6 +1931,33 @@ function migrateRetrievalDefaultSettings(settings = {}, defaults = DEFAULT_SETTI
     if (settings[key] === oldDefault) migrated[key] = newDefault;
   }
   return migrated;
+}
+
+function migrateProviderPromptCachingSetting(settings = {}, persistedSettings = null, defaults = DEFAULT_SETTINGS) {
+  const migrated = Object.assign({}, settings);
+  const persisted = persistedSettings && typeof persistedSettings === "object" ? persistedSettings : settings;
+  const hasPersistedCurrent = Object.prototype.hasOwnProperty.call(persisted, "enableProviderPromptCaching");
+  const hasPersistedLegacy = Object.prototype.hasOwnProperty.call(persisted, "enableOpenAiPromptCaching");
+  let changed = false;
+  if (hasPersistedLegacy && !hasPersistedCurrent) {
+    const legacyValue = persisted.enableOpenAiPromptCaching;
+    const migratedValue = legacyValue === false || String(legacyValue == null ? "" : legacyValue).trim().toLowerCase() === "false"
+      ? false
+      : true;
+    if (migrated.enableProviderPromptCaching !== migratedValue) {
+      migrated.enableProviderPromptCaching = migratedValue;
+      changed = true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(migrated, "enableOpenAiPromptCaching")) {
+    delete migrated.enableOpenAiPromptCaching;
+    changed = true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(migrated, "enableProviderPromptCaching")) {
+    migrated.enableProviderPromptCaching = defaults.enableProviderPromptCaching !== false;
+    changed = true;
+  }
+  return { settings: migrated, changed };
 }
 
 function normalizeReasoningEffort(value, fallback = DEFAULT_REASONING_EFFORT) {
@@ -2553,7 +2602,9 @@ class RuntimeWorkCoordinator {
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
     this._ensurePersistenceCoordinator();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const persistedSettings = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, persistedSettings);
+    this._persistedSettingsForMigration = persistedSettings && typeof persistedSettings === "object" ? persistedSettings : {};
     this.runtimeWorkCoordinator = new RuntimeWorkCoordinator(this);
     this.queryEmbeddingCache = new Map();
     this.taskDeduplicationEmbeddingCache = new Map();
@@ -3933,6 +3984,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async migrateSettings() {
     let changed = false;
+    const promptCachingMigration = migrateProviderPromptCachingSetting(this.settings, this._persistedSettingsForMigration);
+    if (promptCachingMigration.changed) {
+      this.settings = promptCachingMigration.settings;
+      changed = true;
+    }
+    delete this._persistedSettingsForMigration;
     const rawChatWebSaveResearch = this.settings.chatWebSaveResearch;
     const normalizedChatWebSaveResearch = typeof rawChatWebSaveResearch === "string"
       ? rawChatWebSaveResearch.trim().toLowerCase() !== "false"
@@ -9924,6 +9981,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const provider = normalizeWebSearchProvider(request.provider || this.settings.chatWebSearchProvider);
     const model = normalizeWebSearchModel(request.model || this.settings.chatWebSearchModel, provider);
     const mode = normalizeWebSearchMode(request.mode);
+    const profile = webSearchModeProfile(mode);
+    const researchIntent = normalizeWebResearchIntent(request.researchIntent, request.prompt || request.searchPrompt || request.query || "");
     const apiKey = String({ gemini: this.settings.googleApiKey, openai: this.settings.openaiApiKey, openrouter: this.settings.openrouterApiKey }[provider] || "").trim();
     if (!apiKey) {
       const error = new Error(`Internet Search needs the ${provider} API key. Add it under Settings → AI & Search.`);
@@ -9936,19 +9995,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ? {
         contents: [{ role: "user", parts: [{ text: request.query }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { maxOutputTokens: WEB_SEARCH_MAX_OUTPUT_TOKENS, thinkingConfig: { thinkingLevel: mode === "deep" ? "high" : "medium" } }
+        generationConfig: { maxOutputTokens: profile.maxOutputTokens, thinkingConfig: { thinkingLevel: profile.thinkingEffort } }
       }
       : provider === "openai"
         ? {
           model,
-          reasoning: { effort: mode === "deep" ? "high" : "medium" },
-          tools: [{ type: "web_search", search_context_size: WEB_SEARCH_SEARCH_CONTEXT_SIZE }],
+          reasoning: { effort: profile.thinkingEffort },
+          max_output_tokens: profile.maxOutputTokens,
+          tools: [{ type: "web_search", search_context_size: profile.searchContextSize }],
           input: request.query
         }
         : {
           model,
           messages: [{ role: "user", content: request.query }],
-          tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", max_results: 3, max_total_results: 6, max_uses: 3, search_context_size: WEB_SEARCH_SEARCH_CONTEXT_SIZE } }]
+          max_tokens: profile.maxOutputTokens,
+          tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", ...profile.openrouter, search_context_size: profile.searchContextSize } }]
         };
     const transport = provider === "gemini"
       ? {
@@ -9965,13 +10026,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       response = null;
     }
     if (!response || Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
-      const result = Object.assign(webSearchFailureResult(provider, model, response ? `http-${Number(response.status || 0) || "error"}` : "transport-error", response?.json || response?.text || null), { mode });
-      this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "transport", status: "failed", provider, model, resultCount: 0, queryCount: 0, searchRequests: 0, reason: Object.keys(result.reasons)[0] });
+      const result = Object.assign(webSearchFailureResult(provider, model, response ? `http-${Number(response.status || 0) || "error"}` : "transport-error", response?.json || response?.text || null), { mode, researchIntent });
+      this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "transport", status: "failed", provider, model, resultCount: 0, queryCount: 0, searchRequests: 0, requiresExternalCorroboration: researchIntent.requiresExternalCorroboration, targetSourceFamilyCount: researchIntent.targetSourceFamilyCount, reason: Object.keys(result.reasons)[0] });
       return result;
     }
     const rawResponse = response.json || {};
     const extracted = provider === "gemini" ? extractGeminiWebEvidence(rawResponse) : provider === "openai" ? extractOpenAIWebEvidence(rawResponse) : extractOpenRouterWebEvidence(rawResponse);
-    const normalized = normalizeWebEvidenceRows(provider, model, extracted.candidates, this.settings);
+    const normalized = normalizeWebEvidenceRows(provider, model, extracted.candidates, this.settings, { mode });
     const tokenUsage = normalizeWebSearchUsage(provider, rawResponse);
     const result = {
       status: normalized.rows.length ? "searched" : "no-evidence",
@@ -9984,9 +10045,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       rawResponse,
       rawMetadata: provider === "gemini" ? extracted.metadata : null,
       evidence: normalized.rows,
-      reasons: normalized.reasons
+      reasons: normalized.reasons,
+      researchIntent,
+      distinctSourceFamilyCount: normalized.distinctSourceFamilyCount,
+      repeatedSourceFamilyCount: normalized.repeatedSourceFamilyCount
     };
-    this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "terminal", status: result.status, provider, model, queryCount: result.queryCount, resultCount: result.resultCount, searchRequests: tokenUsage.searchRequests, rejected: Object.values(normalized.reasons).reduce((sum, count) => sum + Number(count || 0), 0) });
+    this.recordDebugDiagnostic?.({ operation: "chat-query", phase: "web-search", step: "terminal", status: result.status, provider, model, queryCount: result.queryCount, resultCount: result.resultCount, searchRequests: tokenUsage.searchRequests, requiresExternalCorroboration: researchIntent.requiresExternalCorroboration, targetSourceFamilyCount: researchIntent.targetSourceFamilyCount, distinctSourceFamilyCount: normalized.distinctSourceFamilyCount, repeatedSourceFamilyCount: normalized.repeatedSourceFamilyCount, rejected: Object.values(normalized.reasons).reduce((sum, count) => sum + Number(count || 0), 0) });
     return result;
   }
 
@@ -10203,18 +10267,42 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const requiredEvidenceIds = uniqueValues((reservedTaskEvidence?.sharedEvidence || [])
       .map((entry) => String(entry?.evidenceId || entry?.evidence_id || "")).filter(Boolean));
-    let webSearchResult = { status: "disabled", provider: "", model: "", mode: webSearchMode, queryCount: 0, resultCount: 0, tokenUsage: { searchRequests: 0 }, evidence: [], reasons: {} };
+    let webSearchResult = { status: "disabled", provider: "", model: "", mode: webSearchMode, queryCount: 0, resultCount: 0, tokenUsage: { searchRequests: 0 }, evidence: [], reasons: {}, researchIntent: webResearchIntentPlan(prompt), distinctSourceFamilyCount: 0, repeatedSourceFamilyCount: 0 };
+    let webSearchCorroborationTelemetry = {
+      attempted: false,
+      status: webSearchMode === "concise" ? "pending-initial-search" : "not-requested",
+      triggerReason: "",
+      providerRequests: 0,
+      initialDistinctSourceFamilyCount: 0,
+      finalDistinctSourceFamilyCount: 0,
+      finalRepeatedSourceFamilyCount: 0,
+      addedCount: 0,
+      duplicateCount: 0,
+      capDroppedCount: 0,
+      failureReason: ""
+    };
     if (webSearchEnabled) {
       const webProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
       const webModel = normalizeWebSearchModel(this.settings.chatWebSearchModel, webProvider);
       const webRequest = buildWebSearchRequest({ provider: webProvider, model: webModel, mode: webSearchMode, prompt, active, context });
       this.setSidebarStatus("Searching the web");
       webSearchResult = await this.runWebSearch(webRequest);
+      if (webSearchMode === "concise") {
+        webSearchCorroborationTelemetry.status = webSearchResult.status === "searched" || webSearchResult.status === "no-evidence"
+          ? "retired-shared-analysis-coverage"
+          : "initial-search-failed";
+      }
     }
+    webSearchResult = Object.assign({}, webSearchResult, {
+      providerRequestCount: webSearchEnabled ? 1 : 0,
+      postInitialWebSearchRequests: 0,
+      providerNativeQueryTarget: webSearchEnabled ? webSearchModeProfile(webSearchMode).maxQueries : 0
+    });
+    webSearchResult = Object.assign({}, webSearchResult, { webCorroboration: webSearchCorroborationTelemetry });
     let deepLocalPassTelemetry = {
       mode: webSearchMode,
       attempted: false,
-      status: webSearchMode === "deep" ? "pending" : "not-requested",
+      status: webSearchEnabled ? "pending" : "not-requested",
       addedCount: 0,
       duplicateCount: 0,
       capDroppedCount: 0,
@@ -10222,7 +10310,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       externalQueryEmbeddingCalls: 0,
       runtimeExternalCalls: 0
     };
-    if (webSearchMode === "deep" && webSearchResult.status === "searched") {
+    if (webSearchEnabled && webSearchResult.status === "searched") {
       deepLocalPassTelemetry.attempted = true;
       if (reservedTaskEvidence) {
         deepLocalPassTelemetry.status = "skipped-reserved-task-evidence";
@@ -10281,11 +10369,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
       }
     }
-    if (webSearchMode === "deep" && !deepLocalPassTelemetry.attempted) deepLocalPassTelemetry.status = "not-run-search-not-successful";
+    if (webSearchEnabled && !deepLocalPassTelemetry.attempted) deepLocalPassTelemetry.status = "not-run-search-not-successful";
     webSearchResult.deepLocalPass = deepLocalPassTelemetry;
     let webEvidenceRows = (webSearchResult.evidence || []).map((row) => Object.assign({}, row, {
       evidenceId: String(row.evidenceId),
       sourceId: String(row.url),
+      sourceFamily: row.sourceFamily,
+      domain: row.domain,
       title: row.title,
       text: row.excerpt,
       evidenceText: row.excerpt,
@@ -10299,7 +10389,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       prompt,
       maxRows: Math.max(1, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - webEvidenceRows.length)
     }).concat(webEvidenceRows);
-    const initialWebEvidenceRows = webEvidenceRows.slice();
+    const deepResearchInitialLedgerReservation = webSearchMode === "deep"
+      ? reserveDeepResearchLedgerRows(sourceLedger, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - DEEP_RESEARCH_RESERVED_EVIDENCE_ROWS, requiredEvidenceIds)
+      : { rows: sourceLedger.slice(), reservedRows: 0, droppedCount: 0 };
+    sourceLedger = deepResearchInitialLedgerReservation.rows;
     const initialSourceLedger = sourceLedger.slice();
     const taskContext = reservedTaskEvidence ? "" : await this.buildTaskContext(active, context, prompt);
     const adaptivePack = this.buildAdaptiveContextPack({
@@ -10314,9 +10407,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       contextBundleHash: chatContextBundle?.bundleHash || reservedTaskEvidence?.bundleHash || ""
     });
     const modelChoice = this.aiModelForRequest(chatDispatchOperation, { prompt, context, adaptivePack, taskContext });
+    const deepResearchReasoning = deepResearchReasoningSelection(this.settings, modelChoice);
+    const deepResearchPrimaryOverride = deepResearchReasoning.primaryOverride;
     const chatContextProjection = buildChatProviderContextProjection({
       prompt,
       active,
+      webSearchEnabled,
       history,
       context,
       sourceContract,
@@ -10335,6 +10431,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     let responseSchema = null;
     let deepAnalysis = { value: null, telemetry: { attempted: false, valid: false, schemaInvalidCount: 0, invalidReasons: [], findingsCount: 0, selectedEvidenceCount: 0, unresolvedCount: 0, vaultQueryCount: 0, webQueryCount: 0, additionalEvidenceRequestCount: 0 } };
+    let evidenceAdequacy = { value: null, telemetry: { attempted: false, valid: false, status: "not-requested", schemaInvalidCount: 0, invalidReasons: [], findingsCount: 0, selectedEvidenceCount: 0, unresolvedCount: 0, phase: "evidence-adequacy" } };
     let phase2Projection = chatContextProjection;
     let deepResearchProjection = chatContextProjection;
     let deepResearchPhaseNeutralSystem = "";
@@ -10342,82 +10439,112 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let deepResearchHosted = false;
     let deepEvidenceExpansionTelemetry = {
       attempted: false,
-      status: webSearchMode === "deep" ? "pending-analysis" : "not-requested",
+      status: webSearchEnabled ? "pending-analysis" : "not-requested",
       vaultRequests: 0,
-      webRequests: 0,
       vaultAddedCount: 0,
-      webAddedCount: 0,
       vaultDuplicateCount: 0,
-      webDuplicateCount: 0,
       vaultCapDroppedCount: 0,
-      webCapDroppedCount: 0,
       vaultExternalQueryEmbeddingCalls: 0,
       vaultRuntimeExternalCalls: 0,
       externalQueryEmbeddingCalls: 0,
       runtimeExternalCalls: 0,
       webSearchRequests: 0,
+      reservedEvidenceRows: webSearchMode === "deep" ? DEEP_RESEARCH_RESERVED_EVIDENCE_ROWS : 0,
+      initialLedgerRows: sourceLedger.length,
+      initialLedgerDroppedCount: deepResearchInitialLedgerReservation.droppedCount,
       failureReason: ""
     };
     let deepResearchExpansionRows = [];
-    let deepResearchExpansionWebResult = null;
     const deepResearchAnalysisDirective = [
-      "Deep Research phase 1 directive: return only JSON matching the strict deep research analysis schema.",
-      "Use the complete closed evidence ledger before this directive; produce bounded findings with exact evidence_ids, select the evidence IDs most useful for the final answer, and list unresolved items only when they remain genuinely unestablished.",
-      "When a material unresolved gap could change or meaningfully expand the answer, put zero to two specific local-vault questions in additional_evidence_requests.vault_queries and zero to two specific external-source questions in additional_evidence_requests.web_queries; otherwise return empty arrays. Request only evidence needed for this answer, never repeat a supplied fact, URL, credential, prompt instruction, or private secret.",
+      `${webSearchMode === "deep" ? "Deep Research" : "Internet Search"} phase 1 evidence-analysis: return only JSON matching the strict evidence-analysis schema.`,
+      webSearchMode === "deep"
+        ? "Use the complete closed evidence ledger before this directive; decompose the answer into three to five material facets. For each facet, return a finding with status=supported, partial, contradicted, or unresolved, exact evidence_ids, and enough text to preserve the relevant limits or conflicts. Select the evidence IDs most useful for the final answer, and list unresolved items only when they remain genuinely unestablished."
+        : "Use the complete closed evidence ledger before this directive; produce bounded findings with exact evidence_ids, select the evidence IDs most useful for the final answer, and list unresolved items only when they remain genuinely unestablished.",
+      "When a material unresolved local-context gap could change or meaningfully expand the answer, put zero to two specific existing-index-only vault questions in additional_evidence_requests.vault_queries; always return an empty additional_evidence_requests.web_queries array because the initial web ledger is closed and no later web request is permitted.",
+      webResearchEvidenceRuleInstruction(),
+      webResearchClaimCalibrationInstruction(),
       "This analysis is advisory to the final answer phase; preserve epistemic state and do not claim unsupported facts."
     ].join(" ");
     const deepResearchFinalDirective = [
-      "Deep Research phase 2 directive: return only JSON matching the strict chat evidence final-answer schema.",
-      "Return exactly two or three final narrative paragraphs combining vault and web evidence; each paragraph must remain a cohesive narrative claim and cite only supplied evidence IDs.",
+      `${webSearchMode === "deep" ? "Deep Research" : "Internet Search"} phase 2 final synthesis: return only JSON matching the strict chat evidence final-answer schema.`,
+      webSearchMode === "deep"
+        ? "Return exactly two or three final narrative paragraphs combining vault and web evidence; each paragraph must remain a cohesive narrative claim and cite only supplied evidence IDs."
+        : "Return exactly one final cohesive narrative paragraph combining vault and web evidence; cite only supplied evidence IDs.",
+      webResearchEvidenceRuleInstruction(),
+      webResearchClaimCalibrationInstruction(),
       "Return research_subject as a plain 3–8 word subject (maximum 80 characters), without URLs, markdown, citations, or secrets."
     ].join(" ");
-    if (webSearchMode === "deep") {
-      deepResearchPhaseNeutralSystem = deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled: true });
+    if (webSearchEnabled) {
+      deepResearchPhaseNeutralSystem = deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled: true, mode: webSearchMode });
       deepResearchHosted = modelChoice.provider !== "openwebui";
       deepResearchCacheKey = deepResearchHosted ? deepResearchPromptCacheKey() : "";
       deepResearchProjection = buildDeepResearchPhaseProjection(chatContextProjection, {
         system: deepResearchPhaseNeutralSystem,
         promptCacheKey: deepResearchCacheKey
       });
+      const deepResearchCachePrefix = String(deepResearchProjection.promptCachePrefix || "");
+      const deepResearchCachePrefixHash = providerContextProjectionHash(deepResearchCachePrefix);
+      let deepResearchCacheReleased = false;
+      const releaseDeepResearchCache = async () => {
+        if (deepResearchCacheReleased || modelChoice.provider !== "gemini" || !deepResearchCacheKey) return;
+        deepResearchCacheReleased = true;
+        try {
+          await releaseGeminiPromptCacheForRequest({
+            modelId: modelChoice.model,
+            system: deepResearchPhaseNeutralSystem,
+            prefix: deepResearchCachePrefix,
+            requestKey: deepResearchCacheKey,
+            apiKey: this.settings.googleApiKey
+          });
+        } catch {}
+      };
       phase2Projection = deepResearchProjection;
-      const analysisSchema = deepResearchAnalysisSchema(deepResearchProjection.allowedEvidenceIds);
+      const analysisSchema = deepResearchAnalysisSchema(deepResearchProjection.allowedEvidenceIds, { mode: webSearchMode });
       this.setSidebarStatus("Ready");
-      const analysisRaw = await this.withAiActivity("Reviewing sources", (workflowToken) => this.openaiResponse({
-        operation: "chat-query",
-        deepResearchPhase: "deep-research-analysis",
-        fallbackPolicy: "disabled",
-        workflowToken,
-        model: modelChoice.model,
-        provider: modelChoice.provider,
-        chatContextProjection: deepResearchProjection,
-        promptCachePrefix: deepResearchProjection.promptCachePrefix,
-        promptContextSuffix: deepResearchProjection.promptContextSuffix,
-        promptCacheKey: deepResearchCacheKey,
-        jsonSchema: analysisSchema,
-        system: deepResearchPhaseNeutralSystem,
-        user: deepResearchAnalysisDirective,
-        appendFallbackNotice: false,
-        background: false
-      }));
-      deepAnalysis = validateDeepResearchAnalysis(analysisRaw, deepResearchProjection.allowedEvidenceIds);
+      let analysisRaw;
+      try {
+        analysisRaw = await this.withAiActivity("Reviewing sources", (workflowToken) => this.openaiResponse({
+          operation: "chat-query",
+          deepResearchPhase: "deep-research-analysis",
+          fallbackPolicy: "disabled",
+          workflowToken,
+          primaryOverride: deepResearchPrimaryOverride || undefined,
+          model: modelChoice.model,
+          provider: modelChoice.provider,
+          chatContextProjection: deepResearchProjection,
+          promptCachePrefix: deepResearchCachePrefix,
+          promptContextSuffix: deepResearchProjection.promptContextSuffix,
+          promptCacheKey: deepResearchCacheKey,
+          jsonSchema: analysisSchema,
+          system: deepResearchPhaseNeutralSystem,
+          user: deepResearchAnalysisDirective,
+          appendFallbackNotice: false,
+          background: false
+        }));
+      } catch (error) {
+        await releaseDeepResearchCache();
+        throw error;
+      }
+      deepAnalysis = validateDeepResearchAnalysis(analysisRaw, deepResearchProjection.allowedEvidenceIds, { mode: webSearchMode });
       deepAnalysis.telemetry = Object.assign({}, deepAnalysis.telemetry, {
         attempted: true,
         phase: "deep-research-analysis",
         projectionEvidenceCount: deepResearchProjection.sourceLedger.length,
         phase1InputBytes: utf8ByteLength([deepResearchProjection.promptCachePrefix, deepResearchAnalysisDirective].filter(Boolean).join("\n\n")),
-        promptCachePrefixHash: providerContextProjectionHash(deepResearchProjection.promptCachePrefix),
+        promptCachePrefixHash: deepResearchCachePrefixHash,
         promptContextSuffixHash: providerContextProjectionHash(deepResearchProjection.promptContextSuffix),
         phase1SystemHash: providerContextProjectionHash(deepResearchPhaseNeutralSystem),
-        phase1EvidencePrefixHash: providerContextProjectionHash(deepResearchProjection.promptCachePrefix),
-        phase1PromptCacheKey: deepResearchCacheKey
+        phase1EvidencePrefixHash: deepResearchCachePrefixHash,
+        phase1PromptCacheKey: deepResearchCacheKey,
+        reasoningSelection: deepResearchReasoning.telemetry
       });
       if (deepAnalysis.valid) {
         const additionalRequests = deepAnalysis.value.additional_evidence_requests || {};
         const vaultQueries = Array.isArray(additionalRequests.vault_queries) ? additionalRequests.vault_queries : [];
-        const webQueries = Array.isArray(additionalRequests.web_queries) ? additionalRequests.web_queries : [];
+        // The initial search owns all external retrieval. Phase one may request
+        // only one existing-index-only local expansion; web requests are closed.
         deepEvidenceExpansionTelemetry.vaultRequests = vaultQueries.length;
-        deepEvidenceExpansionTelemetry.webRequests = webQueries.length;
-        deepEvidenceExpansionTelemetry.attempted = Boolean(vaultQueries.length || webQueries.length);
+        deepEvidenceExpansionTelemetry.attempted = Boolean(vaultQueries.length);
         deepEvidenceExpansionTelemetry.status = deepEvidenceExpansionTelemetry.attempted ? "pending" : "no-requests";
         if (deepEvidenceExpansionTelemetry.attempted) this.setSidebarStatus("Checking evidence gaps");
         let deepExpansionLocalRows = [];
@@ -10479,77 +10606,142 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             }
           }
         }
-        let deepExpansionWebRows = [];
-        if (webQueries.length) {
-          deepEvidenceExpansionTelemetry.webSearchRequests = 1;
-          try {
-            this.setSidebarStatus("Searching the web");
-            const expansionPrompt = buildDeepEvidenceExpansionWebQuery({ prompt, webQueries, webEvidenceRows: initialWebEvidenceRows });
-            const expansionRequest = buildWebSearchRequest({
-              provider: normalizeWebSearchProvider(this.settings.chatWebSearchProvider),
-              model: normalizeWebSearchModel(this.settings.chatWebSearchModel, this.settings.chatWebSearchProvider),
-              mode: "deep",
-              prompt: expansionPrompt,
-              active: null,
-              context: []
-            });
-            deepResearchExpansionWebResult = await this.runWebSearch(expansionRequest);
-            const admitted = admitDeepWebExpansionRows(initialWebEvidenceRows, deepResearchExpansionWebResult.evidence || [], 3);
-            deepExpansionWebRows = admitted.rows;
-            deepEvidenceExpansionTelemetry.webDuplicateCount = admitted.duplicateCount;
-            deepEvidenceExpansionTelemetry.webCapDroppedCount = admitted.capDroppedCount;
-            deepEvidenceExpansionTelemetry.webStatus = deepExpansionWebRows.length ? "merged" : deepResearchExpansionWebResult.status === "searched" ? "no-additions" : "failed";
-            if (!deepExpansionWebRows.length && deepResearchExpansionWebResult.status !== "searched") deepEvidenceExpansionTelemetry.failureReason = deepEvidenceExpansionTelemetry.failureReason || "web-expansion-unavailable";
-          } catch (error) {
-            deepEvidenceExpansionTelemetry.webStatus = "failed";
-            deepEvidenceExpansionTelemetry.failureReason = deepEvidenceExpansionTelemetry.failureReason || String(error?.code || error?.message || "web-expansion-failed").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96) || "web-expansion-failed";
-          }
-        }
         const localExpansionLedger = chatSourceLedger(null, deepExpansionLocalRows, this.settings, sourceContract, { prompt, maxRows: CHAT_PROVIDER_MAX_EVIDENCE_ROWS });
         const availableExpansionSlots = Math.max(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS - initialSourceLedger.length);
         const admittedLocalLedger = localExpansionLedger.slice(0, availableExpansionSlots);
-        const admittedWebRows = deepExpansionWebRows.slice(0, Math.max(0, availableExpansionSlots - admittedLocalLedger.length));
         deepEvidenceExpansionTelemetry.vaultCapDroppedCount += Math.max(0, localExpansionLedger.length - admittedLocalLedger.length);
-        deepEvidenceExpansionTelemetry.webCapDroppedCount += Math.max(0, deepExpansionWebRows.length - admittedWebRows.length);
         deepEvidenceExpansionTelemetry.vaultAddedCount = admittedLocalLedger.length;
-        deepEvidenceExpansionTelemetry.webAddedCount = admittedWebRows.length;
-        deepResearchExpansionRows = [...admittedLocalLedger, ...admittedWebRows];
+        deepResearchExpansionRows = admittedLocalLedger;
         if (deepResearchExpansionRows.length) {
           sourceLedger = [...initialSourceLedger, ...deepResearchExpansionRows];
-          webEvidenceRows = [...initialWebEvidenceRows, ...admittedWebRows];
         }
         if (!deepEvidenceExpansionTelemetry.attempted) deepEvidenceExpansionTelemetry.status = "no-requests";
         else if (deepResearchExpansionRows.length) deepEvidenceExpansionTelemetry.status = deepEvidenceExpansionTelemetry.failureReason ? "partial" : "merged";
-        else if (deepEvidenceExpansionTelemetry.failureReason || deepEvidenceExpansionTelemetry.vaultStatus === "failed" || deepEvidenceExpansionTelemetry.webStatus === "failed") deepEvidenceExpansionTelemetry.status = "failed";
-        else if (deepEvidenceExpansionTelemetry.vaultStatus === "skipped-reserved-task-evidence" && !webQueries.length) deepEvidenceExpansionTelemetry.status = "skipped-reserved-task-evidence";
+        else if (deepEvidenceExpansionTelemetry.failureReason || deepEvidenceExpansionTelemetry.vaultStatus === "failed") deepEvidenceExpansionTelemetry.status = "failed";
+        else if (deepEvidenceExpansionTelemetry.vaultStatus === "skipped-reserved-task-evidence") deepEvidenceExpansionTelemetry.status = "skipped-reserved-task-evidence";
         else deepEvidenceExpansionTelemetry.status = "no-additions";
         deepAnalysis.telemetry.additionalEvidenceExpansion = deepEvidenceExpansionTelemetry;
       } else {
         deepEvidenceExpansionTelemetry.status = "skipped-invalid-analysis";
         deepAnalysis.telemetry.additionalEvidenceExpansion = deepEvidenceExpansionTelemetry;
       }
-      if (modelChoice.provider === "openwebui" && deepAnalysis.valid) {
-        const selectedIds = deepAnalysis.value.selected_evidence_ids || [];
-        const selectedContextRows = context.filter((row) => selectedIds.includes(String(row?.evidenceId || row?.evidence_id || "")));
+      if (deepAnalysis.valid) {
+        // Both search modes share one mandatory model-only evidence-adequacy
+        // review over the final closed ledger. It never retrieves or requests
+        // more evidence; invalid output leaves valid phase-one analysis intact.
+        const adequacyProjectionBase = appendDeepResearchExpansionProjection(deepResearchProjection, {
+        sourceLedger,
+        allowedEvidenceIds: sourceLedger.map((entry) => entry?.evidenceId).filter(Boolean),
+        expansionRows: deepResearchExpansionRows
+      });
+        const adequacyProjection = Object.freeze(Object.assign({}, adequacyProjectionBase, {
+        promptCachePrefix: deepResearchCachePrefix,
+        telemetry: Object.freeze(Object.assign({}, adequacyProjectionBase.telemetry || {}, {
+          promptCachePrefix: providerContextProjectionMetrics(deepResearchCachePrefix),
+          promptCachePrefixHash: deepResearchCachePrefixHash,
+          promptCachePrefixBytes: utf8ByteLength(deepResearchCachePrefix)
+        }))
+      }));
+        const adequacyDirective = [
+        `${webSearchMode === "deep" ? "Deep Research" : "Internet Search"} evidence-adequacy review: return only JSON matching the strict evidence-adequacy schema.`,
+        `Evaluate the original user request facet by facet: ${redactWebContext(prompt).slice(0, webSearchModeProfile(webSearchMode).maxQueryChars)}`,
+        "Check whether each cited excerpt genuinely supports the proposition, preserve partial or contradictory coverage, and treat source-family count only as provenance metadata. First-party identity evidence cannot prove independent reach, sharing, uptake, adoption, reception, or impact.",
+        webResearchClaimCalibrationInstruction(),
+        "Use only exact IDs from the closed ledger. Do not request or initiate retrieval, search, embedding, mutation, retry, fallback, or model switching. Return coverage_status complete, partial, insufficient, or contradictory and identify unresolved material gaps explicitly.",
+        "Phase-one analysis is advisory only:", JSON.stringify(deepAnalysis.value || { findings: [], selected_evidence_ids: [], unresolved: [] })
+      ].join(" ");
+        this.setSidebarStatus("Checking evidence gaps");
+        let adequacyRaw;
+        try {
+          adequacyRaw = await this.withAiActivity("Checking evidence gaps", (workflowToken) => this.openaiResponse({
+          operation: "chat-query",
+          deepResearchPhase: "evidence-adequacy",
+          fallbackPolicy: "disabled",
+          workflowToken,
+          primaryOverride: deepResearchPrimaryOverride || undefined,
+          model: modelChoice.model,
+          provider: modelChoice.provider,
+          chatContextProjection: adequacyProjection,
+          promptCachePrefix: deepResearchCachePrefix,
+          promptContextSuffix: adequacyProjection.promptContextSuffix,
+          promptCacheKey: deepResearchHosted ? deepResearchCacheKey : "",
+          jsonSchema: evidenceAdequacySchema(adequacyProjection.allowedEvidenceIds),
+          system: deepResearchPhaseNeutralSystem,
+          user: adequacyDirective,
+          appendFallbackNotice: false,
+          background: false
+          }));
+        } finally {
+          await releaseDeepResearchCache();
+        }
+        evidenceAdequacy = validateEvidenceAdequacy(adequacyRaw, adequacyProjection.allowedEvidenceIds);
+        evidenceAdequacy.telemetry = Object.assign({}, evidenceAdequacy.telemetry, {
+        attempted: true,
+        phase: "evidence-adequacy",
+        projectionEvidenceCount: adequacyProjection.sourceLedger.length,
+        inputBytes: utf8ByteLength([adequacyProjection.promptCachePrefix, adequacyProjection.promptContextSuffix, adequacyDirective].filter(Boolean).join("\n\n")),
+        promptCachePrefixHash: deepResearchCachePrefixHash,
+        promptContextSuffixHash: providerContextProjectionHash(adequacyProjection.promptContextSuffix),
+        systemHash: providerContextProjectionHash(deepResearchPhaseNeutralSystem),
+        evidencePrefixHash: deepResearchCachePrefixHash,
+        promptCacheKey: deepResearchHosted ? deepResearchCacheKey : "",
+        cacheCompatiblePrefix: deepResearchHosted
+          && deepResearchCachePrefixHash === deepAnalysis.telemetry.phase1EvidencePrefixHash
+          && deepResearchCachePrefix === String(adequacyProjection.promptCachePrefix || ""),
+        webSearchRequests: 0,
+        externalQueryEmbeddingCalls: 0,
+        runtimeExternalCalls: 0,
+        reasoningSelection: deepResearchReasoning.telemetry
+      });
+        this.recordDebugDiagnostic?.({
+        operation: "chat-query",
+        phase: "evidence-adequacy",
+        step: "terminal",
+        status: evidenceAdequacy.valid ? evidenceAdequacy.telemetry.status : "invalid",
+        provider: modelChoice.provider,
+        model: modelChoice.model,
+        attempted: true,
+        valid: evidenceAdequacy.valid,
+        findingsCount: evidenceAdequacy.telemetry.findingsCount,
+        selectedEvidenceCount: evidenceAdequacy.telemetry.selectedEvidenceCount,
+        unresolvedCount: evidenceAdequacy.telemetry.unresolvedCount,
+        webSearchRequests: 0,
+        externalQueryEmbeddingCalls: 0
+        });
+      } else {
+        await releaseDeepResearchCache();
+      }
+      if (deepAnalysis.valid) {
+        const finalAnalysisValue = evidenceAdequacy.valid ? evidenceAdequacy.value : deepAnalysis.value;
+        const selectedIds = uniqueValues((finalAnalysisValue?.selected_evidence_ids || []).map(String).filter(Boolean));
+        const activeSourceEvidenceId = String(deepResearchProjection.sourceLedger.find((entry) => entry.role === "Active note")?.evidenceId || "");
+        const requiredCurrentSourceIds = new Set([
+          ...requiredEvidenceIds,
+          activeSourceEvidenceId,
+          String(sourceContract?.primaryEvidenceId || sourceContract?.primary_evidence_id || "")
+        ].filter(Boolean));
+        const expansionIds = new Set(deepResearchExpansionRows.map((row) => String(row?.evidenceId || row?.evidence_id || "")).filter(Boolean));
+        const compactAllowedIds = new Set([...selectedIds, ...requiredCurrentSourceIds, ...expansionIds]);
+        const selectedContextRows = context.filter((row) => compactAllowedIds.has(String(row?.evidenceId || row?.evidence_id || "")));
         const expansionContextRows = deepResearchExpansionRows
           .filter((row) => !webEvidenceRows.some((webRow) => webRow.evidenceId === row.evidenceId))
           .map((row) => Object.assign({}, row, { text: row.text || row.evidenceText || row.excerpt || "", required: true }));
         const compactRows = [...selectedContextRows, ...expansionContextRows];
-        const compactLedger = sourceLedger.filter((entry) => selectedIds.includes(String(entry?.evidenceId || ""))
-          || webEvidenceRows.some((row) => row.evidenceId === entry.evidenceId)
-          || deepResearchExpansionRows.some((row) => row.evidenceId === entry.evidenceId));
+        const compactWebEvidenceRows = webEvidenceRows.filter((row) => compactAllowedIds.has(String(row?.evidenceId || "")));
+        const compactLedger = sourceLedger.filter((entry) => compactAllowedIds.has(String(entry?.evidenceId || "")));
         phase2Projection = buildChatProviderContextProjection({
           prompt,
-          active: selectedIds.includes(String(deepResearchProjection.sourceLedger.find((entry) => entry.role === "Active note")?.evidenceId || "")) ? active : null,
+          active: activeSourceEvidenceId && compactAllowedIds.has(activeSourceEvidenceId) ? active : null,
+          webSearchEnabled,
           history,
           context: compactRows,
           sourceContract,
           sourceLedger: compactLedger,
           reservedTaskEvidence,
-          chatReservedEvidenceIds: (chatContextBundle?.chatReservedEvidenceIds || []).filter((id) => selectedIds.includes(id)),
+          chatReservedEvidenceIds: (chatContextBundle?.chatReservedEvidenceIds || []).filter((id) => compactAllowedIds.has(String(id))),
           chatReservationReasonByEvidenceId: chatContextBundle?.chatReservationReasonByEvidenceId || {},
-          requiredEvidenceIds: requiredEvidenceIds.filter((id) => selectedIds.includes(id)),
-          webEvidenceRows,
+          requiredEvidenceIds: [...requiredCurrentSourceIds],
+          webEvidenceRows: compactWebEvidenceRows,
           retrievalTelemetry: chatRetrievalDegraded || context?.semanticRetrieval?.telemetry || {},
           requireCitableEvidence: Boolean(compactRows.length || requiredEvidenceIds.length),
           adaptivePack,
@@ -10573,65 +10765,64 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         phase2Projection = deepResearchProjection;
         deepAnalysis.telemetry.degradedAnalysis = true;
       }
-      if (deepResearchHosted && deepAnalysis.valid && deepResearchExpansionRows.length) {
-        phase2Projection = appendDeepResearchExpansionProjection(phase2Projection, {
-          sourceLedger,
-          allowedEvidenceIds: sourceLedger.map((entry) => entry?.evidenceId).filter(Boolean),
-          expansionRows: deepResearchExpansionRows
-        });
-      }
-      if (deepResearchExpansionWebResult) {
-        const initialUsage = webSearchResult.tokenUsage || {};
-        const followupUsage = deepResearchExpansionWebResult.tokenUsage || {};
-        const tokenUsage = Object.assign({}, initialUsage);
-        for (const key of new Set([...Object.keys(initialUsage), ...Object.keys(followupUsage)])) {
-          tokenUsage[key] = Number(initialUsage[key] || 0) + Number(followupUsage[key] || 0);
-        }
-        webSearchResult = Object.assign({}, webSearchResult, {
-          status: webEvidenceRows.length ? "searched" : (webSearchResult.status || deepResearchExpansionWebResult.status),
-          queryCount: Number(webSearchResult.queryCount || 0) + Number(deepResearchExpansionWebResult.queryCount || 0),
-          resultCount: webEvidenceRows.length,
-          tokenUsage,
-          evidence: webEvidenceRows,
-          deepEvidenceExpansion: deepEvidenceExpansionTelemetry
-        });
-      }
       webSearchResult = Object.assign({}, webSearchResult, { deepEvidenceExpansion: deepEvidenceExpansionTelemetry });
     }
     responseSchema = chatResponseSchema(CHAT_RESPONSE_MAX_CLAIMS, phase2Projection.allowedEvidenceIds, webSearchMode);
-    const deepResearchExpansionSuffix = webSearchMode === "deep" && deepAnalysis.valid
+    const finalResearchAnalysisValue = evidenceAdequacy.valid
+      ? evidenceAdequacy.value
+      : deepAnalysis.value;
+    const deepResearchExpansionSuffix = webSearchEnabled && deepAnalysis.valid
       ? buildDeepResearchExpansionSuffix(deepResearchExpansionRows)
       : "";
-    const phase2User = webSearchMode === "deep"
-      ? [deepResearchExpansionSuffix, deepResearchFinalDirective, "Validated phase-1 research analysis (use only as a bounded planning aid; the closed evidence ledger remains authoritative):", JSON.stringify(deepAnalysis.value || { findings: [], selected_evidence_ids: [], unresolved: [], additional_evidence_requests: { vault_queries: [], web_queries: [] } })].filter(Boolean).join("\n\n")
+    const phase2ResearchAnalysis = evidenceAdequacy.valid
+      ? [
+        "Validated evidence-adequacy result (the closed ledger remains authoritative; do not strengthen claims beyond coverage_status):",
+        JSON.stringify(finalResearchAnalysisValue || { findings: [], selected_evidence_ids: [], unresolved: [] })
+      ].join("\n\n")
+      : deepAnalysis.valid
+        ? [
+          "Phase-1 analysis (advisory; preserve its limitations and reassess every unresolved item against the closed ledger):",
+          JSON.stringify(finalResearchAnalysisValue || { findings: [], selected_evidence_ids: [], unresolved: [] })
+        ].join("\n\n")
+        : "";
+    const phase2ExpansionReconciliation = [
+      deepResearchExpansionSuffix,
+      "Reconcile every phase-1 unresolved item against the closed ledger; newer admitted local evidence may resolve a limitation, but synthesis must not strengthen a claim beyond evidence-adequacy coverage_status."
+    ].filter(Boolean).join("\n\n");
+    const phase2User = webSearchEnabled
+      ? [deepResearchFinalDirective, phase2ResearchAnalysis, phase2ExpansionReconciliation].filter(Boolean).join("\n\n")
       : phase2Projection.user;
-    if (webSearchMode === "deep") {
+    if (webSearchEnabled) {
       deepAnalysis.telemetry.phase2ProjectionEvidenceCount = phase2Projection.sourceLedger.length;
       deepAnalysis.telemetry.phase2InputBytes = utf8ByteLength([phase2Projection.promptCachePrefix, phase2Projection.promptContextSuffix, phase2User].filter(Boolean).join("\n\n"));
       deepAnalysis.telemetry.phase2PromptCachePrefixHash = providerContextProjectionHash(phase2Projection.promptCachePrefix);
       deepAnalysis.telemetry.phase2SystemHash = providerContextProjectionHash(deepResearchPhaseNeutralSystem);
       deepAnalysis.telemetry.phase2EvidencePrefixHash = providerContextProjectionHash(phase2Projection.promptCachePrefix);
-      deepAnalysis.telemetry.phase2PromptCacheKey = deepResearchHosted ? deepResearchCacheKey : "";
+      deepAnalysis.telemetry.phase2PromptCacheKey = "";
+      const adequacyCacheTelemetry = evidenceAdequacy.telemetry || {};
       deepAnalysis.telemetry.sameProjectionForHosted = deepResearchHosted && phase2Projection === deepResearchProjection;
       deepAnalysis.telemetry.cacheCompatibility = deepResearchHosted
         && Boolean(deepResearchCacheKey)
-        && deepAnalysis.telemetry.phase1SystemHash === deepAnalysis.telemetry.phase2SystemHash
-        && deepAnalysis.telemetry.phase1EvidencePrefixHash === deepAnalysis.telemetry.phase2EvidencePrefixHash
-        && deepAnalysis.telemetry.phase1PromptCacheKey === deepAnalysis.telemetry.phase2PromptCacheKey;
+        && deepAnalysis.telemetry.phase1SystemHash === String(adequacyCacheTelemetry.systemHash || "")
+        && deepAnalysis.telemetry.phase1EvidencePrefixHash === String(adequacyCacheTelemetry.evidencePrefixHash || "")
+        && deepResearchCacheKey === String(adequacyCacheTelemetry.promptCacheKey || "")
+        && adequacyCacheTelemetry.cacheCompatiblePrefix === true;
+      deepAnalysis.telemetry.finalPromptCacheRequested = false;
     }
     this.setSidebarStatus("Ready");
     let response = await this.withAiActivity("Writing the answer", (workflowToken) => this.openaiResponse({
       operation: chatDispatchOperation,
-      ...(webSearchMode === "deep" ? { fallbackPolicy: "disabled" } : {}),
+      ...(webSearchEnabled ? { fallbackPolicy: "disabled" } : {}),
       workflowToken,
+      ...(webSearchEnabled ? { primaryOverride: deepResearchPrimaryOverride || undefined } : {}),
       model: modelChoice.model,
       provider: modelChoice.provider,
       chatContextProjection: phase2Projection,
       promptCachePrefix: phase2Projection.promptCachePrefix,
       promptContextSuffix: phase2Projection.promptContextSuffix,
-      promptCacheKey: webSearchMode === "deep" ? phase2Projection.promptCacheKey : "",
+      promptCacheKey: "",
       jsonSchema: responseSchema,
-      system: webSearchMode === "deep" ? deepResearchPhaseNeutralSystem : [
+      system: webSearchEnabled ? deepResearchPhaseNeutralSystem : [
         "You are a concise Obsidian sidebar assistant.",
         PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
         OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION,
@@ -10645,13 +10836,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         ...(webSearchEnabled ? ["Return research_subject as a plain 3–8 word subject (maximum 80 characters), without URLs, markdown, citations, or secrets."] : []),
         "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the paragraph's evidence_ids; keep the sentence order natural.",
         "Return exactly one category per paragraph. A general conversational answer uses category=conversation, established=false, and no evidence_ids. A vault-specific missing element uses category=unsupported, established=false, and no evidence_ids. Keep conversation, supported, and unsupported paragraphs distinct and never combine supported and unsupported details in one paragraph.",
-        "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
+        ...webSearchFinalEvidenceAuthorityInstructions(webSearchEnabled),
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-        "Treat the active note as the primary supplied evidence. Set established=true only when a vault-specific claim is supported by one or more supplied evidence_ids. General reasoning, advice, greetings, and explanations may use category=conversation with established=false and no evidence_ids; do not present those as vault facts.",
         "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
-        ...(webSearchEnabled ? ["When Internet Search sources are supplied, every externally established claim must cite one or more supplied web-* evidence IDs. Never write or invent a URL yourself, and do not imply that the web was checked when the search status is unavailable or no-evidence."] : []),
+        ...(webSearchEnabled ? [webResearchEvidenceRuleInstruction()] : []),
         "evidence_ids accepts only the exact enum values listed in the supplied schema. fact-* identifiers are metadata only and never citation IDs; never put fact-* values in evidence_ids.",
-        "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
+        "Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
         "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
         "Preserve exact proper names and quoted terms from the evidence. For every supported claim, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
         "Keep grammatical or contextual misuse distinct from avoidance or prohibition: a statement that a term's use has not been grammatically or contextually correct is a usage-quality warning, not an instruction to avoid or ban that term. Never rewrite that warning as avoidance. An instruction to avoid an exact phrase applies only to that phrase; never generalize it to a broader word, term, subject, or concept.",
@@ -10715,7 +10905,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || "",
       chatContextPreflight: phase2Projection.telemetry,
       deepResearchAnalysis: deepAnalysis.telemetry,
+      evidenceAdequacy: evidenceAdequacy.telemetry,
+      deepResearchReasoning: deepResearchReasoning.telemetry,
       deepEvidenceExpansion: deepEvidenceExpansionTelemetry,
+      evidenceTelemetry: {
+        deliveredEvidenceCount: Number(citationResult.telemetry.deliveredEvidenceCount || 0),
+        selectedEvidenceCount: Number(evidenceAdequacy.telemetry.selectedEvidenceCount || 0),
+        citedEvidenceCount: Number(citationResult.telemetry.citedEvidenceCount || 0),
+        unusedEvidenceCount: Number(citationResult.telemetry.unusedEvidenceCount || 0),
+        unusedEvidenceIds: Array.isArray(citationResult.telemetry.unusedEvidenceIds) ? citationResult.telemetry.unusedEvidenceIds.slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS) : []
+      },
       webSearch: Object.assign({}, webSearchResult, { rawResponse: webSearchResult.rawResponse || null }),
       webSearchStatus: finalStatus,
       researchSave,
@@ -10871,7 +11070,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const backgroundCapability = aiCloudCapabilityMemoryState({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "background" });
     const cacheCapability = aiCloudCapabilityMemoryState({ provider: "openai", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "prompt-cache" });
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
-    const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls && cacheCapability.state !== "unsupported";
+    const usePromptCache = this.settings.enableProviderPromptCaching !== false && supportsPromptCacheControls && cacheCapability.state !== "unsupported";
     const useBackground = background !== false && backgroundCapability.state !== "unsupported";
     const contextPrefix = String(promptCachePrefix || "");
     const systemContent = [{
@@ -10924,6 +11123,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (cacheRejected) {
         delete compatibilityBody.prompt_cache_options;
         delete compatibilityBody.prompt_cache_key;
+        for (const message of Array.isArray(compatibilityBody.input) ? compatibilityBody.input : []) {
+          for (const content of Array.isArray(message?.content) ? message.content : []) {
+            if (content?.type === "input_text") delete content.prompt_cache_breakpoint;
+          }
+        }
       }
       response = await this.openaiResponsesRequest("POST", "/responses", compatibilityBody);
       compatibilityRetry = true;
@@ -10990,7 +11194,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return summary;
   }
 
-  async geminiResponse({ model, system, user, promptContextSuffix = "", jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", maxOutputTokens = 0, onUsage = null, attempt = null }) {
+  async geminiResponse({ model, system, user, promptContextSuffix = "", jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", maxOutputTokens = 0, onUsage = null, attempt = null }) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || STS_MULTI_PROVIDER.providerDefaultModel("gemini", "primary"));
     const requestProfile = geminiGenerateContentRequestProfile(modelId);
     const capabilityProfileRevision = requestProfile.id || "gemini-generate-content-v2";
@@ -10998,7 +11202,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const responseJsonSchemaCapability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: capabilityProfileRevision, operation, carrier: "responseJsonSchema" });
     const thinkingSupported = geminiExplicitThinkingSupport(this.settings, modelId);
     const generationConfig = {};
-    const geminiUser = [promptCachePrefix, providerContextSuffixJoin(promptContextSuffix, user)].filter(Boolean).join("\n\n");
+    const geminiUserSuffix = providerContextSuffixJoin(promptContextSuffix, user);
+    const geminiUser = [promptCachePrefix, geminiUserSuffix].filter(Boolean).join("\n\n");
+    const promptCacheRecord = await geminiPromptCacheAcquire({
+      modelId,
+      system,
+      prefix: promptCachePrefix,
+      requestKey: promptCacheKey,
+      settings: this.settings,
+      operation
+    });
+    let activeGeminiCacheName = promptCacheRecord.state === "ready" ? promptCacheRecord.name : "";
     if (reasoningConfig.gemini && thinkingSupported === true) generationConfig.thinkingConfig = reasoningConfig.gemini;
     if (Number.isSafeInteger(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) generationConfig.maxOutputTokens = Math.round(Number(maxOutputTokens));
     if (requestProfile.deprecatedSamplingFieldsOmitted) {
@@ -11021,11 +11235,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (preferredSchemaCarrier === "responseSchema") generationConfig.responseSchema = compatibleSchema;
       else generationConfig.responseJsonSchema = strictSchema;
     }
-    const requestBody = (config = generationConfig) => ({
-      systemInstruction: { parts: [{ text: system || "" }] },
-      contents: [{ role: "user", parts: [{ text: geminiUser }] }],
-      generationConfig: config
-    });
+    const requestBody = (config = generationConfig, cachedContentName = "") => cachedContentName
+      ? {
+        cachedContent: cachedContentName,
+        contents: [{ role: "user", parts: [{ text: geminiUserSuffix }] }],
+        generationConfig: config
+      }
+      : {
+        systemInstruction: { parts: [{ text: system || "" }] },
+        contents: [{ role: "user", parts: [{ text: geminiUser }] }],
+        generationConfig: config
+      };
     const logStructuredAttempt = (response, schemaProfile, responseField, retryReason, requestAttempt) => {
       if (!jsonSchema || typeof this.logLocal !== "function") return;
       const detail = response?.json?.error || {};
@@ -11064,7 +11284,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       return error;
     };
-    const requestGeminiTransport = async (config, schemaCarrier, requestAttempt = 1, allowTransientRetry = true) => {
+    const requestGeminiTransport = async (config, schemaCarrier, requestAttempt = 1, allowTransientRetry = true, cachedContentName = "") => {
       transientRetryState.requestCount = Math.max(transientRetryState.requestCount, requestAttempt);
       transientRetryState.schemaCarrier = schemaCarrier;
       let nextResponse;
@@ -11076,7 +11296,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             "x-goog-api-key": this.settings.googleApiKey,
             "content-type": "application/json"
           },
-          body: JSON.stringify(requestBody(config)),
+          body: JSON.stringify(requestBody(config, cachedContentName)),
           throw: false
         });
       } catch (error) {
@@ -11098,7 +11318,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           transientRetryState.retryReason = classification.reason;
           transientRetryState.retryOrdinal = 1;
           transientRetryState.requestError = false;
-          return requestGeminiTransport(config, schemaCarrier, requestAttempt + 1, false);
+          return requestGeminiTransport(config, schemaCarrier, requestAttempt + 1, false, cachedContentName);
         }
         throw attachGeminiTransientRetry(normalized);
       }
@@ -11120,7 +11340,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           transientRetryState.retryAttempted = true;
           transientRetryState.retryReason = classification.reason;
           transientRetryState.retryOrdinal = 1;
-          return requestGeminiTransport(config, schemaCarrier, requestAttempt + 1, false);
+          return requestGeminiTransport(config, schemaCarrier, requestAttempt + 1, false, cachedContentName);
         }
         throw attachGeminiTransientRetry(normalized);
       }
@@ -11138,7 +11358,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       return nextResponse;
     };
-    let response = await requestGeminiTransport(generationConfig, preferredSchemaCarrier, 1, true);
+    let response = await requestGeminiTransport(generationConfig, preferredSchemaCarrier, 1, true, activeGeminiCacheName);
+    let promptCacheInlineRetry = false;
+    if (activeGeminiCacheName && geminiPromptCacheRecordInvalidation(response)) {
+      promptCacheInlineRetry = true;
+      geminiPromptCacheRecords.delete(promptCacheRecord.key);
+      geminiPromptCacheRememberRecord(promptCacheRecord, "expired", "generate-record-invalidated");
+      activeGeminiCacheName = "";
+      response = await requestGeminiTransport(generationConfig, preferredSchemaCarrier, 1, true, "");
+    } else if (activeGeminiCacheName && geminiPromptCacheIncompatibility(response)) {
+      promptCacheInlineRetry = true;
+      aiCloudCapabilityRemember({ provider: "gemini", model: modelId, profileRevision: "gemini-cached-content-v1", operation, carrier: "prompt-cache" }, "unsupported");
+      geminiPromptCacheRememberRecord(promptCacheRecord, "bypass", "generate-unsupported");
+      activeGeminiCacheName = "";
+      response = await requestGeminiTransport(generationConfig, preferredSchemaCarrier, 1, true, "");
+    }
     const retryEligible = Boolean(jsonSchema
       && preferredSchemaCarrier === "responseJsonSchema"
       && !transientRetryState.retryAttempted
@@ -11152,7 +11386,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         responseJsonSchema: undefined,
         responseSchema: compatibleSchema
       });
-      response = await requestGeminiTransport(compatibleGenerationConfig, "responseSchema", 2, false);
+      response = await requestGeminiTransport(compatibleGenerationConfig, "responseSchema", 2, false, activeGeminiCacheName);
       logStructuredAttempt(response, "compatible-openapi-schema", "responseSchema", "compatible-schema-retry", 2);
     }
     if (response.status < 200 || response.status >= 300) {
@@ -11172,7 +11406,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       responseError.providerError.retryable = transient;
       throw attachGeminiTransientRetry(responseError);
     }
-    const usageSummary = attempt?.timedOut ? null : this.recordAiTokenUsage(operation, model, response.json?.usageMetadata || {}, "gemini");
+    const usageMetadata = Object.assign({}, response.json?.usageMetadata || {});
+    if (promptCacheRecord.state === "ready" && !promptCacheRecord.writeReported && promptCacheRecord.writeTokens > 0) {
+      usageMetadata.cacheWriteTokens = promptCacheRecord.writeTokens;
+      promptCacheRecord.writeReported = true;
+    }
+    const usageSummary = attempt?.timedOut ? null : this.recordAiTokenUsage(operation, model, usageMetadata, "gemini");
     if (usageSummary && typeof onUsage === "function") {
       try { onUsage(usageSummary); } catch {}
     }
@@ -11210,6 +11449,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         schemaCapabilityState: (preferredSchemaCarrier === "responseSchema" ? responseSchemaCapability : responseJsonSchemaCapability).state,
         schemaCapabilityProfileRevision: capabilityProfileRevision,
         thinkingCapabilityState: thinkingSupported === true ? "supported" : thinkingSupported === false ? "unsupported" : "unknown",
+        promptCacheRequested: Boolean(promptCacheKey && promptCachePrefix),
+        promptCacheEnabled: Boolean(activeGeminiCacheName || promptCacheRecord.created || promptCacheRecord.reused),
+        promptCacheCreateCount: Number(promptCacheRecord.createCount || 0),
+        promptCacheReused: Boolean(promptCacheRecord.reused),
+        promptCacheBypassReason: String(promptCacheRecord.reason || ""),
+        promptCacheEstimatedPrefixTokens: Number(promptCacheRecord.estimatedTokens || 0),
+        promptCacheExpirySource: String(promptCacheRecord.expirySource || ""),
+        promptCacheExpiresInMs: Math.max(0, Number(promptCacheRecord.expiresAtMs || 0) - Date.now()),
+        promptCacheNameHash: String(promptCacheRecord.nameHash || ""),
+        promptCacheActualCachedInputTokens: Number(response.json?.usageMetadata?.cachedContentTokenCount || 0),
+        promptCacheActualHit: Number(response.json?.usageMetadata?.cachedContentTokenCount || 0) > 0,
+        promptCacheInlineRetry,
         ...(transientProviderRetry ? geminiTransientRetryTelemetry(transientRetryState) : {})
       }
     };
@@ -17716,20 +17967,29 @@ class SemanticTodoistView extends ItemView {
     if (!this.relevantEl) return;
     this.relevantEl.empty();
     this.relevantEl.createEl("strong", { text: "Relevant notes" });
-    const uniqueChunks = uniqueChunksByPath(chunks);
-    if (!uniqueChunks.length) {
+    const resolvedPaths = new Set();
+    const relevantFiles = [];
+    for (const chunk of Array.isArray(chunks) ? chunks : []) {
+      const candidatePath = String(chunk?.path || "").trim();
+      if (!candidatePath) continue;
+      const file = this.plugin.app.vault.getAbstractFileByPath(candidatePath);
+      if (!(file instanceof TFile) || String(file.extension || "").toLowerCase() !== "md") continue;
+      const resolvedPath = String(file.path || candidatePath);
+      if (!resolvedPath || resolvedPaths.has(resolvedPath)) continue;
+      resolvedPaths.add(resolvedPath);
+      relevantFiles.push(file);
+      if (relevantFiles.length >= 4) break;
+    }
+    if (!relevantFiles.length) {
       this.relevantEl.createDiv({ text: "No relevant notes found." });
       return;
     }
     const tabs = this.relevantEl.createDiv({ cls: "semantic-todoist-source-tabs" });
-    for (const chunk of uniqueChunks.slice(0, 4)) {
+    for (const file of relevantFiles) {
       const card = tabs.createDiv({ cls: "semantic-todoist-source-card" });
-      card.setText(chunk.title || chunk.path);
-      card.title = chunk.path;
-      card.onclick = () => {
-        const file = this.plugin.app.vault.getAbstractFileByPath(chunk.path);
-        if (file instanceof TFile) this.plugin.app.workspace.getLeaf(true).openFile(file);
-      };
+      card.setText(file.basename || file.path);
+      card.title = file.path;
+      card.onclick = () => this.plugin.app.workspace.getLeaf(true).openFile(file);
     }
   }
 
@@ -18061,7 +18321,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     settingsHeading(containerEl, "Advanced AI behavior", "Configure reasoning, fallback notices, optimization, and provider prompt caching.");
     toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
     toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls; keep your selected level for chat, tasks, and descriptions.", this.plugin, "optimizeStructuredAiUsage");
-    toggleSetting(containerEl, "Enable provider prompt caching", "Cache stable instructions when the selected provider supports it. Note, email, and vault content stays outside the cached portion.", this.plugin, "enableOpenAiPromptCaching");
+    toggleSetting(containerEl, "Enable provider prompt caching", "One global cloud-provider caching switch. Where supported, short-lived request-scoped repeated evidence or instructions may be cached; turning this off disables provider cache reads and writes.", this.plugin, "enableProviderPromptCaching");
     numberSetting(containerEl, "Runtime work coordinator workers", this.plugin, "runtimeWorkerCount");
     numberSetting(containerEl, "Same-model AI call concurrency", this.plugin, "aiModelConcurrency");
 
@@ -19157,7 +19417,7 @@ const SETTING_DESCRIPTIONS = {
   chatFallbackReasoningEffort: "Controls the fallback model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   openwebuiThinkingMode: "Controls the native OpenWebUI/Ollama thinking carrier when the exact model advertises thinking. Enabled sends think: true; Model default omits every think field and leaves the model/server default unchanged.",
   optimizeStructuredAiUsage: "Reduces reasoning-token usage for simple scheduler and policy calls while preserving the selected reasoning effort for chat, task extraction, and descriptions. AI duplicate checks use their own reasoning setting.",
-  enableOpenAiPromptCaching: "Enabled by default. Uses explicit provider caching where supported for stable structured-output schemas and system instructions only. Dynamic user, note, email, vault, and Todoist context remains outside the cached portion. Turning this off disables cache reads and writes.",
+  enableProviderPromptCaching: "Enabled by default. One global cloud-provider caching switch: where supported, short-lived request-scoped repeated evidence or instructions may be cached. Turning this off disables provider cache reads and writes; cache scope remains provider-controlled.",
   enableAiModelFallback: "Global gate for generation operations. When off, generation stays primary-only while saved generation fallback provider/model selections are preserved.",
   enableEmbeddingFallback: "Independent embedding fallback gate. When off, embeddings stay primary-only while any saved explicit embedding fallback provider/model selection is preserved.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
@@ -19305,6 +19565,58 @@ function normalizeWebSearchMode(value) {
   return WEB_SEARCH_MODE_VALUES.includes(normalized) ? normalized : "off";
 }
 
+function webSearchModeProfile(value) {
+  return WEB_SEARCH_MODE_PROFILES[normalizeWebSearchMode(value) === "deep" ? "deep" : "concise"];
+}
+
+function webResearchEvidenceRuleInstruction() {
+  return "Research-evidence rule: identify what evidence would prove the user's proposition. Use authoritative or first-party sources for identity and current facts. For reach, sharing, uptake, adoption, reception, or impact, deliberately seek independently published corroboration across distinct source families. Distinct domains are prioritization metadata, not proof of independence. Organization-owned or self-published publication can establish offerings and current facts, but first-party publication alone cannot establish broad external reach; if corroboration is absent, make that limitation clear.";
+}
+
+function webResearchClaimCalibrationInstruction() {
+  return "Claim-calibration rule: breadth, frequency, and intensity modifiers such as widely, broadly, regularly, frequently, substantial, most, or typical require direct proportional evidence across the claimed scope; isolated examples, one recipient, one source, or a handful of instances cannot prove them. Absence and comparative claims require direct evidence for the relevant population, period, or comparator; never infer not, none, no other, only, more, or less from unrelated popular examples or a narrow source set. First-party identity or self-publication proves existence, authorship, or a current offering only; it does not prove independent reach, sharing, uptake, adoption, reception, impact, or frequency. When coverage is partial, say that the supplied evidence does not establish the proposition; do not turn missing evidence into a factual claim that the real-world phenomenon is absent, limited, mostly confined, or exclusive. Answer the user's exact question or decision directly, and when the closed ledger does not establish the requested breadth, frequency, absence, or comparison, state that limitation and mark coverage partial or unresolved instead of supplying a stronger conclusion.";
+}
+
+function webSearchFinalEvidenceAuthorityInstructions(webSearchEnabled = false) {
+  if (!webSearchEnabled) {
+    return [
+      "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
+      "Treat the active note as the primary supplied evidence. Set established=true only when a vault-specific claim is supported by one or more supplied evidence_ids. General reasoning, advice, greetings, and explanations may use category=conversation with established=false and no evidence_ids; do not present those as vault facts.",
+      "Support each factual claim with one specific supplied note or task record."
+    ];
+  }
+  return [
+    "When Internet Search is enabled, vault and active-note evidence remain authoritative for the user's recorded context and disambiguation, while grounded admitted web-* rows are authoritative citable evidence for external facts.",
+    "For user-recorded vault facts, use active note and ranked vault evidence first. For external propositions, answer from supplied admitted web evidence when exact web-* evidence_ids support it: set established=true and cite those exact IDs even when the vault does not establish the proposition. Do not reject an externally supported proposition merely because vault evidence is silent; state a limitation only when the admitted web evidence still does not establish it.",
+    "Support each factual claim with one specific supplied evidence item from the appropriate lane: a note or task record for recorded vault facts, or an admitted web source for grounded external facts."
+  ];
+}
+
+function webResearchIntentPlan(prompt = "") {
+  const boundedPrompt = redactWebContext(prompt).slice(0, webSearchModeProfile("deep").maxQueryChars);
+  const directExternalMarkers = /\b(?:reach(?:ed|es|ing)?|uptake|adopt(?:ed|ion|ing)?|reception|impact|influence|engagement|news\s+coverage|public\s+discussion|community\s+(?:response|discussion)|disseminat(?:e|ion)|spread|distribution)\b/i;
+  const qualifiedSharingMarker = /\b(?:(?:widely|broadly|publicly|externally)(?:\s+\w+){0,6}\s+(?:shared?|sharing|distributed|disseminated)|(?:shared?|sharing|distributed|disseminated)(?:\s+\w+){0,6}\s+(?:widely|broadly|publicly|externally))\b/i;
+  const requiresExternalCorroboration = directExternalMarkers.test(boundedPrompt) || qualifiedSharingMarker.test(boundedPrompt);
+  return Object.freeze({
+    requiresExternalCorroboration,
+    targetSourceFamilyCount: requiresExternalCorroboration ? 2 : 0
+  });
+}
+
+function normalizeWebResearchIntent(value = null, fallbackPrompt = "") {
+  const fallback = webResearchIntentPlan(fallbackPrompt);
+  const requiresExternalCorroboration = value?.requiresExternalCorroboration === true || fallback.requiresExternalCorroboration;
+  return Object.freeze({
+    requiresExternalCorroboration,
+    targetSourceFamilyCount: requiresExternalCorroboration ? 2 : 0
+  });
+}
+
+function webResearchCorroborationLaneInstruction(intent = {}) {
+  if (intent?.requiresExternalCorroboration !== true) return "";
+  return "Corroboration plan for this reach/sharing/uptake/adoption/reception/impact question: use two complementary lanes in this same initial request. Lane A: identify the exact subject or program names and establish current identity and first-party facts. Lane B: search those exact names for independently published recipient, partner, university, funder, professional-association, news, community, or public-discussion evidence. Do not stop after organization-owned results while lane B is unanswered; first-party pages may disambiguate names but cannot prove broad reach.";
+}
+
 function webSearchModeLabel(value) {
   const mode = normalizeWebSearchMode(value);
   return mode === "deep" ? "Deep Research ON" : mode === "concise" ? "Internet Search ON" : "Internet Search OFF";
@@ -19349,7 +19661,106 @@ function canonicalWebSearchUrl(value) {
   }
 }
 
-function boundedWebExcerpt(value, maxChars = WEB_SEARCH_MAX_EVIDENCE_CHARS) {
+function normalizeWebSourceFamily(value) {
+  const raw = String(value || "").trim();
+  const url = canonicalWebSearchUrl(raw);
+  try {
+    const hostname = url
+      ? new URL(url).hostname.toLowerCase().replace(/^www\./, "")
+      : /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::\d{1,5})?$/i.test(raw)
+        ? raw.toLowerCase().replace(/^www\./, "").replace(/:\d{1,5}$/, "")
+        : "";
+    if (!hostname) return "";
+    const labels = hostname.split(".").filter(Boolean);
+    if (labels.length <= 2) return hostname;
+    const suffix = labels.slice(-2).join(".");
+    const multiLabelPublicSuffixes = new Set([
+      "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "edu.au",
+      "co.nz", "com.br", "com.cn", "co.jp", "co.in", "com.mx", "co.za", "com.tr",
+      "com.sg", "co.kr", "github.io", "vercel.app", "netlify.app", "pages.dev"
+    ]);
+    return labels.slice(-(multiLabelPublicSuffixes.has(suffix) ? 3 : 2)).join(".");
+  } catch {
+    return "";
+  }
+}
+
+function webSearchDomain(value) {
+  const url = canonicalWebSearchUrl(value);
+  if (!url) return "";
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function geminiGroundingPublisherDomain(url, title = "") {
+  const canonical = canonicalWebSearchUrl(url);
+  if (!canonical) return "";
+  try {
+    const parsed = new URL(canonical);
+    if (parsed.protocol !== "https:" || parsed.hostname !== "vertexaisearch.cloud.google.com" || !/^\/grounding-api-redirect(?:\/|$)/.test(parsed.pathname)) return "";
+  } catch {
+    return "";
+  }
+  const rawTitle = String(title || "");
+  if (!rawTitle || rawTitle !== rawTitle.trim() || /\s/.test(rawTitle)) return "";
+  const normalized = rawTitle.toLowerCase().replace(/^www\./, "");
+  if (!normalized || normalized.length > 253 || !normalized.includes(".")) return "";
+  const labels = normalized.split(".");
+  if (labels.length < 2 || labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return "";
+  const topLevel = labels[labels.length - 1];
+  if (!/^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/.test(topLevel)) return "";
+  return normalized;
+}
+
+function boundedCitationContext(value, startIndex = 0, endIndex = 0, maxChars = webSearchModeProfile("deep").maxEvidenceChars) {
+  const text = String(value || "").replace(/\r\n?/g, "\n");
+  if (!text.trim()) return "";
+  const start = Math.max(0, Math.min(text.length, Number.isFinite(Number(startIndex)) ? Number(startIndex) : 0));
+  const end = Math.max(start, Math.min(text.length, Number.isFinite(Number(endIndex)) ? Number(endIndex) : start));
+  const paragraphBoundary = text.lastIndexOf("\n\n", Math.max(0, start - 1));
+  const paragraphStart = paragraphBoundary >= 0 ? paragraphBoundary + 2 : 0;
+  const paragraphBreak = text.indexOf("\n\n", end);
+  const paragraphEnd = paragraphBreak >= 0 ? paragraphBreak : text.length;
+  let contextStart = paragraphStart;
+  let contextEnd = paragraphEnd;
+  if (contextEnd - contextStart > maxChars * 2) {
+    const sentencePattern = /[.!?](?:\s+|$)/g;
+    let sentenceStart = paragraphStart;
+    let sentenceEnd = paragraphEnd;
+    let match;
+    while ((match = sentencePattern.exec(text))) {
+      const boundary = match.index + match[0].length;
+      if (boundary <= start) sentenceStart = boundary;
+      if (match.index >= end) {
+        sentenceEnd = match.index + 1;
+        break;
+      }
+    }
+    contextStart = sentenceStart;
+    contextEnd = sentenceEnd;
+  }
+  const scoped = text.slice(contextStart, contextEnd).replace(/\s+/g, " ").trim();
+  if (scoped.length <= maxChars) return scoped;
+  const anchorStart = Math.max(0, start - contextStart);
+  const anchorEnd = Math.max(anchorStart, end - contextStart);
+  const windowStart = Math.max(0, Math.min(scoped.length - maxChars, anchorStart - Math.floor(maxChars / 3)));
+  const windowEnd = Math.min(scoped.length, Math.max(windowStart + maxChars, anchorEnd + Math.floor(maxChars / 3)));
+  return truncateAtWord(scoped.slice(windowStart, windowEnd), maxChars);
+}
+
+function citationExcerpt(text, citation, maxChars = webSearchModeProfile("deep").maxEvidenceChars) {
+  const supplied = [citation?.content, citation?.excerpt, citation?.text]
+    .find((value) => typeof value === "string" && value.trim());
+  if (supplied) return String(supplied).trim();
+  const start = Number(citation?.start_index ?? citation?.startIndex ?? 0);
+  const end = Number(citation?.end_index ?? citation?.endIndex ?? String(text || "").length);
+  return boundedCitationContext(text, start, end, maxChars);
+}
+
+function boundedWebExcerpt(value, maxChars = webSearchModeProfile("concise").maxEvidenceChars) {
   return truncateAtWord(stripExcludedLinks(redactWebContext(value).replace(/\s+/g, " ").trim()), maxChars);
 }
 
@@ -19357,14 +19768,21 @@ function buildWebSearchRequest(options = {}) {
   const provider = normalizeWebSearchProvider(options.provider);
   const model = normalizeWebSearchModel(options.model, provider);
   const mode = normalizeWebSearchMode(options.mode);
+  const profile = webSearchModeProfile(mode);
   const prompt = String(options.prompt || "");
-  const searchPrompt = truncateAtWord(redactWebContext(prompt), WEB_SEARCH_MAX_QUERY_CHARS);
+  const searchPrompt = truncateAtWord(redactWebContext(prompt), profile.maxQueryChars);
   const active = options.active && typeof options.active === "object" ? options.active : {};
-  const activeText = boundedWebExcerpt(active.selection || active.text || "", WEB_SEARCH_MAX_ACTIVE_CHARS);
-  const context = (Array.isArray(options.context) ? options.context : []).slice(0, 4).map((row) => ({
+  const activeText = boundedWebExcerpt(active.selection || active.text || "", profile.maxActiveChars);
+  const context = (Array.isArray(options.context) ? options.context : []).slice(0, profile.maxLocalEvidenceRows).map((row) => ({
     title: redactWebContext(singleLine(row?.title || row?.path || "")).slice(0, 160),
-    excerpt: boundedWebExcerpt(row?.text || row?.excerpt || row?.content || "", WEB_SEARCH_MAX_EVIDENCE_CHARS)
+    excerpt: boundedWebExcerpt(row?.text || row?.excerpt || row?.content || "", profile.maxEvidenceChars)
   })).filter((row) => row.title || row.excerpt);
+  const researchIntent = webResearchIntentPlan(searchPrompt);
+  const minimumQueries = mode === "deep" ? 3 : 2;
+  const maximumQueries = profile.maxQueries;
+  const queryRange = `exactly ${minimumQueries} or ${maximumQueries}`;
+  const searchInstruction = `${mode === "deep" ? "Deep Research" : "Internet Search"} is enabled: execute the best single vault-informed native web search before answering; do not answer from model memory alone. Within this one provider request, issue ${queryRange} complementary provider-native searches when that control is exposed, never fewer than ${minimumQueries} and never more than ${maximumQueries}; stop searching after ${maximumQueries}. Cover every material facet without follow-up requests. Return at most ${profile.maxResults} safe useful sources.`;
+  const researchEvidencePlan = [webResearchEvidenceRuleInstruction(), webResearchClaimCalibrationInstruction(), webResearchCorroborationLaneInstruction(researchIntent)].filter(Boolean).join(" ");
   const request = {
     provider,
     model,
@@ -19374,20 +19792,31 @@ function buildWebSearchRequest(options = {}) {
     activeSource: activeText ? { title: redactWebContext(singleLine(active.title || active.path || "")).slice(0, 160), excerpt: activeText } : null,
     localEvidence: context,
     constraints: {
-      searchContextSize: WEB_SEARCH_SEARCH_CONTEXT_SIZE,
-      maxQueries: 3,
-      maxResults: WEB_SEARCH_MAX_RESULTS
-    }
+      searchContextSize: profile.searchContextSize,
+      thinkingEffort: profile.thinkingEffort,
+      minQueries: minimumQueries,
+      maxQueries: profile.maxQueries,
+      maxResults: profile.maxResults,
+      maxOutputTokens: profile.maxOutputTokens,
+      maxQueryChars: profile.maxQueryChars,
+      maxActiveChars: profile.maxActiveChars,
+      maxEvidenceChars: profile.maxEvidenceChars,
+      maxRequestChars: profile.maxRequestChars
+    },
+    researchIntent,
+    researchEvidencePlan
   };
   request.query = [
-    `${mode === "deep" ? "Deep Research" : "Internet Search"} is enabled: execute the best single vault-informed native web search before answering; do not answer from model memory alone. Use at most three provider-native searches only when material ambiguity, a missing authoritative source, or a distinct required subquestion remains. Return at most five safe useful sources across those searches.`,
+    searchInstruction,
+    researchEvidencePlan,
     "The bounded user request is:", searchPrompt,
     activeText ? `Active source context:\n${activeText}` : "",
     context.length ? `Admitted local evidence:\n${context.map((row) => `- ${row.title}: ${row.excerpt}`).join("\n")}` : ""
   ].filter(Boolean).join("\n\n");
-  if (request.query.length > WEB_SEARCH_MAX_REQUEST_CHARS) {
+  if (request.query.length > profile.maxRequestChars) {
     request.query = [
-      `${mode === "deep" ? "Deep Research" : "Internet Search"} is enabled: execute the best single vault-informed native web search before answering; do not answer from model memory alone. Use at most three provider-native searches only when material ambiguity, a missing authoritative source, or a distinct required subquestion remains. Return at most five safe useful sources across those searches.`,
+      searchInstruction,
+      researchEvidencePlan,
       "The bounded user request is:", searchPrompt,
       activeText ? `Active source context:\n${activeText.slice(0, 600)}` : "",
       context.length ? `Admitted local evidence:\n${context.slice(0, 1).map((row) => `- ${row.title}: ${row.excerpt.slice(0, 240)}`).join("\n")}` : ""
@@ -19397,10 +19826,11 @@ function buildWebSearchRequest(options = {}) {
 }
 
 function buildDeepWebLocalRetrievalQuery(prompt = "", webEvidenceRows = []) {
+  const profile = webSearchModeProfile("deep");
   const titles = uniqueValues((Array.isArray(webEvidenceRows) ? webEvidenceRows : [])
     .map((row) => redactWebContext(singleLine(row?.title || "")).slice(0, 160))
-    .filter(Boolean)).slice(0, WEB_SEARCH_MAX_RESULTS);
-  return [redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS), titles.length ? `Web source titles:\n${titles.map((title) => `- ${title}`).join("\n")}` : ""]
+    .filter(Boolean)).slice(0, profile.maxResults);
+  return [redactWebContext(prompt).slice(0, profile.maxQueryChars), titles.length ? `Web source titles:\n${titles.map((title) => `- ${title}`).join("\n")}` : ""]
     .filter(Boolean)
     .join("\n\n");
 }
@@ -19438,6 +19868,7 @@ function mergeDeepWebLocalContext(baseContext = [], deepContext = []) {
 }
 
 function buildDeepEvidenceExpansionVaultQuery(prompt = "", vaultQueries = []) {
+  const profile = webSearchModeProfile("deep");
   const requests = (Array.isArray(vaultQueries) ? vaultQueries : [])
     .map((value) => redactWebContext(value).trim())
     .filter(Boolean)
@@ -19445,72 +19876,25 @@ function buildDeepEvidenceExpansionVaultQuery(prompt = "", vaultQueries = []) {
   if (!requests.length) return "";
   return truncateAtWord([
     "Deep Research local evidence follow-up. Retrieve only unresolved vault evidence needed for the original request.",
-    `Original user request: ${redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS)}`,
+    `Original user request: ${redactWebContext(prompt).slice(0, profile.maxQueryChars)}`,
     `Unresolved vault questions:\n${requests.map((value) => `- ${value.slice(0, 240)}`).join("\n")}`
-  ].join("\n\n"), WEB_SEARCH_MAX_REQUEST_CHARS);
-}
-
-function buildDeepEvidenceExpansionWebQuery({ prompt = "", webQueries = [], webEvidenceRows = [] } = {}) {
-  const requests = (Array.isArray(webQueries) ? webQueries : [])
-    .map((value) => redactWebContext(value).trim())
-    .filter(Boolean)
-    .slice(0, 2);
-  if (!requests.length) return "";
-  const titles = uniqueValues((Array.isArray(webEvidenceRows) ? webEvidenceRows : [])
-    .map((row) => redactWebContext(singleLine(row?.title || "")).slice(0, 160))
-    .filter(Boolean)).slice(0, WEB_SEARCH_MAX_RESULTS);
-  return truncateAtWord([
-    "Deep Research web evidence follow-up. Search only the unresolved subquestions below; do not answer from model memory.",
-    `Original user request: ${redactWebContext(prompt).slice(0, WEB_SEARCH_MAX_QUERY_CHARS)}`,
-    `Unresolved web questions:\n${requests.map((value) => `- ${value.slice(0, 240)}`).join("\n")}`,
-    titles.length ? `Admitted source titles (titles only):\n${titles.map((title) => `- ${title}`).join("\n")}` : ""
-  ].filter(Boolean).join("\n\n"), WEB_SEARCH_MAX_REQUEST_CHARS);
-}
-
-function admitDeepWebExpansionRows(initialRows = [], candidates = [], maxRows = 3) {
-  const initial = Array.isArray(initialRows) ? initialRows : [];
-  const rows = [];
-  const seenUrls = new Set(initial.map((row) => canonicalWebSearchUrl(row?.url)).filter(Boolean));
-  let duplicateCount = 0;
-  let capDroppedCount = 0;
-  for (const candidate of Array.isArray(candidates) ? candidates : []) {
-    const url = canonicalWebSearchUrl(candidate?.url);
-    if (!url || seenUrls.has(url)) {
-      if (url && seenUrls.has(url)) duplicateCount += 1;
-      continue;
-    }
-    if (rows.length >= Math.max(0, Math.min(3, Number(maxRows) || 0))) {
-      capDroppedCount += 1;
-      continue;
-    }
-    seenUrls.add(url);
-    const evidenceId = `web-followup-${rows.length + 1}`;
-    rows.push(Object.assign({}, candidate, {
-      evidenceId,
-      sourceId: url,
-      url,
-      expansion: true,
-      text: candidate.excerpt,
-      evidenceText: candidate.excerpt,
-      role: "Internet Search follow-up source",
-      required: true,
-      markdown: `[${markdownLinkText(candidate.title)}](${url})`
-    }));
-  }
-  return { rows, duplicateCount, capDroppedCount };
+  ].join("\n\n"), profile.maxRequestChars);
 }
 
 function buildDeepResearchExpansionSuffix(rows = [], maxChars = 7000) {
   const entries = (Array.isArray(rows) ? rows : []).filter((row) => row && typeof row === "object");
   if (!entries.length) return "";
-  const lines = ["Deep Research expansion evidence admitted after phase 1:"];
+  const lines = ["Research expansion evidence admitted after phase 1:"];
   for (const row of entries) {
     const id = String(row.evidenceId || "").trim();
     if (!id) continue;
     const title = singleLine(redactWebContext(row.title || row.path || row.sourceId || "")).slice(0, 180);
     const text = boundedWebExcerpt(row.text || row.evidenceText || row.excerpt || row.content || "", 560);
-    const source = canonicalWebSearchUrl(row.url) || vaultRelativePath(row.path || "");
-    lines.push(`- evidence_id=${id}; title=${title}; source=${source}; text=${text}`);
+    const sourceKind = singleLine(row.sourceKind || row.provenance?.sourceKind || "").slice(0, 80);
+    const sourceFamily = singleLine(row.sourceFamily || row.provenance?.sourceFamily || "").slice(0, 80);
+    const domain = singleLine(row.domain || row.provenance?.domain || "").slice(0, 120);
+    const path = vaultRelativePath(row.path || "");
+    lines.push(`- evidence_id=${id}; title=${title}; source_kind=${sourceKind}; source_family=${sourceFamily}; domain=${domain}; path=${path}; text=${text}`);
   }
   return truncateAtWord(lines.join("\n"), maxChars);
 }
@@ -19523,11 +19907,11 @@ function appendDeepResearchExpansionProjection(projection, { sourceLedger = [], 
   const suffix = buildDeepResearchExpansionSuffix(expansionRows);
   const telemetry = Object.assign({}, source.telemetry || {}, {
     promptCachePrefix: providerContextProjectionMetrics(source.promptCachePrefix || ""),
-    promptContextSuffix: providerContextProjectionMetrics(""),
+    promptContextSuffix: providerContextProjectionMetrics(suffix),
     promptCachePrefixHash: providerContextProjectionHash(source.promptCachePrefix || ""),
     promptContextSuffixHash: providerContextProjectionHash(""),
     promptCachePrefixBytes: utf8ByteLength(source.promptCachePrefix || ""),
-    promptContextSuffixBytes: 0,
+    promptContextSuffixBytes: utf8ByteLength(suffix),
     deepResearchExpansionSuffix: providerContextProjectionMetrics(suffix),
     deepResearchExpansionSuffixHash: providerContextProjectionHash(suffix)
   });
@@ -19535,7 +19919,7 @@ function appendDeepResearchExpansionProjection(projection, { sourceLedger = [], 
     sourceLedger: Object.freeze(nextLedger),
     allowedEvidenceIds: Object.freeze(nextAllowedIds),
     user: "",
-    promptContextSuffix: "",
+    promptContextSuffix: suffix,
     telemetry: Object.freeze(telemetry)
   }));
 }
@@ -19636,33 +20020,56 @@ function normalizeWebSearchUsage(provider, response = {}) {
   return { inputTokens, outputTokens, totalTokens, searchRequests, provider: normalizedProvider };
 }
 
-function normalizeWebEvidenceRows(provider, model, candidates = [], settings = DEFAULT_SETTINGS) {
+function normalizeWebEvidenceRows(provider, model, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
+  const profile = webSearchModeProfile(options?.mode);
+  const normalizedProvider = normalizeWebSearchProvider(provider);
   const rows = [];
+  const safeCandidates = [];
   const seen = new Set();
   const reasons = {};
   const reject = (code) => { reasons[code] = Number(reasons[code] || 0) + 1; };
   for (const candidate of Array.isArray(candidates) ? candidates : []) {
     const url = canonicalWebSearchUrl(candidate?.url || candidate?.uri);
     if (!url) { reject("missing-or-unsafe-url"); continue; }
-    if (isExcludedUrl(url, settings)) { reject("excluded-domain"); continue; }
+    const groundingPublisherDomain = normalizedProvider === "gemini" ? geminiGroundingPublisherDomain(url, candidate?.title) : "";
+    if (isExcludedUrl(url, settings) || (groundingPublisherDomain && isExcludedUrl(`https://${groundingPublisherDomain}`, settings))) { reject("excluded-domain"); continue; }
     if (seen.has(url)) { reject("duplicate-url"); continue; }
-    const excerpt = boundedWebExcerpt(candidate?.excerpt || candidate?.text || "");
+    const excerpt = boundedWebExcerpt(candidate?.excerpt || candidate?.text || "", profile.maxEvidenceChars);
     if (!excerpt) { reject("missing-grounding-support"); continue; }
+    const domain = groundingPublisherDomain || webSearchDomain(url);
+    const sourceFamily = groundingPublisherDomain ? normalizeWebSourceFamily(groundingPublisherDomain) : normalizeWebSourceFamily(url);
+    if (!sourceFamily) { reject("missing-source-family"); continue; }
     seen.add(url);
-    rows.push(Object.freeze({
-      evidenceId: `web-${rows.length + 1}`,
-      sourceKind: "web",
-      epistemicStatus: "external",
-      provider: normalizeWebSearchProvider(provider),
+    safeCandidates.push({
+      provider: normalizedProvider,
       model: String(model || ""),
       url,
+      domain,
+      sourceFamily,
       title: singleLine(candidate?.title || url).slice(0, 240),
       excerpt
-    }));
-    if (rows.length >= WEB_SEARCH_MAX_RESULTS) break;
+    });
   }
-  if (rows.length >= WEB_SEARCH_MAX_RESULTS && (Array.isArray(candidates) ? candidates.length : 0) > rows.length) reject("max-results");
-  return { rows, reasons };
+  const firstByFamily = [];
+  const repeatedFamily = [];
+  const admittedFamilies = new Set();
+  for (const candidate of safeCandidates) {
+    if (admittedFamilies.has(candidate.sourceFamily)) repeatedFamily.push(candidate);
+    else {
+      admittedFamilies.add(candidate.sourceFamily);
+      firstByFamily.push(candidate);
+    }
+  }
+  const ordered = [...firstByFamily, ...repeatedFamily];
+  const admitted = ordered.slice(0, profile.maxResults);
+  for (const candidate of admitted) rows.push(Object.freeze(Object.assign({}, candidate, {
+    evidenceId: `web-${rows.length + 1}`,
+    sourceKind: "web",
+    epistemicStatus: "external"
+  })));
+  if (admitted.length >= profile.maxResults && ordered.length > admitted.length) reject("max-results");
+  const distinctSourceFamilyCount = new Set(rows.map((row) => row.sourceFamily).filter(Boolean)).size;
+  return { rows, reasons, distinctSourceFamilyCount, repeatedSourceFamilyCount: Math.max(0, rows.length - distinctSourceFamilyCount) };
 }
 
 function extractGeminiWebEvidence(response = {}) {
@@ -19690,9 +20097,7 @@ function extractOpenAIWebEvidence(response = {}) {
     for (const annotation of Array.isArray(content?.annotations) ? content.annotations : []) {
       const citation = annotation?.url_citation || annotation;
       if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
-      const start = Number(citation?.start_index ?? citation?.startIndex ?? 0);
-      const end = Number(citation?.end_index ?? citation?.endIndex ?? text.length);
-      candidates.push({ url: citation?.url, title: citation?.title, excerpt: text.slice(Math.max(0, start), Math.max(start, end)) || text });
+      candidates.push({ url: citation?.url, title: citation?.title, excerpt: citationExcerpt(text, citation) });
     }
   }
   const queryCount = output.filter((item) => String(item?.type || "").toLowerCase() === "web_search_call").length;
@@ -19706,9 +20111,7 @@ function extractOpenRouterWebEvidence(response = {}) {
   for (const annotation of Array.isArray(message?.annotations) ? message.annotations : []) {
     const citation = annotation?.url_citation || annotation;
     if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
-    const start = Number(citation?.start_index ?? citation?.startIndex ?? 0);
-    const end = Number(citation?.end_index ?? citation?.endIndex ?? text.length);
-    candidates.push({ url: citation?.url, title: citation?.title, excerpt: text.slice(Math.max(0, start), Math.max(start, end)) || text });
+    candidates.push({ url: citation?.url, title: citation?.title, excerpt: citationExcerpt(text, citation) });
   }
   return { candidates, queryCount: Number(response?.usage?.server_tool_use?.web_search_requests || 0) };
 }
@@ -21512,7 +21915,9 @@ function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS, allowedEvidenc
   };
 }
 
-function deepResearchAnalysisSchema(allowedEvidenceIds = []) {
+function deepResearchAnalysisSchema(allowedEvidenceIds = [], options = {}) {
+  const deepMode = String(options.mode || "deep").trim().toLowerCase() === "deep";
+  const minimumFindings = deepMode ? 3 : 1;
   const allowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
     .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
   const idArray = (maxItems, description) => ({
@@ -21527,16 +21932,17 @@ function deepResearchAnalysisSchema(allowedEvidenceIds = []) {
     properties: {
       findings: {
         type: "array",
-        minItems: 1,
+        minItems: minimumFindings,
         maxItems: 5,
         items: {
           type: "object",
           additionalProperties: false,
           properties: {
             text: { type: "string", minLength: 1, maxLength: 1200 },
+            ...(deepMode ? { status: { type: "string", enum: ["supported", "partial", "contradicted", "unresolved"] } } : {}),
             evidence_ids: idArray(CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM, "Exact IDs from the closed evidence ledger supporting this finding.")
           },
-          required: ["text", "evidence_ids"]
+          required: deepMode ? ["text", "status", "evidence_ids"] : ["text", "evidence_ids"]
         }
       },
       selected_evidence_ids: idArray(CHAT_PROVIDER_MAX_EVIDENCE_ROWS, "Exact ledger IDs to retain for final answer composition."),
@@ -21546,7 +21952,7 @@ function deepResearchAnalysisSchema(allowedEvidenceIds = []) {
         additionalProperties: false,
         properties: {
           vault_queries: { type: "array", minItems: 0, maxItems: 2, items: { type: "string", minLength: 1, maxLength: 240 } },
-          web_queries: { type: "array", minItems: 0, maxItems: 2, items: { type: "string", minLength: 1, maxLength: 240 } }
+          web_queries: { type: "array", minItems: 0, maxItems: 0, items: { type: "string", minLength: 1, maxLength: 240 } }
         },
         required: ["vault_queries", "web_queries"]
       }
@@ -21560,8 +21966,8 @@ function deepResearchEvidenceRequestUnsafe(value = "") {
   return /[\u0000-\u001f\u007f]|(?:https?:\/\/|javascript:|data:|<script\b)|(?:sk-[A-Za-z0-9]|AIza[A-Za-z0-9_-]{20,}|Bearer\s+|api[_ -]?key|password|token\s*[:=])|(?:ignore\s+(?:all|any|the|previous)|system\s+prompt|developer\s+message)/i.test(text);
 }
 
-function deepResearchEvidenceRequestArray(value, field, telemetry) {
-  if (!Array.isArray(value) || value.length > 2) {
+function deepResearchEvidenceRequestArray(value, field, telemetry, maxItems = 2) {
+  if (!Array.isArray(value) || value.length > maxItems) {
     telemetry.invalidReasons.push(`analysis-additional-${field}-invalid`);
     return [];
   }
@@ -21582,7 +21988,9 @@ function deepResearchEvidenceRequestArray(value, field, telemetry) {
   return value;
 }
 
-function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = []) {
+function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = [], options = {}) {
+  const deepMode = String(options.mode || "deep").trim().toLowerCase() === "deep";
+  const minimumFindings = deepMode ? 3 : 1;
   const parsed = (() => {
     try { return JSON.parse(extractJsonPayload(String(value || ""))); } catch { return null; }
   })();
@@ -21605,13 +22013,14 @@ function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = []) {
   }
   const topLevel = Object.keys(parsed);
   if (topLevel.some((key) => !["findings", "selected_evidence_ids", "unresolved", "additional_evidence_requests"].includes(key))) telemetry.invalidReasons.push("analysis-unknown-field");
-  if (!Array.isArray(parsed.findings) || parsed.findings.length < 1 || parsed.findings.length > 5) telemetry.invalidReasons.push("analysis-findings-invalid");
+  if (!Array.isArray(parsed.findings) || parsed.findings.length < minimumFindings || parsed.findings.length > 5) telemetry.invalidReasons.push("analysis-findings-invalid");
   if (!Array.isArray(parsed.selected_evidence_ids) || parsed.selected_evidence_ids.length > CHAT_PROVIDER_MAX_EVIDENCE_ROWS) telemetry.invalidReasons.push("analysis-selected-evidence-invalid");
   const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
   findings.forEach((finding, index) => {
     if (!finding || typeof finding !== "object" || Array.isArray(finding)) return telemetry.invalidReasons.push(`analysis-finding-${index + 1}-not-object`);
-    if (Object.keys(finding).some((key) => !["text", "evidence_ids"].includes(key))) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-unknown-field`);
+    if (Object.keys(finding).some((key) => !["text", "status", "evidence_ids"].includes(key))) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-unknown-field`);
     if (typeof finding.text !== "string" || !finding.text.trim() || finding.text.length > 1200) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-text-invalid`);
+    if (deepMode && !["supported", "partial", "contradicted", "unresolved"].includes(String(finding.status || ""))) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-status-invalid`);
     if (!Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-invalid`);
     if (Array.isArray(finding.evidence_ids) && new Set(finding.evidence_ids).size !== finding.evidence_ids.length) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-duplicate`);
     for (const id of finding.evidence_ids || []) if (typeof id !== "string" || !allowed.has(id)) telemetry.invalidReasons.push(`analysis-finding-${index + 1}-evidence-not-allowed`);
@@ -21625,7 +22034,7 @@ function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = []) {
   } else {
     if (Object.keys(requests).some((key) => !["vault_queries", "web_queries"].includes(key))) telemetry.invalidReasons.push("analysis-additional-evidence-requests-unknown-field");
     const vaultQueries = deepResearchEvidenceRequestArray(requests.vault_queries, "vault-queries", telemetry);
-    const webQueries = deepResearchEvidenceRequestArray(requests.web_queries, "web-queries", telemetry);
+    const webQueries = deepResearchEvidenceRequestArray(requests.web_queries, "web-queries", telemetry, 0);
     telemetry.vaultQueryCount = vaultQueries.length;
     telemetry.webQueryCount = webQueries.length;
     telemetry.additionalEvidenceRequestCount = vaultQueries.length + webQueries.length;
@@ -21634,6 +22043,114 @@ function validateDeepResearchAnalysis(value = "", allowedEvidenceIds = []) {
   telemetry.findingsCount = findings.length;
   telemetry.selectedEvidenceCount = Array.isArray(parsed.selected_evidence_ids) ? parsed.selected_evidence_ids.length : 0;
   telemetry.unresolvedCount = Array.isArray(parsed.unresolved) ? parsed.unresolved.length : 0;
+  telemetry.schemaInvalidCount = telemetry.invalidReasons.length ? 1 : 0;
+  telemetry.valid = telemetry.schemaInvalidCount === 0;
+  return { valid: telemetry.valid, value: telemetry.valid ? parsed : null, telemetry };
+}
+
+// Evidence adequacy is the shared model-only review contract for concise and
+// Deep Research. It deliberately has no retrieval request fields: the ledger
+// is closed before this phase begins and invalid output is observed, not fixed.
+function evidenceAdequacySchema(allowedEvidenceIds = []) {
+  const allowedIds = uniqueValues((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
+    .map((value) => String(value || "").trim()).filter(Boolean)).slice(0, CHAT_PROVIDER_MAX_EVIDENCE_ROWS);
+  const idArray = (maxItems, description) => ({
+    type: "array",
+    maxItems,
+    items: Object.assign({ type: "string" }, allowedIds.length ? { enum: allowedIds } : {}),
+    description
+  });
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      coverage_status: { type: "string", enum: ["complete", "partial", "insufficient", "contradictory"] },
+      coverage_reason: { type: "string", minLength: 1, maxLength: 600 },
+      findings: {
+        type: "array",
+        minItems: 1,
+        maxItems: 5,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            text: { type: "string", minLength: 1, maxLength: 1200 },
+            status: { type: "string", enum: ["supported", "partial", "contradicted", "unresolved"] },
+            evidence_ids: idArray(CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM, "Exact closed-ledger IDs supporting this proposition.")
+          },
+          required: ["text", "status", "evidence_ids"]
+        }
+      },
+      selected_evidence_ids: idArray(CHAT_PROVIDER_MAX_EVIDENCE_ROWS, "Exact closed-ledger IDs selected for final synthesis."),
+      unresolved: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 600 } }
+    },
+    required: ["coverage_status", "coverage_reason", "findings", "selected_evidence_ids", "unresolved"]
+  };
+}
+
+function validateEvidenceAdequacy(value = "", allowedEvidenceIds = []) {
+  const parsed = (() => {
+    try { return JSON.parse(extractJsonPayload(String(value || ""))); } catch { return null; }
+  })();
+  const allowed = new Set((Array.isArray(allowedEvidenceIds) ? allowedEvidenceIds : [allowedEvidenceIds])
+    .map((id) => String(id || "").trim()).filter(Boolean));
+  const telemetry = {
+    attempted: false,
+    valid: false,
+    status: "invalid",
+    findingsCount: 0,
+    selectedEvidenceCount: 0,
+    unresolvedCount: 0,
+    schemaInvalidCount: 0,
+    invalidReasons: []
+  };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    telemetry.schemaInvalidCount = 1;
+    telemetry.invalidReasons.push("adequacy-not-object");
+    return { valid: false, value: null, telemetry };
+  }
+  if (Object.keys(parsed).some((key) => !["coverage_status", "coverage_reason", "findings", "selected_evidence_ids", "unresolved"].includes(key))) telemetry.invalidReasons.push("adequacy-unknown-field");
+  if (!["complete", "partial", "insufficient", "contradictory"].includes(String(parsed.coverage_status || ""))) telemetry.invalidReasons.push("adequacy-status-invalid");
+  if (typeof parsed.coverage_reason !== "string" || !parsed.coverage_reason.trim() || parsed.coverage_reason.length > 600) telemetry.invalidReasons.push("adequacy-reason-invalid");
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  if (!Array.isArray(parsed.findings) || findings.length < 1 || findings.length > 5) telemetry.invalidReasons.push("adequacy-findings-invalid");
+  findings.forEach((finding, index) => {
+    if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+      telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-not-object`);
+      return;
+    }
+    if (Object.keys(finding).some((key) => !["text", "status", "evidence_ids"].includes(key))) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-unknown-field`);
+    if (typeof finding.text !== "string" || !finding.text.trim() || finding.text.length > 1200) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-text-invalid`);
+    if (!["supported", "partial", "contradicted", "unresolved"].includes(String(finding.status || ""))) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-status-invalid`);
+    if (!Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-evidence-invalid`);
+    if (Array.isArray(finding.evidence_ids) && new Set(finding.evidence_ids).size !== finding.evidence_ids.length) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-evidence-duplicate`);
+    for (const id of finding.evidence_ids || []) if (typeof id !== "string" || !allowed.has(id)) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-evidence-not-allowed`);
+  });
+  const selected = Array.isArray(parsed.selected_evidence_ids) ? parsed.selected_evidence_ids : [];
+  if (!Array.isArray(parsed.selected_evidence_ids) || selected.length > CHAT_PROVIDER_MAX_EVIDENCE_ROWS) telemetry.invalidReasons.push("adequacy-selected-evidence-invalid");
+  if (new Set(selected).size !== selected.length) telemetry.invalidReasons.push("adequacy-selected-evidence-duplicate");
+  for (const id of selected) if (typeof id !== "string" || !allowed.has(id)) telemetry.invalidReasons.push("adequacy-selected-evidence-not-allowed");
+  const unresolved = Array.isArray(parsed.unresolved) ? parsed.unresolved : [];
+  if (!Array.isArray(parsed.unresolved) || unresolved.length > 3 || unresolved.some((item) => typeof item !== "string" || !item.trim() || item.length > 600)) telemetry.invalidReasons.push("adequacy-unresolved-invalid");
+  const selectedSet = new Set(selected);
+  for (const [index, finding] of findings.entries()) {
+    const status = String(finding?.status || "");
+    const findingEvidence = Array.isArray(finding?.evidence_ids) ? finding.evidence_ids : [];
+    if (["supported", "partial", "contradicted"].includes(status) && findingEvidence.length < 1) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-evidence-required`);
+    for (const id of findingEvidence) if (!selectedSet.has(id)) telemetry.invalidReasons.push(`adequacy-finding-${index + 1}-evidence-not-selected`);
+  }
+  const findingStatuses = new Set(findings.map((finding) => String(finding?.status || "")));
+  const coverageStatus = String(parsed.coverage_status || "");
+  if (coverageStatus === "complete" && (findingStatuses.has("partial") || findingStatuses.has("contradicted") || findingStatuses.has("unresolved") || unresolved.length > 0)) telemetry.invalidReasons.push("adequacy-complete-inconsistent");
+  if (coverageStatus === "contradictory" && !findingStatuses.has("contradicted")) telemetry.invalidReasons.push("adequacy-contradictory-finding-missing");
+  if (["partial", "insufficient"].includes(coverageStatus)
+    && findings.length > 0
+    && findings.every((finding) => String(finding?.status || "") === "supported")
+    && unresolved.length === 0) telemetry.invalidReasons.push("adequacy-coverage-status-masquerades-complete");
+  telemetry.findingsCount = findings.length;
+  telemetry.selectedEvidenceCount = selected.length;
+  telemetry.unresolvedCount = unresolved.length;
+  telemetry.status = ["complete", "partial", "insufficient", "contradictory"].includes(String(parsed.coverage_status || "")) ? String(parsed.coverage_status) : "invalid";
   telemetry.schemaInvalidCount = telemetry.invalidReasons.length ? 1 : 0;
   telemetry.valid = telemetry.schemaInvalidCount === 0;
   return { valid: telemetry.valid, value: telemetry.valid ? parsed : null, telemetry };
@@ -25921,6 +26438,41 @@ function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, opt
   return cleaned;
 }
 
+function reserveDeepResearchLedgerRows(entries = [], maxRows = CHAT_PROVIDER_MAX_EVIDENCE_ROWS, requiredEvidenceIds = []) {
+  const rows = Array.isArray(entries) ? entries : [];
+  const required = new Set((Array.isArray(requiredEvidenceIds) ? requiredEvidenceIds : [requiredEvidenceIds])
+    .map((value) => String(value || "").trim()).filter(Boolean));
+  const isProtected = (entry) => entry?.role === "Active note"
+    || entry?.required === true
+    || required.has(String(entry?.evidenceId || ""));
+  const protectedRows = rows.filter(isProtected);
+  const limit = Math.max(protectedRows.length, Math.min(CHAT_PROVIDER_MAX_EVIDENCE_ROWS, Number(maxRows) || CHAT_PROVIDER_MAX_EVIDENCE_ROWS));
+  if (rows.length <= limit) return { rows: rows.slice(), reservedRows: Math.max(0, limit - rows.length), droppedCount: 0 };
+  const selected = [];
+  const selectedKeys = new Set();
+  const optionalBudget = Math.max(0, limit - protectedRows.length);
+  let optionalCount = 0;
+  for (const row of rows) {
+    if (!isProtected(row)) {
+      if (optionalCount >= optionalBudget) continue;
+      optionalCount += 1;
+    }
+    selected.push(row);
+    selectedKeys.add(row);
+  }
+  for (const row of protectedRows) {
+    if (selectedKeys.has(row)) continue;
+    selected.push(row);
+    selectedKeys.add(row);
+  }
+  const ordered = rows.filter((row) => selectedKeys.has(row));
+  return {
+    rows: ordered,
+    reservedRows: Math.max(0, limit - ordered.length),
+    droppedCount: Math.max(0, rows.length - ordered.length)
+  };
+}
+
 function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTINGS, sourceContract = null, options = {}) {
   const entries = [];
   const requiredEvidenceIdsInput = Array.isArray(options.requiredEvidenceIds) ? options.requiredEvidenceIds : [options.requiredEvidenceIds];
@@ -25965,6 +26517,8 @@ function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTING
       path: kind === "vault-note" ? path : "",
       title,
       role: entry.role || (kind === "todoist-task" ? "Todoist task" : "Vault note"),
+      sourceFamily: String(entry.sourceFamily || entry.provenance?.sourceFamily || ""),
+      domain: String(entry.domain || entry.provenance?.domain || ""),
       evidenceText: String(entry.text || entry.excerpt || entry.evidence || ""),
       url,
       markdown: `[${markdownLinkText(title)}](${url})`
@@ -44827,20 +45381,31 @@ function chatQueryRequestsGeneratedTaskSection(prompt = "", queryPlan = null) {
   return /\b(?:tasks?|todoist|schedules?|scheduling|due\s+dates?|deadlines?|action\s+items?|next\s+steps?)\b/i.test(String(prompt || ""));
 }
 
-function deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled = true } = {}) {
+function chatQueryRequestsWholeActiveNote(prompt = "") {
+  return /\b(?:whole|entire|full|complete|all\s+of)\s+(?:the\s+)?(?:active\s+)?note\b|\b(?:active\s+)?note\s+(?:as\s+a\s+whole|in\s+full)\b/i.test(String(prompt || ""));
+}
+
+function deepResearchPhaseNeutralSystemInstruction({ webSearchEnabled = true, mode = "deep" } = {}) {
+  const normalizedMode = normalizeWebSearchMode(mode);
+  const presentation = normalizedMode === "concise"
+    ? "Internet Search mode requires exactly one final narrative paragraph combining vault and web evidence."
+    : normalizedMode === "deep"
+      ? "Deep Research mode requires exactly two or three final narrative paragraphs combining vault and web evidence."
+      : "Answer the exact question directly, usually in one paragraph and never more than three paragraphs.";
   return [
-    "You are a concise Obsidian sidebar assistant working through a bounded Deep Research workflow.",
+    `You are a concise Obsidian sidebar assistant working through a bounded ${normalizedMode === "concise" ? "Internet Search" : "Deep Research"} workflow.`,
     PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
     OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION,
     PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION,
     "Use the complete closed evidence ledger supplied in the immutable context projection; never invent, alter, or cite an evidence ID that is not supplied.",
+    presentation,
     "Synthesize directly related current state, history, timing, handoffs, and next steps only when every vault-specific statement is supported by the supplied evidence IDs; keep the sentence order natural.",
-    "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
+    ...webSearchFinalEvidenceAuthorityInstructions(webSearchEnabled),
     "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
-    "Treat the active note as the primary supplied evidence. General reasoning, advice, greetings, and explanations must not be presented as vault facts.",
     "For every supported factual statement, use only the exact supplied evidence IDs. The plugin renders allowed source-title hyperlinks deterministically; never invent URLs, Markdown links, numbered citations, or a source list.",
-    ...(webSearchEnabled ? ["When Internet Search sources are supplied, every externally established statement must cite one or more supplied web-* evidence IDs. Never imply that the web was checked when search is unavailable or no web evidence was admitted."] : []),
-    "Support each factual statement with one specific supplied note, task record, or web source. Never fuse unrelated details from different sources into one event, decision, task, or explanation.",
+    ...(webSearchEnabled ? [webResearchEvidenceRuleInstruction()] : []),
+    ...(webSearchEnabled ? [webResearchClaimCalibrationInstruction()] : []),
+    "Never fuse unrelated details from different sources into one event, decision, task, or explanation.",
     "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
     "Preserve exact proper names and quoted terms from the evidence. For every supported statement, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
     "Keep grammatical or contextual misuse distinct from avoidance or prohibition: a usage-quality warning is not an instruction to avoid or ban a term, and an instruction to avoid an exact phrase applies only to that phrase.",
@@ -44900,7 +45465,9 @@ function buildChatProviderContextProjection(options = {}) {
   const prompt = String(options.prompt || "");
   const active = options.active || {};
   const activePath = String(active.path || "");
-  const activeText = String(active.text || active.selection || "");
+  const activeSelection = String(active.selection || "");
+  const activeText = activeSelection || String(active.text || "");
+  const webSearchEnabled = options.webSearchEnabled === true;
   const sourceContract = options.sourceContract || null;
   const reservedTaskEvidence = options.reservedTaskEvidence || null;
   const sourceRows = [
@@ -45014,7 +45581,9 @@ function buildChatProviderContextProjection(options = {}) {
       markDropped("empty-ledger-evidence");
       continue;
     }
-    if (path && activePath && path === activePath) {
+    const rowSourceKind = String(row?.sourceKind || row?.source_kind || row?.provenance?.sourceKind || ledger.sourceKind || "").toLowerCase();
+    const currentSourceRow = row?.currentSource === true || row?.current_source === true || ["current-source", "current-source-context"].includes(rowSourceKind);
+    if (path && activePath && path === activePath && !(webSearchEnabled && currentSourceRow)) {
       dedupDropped += 1;
       markDropped("active-source-duplicate");
       continue;
@@ -45074,9 +45643,73 @@ function buildChatProviderContextProjection(options = {}) {
     error.code = "chat-evidence-schema-empty";
     throw error;
   }
+  let sourceSummaryDuplicateCount = 0;
+  const activeLedgerEntry = projectedSourceLedger.find((entry) => entry.role === "Active note") || null;
+  const explicitWholeActiveNote = chatQueryRequestsWholeActiveNote(prompt);
+  const activeFocusTelemetry = {
+    enabled: webSearchEnabled,
+    explicitSelection: Boolean(activeSelection.trim()),
+    explicitWholeNote: explicitWholeActiveNote,
+    focusedRowCount: 0,
+    boundFactCount: 0,
+    fallbackUsed: false,
+    fallbackReason: "",
+    mode: webSearchEnabled ? (activeSelection.trim() || explicitWholeActiveNote ? "full-active-source" : "focused-current-source") : "unchanged"
+  };
+  let providerActiveText = normalizedActiveText;
+  if (webSearchEnabled && !activeSelection.trim() && !explicitWholeActiveNote) {
+    const focusedRows = [];
+    const focusedIds = new Set();
+    for (const row of sourceRows) {
+      const id = chatProviderStableId(row, "");
+      const ledger = projectedLedgerByEvidenceId.get(id) || citableLedgerByEvidenceId.get(id) || {};
+      const path = String(row?.path || row?.provenance?.path || ledger.path || "");
+      const sourceKind = String(row?.sourceKind || row?.source_kind || row?.provenance?.sourceKind || ledger.sourceKind || "").toLowerCase();
+      const currentSource = row?.current !== false
+        && (path === activePath || row?.currentSource === true || row?.current_source === true || ["current-source", "current-source-context"].includes(sourceKind));
+      if (!activePath || path !== activePath || !currentSource || !id || focusedIds.has(id) || !allowedEvidenceIdSet.has(id)) continue;
+      const text = String(row?.text || row?.excerpt || row?.evidenceText || row?.content || ledger.evidenceText || "").replace(/\r\n/g, "\n");
+      if (!text) continue;
+      focusedIds.add(id);
+      focusedRows.push({ id, text });
+    }
+    const boundFacts = (Array.isArray(sourceContract?.facts) ? sourceContract.facts : [])
+      .filter((fact) => fact && fact.current !== false && String(fact.authority || "current") !== "historical")
+      .filter((fact) => allowedEvidenceIdSet.has(String(fact.evidenceId || fact.evidence_id || "")))
+      .map((fact) => ({
+        fact,
+        value: String(fact.value || fact.text || fact.sourceSurface || "").replace(/\r\n/g, "\n").trim()
+      }))
+      .filter(Boolean);
+    const focusedBoundFacts = boundFacts.filter(({ fact, value }) => {
+      const factKind = String(fact.kind || fact.type || "").trim().toLowerCase();
+      const factRole = String(fact.role || "").trim().toLowerCase();
+      const isSourceSummary = [factKind, factRole].some((value) => ["source-summary", "current-source-summary", "summary"].includes(value));
+      if (isSourceSummary && activeTextComparisonValues.has(normalizedForComparison(value))) {
+        sourceSummaryDuplicateCount += 1;
+        markDropped("source-summary-active-note-duplicate");
+        return false;
+      }
+      return Boolean(value);
+    }).map(({ value }) => value);
+    activeFocusTelemetry.focusedRowCount = focusedRows.length;
+    activeFocusTelemetry.boundFactCount = focusedBoundFacts.length;
+    if (focusedRows.length || focusedBoundFacts.length) {
+      providerActiveText = [
+        focusedRows.length ? focusedRows.map((row) => row.text).join("\n\n") : "",
+        focusedBoundFacts.length ? `Bound current-source facts:\n${uniqueValues(focusedBoundFacts).map((value) => `- ${value}`).join("\n")}` : ""
+      ].filter(Boolean).join("\n\n");
+    } else {
+      activeFocusTelemetry.fallbackUsed = true;
+      activeFocusTelemetry.fallbackReason = "no-focused-current-source-evidence";
+      const anchor = activeLedgerEntry
+        ? `Active source citation anchor: evidence_id=${activeLedgerEntry.evidenceId || ""} title=${activeLedgerEntry.title || ""} path=${activeLedgerEntry.path || activePath}`
+        : activePath ? `Active source citation anchor: path=${activePath}` : "";
+      providerActiveText = anchor || "No focused current-source evidence was available.";
+    }
+  }
   const facts = [];
   const factIds = new Set();
-  let sourceSummaryDuplicateCount = 0;
   for (const fact of Array.isArray(sourceContract?.facts) ? sourceContract.facts : []) {
     if (!fact || fact.current === false || String(fact.authority || "current") === "historical") continue;
     const evidenceId = String(fact.evidenceId || fact.evidence_id || "");
@@ -45191,7 +45824,6 @@ function buildChatProviderContextProjection(options = {}) {
     const ledger = projectedLedgerByEvidenceId.get(evidenceId) || {};
     return {
       evidenceId,
-      sourceId: String(ledger.sourceId || ""),
       sourceKind: String(ledger.sourceKind || ""),
       title: String(ledger.title || ""),
       path: String(ledger.path || ""),
@@ -45200,7 +45832,6 @@ function buildChatProviderContextProjection(options = {}) {
       temporalRelation: String(entry.temporalRelation || entry.temporal_relation || "undated"),
       authority: String(entry.authority || entry.authorityState || entry.authority_state || "supporting"),
       conflictState: String(entry.conflictState || entry.conflict_state || "none"),
-      link: String(ledger.markdown || ""),
       metadata: chatProviderCompactEvidenceMetadata(Object.assign({}, ledger, entry), evidenceId)
     };
   });
@@ -45208,7 +45839,7 @@ function buildChatProviderContextProjection(options = {}) {
     "Reserved task evidence lanes (metadata only; excerpts appear only in Selected semantic evidence):",
     projectedReservedLanes.length ? projectedReservedLanes.map((lane) => `- ordinal=${lane.ordinal} task_id=${lane.taskId} scope_id=${lane.scopeId} query_id=${lane.queryId} evidence_refs=${lane.evidenceRefs.join(",") || "(none)"} active_source_evidence_refs=${lane.activeSourceEvidenceRefs.join(",") || "(none)"}`).join("\n") : "- No projected reserved task lanes.",
     "Reserved shared evidence table metadata:",
-    projectedReservedSharedEvidence.length ? projectedReservedSharedEvidence.map((entry) => `- evidence_id=${entry.evidenceId} source_id=${entry.sourceId} source_kind=${entry.sourceKind} title=${entry.title} path=${entry.path} lines=${entry.lineStart}-${entry.lineEnd} temporal=${entry.temporalRelation} authority=${entry.authority} conflict=${entry.conflictState} link=${entry.link}\n  metadata=${JSON.stringify(entry.metadata)}`).join("\n") : "- No projected reserved shared-evidence rows."
+    projectedReservedSharedEvidence.length ? projectedReservedSharedEvidence.map((entry) => `- evidence_id=${entry.evidenceId} source_kind=${entry.sourceKind} title=${entry.title} path=${entry.path} lines=${entry.lineStart}-${entry.lineEnd} temporal=${entry.temporalRelation} authority=${entry.authority} conflict=${entry.conflictState}\n  metadata=${JSON.stringify(entry.metadata)}`).join("\n") : "- No projected reserved shared-evidence rows."
   ].join("\n") : "";
   const compactTaskField = (value, max = 360) => truncateAtWord(singleLine(value || ""), max);
   const allowedLedgerPaths = new Set(projectedSourceLedger.map((entry) => String(entry.path || "")).filter(Boolean));
@@ -45284,18 +45915,26 @@ function buildChatProviderContextProjection(options = {}) {
     ].filter(Boolean).join("\n"))
   ].join("\n") : "";
   const requiredSections = [
-    "Active note context:", normalizedActiveText || "No active note context.",
+    "Active note context:", providerActiveText || "No active note context.",
     "Retrieval state:", retrievalDegraded
       ? `Degraded/source-only (${retrievalDegradedReason}). General conversation answers remain allowed, but do not imply vault-specific facts without exact supplied evidence; identify genuinely missing requested vault facts as unsupported.`
       : "Ready. Use exact supplied evidence IDs for vault-specific facts; general conversation claims may be answered without citations.",
     "Current typed source-contract facts (authoritative/current):",
     facts.length ? facts.map((fact) => `- fact_id=${fact.id} evidence_id=${fact.evidenceId} type=${fact.type} role=${fact.role} temporal=${fact.temporalRelation} current=${fact.current} authority=${fact.authority} conflict=${fact.conflictState} | value=${fact.value}`).join("\n") : "- No typed current source-contract facts were established.",
     "Selected semantic evidence (accepted rows; required for provider context):",
-    deliveredEvidenceRows.length ? deliveredEvidenceRows.map((row) => `- evidence_id=${row.id} source_id=${row.sourceId} title=${row.title} path=${row.path}\n  metadata=${JSON.stringify(row.metadata)}\n  ${row.text}`).join("\n") : "- No selected semantic evidence rows were admitted.",
+    deliveredEvidenceRows.length ? deliveredEvidenceRows.map((row) => `- evidence_id=${row.id} title=${row.title} path=${row.path}\n  metadata=${JSON.stringify(row.metadata)}\n  ${row.text}`).join("\n") : "- No selected semantic evidence rows were admitted.",
     projectedTaskMetadata,
     projectedReservedMetadata,
     "Allowed evidence ledger (return evidence_ids only; never print links, numbered citations, or a source list):",
-    projectedSourceLedger.map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || ""} title=${entry.title || ""} link=${entry.markdown || ""}`).join("\n") || "No source links available.",
+    projectedSourceLedger.map((entry) => {
+      const sourceKind = String(entry.sourceKind || entry.provenance?.sourceKind || "").toLowerCase();
+      const taskSource = ["todoist-snapshot-reference-row", "subtask-task-tree-record", "todoist-task-reference"].includes(sourceKind);
+      const webSource = sourceKind === "web" || sourceKind.startsWith("web-") || sourceKind.includes("web-search");
+      const link = !webSource && (taskSource || String(entry.url || "").startsWith("obsidian://")) && entry.markdown
+        ? ` link=${entry.markdown}`
+        : "";
+      return `- evidence_id=${entry.evidenceId || ""} source_kind=${entry.sourceKind || ""} source_family=${entry.sourceFamily || entry.provenance?.sourceFamily || ""} domain=${entry.domain || entry.provenance?.domain || ""} title=${entry.title || ""} path=${entry.path || ""}${link}`;
+    }).join("\n") || "No source links available.",
     "User prompt:", prompt
   ];
   const requiredUser = requiredSections.join("\n");
@@ -45354,6 +45993,8 @@ function buildChatProviderContextProjection(options = {}) {
     historyLimitChars: CHAT_PROVIDER_MAX_HISTORY_CHARS,
     historyChars,
     activeChars: activeText.length,
+    providerActiveChars: providerActiveText.length,
+    activeFocus: Object.freeze({ ...activeFocusTelemetry }),
     factCount: facts.length,
     factChars: facts.reduce((sum, fact) => sum + fact.value.length, 0),
     candidates: sourceRows.length,
@@ -45416,6 +46057,34 @@ function buildChatProviderContextProjection(options = {}) {
     retrievalDegraded,
     retrievalDegradedReason: retrievalDegraded ? retrievalDegradedReason : ""
   };
+  const providerVisibleElided = projectedSourceLedger.reduce((summary, entry) => {
+    const sourceId = String(entry?.sourceId || entry?.provenance?.sourceId || "");
+    const url = String(entry?.url || "");
+    const markdown = String(entry?.markdown || "");
+    if (sourceId) {
+      summary.sourceIdFieldCount += 1;
+      summary.sourceIdBytes += utf8ByteLength(sourceId);
+    }
+    if (url) {
+      summary.urlFieldCount += 1;
+      summary.urlBytes += utf8ByteLength(url);
+    }
+    if (markdown) {
+      summary.markdownFieldCount += 1;
+      summary.markdownBytes += utf8ByteLength(markdown);
+    }
+    return summary;
+  }, { sourceIdFieldCount: 0, sourceIdBytes: 0, urlFieldCount: 0, urlBytes: 0, markdownFieldCount: 0, markdownBytes: 0 });
+  telemetry.providerVisibleElided = Object.freeze({
+    sourceIdFieldCount: providerVisibleElided.sourceIdFieldCount,
+    sourceIdBytes: providerVisibleElided.sourceIdBytes,
+    urlFieldCount: providerVisibleElided.urlFieldCount,
+    urlBytes: providerVisibleElided.urlBytes,
+    markdownFieldCount: providerVisibleElided.markdownFieldCount,
+    markdownBytes: providerVisibleElided.markdownBytes,
+    fields: providerVisibleElided.sourceIdFieldCount + providerVisibleElided.urlFieldCount + providerVisibleElided.markdownFieldCount,
+    bytes: providerVisibleElided.sourceIdBytes + providerVisibleElided.urlBytes + providerVisibleElided.markdownBytes
+  });
   const prefixMetrics = providerContextProjectionMetrics(promptCachePrefix);
   const suffixMetrics = providerContextProjectionMetrics(promptContextSuffix);
   const prefixValidation = providerContextStablePrefixValidation(promptCachePrefix, [
@@ -53730,6 +54399,9 @@ const STS_MULTI_PROVIDER = (() => {
         if (/auth|unauthoriz|forbidden|credential|permission|login|jwt|token\b/.test(token)) matches.add("auth");
         if (/grammar|schema|json[_ -]?schema|response[_ -]?format|pattern\b|unsupported|capabilit|not[_ -]?support|unrecognized[_ -]?field|unknown[_ -]?field/.test(token)) matches.add("schema");
         if (/failed\s+to\s+parse\s+grammar(?:\s+from\s+[a-z0-9._-]+)?\b|unsupported\s+(?:response\s+)?grammar\b/.test(token)) matches.add("grammar");
+        if (/context|token[_ -]?limit|max[_ -]?(?:context|tokens)|too[_ -]?many[_ -]?tokens/.test(token)) matches.add("context");
+        if (/(?:model|route|endpoint).{0,32}(?:not[_ -]?found|unknown|missing|does not exist|unavailable)/.test(token)
+          || /(?:not[_ -]?found|no such model|unknown model)/.test(token)) matches.add("model-not-found");
         if (/bad[_ -]?request|request[_ -]?validation|validation|invalid[_ -]?request|malformed|missing[_ -]?field|size|too[_ -]?large|payload|length[_ -]?limit|token[_ -]?limit/.test(token)) matches.add("validation");
         if (/server|upstream|connection|connect|timeout|timed[_ -]?out|reset|closed|unavailable|overload|capacity|temporar/.test(token)) matches.add("transport");
         if (depth < 4 && stringValue.length <= 16 * 1024) {
@@ -53762,15 +54434,19 @@ const STS_MULTI_PROVIDER = (() => {
       ? "auth"
       : matches.has("schema")
         ? "schema"
+        : matches.has("model-not-found")
+          ? "model-not-found"
           : matches.has("transport") || retryableStatus(status)
             ? "transport"
             : matches.has("validation")
               ? "validation"
-            : "unknown";
+              : "unknown";
     const code = classification === "auth"
       ? status === 401 ? "auth-required" : "auth-failed"
       : classification === "schema"
         ? "unsupported-schema"
+        : classification === "model-not-found"
+          ? "model-not-found"
         : classification === "validation"
           ? "request-validation"
           : classification === "unknown"
@@ -53786,6 +54462,8 @@ const STS_MULTI_PROVIDER = (() => {
         status,
         classification,
         grammar: matches.has("grammar"),
+        contextLimit: matches.has("context"),
+        modelNotFound: matches.has("model-not-found"),
         diagnosticHash
       }
     };
@@ -54748,14 +55426,11 @@ const STS_MULTI_PROVIDER = (() => {
       && String(memoryCached.metadataRevision || "") === metadataIdentity.metadataRevision;
     const cached = (memoryMatches ? memoryCached : null) || persisted;
     // Ollama's native grammar compiler is not uniformly compatible with the
-    // projected schema.  Start chat/description calls in JSON mode until an
-    // exact, metadata-valid durable record proves a carrier preference.  Task
-    // generation remains schema-first because its current model set is known
-    // to accept the projected task schema.  A valid cached/persisted record
-    // always wins, including an explicit direct-schema preference.
-    const coldCarrier = metadata?.ollamaBacked === true && ["chat-query", "task-description"].includes(operation)
-      ? "direct-json"
-      : "direct-schema";
+    // projected schema. Start every structured Ollama operation in JSON mode
+    // until an exact, metadata-valid durable record proves a carrier
+    // preference. A valid cached/persisted record always wins, including an
+    // explicit direct-schema preference.
+    const coldCarrier = metadata?.ollamaBacked === true ? "direct-json" : "direct-schema";
     const adaptiveConcurrencyLimit = Number(cached?.adaptiveConcurrencyLimit);
     return {
       cacheHit: Boolean(cached),
@@ -55291,7 +55966,7 @@ const STS_MULTI_PROVIDER = (() => {
     };
     const requireParametersCapability = aiCloudCapabilityMemoryState(Object.assign({}, capabilityMemoryParams, { carrier: "provider.require_parameters" }));
     const responseHealingCapability = aiCloudCapabilityMemoryState(Object.assign({}, capabilityMemoryParams, { carrier: "plugins.response-healing" }));
-    if (settings.enableOpenAiPromptCaching !== false) {
+    if (settings.enableProviderPromptCaching !== false) {
       if (sessionIdentity) body.session_id = sessionIdentity;
     }
     if (schema) body.response_format = { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema } };
@@ -56070,16 +56745,45 @@ const STS_MULTI_PROVIDER = (() => {
       fullValidation
     };
   };
+  const openWebUIJsonCarrierCompatibilityEligible = (error, response, options = {}) => {
+    const providerError = error?.providerError || {};
+    if (providerError.provider !== "openwebui" || options.ollamaBacked !== true || options.attemptCarrier !== "direct-json") return false;
+    const responseStatus = response ? Number(statusOf(response)) || 0 : 0;
+    const normalizedErrorStatus = Number(providerError.status) || 0;
+    const status = responseStatus > 0 ? responseStatus : normalizedErrorStatus;
+    const errorStatus = providerError.status == null ? status : normalizedErrorStatus || status;
+    if (status !== 400 || errorStatus !== 400) return false;
+    const diagnostic = providerError.providerDiagnostic || {};
+    const code = String(providerError.code || "").toLowerCase();
+    // Some OpenWebUI transports throw after receiving HTTP 400 instead of
+    // returning the response object. A normalized 400 status still proves an
+    // HTTP response and is eligible for the one bounded carrier retry.
+    const hasHttpResponse = Boolean(response) || Number(providerError.status) === 400;
+    if (["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted"].includes(code)
+      || (code === "transport" && !hasHttpResponse)) return false;
+    const classification = String(diagnostic.classification || "").toLowerCase();
+    if (["auth", "context", "model-not-found"].includes(classification)
+      || (classification === "transport" && !hasHttpResponse)) return false;
+    if (diagnostic.draining === true
+      || diagnostic.contextLimit === true
+      || diagnostic.modelNotFound === true
+      || String(diagnostic.finalization || "").toLowerCase() === "draining"
+      || String(diagnostic.transport || "").toLowerCase() === "abort") return false;
+    return true;
+  };
   const openWebUIGrammarCompatibilityEligible = (error, response, options = {}) => {
     const providerError = error?.providerError || {};
     if (providerError.provider !== "openwebui") return false;
     const diagnostic = providerError.providerDiagnostic || {};
-    if (diagnostic.classification !== "schema" || diagnostic.grammar !== true) return false;
     const code = String(providerError.code || "").toLowerCase();
-    if (["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted", "transport"].includes(code)) return false;
+    const jsonCarrierCompatibility = openWebUIJsonCarrierCompatibilityEligible(error, response, options);
+    if (!jsonCarrierCompatibility
+      && ["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted", "transport"].includes(code)) return false;
     if (diagnostic.draining === true || String(diagnostic.finalization || "").toLowerCase() === "draining" || String(diagnostic.transport || "").toLowerCase() === "abort") return false;
     const status = response ? statusOf(response) : Number(providerError.status) || 0;
     const errorStatus = providerError.status == null ? status : Number(providerError.status);
+    if (jsonCarrierCompatibility) return true;
+    if (diagnostic.classification !== "schema" || diagnostic.grammar !== true) return false;
     return status !== 200 || errorStatus !== 200;
   };
   const openWebUIStructuredRetryEligible = (error, schema, response, requestProfile = "", options = {}) => {
@@ -56100,7 +56804,7 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const openWebUICachedJsonAlternateCarrierRetryEligible = (error, response, requestProfile = "", options = {}) => {
     if (options.cachedDirectJson !== true || requestProfile !== "local-schema-compatibility-json") return false;
-    return openWebUIGrammarCompatibilityEligible(error, response, options);
+    return openWebUIGrammarCompatibilityEligible(error, response, Object.assign({}, options, { attemptCarrier: "direct-json" }));
   };
   const openWebUIStructuredRetryRaw = (response) => {
     if (typeof response?.text === "string") {
@@ -57070,7 +57774,9 @@ const STS_MULTI_PROVIDER = (() => {
             preserved.providerDiagnostic = providerErrorValue.providerDiagnostic;
           } else preserved.providerDiagnostic = Object.assign({}, lastStructuredResponseDiagnostic);
         }
-        const responseStatus = response ? statusOf(response) : Number(preserved?.providerError?.status) || 0;
+        const normalizedProviderErrorStatus = Number(preserved?.providerError?.status) || 0;
+        const observedResponseStatus = response ? Number(statusOf(response)) || 0 : 0;
+        const responseStatus = normalizedProviderErrorStatus > 0 ? normalizedProviderErrorStatus : observedResponseStatus;
         const rawOutput = responseStatus === 200 ? openWebUIStructuredRetryRaw(response) : "";
         if (responseStatus === 200) structuredRetryState.rawOutputs.push(rawOutput);
         const rawResponseText = responseStatus !== 200 && typeof preserved?.providerError?.rawResponseText === "string"
@@ -57079,10 +57785,60 @@ const STS_MULTI_PROVIDER = (() => {
         if (rawResponseText) structuredRetryState.rawResponses.push(rawResponseText);
         if (attemptSchemaProjection) {
           const providerErrorValue = preserved?.providerError || {};
+          const compatibilityStatus = Number(providerErrorValue.status) || responseStatus;
+          const compatibilityError = Object.assign({}, preserved, {
+            providerError: Object.assign({}, providerErrorValue, {
+              provider: "openwebui",
+              status: compatibilityStatus
+            })
+          });
+          const compatibilityDiagnostic = providerErrorValue.providerDiagnostic || {};
+          const compatibilityCode = String(providerErrorValue.code || "").toLowerCase();
+          const compatibilityClassification = String(compatibilityDiagnostic.classification || "").toLowerCase();
+          const jsonCarrierHttp400Compatibility = ollamaBacked === true
+            && attemptCarrier === "direct-json"
+            && compatibilityStatus === 400
+            && !["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted", "transport"].includes(compatibilityCode)
+            && !["auth", "context", "model-not-found", "transport"].includes(compatibilityClassification)
+            && compatibilityDiagnostic.draining !== true
+            && compatibilityDiagnostic.contextLimit !== true
+            && compatibilityDiagnostic.modelNotFound !== true
+            && String(compatibilityDiagnostic.finalization || "").toLowerCase() !== "draining"
+            && String(compatibilityDiagnostic.transport || "").toLowerCase() !== "abort";
+          const carrierCompatibilityReason = jsonCarrierHttp400Compatibility
+            ? "json-mode-http-400"
+            : ollamaBacked !== true
+              ? "blocked-not-ollama"
+              : attemptCarrier !== "direct-json"
+                ? "blocked-carrier"
+                : compatibilityStatus !== 400
+                  ? `blocked-http-${compatibilityStatus || 0}`
+                  : ["auth-required", "auth-failed", "auth-expired", "attempt-timeout", "request-aborted", "transport"].includes(compatibilityCode)
+                    ? `blocked-code-${compatibilityCode}`
+                    : ["auth", "context", "model-not-found", "transport"].includes(compatibilityClassification)
+                      ? `blocked-classification-${compatibilityClassification}`
+                      : compatibilityDiagnostic.draining === true
+                        ? "blocked-draining"
+                        : compatibilityDiagnostic.contextLimit === true
+                          ? "blocked-context"
+                          : compatibilityDiagnostic.modelNotFound === true
+                            ? "blocked-model-not-found"
+                            : String(compatibilityDiagnostic.finalization || "").toLowerCase() === "draining"
+                              ? "blocked-finalization"
+                              : String(compatibilityDiagnostic.transport || "").toLowerCase() === "abort"
+                                ? "blocked-abort"
+                                : "blocked-provider-diagnostic";
+          const carrierDiagnostic = Object.assign({}, providerErrorValue.providerDiagnostic || {}, {
+            ...(jsonCarrierHttp400Compatibility ? { classification: "schema", grammar: true } : {}),
+            carrierCompatibility: jsonCarrierHttp400Compatibility,
+            carrierCompatibilityReason
+          });
+          providerErrorValue.providerDiagnostic = carrierDiagnostic;
+          preserved.providerDiagnostic = carrierDiagnostic;
           const diagnostic = providerErrorValue.providerDiagnostic || {};
           const nativeDescriptionGrammarFailure = nativeDescription
             && attemptCarrier === "direct-schema"
-            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked, attemptCarrier });
           if (nativeDescriptionGrammarFailure) {
             descriptionCapability.grammarUnsupported = true;
             attemptProviderRequestTelemetry.descriptionGrammarLearned = true;
@@ -57097,7 +57853,7 @@ const STS_MULTI_PROVIDER = (() => {
           const structuredGrammarFailure = !nativeDescription
             && structuredInitialCarrier === "direct-schema"
             && structuredAttempt === 1
-            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked, attemptCarrier });
           if (structuredGrammarFailure && structuredCapability) {
             structuredCapability.grammarUnsupported = true;
             attemptProviderRequestTelemetry.structuredGrammarLearned = true;
@@ -57182,6 +57938,22 @@ const STS_MULTI_PROVIDER = (() => {
             descriptionWrapperFallbackEligible: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackEligible),
             descriptionWrapperFallbackAttempted: Boolean(attemptProviderRequestTelemetry.descriptionWrapperFallbackAttempted),
             descriptionSameCarrierRetryEligible: Boolean(attemptProviderRequestTelemetry.descriptionSameCarrierRetryEligible),
+            carrierCompatibility: Boolean(diagnostic.carrierCompatibility),
+            carrierCompatibilityReason: String(diagnostic.carrierCompatibilityReason || "").slice(0, 64),
+            carrierCompatibilityInputs: {
+              ollamaBacked: Boolean(ollamaBacked),
+              attemptCarrier: String(attemptCarrier || "").slice(0, 32),
+              responseStatus,
+              providerErrorStatus: Number(providerErrorValue.status) || 0,
+              compatibilityStatus,
+              code: compatibilityCode.slice(0, 48),
+              classification: compatibilityClassification.slice(0, 48),
+              draining: Boolean(compatibilityDiagnostic.draining),
+              contextLimit: Boolean(compatibilityDiagnostic.contextLimit),
+              modelNotFound: Boolean(compatibilityDiagnostic.modelNotFound),
+              finalization: String(compatibilityDiagnostic.finalization || "").slice(0, 32),
+              transport: String(compatibilityDiagnostic.transport || "").slice(0, 32)
+            },
             usage: preserved?.providerUsage || diagnostic.usage || {},
             queueTelemetry
           });
@@ -57204,7 +57976,7 @@ const STS_MULTI_PROVIDER = (() => {
           const nativeDescriptionGrammarRetry = nativeDescription
             && descriptionInitialCarrier !== "wrapper-json"
             && structuredAttempt === 1
-            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked });
+            && openWebUIGrammarCompatibilityEligible(preserved, response, { ollamaBacked, attemptCarrier });
           if (nativeDescriptionGrammarRetry) {
             structuredRetryState.retryEligible = true;
             structuredRetryState.retryAttempted = true;
@@ -57216,10 +57988,11 @@ const STS_MULTI_PROVIDER = (() => {
           const cachedJsonAlternateCarrierRetry = !nativeDescription
             && structuredAttempt === 1
             && structuredInitialCarrier === "direct-json"
-            && openWebUICachedJsonAlternateCarrierRetryEligible(preserved, response, attemptRequestProfile, {
-              ollamaBacked,
-              cachedDirectJson: true
-            });
+            && (jsonCarrierHttp400Compatibility
+              || openWebUICachedJsonAlternateCarrierRetryEligible(compatibilityError, null, attemptRequestProfile, {
+                ollamaBacked,
+                cachedDirectJson: true
+              }));
           const standardStructuredRetry = structuredAttempt === 1
             && !capabilityDirectedCompatibility
             && (!nativeDescription || attemptCarrier === "direct-schema")
@@ -59055,6 +59828,22 @@ function aiGatewayBoundedProviderRetry(value = null) {
       schemaCarrier: token(source.schemaCarrier, 48),
       jsonModePresent: Boolean(source.jsonModePresent),
       jsonModeCarrier: token(source.jsonModeCarrier, 32),
+      carrierCompatibility: Boolean(source.carrierCompatibility),
+      carrierCompatibilityReason: token(source.carrierCompatibilityReason, 64),
+      carrierCompatibilityInputs: Object.freeze({
+        ollamaBacked: Boolean(source.carrierCompatibilityInputs?.ollamaBacked),
+        attemptCarrier: token(source.carrierCompatibilityInputs?.attemptCarrier, 32),
+        responseStatus: number(source.carrierCompatibilityInputs?.responseStatus),
+        providerErrorStatus: number(source.carrierCompatibilityInputs?.providerErrorStatus),
+        compatibilityStatus: number(source.carrierCompatibilityInputs?.compatibilityStatus),
+        code: token(source.carrierCompatibilityInputs?.code, 48),
+        classification: token(source.carrierCompatibilityInputs?.classification, 48),
+        draining: Boolean(source.carrierCompatibilityInputs?.draining),
+        contextLimit: Boolean(source.carrierCompatibilityInputs?.contextLimit),
+        modelNotFound: Boolean(source.carrierCompatibilityInputs?.modelNotFound),
+        finalization: token(source.carrierCompatibilityInputs?.finalization, 32),
+        transport: token(source.carrierCompatibilityInputs?.transport, 32)
+      }),
       retryOrdinal: number(source.retryOrdinal),
       rawHash: token(source.rawHash || source.rawSha256, 80),
       rawByteCount: number(source.rawByteCount || source.rawUtf8Bytes)
@@ -59594,6 +60383,171 @@ const aiCloudCapabilityTelemetry = (state = {}) => ({
   capabilityServedModelHash: state.servedModel ? shortHash(state.servedModel) : "",
   capabilityFingerprintHash: state.fingerprint ? shortHash(state.fingerprint) : ""
 });
+
+const GEMINI_PROMPT_CACHE_TTL_SECONDS = 300;
+const GEMINI_PROMPT_CACHE_LOCAL_TTL_MS = GEMINI_PROMPT_CACHE_TTL_SECONDS * 1000;
+const GEMINI_PROMPT_CACHE_MIN_ESTIMATED_TOKENS = 4096;
+const GEMINI_PROMPT_CACHE_RECORD_LIMIT = 32;
+const geminiPromptCacheRecords = new Map();
+const geminiPromptCacheRecordKey = ({ model = "", system = "", prefix = "", requestKey = "" } = {}) => [
+  "gemini",
+  String(model || "").trim(),
+  providerContextProjectionHash(system),
+  providerContextProjectionHash(prefix),
+  providerContextProjectionHash(String(requestKey || "").trim().slice(0, 160))
+].join("|");
+const geminiPromptCacheEstimate = (system = "", prefix = "") => Math.ceil(utf8ByteLength([system, prefix].filter(Boolean).join("\n\n")) / 4);
+const geminiPromptCacheRecordExpired = (record = null, nowMs = Date.now()) => Boolean(
+  record?.state === "ready"
+    && Number(record.expiresAtMs || 0) > 0
+    && Number(nowMs) >= Number(record.expiresAtMs)
+);
+const geminiPromptCacheIncompatibility = (response = null) => {
+  const status = Number(response?.status || 0);
+  const text = String(response?.json?.error?.message || response?.text || "");
+  return [400, 404].includes(status) && /cached[_ -]?content|cachedcontents|prompt[_ -]?cache|cache/i.test(text || String(response?.json?.error?.status || ""));
+};
+const geminiPromptCacheRecordInvalidation = (response = null) => {
+  const status = Number(response?.status || 0);
+  const text = String(response?.json?.error?.message || response?.json?.error?.status || response?.text || "");
+  return status === 404 || /cached[_ -]?content[^\n]*(?:not[ _-]?found|expired)|(?:not[ _-]?found|expired)[^\n]*cached[_ -]?content/i.test(text);
+};
+const geminiPromptCacheCreateCapabilityUnsupported = (response = null) => {
+  const status = Number(response?.status || 0);
+  const text = String(response?.json?.error?.message || response?.text || "");
+  return status === 404 || /cached[_ -]?content|cachedcontents|prompt[_ -]?cache/i.test(text);
+};
+const geminiPromptCacheRememberRecord = (record, state, reason = "") => {
+  if (!record) return;
+  record.state = state;
+  record.reason = String(reason || "").replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96);
+  record.promise = null;
+};
+const geminiPromptCacheAcquire = async ({ modelId, system = "", prefix = "", requestKey = "", settings = {}, operation = "" } = {}) => {
+  const normalizedKey = String(requestKey || "").trim().slice(0, 160);
+  const normalizedPrefix = String(prefix || "");
+  const estimatedTokens = geminiPromptCacheEstimate(system, normalizedPrefix);
+  const base = {
+    key: geminiPromptCacheRecordKey({ model: modelId, system, prefix: normalizedPrefix, requestKey: normalizedKey }),
+    state: "bypass",
+    reason: "",
+    estimatedTokens,
+    created: false,
+    reused: false,
+    name: "",
+    nameHash: "",
+    writeTokens: 0,
+    writeReported: false,
+    expiresAtMs: 0,
+    expirySource: "",
+    deleteStatus: "not-requested",
+    createCount: 0
+  };
+  if (settings?.enableProviderPromptCaching === false) {
+    base.reason = "disabled-by-setting";
+    return base;
+  }
+  if (!normalizedKey || !normalizedPrefix) {
+    base.reason = !normalizedKey ? "request-key-empty" : "prefix-empty";
+    return base;
+  }
+  if (estimatedTokens < GEMINI_PROMPT_CACHE_MIN_ESTIMATED_TOKENS) {
+    base.reason = "below-prefix-token-threshold";
+    return base;
+  }
+  const capability = aiCloudCapabilityMemoryState({ provider: "gemini", model: modelId, profileRevision: "gemini-cached-content-v1", operation, carrier: "prompt-cache" });
+  if (capability.state === "unsupported") {
+    base.reason = "capability-unsupported";
+    return base;
+  }
+  let record = geminiPromptCacheRecords.get(base.key);
+  if (geminiPromptCacheRecordExpired(record)) {
+    geminiPromptCacheRecords.delete(base.key);
+    record = null;
+  }
+  if (record?.state === "ready") {
+    record.reused = true;
+    return record;
+  }
+  if (record?.state === "bypass") return record;
+  if (!record) {
+    record = base;
+    record.state = "creating";
+    record.promise = (async () => {
+      let response;
+      try {
+        response = await requestUrl({
+          url: "https://generativelanguage.googleapis.com/v1beta/cachedContents",
+          method: "POST",
+          headers: {
+            "x-goog-api-key": settings.googleApiKey,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            model: `models/${String(modelId || "").replace(/^models\//i, "")}`,
+            ttl: `${GEMINI_PROMPT_CACHE_TTL_SECONDS}s`,
+            systemInstruction: { parts: [{ text: String(system || "") }] },
+            contents: [{ role: "user", parts: [{ text: normalizedPrefix }] }]
+          }),
+          throw: false
+        });
+      } catch (error) {
+        return { status: 0, text: String(error?.message || ""), json: {}, transportError: true };
+      }
+      return response;
+    })();
+    geminiPromptCacheRecords.set(base.key, record);
+    while (geminiPromptCacheRecords.size > GEMINI_PROMPT_CACHE_RECORD_LIMIT) {
+      const oldest = geminiPromptCacheRecords.keys().next().value;
+      if (!oldest || oldest === base.key) break;
+      geminiPromptCacheRecords.delete(oldest);
+    }
+  }
+  const response = await record.promise;
+  const name = String(response?.json?.name || "").trim();
+  if (response?.status >= 200 && response?.status < 300 && name) {
+    record.state = "ready";
+    record.created = true;
+    record.createCount = 1;
+    record.name = name;
+    record.nameHash = shortHash(name);
+    record.writeTokens = Math.max(0, Number(response?.json?.usageMetadata?.totalTokenCount || 0));
+    const nowMs = Date.now();
+    const serverExpireMs = Date.parse(String(response?.json?.expireTime || response?.json?.expirationTime || ""));
+    record.expiresAtMs = serverExpireMs > 0
+      ? Math.min(serverExpireMs, nowMs + GEMINI_PROMPT_CACHE_LOCAL_TTL_MS)
+      : nowMs + GEMINI_PROMPT_CACHE_LOCAL_TTL_MS;
+    record.expirySource = serverExpireMs > 0 ? "server-expire-time" : "local-ttl";
+    record.promise = null;
+    aiCloudCapabilityRemember({ provider: "gemini", model: modelId, profileRevision: "gemini-cached-content-v1", operation, carrier: "prompt-cache" }, "supported");
+    return record;
+  }
+  const unsupported = geminiPromptCacheCreateCapabilityUnsupported(response);
+  geminiPromptCacheRememberRecord(record, "bypass", unsupported ? "create-unsupported" : "create-rejected");
+  if (unsupported) aiCloudCapabilityRemember({ provider: "gemini", model: modelId, profileRevision: "gemini-cached-content-v1", operation, carrier: "prompt-cache" }, "unsupported");
+  return record;
+};
+const releaseGeminiPromptCacheForRequest = async ({ modelId = "", system = "", prefix = "", requestKey = "", apiKey = "" } = {}) => {
+  const key = geminiPromptCacheRecordKey({ model: modelId, system, prefix, requestKey });
+  const record = geminiPromptCacheRecords.get(key);
+  if (!record || !record.name || record.deleteStatus === "succeeded") return { status: "not-requested" };
+  record.deleteStatus = "pending";
+  let response;
+  try {
+    response = await requestUrl({
+      url: `https://generativelanguage.googleapis.com/v1beta/${String(record.name).replace(/^\//, "")}`,
+      method: "DELETE",
+      headers: { "x-goog-api-key": apiKey || "" },
+      throw: false
+    });
+  } catch {
+    record.deleteStatus = "failed";
+    return { status: "failed", nameHash: record.nameHash };
+  }
+  record.deleteStatus = [200, 202, 204, 404].includes(Number(response?.status)) ? "succeeded" : "failed";
+  if (record.deleteStatus === "succeeded") geminiPromptCacheRecords.delete(key);
+  return { status: record.deleteStatus, nameHash: record.nameHash };
+};
 const aiGatewaySingletonDescriptionContract = (operation = "", request = {}) => {
   if (!request?.singletonDescription || stsMpOperationName(operation) !== "task-description") return null;
   const consumerSchema = [request.originalSchema, request.jsonSchema, request.schema].find((candidate) => {
@@ -60546,6 +61500,8 @@ if (typeof module !== "undefined" && module.exports) {
     geminiNormalizeRequestError,
     geminiTransientRetrySnapshot,
     chatResponseSchema,
+    evidenceAdequacySchema,
+    validateEvidenceAdequacy,
     classifyChatConversationRequest,
     normalizeChatEvidencePayloadForValidation,
     normalizeChatProviderResponse,
@@ -60592,6 +61548,26 @@ const stsMpOperationName = (operation = "chat") => {
   if (["prompt-response", "prompt", "response"].includes(value)) return "prompt-response";
   return STS_MULTI_PROVIDER.OPERATION_KEYS.includes(value) ? value : "prompt-response";
 };
+
+function deepResearchReasoningSelection(settings = {}, modelChoice = {}) {
+  const provider = normalizeAiProvider(modelChoice.provider || "");
+  const model = String(modelChoice.model || "").trim();
+  const compatible = Boolean(provider && model
+    && STS_MULTI_PROVIDER.reasoningEffortCompatible(settings, provider, model, "high"));
+  return {
+    primaryOverride: compatible
+      ? { provider, model, reasoningEffort: "high", reasoningSource: "explicit" }
+      : null,
+    telemetry: {
+      requestedEffort: "high",
+      selectedEffort: compatible ? "high" : "automatic",
+      compatible,
+      overrideApplied: compatible,
+      provider,
+      model
+    }
+  };
+}
 
 if (typeof module !== "undefined" && module.exports?.prototype) {
   const stsMpPluginPrototype = module.exports.prototype;
@@ -60805,7 +61781,7 @@ function stsCreateRuntimeAiModelGateway(plugin) {
         gemini: async (request, adapterContext = {}) => {
           let usage = null;
           const geminiRequestProfile = geminiGenerateContentRequestProfile(request.model);
-          const providerResponse = await plugin.geminiResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
+          const providerResponse = await plugin.geminiResponse({ model: request.model, system: request.system || "", user: request.user || "", promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "", jsonSchema: request.schema || null, reasoningConfig: request.reasoningEffort && request.reasoningEffort !== "default" ? modelReasoningConfig(request.model, request.reasoningEffort) : {}, operation: request.operation, promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "", promptCacheKey: request.promptCacheKey || request.cacheMetadata?.promptCacheKey || request.cache?.promptCacheKey || request.cache?.key || "", maxOutputTokens: request.maxOutputTokens, onUsage: (value) => { usage = value; }, attempt: request._gatewayAttempt });
           const text = typeof providerResponse === "string" ? providerResponse : providerResponse?.text;
           const rawText = typeof providerResponse === "string" ? providerResponse : providerResponse?.rawText;
           return {

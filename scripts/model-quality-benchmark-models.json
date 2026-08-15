@@ -1,0 +1,15 @@
+{
+  "version": "2026-08-09-v2",
+  "models": [
+    { "label": "OpenRouter openai/gpt-5.6-luna high", "provider": "openrouter", "model": "openai/gpt-5.6-luna", "reasoning_effort": "high" },
+    { "label": "OpenRouter deepseek/deepseek-v4-flash-0731 high", "provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "reasoning_effort": "high" },
+    { "label": "OpenRouter qwen/qwen3.7-plus", "provider": "openrouter", "model": "qwen/qwen3.7-plus", "reasoning_effort": "default" },
+    { "label": "OpenRouter tencent/hy3 high", "provider": "openrouter", "model": "tencent/hy3", "reasoning_effort": "high" },
+    { "label": "OpenRouter xiaomi/mimo-v2.5", "provider": "openrouter", "model": "xiaomi/mimo-v2.5", "reasoning_effort": "default" },
+    { "label": "OpenRouter openrouter/free", "provider": "openrouter", "model": "openrouter/free", "reasoning_effort": "default" },
+    { "label": "Gemini gemini-3.5-flash-lite", "provider": "gemini", "model": "gemini-3.5-flash-lite", "reasoning_effort": "default" },
+    { "label": "Gemini gemini-3.7-flash high", "provider": "gemini", "model": "gemini-3.7-flash", "reasoning_effort": "high" },
+    { "label": "Open WebUI Gemma E4B", "provider": "openwebui", "model": "gemma4:e4b", "reasoning_effort": "default" },
+    { "label": "Open WebUI Qwen3.5-9B Defiant Fable", "provider": "openwebui", "model": "hf.co/DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:IQ3_M", "reasoning_effort": "default" }
+  ]
+}

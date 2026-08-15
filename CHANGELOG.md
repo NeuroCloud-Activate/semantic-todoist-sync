@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.18
+
+- Added conservative, capability-driven OpenRouter and Open WebUI defaults plus identity-scoped model profiles across OpenAI, Gemini, OpenRouter, and Open WebUI.
+- Standardized tested OpenRouter semantic indexing on `openai/text-embedding-3-small` and documented the sealed ten-model comparison.
+- Kept task discovery whole-note aware: configured markers remain mandatory anchors, clearly actionable unmarked content is included, and normal capture has no note-wide main-task cap.
+- Fixed task-plan and task-description completion so whole-note tasks without markers remain eligible, shared authoritative note evidence is not mistaken for a foreign task scope, and malformed singleton description JSON can use the one permitted bounded recovery request.
+- Made generated-task insertion and immediate sync obey their global settings even when a prompt template requests those side effects.
+- Preserved terminal provider/model failures as visible results under the shared initial-plus-one-retry generation budget.
+
 ## 0.8.17
 
 - Scheduling stays out of the past automatically, while deliberate drag, arrow, swap, add-at-time, and restore moves can use up to one hour of earlier grid time; automatic adds and duration-only edits cannot, and stale or out-of-window previews write nothing.

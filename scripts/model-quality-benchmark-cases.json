@@ -1,0 +1,127 @@
+{
+  "version": "2026-08-06-v2",
+  "title": "Frozen-evidence generation benchmark",
+  "classification": "synthetic-public-fixture",
+  "synthetic_provenance": {
+    "fixture": "synthetic-public-fixture",
+    "synthetic_only": true
+  },
+  "requested_max_output_tokens": 12288,
+  "score_contract": {
+    "reference": "The current Codex session's frozen reference outputs define the 100/100 suite anchor.",
+    "interpretation": "Scores describe this six-operation synthetic suite only; they are not universal model ratings.",
+    "points": {
+      "chat": 20,
+      "task_title": 10,
+      "description": 20
+    }
+  },
+  "cases": [
+    {
+      "id": "aurora-chat",
+      "scenario": "aurora",
+      "operation": "chat",
+      "provider_operation": "chat-query",
+      "output_key": "answer",
+      "points": 20,
+      "request": "What exact Aurora eligibility and supervisor-letter rules must I verify before completing the review?",
+      "evidence": [
+        { "id": "A1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "The current Aurora grant guidance limits the co-investigator role to one named collaborator. The broader research team may still contribute without being listed as co-investigators." },
+        { "id": "A2", "lane": "material_current", "synthetic_provenance": "synthetic-public-fixture", "text": "A research-supervisor letter is required only when the lead applicant holds a development-scientist appointment. When required, it must confirm supervision and access to the proposed research environment." },
+        { "id": "A3", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "The facilities inventory review concerns office access cards and printer maintenance. It is unrelated to the Aurora grant application." }
+      ],
+      "reference_output": "Verify that only one named collaborator is listed as co-investigator, while other team members may contribute without that designation. Require a research-supervisor letter only if the lead applicant has a development-scientist appointment; if required, it must confirm supervision and access to the proposed research environment.",
+      "required_facts": ["one named collaborator", "broader team may contribute without co-investigator status", "letter conditional on development-scientist appointment", "letter confirms supervision", "letter confirms research-environment access"],
+      "prohibited_inferences": ["facilities inventory", "letter always required", "multiple named co-investigators"]
+    },
+    {
+      "id": "aurora-task",
+      "scenario": "aurora",
+      "operation": "task_title",
+      "provider_operation": "task-generation",
+      "output_key": "title",
+      "points": 10,
+      "request": "Create exactly one concise task title from the configured #action marker. Do not create subtasks.",
+      "evidence": [
+        { "id": "A0", "lane": "current_action", "synthetic_provenance": "synthetic-public-fixture", "text": "#action Review the Aurora grant application today." },
+        { "id": "A1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Confirm the co-investigator eligibility wording and the research-supervisor letter requirement before completing the review." },
+        { "id": "A3", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "An unrelated facilities review covers office access cards and printer maintenance." }
+      ],
+      "reference_output": "Review the Aurora grant application today",
+      "required_facts": ["review Aurora grant application", "today"],
+      "prohibited_inferences": ["facilities inventory", "subtasks", "literal #action marker"]
+    },
+    {
+      "id": "aurora-description",
+      "scenario": "aurora",
+      "operation": "description",
+      "provider_operation": "task-description",
+      "output_key": "description",
+      "points": 20,
+      "request": "Write one concise standalone task description for 'Review the Aurora grant application today'. Include only facts needed to do the task and do not narrate evidence IDs.",
+      "evidence": [
+        { "id": "A0", "lane": "current_action", "synthetic_provenance": "synthetic-public-fixture", "text": "#action Review the Aurora grant application today. Confirm the co-investigator eligibility wording and the research-supervisor letter requirement before completing the review. The intended output is one task; do not create subtasks." },
+        { "id": "A1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Current guidance permits one named collaborator as co-investigator; other team members may contribute without being listed as co-investigators." },
+        { "id": "A2", "lane": "material_current", "synthetic_provenance": "synthetic-public-fixture", "text": "The supervisor letter is required only for a lead applicant with a development-scientist appointment, and must confirm supervision and access to the proposed research environment." },
+        { "id": "A3", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "An unrelated facilities review covers office access cards and printer maintenance." }
+      ],
+      "reference_output": "Confirm that the application names no more than one collaborator as co-investigator and makes clear that other team members may contribute without that designation. If the lead applicant has a development-scientist appointment, verify that the supervisor letter confirms supervision and access to the proposed research environment.",
+      "required_facts": ["one named collaborator", "other team contribution allowed", "conditional letter rule", "supervision", "research-environment access"],
+      "prohibited_inferences": ["facilities inventory", "subtasks", "evidence IDs", "letter always required"]
+    },
+    {
+      "id": "solaris-chat",
+      "scenario": "solaris",
+      "operation": "chat",
+      "provider_operation": "chat-query",
+      "output_key": "answer",
+      "points": 20,
+      "request": "What current Solaris export and approval rules apply, and does the 2024 pilot rule still control?",
+      "evidence": [
+        { "id": "S1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Effective January 2026, external analysts may access only de-identified aggregate exports after the data steward approves the request." },
+        { "id": "S2", "lane": "material_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Legal review is required only when row-level data or a cross-border transfer is proposed. The approval order is data steward first, then legal review only when that condition applies." },
+        { "id": "S3", "lane": "superseded_history", "synthetic_provenance": "synthetic-public-fixture", "text": "The 2024 pilot allowed pseudonymized row-level exports. That pilot rule was superseded by the January 2026 policy." },
+        { "id": "S4", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "The website redesign backlog covers typography and navigation. It is unrelated to Solaris data sharing." }
+      ],
+      "reference_output": "Use the January 2026 policy: external analysts may receive only de-identified aggregate exports after data-steward approval. Legal review follows only if row-level data or a cross-border transfer is proposed. The 2024 pseudonymized row-level pilot rule was superseded and no longer controls.",
+      "required_facts": ["de-identified aggregate exports only", "data-steward approval", "legal conditional on row-level or cross-border", "steward before conditional legal", "2024 pilot superseded"],
+      "prohibited_inferences": ["website redesign", "2024 rule still controls", "legal always required"]
+    },
+    {
+      "id": "solaris-task",
+      "scenario": "solaris",
+      "operation": "task_title",
+      "provider_operation": "task-generation",
+      "output_key": "title",
+      "points": 10,
+      "request": "Create exactly one concise task title from the configured #next marker. Do not create subtasks and do not infer a security audit.",
+      "evidence": [
+        { "id": "S0", "lane": "current_action", "synthetic_provenance": "synthetic-public-fixture", "text": "#next Finalize the Solaris data-sharing amendment by Friday." },
+        { "id": "S1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Verify the external-analyst export rule and approval order." },
+        { "id": "S4", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "An unrelated website redesign backlog covers typography and navigation." }
+      ],
+      "reference_output": "Finalize the Solaris data-sharing amendment by Friday",
+      "required_facts": ["finalize Solaris data-sharing amendment", "by Friday"],
+      "prohibited_inferences": ["security audit", "website redesign", "subtasks", "literal #next marker"]
+    },
+    {
+      "id": "solaris-description",
+      "scenario": "solaris",
+      "operation": "description",
+      "provider_operation": "task-description",
+      "output_key": "description",
+      "points": 20,
+      "request": "Write one concise standalone task description for 'Finalize the Solaris data-sharing amendment by Friday'. Apply the current rule, distinguish superseded history, and do not narrate evidence IDs.",
+      "evidence": [
+        { "id": "S0", "lane": "current_action", "synthetic_provenance": "synthetic-public-fixture", "text": "#next Finalize the Solaris data-sharing amendment by Friday. Keep this as one task and do not infer a security audit." },
+        { "id": "S1", "lane": "required_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Effective January 2026, external analysts may access only de-identified aggregate exports after data-steward approval." },
+        { "id": "S2", "lane": "material_current", "synthetic_provenance": "synthetic-public-fixture", "text": "Legal review follows only if row-level data or a cross-border transfer is proposed." },
+        { "id": "S3", "lane": "superseded_history", "synthetic_provenance": "synthetic-public-fixture", "text": "A 2024 pilot permitted pseudonymized row-level exports, but that pilot was superseded by the January 2026 policy." },
+        { "id": "S4", "lane": "unrelated", "synthetic_provenance": "synthetic-public-fixture", "text": "An unrelated website redesign backlog covers typography and navigation." }
+      ],
+      "reference_output": "Update the amendment to allow external analysts only de-identified aggregate exports after data-steward approval. Add legal review after steward approval only when row-level data or a cross-border transfer is proposed, and do not rely on the superseded 2024 pilot rule.",
+      "required_facts": ["de-identified aggregate exports only", "data-steward approval", "conditional legal review", "2024 pilot superseded"],
+      "prohibited_inferences": ["security audit", "website redesign", "evidence IDs", "legal always required"]
+    }
+  ]
+}

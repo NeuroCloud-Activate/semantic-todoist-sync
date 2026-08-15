@@ -1,18 +1,19 @@
-# Local/private project state
-AGENTS.md
-Plan.md
-.repowise/
-.mcp.json
-.claude/
+# Private/local state
 .env
 .env.*
 !.env.example
-
-# OS and editor noise
-.DS_Store
-
-# Runtime/build artifacts
+/Testing/
+/public-share/
 node_modules/
 *.log
 data.json
 semantic-index*.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+*.tokens
+*.sqlite
+*.sqlite3
+*.db

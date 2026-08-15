@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "suite_version": "2026-08-06-v2",
+  "judge": "current Codex session using identity-blinded candidate packets",
+  "reference_score": 100,
+  "requested_max_output_tokens_per_call": 12288,
+  "case_order": [
+    "aurora-chat",
+    "aurora-task",
+    "aurora-description",
+    "solaris-chat",
+    "solaris-task",
+    "solaris-description"
+  ],
+  "case_maximums": [20, 10, 20, 20, 10, 20],
+  "evaluated": [
+    { "model": "openai:gpt-5.6-luna:high", "case_scores": [20, 10, 20, 20, 10, 20], "quality_score": 100, "completed_cases": 6 },
+    { "model": "openrouter:deepseek/deepseek-v4-flash-0731", "case_scores": [20, 10, 20, 20, 10, 19], "quality_score": 99, "completed_cases": 6 },
+    { "model": "openwebui:gemma4:e4b:structured-thinking-disabled", "case_scores": [20, 8, 20, 20, 10, 20], "quality_score": 98, "completed_cases": 6 },
+    { "model": "openrouter:qwen/qwen3.7-plus", "case_scores": [20, 8, 20, 20, 10, 19], "quality_score": 97, "completed_cases": 6 },
+    { "model": "gemini:gemini-3.5-flash-lite", "case_scores": [18, 10, 20, 20, 10, 19], "quality_score": 97, "completed_cases": 6 },
+    { "model": "openrouter:tencent/hy3", "case_scores": [20, 10, 17, 20, 10, 19], "quality_score": 96, "completed_cases": 6 },
+    { "model": "openrouter:deepseek/deepseek-v4-flash", "case_scores": [18, 10, 20, 20, 10, 17], "quality_score": 95, "completed_cases": 6 },
+    { "model": "openrouter:xiaomi/mimo-v2.5", "case_scores": [20, 8, 17, 20, 10, 17], "quality_score": 92, "completed_cases": 6 },
+    { "model": "openwebui:qwen3.5-9b-defiant:rtx3070-structured", "case_scores": [0, 10, 20, 20, 10, 14], "quality_score": 74, "completed_cases": 5 },
+    { "model": "openrouter:openrouter/free", "case_scores": [0, 0, 20, 0, 10, 20], "quality_score": 50, "completed_cases": 3 }
+  ],
+  "unavailable_configurations": [
+    "openrouter:tencent/hy3:free",
+    "openwebui:qwen3.5-9b-defiant:m4-pro-optimized",
+    "openwebui:gemma-4-12b-agentic:m4-pro-optimized",
+    "openwebui:gemma-4-12b-agentic:unoptimized",
+    "openwebui:qwythos-9b",
+    "openwebui:qwen3.5:4b"
+  ]
+}

@@ -2,12 +2,23 @@
 
 ## 0.8.18
 
-- Added conservative, capability-driven OpenRouter and Open WebUI defaults plus identity-scoped model profiles across OpenAI, Gemini, OpenRouter, and Open WebUI.
-- Standardized tested OpenRouter semantic indexing on `openai/text-embedding-3-small` and documented the sealed ten-model comparison.
-- Kept task discovery whole-note aware: configured markers remain mandatory anchors, clearly actionable unmarked content is included, and normal capture has no note-wide main-task cap.
-- Fixed task-plan and task-description completion so whole-note tasks without markers remain eligible, shared authoritative note evidence is not mistaken for a foreign task scope, and malformed singleton description JSON can use the one permitted bounded recovery request.
+- Made task discovery whole-note aware: configured required-action markers remain mandatory coverage anchors rather than an exclusive filter, clearly actionable unmarked sentences stay eligible, and the legacy per-note main-task cap is no longer applied. Context admission and the configured per-task subtask limit remain operational bounds.
+- Isolated each detected action into its own generation scope, with exact actor, artifact, condition, timing, and source bindings. Added sibling-action substitution checks plus normalized cross-scope duplicate detection so repeated or swapped outputs receive at most one bounded repair instead of being silently accepted.
+- Added deterministic priority correction for explicit urgency and narrowly admitted structural repair for safe task-shape failures without broadening the requested action.
+- Reworked task descriptions around compact singleton, task-local evidence ledgers and a cacheable shared prefix. Descriptions exclude stale and sibling work, avoid filler and source-title narration, preserve exact execution details, and attach canonical references only to facts actually stated.
+- Added deterministic singleton identity restoration and canonical sentence-reference cleanup when the task and scope are unambiguous. A complete same-model regeneration is allowed only for admitted schema, content, or identity failures and only while the shared dispatch budget remains; arbitrary malformed output does not automatically receive another AI call.
+- Added an indexed lexical seed route, bounded semantic-handle selection, source-thread corroboration, and revision-scoped retrieval caches. These are implementation optimizations and do not by themselves claim a measured relevance or latency improvement.
+- Added adaptive Open WebUI live-query embeddings for eligible chat and task retrieval. Query vectors are provider/model/dimension checked, deduplicated, cached, and batched within the provider-input budget, with indexed handles retained as the fallback.
+- Added a strict local preflight below 16,000 estimated provider-input tokens for generation, embeddings, and native web search. Embedding batches split or stop before the boundary, and generation output allowances remain request- and context-derived rather than imposing a Gemma-specific profile ceiling.
+- Enforced one shared generation budget of exactly two provider dispatches per logical operation: the initial request plus at most one additional request across carrier, transient, fallback, and workflow recovery paths. Deterministic parsing, normalization, and canonical-reference cleanup do not consume that budget.
+- Added conservative OpenRouter and Open WebUI structured-output defaults. OpenRouter enables optional schema, reasoning, and output features only from fresh model or served-route capability evidence; stale and dynamic-route metadata fall back safely.
+- Expanded provider/model/operation focus guidance across OpenAI, Gemini, OpenRouter, and Open WebUI, while keeping Open WebUI carrier, thinking, streaming, cooldown, and deadline overrides exact-model scoped.
+- Fixed Gemma4 E4B Open WebUI compatibility by disabling the failing native-thinking path, using completed delivery, retaining native schema for chat, and using prompt-grounded JSON for task generation and descriptions. Current Gemma4 profiles do not add a hard model-specific output-token ceiling.
+- Hardened Open WebUI response handling for completed JSON, native NDJSON, and SSE. HTTP-200 error envelopes are classified and sanitized as provider failures instead of model output or missing content, and oversized response bodies are rejected before parsing.
+- Improved OpenRouter rate handling by applying the rolling 20-requests-per-minute admission policy only to free routes, leaving paid routes provider-managed, and preserving bounded `Retry-After`, quota, and rate-header diagnostics.
+- Kept provider scheduling conservative: OpenRouter defaults to 10 concurrent calls with a maximum of 16, while Open WebUI defaults to one model-affine worker. Benchmark concurrency remains run-specific rather than a model-quality claim.
 - Made generated-task insertion and immediate sync obey their global settings even when a prompt template requests those side effects.
-- Preserved terminal provider/model failures as visible results under the shared initial-plus-one-retry generation budget.
+- Added a documented model-quality protocol, candidate configuration, sanitized aggregate scorecard, carrier-recovery fixtures, and an allowlist-based public-share scanner. The README's top-five table includes only completed rows with all expected rendered outputs and is not a universal model or release-readiness rating.
 
 ## 0.8.17
 

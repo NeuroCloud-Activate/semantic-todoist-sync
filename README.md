@@ -114,6 +114,14 @@ For the scoring approach and the complete sanitized aggregate, see the
 [model-quality benchmark protocol](docs/model-quality-benchmark.md) and its
 [published scorecard](docs/model-quality-benchmark-scorecard-2026-08-09.json).
 
+### Optimizations in 0.8.21
+
+- Fixed remaining selector usability regressions in primary/fallback model controls:
+  - typed search input no longer gets overwritten by the selected label after user typing,
+  - query text stays local to the search box until an explicit model is selected,
+  - and minimum-3-character matching checks full provider/model text as before for dense OpenRouter/OpenAI/OpenWebUI catalogs.
+- Confirmed selector lists are still grouped by provider and remain scrollable through long catalog lengths.
+
 ### Optimizations in 0.8.20
 
 - Settings model pickers now keep their behavior consistent across all primary/fallback and operation contexts:

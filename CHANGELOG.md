@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.21
+
+- Fixed model selector usability by stabilizing search query state and preventing the active text input from being overwritten by the selected label while typing.
+- Kept searchable model combobox behavior at provider scope:
+  - minimum 3-character query matching continues to run against full provider/model text,
+  - empty query remains an unfiltered view of all rows,
+  - and result order stays provider-grouped and fully scrollable for long catalogs.
+- Synchronized plugin release metadata with the new patch (`manifest.json` / `versions.json`) at `0.8.21`.
+
 ## 0.8.20
 
 - Fixed primary/fallback model selectors in settings so picker input is reliably searchable and the popup remains scrollable on long provider catalogs.

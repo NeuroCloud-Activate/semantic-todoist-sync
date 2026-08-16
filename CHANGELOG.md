@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.20
+
+- Fixed primary/fallback model selectors in settings so picker input is reliably searchable and the popup remains scrollable on long provider catalogs.
+- Ensured model picker dropdowns remain provider-scoped and preserved the selected provider/model boundaries when switching operation scope or provider configuration.
+- Consolidated release metadata updates for this release and aligned `manifest.json` / `versions.json` to `0.8.20`.
+
 ## 0.8.19
 
 - Added provider-scoped operation model pickers in settings so the primary and fallback selectors only show models from their selected provider family.

@@ -2287,9 +2287,9 @@
   display: block;
   max-width: calc(100vw - 16px);
   min-height: 44px;
-  max-height: 360px;
-  overflow-x: hidden;
-  overflow-y: auto;
+  max-height: 360px !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
   padding: 4px;

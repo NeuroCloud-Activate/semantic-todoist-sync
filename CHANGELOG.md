@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.19
+
+- Added provider-scoped operation model pickers in settings so the primary and fallback selectors only show models from their selected provider family.
+- Made primary/fallback model selectors searchable from the provider-selected list, improving discovery and selection reliability.
+- Set model dropdown lists to bounded-height scrolling surfaces so long model catalogs remain accessible and keyboard/mouse navigable.
+- Kept Obsidian release metadata in sync with this patch by aligning `manifest.json` and `versions.json` to version `0.8.19`.
+
 ## 0.8.18
 
 - Made task discovery whole-note aware: configured required-action markers remain mandatory coverage anchors rather than an exclusive filter, clearly actionable unmarked sentences stay eligible, and the legacy per-note main-task cap is no longer applied. Context admission and the configured per-task subtask limit remain operational bounds.

@@ -114,7 +114,7 @@ For the scoring approach and the complete sanitized aggregate, see the
 [model-quality benchmark protocol](docs/model-quality-benchmark.md) and its
 [published scorecard](docs/model-quality-benchmark-scorecard-2026-08-09.json).
 
-### Optimizations in 0.8.18
+### Optimizations in 0.8.19
 
 **Task quality and scope safety**
 

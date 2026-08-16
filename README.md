@@ -114,6 +114,14 @@ For the scoring approach and the complete sanitized aggregate, see the
 [model-quality benchmark protocol](docs/model-quality-benchmark.md) and its
 [published scorecard](docs/model-quality-benchmark-scorecard-2026-08-09.json).
 
+### Optimizations in 0.8.20
+
+- Settings model pickers now keep their behavior consistent across all primary/fallback and operation contexts:
+  - both pickers are searchable from the selected provider list,
+  - popup lists remain scrollable with dense long catalogs,
+  - and query typing preserves the active filter when opening via typing or arrow-key navigation.
+- Model selection remains provider-scoped in picker rows, so the configured primary/fallback selection set matches the active provider family used for each role.
+
 ### Optimizations in 0.8.19
 
 **Task quality and scope safety**

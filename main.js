@@ -69449,6 +69449,7 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
   const input = make("input", "semantic-todoist-searchable-combobox-input");
   const selectedValueEl = make("div", "semantic-todoist-searchable-combobox-selected-value");
   const popup = make("div", "semantic-todoist-searchable-combobox-popup");
+  popup.setAttribute("tabindex", "-1");
   const listboxId = `semantic-todoist-model-listbox-${++stsMpSearchableComboboxSequence}`;
   const inputId = `semantic-todoist-model-input-${stsMpSearchableComboboxSequence}`;
   const label = asText(config.accessibleLabel || config.label || "Model");
@@ -69528,6 +69529,13 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     return haystack.includes(normalize(query));
   };
   const selectable = () => optionElements.filter((option) => !option.disabled);
+  const applyPopupGeometry = (availableHeight) => {
+    popup.style.maxHeight = `${Math.max(176, Math.min(360, Number(availableHeight) || 176))}px`;
+    popup.style.overflowY = "auto";
+    popup.style.overflowX = "hidden";
+    popup.style.overscrollBehavior = "contain";
+    popup.style.WebkitOverflowScrolling = "touch";
+  };
   const setActive = (index) => {
     optionElements.forEach((option, optionIndex) => {
       const active = optionIndex === index;
@@ -69559,7 +69567,7 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     popup.style.left = `${left}px`;
     popup.style.top = `${Math.max(8, top)}px`;
     popup.style.width = `${width}px`;
-    popup.style.maxHeight = `${maxHeight}px`;
+    applyPopupGeometry(maxHeight);
   };
   const render = () => {
     while (popup.firstChild) popup.removeChild(popup.firstChild);
@@ -69625,9 +69633,13 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     }
     setActive(-1);
   };
-  const openPopup = () => {
+  const openPopup = (options = {}) => {
     if (destroyed) return;
     ensureSelectedRow();
+    if (!options.preserveQuery) {
+      query = "";
+      input.value = "";
+    }
     open = true;
     popup.hidden = false;
     input.setAttribute("aria-expanded", "true");
@@ -69665,13 +69677,13 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
   };
   const onInput = () => {
     query = input.value;
-    if (!open) openPopup();
+    if (!open) openPopup({ preserveQuery: true });
     else { render(); position(); }
   };
   const onFocus = () => openPopup();
   const onKeyDown = (event) => {
-    if (event.key === "ArrowDown") { event.preventDefault(); if (!open) openPopup(); moveActive(1); }
-    else if (event.key === "ArrowUp") { event.preventDefault(); if (!open) openPopup(); moveActive(-1); }
+    if (event.key === "ArrowDown") { event.preventDefault(); if (!open) openPopup({ preserveQuery: true }); moveActive(1); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); if (!open) openPopup({ preserveQuery: true }); moveActive(-1); }
     else if (event.key === "Home" && open) { event.preventDefault(); const available = selectable(); if (available.length) setActive(optionElements.indexOf(available[0])); }
     else if (event.key === "End" && open) { event.preventDefault(); const available = selectable(); if (available.length) setActive(optionElements.indexOf(available.at(-1))); }
     else if (event.key === "Enter" && open) {

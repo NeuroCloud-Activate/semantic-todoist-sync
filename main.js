@@ -69844,18 +69844,22 @@ function stsMpSharedGenerationReasoningSetting(containerEl, plugin, role = "prim
 
 function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
-  const rows = stsMpCatalogForOperation(plugin.settings, operation);
+  const modelProvider = () => STS_MULTI_PROVIDER.normalizeProvider(
+    options.provider || reference?.primary?.provider || plugin.settings.aiModelProvider,
+    plugin.settings.aiModelProvider
+  );
+  const rows = stsMpCatalogForOperation(plugin.settings, operation, modelProvider());
   const current = stsMpProviderScopedValue(reference?.primary);
   const setting = new Setting(containerEl)
     .setName(options.name || `${operation} model`)
-    .setDesc(options.desc || "Type to search provider name, display label, or the full native model ID. The provider scope is persisted explicitly and slash IDs remain intact.");
+    .setDesc(options.desc || "Type to search the selected provider models. The provider scope is persisted explicitly and slash IDs remain intact.");
   setting.settingEl?.addClass?.("semantic-todoist-model-setting");
   stsMpSearchableCombobox(setting.controlEl, {
     accessibleLabel: options.accessibleLabel || `${operation} model`,
     rows,
-    getRows: () => stsMpCatalogForOperation(plugin.settings, operation),
+    getRows: () => stsMpCatalogForOperation(plugin.settings, operation, modelProvider()),
     value: current,
-    manualRowForQuery: (value) => stsMpManualModelRow(value, STS_MULTI_PROVIDER.PROVIDERS, plugin.settings),
+    manualRowForQuery: (value) => stsMpManualModelRow(value, [modelProvider()], plugin.settings),
     onSelect: async (row) => {
       const selected = stsMpParseProviderScopedValue(row?.value || "");
       if (!selected) return;
@@ -69872,24 +69876,29 @@ function stsMpOperationModelSetting(containerEl, plugin, operation, refreshDispl
 
 function stsMpFallbackModelSetting(containerEl, plugin, operation, refreshDisplay = null, options = {}) {
   const reference = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation);
-  const rows = STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, stsMpCatalogForOperation(plugin.settings, operation));
+  const fallbackProvider = () => STS_MULTI_PROVIDER.normalizeProvider(
+    options.provider || reference?.fallback?.provider || plugin.settings.fallbackAiModelProvider || plugin.settings.aiModelProvider,
+    plugin.settings.fallbackAiModelProvider || plugin.settings.aiModelProvider
+  );
+  const catalog = () => stsMpCatalogForOperation(plugin.settings, operation, fallbackProvider());
+  const rows = STS_MULTI_PROVIDER.fallbackCatalogRows(reference?.primary, catalog());
   const current = stsMpProviderScopedValue(reference?.fallback);
   const setting = new Setting(containerEl)
     .setName(options.name || `${operation} fallback`)
-    .setDesc(options.desc || "Type to search the fixed provider groups. Automatic selects a provider-local fallback; choose an explicit provider:model to use any configured provider. The exact primary model is disabled. Selection alone makes no network call.");
+    .setDesc(options.desc || "Type to search fallback models for the configured fallback provider. Automatic selects a provider-local fallback; the exact primary model is disabled. Selection alone makes no network call.");
   setting.settingEl?.addClass?.("semantic-todoist-model-setting");
   stsMpSearchableCombobox(setting.controlEl, {
     accessibleLabel: options.accessibleLabel || `${operation} fallback`,
     rows,
     getRows: () => STS_MULTI_PROVIDER.fallbackCatalogRows(
       STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation)?.primary,
-      stsMpCatalogForOperation(plugin.settings, operation)
+      catalog()
     ),
     value: current,
     automatic: true,
     automaticLabel: "Automatic fallback",
     manualRowForQuery: (value) => {
-      const row = stsMpManualModelRow(value, STS_MULTI_PROVIDER.PROVIDERS, plugin.settings);
+      const row = stsMpManualModelRow(value, [fallbackProvider()], plugin.settings);
       const primary = STS_MULTI_PROVIDER.operationModelReference(plugin.settings, operation)?.primary;
       if (row && primary && STS_MULTI_PROVIDER.modelIdentity(row.provider, row.id) === STS_MULTI_PROVIDER.modelIdentity(primary.provider, primary.model)) row.disabled = true;
       return row;

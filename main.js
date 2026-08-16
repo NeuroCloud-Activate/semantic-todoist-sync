@@ -69524,9 +69524,10 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     // never inject it into the popup option list.
   };
   const isMatch = (row) => {
-    if (!query) return true;
+    const candidate = String(query || "").trim().toLowerCase();
+    if (!candidate || candidate.length < 3) return true;
     const haystack = [providerName(row.provider), row.label, row.id, row.value].map(normalize).join(" ");
-    return haystack.includes(normalize(query));
+    return haystack.includes(candidate);
   };
   const selectable = () => optionElements.filter((option) => !option.disabled);
   const applyPopupGeometry = (availableHeight) => {
@@ -69654,8 +69655,7 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     input.removeAttribute("aria-activedescendant");
     setActive(-1);
     if (restore) {
-      query = "";
-      input.value = selectedLabel();
+      input.value = query || selectedLabel();
     }
     updateSelectedValuePresentation();
   };
@@ -69675,12 +69675,22 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     const next = Math.max(0, Math.min(available.length - 1, current + direction));
     setActive(optionElements.indexOf(available[next]));
   };
+  const currentInputValue = () => String(input.value || "");
+  const syncQueryFromInput = () => {
+    const value = currentInputValue();
+    const selectedText = selectedLabel();
+    query = value && value !== selectedText ? value : "";
+    return query;
+  };
   const onInput = () => {
-    query = input.value;
+    syncQueryFromInput();
     if (!open) openPopup({ preserveQuery: true });
     else { render(); position(); }
   };
-  const onFocus = () => openPopup();
+  const onFocus = () => {
+    const fromInput = syncQueryFromInput();
+    openPopup({ preserveQuery: String(fromInput || query || "").trim().length > 0 });
+  };
   const onKeyDown = (event) => {
     if (event.key === "ArrowDown") { event.preventDefault(); if (!open) openPopup({ preserveQuery: true }); moveActive(1); }
     else if (event.key === "ArrowUp") { event.preventDefault(); if (!open) openPopup({ preserveQuery: true }); moveActive(-1); }

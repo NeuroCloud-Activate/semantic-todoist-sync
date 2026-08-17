@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.27
+
+- Added support for llama-server Responses API SSE envelopes returned through
+  OpenWebUI's OpenAI-compatible chat route (`response.output_text.delta` and
+  `response.completed`). Existing Chat Completions SSE and Ollama NDJSON
+  transports remain unchanged.
+- Added bounded regression coverage for completed and incomplete Responses API
+  streams.
+
 ## 0.8.26
 
 - Fixed Open WebUI model discovery to retain the callable API `id` instead of

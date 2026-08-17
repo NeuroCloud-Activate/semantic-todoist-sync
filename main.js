@@ -47782,6 +47782,22 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     items.push(normalized);
   }
   const recordCeiling = Math.max(1, Number(options.recordCeiling ?? settings.maxTaskContextChunks ?? 48) || 48);
+  const exactTaskFactIds = new Set();
+  for (const task of options.tasks || []) {
+    const selectedEvidenceIds = new Set([
+      ...(task?.evidence_ids || task?.evidenceIds || []),
+      ...(task?.taskLocalEvidence?.evidenceIds || task?.taskLocalEvidence?.evidence_ids || []),
+      ...(task?.providerEligibleEvidenceIds || [])
+    ].map(String).filter(Boolean));
+    for (const binding of [
+      ...(task?.fact_bindings || task?.factBindings || []),
+      ...(task?.taskLocalEvidence?.factBindings || task?.taskLocalEvidence?.fact_bindings || [])
+    ]) {
+      const factId = String(binding?.factId || binding?.fact_id || "").trim();
+      const evidenceId = String(binding?.evidenceId || binding?.evidence_id || "").trim();
+      if (factId && evidenceId && selectedEvidenceIds.has(evidenceId)) exactTaskFactIds.add(factId);
+    }
+  }
   const factsById = new Map();
   const addFact = (fact = {}) => {
     const factId = String(fact.factId || fact.fact_id || "").trim();
@@ -47789,7 +47805,12 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   };
   for (const fact of sourceContract.facts || []) addFact(fact);
   for (const fact of Object.values(options.contextBundle?.factsById || {})) addFact(fact);
-  for (const task of options.tasks || []) for (const fact of task?.taskLocalEvidence?.typedFacts || []) addFact(fact);
+  for (const task of options.tasks || []) {
+    for (const fact of task?.taskLocalEvidence?.typedFacts || []) {
+      const factId = String(fact?.factId || fact?.fact_id || fact?.id || "").trim();
+      if (exactTaskFactIds.has(factId)) addFact(fact);
+    }
+  }
   const protectedEvidenceIds = new Set();
   const protectedFactIds = new Set();
   const protectedReasonByEvidenceId = new Map();
@@ -47847,30 +47868,37 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
       ...(rich.priorityFactRefs || []),
       ...(rich.priority_fact_refs || [])
     ]) {
-      if (mandatoryFact(factsById.get(String(factId || "")) || {})) addProtectedFact(factId, "mandatory-fact");
+      if (exactTaskFactIds.has(String(factId || ""))
+        && mandatoryFact(factsById.get(String(factId || "")) || {})) addProtectedFact(factId, "mandatory-fact");
     }
     for (const factId of [
       ...(rich.materialDescriptionFactRefs || []),
       ...(rich.material_description_fact_refs || []),
       ...(rich.executionDetailFactRefs || []),
       ...(rich.execution_detail_fact_refs || [])
-    ]) addProtectedFact(factId, "required-description-material-fact");
+    ]) {
+      if (exactTaskFactIds.has(String(factId || ""))) addProtectedFact(factId, "required-description-material-fact");
+    }
     for (const fact of rich.priorityFacts || []) {
+      const factId = String(fact?.factId || fact?.fact_id || fact?.id || "").trim();
+      if (!exactTaskFactIds.has(factId)) continue;
       addFact(fact);
       if (mandatoryFact(fact)) addProtectedFact(fact.factId, "mandatory-fact");
     }
     for (const binding of rich.factBindings || rich.fact_bindings || []) {
       const factId = String(binding?.factId || binding?.fact_id || "");
-      if (factId && mandatoryFact(factsById.get(factId) || {})) addProtectedFact(factId, "mandatory-fact");
+      if (factId && exactTaskFactIds.has(factId) && mandatoryFact(factsById.get(factId) || {})) addProtectedFact(factId, "mandatory-fact");
     }
   }
   for (const bundle of Object.values(options.scopeSemanticEvidence || {})) {
     for (const factId of [
       ...(bundle?.mandatoryTaskFactIds || []),
-      ...(bundle?.mandatoryDescriptionFactIds || []),
-      ...(bundle?.primaryContextFactIds || [])
+      ...(bundle?.mandatoryDescriptionFactIds || [])
     ]) addProtectedFact(factId, "scope-mandatory-fact");
-    if (bundle?.factId) addProtectedFact(bundle.factId, "scope-primary-fact");
+    for (const factId of bundle?.primaryContextFactIds || []) {
+      if (factsById.has(String(factId || ""))) addProtectedFact(factId, "scope-primary-context-fact");
+    }
+    if (bundle?.factId && factsById.has(String(bundle.factId))) addProtectedFact(bundle.factId, "scope-primary-fact");
   }
   const missingProtectedFactIds = Array.from(requiredProtectedFactIds).filter((factId) => !factsById.has(factId));
   const missingProtectedEvidenceIds = Array.from(requiredProtectedEvidenceIds).filter((evidenceId) => !itemById.has(evidenceId));
@@ -51631,6 +51659,93 @@ function taskWorkflowProviderReservationCoverageEligible(item = {}) {
   return actionProof || requestScopedProof || continuityProof || materialityProof;
 }
 
+function taskWorkflowSourceContractEvidenceClosure(sourceContract = {}, records = [], sourceSummary = "") {
+  const finalItems = Array.isArray(records) ? records.slice() : [];
+  const byEvidenceId = new Map(finalItems
+    .map((item) => [String(item?.evidenceId || item?.evidence_id || item?.id || ""), item])
+    .filter(([evidenceId]) => evidenceId));
+  const factsByEvidenceId = new Map();
+  for (const fact of sourceContract.facts || []) {
+    const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "").trim();
+    if (!evidenceId) continue;
+    const facts = factsByEvidenceId.get(evidenceId) || [];
+    facts.push(fact);
+    factsByEvidenceId.set(evidenceId, facts);
+  }
+  const requiredEvidenceIds = uniqueValues([
+    sourceContract.primaryEvidenceId,
+    ...(sourceContract.primaryEvidenceIds || []),
+    ...(sourceContract.scopes || []).flatMap((scope) => [
+      ...(scope?.primaryEvidenceIds || []),
+      scope?.primaryEvidenceId
+    ])
+  ].map(String).filter(Boolean));
+  const sourceScopeIds = uniqueValues([
+    ...(sourceContract.scopeIds || []),
+    sourceContract.sourceScopeId,
+    sourceContract.scopeId,
+    sourceContract.defaultScopeId
+  ].map(String).filter(Boolean));
+  let repairedCount = 0;
+  for (const evidenceId of requiredEvidenceIds) {
+    const contractFacts = (factsByEvidenceId.get(evidenceId) || []).slice();
+    const existing = byEvidenceId.get(evidenceId);
+    if (existing) {
+      if (contractFacts.length) {
+        const factsById = new Map([...(existing.structuredFacts || []), ...contractFacts]
+          .map((fact) => [String(fact?.factId || fact?.fact_id || fact?.id || ""), fact])
+          .filter(([factId]) => factId));
+        existing.structuredFacts = Array.from(factsById.values());
+        existing.factIds = uniqueValues([
+          ...(existing.factIds || []),
+          ...contractFacts.map((fact) => fact?.factId || fact?.fact_id || fact?.id)
+        ].map(String).filter(Boolean));
+      }
+      existing.scopeIds = uniqueValues([
+        ...(existing.scopeIds || []),
+        ...contractFacts.map((fact) => fact?.scopeId || fact?.scope_id),
+        ...sourceScopeIds
+      ].map(String).filter(Boolean));
+      continue;
+    }
+    // The source contract is authoritative for its own primary rows. Rebuild
+    // only those required rows; unresolved external/semantic references still
+    // fail closed in taskWorkflowProviderEvidenceProjection below.
+    if (evidenceId !== String(sourceContract.primaryEvidenceId || "") && !contractFacts.length) continue;
+    const row = {
+      evidenceId,
+      id: evidenceId,
+      sourceKind: evidenceId === String(sourceContract.primaryEvidenceId || "") ? "current-source" : "current-source-reference",
+      primarySource: evidenceId === String(sourceContract.primaryEvidenceId || ""),
+      semanticScore: 1,
+      provenance: {
+        sourceId: String(sourceContract.sourceId || ""),
+        sourceType: String(sourceContract.sourceType || ""),
+        title: String(sourceContract.title || ""),
+        path: String(sourceContract.path || ""),
+        authority: "current"
+      },
+      temporalRelation: "current",
+      authorityState: "authoritative",
+      conflictState: "none",
+      current: true,
+      scopeIds: uniqueValues([
+        ...sourceScopeIds,
+        ...contractFacts.map((fact) => fact?.scopeId || fact?.scope_id)
+      ].map(String).filter(Boolean)),
+      factIds: contractFacts.map((fact) => String(fact?.factId || fact?.fact_id || fact?.id || "")).filter(Boolean),
+      structuredFacts: contractFacts.map((fact) => Object.assign({}, fact)),
+      excerpt: evidenceId === String(sourceContract.primaryEvidenceId || "")
+        ? String(sourceSummary || "")
+        : contractFacts.map((fact) => String(fact?.sourceSurface || fact?.value || fact?.text || "")).filter(Boolean).join(" ")
+    };
+    finalItems.push(row);
+    byEvidenceId.set(evidenceId, row);
+    repairedCount += 1;
+  }
+  return { records: finalItems, repairedCount };
+}
+
 function taskWorkflowContextBundle(options = {}) {
   const settings = options.settings || DEFAULT_SETTINGS;
   const sourceSummary = String(options.sourceSummary || "").trim();
@@ -51662,6 +51777,8 @@ function taskWorkflowContextBundle(options = {}) {
   });
   const finalEvidenceDedup = deduplicateTaskWorkflowEvidenceRecords(catalogEvidencePartition.selected);
   let finalItems = finalEvidenceDedup.records;
+  const sourceClosure = taskWorkflowSourceContractEvidenceClosure(sourceContract, finalItems, sourceSummary);
+  finalItems = sourceClosure.records;
   const workflowTasks = flattenTaskPlan(options.tasks || []);
   const exactTaskSelectionByKey = new Map();
   const taskRowsByEvidenceId = (rows = []) => {

@@ -59028,6 +59028,7 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENWEBUI_RESPONSE_PROFILE_JSON = "openwebui-json";
   const OPENWEBUI_RESPONSE_PROFILE_NATIVE = "openwebui-ollama-native-v1";
   const OPENWEBUI_RESPONSE_PROFILE_SSE = "openwebui-sse-delta-v1";
+  const OPENWEBUI_RESPONSE_PROFILE_RESPONSES_SSE = "openwebui-responses-sse-v1";
   const OPENWEBUI_STRUCTURED_ENVELOPE_PROFILE = "openwebui-fenced-json-v1";
   const OPENWEBUI_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
   const OPENWEBUI_RESPONSE_MAX_LINES = 8192;
@@ -59684,6 +59685,136 @@ const STS_MULTI_PROVIDER = (() => {
     if (openWebUIUtf8ByteLength(bodyText) > OPENWEBUI_RESPONSE_MAX_BYTES) openWebUIIncompleteTransport(status, "body-too-large");
     const lines = bodyText.split(/\r?\n/);
     if (lines.length > OPENWEBUI_RESPONSE_MAX_LINES) openWebUIIncompleteTransport(status, "line-limit");
+    // llama-server can sit behind OpenWebUI's OpenAI-compatible route while
+    // returning the newer Responses API SSE envelope instead of Chat
+    // Completions delta chunks. It uses paired `event:`/`data:` lines and a
+    // `response.completed` terminal event, with no `[DONE]` sentinel.
+    if (/^\s*event:\s*response\./m.test(bodyText)) {
+      let eventName = "";
+      let eventData = [];
+      let eventCount = 0;
+      let doneCount = 0;
+      let usageEventCount = 0;
+      let reasoningContentExcludedChunks = 0;
+      let reasoningContent = "";
+      let reasoningContentBytes = 0;
+      let content = "";
+      let contentBytes = 0;
+      let model = nonEmpty(requestedModel);
+      let usage = {};
+      let finishReason = "";
+      let outputDeltaSeen = false;
+      const processResponsesEvent = () => {
+        if (!eventName && !eventData.length) return;
+        if (!eventName || !eventData.length) openWebUIIncompleteTransport(status, "malformed-event", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        eventCount += 1;
+        if (eventCount > OPENWEBUI_RESPONSE_MAX_EVENTS) openWebUIIncompleteTransport(status, "event-limit", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        const eventText = eventData.join("\n").trim();
+        let event;
+        try { event = JSON.parse(eventText); } catch { openWebUIIncompleteTransport(status, "malformed-json", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks }); }
+        if (!event || typeof event !== "object" || Array.isArray(event)) openWebUIIncompleteTransport(status, "invalid-event", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        const type = nonEmpty(event.type || eventName);
+        if (!type || (event.type && type !== eventName)) openWebUIIncompleteTransport(status, "event-type-conflict", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        const response = event.response && typeof event.response === "object" && !Array.isArray(event.response) ? event.response : null;
+        const eventModel = nonEmpty(event.model || response?.model);
+        if (eventModel) model = normalizeModel("openwebui", eventModel);
+        if (event.usage && typeof event.usage === "object" && !Array.isArray(event.usage)) {
+          usage = Object.assign({}, usage, event.usage);
+          usageEventCount += 1;
+        } else if (response?.usage && typeof response.usage === "object" && !Array.isArray(response.usage)) {
+          usage = Object.assign({}, usage, response.usage);
+          usageEventCount += 1;
+        }
+        if (type === "response.reasoning_text.delta") {
+          if (event.delta !== undefined && typeof event.delta !== "string") openWebUIIncompleteTransport(status, "reasoning-shape", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          if (typeof event.delta === "string" && event.delta.length > 0) {
+            reasoningContentExcludedChunks += 1;
+            reasoningContent += event.delta;
+            reasoningContentBytes += openWebUIUtf8ByteLength(event.delta);
+            if (reasoningContentBytes > OPENWEBUI_RESPONSE_MAX_BYTES) openWebUIIncompleteTransport(status, "reasoning-too-large", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          }
+        } else if (type === "response.output_text.delta") {
+          if (typeof event.delta !== "string") openWebUIIncompleteTransport(status, "content-shape", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          content += event.delta;
+          contentBytes += openWebUIUtf8ByteLength(event.delta);
+          outputDeltaSeen = true;
+          if (contentBytes > OPENWEBUI_RESPONSE_MAX_BYTES) openWebUIIncompleteTransport(status, "content-too-large", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        } else if (type === "response.output_text.done") {
+          if (event.text !== undefined && typeof event.text !== "string") openWebUIIncompleteTransport(status, "content-shape", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          if (!outputDeltaSeen && typeof event.text === "string") {
+            content = event.text;
+            contentBytes = openWebUIUtf8ByteLength(content);
+            if (contentBytes > OPENWEBUI_RESPONSE_MAX_BYTES) openWebUIIncompleteTransport(status, "content-too-large", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          }
+        } else if (type === "response.completed") {
+          doneCount += 1;
+          if (doneCount !== 1 || response?.status && response.status !== "completed") openWebUIIncompleteTransport(status, "completion-status", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          finishReason = nonEmpty(response?.status || event.status);
+        } else if (type === "response.failed" || type === "response.incomplete") {
+          openWebUIIncompleteTransport(status, type === "response.failed" ? "provider-failed" : "provider-incomplete", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+        }
+        eventName = "";
+        eventData = [];
+      };
+      for (const line of lines) {
+        const trimmed = line.trimEnd();
+        if (!trimmed.trim()) {
+          processResponsesEvent();
+          continue;
+        }
+        if (trimmed.startsWith(":")) continue;
+        const eventMatch = /^\s*event:\s*(.*)$/.exec(trimmed);
+        if (eventMatch) {
+          if (eventName || eventData.length) processResponsesEvent();
+          eventName = eventMatch[1].trim();
+          continue;
+        }
+        const dataMatch = /^\s*data:\s?(.*)$/.exec(trimmed);
+        if (dataMatch) {
+          if (!eventName) openWebUIIncompleteTransport(status, "data-without-event", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+          eventData.push(dataMatch[1]);
+          continue;
+        }
+        openWebUIIncompleteTransport(status, "malformed-event", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+      }
+      processResponsesEvent();
+      if (doneCount !== 1) openWebUIIncompleteTransport(status, "missing-completed", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+      if (content.length === 0) {
+        if (strictSchemaExpected && reasoningContent.length > 0) {
+          const envelope = openWebUIStructuredContentEnvelope(reasoningContent, true, originalSchema);
+          const reasoningOnlyValidation = openWebUIReasoningOnlyJson(envelope.text, originalSchema);
+          const responseTelemetry = openWebUIResponseTelemetry(OPENWEBUI_RESPONSE_PROFILE_RESPONSES_SSE, {
+            eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks,
+            reasoningOnlyCandidateUsed: true,
+            reasoningOnlyCandidateAccepted: reasoningOnlyValidation.accepted,
+            reasoningOnlyCandidateCount: reasoningContentExcludedChunks,
+            reasoningOnlyValidationProfile: OPENWEBUI_REASONING_VALIDATION_PROFILE,
+            reasoningOnlyValidationReason: reasoningOnlyValidation.reason,
+            reasoningOnlyValidationSchemaHash: reasoningOnlyValidation.schemaHash,
+            structuredEnvelopeNormalized: envelope.normalized,
+            structuredEnvelopeProfile: envelope.profile,
+            structuredEnvelopeReason: envelope.reason,
+            finishReason
+          });
+          return { text: reasoningOnlyValidation.accepted ? envelope.text : "", rawText: reasoningContent, thinking: reasoningContent, model, usage: normalizeUsage(usage), responseTelemetry };
+        }
+        openWebUIIncompleteTransport(status, "content-empty", { eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks });
+      }
+      const envelope = openWebUIStructuredContentEnvelope(content, strictSchemaExpected, originalSchema);
+      return {
+        text: envelope.text,
+        rawText: envelope.rawText,
+        model,
+        usage: normalizeUsage(usage),
+        responseTelemetry: openWebUIResponseTelemetry(OPENWEBUI_RESPONSE_PROFILE_RESPONSES_SSE, {
+          eventCount, doneCount, usageEventCount, reasoningContentExcludedChunks,
+          structuredEnvelopeNormalized: envelope.normalized,
+          structuredEnvelopeProfile: envelope.profile,
+          structuredEnvelopeReason: envelope.reason,
+          finishReason
+        })
+      };
+    }
     let eventCount = 0;
     let doneCount = 0;
     let usageEventCount = 0;

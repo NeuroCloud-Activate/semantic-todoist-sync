@@ -448,6 +448,41 @@ for (const response of [
     JSON.stringify({ model: "gemma4:e4b", message: { content: "streamed\"}" }, done: true, done_reason: "stop" })
   ].join("\n") }, "gemma4:e4b", { nativeOllama: true, strictSchemaExpected: true, originalSchema: schema });
   assert(normalStream.text === '{"answer":"streamed"}' && normalStream.responseTelemetry?.profile === "openwebui-ollama-native-v1", "The bounded native NDJSON decoder must join a complete event stream before strict schema validation.");
+  const responsesApiStream = providers.openWebUIResponseNormalize({ status: 200, text: [
+    "event: response.created",
+    `data: ${JSON.stringify({ type: "response.created", response: { status: "in_progress" } })}`,
+    "",
+    "event: response.reasoning_text.delta",
+    `data: ${JSON.stringify({ type: "response.reasoning_text.delta", delta: "brief reasoning" })}`,
+    "",
+    "event: response.output_text.delta",
+    `data: ${JSON.stringify({ type: "response.output_text.delta", delta: '{"answer":"' })}`,
+    "",
+    "event: response.output_text.delta",
+    `data: ${JSON.stringify({ type: "response.output_text.delta", delta: 'responses"}' })}`,
+    "",
+    "event: response.output_text.done",
+    `data: ${JSON.stringify({ type: "response.output_text.done", text: '{"answer":"responses"}' })}`,
+    "",
+    "event: response.completed",
+    `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed" } })}`,
+    ""
+  ].join("\n") }, "llama-server-model", { strictSchemaExpected: true, originalSchema: schema });
+  assert(responsesApiStream.text === '{"answer":"responses"}'
+    && responsesApiStream.responseTelemetry?.profile === "openwebui-responses-sse-v1"
+    && responsesApiStream.responseTelemetry?.doneCount === 1,
+  "The OpenAI Responses API SSE adapter must join llama-server output_text deltas, ignore reasoning events, and require response.completed.");
+  let missingResponsesCompletion = null;
+  try {
+    providers.openWebUIResponseNormalize({ status: 200, text: [
+      "event: response.output_text.delta",
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "partial" })}`,
+      ""
+    ].join("\n") }, "llama-server-model");
+  } catch (error) { missingResponsesCompletion = error; }
+  assert(missingResponsesCompletion?.providerError?.code === "incomplete-transport"
+    && missingResponsesCompletion?.providerError?.providerDiagnostic?.reason === "missing-completed",
+  "A Responses API SSE body without response.completed must remain an incomplete transport failure.");
 
     const defaultModel = "synthetic-default-ollama";
     const defaultBudget = gateway.aiGenerationDispatchBudgetCreate({ operation: "chat-query", lineageId: "openwebui-default-native-schema" });

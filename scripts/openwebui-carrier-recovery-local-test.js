@@ -345,6 +345,35 @@ const deepSeekDescriptionBudget = gateway.aiDynamicOutputBudget({
 });
 assert(deepSeekDescriptionBudget.maxOutputTokens >= 8192, "Reasoning-capable structured descriptions must not be squeezed below the 8,192-token production floor.");
 assert(deepSeekDescriptionBudget.outputCeilingTokens === 12288, "Structured descriptions must retain the common 12,288-token expansion ceiling.");
+const chatOutputBudget = gateway.aiDynamicOutputBudget({
+  operation: "chat-query",
+  schema: { type: "object", additionalProperties: false, properties: { answer: { type: "string" } }, required: ["answer"] },
+  request: {},
+  settings: { openwebuiModelMetadata: {} },
+  provider: "openwebui",
+  model: "llama-server/gemma4:26b",
+  preflight: {
+    contextWindowTokens: 32768,
+    hardContextWindowTokens: 32768,
+    contextWindowKnown: true,
+    contextWindowExact: true,
+    adjustedEstimatedInputTokens: 5873,
+    availableInputTokens: 26895,
+    operationalInputTokenLimitTokens: 26895
+  }
+});
+assert(chatOutputBudget && chatOutputBudget.outputCeilingTokens === 4096 && chatOutputBudget.maxOutputTokens > 0 && chatOutputBudget.maxOutputTokens <= 4096,
+  "Chat-query requests must use the 4,096-token output ceiling instead of inheriting the OpenWebUI/llama-server default output length.");
+const promptResponseOutputBudget = gateway.aiDynamicOutputBudget({
+  operation: "prompt-response",
+  schema: { type: "object", additionalProperties: false, properties: { answer: { type: "string" } }, required: ["answer"] },
+  request: {},
+  settings: { openwebuiModelMetadata: {} },
+  provider: "openwebui",
+  model: "llama-server/gemma4:26b"
+});
+assert(promptResponseOutputBudget && promptResponseOutputBudget.outputCeilingTokens === 4096 && promptResponseOutputBudget.maxOutputTokens > 0 && promptResponseOutputBudget.maxOutputTokens <= 4096,
+  "Prompt-response requests must use the same bounded 4,096-token output ceiling.");
 const unknownOpenWebUITaskBudget = gateway.aiDynamicOutputBudget({
   operation: "task-generation",
   schema: gateway.taskStructureResponseSchema(1, 4, { evidenceIds: ["evidence-1"], factIds: ["fact-1"], scopeIds: ["scope-1"] }),
@@ -624,6 +653,44 @@ for (const response of [
     } });
     assert(incapableBody?.stream === false && !Object.prototype.hasOwnProperty.call(incapableBody, "format") && !Object.prototype.hasOwnProperty.call(incapableBody?.options || {}, "format") && incapableResult.providerRequestTelemetry?.schemaCarrier === "none", "A discovered Ollama model without structured-output support must use completed prompt-grounded JSON instead of sending native schema or JSON-mode grammar.");
     assert(incapableResult.providerRetry?.attempts?.length === 1 && gateway.aiGenerationDispatchBudgetSnapshot(incapableBudget).used === 1, "The discovered no-schema default must retain one physical generation dispatch and the unchanged two-dispatch ceiling.");
+
+  const llamaServerModel = "llama-server/gemma4:26b";
+  const llamaServerSettings = Object.assign({}, streamSettings, { openwebuiModelMetadata: {} });
+  let llamaServerBody = null;
+  await providers.openWebUIChat(auth, llamaServerSettings, {
+    model: llamaServerModel,
+    operation: "chat-query",
+    system: "Return the exact synthetic JSON.",
+    user: "Verify the bounded llama-server output carrier.",
+    jsonSchema: schema,
+    maxOutputTokens: chatOutputBudget.maxOutputTokens,
+    outputBudget: chatOutputBudget
+  }, { requestUrl: async (request) => {
+    llamaServerBody = JSON.parse(request.body);
+    return { status: 200, text: JSON.stringify({ choices: [{ message: { content: '{"answer":"wire"}' } }] }) };
+  } });
+  assert(llamaServerBody?.max_tokens === chatOutputBudget.maxOutputTokens,
+    "Non-Ollama llama-server OpenWebUI requests must carry the derived chat output cap as max_tokens.");
+
+  const ollamaBudgetModel = "synthetic-bounded-ollama";
+  const ollamaBudgetSettings = Object.assign({}, streamSettings, {
+    openwebuiModelMetadata: { [ollamaBudgetModel]: { ollamaBacked: true } }
+  });
+  let ollamaBudgetBody = null;
+  await providers.openWebUIChat(auth, ollamaBudgetSettings, {
+    model: ollamaBudgetModel,
+    operation: "chat-query",
+    system: "Return the exact synthetic JSON.",
+    user: "Verify the bounded Ollama output carrier.",
+    jsonSchema: schema,
+    maxOutputTokens: chatOutputBudget.maxOutputTokens,
+    outputBudget: chatOutputBudget
+  }, { requestUrl: async (request) => {
+    ollamaBudgetBody = JSON.parse(request.body);
+    return { status: 200, text: JSON.stringify({ message: { content: '{"answer":"ollama-wire"}' }, done: true, done_reason: "stop" }) };
+  } });
+  assert(ollamaBudgetBody?.options?.num_predict === chatOutputBudget.maxOutputTokens,
+    "Ollama-backed OpenWebUI requests must carry the same derived chat output cap as options.num_predict.");
 
   let overflowError = null;
   try {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.33
+
+- Repaired incomplete task-generation context catalogs from the immutable
+  source contract before provider projection, and stopped stale task-local
+  diagnostic references from being promoted as provider-protected evidence.
+  OpenAI, Gemini, OpenRouter, and OpenWebUI no longer fail before dispatch
+  when an intermediate projection omits the primary source row. Unresolvable
+  external protected references remain blocked, with deterministic local
+  regression coverage.
+
 ## 0.8.32
 
 - Preserve the AI & Search settings scroll position when a setting change

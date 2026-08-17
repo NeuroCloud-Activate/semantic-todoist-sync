@@ -69470,9 +69470,13 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
   popup.hidden = true;
   host.appendChild(input);
   host.appendChild(selectedValueEl);
+  // Keep the list attached to the control itself. Obsidian settings are
+  // rendered in modal/scroll containers with independent stacking contexts;
+  // a document-body portal can be painted behind that modal even with a high
+  // z-index. An absolutely positioned child remains in the same interactive
+  // surface and can still scroll independently.
+  host.appendChild(popup);
   containerEl.appendChild(host);
-  const body = documentRef.body || containerEl;
-  body.appendChild(popup);
 
   let rows = Array.isArray(config.rows) ? config.rows.slice() : [];
   const automaticRow = config.automatic ? {
@@ -69556,18 +69560,20 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     if (!popup.getBoundingClientRect || !input.getBoundingClientRect) return;
     const rect = input.getBoundingClientRect();
     const windowRef = typeof window !== "undefined" ? window : {};
-    const viewportWidth = Math.max(240, Number(windowRef.innerWidth || documentRef.documentElement?.clientWidth || 640));
     const viewportHeight = Math.max(240, Number(windowRef.innerHeight || documentRef.documentElement?.clientHeight || 640));
-    const width = Math.min(Math.max(Number(rect.width) || 260, 240), viewportWidth - 16);
     const below = viewportHeight - Number(rect.bottom || 0) - 8;
     const above = Number(rect.top || 0) - 8;
     const maxHeight = Math.max(176, Math.min(360, Math.max(below, above)));
-    const top = below >= 176 || below >= above ? Number(rect.bottom || 0) + 4 : Math.max(8, Number(rect.top || 0) - maxHeight - 4);
-    const left = Math.max(8, Math.min(Number(rect.left || 0), viewportWidth - width - 8));
-    popup.style.position = "fixed";
-    popup.style.left = `${left}px`;
-    popup.style.top = `${Math.max(8, top)}px`;
-    popup.style.width = `${width}px`;
+    popup.style.position = "absolute";
+    popup.style.left = "0";
+    popup.style.width = "100%";
+    popup.style.right = "auto";
+    popup.style.top = below >= 176 || below >= above ? "calc(100% + 4px)" : "auto";
+    popup.style.bottom = below >= 176 || below >= above ? "auto" : "calc(100% + 4px)";
+    // Keep the list above neighboring setting rows and interactive while open.
+    popup.style.zIndex = "2147483647";
+    popup.style.visibility = "visible";
+    popup.style.pointerEvents = "auto";
     applyPopupGeometry(maxHeight);
   };
   const render = () => {
@@ -69643,6 +69649,8 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     }
     open = true;
     popup.hidden = false;
+    popup.classList.add("is-open");
+    popup.setAttribute("aria-hidden", "false");
     input.setAttribute("aria-expanded", "true");
     updateSelectedValuePresentation();
     render();
@@ -69651,6 +69659,8 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
   const closePopup = (restore = true) => {
     open = false;
     popup.hidden = true;
+    popup.classList.remove("is-open");
+    popup.setAttribute("aria-hidden", "true");
     input.setAttribute("aria-expanded", "false");
     input.removeAttribute("aria-activedescendant");
     setActive(-1);
@@ -69747,8 +69757,21 @@ function stsMpSearchableCombobox(containerEl, config = {}) {
     setRows(nextRows = []) { rows = Array.isArray(nextRows) ? nextRows.slice() : []; ensureSelectedRow(); updateSelectedValuePresentation(); if (open) { render(); position(); } },
     refresh() {
       const nextRows = typeof config.getRows === "function" ? config.getRows() : rows;
+      const focused = documentRef.activeElement === input;
+      const inputText = currentInputValue();
       this.setRows(nextRows);
-      if (!open) { input.value = selectedLabel(); updateSelectedValuePresentation(); }
+      // Provider discovery can refresh catalogs while the user is typing. Never
+      // replace an active query with the selected/default label during that
+      // refresh; the query remains authoritative until the user selects a row.
+      if (open || focused) {
+        if (focused && inputText !== selectedLabel()) query = inputText;
+        input.value = query;
+        updateSelectedValuePresentation();
+        if (open) position();
+      } else {
+        input.value = selectedLabel();
+        updateSelectedValuePresentation();
+      }
     },
     isHostConnected: () => {
       if (typeof host.isConnected === "boolean") return host.isConnected;

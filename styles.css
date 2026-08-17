@@ -2104,8 +2104,8 @@
   min-height: 44px;
 }
 
-/* Searchable provider/model controls use a fixed popup so settings overflow
- * and narrow mobile panes cannot clip the option list. */
+/* Searchable provider/model controls use an attached popup so settings modal
+ * stacking contexts cannot hide the option list. */
 .semantic-todoist-searchable-combobox {
   display: block;
   min-width: 0;
@@ -2281,9 +2281,12 @@
 }
 
 .semantic-todoist-searchable-combobox-popup {
-  position: fixed;
+  position: absolute;
   --semantic-todoist-combobox-layer: 1100;
-  z-index: var(--layer-tooltip, var(--layer-menu, var(--semantic-todoist-combobox-layer)));
+  /* Obsidian settings/modals establish stacking contexts above the normal
+   * tooltip/menu variables. Keep this attached popup above its setting row
+   * and interactive while it is open. */
+  z-index: 2147483647 !important;
   display: block;
   max-width: calc(100vw - 16px);
   min-height: 44px;
@@ -2296,6 +2299,7 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   background: var(--background-primary);
+  pointer-events: auto;
 }
 
 .semantic-todoist-searchable-combobox-popup[hidden] {

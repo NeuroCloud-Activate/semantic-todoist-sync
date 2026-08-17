@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.22
+
+- Fixed primary and fallback model pickers in Obsidian settings so opening the
+  field reliably displays the provider catalog instead of leaving only the
+  selected value visible.
+- Kept the catalog attached to its control so long provider lists remain
+  scrollable inside Obsidian's settings modal and are not hidden by modal
+  stacking contexts.
+- Preserved active search text during provider-catalog refreshes. Queries of
+  three or more characters match case-insensitively anywhere in the provider,
+  model ID, or display label; shorter queries intentionally show the full
+  provider list.
+
 ## 0.8.21
 
 - Fixed model selector usability by stabilizing search query state and preventing the active text input from being overwritten by the selected label while typing.

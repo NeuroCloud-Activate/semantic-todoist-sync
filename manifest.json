@@ -1,7 +1,7 @@
 {
   "id": "semantic-todoist-sync",
   "name": "Semantic Todoist Sync",
-  "version": "0.8.21",
+  "version": "0.8.22",
   "minAppVersion": "1.5.0",
   "description": "BYOK semantic vault search and context-aware task extraction across OpenAI, Gemini, OpenRouter, and Open WebUI, with email-to-Todoist and note-to-Todoist sync.",
   "author": "Neurocloud",

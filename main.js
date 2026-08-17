@@ -58407,7 +58407,10 @@ const STS_MULTI_PROVIDER = (() => {
     const candidates = catalogRows(migrated, {}, repairReferences)
       .filter((row) => (!providerFilter || row.provider === providerFilter)
         && generationCatalogRowEligible(row)
-        && modelRoleCapability(migrated, row.provider, row.id).generation === true)
+        // Discovery can know that an ID is live without reporting role
+        // capabilities. Preserve those models; only an explicit
+        // generation:false capability makes a row ineligible for repair.
+        && modelRoleCapability(migrated, row.provider, row.id).generation !== false)
       .sort((left, right) => left.label.localeCompare(right.label));
     const liveGenerationIdentities = new Set(candidates.map((row) => modelIdentity(row.provider, row.id)));
     const staleOpenWebUIReference = (reference) => reference?.provider === "openwebui"

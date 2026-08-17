@@ -100,6 +100,18 @@ const staleModelRepair = providers.repairGenerationModelReferences({
   manualProviderGenerationModels: { openwebui: [] }
 }, "openwebui");
 assert(staleModelRepair.changed && staleModelRepair.settings.aiOperationModels["chat-query"].primary.model === "live-model" && staleModelRepair.diagnostics.repaired[0]?.reason === "stale-model", "A refreshed Open WebUI catalog must repair a removed selected model instead of preserving a stale ID for the next generation request.");
+const liveUnknownCapabilityPreservation = providers.repairGenerationModelReferences({
+  openwebuiBaseUrl: "https://synthetic.invalid",
+  openwebuiApiKey: "synthetic-key",
+  aiModelProvider: "openwebui",
+  chatModel: "live-unknown-model",
+  aiOperationModels: { "chat-query": { primary: { provider: "openwebui", model: "live-unknown-model" } } },
+  enableMultiProviderOperationModels: false,
+  availableOpenWebUIModels: ["live-unknown-model", "known-generation-model"],
+  openwebuiModelMetadata: { "known-generation-model": { roleCapabilities: { generation: true, embedding: false, source: "synthetic-discovery" } } },
+  manualProviderGenerationModels: { openwebui: [] }
+}, "openwebui");
+assert(!liveUnknownCapabilityPreservation.changed && liveUnknownCapabilityPreservation.settings.aiOperationModels["chat-query"].primary.model === "live-unknown-model", "A live Open WebUI model with undisclosed role capabilities must remain selected during refresh instead of being replaced by the first explicitly classified generation model.");
 const modelNotFoundMessage = gateway.aiGatewayUserErrorMessage("openwebui", 400, "model-not-found", { modelNotFound: true });
 assert(modelNotFoundMessage.includes("could not find the selected model") && modelNotFoundMessage.includes("Refresh the Open WebUI model list"), "Open WebUI model lookup failures must point to model discovery and selection instead of being mislabeled as schema failures.");
 assert(providers.providerDiscoveryRetryEligible({ providerError: { status: 503, code: "transport", retryable: true, providerDiagnostic: { classification: "transport" } } }) === true, "A transient provider discovery transport failure must be eligible for one bounded retry.");

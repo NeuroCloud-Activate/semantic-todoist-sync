@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.25
+
+- Preserved a live Open WebUI primary model when discovery does not report
+  explicit role capabilities. Refresh now replaces a selected model only when
+  it is absent from the live catalog or explicitly marked generation-ineligible.
+- Added a regression case covering unknown-capability Open WebUI models so
+  refreshing the model list no longer changes the selected primary model.
+
 ## 0.8.24
 
 - Fixed stale Open WebUI model selections after a model is removed or renamed

@@ -58415,8 +58415,17 @@ const STS_MULTI_PROVIDER = (() => {
     const liveGenerationIdentities = new Set(candidates.map((row) => modelIdentity(row.provider, row.id)));
     const staleOpenWebUIReference = (reference) => reference?.provider === "openwebui"
       && !liveGenerationIdentities.has(modelIdentity(reference.provider, reference.model));
-    const choose = (providerName, excluded = null) => candidates.find((row) => row.provider === providerName
-      && (!excluded || modelIdentity(row.provider, row.id) !== modelIdentity(excluded.provider, excluded.model))) || null;
+    const openWebUIReferenceAliasMatch = (row, reference) => {
+      if (row?.provider !== "openwebui" || reference?.provider !== "openwebui") return false;
+      const rowId = normalizeModel("openwebui", row.id).replace(/^\/models\//i, "").toLowerCase();
+      const referenceId = normalizeModel("openwebui", reference.model).toLowerCase();
+      return Boolean(rowId && referenceId && rowId === referenceId);
+    };
+    const choose = (providerName, excluded = null, preferredReference = null) => {
+      const eligible = candidates.filter((row) => row.provider === providerName
+        && (!excluded || modelIdentity(row.provider, row.id) !== modelIdentity(excluded.provider, excluded.model)));
+      return eligible.find((row) => openWebUIReferenceAliasMatch(row, preferredReference)) || eligible[0] || null;
+    };
     const replacement = (current, row, isFallback, operation) => {
       const preserveExplicit = current?.reasoningSource === "explicit"
         && reasoningEffortCompatible(next, row.provider, row.id, current.reasoningEffort);
@@ -58440,7 +58449,7 @@ const STS_MULTI_PROVIDER = (() => {
       if (primary && (!providerFilter || primary.provider === providerFilter)
         && (modelRoleCapability(migrated, primary.provider, primary.model).generation === false
           || staleOpenWebUIReference(primary))) {
-        const row = choose(primary.provider, fallback);
+        const row = choose(primary.provider, fallback, primary);
         if (row) {
           primary = replacement(primary, row, false, operation);
           diagnostics.repaired.push({ operation, role: "primary", provider: row.provider, model: row.id, reason: staleOpenWebUIReference(migrated.aiOperationModels?.[operation]?.primary) ? "stale-model" : "embedding-only" });
@@ -58449,7 +58458,7 @@ const STS_MULTI_PROVIDER = (() => {
       if (fallback && (!providerFilter || fallback.provider === providerFilter)
         && (modelRoleCapability(migrated, fallback.provider, fallback.model).generation === false
           || staleOpenWebUIReference(fallback))) {
-        const row = choose(fallback.provider, primary);
+        const row = choose(fallback.provider, primary, fallback);
         if (row) {
           fallback = replacement(fallback, row, true, operation);
           diagnostics.repaired.push({ operation, role: "fallback", provider: row.provider, model: row.id, reason: staleOpenWebUIReference(migrated.aiOperationModels?.[operation]?.fallback) ? "stale-model" : "embedding-only" });
@@ -63998,7 +64007,11 @@ const STS_MULTI_PROVIDER = (() => {
     row?.contextLength,
     row?.num_ctx
   ].map(openWebUIPositiveContextValue).find(Boolean) || 0;
-  const openWebUIModelIdFromRow = (row = {}) => row?.model || row?.name || row?.id || row?.model_name || "";
+  // Open WebUI's /api/models rows expose the callable API identifier in `id`
+  // and a human-readable label in `name`. Prefer the identifier so a display
+  // label cannot be sent back to /api/chat/completions as an unknown model.
+  // Ollama inventory rows use `model`, which is already the callable ID.
+  const openWebUIModelIdFromRow = (row = {}) => row?.model || row?.id || row?.name || row?.model_name || "";
   const openWebUIInventoryModelId = (value) => {
     if (typeof value !== "string") return "";
     const id = normalizeModel("openwebui", value);

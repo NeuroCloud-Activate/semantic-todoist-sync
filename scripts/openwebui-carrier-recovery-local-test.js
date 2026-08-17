@@ -30,12 +30,27 @@ global.fetch = async () => { blockedNetworkCallAttempts += 1; throw new Error("N
 const Plugin = require(path.join(__dirname, "..", "main.js"));
 const providers = Plugin.__multiProvider;
 const gateway = Plugin.__aiModelGateway;
+const semantic = Plugin.__semanticRetrieval;
 let passedAssertions = 0;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
   passedAssertions += 1;
 }
+
+assert(semantic.chatSemanticLexicalSeedQueryEligible("what was my last meeting with Jim about?"), "Named-person chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");
+assert(semantic.chatSemanticLexicalSeedQueryEligible("what is the status of project-x?"), "Distinctive keyword chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");
+assert(!semantic.chatSemanticLexicalSeedQueryEligible("what was the meeting?"), "A query containing only generic terms must not trigger broad lexical recovery.");
+const hybridSeedEvidenceIds = semantic.chatSemanticLexicalSeedEvidenceIds("what was my last meeting with Jim about?", [
+  { sourceEvidenceIds: ["synthetic-jim-1", "synthetic-jim-2"] },
+  { sourceEvidenceIds: ["synthetic-jim-2", "synthetic-jim-3"] }
+]);
+assert(JSON.stringify(hybridSeedEvidenceIds) === JSON.stringify(["synthetic-jim-1", "synthetic-jim-2", "synthetic-jim-3"]), "Lexical seed evidence IDs must remain deduplicated and bounded before semantic routing.");
+const hybridAdmission = semantic.chatSemanticAdmissionPool([
+  { evidenceId: "synthetic-keyword-match", text: "Project-x status", semantic: 0.05, lexicalSeedReserved: true },
+  { evidenceId: "synthetic-semantic-match", text: "Unrelated semantic neighbor", semantic: 0.95 }
+], 1, { mode: "chat", intent: "focused", broad: false, history: false, tasks: false, portfolio: false });
+assert(hybridAdmission.protectedEvidenceIds.includes("synthetic-keyword-match") && hybridAdmission.reservedEvidenceIds.includes("synthetic-keyword-match"), "Lexical keyword matches must remain protected through chat evidence admission while semantic ranking remains available.");
 
 function retry(overrides = {}, profile = "local-schema-compatibility-json", cachedDirectJson = true) {
   const providerError = {

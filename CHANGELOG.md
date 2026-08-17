@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.32
+
+- Preserve the AI & Search settings scroll position when a setting change
+  rerenders the pane, including the surrounding Obsidian settings container.
+
 ## 0.8.31
 
 - Fixed persisted semantic-index partition validation when the configured

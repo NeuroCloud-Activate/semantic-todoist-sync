@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.28
+
+- Improved chat semantic retrieval for Open WebUI by combining the live query
+  embedding with bounded lexical keyword seeds from the local semantic index.
+  Distinctive terms, including exact person names, now reserve up to four
+  matching evidence rows while semantic scores remain the ranking signal.
+- Preserved note metadata, temporal metadata, source identity, and relevant
+  Todoist task-reference metadata through the same evidence admission path so
+  lexical matches remain grounded and citable.
+- Added regression coverage for named-person and general-keyword hybrid
+  retrieval reservations.
+
 ## 0.8.27
 
 - Added support for llama-server Responses API SSE envelopes returned through

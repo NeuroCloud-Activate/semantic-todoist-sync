@@ -9360,7 +9360,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           }
         }
       }
-      const localSeed = liveQueryHandle || structuredHandleCount
+      const lexicalSeedRecovery = Boolean(liveQueryHandle && !structuredHandleCount && chatSemanticLexicalSeedQueryEligible(plan.prompt || query));
+      const localSeed = (structuredHandleCount || (liveQueryHandle && !lexicalSeedRecovery))
         ? { handles: [], telemetry: { source: "indexed-local-text-seed", candidateCount: 0, selectedCount: 0, skipped: true } }
         : resolveIndexedLocalTextSeedQueryHandles({
           query: plan.prompt || query,
@@ -9375,6 +9376,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         });
       const seedHandles = localSeed.handles || [];
       seedHandleCount = seedHandles.length;
+      const lexicalSeedEvidenceIds = lexicalSeedRecovery
+        ? chatSemanticLexicalSeedEvidenceIds(plan.prompt || query, seedHandles)
+        : [];
       queryHandles = selectChatSemanticQueryHandles(liveQueryHandle, structuredHandles, seedHandles, 4);
       queryHandleTelemetry = Object.assign({}, structuredResolved.telemetry || {}, {
         source: liveQueryHandle ? "openwebui-query-embedding" : "indexed",
@@ -9395,9 +9399,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         attemptedLiveQueryEmbeddingCalls: liveQueryEmbeddingAttempts,
         successfulLiveQueryEmbeddingCalls: liveQueryEmbeddingSuccesses,
         liveQueryEmbeddingFailure,
+        lexicalSeedRecovery,
+        lexicalSeedEvidenceCount: lexicalSeedEvidenceIds.length,
         adaptiveLiveQueryEmbeddingDecision: liveQueryDecision.reason,
         externalQueryEmbeddingCalls: liveQueryEmbeddingAttempts,
-        runtimeExternalCalls: liveQueryEmbeddingAttempts
+        runtimeExternalCalls: liveQueryEmbeddingAttempts,
+        lexicalSeedEvidenceIds
       });
       if (!queryHandles.length) {
         queryHandleTelemetry.degradedReason = "chat-local-query-handle-unavailable";
@@ -9415,6 +9422,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return this.setSemanticRetrievalCache(cacheKey, result);
       }
       queryEmbedding = queryHandles[0].vector;
+      queryHandleRequest.lexicalSeedEvidenceIds = lexicalSeedEvidenceIds;
     } else {
       const resolved = resolveIndexedSemanticQueryHandles(resolverIndex, queryHandleRequest);
       queryHandles = resolved.handles || [];
@@ -9439,7 +9447,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const poolSize = Math.max(requestedLimit * 6, 40);
     const profile = buildContextQueryProfile(this, usableIndex, plan);
     const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
-    const routedBatch = await this.routeProductionSemanticCandidateBatches([{ groupId: "chat", handles: queryHandles, topK: poolSize }], usableIndex, {
+    const routedBatch = await this.routeProductionSemanticCandidateBatches([{
+      groupId: "chat",
+      handles: queryHandles,
+      topK: poolSize,
+      requiredEvidenceIds: queryHandleRequest.lexicalSeedEvidenceIds || []
+    }], usableIndex, {
       mode: retrievalMode,
       policyVersion: plan.semanticPolicyVersion || plan.policyVersion || TASK_SEMANTIC_DIMENSION_POLICY_VERSION,
       indexRevision: this.semanticIndexRevision || 0,
@@ -9477,6 +9490,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const rawCandidate = {
         ...item,
         ...contextCandidateScopeMetadata(chunk, profile, {}),
+        lexicalSeedReserved: (queryHandleRequest.lexicalSeedEvidenceIds || []).includes(String(chunk?.evidenceId || chunk?.id || "")),
         semanticAnchorContribution: retrievalMode === "chat"
           ? chatSemanticExactAnchorContribution(plan.prompt || query, item)
           : 0
@@ -30842,21 +30856,32 @@ function chatSemanticAdmissionPool(candidates = [], requestedLimit = 8, profile 
   const recipientReservations = profile.mode === "chat"
     ? chatSemanticRecipientHandoffReservations(initial, profile, maxItems)
     : [];
+  const lexicalSeedReservedCandidates = profile.mode === "chat"
+    ? initial.filter((item) => item?.lexicalSeedReserved === true)
+    : [];
+  const lexicalSeedReservedEvidenceIds = lexicalSeedReservedCandidates
+    .map(chatSemanticCandidateEvidenceId)
+    .filter(Boolean);
   const sourceThread = profile.mode === "chat"
     ? chatSemanticSourceThreadReservations(initial, maxItems, profile)
     : { reservations: [], reservedCandidates: [], reservedEvidenceIds: [], reservationReasonByEvidenceId: {}, supportFloor: 0, reason: "non-chat-mode" };
   const reservedEvidenceIds = uniqueValues([
     ...(sourceThread.reservedEvidenceIds || []),
-    ...recipientReservations.map((reservation) => reservation.evidenceId)
+    ...recipientReservations.map((reservation) => reservation.evidenceId),
+    ...lexicalSeedReservedEvidenceIds
   ].filter(Boolean));
   const reservationReasonByEvidenceId = Object.assign({}, sourceThread.reservationReasonByEvidenceId || {}, Object.fromEntries(recipientReservations.map((reservation) => [
     reservation.evidenceId,
     "semantic-current-open-recipient-handoff"
+  ])), Object.fromEntries(lexicalSeedReservedEvidenceIds.map((evidenceId) => [
+    evidenceId,
+    "semantic-explicit-person-anchor"
   ])));
   const recipientReservedCandidates = recipientReservations
     .map((reservation) => initial.find((item) => chatSemanticCandidateEvidenceId(item) === reservation.evidenceId))
     .filter(Boolean);
-  const reservedCandidates = (sourceThread.reservedCandidates || []).concat(recipientReservedCandidates);
+  const reservedCandidates = (sourceThread.reservedCandidates || [])
+    .concat(recipientReservedCandidates, lexicalSeedReservedCandidates);
   if (profile.mode !== "chat" || explicitStructuredExpansion) {
     if (profile.mode !== "chat") {
       return {
@@ -35036,6 +35061,29 @@ function chatSemanticQueryPeople(query = "") {
   return uniqueValues((String(query || "").match(/\b[A-Z][a-z]{2,}\b/g) || [])
     .filter((value) => !ignored.has(value)))
     .slice(0, 8);
+}
+
+function chatSemanticLexicalSeedQueryEligible(query = "") {
+  const terms = localSemanticTextSeedTerms(query)
+    .filter((term) => term.length >= 3 && !SEMANTIC_ADAPTIVE_QUERY_GENERIC_TERMS.has(term));
+  return terms.length > 0;
+}
+
+// A successful provider query embedding is still allowed to rank the chat
+// result, but distinctive lexical terms (including exact person names) are
+// high-value retrieval anchors that local embeddings can underweight. Reserve
+// only the bounded lexical seed rows for queries with such terms; this is not
+// a broad keyword-only fallback.
+function chatSemanticLexicalSeedEvidenceIds(query = "", seedHandles = []) {
+  if (!chatSemanticLexicalSeedQueryEligible(query)) return [];
+  return uniqueValues((Array.isArray(seedHandles) ? seedHandles : [])
+    .flatMap((handle) => [
+      ...(Array.isArray(handle?.sourceEvidenceIds) ? handle.sourceEvidenceIds : []),
+      ...(Array.isArray(handle?.evidenceIds) ? handle.evidenceIds : [])
+    ])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))
+    .slice(0, 4);
 }
 
 function chatSemanticApprovalState(item = {}) {
@@ -68133,6 +68181,9 @@ if (typeof module !== "undefined" && module.exports) {
     contextCandidateScore,
     chatSemanticExactAcronymAnchors,
     chatSemanticExactAnchorContribution,
+    chatSemanticQueryPeople,
+    chatSemanticLexicalSeedQueryEligible,
+    chatSemanticLexicalSeedEvidenceIds,
     chatSemanticApprovalState,
     pruneChatSemanticSupersededCandidates,
     CHAT_SEMANTIC_ADMISSION_POLICY_VERSION,

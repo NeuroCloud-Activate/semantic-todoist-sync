@@ -31,6 +31,8 @@ const Plugin = require(path.join(__dirname, "..", "main.js"));
 const providers = Plugin.__multiProvider;
 const gateway = Plugin.__aiModelGateway;
 const semantic = Plugin.__semanticRetrieval;
+const semanticIndexPartitionContract = Plugin.__semanticIndexPartitionContract;
+const semanticIndexManifestValidation = Plugin.__semanticIndexManifestValidation;
 let passedAssertions = 0;
 
 function assert(condition, message) {
@@ -59,12 +61,44 @@ try {
     "Pending semantic-index recovery must not create duplicate timers.");
   schedulerProbe.pendingIndexPaths.clear();
   schedulerProbe.semanticIndexTimer = null;
-  assert(!schedulerProbe.schedulePendingSemanticIndexFlush(),
+assert(!schedulerProbe.schedulePendingSemanticIndexFlush(),
     "Semantic-index recovery must not schedule work after the pending queue is empty.");
 } finally {
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
 }
+
+const persistedIndexSettings = {
+  embeddingProvider: "openrouter",
+  embeddingModel: "openai/text-embedding-3-small",
+  semanticIndexEmbeddingPrecision: 4,
+  semanticIndexMeta: {}
+};
+const persistedIndexPartition = semanticIndexPartitionContract(persistedIndexSettings, {
+  provider: "openrouter",
+  model: "openai/text-embedding-3-small",
+  actualDimension: 1536,
+  configuredDimension: 0
+});
+const legacyDimensionlessManifest = {
+  meta: {
+    provider: "openrouter",
+    model: "openai/text-embedding-3-small",
+    dimension: 1536,
+    partitionIdentityHash: persistedIndexPartition.identityHash,
+    chunks: 1,
+    shardCount: 1
+  },
+  shards: [{ file: "semantic-index.openrouter.000.json", index: 0, chunks: 1, bytes: 1 }]
+};
+let persistedIndexValidationError = null;
+try {
+  semanticIndexManifestValidation(legacyDimensionlessManifest, "semantic-index.openrouter.json", persistedIndexSettings);
+} catch (error) {
+  persistedIndexValidationError = error;
+}
+assert(!persistedIndexValidationError,
+  "A persisted index with an unconstrained configured dimension must validate against its actual vector dimension without changing partition identity.");
 
 assert(semantic.chatSemanticLexicalSeedQueryEligible("what was my last meeting with Jim about?"), "Named-person chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");
 assert(semantic.chatSemanticLexicalSeedQueryEligible("what is the status of project-x?"), "Distinctive keyword chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");

@@ -88,6 +88,20 @@ const promptGroundedCarrierAdmission = providers.openWebUIUnsupportedSchemaCarri
   maxAttempts: 2
 });
 assert(promptGroundedCarrierAdmission.admitted === false, "An exact prompt-grounded JSON profile must keep HTTP 400 request validation terminal instead of reintroducing an unsupported native schema carrier.");
+const staleModelRepair = providers.repairGenerationModelReferences({
+  openwebuiBaseUrl: "https://synthetic.invalid",
+  openwebuiApiKey: "synthetic-key",
+  aiModelProvider: "openwebui",
+  chatModel: "stale-model",
+  aiOperationModels: { "chat-query": { primary: { provider: "openwebui", model: "stale-model" } } },
+  enableMultiProviderOperationModels: false,
+  availableOpenWebUIModels: ["live-model"],
+  openwebuiModelMetadata: { "live-model": { roleCapabilities: { generation: true, embedding: false, source: "synthetic-discovery" } } },
+  manualProviderGenerationModels: { openwebui: [] }
+}, "openwebui");
+assert(staleModelRepair.changed && staleModelRepair.settings.aiOperationModels["chat-query"].primary.model === "live-model" && staleModelRepair.diagnostics.repaired[0]?.reason === "stale-model", "A refreshed Open WebUI catalog must repair a removed selected model instead of preserving a stale ID for the next generation request.");
+const modelNotFoundMessage = gateway.aiGatewayUserErrorMessage("openwebui", 400, "model-not-found", { modelNotFound: true });
+assert(modelNotFoundMessage.includes("could not find the selected model") && modelNotFoundMessage.includes("Refresh the Open WebUI model list"), "Open WebUI model lookup failures must point to model discovery and selection instead of being mislabeled as schema failures.");
 assert(providers.providerDiscoveryRetryEligible({ providerError: { status: 503, code: "transport", retryable: true, providerDiagnostic: { classification: "transport" } } }) === true, "A transient provider discovery transport failure must be eligible for one bounded retry.");
 assert(providers.providerDiscoveryRetryEligible({ providerError: { status: 400, code: "request-validation", providerDiagnostic: { classification: "validation" } } }) === false, "Provider discovery request validation must remain terminal and must not be retried.");
 const emptyWebSchema = gateway.chatResponseSchema(3, [], "concise");

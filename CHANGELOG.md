@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.24
+
+- Fixed stale Open WebUI model selections after a model is removed or renamed
+  in the live `/api/models` or Ollama `/api/tags` inventory. Refresh now treats
+  those endpoints as authoritative, repairs affected generation references to
+  a live model, and keeps only explicitly manual IDs outside the live catalog.
+- Improved Open WebUI model-not-found errors so they direct users to refresh
+  discovery and choose an installed model instead of incorrectly suggesting a
+  schema problem.
+
 ## 0.8.23
 
 - Corrected the GitHub release packaging for Obsidian installation. The release

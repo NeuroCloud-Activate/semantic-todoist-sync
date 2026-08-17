@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.29
+
+- Automatically schedules and retries pending semantic-index updates so a
+  compatibility rebuild or transient failure cannot strand the queue and leave
+  chat retrieval without vault evidence.
+- Continues using the discovered Open WebUI/llama-server model context window,
+  with a bounded six-minute request deadline for evidence-rich local prompts.
+- Added validation for the Open WebUI model catalog's nested context metadata
+  and adaptive input budget behavior.
+
 ## 0.8.28
 
 - Improved chat semantic retrieval for Open WebUI by combining the live query

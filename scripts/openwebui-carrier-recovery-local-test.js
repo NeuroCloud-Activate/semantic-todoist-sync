@@ -38,6 +38,34 @@ function assert(condition, message) {
   passedAssertions += 1;
 }
 
+const schedulerProbe = Object.create(Plugin.prototype);
+schedulerProbe.settings = { semanticIndexDelaySeconds: 30 };
+schedulerProbe.pendingIndexPaths = new Set(["Notes/jim.md"]);
+schedulerProbe.semanticIndexTimer = null;
+schedulerProbe.isUnloading = false;
+schedulerProbe.flushSemanticIndexUpdates = () => Promise.resolve({ ok: true });
+const originalSetTimeout = global.setTimeout;
+const originalClearTimeout = global.clearTimeout;
+let scheduledFlushes = 0;
+try {
+  global.setTimeout = () => {
+    scheduledFlushes += 1;
+    return 7000 + scheduledFlushes;
+  };
+  global.clearTimeout = () => {};
+  assert(schedulerProbe.schedulePendingSemanticIndexFlush(1000) && scheduledFlushes === 1,
+    "A live pending semantic-index queue must schedule an automatic flush.");
+  assert(schedulerProbe.schedulePendingSemanticIndexFlush(1000) && scheduledFlushes === 1,
+    "Pending semantic-index recovery must not create duplicate timers.");
+  schedulerProbe.pendingIndexPaths.clear();
+  schedulerProbe.semanticIndexTimer = null;
+  assert(!schedulerProbe.schedulePendingSemanticIndexFlush(),
+    "Semantic-index recovery must not schedule work after the pending queue is empty.");
+} finally {
+  global.setTimeout = originalSetTimeout;
+  global.clearTimeout = originalClearTimeout;
+}
+
 assert(semantic.chatSemanticLexicalSeedQueryEligible("what was my last meeting with Jim about?"), "Named-person chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");
 assert(semantic.chatSemanticLexicalSeedQueryEligible("what is the status of project-x?"), "Distinctive keyword chat queries must enable bounded lexical seed recovery alongside the live semantic query embedding.");
 assert(!semantic.chatSemanticLexicalSeedQueryEligible("what was the meeting?"), "A query containing only generic terms must not trigger broad lexical recovery.");
@@ -425,7 +453,7 @@ for (const response of [
   const discoveredIdentifierCatalog = await providers.openWebUIDiscover(discoveryIdentifierAuth, discoveryIdentifierSettings, {
     requestUrl: async (request) => {
       const pathName = new URL(request.url).pathname;
-      if (pathName === "/api/models") return { status: 200, text: JSON.stringify({ data: [{ id: "/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf", name: "gemma-4-26B-A4B-it-MXFP4_MOE.gguf", owned_by: "openai" }] }) };
+      if (pathName === "/api/models") return { status: 200, text: JSON.stringify({ data: [{ id: "/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf", name: "gemma-4-26B-A4B-it-MXFP4_MOE.gguf", owned_by: "openai", info: { meta: { runtime: { context_length: 32768 } } } }] }) };
       if (pathName === "/ollama/api/tags") return { status: 200, text: JSON.stringify({ models: [] }) };
       throw new Error(`Unexpected synthetic discovery path: ${pathName}`);
     }
@@ -433,6 +461,24 @@ for (const response of [
   assert(discoveredIdentifierCatalog.chat.includes("/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf")
     && !discoveredIdentifierCatalog.chat.includes("gemma-4-26B-A4B-it-MXFP4_MOE.gguf"),
   "Open WebUI discovery must retain the API model identifier instead of replacing it with the row display name.");
+  const discoveredContextMetadata = discoveredIdentifierCatalog.metadata["/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf"];
+  assert(discoveredContextMetadata?.modelContextWindowTokens === 32768
+    && discoveredContextMetadata?.modelContextSource === "openwebui-api-catalog",
+  "Open WebUI discovery must recover a nested llama-server context_length from the non-Ollama /api/models model row.");
+  const knownContextSettings = {
+    openwebuiModelMetadata: {
+      "llama-server/gemma4:26b": {
+        modelContextWindowTokens: 32768,
+        modelContextSource: "openwebui-api-model-limit",
+        modelContextObservedAt: new Date().toISOString()
+      }
+    }
+  };
+  const knownContextWindow = gateway.chatProviderContextWindow(knownContextSettings, "openwebui", "llama-server/gemma4:26b");
+  assert(knownContextWindow.contextWindowTokens === 32768
+    && knownContextWindow.operationalInputTokenLimitTokens > 15999
+    && knownContextWindow.inputMaximumTokens > 15999,
+  "A fresh Open WebUI model context must raise the provider input budget above the unknown-model 15,999-token fallback.");
   const discoveryPlugin = Object.create(Plugin.prototype);
   let discoveryAttempts = 0;
   discoveryPlugin.settings = { openwebuiBaseUrl: "https://synthetic.invalid", openwebuiModelMetadata: {}, availableOpenWebUIModels: [], availableOpenWebUIEmbeddingModels: [] };

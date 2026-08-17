@@ -45,6 +45,9 @@ const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
+// A large startup/change burst is cheaper and more reliable as one current
+// vault rebuild than hundreds of serial per-file embedding jobs.
+const SEMANTIC_INDEX_PENDING_REBUILD_THRESHOLD = 64;
 const SEMANTIC_EMBEDDING_CONTENT_VERSION = 3;
 const SEMANTIC_MATERIALITY_ANCHOR_VERSION = 1;
 const SEMANTIC_MATERIALITY_ANCHOR_TEXTS = Object.freeze({
@@ -559,6 +562,11 @@ const OPENWEBUI_MODEL_LOAD_MIN_TIMEOUT_MS = 120 * 1000;
 const OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS = 600 * 1000;
 const OPENWEBUI_DEFAULT_MODEL_LOAD_TIMEOUT_MS = 240 * 1000;
 const OPENWEBUI_CONTEXT_METADATA_FRESH_MS = 60 * 1000;
+// Model maximums are stable discovery metadata, unlike /ps resident
+// allocations. Keep them usable between refreshes (including for
+// non-Ollama/llama-server models where /ollama/api/show is unavailable), while
+// still expiring a genuinely old catalog entry.
+const OPENWEBUI_MODEL_CONTEXT_METADATA_FRESH_MS = 24 * 60 * 60 * 1000;
 const OPENROUTER_MODEL_METADATA_STALE_MS = 24 * 60 * 60 * 1000;
 const CHAT_PROVIDER_OUTPUT_HEADROOM_TOKENS = 1024;
 const CHAT_PROVIDER_REASONING_HEADROOM_TOKENS = 512;
@@ -5872,6 +5880,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             completedAt: deviceTimestamp(),
             error: ok ? "" : reasonCode
           });
+          if (ok) this.schedulePendingSemanticIndexFlush?.(1000);
           this.logLocal(ok
             ? (queued.reasonCode === "missing-index" ? "Automatic semantic index rebuild complete" : "Semantic index compatibility rebuild complete")
             : (queued.reasonCode === "missing-index" ? "Automatic semantic index rebuild failed" : "Semantic index compatibility rebuild failed"), {
@@ -7518,7 +7527,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.setSidebarStatus(message, { owner: "index" });
   }
 
+  schedulePendingSemanticIndexFlush(delayMs = 0) {
+    if (this.isUnloading || !this.pendingIndexPaths?.size || typeof window === "undefined") return false;
+    if (this.semanticIndexTimer) return true;
+    const configuredDelay = Number(delayMs) > 0
+      ? Number(delayMs)
+      : Math.max(1000, Number(this.settings?.semanticIndexDelaySeconds || 1) * 1000);
+    this.semanticIndexTimer = window.setTimeout(() => {
+      this.semanticIndexTimer = null;
+      Promise.resolve(this.flushSemanticIndexUpdates())
+        .catch((error) => {
+          this.logLocal("Semantic index pending flush failed", { error: error?.message || String(error) });
+          this.schedulePendingSemanticIndexFlush();
+        });
+    }, Math.max(1000, configuredDelay));
+    return true;
+  }
+
   refreshSidebarStatus() {
+    this.schedulePendingSemanticIndexFlush?.();
     const compatibilityState = this.semanticIndexCompatibilityRefresh?.state || "";
     const indexActive = compatibilityState === "queued" || compatibilityState === "running"
       || Boolean(this.semanticIndexLoadInProgress || this.semanticIndexLoadTimer || this.semanticIndexOptimizeInProgress
@@ -7823,8 +7850,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!aiAccessConfigured(this.settings)) return semanticOperationResult({ ok: false, reasonCode: "embedding-access-unavailable" });
     if (!this.shouldQueueSemanticIndexUpdate(normalizedPath, reason)) return semanticOperationResult({ ok: true, reasonCode: "unchanged-or-startup-suppressed" });
     this.pendingIndexPaths.add(normalizedPath);
-    window.clearTimeout(this.semanticIndexTimer);
-    this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(5, this.settings.semanticIndexDelaySeconds) * 1000);
+    this.schedulePendingSemanticIndexFlush(Math.max(5, this.settings.semanticIndexDelaySeconds) * 1000);
     this.refreshSidebarStatus();
     return semanticOperationResult({ ok: true, queued: 1, reasonCode: "queued" });
   }
@@ -8182,7 +8208,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async flushSemanticIndexUpdates() {
     if (this.semanticIndexInProgress && !this.semanticIndexOperationActive) {
       window.clearTimeout(this.semanticIndexTimer);
-      this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), 10000);
+      this.semanticIndexTimer = null;
+      this.schedulePendingSemanticIndexFlush(10000);
       this.refreshSidebarStatus();
       return semanticOperationResult({ ok: true, queued: this.pendingIndexPaths.size, reasonCode: "semantic-index-busy" });
     }
@@ -8192,12 +8219,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.refreshSidebarStatus();
         return semanticOperationResult({ ok: true, reasonCode: "nothing-pending" });
       }
+      if (this.pendingIndexPaths.size >= SEMANTIC_INDEX_PENDING_REBUILD_THRESHOLD) {
+        const rebuilt = await this.rebuildSemanticIndex(false);
+        if (!rebuilt?.ok) {
+          this.schedulePendingSemanticIndexFlush();
+          return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || "rebuild-failed", repairQueued: Boolean(rebuilt?.repairQueued) });
+        }
+        this.pendingIndexPaths.clear();
+        this.semanticIndexTimer = null;
+        this.refreshSidebarStatus();
+        return semanticOperationResult({ ok: true, changed: true, changedCount: rebuilt.changedCount, reasonCode: "rebuilt-pending-burst" });
+      }
       if (!this.hasUsableSemanticIndex() && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
         await this.ensureSemanticIndexLoaded("semantic index cache");
       }
       if (!this.hasUsableSemanticIndex()) {
         const rebuilt = await this.rebuildSemanticIndex(false);
         if (!rebuilt?.ok) {
+          this.schedulePendingSemanticIndexFlush();
           return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || "rebuild-failed", repairQueued: Boolean(rebuilt?.repairQueued) });
         }
         this.pendingIndexPaths.clear();
@@ -8207,6 +8246,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!anchorCompatibility.compatible) {
         const rebuilt = await this.rebuildSemanticIndex(false);
         if (!rebuilt?.ok) {
+          this.schedulePendingSemanticIndexFlush();
           return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || `materiality-anchors-${anchorCompatibility.reasonCode}`, repairQueued: Boolean(rebuilt?.repairQueued) });
         }
         this.pendingIndexPaths.clear();
@@ -8276,7 +8316,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.taskReferenceIntegrity = previousIntegrity;
         for (const path of paths) this.pendingIndexPaths.add(path);
         window.clearTimeout(this.semanticIndexTimer);
-        this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
+        this.semanticIndexTimer = null;
+        this.schedulePendingSemanticIndexFlush();
         result.ok = false;
         result.reasonCode = String(error?.message || "semantic-index-update-failed").split("\n")[0].slice(0, 120);
         result.repairQueued = Boolean(this.scheduleSemanticTaskReferenceRepair?.("incremental-integrity"));
@@ -8730,10 +8771,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
         for (const path of paths) this.pendingIndexPaths?.add?.(path);
-        if (paths.length && typeof window !== "undefined") {
-          window.clearTimeout(this.semanticIndexTimer);
-          this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
-        }
+        if (paths.length) this.schedulePendingSemanticIndexFlush();
         if (semanticEmbeddingFallbackEligible(error, this.settings)) {
           result.ok = true;
           result.reasonCode = "embedding-fallback-required";
@@ -9065,10 +9103,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
         this.pendingIndexPaths?.add?.(normalizedPath);
-        if (typeof window !== "undefined") {
-          window.clearTimeout(this.semanticIndexTimer);
-          this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
-        }
+        this.schedulePendingSemanticIndexFlush();
         if (semanticEmbeddingFallbackEligible(error, this.settings)) {
           return Object.assign(semanticOperationResult({ ok: true, queued: 1, reasonCode: "embedding-fallback-required" }), {
             embeddingFallbackRequired: true
@@ -9150,6 +9185,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async retrieveSemanticContext(query, limit, queryPlan = null) {
     const startedAt = Date.now();
     const plan = queryPlan || contextQueryPlan(query, "chat");
+    this.schedulePendingSemanticIndexFlush?.();
     this._debugSemanticRetrievalSequence = Number(this._debugSemanticRetrievalSequence || 0) + 1;
     this.recordDebugDiagnostic?.({ operation: aiDebugOperationName(plan.mode || "chat"), phase: "semantic", step: "selection-start", status: "started", contextSummary: { scopeCount: plan.scopeIds?.length || 0 } });
     const request = semanticRetrievalRequestMetadata(query, limit, plan, this.settings);
@@ -49265,7 +49301,7 @@ function openWebUITrustedModelContextValue(metadata = {}, now = Date.now()) {
     || !OPENWEBUI_TRUSTED_MODEL_CONTEXT_SOURCES.includes(String(metadata.modelContextSource || "").trim())) return 0;
   const observedAt = Date.parse(String(metadata.modelContextObservedAt || ""));
   const ageMs = Number(now) - observedAt;
-  if (!Number.isFinite(observedAt) || !Number.isFinite(ageMs) || ageMs < 0 || ageMs > OPENWEBUI_CONTEXT_METADATA_FRESH_MS) return 0;
+  if (!Number.isFinite(observedAt) || !Number.isFinite(ageMs) || ageMs < 0 || ageMs > OPENWEBUI_MODEL_CONTEXT_METADATA_FRESH_MS) return 0;
   return openWebUIPositiveContextValue(metadata.modelContextWindowTokens);
 }
 
@@ -50148,7 +50184,15 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
   const providerOperationalInputLimitTokens = capacityKnown
     ? Math.min(curveCeilingTokens, providerInputLimitTokens > 0 ? providerInputLimitTokens : curveCeilingTokens)
     : unknownOperationalTokens;
-  const operationalInputLimitTokens = Math.min(providerOperationalInputLimitTokens, PROVIDER_INPUT_MAX_TOKENS);
+  // The 16K ceiling remains the fail-closed fallback for unknown providers and
+  // unknown OpenWebUI models. Once OpenWebUI has reported an exact model
+  // context, use its bounded adaptive ceiling instead of silently reducing a
+  // 32K/64K/etc. model to the product-wide fallback.
+  const providerInputMaximumExclusiveTokens = normalizedProvider === "openwebui" && capacityKnown
+    ? Math.max(PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS, providerOperationalInputLimitTokens + 1)
+    : PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS;
+  const providerInputMaximumTokens = providerInputMaximumExclusiveTokens - 1;
+  const operationalInputLimitTokens = Math.min(providerOperationalInputLimitTokens, providerInputMaximumTokens);
   return {
     provider: normalizedProvider,
     model: normalizedModel,
@@ -50166,8 +50210,10 @@ function chatProviderContextWindow(settings = DEFAULT_SETTINGS, provider = "", m
     contextWindowProfiled: profiled,
     usableInputTokens: operationalInputLimitTokens,
     adaptiveTargetInputTokens: curveCeilingTokens,
-    globalInputBudgetTokens: PROVIDER_INPUT_MAX_TOKENS,
-    globalInputMaximumExclusiveTokens: PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
+    globalInputBudgetTokens: providerInputMaximumTokens,
+    globalInputMaximumExclusiveTokens: providerInputMaximumExclusiveTokens,
+    inputMaximumTokens: providerInputMaximumTokens,
+    inputMaximumExclusiveTokens: providerInputMaximumExclusiveTokens,
     contextWindowKnown: known,
     contextSource: known || profiled ? contextSource : "unknown-model-context-setting",
     contextValueKind: profiled ? "provider-profile" : limits.contextValueKind,
@@ -50769,7 +50815,9 @@ function buildChatProviderContextProjection(options = {}) {
   });
   const estimatedInputTokens = envelopeEstimate.adjustedEstimatedInputTokens;
   const availableInputTokens = limits.inputTokenLimitTokens;
-  const globalInputBudgetExceeded = estimatedInputTokens >= PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS;
+  const inputMaximumTokens = Math.max(PROVIDER_INPUT_MAX_TOKENS, Math.floor(Number(limits.inputMaximumTokens || 0)));
+  const inputMaximumExclusiveTokens = inputMaximumTokens + 1;
+  const globalInputBudgetExceeded = estimatedInputTokens >= inputMaximumExclusiveTokens;
   const overflow = estimatedInputTokens > availableInputTokens || globalInputBudgetExceeded;
   const telemetry = {
     chars: totalChars,
@@ -50847,8 +50895,10 @@ function buildChatProviderContextProjection(options = {}) {
     operationalInputTokenLimitTokens: limits.operationalInputTokenLimitTokens,
     usableInputTokens: limits.usableInputTokens,
     adaptiveTargetInputTokens: limits.adaptiveTargetInputTokens,
-    globalInputBudgetTokens: PROVIDER_INPUT_MAX_TOKENS,
-    globalInputMaximumExclusiveTokens: PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
+    globalInputBudgetTokens: inputMaximumTokens,
+    globalInputMaximumExclusiveTokens: inputMaximumExclusiveTokens,
+    inputMaximumTokens,
+    inputMaximumExclusiveTokens,
     globalInputBudgetExceeded,
     source: limits.contextSource,
     contextValueKind: limits.contextValueKind,
@@ -50966,7 +51016,9 @@ function chatProviderContextPreflight({ settings = DEFAULT_SETTINGS, provider = 
   });
   const estimatedInputTokens = envelopeEstimate.adjustedEstimatedInputTokens;
   const availableInputTokens = limits.inputTokenLimitTokens;
-  const globalInputBudgetExceeded = estimatedInputTokens >= PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS;
+  const inputMaximumTokens = Math.max(PROVIDER_INPUT_MAX_TOKENS, Math.floor(Number(limits.inputMaximumTokens || 0)));
+  const inputMaximumExclusiveTokens = inputMaximumTokens + 1;
+  const globalInputBudgetExceeded = estimatedInputTokens >= inputMaximumExclusiveTokens;
   const overflow = estimatedInputTokens > availableInputTokens || globalInputBudgetExceeded;
   const prefixValidation = projection?.telemetry?.promptPrefixValidation || { valid: true, reasonCodes: [] };
   return Object.freeze(Object.assign({}, base, {
@@ -51004,8 +51056,10 @@ function chatProviderContextPreflight({ settings = DEFAULT_SETTINGS, provider = 
     providerOperationalInputLimitTokens: limits.providerOperationalInputLimitTokens,
     usableInputTokens: limits.usableInputTokens,
     adaptiveTargetInputTokens: limits.adaptiveTargetInputTokens,
-    globalInputBudgetTokens: PROVIDER_INPUT_MAX_TOKENS,
-    globalInputMaximumExclusiveTokens: PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
+    globalInputBudgetTokens: inputMaximumTokens,
+    globalInputMaximumExclusiveTokens: inputMaximumExclusiveTokens,
+    inputMaximumTokens,
+    inputMaximumExclusiveTokens,
     globalInputBudgetExceeded,
     source: limits.contextSource,
     contextValueKind: limits.contextValueKind,
@@ -51144,7 +51198,9 @@ function taskDescriptionProviderContextPreflight({
   const reasoningHeadroom = Math.max(0, Math.round(Number(reasoningHeadroomTokens) || 0));
   const reservedHeadroomTokens = outputHeadroom + reasoningHeadroom;
   const availableInputTokens = contextBudget.operationalInputTokenLimitTokens;
-  const globalInputBudgetExceeded = estimatedInputTokens >= PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS;
+  const inputMaximumTokens = Math.max(PROVIDER_INPUT_MAX_TOKENS, Math.floor(Number(contextBudget.inputMaximumTokens || 0)));
+  const inputMaximumExclusiveTokens = inputMaximumTokens + 1;
+  const globalInputBudgetExceeded = estimatedInputTokens >= inputMaximumExclusiveTokens;
   const status = estimatedInputTokens > availableInputTokens || globalInputBudgetExceeded ? "overflow" : "ok";
   const schemaVocabularyPreflight = taskWorkflowSchemaVocabularyHasRequiredEnums(schemaForPreflight, schemaVocabulary);
   const schemaBytes = envelopeEstimate.schemaBytes;
@@ -51173,8 +51229,10 @@ function taskDescriptionProviderContextPreflight({
     providerOperationalInputLimitTokens: contextBudget.providerOperationalInputLimitTokens,
     usableInputTokens: contextBudget.usableInputTokens,
     adaptiveTargetInputTokens: contextBudget.adaptiveTargetInputTokens,
-    globalInputBudgetTokens: PROVIDER_INPUT_MAX_TOKENS,
-    globalInputMaximumExclusiveTokens: PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
+    globalInputBudgetTokens: inputMaximumTokens,
+    globalInputMaximumExclusiveTokens: inputMaximumExclusiveTokens,
+    inputMaximumTokens,
+    inputMaximumExclusiveTokens,
     globalInputBudgetExceeded,
     providerContextLimit: contextBudget.providerContextLimit,
     providerContextLimitTokens: contextBudget.providerContextLimitTokens,
@@ -59081,7 +59139,11 @@ const STS_MULTI_PROVIDER = (() => {
   const OPENWEBUI_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
   const OPENWEBUI_RESPONSE_MAX_LINES = 8192;
   const OPENWEBUI_RESPONSE_MAX_EVENTS = 4096;
-  const OPENWEBUI_MODEL_EXECUTION_TIMEOUT_MS = 240000;
+  // Evidence-rich prompts can take materially longer than a short health-check
+  // request on a local llama-server model. Keep the deadline bounded, but align
+  // the generic OpenWebUI path with the configured six-minute maximum used by the
+  // model barrier instead of aborting healthy inference at four minutes.
+  const OPENWEBUI_MODEL_EXECUTION_TIMEOUT_MS = OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS;
   const OPENWEBUI_REASONING_VALIDATION_PROFILE = "openwebui-reasoning-schema-v1";
   const OPENWEBUI_JSON_MODE_PROFILE = "openwebui-ollama-json-mode-v1";
   const OPENWEBUI_REASONING_VALIDATION_MAX_DEPTH = 64;
@@ -64165,18 +64227,36 @@ const STS_MULTI_PROVIDER = (() => {
     const number = typeof value === "number" ? value : Number(nonEmpty(value));
     return Number.isSafeInteger(number) && number > 0 ? number : 0;
   };
-  const openWebUIContextValueFromRow = (row = {}) => [
-    row?.context_length,
-    row?.contextLength,
-    row?.context_window,
-    row?.contextWindow,
-    row?.max_context_length,
-    row?.maxContextLength,
-    row?.num_ctx,
-    row?.info?.meta?.context_length,
-    row?.info?.meta?.contextLength,
-    row?.details?.context_length
-  ].map(openWebUIPositiveContextValue).find(Boolean) || 0;
+  const openWebUIContextValueFromObject = (root = {}) => {
+    const contextKeys = new Set([
+      "context_length", "contextlength", "context_window", "contextwindow",
+      "max_context_length", "maxcontextlength", "num_ctx", "n_ctx",
+      "context_size", "contextsize", "max_model_len", "maxmodellength",
+      "max_seq_len", "maxseqlen", "max_position_embeddings", "maxpositionembeddings",
+      "n_ctx_train", "nctxtrain"
+    ]);
+    const values = [];
+    const visited = new Set();
+    const walk = (value, depth = 0) => {
+      if (values.length >= 16 || depth > 8 || value === null || typeof value !== "object" || visited.has(value)) return;
+      visited.add(value);
+      if (Array.isArray(value)) {
+        value.slice(0, 32).forEach((entry) => walk(entry, depth + 1));
+        return;
+      }
+      for (const [key, child] of Object.entries(value).slice(0, 96)) {
+        const normalizedKey = String(key || "").replace(/[.-]/g, "_").toLowerCase();
+        if (contextKeys.has(normalizedKey) || /(?:^|_)context_length$/.test(normalizedKey)) {
+          const candidate = openWebUIPositiveContextValue(child);
+          if (candidate) values.push(candidate);
+        }
+        if (child && typeof child === "object") walk(child, depth + 1);
+      }
+    };
+    walk(root);
+    return values.find(Boolean) || 0;
+  };
+  const openWebUIContextValueFromRow = (row = {}) => openWebUIContextValueFromObject(row);
   // /ollama/api/ps describes the allocation of a currently resident model.
   // Accept only active-allocation fields from that endpoint; a model maximum
   // such as max_context_length is capability metadata and must never be
@@ -64282,26 +64362,7 @@ const STS_MULTI_PROVIDER = (() => {
     });
     return { capabilities, role, contextLength, embeddingLength };
   };
-  const openWebUIContextValueFromModelInfo = (payload = {}) => {
-    const modelInfo = payload?.model_info && typeof payload.model_info === "object" ? payload.model_info : {};
-    const values = [];
-    let visited = 0;
-    const walk = (value, depth = 0) => {
-      if (visited >= 160 || depth > 6 || value === null || typeof value !== "object") return;
-      visited += 1;
-      if (Array.isArray(value)) {
-        for (const entry of value.slice(0, 24)) walk(entry, depth + 1);
-        return;
-      }
-      for (const [key, child] of Object.entries(value).slice(0, 64)) {
-        const normalizedKey = String(key || "").toLowerCase();
-        if (normalizedKey === "context_length" || /(?:^|[._-])context_length$/.test(normalizedKey)) values.push(openWebUIPositiveContextValue(child));
-        if (child && typeof child === "object") walk(child, depth + 1);
-      }
-    };
-    walk(modelInfo);
-    return values.find(Boolean) || 0;
-  };
+  const openWebUIContextValueFromModelInfo = (payload = {}) => openWebUIContextValueFromObject(payload);
   const openWebUIEmbeddingLengthFromModelInfo = (payload = {}) => {
     const modelInfo = payload?.model_info && typeof payload.model_info === "object" ? payload.model_info : {};
     const values = [];
@@ -64883,7 +64944,7 @@ const AI_GATEWAY_ATTEMPT_DEFAULT_DEADLINE_MS = 180000;
 const AI_GATEWAY_OPENROUTER_FREE_DEADLINE_MS = 180000;
 const AI_GATEWAY_OPENROUTER_FIXED_DEADLINE_MS = 240000;
 const AI_GATEWAY_OPENROUTER_NEMOTRON_LIGHTNING_DEADLINE_MS = 360000;
-const AI_GATEWAY_OPENWEBUI_LOCAL_DEADLINE_MS = 240000;
+const AI_GATEWAY_OPENWEBUI_LOCAL_DEADLINE_MS = OPENWEBUI_MODEL_LOAD_MAX_TIMEOUT_MS;
 const AI_GATEWAY_ATTEMPT_MIN_DEADLINE_MS = 1;
 const AI_GATEWAY_ATTEMPT_MAX_DEADLINE_MS = 600000;
 const AI_GATEWAY_EMBEDDING_MAX_ATTEMPTS = 3;

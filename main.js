@@ -4373,7 +4373,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             model,
             meta,
             actualDimension: meta.actualDimension || meta.dimension,
-            configuredDimension: meta.configuredDimension || meta.targetDimension || meta.dimension
+            configuredDimension: meta.configuredDimension || meta.targetDimension || 0
           });
           if (String(identity.identityHash) !== String(meta.partitionIdentityHash)) continue;
         } catch { continue; }
@@ -4635,7 +4635,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.logLocal("Legacy semantic index migration queued rebuild", { reason: "manifest-invalid" });
         continue;
       }
-      const partition = this.semanticIndexStoragePartition({ settings: legacySettings, provider, model, meta: legacyMeta, actualDimension: legacyMeta.dimension, configuredDimension: legacyMeta.targetDimension || legacyMeta.dimension });
+      const partition = this.semanticIndexStoragePartition({ settings: legacySettings, provider, model, meta: legacyMeta, actualDimension: legacyMeta.dimension, configuredDimension: legacyMeta.targetDimension || 0 });
       const targetDir = this.semanticIndexStorageDir(partition);
       const targetManifestPath = `${targetDir}/${indexFile}`;
       const sourceFiles = uniqueValues([indexFile, ...validation.shardFiles, validation.pathMetaFile, SEMANTIC_INDEX_PATH_META_FILE, LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE]).filter(Boolean);
@@ -6099,7 +6099,38 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // Prepare the provider-free routing generation before the index becomes
       // observable as warm. Persistence/load may refine this state later, but
       // a missing artifact never authorizes an unbounded retrieval scan.
-      await this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: true, allowPersistedRevisionHydration: true });
+      let startupRoutingState = await this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: true, allowPersistedRevisionHydration: true });
+      // A persisted sidecar can be stale even when the semantic chunks are
+      // valid (for example after a revision-only cache invalidation). Retry a
+      // provider-free in-memory build before exposing the index as warm. This
+      // keeps retrieval available when the optional sidecar cannot be read or
+      // promoted by a transient vault adapter error.
+      if (this.semanticIndex.length && !startupRoutingState) {
+        startupRoutingState = await this.ensureProductionSemanticRoutingState({
+          chunks: this.semanticIndex,
+          revision: this.semanticIndexRevision || 0,
+          storageFingerprint: this.semanticIndexStorageFingerprint || "",
+          allowLoad: false,
+          allowBuild: true,
+          persist: false,
+          forceBuild: true
+        });
+      }
+      if (this.semanticIndex.length && !startupRoutingState && !this.semanticIndexAutomaticRecoveryAttempted) {
+        this.semanticIndexAutomaticRecoveryAttempted = true;
+        const recover = () => {
+          if (this.isUnloading) return;
+          if (this.semanticIndexInProgress || this.syncInProgress) {
+            window.setTimeout(recover, 5000);
+            return;
+          }
+          this.rebuildSemanticIndex(false).catch((error) => this.logLocal?.("Automatic semantic index recovery failed", {
+            reasonCode: String(error?.code || "semantic-index-recovery-failed"),
+            error: String(error?.message || "").slice(0, 240)
+          }));
+        };
+        window.setTimeout(recover, 1000);
+      }
       if (settingsChanged) await this.saveSettings();
     } finally {
       this.semanticIndexLoaded = true;
@@ -6805,6 +6836,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   invalidateProductionSemanticRoutingState(reasonCode = "semantic-index-revision") {
+    // Retrieval-cache invalidation does not change the loaded chunk array.
+    // Preserve a matching provider-free router across those cache-only
+    // revisions; a replacement index array still takes the full rebuild path.
+    if (this.productionSemanticRoutingState?.routingIndex
+      && this.productionSemanticRoutingState.sourceChunksIdentity === this.semanticIndex) {
+      this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingState.telemetry || {}, {
+        state: "ready",
+        cacheInvalidated: true,
+        reasonCode: ""
+      });
+      return this.productionSemanticRoutingTelemetry;
+    }
     this.productionSemanticRoutingState = null;
     this.productionSemanticRoutingInFlight?.clear?.();
     this.productionSemanticRoutingInvalidationSerial = Number(this.productionSemanticRoutingInvalidationSerial || 0) + 1;
@@ -6837,7 +6880,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const expectedProvider = String(options.provider || semanticEmbeddingProviderForSettings(settings)).toLowerCase();
       const expectedModel = String(options.model || settings.embeddingModel || "");
       const expectedDimension = Number(options.dimension || settings.semanticIndexMeta?.dimension || semanticEmbeddingTargetDimension(settings) || 0);
-      const compatibility = productionSemanticRoutingArtifactCompatibility(artifact, chunks, settings, {
+      let compatibility = productionSemanticRoutingArtifactCompatibility(artifact, chunks, settings, {
         generation: options.generation || settings.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "",
         provider: expectedProvider,
         model: expectedModel,
@@ -6847,6 +6890,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         storageFingerprint,
         shardCount: options.shardCount || settings.semanticIndexMeta?.shardCount || 0
       });
+      // The revision is an in-memory cache generation, not part of the
+      // persisted vector identity. A valid sidecar may therefore outlive a
+      // cache invalidation while retaining the same semantic-index
+      // generation, ordering, and vectors. Revalidate that durable contract
+      // without rejecting solely on the transient revision number.
+      const cacheIdentityMismatch = compatibility.reasonCodes?.length
+        && compatibility.reasonCodes.every((reason) => reason === "artifact-index-revision-mismatch"
+          || reason === "artifact-storage-fingerprint-mismatch"
+          || reason === "artifact-shard-layout-mismatch");
+      if (!compatibility.compatible && cacheIdentityMismatch) {
+        const relaxed = productionSemanticRoutingArtifactCompatibility(artifact, chunks, settings, {
+          generation: options.generation || settings.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "",
+          provider: expectedProvider,
+          model: expectedModel,
+          dimension: expectedDimension,
+          contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION
+        });
+        if (relaxed.compatible) compatibility = Object.assign({}, relaxed, { relaxedCacheIdentity: true });
+      }
       if (!compatibility.compatible) {
         throw localSemanticRoutingError(compatibility.reasonCode, "Production routing artifact is incompatible with the loaded semantic index.", {
           reasonCodes: compatibility.reasonCodes,
@@ -6862,7 +6924,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       for (let row = 0; row < sourceChunks.length; row += 1) chunkByEvidenceId.set(routingIndex.evidenceIds[row], sourceChunks[row]);
       const handleLookup = productionSemanticRoutingHandleLookup(sourceChunks, routingIndex);
       const textSeedIndex = buildLocalSemanticTextSeedIndex(sourceChunks);
-      const telemetry = Object.freeze({ state: "ready", coldBuild: false, loadHit: true, artifactCompatibility: "aligned", providerCalls: 0, networkCalls: 0, revision, storageFingerprint, count: routingIndex.count, dimension: routingIndex.encoder.dimension, loadElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) });
+      const telemetry = Object.freeze({ state: "ready", coldBuild: false, loadHit: true, artifactCompatibility: compatibility.relaxedCacheIdentity ? "aligned-cache-identity-relaxed" : "aligned", providerCalls: 0, networkCalls: 0, revision, storageFingerprint, count: routingIndex.count, dimension: routingIndex.encoder.dimension, loadElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) });
       const state = Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, textSeedIndex, sourceChunksIdentity: chunks, telemetry });
       this.productionSemanticRoutingState = state;
       this.productionSemanticRoutingTelemetry = telemetry;
@@ -7069,11 +7131,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // state was rejected as stale and request-time retrieval degraded to the
     // active source only. Preserve zero while still rejecting a missing
     // revision.
-    if (!options.forceBuild && current?.routingIndex && current.sourceChunksIdentity === chunks && currentGenerationMatches && currentShardLayoutMatches && Number(current.telemetry?.revision ?? -1) === revision && String(current.telemetry?.storageFingerprint || "") === storageFingerprint && Number(current.routingIndex.count || 0) === chunkCount) {
+    if (!options.forceBuild && current?.routingIndex && current.sourceChunksIdentity === chunks && currentGenerationMatches && currentShardLayoutMatches && Number(current.routingIndex.count || 0) === chunkCount) {
       this.productionSemanticRoutingTelemetry = Object.assign({}, current.telemetry, { cacheHit: true, coldBuild: false, loadHit: Boolean(current.telemetry?.loadHit) });
       return current;
     }
-    if (!options.forceBuild && options.allowLoad !== false && storageFingerprint) {
+    if (!options.forceBuild && options.allowLoad !== false && (storageFingerprint || generation)) {
       const loaded = await this.loadProductionSemanticRoutingArtifact({ chunks, settings, revision, storageFingerprint, generation: options.generationCanonical === false ? "" : options.generation, provider: options.provider, model: options.model, dimension: options.dimension, shardCount: options.shardCount });
       if (loaded) return loaded;
       artifactCompatibilityReason = String(this.productionSemanticRoutingTelemetry?.artifactCompatibility || this.productionSemanticRoutingTelemetry?.reasonCode || "artifact-load-failed");
@@ -7112,21 +7174,68 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           expectedStorageFingerprint: storageFingerprint
         });
         if (!persisted) {
-          this.productionSemanticRoutingState = null;
+          // A provider-free routing build is still usable for this session
+          // when the optional persisted artifact cannot be promoted (for
+          // example, a transient vault adapter read/write failure). Keep the
+          // in-memory state available so retrieval does not degrade merely
+          // because persistence is temporarily unavailable; the next load
+          // will retry artifact persistence against the same index.
+          const persistenceWarning = Object.freeze(Object.assign({}, state.telemetry, {
+            state: "ready",
+            persistenceState: "failed",
+            persistenceError: String(this.productionSemanticRoutingTelemetry?.persistenceError || "routing-artifact-persistence-failed").slice(0, 240)
+          }));
+          const fallbackState = Object.freeze(Object.assign({}, state, { telemetry: persistenceWarning }));
+          this.productionSemanticRoutingState = fallbackState;
           this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, {
-            state: "migration-required",
+            state: "ready",
             reasonCode: "routing-artifact-persistence-failed",
+            persistenceState: "failed",
             providerCalls: 0,
             networkCalls: 0,
             revision,
             storageFingerprint
           });
-          return null;
+          return fallbackState;
         }
       }
       return state;
     } catch (error) {
+      // If settings were switched after an index was built, the persisted
+      // chunks still carry the encoder identity that produced their vectors.
+      // Build a provider-free fallback from that durable identity instead of
+      // leaving the whole index unavailable merely because chat/embedding
+      // settings currently name a different backend.
+      try {
+        const fallbackChunks = chunks.filter((chunk) => chunk && Array.isArray(chunk.embedding) && chunk.embedding.length > 0);
+        const sample = fallbackChunks[0];
+        const sampleMeta = sample?.indexMetadata || {};
+        const fallbackSettings = Object.assign({}, settings, {
+          embeddingProvider: sample?.embeddingProvider || sampleMeta.provider || settings.embeddingProvider,
+          embeddingModel: sample?.embeddingModel || sampleMeta.model || settings.embeddingModel
+        });
+        const preparedFallback = prepareProductionSemanticRoutingState(fallbackChunks, fallbackSettings, revision, storageFingerprint, options);
+        const fallbackTelemetry = Object.freeze(Object.assign({}, preparedFallback.telemetry, {
+          state: "ready",
+          degraded: true,
+          degradedReason: "routing-settings-identity-fallback",
+          cacheHit: false,
+          coldBuild: true,
+          loadHit: false,
+          artifactCompatibility: "rebuilt-encoder-identity-fallback"
+        }));
+        const fallbackState = Object.freeze(Object.assign({}, preparedFallback, { sourceChunksIdentity: chunks, telemetry: fallbackTelemetry }));
+        this.productionSemanticRoutingState = fallbackState;
+        this.productionSemanticRoutingTelemetry = fallbackTelemetry;
+        return fallbackState;
+      } catch {}
       this.productionSemanticRoutingState = null;
+      this.logLocal?.("Production semantic routing build failed", {
+        reasonCode: String(error?.code || "routing-state-build-failed"),
+        error: String(error?.message || "Production semantic routing state could not be prepared.").slice(0, 240),
+        count: chunks.length,
+        revision
+      });
       this.productionSemanticRoutingTelemetry = {
         state: "migration-required",
         reasonCode: String(error?.code || "routing-state-build-failed"),
@@ -9746,6 +9855,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticExactScoreCache?.clear?.();
     this.semanticIndexRevision = (this.semanticIndexRevision || 0) + 1;
     this.invalidateProductionSemanticRoutingState("semantic-index-revision");
+    // Cache invalidation also invalidates the sidecar's revision. Rebuild the
+    // provider-free router automatically once the current index is loaded so
+    // background note/task sync cannot leave the UI permanently unavailable.
+    if (!this.isUnloading && this.semanticIndexLoaded && Array.isArray(this.semanticIndex) && this.semanticIndex.length) {
+      window.clearTimeout(this.productionSemanticRoutingRebuildTimer);
+      this.productionSemanticRoutingRebuildTimer = window.setTimeout(() => {
+        this.productionSemanticRoutingRebuildTimer = null;
+        this.ensureProductionSemanticRoutingState({
+          chunks: this.semanticIndex,
+          settings: this.settings,
+          revision: this.semanticIndexRevision || 0,
+          storageFingerprint: this.semanticIndexStorageFingerprint || "",
+          allowLoad: true,
+          allowBuild: true,
+          persist: false,
+          forceBuild: true
+        }).catch((error) => this.logLocal?.("Production semantic routing rebuild failed", {
+          reasonCode: String(error?.code || "routing-state-build-failed"),
+          error: String(error?.message || "").slice(0, 240)
+        }));
+      }, 250);
+    }
   }
 
   async routeProductionSemanticCandidateBatches(handleGroups = [], usableIndex = [], options = {}) {
@@ -9799,7 +9930,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!groups.some((group) => group.handles.length)) {
       return Object.freeze({ groups: emptyGroups(), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, { contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) })), degradedReason: "query-vector-unavailable", routingState: null });
     }
-    const routingState = Object.prototype.hasOwnProperty.call(options, "routingState") ? options.routingState : await this.ensureProductionSemanticRoutingState({
+    let routingState = Object.prototype.hasOwnProperty.call(options, "routingState") ? options.routingState : await this.ensureProductionSemanticRoutingState({
       chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
       settings: this.settings,
       revision,
@@ -9808,6 +9939,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       allowBuild: false,
       persist: false
     });
+    if (!routingState && !Object.prototype.hasOwnProperty.call(options, "routingState") && Array.isArray(this.semanticIndex) && this.semanticIndex.length) {
+      routingState = await this.ensureProductionSemanticRoutingState({
+        chunks: this.semanticIndex,
+        settings: this.settings,
+        revision,
+        storageFingerprint,
+        allowLoad: false,
+        allowBuild: true,
+        persist: false,
+        forceBuild: true
+      });
+    }
     if (!routingState?.routingIndex || !routingState.chunkByEvidenceId) {
       const reason = this.productionSemanticRoutingTelemetry?.reasonCode || "local-warmup-required";
       return Object.freeze({ groups: emptyGroups(reason), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, { contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) })), degradedReason: reason, routingState: null });
@@ -55032,7 +55175,7 @@ function semanticIndexManifestValidation(parsed = {}, indexFile = SEMANTIC_INDEX
       model: meta.model,
       meta,
       actualDimension: meta.actualDimension || meta.dimension,
-      configuredDimension: meta.configuredDimension || meta.targetDimension || meta.dimension
+      configuredDimension: meta.configuredDimension || meta.targetDimension || 0
     });
     if (String(meta.partitionIdentityHash) !== String(partition.identityHash)) throw new Error("Semantic-index partition identity is incompatible.");
   }
@@ -64936,6 +65079,7 @@ const STS_MULTI_PROVIDER = (() => {
 
 if (typeof module !== "undefined" && module.exports) module.exports.__multiProvider = STS_MULTI_PROVIDER;
 if (typeof module !== "undefined" && module.exports) module.exports.__semanticIndexPartitionContract = semanticIndexPartitionContract;
+if (typeof module !== "undefined" && module.exports) module.exports.__semanticIndexManifestValidation = semanticIndexManifestValidation;
 
 // One provider-neutral execution seam.  The gateway owns selection, plan
 // immutability, preflight, retry/fallback ordering, and diagnostics; adapters

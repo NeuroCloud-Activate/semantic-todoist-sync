@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.31
+
+- Fixed persisted semantic-index partition validation when the configured
+  embedding dimension is intentionally unconstrained, so valid indexes no
+  longer remain queued after restart.
+- Recovered provider-free routing automatically after cache revisions,
+  transient sidecar persistence failures, or an encoder-setting mismatch;
+  startup now triggers one bounded rebuild when the loaded index needs it.
+
 ## 0.8.30
 
 - Raised the bounded Open WebUI chat and prompt-response output ceiling to

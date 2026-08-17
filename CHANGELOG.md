@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.26
+
+- Fixed Open WebUI model discovery to retain the callable API `id` instead of
+  sending the human-readable `name`, preventing model-not-found errors for
+  models served from paths such as `/models/*.gguf`.
+- Migrated previously saved Open WebUI display-name selections to their live
+  API identifiers during refresh, so the primary model remains stable.
+
 ## 0.8.25
 
 - Preserved a live Open WebUI primary model when discovery does not report

@@ -112,6 +112,20 @@ const liveUnknownCapabilityPreservation = providers.repairGenerationModelReferen
   manualProviderGenerationModels: { openwebui: [] }
 }, "openwebui");
 assert(!liveUnknownCapabilityPreservation.changed && liveUnknownCapabilityPreservation.settings.aiOperationModels["chat-query"].primary.model === "live-unknown-model", "A live Open WebUI model with undisclosed role capabilities must remain selected during refresh instead of being replaced by the first explicitly classified generation model.");
+const apiIdentifierAliasRepair = providers.repairGenerationModelReferences({
+  openwebuiBaseUrl: "https://synthetic.invalid",
+  openwebuiApiKey: "synthetic-key",
+  aiModelProvider: "openwebui",
+  chatModel: "gemma-4-26B-A4B-it-MXFP4_MOE.gguf",
+  aiOperationModels: { "chat-query": { primary: { provider: "openwebui", model: "gemma-4-26B-A4B-it-MXFP4_MOE.gguf" } } },
+  enableMultiProviderOperationModels: false,
+  availableOpenWebUIModels: ["arena-model", "/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf"],
+  openwebuiModelMetadata: {},
+  manualProviderGenerationModels: { openwebui: [] }
+}, "openwebui");
+assert(apiIdentifierAliasRepair.changed
+  && apiIdentifierAliasRepair.settings.aiOperationModels["chat-query"].primary.model === "/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf",
+"A previously saved Open WebUI display-name selection must repair to the matching callable /models/{id} API identifier instead of an unrelated first catalog row.");
 const modelNotFoundMessage = gateway.aiGatewayUserErrorMessage("openwebui", 400, "model-not-found", { modelNotFound: true });
 assert(modelNotFoundMessage.includes("could not find the selected model") && modelNotFoundMessage.includes("Refresh the Open WebUI model list"), "Open WebUI model lookup failures must point to model discovery and selection instead of being mislabeled as schema failures.");
 assert(providers.providerDiscoveryRetryEligible({ providerError: { status: 503, code: "transport", retryable: true, providerDiagnostic: { classification: "transport" } } }) === true, "A transient provider discovery transport failure must be eligible for one bounded retry.");
@@ -386,6 +400,24 @@ for (const response of [
 }
 
 (async () => {
+  const discoveryIdentifierSettings = {
+    openwebuiBaseUrl: "https://synthetic.invalid",
+    openwebuiAuthMode: "api-key",
+    openwebuiApiKey: "synthetic-key",
+    openwebuiModelMetadata: {}
+  };
+  const discoveryIdentifierAuth = providers.openWebUIAuth(discoveryIdentifierSettings, { requestUrl: obsidianRequestUrl });
+  const discoveredIdentifierCatalog = await providers.openWebUIDiscover(discoveryIdentifierAuth, discoveryIdentifierSettings, {
+    requestUrl: async (request) => {
+      const pathName = new URL(request.url).pathname;
+      if (pathName === "/api/models") return { status: 200, text: JSON.stringify({ data: [{ id: "/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf", name: "gemma-4-26B-A4B-it-MXFP4_MOE.gguf", owned_by: "openai" }] }) };
+      if (pathName === "/ollama/api/tags") return { status: 200, text: JSON.stringify({ models: [] }) };
+      throw new Error(`Unexpected synthetic discovery path: ${pathName}`);
+    }
+  });
+  assert(discoveredIdentifierCatalog.chat.includes("/models/gemma-4-26B-A4B-it-MXFP4_MOE.gguf")
+    && !discoveredIdentifierCatalog.chat.includes("gemma-4-26B-A4B-it-MXFP4_MOE.gguf"),
+  "Open WebUI discovery must retain the API model identifier instead of replacing it with the row display name.");
   const discoveryPlugin = Object.create(Plugin.prototype);
   let discoveryAttempts = 0;
   discoveryPlugin.settings = { openwebuiBaseUrl: "https://synthetic.invalid", openwebuiModelMetadata: {}, availableOpenWebUIModels: [], availableOpenWebUIEmbeddingModels: [] };

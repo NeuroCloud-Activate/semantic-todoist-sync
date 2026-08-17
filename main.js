@@ -20623,6 +20623,26 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.settingsModalEl = null;
   }
 
+  captureSettingsScrollPositions() {
+    const positions = [];
+    let element = this.containerEl;
+    while (element) {
+      if (typeof element.scrollTop === "number" && typeof element.scrollLeft === "number") {
+        positions.push({ element, top: element.scrollTop, left: element.scrollLeft });
+      }
+      element = element.parentElement;
+    }
+    return positions;
+  }
+
+  restoreSettingsScrollPositions(positions = []) {
+    for (const position of positions) {
+      if (!position?.element) continue;
+      position.element.scrollTop = position.top;
+      position.element.scrollLeft = position.left;
+    }
+  }
+
   hide() {
     this.clearSettingsModalClass();
     stsMpDestroySearchableComboboxes();
@@ -20634,6 +20654,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   display() {
     const { containerEl } = this;
+    const scrollPositions = this.captureSettingsScrollPositions();
     stsMpDestroySearchableComboboxes();
     containerEl.empty();
     containerEl.addClass("semantic-todoist-settings");
@@ -20668,8 +20689,14 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     tabs.scrollLeft = Number(this.tabScrollLeft || 0);
     if (activeButton) {
       const alignActiveTab = () => activeButton.scrollIntoView({ block: "nearest", inline: "center" });
-      if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(alignActiveTab);
-      else alignActiveTab();
+      const restoreAfterLayout = () => {
+        alignActiveTab();
+        this.restoreSettingsScrollPositions(scrollPositions);
+      };
+      if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(restoreAfterLayout);
+      else restoreAfterLayout();
+    } else {
+      this.restoreSettingsScrollPositions(scrollPositions);
     }
   }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.23
+
+- Corrected the GitHub release packaging for Obsidian installation. The release
+  now publishes `main.js`, `manifest.json`, and `styles.css` as individual
+  binary assets, matching Obsidian's installer contract.
+- Synchronized the plugin manifest and compatibility map to version `0.8.23`.
+- Retained the searchable, provider-scoped, scrollable primary and fallback
+  model pickers from `0.8.22`.
+
 ## 0.8.22
 
 - Fixed primary and fallback model pickers in Obsidian settings so opening the

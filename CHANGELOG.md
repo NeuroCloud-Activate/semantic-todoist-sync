@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.30
+
+- Raised the bounded Open WebUI chat and prompt-response output ceiling to
+  4,096 tokens while keeping task-generation and task-description budgets
+  unchanged.
+- Ensured ordinary chat requests always carry an explicit output limit to both
+  non-Ollama llama-server (`max_tokens`) and Ollama-backed (`num_predict`)
+  transports.
+
 ## 0.8.29
 
 - Automatically schedules and retries pending semantic-index updates so a

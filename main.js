@@ -569,6 +569,7 @@ const OPENWEBUI_CONTEXT_METADATA_FRESH_MS = 60 * 1000;
 const OPENWEBUI_MODEL_CONTEXT_METADATA_FRESH_MS = 24 * 60 * 60 * 1000;
 const OPENROUTER_MODEL_METADATA_STALE_MS = 24 * 60 * 60 * 1000;
 const CHAT_PROVIDER_OUTPUT_HEADROOM_TOKENS = 1024;
+const CHAT_PROVIDER_OUTPUT_CEILING_TOKENS = 4096;
 const CHAT_PROVIDER_REASONING_HEADROOM_TOKENS = 512;
 const AI_DYNAMIC_ROUTER_RETRY_RESERVE_TOKENS = 1024;
 const CHAT_PROVIDER_MAX_HISTORY_MESSAGES = 8;
@@ -65586,7 +65587,14 @@ function aiSanitizedUiError(error) {
   return singleLine(error?.message || String(error || "The request failed.")).slice(0, 300);
 }
 
-const AI_DYNAMIC_OUTPUT_BUDGET_OPERATIONS = new Set(["task-generation", "task-description", "section-title"]);
+// Chat and prompt-response calls must receive the same bounded output-budget
+// derivation as structured task calls. Without these operations in the set,
+// input preflight still runs but maxOutputTokens remains unset, so OpenWebUI
+// and llama-server fall back to their large provider default (observed near
+// 10K tokens) instead of the ordinary chat ceiling below.
+const AI_DYNAMIC_OUTPUT_BUDGET_OPERATIONS = new Set([
+  "chat-query", "prompt-response", "task-generation", "task-description", "section-title"
+]);
 
 function aiOperationRequestedItemCount(operation = "", schema = null, request = {}) {
   const explicit = Number(request.outputBudgetItemCount || request.requestedItemCount || request.taskCount || 0);
@@ -65713,7 +65721,7 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
         schemaCap: 256,
         reasoning: CHAT_PROVIDER_REASONING_HEADROOM_TOKENS + ({ medium: 256, high: 512, xhigh: 768, max: 1024 })[reasoningEffort] || CHAT_PROVIDER_REASONING_HEADROOM_TOKENS,
         minimum: 512,
-        ceiling: 2048
+        ceiling: CHAT_PROVIDER_OUTPUT_CEILING_TOKENS
       };
   const effortMinimum = ["task-generation", "task-description"].includes(normalizedOperation)
     ? ({ high: 5120, xhigh: 6144, max: 7168 })[reasoningEffort] || profile.minimum

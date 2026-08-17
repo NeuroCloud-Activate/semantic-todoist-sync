@@ -58397,11 +58397,21 @@ const STS_MULTI_PROVIDER = (() => {
       const current = migrated.aiOperationModels?.[operation] || {};
       return [current.primary, current.fallback].filter(Boolean);
     });
-    const candidates = catalogRows(migrated, {}, references)
+    // A successful Open WebUI refresh is authoritative for the live model
+    // inventory.  Do not feed the previously selected Open WebUI references
+    // back into catalogRows as synthetic manual entries: if a model was
+    // removed or renamed upstream, preserving it here defeats the repair and
+    // the next generation request fails with HTTP 400 model-not-found.  True
+    // manual entries remain available through manualProviderGenerationModels.
+    const repairReferences = references.filter((reference) => reference?.provider !== "openwebui");
+    const candidates = catalogRows(migrated, {}, repairReferences)
       .filter((row) => (!providerFilter || row.provider === providerFilter)
         && generationCatalogRowEligible(row)
         && modelRoleCapability(migrated, row.provider, row.id).generation === true)
       .sort((left, right) => left.label.localeCompare(right.label));
+    const liveGenerationIdentities = new Set(candidates.map((row) => modelIdentity(row.provider, row.id)));
+    const staleOpenWebUIReference = (reference) => reference?.provider === "openwebui"
+      && !liveGenerationIdentities.has(modelIdentity(reference.provider, reference.model));
     const choose = (providerName, excluded = null) => candidates.find((row) => row.provider === providerName
       && (!excluded || modelIdentity(row.provider, row.id) !== modelIdentity(excluded.provider, excluded.model))) || null;
     const replacement = (current, row, isFallback, operation) => {
@@ -58425,19 +58435,21 @@ const STS_MULTI_PROVIDER = (() => {
       let primary = current.primary ? Object.assign({}, current.primary) : null;
       let fallback = current.fallback ? Object.assign({}, current.fallback) : null;
       if (primary && (!providerFilter || primary.provider === providerFilter)
-        && modelRoleCapability(migrated, primary.provider, primary.model).generation === false) {
+        && (modelRoleCapability(migrated, primary.provider, primary.model).generation === false
+          || staleOpenWebUIReference(primary))) {
         const row = choose(primary.provider, fallback);
         if (row) {
           primary = replacement(primary, row, false, operation);
-          diagnostics.repaired.push({ operation, role: "primary", provider: row.provider, model: row.id, reason: "embedding-only" });
+          diagnostics.repaired.push({ operation, role: "primary", provider: row.provider, model: row.id, reason: staleOpenWebUIReference(migrated.aiOperationModels?.[operation]?.primary) ? "stale-model" : "embedding-only" });
         } else diagnostics.unresolved.push({ operation, role: "primary", provider: primary.provider, reason: "provider-model-unavailable" });
       }
       if (fallback && (!providerFilter || fallback.provider === providerFilter)
-        && modelRoleCapability(migrated, fallback.provider, fallback.model).generation === false) {
+        && (modelRoleCapability(migrated, fallback.provider, fallback.model).generation === false
+          || staleOpenWebUIReference(fallback))) {
         const row = choose(fallback.provider, primary);
         if (row) {
           fallback = replacement(fallback, row, true, operation);
-          diagnostics.repaired.push({ operation, role: "fallback", provider: row.provider, model: row.id, reason: "embedding-only" });
+          diagnostics.repaired.push({ operation, role: "fallback", provider: row.provider, model: row.id, reason: staleOpenWebUIReference(migrated.aiOperationModels?.[operation]?.fallback) ? "stale-model" : "embedding-only" });
         } else {
           fallback = null;
           diagnostics.omittedFallbacks.push({ operation, provider: current.fallback?.provider || "", reason: "provider-model-unavailable" });
@@ -64317,19 +64329,17 @@ const STS_MULTI_PROVIDER = (() => {
       ...configuredEmbeddingIds,
       ...(settings.manualProviderEmbeddingModels?.openwebui || []).map((id) => normalizeModel("openwebui", id))
     ]).filter(Boolean);
-    const chatInventory = openWebUIInventoryCatalog(
-      chat,
-      tagIds,
-      settings.availableOpenWebUIModels || [],
-      configuredIds,
-      settings.manualProviderGenerationModels?.openwebui || []
-    );
-    const embeddings = openWebUIInventoryCatalog(
-      tagIds,
-      settings.availableOpenWebUIEmbeddingModels || [],
-      configuredEmbeddingIds,
-      settings.manualProviderEmbeddingModels?.openwebui || []
-    );
+    // `/api/models` and `/ollama/api/tags` are the live inventory. Persisted
+    // catalogs and selected IDs are cache state, not proof that a model is
+    // still served. Keeping stale IDs here makes the picker and generation
+    // path dispatch a model that Open WebUI rejects with HTTP 400
+    // model-not-found. Explicit manual entries remain the one intentional
+    // exception because they represent user-supplied IDs that may not be
+    // returned by either inventory endpoint.
+    const manualGenerationModels = settings.manualProviderGenerationModels?.openwebui || [];
+    const manualEmbeddingModels = settings.manualProviderEmbeddingModels?.openwebui || [];
+    const chatInventory = openWebUIInventoryCatalog(chat, tagIds, manualGenerationModels);
+    const embeddings = openWebUIInventoryCatalog(tagIds, manualEmbeddingModels);
     const telemetry = {
       profile: "openwebui-context-enrichment-v1",
       configuredModelCount: configuredIds.length,
@@ -65263,6 +65273,7 @@ function aiGatewayUserErrorMessage(provider = "", status = null, code = "", diag
   if (canonical === "permission_denied" || Number(status) === 403) return `${normalizedProvider} denied access. Check account permissions and provider policy settings.`;
   if (["context_length_exceeded", "max_tokens_exceeded", "token_limit_exceeded", "string_too_long"].includes(canonical) || Number(status) === 413) return `${normalizedProvider} rejected the request because it is too large. Reduce the supplied context or output requirements.`;
   if (canonical === "payload_too_large") return `${normalizedProvider} rejected the request payload because it is too large. Reduce the supplied content.`;
+  if (["model-not-found", "not-found"].includes(String(code)) || diagnostic?.modelNotFound === true || /model[ _-]?not[ _-]?found/i.test(String(diagnostic?.classification || ""))) return `${normalizedProvider} could not find the selected model. Refresh the Open WebUI model list and choose a model that is currently installed and available.`;
   if (canonical === "not_found" || Number(status) === 404) return `${normalizedProvider} could not find the requested route. Refresh model discovery or choose an available model.`;
   if (canonical === "rate_limit_exceeded" || Number(status) === 429) {
     const reason = String(rateLimit?.rateLimitReason || diagnostic?.rateLimitReason || "");

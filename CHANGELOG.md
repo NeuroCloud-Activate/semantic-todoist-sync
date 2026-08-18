@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.36
+
+- Automatically repair missing canonical semantic-context fact/evidence links
+  in descriptions, adding only closed-contract fact surfaces when the model
+  omitted the required narrative sentence.
+- Repair mid-sentence source-title attribution while preserving legitimate
+  working-artifact references, and document the repair behavior in the prompt.
+- Validate the repair path with focused local checks and a live July 6, 2026
+  OpenRouter GPT-5.6 Luna generation against the rebuilt semantic index.
+
 ## 0.8.35
 
 - Narrowed source-reference validation to explicit source attribution so

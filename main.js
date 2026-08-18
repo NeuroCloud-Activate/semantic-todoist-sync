@@ -3315,9 +3315,12 @@ const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
 const TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE = "Semantic disambiguation: when current terminology is ambiguous and same-scope semantic history identifies a legacy named term being phased out and its replacement, state the direction as use the replacement and avoid the legacy proper name; never invert that direction or prohibit the replacement. Treat the exact terminology and replacement direction as material. When the current action is to review an artifact, treat same-artifact prior reviewer edits or comments as materially useful if evidence says they remain to be reviewed or addressed, unless newer evidence supersedes or closes them.";
 const TASK_DESCRIPTION_EXECUTION_SELECTION_RULE = "Silently inspect every task-local execution candidate and every supplied semantic-context evidence bundle item before drafting. Efficiently use each supported detail that materially changes how the task can be acted on, including applicable intent, current state, actor or recipient, artifact details, criteria or conditions, dependencies or handoffs, timing, and substantive review history. Include all materially necessary semantic-context detail accurately and relevantly; do not omit context needed to execute the task. Omit a candidate only when it is stale, irrelevant, redundant, non-actionable, or already fully expressed by another selected detail. Never mention the semantic bundle, retrieval process, scores, or internal evidence metadata in prose.";
 const TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE = "Before returning a description, audit its canonical references. Sentence-local fact_refs are asserted claims, never related-source tags. Never attach a requested-action fact_ref merely because it describes the task. Never reuse one fact_ref as a placeholder for a different sentence; and each sentence containing fact_ref F must contain the evidenceId from executionCandidatesByFactId[F] or shared factsById[F] in that sentence's evidence_ids and must affirmatively and independently state that canonical fact with the same polarity and epistemic state, preserving its exact names, codes, numbers, and other identifying anchors. If one sentence cannot independently state every referenced fact, split the claims into separate sentences or remove each unstated fact_ref and its evidence_id. The union of description_sentences[].fact_refs must exactly equal the top-level fact_refs actually stated.";
+const TASK_DESCRIPTION_SOURCE_REFERENCE_RULE = "At the start of drafting, keep the narrative free of direct source-note, filename, subject, or source-container references. Do not write according to this note, the source document states, from the email, the active note, or equivalent attribution; source references belong only in the final Sources/Context Notes citation list rendered by the plugin. A document, email, PDF, spreadsheet, or file may still be named when it is the actionable working artifact rather than the source container.";
+const TASK_DESCRIPTION_NARRATIVE_RULE = "Write descriptions as natural narrative prose, not a title echo, metadata list, evidence dump, or citation-only fragment. Carry the current, relevant context needed to accomplish the task accurately, including material intent, state, dependencies, criteria, timing, recipient, reviewer history, and handoffs when supported and useful.";
+const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin automatically repairs title echoes and explicit source-attribution lead-ins, then rejects and retries any description that still violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
 const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline still requires the configured date rules and supported timing evidence.";
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. A supplied exact-scope fact that changes the action, object, actor, timing, or applicable condition must be reflected when omitting it would make the title materially wrong or ambiguous; supporting execution history belongs in the description. Merely related candidate evidence remains advisory. Never use merely same-topic history to satisfy execution-detail coverage.";
-const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title, and do not refer to the source note, file, or subject directly in the narrative; source references are rendered only in the final Sources/Context Notes citation list. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
+const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `${TASK_DESCRIPTION_NARRATIVE_RULE} ${TASK_DESCRIPTION_SOURCE_REFERENCE_RULE} ${TASK_DESCRIPTION_VALIDATION_REPAIR_RULE} Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
 const TASK_GENERATION_PROMPT_CONTRACT_ID = "semantic-todoist-task-generation";
 const TASK_GENERATION_PROMPT_CONTRACT_VERSION = 1;
 const TASK_GENERATION_PROMPT_CONTRACT = Object.freeze({
@@ -3366,6 +3369,9 @@ function taskWorkflowSystemInstruction() {
 function taskDescriptionSystemInstruction() {
   return [
     "You are generating one singleton task-description phase of a bounded Semantic Todoist Sync workflow.",
+    TASK_DESCRIPTION_NARRATIVE_RULE,
+    TASK_DESCRIPTION_SOURCE_REFERENCE_RULE,
+    TASK_DESCRIPTION_VALIDATION_REPAIR_RULE,
     PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
     OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION,
     PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION,
@@ -42273,8 +42279,8 @@ function taskDescriptionSourceReferenceReason(summary = "", task = {}, sourceCon
   if (directAliases.some((alias) => new RegExp(`\\b${escapeRegExp(alias).replace(/\s+/g, "\\s+")}\\b`, "i").test(text))) {
     return "description directly references source note";
   }
-  if (/\b(?:this|the|active|source)\s+(?:note|document|email|thread|file)\b/i.test(text)
-    || /\b(?:according to|based on|from)\s+(?:this|the|active|source)\s+(?:note|document|email|thread|file)\b/i.test(text)) {
+  if (/\b(?:according to|based on|as noted in|as stated in|from|in|within)\s+(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\b/i.test(text)
+    || /\b(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\s+(?:records?|notes?|says?|states?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?|contains?|includes?|outlines?)\b/i.test(text)) {
     return "description directly references source note";
   }
   return "passed";
@@ -42291,8 +42297,8 @@ function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceCont
   }
   summary = removeSourceLeadIn(summary, sourceTitle);
   summary = summary
-    .replace(/^(?:this|the|active|source)\s+(?:note|document|email|thread|file)\s+(?:says?|states?|indicates?|mentions?|shows?|describes?)\s+(?:that\s+)?/i, "")
-    .replace(/^(?:according to|based on|from)\s+(?:this|the|active|source)\s+(?:note|document|email|thread|file)\s*,?\s*/i, "")
+    .replace(/^(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\s+(?:records?|notes?|says?|states?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?|contains?|includes?|outlines?)\s+(?:that\s+)?/i, "")
+    .replace(/^(?:according to|based on|as noted in|as stated in|from|in|within)\s+(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\s*,?\s*/i, "")
     .trim();
   return {
     summary: capitalizeSentenceStart(summary),

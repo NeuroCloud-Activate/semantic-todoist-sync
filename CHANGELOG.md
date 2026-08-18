@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.35
+
+- Narrowed source-reference validation to explicit source attribution so
+  legitimate working-artifact language such as “review the document” remains
+  valid.
+- Put the narrative-prose, source-citation-only, semantic-context, and
+  independent validation/automatic-repair rules at the beginning of the
+  description-generation prompt.
+- Added regression coverage for the reported Research Team task descriptions
+  and explicit source-attribution repairs.
+
 ## 0.8.34
 
 - Validate and automatically repair generated root-task section metadata so

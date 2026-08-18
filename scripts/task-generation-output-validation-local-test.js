@@ -51,13 +51,19 @@ const repairedDescription = validation.repairTaskDescriptionSourceReferences(
 assert.strictEqual(repairedDescription.summary, "The review must include dependency risks.", "leading source-note attribution should be repaired out of the narrative");
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Review the project plan", task, context), "description repeats task title", "title-only descriptions should fail validation");
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("The Project Plan must include dependency risks.", task, context), "description directly references source note", "direct source-title prose should fail validation");
+assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Review the document for dependency risks.", task, context), "passed", "an action may legitimately refer to a document as its working artifact");
+assert.strictEqual(validation.repairTaskDescriptionSourceReferences("According to the source note, the review must include dependency risks.", task, context, { title: context.sourceTitle, path: context.sourcePath }).summary, "The review must include dependency risks.", "explicit source attribution should be repaired from the narrative");
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Include dependency risks and confirm the review criteria.", task, context), "passed", "actionable prose without direct source references should pass");
-passed += 4;
+passed += 6;
 
 const descriptionInstruction = gateway.taskDescriptionSystemInstruction();
+assert.ok(descriptionInstruction.indexOf("At the start of drafting") < descriptionInstruction.indexOf("Semantic context evidence bundles"), "source-reference rules must appear before semantic-context guidance");
+assert.match(descriptionInstruction, /natural narrative prose/i, "description prompt must require narrative prose");
+assert.match(descriptionInstruction, /context needed to accomplish the task accurately/i, "description prompt must require actionable context");
+assert.match(descriptionInstruction, /validated independently after the cached batched generation call/i, "description prompt must explain independent validation and repair");
 assert.match(descriptionInstruction, /semantic context evidence bundles/i, "description generation must explicitly inspect semantic context bundles");
 assert.match(descriptionInstruction, /Sources\/Context Notes citation list/i, "description generation must reserve source references for the citation list");
-passed += 2;
+passed += 6;
 
 const semanticFact = {
   factId: "fact-semantic-context",

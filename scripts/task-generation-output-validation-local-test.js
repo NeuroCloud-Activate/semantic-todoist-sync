@@ -53,8 +53,9 @@ assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Review the p
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("The Project Plan must include dependency risks.", task, context), "description directly references source note", "direct source-title prose should fail validation");
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Review the document for dependency risks.", task, context), "passed", "an action may legitimately refer to a document as its working artifact");
 assert.strictEqual(validation.repairTaskDescriptionSourceReferences("According to the source note, the review must include dependency risks.", task, context, { title: context.sourceTitle, path: context.sourcePath }).summary, "The review must include dependency risks.", "explicit source attribution should be repaired from the narrative");
+assert.strictEqual(validation.repairTaskDescriptionSourceReferences("In Project Plan, confirm the review criteria before sending.", task, context, { title: context.sourceTitle, path: context.sourcePath }).summary, "Confirm the review criteria before sending.", "mid-sentence source-title attribution should be repaired from the narrative");
 assert.strictEqual(validation.taskDescriptionSourceReferenceReason("Include dependency risks and confirm the review criteria.", task, context), "passed", "actionable prose without direct source references should pass");
-passed += 6;
+passed += 7;
 
 const descriptionInstruction = gateway.taskDescriptionSystemInstruction();
 assert.ok(descriptionInstruction.indexOf("At the start of drafting") < descriptionInstruction.indexOf("Semantic context evidence bundles"), "source-reference rules must appear before semantic-context guidance");
@@ -108,7 +109,40 @@ const requiredFactCheck = validation.validateTaskDescriptionSentences(
 );
 assert.strictEqual(requiredFactCheck.valid, false, "omitting selected semantic execution context must fail description validation");
 assert.ok(requiredFactCheck.errors.includes(`description-required-fact-missing:${semanticFact.factId}`), "missing semantic execution context must be diagnosable");
-passed += 2;
+const semanticRepair = validation.taskDescriptionRequiredSemanticContextRepair(
+  {
+    index: 0,
+    task_id: "task-1",
+    scope_id: "scope-1",
+    description_sentences: [{ text: "Send the reviewed plan.", evidence_ids: ["evidence-source"], fact_refs: ["fact-source"] }],
+    evidence_ids: ["evidence-source"],
+    fact_refs: ["fact-source"]
+  },
+  {
+    valid: true,
+    expectedIndex: 0,
+    taskId: "task-1",
+    scopeId: "scope-1",
+    allowedEvidenceIds: ["evidence-source", semanticFact.evidenceId],
+    allowedFactIds: ["fact-source", semanticFact.factId],
+    requiredDescriptionFactRefs: [semanticFact.factId],
+    materialDescriptionFactRefs: [],
+    executionDetailFactRefs: [],
+    factsById: {
+      "fact-source": { factId: "fact-source", evidenceId: "evidence-source", scopeId: "scope-1", type: "action", role: "requested-action" },
+      [semanticFact.factId]: semanticFact
+    },
+    factBindings: [
+      { factId: "fact-source", evidenceId: "evidence-source", scopeId: "scope-1" },
+      { factId: semanticFact.factId, evidenceId: semanticFact.evidenceId, scopeId: "scope-1" }
+    ]
+  }
+);
+assert.strictEqual(semanticRepair.applied, true, "missing semantic context should be repaired from the closed contract");
+assert.ok(semanticRepair.item.fact_refs.includes(semanticFact.factId), "repair should add the required semantic fact reference");
+assert.ok(semanticRepair.item.evidence_ids.includes(semanticFact.evidenceId), "repair should add the canonical semantic evidence reference");
+assert.ok(semanticRepair.item.description_sentences.some((sentence) => sentence.fact_refs.includes(semanticFact.factId)), "repair should bind the fact to a narrative sentence");
+passed += 5;
 
 process.stdout.write(JSON.stringify({
   passed,
@@ -117,6 +151,7 @@ process.stdout.write(JSON.stringify({
     "generated-root-task-section-repair",
     "description-title-and-source-reference-validation",
     "semantic-context-and-citation-only-prompt-guidance",
-    "required-semantic-context-fact-coverage"
+    "required-semantic-context-fact-coverage",
+    "required-semantic-context-fact-repair"
   ]
 }, null, 2) + "\n");

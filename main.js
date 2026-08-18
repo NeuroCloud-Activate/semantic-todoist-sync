@@ -3317,7 +3317,7 @@ const TASK_DESCRIPTION_EXECUTION_SELECTION_RULE = "Silently inspect every task-l
 const TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE = "Before returning a description, audit its canonical references. Sentence-local fact_refs are asserted claims, never related-source tags. Never attach a requested-action fact_ref merely because it describes the task. Never reuse one fact_ref as a placeholder for a different sentence; and each sentence containing fact_ref F must contain the evidenceId from executionCandidatesByFactId[F] or shared factsById[F] in that sentence's evidence_ids and must affirmatively and independently state that canonical fact with the same polarity and epistemic state, preserving its exact names, codes, numbers, and other identifying anchors. If one sentence cannot independently state every referenced fact, split the claims into separate sentences or remove each unstated fact_ref and its evidence_id. The union of description_sentences[].fact_refs must exactly equal the top-level fact_refs actually stated.";
 const TASK_DESCRIPTION_SOURCE_REFERENCE_RULE = "At the start of drafting, keep the narrative free of direct source-note, filename, subject, or source-container references. Do not write according to this note, the source document states, from the email, the active note, or equivalent attribution; source references belong only in the final Sources/Context Notes citation list rendered by the plugin. A document, email, PDF, spreadsheet, or file may still be named when it is the actionable working artifact rather than the source container.";
 const TASK_DESCRIPTION_NARRATIVE_RULE = "Write descriptions as natural narrative prose, not a title echo, metadata list, evidence dump, or citation-only fragment. Carry the current, relevant context needed to accomplish the task accurately, including material intent, state, dependencies, criteria, timing, recipient, reviewer history, and handoffs when supported and useful.";
-const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin automatically repairs title echoes and explicit source-attribution lead-ins, then rejects and retries any description that still violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
+const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin automatically repairs title echoes, explicit source-attribution lead-ins, and missing canonical semantic fact/evidence links when the supplied prose already expresses the fact; if the fact was omitted, it adds only the exact contract-bound fact surface as a narrative sentence. It then rejects and retries any description that still violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
 const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline still requires the configured date rules and supported timing evidence.";
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. A supplied exact-scope fact that changes the action, object, actor, timing, or applicable condition must be reflected when omitting it would make the title materially wrong or ambiguous; supporting execution history belongs in the description. Merely related candidate evidence remains advisory. Never use merely same-topic history to satisfy execution-detail coverage.";
 const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `${TASK_DESCRIPTION_NARRATIVE_RULE} ${TASK_DESCRIPTION_SOURCE_REFERENCE_RULE} ${TASK_DESCRIPTION_VALIDATION_REPAIR_RULE} Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
@@ -15748,6 +15748,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         : task;
       let validatedItem = item;
       if (structuredEvidence && !legacyDescriptionResponse && validationContract) {
+        const semanticContextCorrection = taskDescriptionRequiredSemanticContextRepair(validatedItem, validationContract);
+        if (semanticContextCorrection.applied) {
+          validatedItem = semanticContextCorrection.item;
+          normalizationCorrections.push({
+            taskIndex: item.index,
+            reasonCode: semanticContextCorrection.reasonCode,
+            addedFactRefCount: semanticContextCorrection.addedFactRefCount,
+            addedEvidenceLinkCount: semanticContextCorrection.addedEvidenceLinkCount,
+            addedSentenceCount: semanticContextCorrection.addedSentenceCount,
+            evidenceLinkCount: semanticContextCorrection.addedEvidenceLinkCount,
+            removedFactRefCount: 0,
+            sentenceCount: semanticContextCorrection.addedSentenceCount
+          });
+        }
         const correction = taskDescriptionCanonicalSentenceEvidenceCorrection(validatedItem, validationContract);
         if (correction.applied) {
           validatedItem = correction.item;
@@ -39671,6 +39685,113 @@ function taskDescriptionCanonicalSentenceEvidenceCorrection(item = {}, singleton
   };
 }
 
+// Required semantic-context facts are immutable plugin-owned evidence. A
+// provider may express one accurately but omit its fact/evidence metadata (or
+// omit the sentence entirely). Repair only against the closed singleton
+// contract: link a clearly expressed sentence to its canonical fact, or add
+// the canonical fact surface as a concise narrative sentence. Never invent a
+// paraphrase or promote an uncontracted fact.
+function taskDescriptionRequiredSemanticContextRepair(item = {}, singletonContract = null) {
+  const contract = singletonContract && typeof singletonContract === "object" ? singletonContract : null;
+  const unchanged = (reasonCode = "") => ({
+    applied: false,
+    item,
+    addedFactRefCount: 0,
+    addedEvidenceLinkCount: 0,
+    addedSentenceCount: 0,
+    reasonCode
+  });
+  if (!contract?.valid || !item || typeof item !== "object" || Array.isArray(item)) return unchanged();
+  const expectedIndex = Number(contract.expectedIndex ?? contract.expected_index);
+  const expectedTaskId = String(contract.taskId || contract.task_id || "");
+  const expectedScopeId = String(contract.scopeId || contract.scope_id || "");
+  if (!Number.isInteger(expectedIndex) || Number(item.index) !== expectedIndex
+    || String(item.task_id || item.taskId || "") !== expectedTaskId
+    || String(item.scope_id || item.scopeId || "") !== expectedScopeId) return unchanged();
+  const requiredFactRefs = uniqueValues([
+    ...(contract.requiredDescriptionFactRefs || contract.required_description_fact_refs || []),
+    ...(contract.materialDescriptionFactRefs || contract.material_description_fact_refs || []),
+    ...(contract.executionDetailFactRefs || contract.execution_detail_fact_refs || [])
+  ].map(String).filter(Boolean));
+  if (!requiredFactRefs.length) return unchanged();
+  const allowedFacts = new Set((contract.allowedFactIds || contract.allowed_fact_ids || []).map(String));
+  const allowedEvidence = new Set((contract.allowedEvidenceIds || contract.allowed_evidence_ids || []).map(String));
+  const factsById = contract.factsById || contract.facts_by_id || {};
+  const bindings = Array.isArray(contract.factBindings || contract.fact_bindings)
+    ? (contract.factBindings || contract.fact_bindings) : [];
+  const sentences = Array.isArray(item.description_sentences) ? item.description_sentences : [];
+  if (!sentences.length) return unchanged("description-required-semantic-context-no-sentences");
+  const correctedSentences = sentences.map((sentence) => {
+    if (!sentence || typeof sentence !== "object" || Array.isArray(sentence)) return sentence;
+    return Object.assign({}, sentence, {
+      evidence_ids: Array.isArray(sentence.evidence_ids) ? uniqueValues(sentence.evidence_ids.map(String).filter(Boolean)) : [],
+      fact_refs: Array.isArray(sentence.fact_refs) ? uniqueValues(sentence.fact_refs.map(String).filter(Boolean)) : []
+    });
+  });
+  const topFactRefs = uniqueValues((Array.isArray(item.fact_refs) ? item.fact_refs : []).map(String).filter(Boolean));
+  const topEvidenceIds = uniqueValues((Array.isArray(item.evidence_ids) ? item.evidence_ids : []).map(String).filter(Boolean));
+  // Reconcile provider sentence-level metadata into the required top-level
+  // carrier before validating the singleton contract. This is metadata-only
+  // repair; foreign IDs remain untouched and are still rejected downstream.
+  for (const sentence of correctedSentences) {
+    for (const factId of sentence.fact_refs || []) if (allowedFacts.has(factId) && !topFactRefs.includes(factId)) topFactRefs.push(factId);
+    for (const evidenceId of sentence.evidence_ids || []) if (allowedEvidence.has(evidenceId) && !topEvidenceIds.includes(evidenceId)) topEvidenceIds.push(evidenceId);
+  }
+  const citedFactIds = new Set();
+  for (const sentence of correctedSentences) for (const factId of sentence.fact_refs || []) citedFactIds.add(String(factId));
+  const exactBindingFor = (factId, fact) => {
+    const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
+    const scopeId = String(fact?.scopeId || fact?.scope_id || expectedScopeId);
+    const matches = bindings.filter((binding) => String(binding?.factId || binding?.fact_id || "") === factId
+      && String(binding?.evidenceId || binding?.evidence_id || "") === evidenceId
+      && String(binding?.scopeId || binding?.scope_id || "") === scopeId);
+    return matches.length === 1 ? { evidenceId, scopeId } : null;
+  };
+  let addedFactRefCount = 0;
+  let addedEvidenceLinkCount = 0;
+  let addedSentenceCount = 0;
+  for (const factId of requiredFactRefs) {
+    if (citedFactIds.has(factId)) continue;
+    if (!allowedFacts.has(factId)) continue;
+    const fact = factsById[factId];
+    const binding = exactBindingFor(factId, fact);
+    const surface = singleLine(fact?.sourceSurface || fact?.source_surface || fact?.value || fact?.text || "").trim();
+    if (!fact || !binding || !allowedEvidence.has(binding.evidenceId) || !surface) continue;
+    // Prefer linking prose the model already wrote. The lexical check is
+    // deliberately conservative; uncertain paraphrases get an exact
+    // canonical sentence instead of an invented metadata claim.
+    let target = correctedSentences.find((sentence) => taskDescriptionFactSurfaceExpressed(sentence?.text || "", fact, sentence?.text || ""));
+    if (target) {
+      target.fact_refs = uniqueValues([...(target.fact_refs || []), factId]);
+      target.evidence_ids = uniqueValues([...(target.evidence_ids || []), binding.evidenceId]);
+      addedFactRefCount += 1;
+      addedEvidenceLinkCount += 1;
+    } else {
+      const narrative = /[.!?]$/.test(surface) ? surface : `${surface}.`;
+      correctedSentences.push({ text: narrative, fact_refs: [factId], evidence_ids: [binding.evidenceId] });
+      addedFactRefCount += 1;
+      addedEvidenceLinkCount += 1;
+      addedSentenceCount += 1;
+    }
+    citedFactIds.add(factId);
+    if (!topFactRefs.includes(factId)) topFactRefs.push(factId);
+    if (!topEvidenceIds.includes(binding.evidenceId)) topEvidenceIds.push(binding.evidenceId);
+  }
+  if (!addedFactRefCount) return unchanged("description-required-semantic-context-unresolved");
+  return {
+    applied: true,
+    item: Object.assign({}, item, {
+      description_sentences: correctedSentences,
+      fact_refs: topFactRefs,
+      evidence_ids: topEvidenceIds
+    }),
+    addedFactRefCount,
+    addedEvidenceLinkCount,
+    addedSentenceCount,
+    reasonCode: "description-required-semantic-context-repaired"
+  };
+}
+
 function taskDescriptionFactSurfaceExpressed(sentenceText = "", fact = {}, factCitationText = sentenceText) {
   if (!taskDescriptionSentenceEpistemicallySupportsFact(sentenceText, fact)) return false;
   const surface = singleLine(fact?.sourceSurface || fact?.source_surface || fact?.value || fact?.text || "").trim();
@@ -42300,6 +42421,17 @@ function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceCont
     .replace(/^(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\s+(?:records?|notes?|says?|states?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?|contains?|includes?|outlines?)\s+(?:that\s+)?/i, "")
     .replace(/^(?:according to|based on|as noted in|as stated in|from|in|within)\s+(?:this|the|active|source)\s+(?:source\s+)?(?:note|document|email|thread|file)\s*,?\s*/i, "")
     .trim();
+  // Providers sometimes put the source title in the middle of an otherwise
+  // usable sentence (for example, “In July 6, 2026, ...”). Remove only the
+  // attribution construction; leave named working artifacts untouched.
+  for (const alias of sourceTitleAliases(sourceTitle)) {
+    const escaped = escapeRegExp(alias).replace(/\s+/g, "\\s+");
+    summary = summary
+      .replace(new RegExp(`\\b(?:according\\s+to|based\\s+on|as\\s+(?:noted|stated|described)\\s+in|from|in|within)\\s+(?:this|the|active|source)?\\s*${escaped}(?:\\.md)?(?:\\s+(?:source\\s+)?(?:note|document|email|thread|file))?\\s*,?\\s*`, "ig"), "")
+      .replace(new RegExp(`\\b(?:this|the|active|source)\\s+${escaped}(?:\\.md)?\\s+(?:source\\s+)?(?:note|document|email|thread|file)\\b`, "ig"), "")
+      .replace(new RegExp(`\\b${escaped}(?:\\.md)?\\s+(?:records?|notes?|says?|states?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?|contains?|includes?|outlines?)\\s+(?:that\\s+)?`, "ig"), "");
+  }
+  summary = summary.replace(/\s{2,}/g, " ").replace(/\s+([,.;!?])/g, "$1").trim();
   return {
     summary: capitalizeSentenceStart(summary),
     sourceList: split.sourceList || "",
@@ -68724,6 +68856,7 @@ if (typeof module !== "undefined" && module.exports) {
     taskDescriptionSourceReferenceReason,
     repairTaskDescriptionSourceReferences,
     structuredTaskDescriptionQualityReason,
+    taskDescriptionRequiredSemanticContextRepair,
     validateTaskDescriptionSentences
   });
   module.exports.__runtimeWorkCoordinator = Object.freeze({

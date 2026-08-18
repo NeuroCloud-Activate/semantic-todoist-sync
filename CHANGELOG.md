@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.34
+
+- Validate and automatically repair generated root-task section metadata so
+  synced tasks remain under one Todoist section, while preserving subtask
+  inheritance.
+- Reject title-echo and direct source-note prose in descriptions; source
+  references are retained only in the generated Sources/Context Notes list.
+- Require selected material and execution-critical semantic-context evidence
+  to be represented in descriptions, with provider-neutral prompt guidance and
+  deterministic validation and repair coverage.
+
 ## 0.8.33
 
 - Repaired incomplete task-generation context catalogs from the immutable

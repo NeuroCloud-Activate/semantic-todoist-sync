@@ -207,7 +207,7 @@ const REASONING_EFFORT_VALUES = ["default", "none", "minimal", "low", "medium", 
 
 const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Keep descriptions complete and actionable: select and incorporate the task-local facts that usefully clarify execution. When the selected evidence supports multiple execution dimensions, integrate them into complete natural sentences covering the applicable state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, and remaining action. A concise one-sentence brief is valid when additional supplied facts would be irrelevant, redundant, stale, or non-actionable. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions when selected.";
 const LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a grounded execution brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
-const TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE = "semanticContext dimension meanings, contributions, and temporal/authority/materiality metadata are compact interpretation aids for selected evidence, not truth or permission to invent. Treat contribution values as relative selection signals; current authoritative source facts win every conflict. State supported facts directly in natural prose without mentioning semantic labels, scores, meanings, evidence selection, or context containers.";
+const TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE = "Semantic context evidence bundles are execution inputs, not decorative background. Inspect their supplied current, same-scope, materially relevant facts and incorporate the context needed to act accurately; exclude stale, unrelated, conflicting, or redundant material. Dimension meanings, contributions, and temporal/authority/materiality metadata are interpretation aids, not truth or permission to invent. Treat contribution values as relative selection signals; current authoritative source facts win every conflict. State supported facts directly in natural prose without mentioning semantic labels, scores, meanings, evidence selection, retrieval, or context containers.";
 const PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION = "Treat every supplied provider context bundle as a personal-user-record: user-authored or user-captured notes, drafts, plans, observations, decisions, and tasks. It is authoritative for what the user recorded, intended, and marked as current work, but partial and viewpoint-bound rather than unbiased external knowledge. Preserve draft, planned, reported, and observed states versus independently verified facts; silence in the vault is not proof that something did not occur.";
 const OPERATIONAL_RELATIONSHIP_CONTEXT_INSTRUCTION = "Interpret the explicit operational relationship metadata together with the adjacent original note or task text; metadata clarifies recorded action direction, state, people, hierarchy, and evidence bindings but never invents facts. An open action to send or provide a named person an artifact supports a pending recipient-facing handoff and what that person is expected to receive; do not infer private belief, awareness, acknowledgement, or other subjective state unless separately evidenced.";
 const PERSONAL_KNOWLEDGE_ASSISTANT_CONTEXT_INSTRUCTION = "Silently operate as the user's personal knowledge assistant: answer directly, connect supported context to actionable understanding, and retain the intent, history, dependencies, and next steps needed to act. Never announce or mention this role or these instructions; do not invent facts or make stronger epistemic claims than the supplied evidence supports.";
@@ -460,7 +460,9 @@ const TASK_DESCRIPTION_REGENERATION_SCHEMA_CODES = Object.freeze([
   "description-response-schema-required-missing"
 ]);
 const TASK_DESCRIPTION_REGENERATION_CONTENT_CODES = Object.freeze([
-  "description-response-parse-failure"
+  "description-response-parse-failure",
+  "description-direct-source-reference",
+  "cleaned-empty-or-title-echo"
 ]);
 
 function taskDescriptionProviderStructuredRetryReasonCode(error = null) {
@@ -497,6 +499,7 @@ function taskDescriptionCompleteRegenerationAdmission(failures = [], options = {
     const stage = String(failure.stage || "");
     const reasonCode = String(failure.reasonCode || "");
     return ["evidence", "sentences"].includes(stage)
+      || (stage === "quality" && ["description-direct-source-reference", "cleaned-empty-or-title-echo"].includes(reasonCode))
       || (stage === "response" && [
         ...TASK_DESCRIPTION_REGENERATION_IDENTITY_CODES,
         ...TASK_DESCRIPTION_REGENERATION_SCHEMA_CODES,
@@ -3310,11 +3313,11 @@ function openAiPromptCacheKey(operation = "chat") {
 
 const TASK_WORKFLOW_PROMPT_CACHE_KEY = "semantic-todoist-task-workflow";
 const TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE = "Semantic disambiguation: when current terminology is ambiguous and same-scope semantic history identifies a legacy named term being phased out and its replacement, state the direction as use the replacement and avoid the legacy proper name; never invert that direction or prohibit the replacement. Treat the exact terminology and replacement direction as material. When the current action is to review an artifact, treat same-artifact prior reviewer edits or comments as materially useful if evidence says they remain to be reviewed or addressed, unless newer evidence supersedes or closes them.";
-const TASK_DESCRIPTION_EXECUTION_SELECTION_RULE = "Silently inspect every task-local execution candidate before drafting. Use each supported detail that materially changes how the task can be acted on, including applicable intent, current state, actor or recipient, artifact details, criteria or conditions, dependencies or handoffs, timing, and substantive review history. Omit a candidate only when it is stale, irrelevant, redundant, non-actionable, or already fully expressed by another selected detail; this is a drafting judgment, not a required-fact coverage gate.";
+const TASK_DESCRIPTION_EXECUTION_SELECTION_RULE = "Silently inspect every task-local execution candidate and every supplied semantic-context evidence bundle item before drafting. Efficiently use each supported detail that materially changes how the task can be acted on, including applicable intent, current state, actor or recipient, artifact details, criteria or conditions, dependencies or handoffs, timing, and substantive review history. Include all materially necessary semantic-context detail accurately and relevantly; do not omit context needed to execute the task. Omit a candidate only when it is stale, irrelevant, redundant, non-actionable, or already fully expressed by another selected detail. Never mention the semantic bundle, retrieval process, scores, or internal evidence metadata in prose.";
 const TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE = "Before returning a description, audit its canonical references. Sentence-local fact_refs are asserted claims, never related-source tags. Never attach a requested-action fact_ref merely because it describes the task. Never reuse one fact_ref as a placeholder for a different sentence; and each sentence containing fact_ref F must contain the evidenceId from executionCandidatesByFactId[F] or shared factsById[F] in that sentence's evidence_ids and must affirmatively and independently state that canonical fact with the same polarity and epistemic state, preserving its exact names, codes, numbers, and other identifying anchors. If one sentence cannot independently state every referenced fact, split the claims into separate sentences or remove each unstated fact_ref and its evidence_id. The union of description_sentences[].fact_refs must exactly equal the top-level fact_refs actually stated.";
 const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline still requires the configured date rules and supported timing evidence.";
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. A supplied exact-scope fact that changes the action, object, actor, timing, or applicable condition must be reflected when omitting it would make the title materially wrong or ambiguous; supporting execution history belongs in the description. Merely related candidate evidence remains advisory. Never use merely same-topic history to satisfy execution-detail coverage.";
-const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id; omission of an available fact is not a validation failure.`;
+const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title, and do not refer to the source note, file, or subject directly in the narrative; source references are rendered only in the final Sources/Context Notes citation list. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
 const TASK_GENERATION_PROMPT_CONTRACT_ID = "semantic-todoist-task-generation";
 const TASK_GENERATION_PROMPT_CONTRACT_VERSION = 1;
 const TASK_GENERATION_PROMPT_CONTRACT = Object.freeze({
@@ -3372,6 +3375,7 @@ function taskDescriptionSystemInstruction() {
     TASK_DESCRIPTION_EXECUTION_SELECTION_RULE,
     "When selected conditional criteria are useful to execution, translate them into the concrete review, verification, or decision needed: state what must be confirmed and which requirement applies in each supported branch. When one selected fact names a person or item and another selected fact says a rule applies only if a condition is true, explicitly tell the user to confirm whether that person or item meets the condition and apply the rule only if they do. Never claim that the conditional rule applies merely because the person or item was named. Do not open with From <date>, From the note, or similar source-container narration, and omit message-history narration unless the communication itself changes execution.",
     "Do not use a title-only or slight-restatement description. Open with direct execution sentences rather than repeating or paraphrasing the task title.",
+    "Do not refer to the source note, filename, or subject directly in the narrative; source references belong only in the final Sources/Context Notes citation list rendered by the plugin.",
     TASK_DESCRIPTION_ANTI_FILLER_RULE,
     TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
     TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
@@ -15783,16 +15787,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         summary = sentenceValidation.rendered;
       }
+      const descriptionSourceContext = {
+        sourceTitle,
+        sourcePath: options.sourceContract?.path || options.sourceContract?.sourcePath || ""
+      };
+      const repairedDescription = repairTaskDescriptionSourceReferences(
+        summary,
+        task,
+        descriptionSourceContext,
+        options.sourceContract,
+        this.settings
+      );
+      summary = repairedDescription.summary;
       const contractReason = structuredEvidence
-        ? structuredTaskDescriptionQualityReason(summary, task, structuredRefs.bundle)
-        : descriptionQualityReason(summary, task.content, this.settings);
+        ? structuredTaskDescriptionQualityReason(summary, task, structuredRefs.bundle, descriptionSourceContext)
+        : descriptionQualityReason(summary, task.content, this.settings, descriptionSourceContext, options.sourceContract);
       if (structuredEvidence && contractReason !== "passed") {
         this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality") });
       } else if (!structuredEvidence && contractReason !== "passed") {
         this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality") });
       }
       const blockingDescriptionShape = !singleLine(summary).trim()
-        || /description has no task-focused narrative|prompt commentary|prompt-injection text/i.test(contractReason);
+        || /description has no task-focused narrative|prompt commentary|prompt-injection text|directly references source note|repeats task title/i.test(contractReason);
       if (blockingDescriptionShape) {
         failures.push({ taskIndex: item.index, reason: contractReason, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality"), stage: "quality" });
         continue;
@@ -16021,6 +16037,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "description-response-index-mismatch"
     ]);
     const retryableFailure = (failure) => ["evidence", "sentences"].includes(String(failure.stage || ""))
+      || (failure.stage === "quality" && ["description-direct-source-reference", "cleaned-empty-or-title-echo"].includes(String(failure.reasonCode || "")))
       || (failure.stage === "missing/nontext" && failure.reason === "description was missing or not text")
       || (failure.stage === "response" && (
         failure.reason === "description response omitted the task index"
@@ -17506,8 +17523,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       options.citeContextNotes !== false,
       options.source || plan.taskWorkflowContextBundle?.sourceType || "note"
     );
-    plan.sectionName = sectionName || cleanGeneratedSectionName(fallbackSectionName);
-    for (const task of tasks || []) task.section = plan.sectionName;
+    plan.sectionName = generatedTaskSectionName(sectionName || fallbackSectionName);
+    const initialSectionRepair = repairGeneratedTaskSectionMetadata(tasks, plan.sectionName);
+    plan.sectionMetadataRepair = initialSectionRepair;
     let projectId = "";
     let projectName = "";
     let sectionId = "";
@@ -17529,6 +17547,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const dedupeStats = await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
     const restoredDedupeStructures = restoreTaskStructureAfterDedupeRegression(tasks, preDedupeStructure);
     if (restoredDedupeStructures > 0) this.logLocal("Restored validated task structure after deduplication regression", { source: options.source || "", tasks: restoredDedupeStructures });
+    const finalSectionRepair = repairGeneratedTaskSectionMetadata(tasks, plan.sectionName);
+    const sectionValidation = validateGeneratedTaskSectionMetadata(tasks, plan.sectionName);
+    plan.sectionMetadataRepair = Object.assign({}, finalSectionRepair, {
+      initialRepairCount: initialSectionRepair.repairedCount,
+      finalValidation: sectionValidation
+    });
+    if (!sectionValidation.valid) {
+      const error = new Error("Generated tasks could not be assigned to one Todoist section.");
+      error.code = "generated-task-section-validation-failed";
+      error.sectionValidation = sectionValidation;
+      throw error;
+    }
     if (options.citeContextNotes !== false && (dedupeStats.generatedDuplicates > 0 || dedupeStats.merged > 0)) {
       addContextToTaskDescriptions(
         tasks,
@@ -17556,7 +17586,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const details = fatalIssues.map((issue) => `${issue.code} on task ${issue.taskIndex + 1}${issue.reason ? ` (${issue.reason})` : ""}`).join("; ");
       throw new Error(`Generated tasks failed ${fatalIssues.length} blocking local quality check${fatalIssues.length === 1 ? "" : "s"}: ${details}.`);
     }
-    return { projectId, projectName, sectionId, sectionName: plan.sectionName, quality, requestRepair };
+    return {
+      projectId,
+      projectName,
+      sectionId,
+      sectionName: plan.sectionName,
+      sectionMetadataRepair: plan.sectionMetadataRepair,
+      quality,
+      requestRepair
+    };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -25205,9 +25243,9 @@ function taskDescriptionSingletonContract(task = {}, sharedPayload = {}, sourceC
     ...allowedFactIds
   ]);
   const primaryFactId = primaryFactCandidates.find(isPrimaryFact) || "";
-  // Description evidence is a candidate pool, not an output-coverage list.
-  // Keep current/material/execution classifications available to the model,
-  // but do not make omission of any supplied fact a contract failure.
+  // Description evidence is a candidate pool, while material and execution
+  // classifications are the selected semantic-context closure that must be
+  // represented in the final description.
   const requiredCurrentFactIds = [];
   const requiredCurrentEvidenceIds = [];
   const requiredFactIds = [];
@@ -25221,7 +25259,10 @@ function taskDescriptionSingletonContract(task = {}, sharedPayload = {}, sourceC
     ...(rich.candidateSupportingFactRefs || []),
     ...allowedFactIds
   ]).filter((factId) => allowedFactIds.includes(factId));
-  const requiredDescriptionFactRefs = [];
+  const requiredDescriptionFactRefs = uniqueValues([
+    ...materialDescriptionFactRefs,
+    ...executionDetailFactRefs
+  ]).filter((factId) => allowedFactIds.includes(factId));
   const requiredFactSurfaces = [];
   const factFingerprint = (id) => {
     const row = factsById[id] || {};
@@ -27948,9 +27989,53 @@ function flattenTaskPlan(tasks) {
   return flat;
 }
 
+function generatedTaskSectionName(sectionName = "") {
+  return cleanGeneratedSectionName(sectionName) || "Tasks";
+}
+
+function repairGeneratedTaskSectionMetadata(tasks = [], sectionName = "") {
+  const normalizedSectionName = generatedTaskSectionName(sectionName);
+  const repairedTaskIndexes = [];
+  const invalidTaskIndexes = [];
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    const task = tasks[index];
+    if (!task || task.deduplication?.omitNoteInsertion === true) continue;
+    const current = generatedTaskSectionName(task.section || "");
+    if (!task.section || current !== normalizedSectionName) repairedTaskIndexes.push(index);
+    task.section = normalizedSectionName;
+    if (generatedTaskSectionName(task.section || "") !== normalizedSectionName) invalidTaskIndexes.push(index);
+  }
+  return {
+    valid: invalidTaskIndexes.length === 0,
+    sectionName: normalizedSectionName,
+    repairedCount: repairedTaskIndexes.length,
+    repairedTaskIndexes,
+    invalidTaskIndexes
+  };
+}
+
+function validateGeneratedTaskSectionMetadata(tasks = [], sectionName = "") {
+  const normalizedSectionName = generatedTaskSectionName(sectionName);
+  const missingTaskIndexes = [];
+  const mismatchedTaskIndexes = [];
+  for (let index = 0; index < (tasks || []).length; index += 1) {
+    const task = tasks[index];
+    if (!task || task.deduplication?.omitNoteInsertion === true) continue;
+    const current = singleLine(task.section || "");
+    if (!current) missingTaskIndexes.push(index);
+    else if (generatedTaskSectionName(current) !== normalizedSectionName) mismatchedTaskIndexes.push(index);
+  }
+  return {
+    valid: missingTaskIndexes.length === 0 && mismatchedTaskIndexes.length === 0,
+    sectionName: normalizedSectionName,
+    missingTaskIndexes,
+    mismatchedTaskIndexes
+  };
+}
+
 function ensureGeneratedTaskMetadata(tasks, sectionName, settings = DEFAULT_SETTINGS) {
+  const sectionRepair = repairGeneratedTaskSectionMetadata(tasks, sectionName);
   for (const task of tasks || []) {
-    task.section = sectionName;
     for (const subtask of task.subtasks || []) {
       subtask.section = "";
       subtask.description = "";
@@ -27960,6 +28045,7 @@ function ensureGeneratedTaskMetadata(tasks, sectionName, settings = DEFAULT_SETT
       if (!settings.subtaskIncludeDeadline) subtask.deadline_date = null;
     }
   }
+  return sectionRepair;
 }
 
 function renderTaskHeading(settings, template = null) {
@@ -39666,6 +39752,13 @@ function validateTaskDescriptionSingletonProvenanceSentences(item = {}, structur
     normalized.push({ text, evidence_ids: uniqueValues(evidenceIds), fact_refs: uniqueValues(factRefs) });
   }
   if (!taskDescriptionNarrativeBodyPresent(normalized)) errors.push("description-narrative-body-missing");
+  const requiredFactRefs = uniqueValues([
+    ...(structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []),
+    ...(structuredRefs.materialDescriptionFactRefs || structuredRefs.material_description_fact_refs || []),
+    ...(structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || [])
+  ].map(String).filter(Boolean));
+  const citedFactRefs = new Set(normalized.flatMap((sentence) => sentence.fact_refs || []).map(String));
+  for (const factId of requiredFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
   const uniqueErrors = uniqueValues(errors);
   const uniqueDiagnostics = uniqueValues(diagnostics);
   const acceptedCitationLedger = uniqueErrors.length ? [] : taskDescriptionAcceptedCitationLedger(normalized, citationLedger, null);
@@ -39750,6 +39843,13 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
     for (const evidenceId of evidenceIds) if (!sentenceFactEvidenceIds.has(evidenceId)) errors.push(`description-sentence-evidence-orphan:${index}:${evidenceId}`);
     sentences.push({ text, evidence_ids: evidenceIds, fact_refs: factRefs });
   }
+  const requiredFactRefs = uniqueValues([
+    ...(structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []),
+    ...(structuredRefs.materialDescriptionFactRefs || structuredRefs.material_description_fact_refs || []),
+    ...(structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || [])
+  ].map(String).filter(Boolean));
+  const citedFactRefs = new Set(sentences.flatMap((sentence) => sentence.fact_refs || []).map(String));
+  for (const factId of requiredFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
   const uniqueErrors = uniqueValues(errors);
   const acceptedCitationLedger = uniqueErrors.length
     ? []
@@ -41664,7 +41764,9 @@ const TASK_DESCRIPTION_FAILURE_REASON_CODES = new Set([
   "description-sentence-fact-binding-missing",
   "description-sentence-evidence-orphan",
   "description-sentence-unsupported-citation",
+  "description-required-fact-missing",
   "description-narrative-body-missing",
+  "description-direct-source-reference",
   "quality-too-short",
   "quality-fragment",
   "quality-generic",
@@ -41685,7 +41787,7 @@ function taskDescriptionFailureReasonCode(reason = "", stage = "") {
   if (stage === "missing/nontext" || /missing or not text/.test(text)) return "missing-or-nontext";
   if (stage === "provider" || /provider call failed/.test(text)) return "provider-failure";
   if (stage === "sentences" || /description-sentence-/.test(text)) {
-    const code = text.match(/description-(?:sentence-(?:missing|empty|evidence-missing|fact-missing|foreign-evidence|foreign-fact|citation-ledger-missing|evidence-unusable|fact-evidence-mismatch|fact-unusable|fact-binding-missing|evidence-orphan)|current-source-grounding-missing|narrative-body-missing)/)?.[0];
+    const code = text.match(/description-(?:sentence-(?:missing|empty|evidence-missing|fact-missing|foreign-evidence|foreign-fact|citation-ledger-missing|evidence-unusable|fact-evidence-mismatch|fact-unusable|fact-binding-missing|evidence-orphan)|required-fact-missing|current-source-grounding-missing|narrative-body-missing)/)?.[0];
     return code || "description-sentence-missing";
   }
   if (/json could not be parsed/.test(text)) return "response-parse-failure";
@@ -41703,7 +41805,8 @@ function taskDescriptionFailureReasonCode(reason = "", stage = "") {
     if (/missing source-grounded (?:rationale|dependency) detail/.test(text)) return "grounding-knowledge";
     return "grounding-failure";
   }
-  if (/too short \(0 characters\)|starts by repeating the task title|title-only|cleaned?.*empty|empty.*cleaned/.test(text)) return "cleaned-empty-or-title-echo";
+  if (/directly references source note/.test(text)) return "description-direct-source-reference";
+  if (/repeats task title|too short \(0 characters\)|starts by repeating the task title|title-only|cleaned?.*empty|empty.*cleaned/.test(text)) return "cleaned-empty-or-title-echo";
   if (/too short/.test(text)) return "quality-too-short";
   if (/fragment/.test(text)) return "quality-fragment";
   if (/generic/.test(text)) return "quality-generic";
@@ -41896,9 +41999,13 @@ function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFA
   const summaryInput = renderedSourceHeading
     ? descriptionText.slice(0, renderedSourceHeading.index).trim()
     : descriptionText.trim();
-  // Structured descriptions are provider-authored content. Preserve wording;
-  // only normalize links and the final Todoist serialization.
-  const summary = normalizeDescriptionLinks(summaryInput, linkContext, settings);
+  const currentSource = (bundle.items || []).find((item) => item.sourceKind === "current-source") || {};
+  const repairedSummary = repairTaskDescriptionSourceReferences(summaryInput, task, {
+    sourceTitle: active?.title || bundle.sourceContract?.title || currentSource.provenance?.title || "",
+    sourcePath: active?.path || bundle.sourceContract?.path || currentSource.provenance?.path || ""
+  }, bundle.sourceContract || null, settings);
+  if (repairedSummary.reason !== "passed" && repairedSummary.summary) return "";
+  const summary = normalizeDescriptionLinks(repairedSummary.summary, linkContext, settings);
   if (!summary) return "";
   const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList, sourceType);
   const parts = [summary, sourceList].filter(Boolean);
@@ -42042,13 +42149,13 @@ function isUsefulDescriptionSummary(value, taskTitle = "", settings = DEFAULT_SE
   return descriptionQualityReason(value, taskTitle, settings) === "passed";
 }
 
-function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETTINGS) {
+function descriptionQualityReason(value, taskTitle = "", settings = DEFAULT_SETTINGS, sourceContext = {}, sourceContract = null) {
   const text = singleLine(cleanGeneratedDescriptionSummary(value || "", settings));
   if (!text) return "description has no task-focused narrative";
   const boilerplateReason = taskDescriptionPromptBoilerplateReason(value);
   if (boilerplateReason) return boilerplateReason;
   if (/\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "description contained prompt-injection text";
-  return "passed";
+  return taskDescriptionSourceReferenceReason(text, { content: taskTitle }, sourceContext, sourceContract);
 }
 
 function fallbackActionSummary(task, sourceText, contextChunks, sourceTitle = "", settings = DEFAULT_SETTINGS, evidence = null) {
@@ -42148,6 +42255,50 @@ function sourceTitleAliases(sourceTitle = "") {
   add(title);
   add(title.replace(/^(?:\w+\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}[-_/]\d{1,2}[-_/]\d{2,4})\s*[-:–—]\s*/i, ""));
   return aliases;
+}
+
+function taskDescriptionSourceReferenceReason(summary = "", task = {}, sourceContext = {}, sourceContract = null) {
+  const text = singleLine(splitDescriptionSourceListBlock(summary).summary || summary).trim();
+  if (!text) return "description has no task-focused narrative";
+  const taskTitle = singleLine(task.content || "");
+  if (taskTitle && (text.toLowerCase() === taskTitle.toLowerCase()
+    || (text.length <= taskTitle.length + 80 && taskStructureTitleOverlap(text, taskTitle) >= 0.86))) {
+    return "description repeats task title";
+  }
+  const sourceTitle = singleLine(sourceContext.sourceTitle || sourceContext.title || sourceContract?.title || "");
+  const sourcePath = singleLine(sourceContext.sourcePath || sourceContext.path || sourceContract?.path || "");
+  const titleAliases = sourceTitleAliases(sourceTitle).filter((alias) => alias.length >= 8);
+  const pathAlias = sourcePath.replace(/\\+/g, "/").split("/").pop()?.replace(/\.md$/i, "") || "";
+  const directAliases = uniqueValues([...titleAliases, pathAlias].map(singleLine).filter((alias) => alias.length >= 8));
+  if (directAliases.some((alias) => new RegExp(`\\b${escapeRegExp(alias).replace(/\s+/g, "\\s+")}\\b`, "i").test(text))) {
+    return "description directly references source note";
+  }
+  if (/\b(?:this|the|active|source)\s+(?:note|document|email|thread|file)\b/i.test(text)
+    || /\b(?:according to|based on|from)\s+(?:this|the|active|source)\s+(?:note|document|email|thread|file)\b/i.test(text)) {
+    return "description directly references source note";
+  }
+  return "passed";
+}
+
+function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceContext = {}, sourceContract = null, settings = DEFAULT_SETTINGS) {
+  const split = splitDescriptionSourceListBlock(value);
+  const sourceTitle = singleLine(sourceContext.sourceTitle || sourceContext.title || sourceContract?.title || "");
+  let summary = cleanGeneratedDescriptionSummary(split.summary || "", settings);
+  summary = removeTitleEcho(summary, task.content || "");
+  for (const alias of sourceTitleAliases(sourceTitle)) {
+    const lead = new RegExp(`^${escapeRegExp(alias).replace(/\s+/g, "\\s+")}(?:\\.md)?\\s+(?:records?|notes?|states?|says?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?)(?:\\s+that)?\\s*`, "i");
+    summary = summary.replace(lead, "");
+  }
+  summary = removeSourceLeadIn(summary, sourceTitle);
+  summary = summary
+    .replace(/^(?:this|the|active|source)\s+(?:note|document|email|thread|file)\s+(?:says?|states?|indicates?|mentions?|shows?|describes?)\s+(?:that\s+)?/i, "")
+    .replace(/^(?:according to|based on|from)\s+(?:this|the|active|source)\s+(?:note|document|email|thread|file)\s*,?\s*/i, "")
+    .trim();
+  return {
+    summary: capitalizeSentenceStart(summary),
+    sourceList: split.sourceList || "",
+    reason: taskDescriptionSourceReferenceReason(summary, task, sourceContext, sourceContract)
+  };
 }
 
 function capitalizeSentenceStart(value) {
@@ -47651,11 +47802,11 @@ function validateTaskDescriptionEvidenceReferences(item = {}, task = {}, sourceC
   };
 }
 
-function structuredTaskDescriptionQualityReason(summary = "", task = {}, bundle = null) {
+function structuredTaskDescriptionQualityReason(summary = "", task = {}, bundle = null, sourceContext = {}) {
   const text = singleLine(summary);
   if (!text) return "description was empty";
   if (/\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior|system|developer)\s+instructions?\b/i.test(text)) return "description contained prompt-injection text";
-  return "passed";
+  return taskDescriptionSourceReferenceReason(text, task, sourceContext, bundle?.sourceContract || null);
 }
 
 function taskWorkflowRequiredPromptBlock(sourceContract = {}, evidenceCatalog = {}, settings = DEFAULT_SETTINGS) {
@@ -68560,7 +68711,14 @@ if (typeof module !== "undefined" && module.exports) {
     taskGenerationExpectedPriority,
     taskGenerationApplyExpectedPriorityCorrection,
     taskGenerationSourceFieldClosure,
-    taskGenerationScopeContentClosure
+    taskGenerationScopeContentClosure,
+    generatedTaskSectionName,
+    repairGeneratedTaskSectionMetadata,
+    validateGeneratedTaskSectionMetadata,
+    taskDescriptionSourceReferenceReason,
+    repairTaskDescriptionSourceReferences,
+    structuredTaskDescriptionQualityReason,
+    validateTaskDescriptionSentences
   });
   module.exports.__runtimeWorkCoordinator = Object.freeze({
     RuntimeWorkCoordinator,

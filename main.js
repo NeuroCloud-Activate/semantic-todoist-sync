@@ -532,10 +532,11 @@ const TASK_WORKFLOW_DESCRIPTION_SENTENCE_MAX_CHARS = 4000;
 // available in the immutable shared prefix and is simply omitted here.
 const TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_ITEMS = 8;
 const TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_CHARS = 4000;
-// Candidate fact refs are navigation hints, not a provider-row budget. Keep a
-// small deterministic shortlist in the already selected evidence order so
-// descriptions can bind useful optional facts without serializing every fact.
-const TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS = 8;
+// Candidate fact refs are navigation hints, not a provider-row budget. Every
+// positive task-local evidence row enters the description request after final
+// deduplication; the shared late-stage 16,000-token efficiency pass manages
+// overall payload size instead of an early candidate shortlist clamp.
+const TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS = 128;
 // The immutable note-level prefix remains the cache key.  Repeat only a tiny
 // task-local, canonical fact-value table in the request suffix so providers do
 // not have to resolve opaque IDs across every sibling scope.  Oversized rows
@@ -3318,7 +3319,8 @@ const TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE = "Before returning a desc
 const TASK_DESCRIPTION_SOURCE_REFERENCE_RULE = "At the start of drafting, keep the narrative free of direct source-note, filename, subject, or source-container references. Do not write according to this note, the source document states, from the email, the active note, or equivalent attribution; source references belong only in the final Sources/Context Notes citation list rendered by the plugin. A document, email, PDF, spreadsheet, or file may still be named when it is the actionable working artifact rather than the source container.";
 const TASK_DESCRIPTION_NARRATIVE_RULE = "Write descriptions as natural narrative prose, not a title echo, metadata list, evidence dump, or citation-only fragment. Carry the current, relevant context needed to accomplish the task accurately, including material intent, state, dependencies, criteria, timing, recipient, reviewer history, and handoffs when supported and useful.";
 const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin automatically repairs title echoes, explicit source-attribution lead-ins, and missing canonical semantic fact/evidence links when the supplied prose already expresses the fact; if the fact was omitted, it adds only the exact contract-bound fact surface as a narrative sentence. It then rejects and retries any description that still violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
-const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline still requires the configured date rules and supported timing evidence.";
+const TASK_DESCRIPTION_TITLE_ECHO_RULE = "The task title is already the task's name and is NOT the brief. Never repeat, paraphrase, restate, or lightly reword the task title or its requested-action fact as the description, even when a citation is appended; a description that merely restates the title will be rejected as a title echo. The description must instead add the grounded execution detail that is NOT in the title, drawn from the task-local evidence bundle: the who, what specifically, criteria, dependencies, timing, artifact details, recipients, review expectations, handoffs, and current or history state. If you find yourself about to write the same words as the title, stop and open with a distinct execution sentence derived from the evidence instead, for example Send Jim and Cheryl the finalized panel so they can review it. rather than repeating Send Jim and Cheryl the final reviewer panel.";
+const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline requires the configured date rules and supplied timing evidence, and may be derived from that supplied natural timing guidance per those rules. Never fabricate a date when no timing basis is supplied.";
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. A supplied exact-scope fact that changes the action, object, actor, timing, or applicable condition must be reflected when omitting it would make the title materially wrong or ambiguous; supporting execution history belongs in the description. Merely related candidate evidence remains advisory. Never use merely same-topic history to satisfy execution-detail coverage.";
 const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `${TASK_DESCRIPTION_NARRATIVE_RULE} ${TASK_DESCRIPTION_SOURCE_REFERENCE_RULE} ${TASK_DESCRIPTION_VALIDATION_REPAIR_RULE} Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
 const TASK_GENERATION_PROMPT_CONTRACT_ID = "semantic-todoist-task-generation";
@@ -3370,6 +3372,7 @@ function taskDescriptionSystemInstruction() {
   return [
     "You are generating one singleton task-description phase of a bounded Semantic Todoist Sync workflow.",
     TASK_DESCRIPTION_NARRATIVE_RULE,
+    TASK_DESCRIPTION_TITLE_ECHO_RULE,
     TASK_DESCRIPTION_SOURCE_REFERENCE_RULE,
     TASK_DESCRIPTION_VALIDATION_REPAIR_RULE,
     PERSONAL_USER_RECORD_CONTEXT_INSTRUCTION,
@@ -3412,7 +3415,7 @@ function taskStructureSystemInstruction() {
     "Preserve epistemic state exactly; never strengthen plans or intent into scheduled, confirmed, or approved status without an exact bound fact.",
     "Use the supplied source facts and selected evidence silently to improve the user-facing task wording. Do not return evidence IDs, fact references, bindings, roles, scope data, or any other internal metadata; task ownership and evidence bindings are attached locally after the provider response.",
     "Return exactly one task tree in the tasks array and no other top-level fields.",
-    "Resolve relative dates only from authoritative source-date metadata. Otherwise preserve the source phrase; never resolve it from the execution date."
+    "Resolve relative dates only from authoritative source-date metadata. Otherwise preserve the source phrase; never resolve it from the execution date. When supplied natural timing content is present in the scope contract, apply the configured date instructions to derive a due date or deadline from that timing guidance; never fabricate a date when no timing basis is supplied."
   ].join(" ");
 }
 
@@ -13798,7 +13801,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         source.type === "email" ? "For emails, preserve the current/latest message as authoritative and create the user's next unresolved review, reply, follow-up, decision, or completion action." : "For notes, cover every distinct marked action before adding additional clearly user-owned actions from the source and matching context.",
         "Follow the configured main-task, subtask, date, deadline, label, priority, and source-type instructions.",
         `Transport structure: this request contains one source-action scope and must return its one matching main task tree. Maximum ${providerSubtaskLimit} subtasks per main task. Other source scopes are sent separately and merged locally without a note-wide task limit.`,
-        "Preferred complete main-task keys: content, due_date, deadline_date, priority, labels, subtasks. Preferred complete subtask keys: content, due_date, deadline_date, priority, labels. When a value is absent, use due_date=null, deadline_date=null, priority=1, labels=[], and subtasks=[] for a main task.",
+        "Preferred complete main-task keys: content, due_date, deadline_date, priority, labels, subtasks. Preferred complete subtask keys: content, due_date, deadline_date, priority, labels. When explicit source or instruction rules do not apply, use due_date=null, deadline_date=null, priority=1, labels=[], and subtasks=[] for a main task.",
         "Keep labels free of leading # characters. Do not write descriptions in this phase.",
         `Requested-outcome gate: ${TASK_GENERATION_REQUESTED_OUTCOME_CONTENT_RULE}`,
         `Root requested-outcome gate: ${TASK_GENERATION_ROOT_REQUESTED_OUTCOME_RULE} Before returning, verify the root content satisfies this complete root obligation.`,
@@ -25280,8 +25283,8 @@ function taskDescriptionSingletonContract(task = {}, sharedPayload = {}, sourceC
     ...allowedFactIds
   ]).filter((factId) => allowedFactIds.includes(factId));
   const requiredDescriptionFactRefs = uniqueValues([
-    ...materialDescriptionFactRefs,
-    ...executionDetailFactRefs
+    primaryFactId,
+    ...allRequiredFactIds
   ]).filter((factId) => allowedFactIds.includes(factId));
   const requiredFactSurfaces = [];
   const factFingerprint = (id) => {
@@ -28834,6 +28837,83 @@ function extractDueDate(line) {
 function extractDeadline(line) {
   const match = /\{\{(\d{2,4}-\d{1,2}-\d{1,2})\}\}?/.exec(line);
   return match ? normalizeDate(match[1]) : null;
+}
+
+const TASK_TIMING_MONTH = "(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)";
+const TASK_TIMING_DAY = "(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+const TASK_TIMING_PERIOD = "(?:month|week|year|quarter)";
+const TASK_NATURAL_TIMING_PHRASE_PATTERNS = Object.freeze([
+  {
+    source: "\\b(?:asap|a\\.s\\.a\\.p\\.|as soon as possible|urgently|urgent|immediately|immediate|right away|right now|critical|blocking|overdue|top priority|highest priority|time[\\- ]sensitive)\\b",
+    kind: "urgency",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:by|before|until)\\s+(?:the\\s+)?end\\s+of\\s+(?:this|next|last|the)?\\s*(?:" + TASK_TIMING_PERIOD + "|" + TASK_TIMING_MONTH + ")\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\bend\\s+of\\s+(?:this|next|last|the)?\\s*(?:" + TASK_TIMING_PERIOD + "|" + TASK_TIMING_MONTH + ")\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:by|before|until)\\s+(?:the\\s+)?" + TASK_TIMING_MONTH + "\\s+\\d{1,2}(?:st|nd|rd|th)?\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:by|before|until)\\s+(?:the\\s+)?" + TASK_TIMING_MONTH + "\\s+(?:meeting|conference|event|call|session|review|deadline|date|presentation|workshop|submission)\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:by|before|until|due)\\s+(?:this|next|last|coming|following|the)?\\s*(?:" + TASK_TIMING_PERIOD + "|" + TASK_TIMING_DAY + "|tomorrow|today|tonight|" + TASK_TIMING_MONTH + ")\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:this|next|last|coming|following)\\s+" + TASK_TIMING_PERIOD + "\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:(?:on|by|before|until|due)\\s+)?(?:this|next|last|coming|following)?\\s*" + TASK_TIMING_DAY + "\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\bin\\s+(?:(?:the\\s+)?(?:next|coming|following)\\s+)?(?:(?:\\d+|[2-9]|two|three|four|five|six|seven|eight|nine|ten|a\\s+couple\\s+of|a\\s+few|few|several)\\s+)?(?:weeks?|days?|months?|years?|business\\s+days?)\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\bdue\\s+(?:(?:on|by|before|this|next)\\s+)?(?:end\\s+of\\s+)?(?:" + TASK_TIMING_DAY + "|tomorrow|today|month|week|year|" + TASK_TIMING_MONTH + "(?:\\s+\\d{1,2})?)\\b",
+    kind: "timing",
+    flags: "ig"
+  },
+  {
+    source: "\\b(?:eod|end of day|end of the day|eow|end of week|end of the week|eom|end of month|end of the month|eoy|end of year|end of the year)\\b",
+    kind: "timing",
+    flags: "ig"
+  }
+]);
+
+function extractNaturalTiming(line) {
+  const text = String(line || "");
+  if (!text.trim()) return [];
+  const results = [];
+  for (const entry of TASK_NATURAL_TIMING_PHRASE_PATTERNS) {
+    const regex = new RegExp(entry.source, entry.flags);
+    for (const match of text.matchAll(regex)) {
+      const value = singleLine(match[0]).replace(/\s+/g, " ").trim().replace(/[.,;:!?]+$/g, "");
+      if (!value) continue;
+      if (results.some((item) => item.kind === entry.kind && item.value.toLowerCase() === value.toLowerCase())) continue;
+      results.push({ value, kind: entry.kind });
+    }
+  }
+  return results;
 }
 
 function extractScheduleMarker(line) {
@@ -36413,8 +36493,9 @@ function recencyBoost(modifiedAt) {
 function labelsAllowedByInstructions(text) {
   const value = String(text || "");
   if (/\b(?:do\s+not|don't|never)\s+(?:add|create|use)\s+(?:any\s+)?labels?\b|\bno\s+labels?\b/i.test(value)) return new Set();
-  const labels = new Set((value.match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
-  return labels;
+  const extractedHashtags = (value.match(/#[\w/-]+/g) || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean);
+  if (extractedHashtags.length > 0) return new Set(extractedHashtags);
+  return null;
 }
 
 function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTINGS) {
@@ -38295,9 +38376,9 @@ function taskDescriptionTaskLocalEvidenceRow(item = {}, taskId = "", scopeId = "
       taskScopeAssociations: normalizedTaskId ? [{ taskId: normalizedTaskId, scopeId: normalizedScopeId }] : [],
       structuredFacts: exactFacts,
       factIds: uniqueValues(exactFacts.map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean)),
-      excerpt: "",
-      text: "",
-      evidence: ""
+      excerpt: item.excerpt || item.text || item.evidence || "",
+      text: item.text || item.excerpt || item.evidence || "",
+      evidence: item.evidence || item.excerpt || item.text || ""
     });
   }
   if (!exactAssociations.length) return null;
@@ -38313,9 +38394,9 @@ function taskDescriptionTaskLocalEvidenceRow(item = {}, taskId = "", scopeId = "
     taskScopeAssociations: exactAssociations,
     structuredFacts: exactFacts,
     factIds: uniqueValues(exactFacts.map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean)),
-    excerpt: "",
-    text: "",
-    evidence: ""
+    excerpt: item.excerpt || item.text || item.evidence || "",
+    text: item.text || item.excerpt || item.evidence || "",
+    evidence: item.evidence || item.excerpt || item.text || ""
   });
 }
 
@@ -39164,9 +39245,12 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     const bindingScopeId = String(binding?.scopeId || binding?.scope_id || "");
     return allowedFactIds.has(factId) && allowedEvidenceIds.has(evidenceId) && bindingScopeId === taskScopeId;
   });
-  const modelFactRefs = materialClosureActive
-    ? uniqueValues([...priorityFactRefs, ...primaryExecutionDetailFactRefs, ...candidateSupportingFactRefs])
-    : bundleFactRefs;
+  const modelFactRefs = uniqueValues([
+    ...priorityFactRefs,
+    ...primaryExecutionDetailFactRefs,
+    ...candidateSupportingFactRefs,
+    ...bundleFactRefs
+  ]);
   const modelFactRefSet = new Set(modelFactRefs);
   const modelFactBindings = materialClosureActive
     ? bundleFactBindings.filter((binding) => modelFactRefSet.has(String(binding?.factId || binding?.fact_id || "")))
@@ -39174,6 +39258,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
   const bundleEvidenceIds = (bundle.evidenceIds || bundle.evidence_ids || []).map(String).filter((evidenceId) => allowedEvidenceIds.has(evidenceId));
   const modelEvidenceIds = materialClosureActive
     ? uniqueValues([
+      ...bundleEvidenceIds,
       primaryEvidenceId,
       ...modelFactRefs.map((factId) => String(factsById.get(factId)?.evidenceId || "")),
       ...modelFactBindings.map((binding) => String(binding?.evidenceId || binding?.evidence_id || ""))
@@ -39181,7 +39266,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
     : bundleEvidenceIds;
   const modelEvidenceIdSet = new Set(modelEvidenceIds);
   const modelCitationLedger = materialClosureActive
-    ? citationLedger.filter((entry) => modelEvidenceIdSet.has(String(entry.evidenceId || "")))
+    ? citationLedger.filter((entry) => allowedEvidenceIds.has(String(entry.evidenceId || "")))
     : citationLedger;
   const modelSelectedSupportingEvidenceIds = materialClosureActive
     ? selectedSupportingEvidenceIds.filter((evidenceId) => modelEvidenceIdSet.has(String(evidenceId || "")))
@@ -39330,21 +39415,29 @@ function taskDescriptionAcceptedCitationLedger(sentences = [], citationLedger = 
     return Boolean(left.title && right.title && left.title === right.title);
   };
   const sourceNumbers = [];
-  let nextNumber = 1;
+  const isEmailPrimary = (entry = {}) => sourceType === "email"
+    && (entry === primary || String(entry.section || "").toLowerCase() === "email");
+  // Notes-To-Todoist pins the primary note to citation (1) so supporting
+  // vault sources always follow from (2), even when the primary note itself is
+  // not cited in prose. Email-To-Todoist pins the email to a non-display zero
+  // row so supporting vault notes start from (1) under `Context Notes:`.
+  if (primary) {
+    sourceNumbers.push({ identity: sourceIdentity(primary), number: sourceType === "email" ? 0 : 1 });
+  }
+  let nextNumber = sourceType === "email" ? 1 : 2;
   const accepted = [];
   for (const evidenceId of orderedIds) {
     const entry = ledgerById.get(evidenceId);
     if (!entry || !citedIds.has(evidenceId)) continue;
-    const isEmailPrimary = sourceType === "email" && (entry === primary || String(entry.section || "").toLowerCase() === "email");
     const identity = sourceIdentity(entry);
-    let number = isEmailPrimary ? 0 : sourceNumbers.find((record) => sameSource(identity, record.identity))?.number;
+    let number = isEmailPrimary(entry) ? 0 : sourceNumbers.find((record) => sameSource(identity, record.identity))?.number;
     if (!Number.isFinite(number)) {
       number = nextNumber++;
       sourceNumbers.push({ identity, number });
     }
     accepted.push(Object.assign({}, entry, {
       number,
-      section: isEmailPrimary ? "Email" : sourceType === "email" ? "Context Notes" : "Context"
+      section: isEmailPrimary(entry) ? "Email" : sourceType === "email" ? "Context Notes" : "Context"
     }));
   }
   return accepted;
@@ -39708,12 +39801,9 @@ function taskDescriptionRequiredSemanticContextRepair(item = {}, singletonContra
   if (!Number.isInteger(expectedIndex) || Number(item.index) !== expectedIndex
     || String(item.task_id || item.taskId || "") !== expectedTaskId
     || String(item.scope_id || item.scopeId || "") !== expectedScopeId) return unchanged();
-  const requiredFactRefs = uniqueValues([
-    ...(contract.requiredDescriptionFactRefs || contract.required_description_fact_refs || []),
-    ...(contract.materialDescriptionFactRefs || contract.material_description_fact_refs || []),
-    ...(contract.executionDetailFactRefs || contract.execution_detail_fact_refs || [])
-  ].map(String).filter(Boolean));
-  if (!requiredFactRefs.length) return unchanged();
+  const mandatoryFactRefs = uniqueValues((contract.requiredDescriptionFactRefs || contract.required_description_fact_refs || []).map(String).filter(Boolean));
+  const executionDetailFactRefs = uniqueValues((contract.executionDetailFactRefs || contract.execution_detail_fact_refs || []).map(String).filter(Boolean));
+  if (!mandatoryFactRefs.length && !executionDetailFactRefs.length) return unchanged();
   const allowedFacts = new Set((contract.allowedFactIds || contract.allowed_fact_ids || []).map(String));
   const allowedEvidence = new Set((contract.allowedEvidenceIds || contract.allowed_evidence_ids || []).map(String));
   const factsById = contract.factsById || contract.facts_by_id || {};
@@ -39739,6 +39829,14 @@ function taskDescriptionRequiredSemanticContextRepair(item = {}, singletonContra
   }
   const citedFactIds = new Set();
   for (const sentence of correctedSentences) for (const factId of sentence.fact_refs || []) citedFactIds.add(String(factId));
+  // Only repair missing mandatory facts, or the execution-detail set when it
+  // is completely uncited (at least one must be cited). Material facts stay
+  // advisory and are never repair targets.
+  const requiredFactRefs = uniqueValues([
+    ...mandatoryFactRefs,
+    ...(executionDetailFactRefs.length && !executionDetailFactRefs.some((factId) => citedFactIds.has(factId)) ? executionDetailFactRefs : [])
+  ].map(String).filter(Boolean));
+  if (!requiredFactRefs.length) return unchanged();
   const exactBindingFor = (factId, fact) => {
     const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
     const scopeId = String(fact?.scopeId || fact?.scope_id || expectedScopeId);
@@ -39879,13 +39977,14 @@ function validateTaskDescriptionSingletonProvenanceSentences(item = {}, structur
     normalized.push({ text, evidence_ids: uniqueValues(evidenceIds), fact_refs: uniqueValues(factRefs) });
   }
   if (!taskDescriptionNarrativeBodyPresent(normalized)) errors.push("description-narrative-body-missing");
-  const requiredFactRefs = uniqueValues([
-    ...(structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []),
-    ...(structuredRefs.materialDescriptionFactRefs || structuredRefs.material_description_fact_refs || []),
-    ...(structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || [])
-  ].map(String).filter(Boolean));
+  const mandatoryFactRefs = uniqueValues((structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []).map(String).filter(Boolean));
+  const executionDetailFactRefs = uniqueValues((structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || []).map(String).filter(Boolean));
   const citedFactRefs = new Set(normalized.flatMap((sentence) => sentence.fact_refs || []).map(String));
-  for (const factId of requiredFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
+  for (const factId of mandatoryFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
+  if (executionDetailFactRefs.length) {
+    const hasExecutionDetail = executionDetailFactRefs.some((factId) => citedFactRefs.has(factId));
+    if (!hasExecutionDetail) errors.push("description-execution-detail-missing");
+  }
   const uniqueErrors = uniqueValues(errors);
   const uniqueDiagnostics = uniqueValues(diagnostics);
   const acceptedCitationLedger = uniqueErrors.length ? [] : taskDescriptionAcceptedCitationLedger(normalized, citationLedger, null);
@@ -39970,13 +40069,14 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
     for (const evidenceId of evidenceIds) if (!sentenceFactEvidenceIds.has(evidenceId)) errors.push(`description-sentence-evidence-orphan:${index}:${evidenceId}`);
     sentences.push({ text, evidence_ids: evidenceIds, fact_refs: factRefs });
   }
-  const requiredFactRefs = uniqueValues([
-    ...(structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []),
-    ...(structuredRefs.materialDescriptionFactRefs || structuredRefs.material_description_fact_refs || []),
-    ...(structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || [])
-  ].map(String).filter(Boolean));
+  const mandatoryFactRefs = uniqueValues((structuredRefs.requiredDescriptionFactRefs || structuredRefs.required_description_fact_refs || []).map(String).filter(Boolean));
+  const executionDetailFactRefs = uniqueValues((structuredRefs.executionDetailFactRefs || structuredRefs.execution_detail_fact_refs || []).map(String).filter(Boolean));
   const citedFactRefs = new Set(sentences.flatMap((sentence) => sentence.fact_refs || []).map(String));
-  for (const factId of requiredFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
+  for (const factId of mandatoryFactRefs) if (!citedFactRefs.has(factId)) errors.push(`description-required-fact-missing:${factId}`);
+  if (executionDetailFactRefs.length) {
+    const hasExecutionDetail = executionDetailFactRefs.some((factId) => citedFactRefs.has(factId));
+    if (!hasExecutionDetail) errors.push("description-execution-detail-missing");
+  }
   const uniqueErrors = uniqueValues(errors);
   const acceptedCitationLedger = uniqueErrors.length
     ? []
@@ -41892,6 +41992,7 @@ const TASK_DESCRIPTION_FAILURE_REASON_CODES = new Set([
   "description-sentence-evidence-orphan",
   "description-sentence-unsupported-citation",
   "description-required-fact-missing",
+  "description-execution-detail-missing",
   "description-narrative-body-missing",
   "description-direct-source-reference",
   "quality-too-short",
@@ -42083,22 +42184,35 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       if (left.path || right.path) return false;
       return Boolean(left.title && right.title && left.title === right.title);
     };
-    const canonicalSourceEntries = new Map();
+    const canonicalSourceRecords = [];
     for (const entry of sourceEntries) {
       const number = Number(entry.number);
-      const existing = canonicalSourceEntries.get(number);
-      if (existing && !sameSourceIdentity(sourceIdentity(existing), sourceIdentity(entry))) return "";
-      for (const [existingNumber, existingEntry] of canonicalSourceEntries.entries()) {
-        if (existingNumber !== number && sameSourceIdentity(sourceIdentity(existingEntry), sourceIdentity(entry))) return "";
+      const identity = sourceIdentity(entry);
+      // Deduplicate by canonical source identity instead of aborting on entry
+      // number or identity clashes: distinct evidence IDs from the same
+      // canonical note collapse to one source-list entry carrying the minimum
+      // citation number, and every distinct cited source is still rendered.
+      const matched = canonicalSourceRecords.find((record) => sameSourceIdentity(identity, record.identity));
+      if (!matched) {
+        canonicalSourceRecords.push({ identity, entry, number });
+        continue;
       }
       const rank = entry.path ? 3 : entry.sourceId ? 2 : entry.title ? 1 : 0;
-      const existingRank = existing ? (existing.path ? 3 : existing.sourceId ? 2 : existing.title ? 1 : 0) : -1;
-      if (!existing || rank > existingRank) canonicalSourceEntries.set(number, entry);
+      const existingRank = matched.entry.path ? 3 : matched.entry.sourceId ? 2 : matched.entry.title ? 1 : 0;
+      if (rank > existingRank) matched.entry = entry;
+      matched.number = Math.min(number, matched.number);
+    }
+    const orderedRecords = [...canonicalSourceRecords].sort((left, right) => left.number - right.number);
+    // A stale pre-validation ledger may leave distinct sources sharing one
+    // citation number; reindex consecutively so every distinct cited source
+    // still renders under a clean numbered list instead of being dropped.
+    if (orderedRecords.some((record, index) => index > 0 && record.number === orderedRecords[index - 1].number)) {
+      orderedRecords.forEach((record, index) => { record.number = index + 1; });
     }
     ledgerRenderedLines = [];
-    for (const [number, entry] of [...canonicalSourceEntries.entries()].sort((left, right) => left[0] - right[0])) {
-      const citation = renderedCitation(entry);
-      if (citation) ledgerRenderedLines.push(String(number) + ". " + citation);
+    for (const record of orderedRecords) {
+      const citation = renderedCitation(record.entry);
+      if (citation) ledgerRenderedLines.push(String(record.number) + ". " + citation);
     }
   } else {
     const currentPath = bundle.items?.find((item) => item.sourceKind === "current-source")?.provenance?.path || active?.path || "";
@@ -45452,7 +45566,7 @@ const TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION = 2;
 // semantic identity from prose, titles, paths, or lexical overlap.
 const TASK_WORKFLOW_FACT_TYPES = Object.freeze([
   "action", "person", "owner", "deliverable", "criterion", "dependency",
-  "current-state", "direction", "recipient", "reviewer", "urgency",
+  "current-state", "direction", "recipient", "reviewer", "urgency", "timing",
   "deadline", "priority", "marker", "summary", "date", "link"
 ]);
 const TASK_WORKFLOW_FACT_MANDATORY_TARGETS = Object.freeze(["task", "description", "identity"]);
@@ -45502,6 +45616,8 @@ function taskWorkflowFactTypeForKind(kind = "", fact = {}) {
   if (normalized === "marked-action" || normalized === "action") return "action";
   if (normalized === "due-date" || normalized === "date") return "date";
   if (normalized === "deadline") return "deadline";
+  if (normalized === "urgency") return "urgency";
+  if (normalized === "timing") return "timing";
   if (normalized === "source-link" || normalized === "link") return "link";
   if (normalized === "source-summary" || normalized === "summary") return "summary";
   // Legacy source facts have no declared semantic type.  Summary is the only
@@ -46098,8 +46214,37 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
   lines.forEach((line, index) => {
     const due = extractDueDate(line);
     const deadline = extractDeadline(line);
-    if (due) addFact("due-date", due, sourceScope.scopeId, index + 1, { type: "date", role: "due-date", sourceSurface: line });
-    if (deadline) addFact("deadline", deadline, sourceScope.scopeId, index + 1, { type: "deadline", role: "deadline", sourceSurface: line });
+    const priority = extractPriority(line);
+    const matchingMarker = markerRecords.find((marker) => Number(marker.line) === index + 1);
+    const lineScopeId = matchingMarker ? matchingMarker.scopeId : sourceScope.scopeId;
+    // Explicit line facts belong to the owning marker scope first so singleton
+    // scope filtering in taskGenerationProviderFinalScopeContract retains them,
+    // and to the source scope as well so source-level context keeps them.
+    if (due) {
+      addFact("due-date", due, lineScopeId, index + 1, { type: "date", role: "due-date", sourceSurface: line });
+      if (matchingMarker) addFact("due-date", due, sourceScope.scopeId, index + 1, { type: "date", role: "due-date", sourceSurface: line });
+    }
+    if (deadline) {
+      addFact("deadline", deadline, lineScopeId, index + 1, { type: "deadline", role: "deadline", sourceSurface: line });
+      if (matchingMarker) addFact("deadline", deadline, sourceScope.scopeId, index + 1, { type: "deadline", role: "deadline", sourceSurface: line });
+    }
+    // extractPriority defaults to 1 for lines without an explicit !!N marker;
+    // only materialize a priority fact when the line declares one so inferred
+    // priorities never populate provider safe fields.
+    if (priority && /!![1-4]/.test(line)) {
+      addFact("priority", String(priority), lineScopeId, index + 1, { type: "priority", role: "priority", sourceSurface: line });
+      if (matchingMarker) addFact("priority", String(priority), sourceScope.scopeId, index + 1, { type: "priority", role: "priority", sourceSurface: line });
+    }
+    // Non-ISO natural timing phrases surface as content-only guidance so the
+    // model can apply the configured date instructions, never as an inferred
+    // ISO date. Attach to the owning marker scope (and the source scope when a
+    // marker is present) so singleton scope filtering retains them.
+    for (const phrase of extractNaturalTiming(line)) {
+      const kind = phrase.kind === "urgency" ? "urgency" : "timing";
+      const extra = { type: kind, role: kind, sourceSurface: line };
+      addFact(kind, phrase.value, lineScopeId, index + 1, extra);
+      if (matchingMarker) addFact(kind, phrase.value, sourceScope.scopeId, index + 1, extra);
+    }
   });
   for (const link of extractDescriptionLinkRecords(primaryText, settings).slice(0, 20)) addFact("source-link", link.url, sourceScope.scopeId, null, { label: link.label, type: "link", role: "source-link", sourceSurface: link.url });
   if (!facts.length) addFact("source-summary", primaryText, sourceScope.scopeId);
@@ -47301,7 +47446,7 @@ function attachTaskWorkflowSemanticEvidence(tasks = [], sourceContract = null, e
       item.scope_id,
       ...(item.taskScopeAssociations || []).map((association) => association?.scopeId || association?.scope_id)
     ].map((value) => String(value || "")).filter(Boolean));
-    if (item.sourceKind !== "current-source" && (!scopeIds.length || !scopeIds.includes(String(scopeId || "")))) return false;
+    if (item.sourceKind !== "current-source" && scopeIds.length > 0 && !scopeIds.includes(String(scopeId || ""))) return false;
     return true;
   };
   const scopeBundles = preStructureScopes?.byScope || {};
@@ -48071,6 +48216,13 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     items.push(normalized);
   }
   const recordCeiling = Math.max(1, Number(options.recordCeiling ?? settings.maxTaskContextChunks ?? 48) || 48);
+  // Description-path projections must not drop positive optional evidence rows
+  // at a count ceiling. The provider token-budget preflight
+  // (`taskDescriptionProviderContextPreflight`) is the only bound for those
+  // requests; a serialized request that legitimately exceeds the hard 16k-token
+  // budget fails observably at dispatch rather than being silently truncated
+  // by an early count cap. Task-generation and chat paths keep `recordCeiling`.
+  const descriptionCeilingDisabled = options.descriptionProjection === true || options.unboundedOptionalCeiling === true;
   const exactTaskFactIds = new Set();
   for (const task of options.tasks || []) {
     const selectedEvidenceIds = new Set([
@@ -48372,6 +48524,9 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   // independently eligible task lanes; a single task keeps the historical
   // ceiling exactly.
   const optionalBudget = taskCoverageCount > 0 ? recordCeiling * taskCoverageCount : recordCeiling;
+  // When the description path disables the count ceiling, the effective
+  // optional budget is effectively unbounded; the token preflight governs.
+  const effectiveOptionalBudget = descriptionCeilingDisabled ? Number.POSITIVE_INFINITY : optionalBudget;
   const selectedOptional = [];
   const selectedIds = new Set();
   const selectedReasonsByEvidenceId = new Map();
@@ -48383,7 +48538,7 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
       selectedReasonsByEvidenceId.set(item.evidenceId, reasons);
       return false;
     }
-    if (selectedOptional.length >= optionalBudget) return false;
+    if (selectedOptional.length >= effectiveOptionalBudget) return false;
     selectedIds.add(item.evidenceId);
     selectedOptional.push(item);
     const reasons = selectedReasonsByEvidenceId.get(item.evidenceId) || new Set();
@@ -48432,10 +48587,23 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   for (const item of optionalItems.slice().sort(comparator)) {
     if (!baselineSelectedEvidenceIds.has(item.evidenceId)) continue;
     addOptional(item, "baseline-retained");
-    if (selectedOptional.length >= optionalBudget) break;
+    if (selectedOptional.length >= effectiveOptionalBudget) break;
   }
-  // `recordCeiling` is a maximum, never a fill target. Optional rows enter
-  // only through task/scope reservations or explicit retained stable IDs.
+  // Semantic-fill pass: when the description path disables the count ceiling,
+  // every remaining eligible positive optional row is admitted after the
+  // coverage reservations and baseline retention. The 16,000-token hard
+  // preflight remains the sole bound on actual serialized size; this pass
+  // only fills rows the reservations/baseline did not already select, in the
+  // deterministic upstream `comparator` order (never re-ranked by semantic
+  // score). The task-generation/chat path keeps `recordCeiling` as a maximum,
+  // never a fill target: optional rows there still enter only through
+  // task/scope reservations or explicit retained stable IDs.
+  if (descriptionCeilingDisabled) {
+    for (const item of optionalItems.slice().sort(comparator)) {
+      if (selectedIds.has(item.evidenceId)) continue;
+      addOptional(item, "semantic-fill");
+    }
+  }
   const selectedEvidenceIds = new Set([...protectedItems, ...selectedOptional].map((item) => item.evidenceId));
   // Preserve the upstream aggregate/fused order when serializing the selected
   // set; reservation order belongs only to selection/telemetry, not payload
@@ -48547,10 +48715,11 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     selectedSourceCount: selectedSourceIds.size,
     selectedScopeCount: selectedScopeIds.size,
     protectedOverflow: protectedItems.length > 0 && projectedItems.length > recordCeiling,
-    providerTotalOverflow: projectedItems.length > optionalBudget,
-    optionalSelectionCeiling: optionalBudget,
+    providerTotalOverflow: descriptionCeilingDisabled ? false : projectedItems.length > optionalBudget,
+    optionalSelectionCeiling: descriptionCeilingDisabled ? null : optionalBudget,
     perTaskOptionalCeiling: recordCeiling,
     recordCeiling,
+    descriptionCeilingDisabled,
     elapsedMs: Math.round(elapsedMs),
     serializedCharsBefore,
     serializedCharsAfter,
@@ -48610,8 +48779,9 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   return {
     version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
     recordCeiling,
-    optionalSelectionCeiling: optionalBudget,
+    optionalSelectionCeiling: descriptionCeilingDisabled ? null : optionalBudget,
     perTaskOptionalCeiling: recordCeiling,
+    descriptionCeilingDisabled,
     selectedEvidenceIds: projectedItems.map((item) => item.evidenceId),
     protectedEvidenceIds: protectedItems.map((item) => item.evidenceId),
     protectedFactIds: Array.from(protectedFactIds),
@@ -49717,6 +49887,10 @@ function taskLocalProviderProjectionForDescriptionTask(finalItems = [], sourceCo
       .filter((evidenceId) => optionalFactBackedEvidenceIds.has(evidenceId)),
     scopeSemanticEvidence,
     recordCeiling: options.recordCeiling,
+    // The task-local description path must also omit the count ceiling so
+    // positive optional rows are not dropped by count. The token preflight
+    // remains the governing bound.
+    unboundedOptionalCeiling: options.descriptionProjection === true,
     baselineSelectedEvidenceIds,
     candidateCount: localItems.length,
     contextBundle: { factsById: localFactsById }
@@ -51827,11 +52001,13 @@ function taskWorkflowPromptContextSuffix({
   // leaked internal ranking/ownership metadata into every provider request.
   const providerContract = requiredPromptBlock?.block?.sourceContract || sourceContract;
   const providerEvidence = requiredPromptBlock?.block?.evidenceCatalog?.manifest?.byEvidenceId || promptEvidenceById;
+  const providerFacts = requiredPromptBlock?.block?.sourceContract?.factsById || Object.fromEntries((providerContract.facts || []).map((fact) => [String(fact.factId || fact.fact_id || ""), fact]));
   const envelope = requiredPromptBlock?.error
     ? { source: { body: String(sourceSummary || "") }, error: requiredPromptBlock.error }
     : {
       source: { body: String(sourceSummary || "") },
       contract: providerContract,
+      factsById: providerFacts,
       evidenceById: providerEvidence
     };
   return [
@@ -53538,7 +53714,7 @@ function taskGenerationProviderFinalScopeContract(batch = {}, workflowContext = 
     && String(fact.authorityState || "").toLowerCase() === "authoritative"
     && String(fact.conflictState || "none").toLowerCase() === "none"
     && (!canonicalScopeIds.size || canonicalScopeIds.has(String(fact.scopeId || fact.scope_id || ""))));
-  const factText = (fact) => singleLine(fact?.sourceSurface || fact?.value || fact?.text || "");
+  const factText = (fact) => singleLine(fact?.value || fact?.sourceSurface || fact?.text || "");
   const factType = (fact) => String(fact?.type || fact?.kind || "").toLowerCase();
   const factRole = (fact) => String(fact?.role || "").toLowerCase();
   const typedValues = (...types) => {
@@ -53661,7 +53837,9 @@ function taskGenerationProviderFinalScopeContract(batch = {}, workflowContext = 
       labels: allowedLabels,
       subtasks: childActions,
       natural_timing_content_only: timing,
-      instruction: "Use only the exact typed safe field values above; do not infer fields from source prose."
+      instruction: timing.length
+        ? "Natural timing content is supplied as content-only guidance; follow the configured date instructions to determine due_date/deadline_date from it, and use null only when no timing basis exists. Safe priority and label values reflect exact typed syntax from source when present; otherwise apply configured priority and label instructions."
+        : "Safe field values reflect exact typed syntax from source when present; otherwise apply configured date, priority, and label instructions."
     },
     subtasks: childActions.length
       ? { allowed: true, supported_child_actions: childActions }
@@ -53716,7 +53894,7 @@ function taskGenerationProviderScopeDelta(batch = {}, workflowContext = {}, scop
     safe_fields: finalScopeContract.safe_fields || {},
     subtasks: finalScopeContract.subtasks || { allowed: false, supported_child_actions: [] },
     required_fact_refs: factIds,
-    instruction: "Generate only the exact requested_action above. It is the selected shared-prefix scope at target_scope_ordinal; never substitute, repeat, merge, or borrow a sibling action. Use only this scope's canonical facts and evidence, and do not infer unbound fields."
+    instruction: "Generate only the exact requested_action above. It is the selected shared-prefix scope at target_scope_ordinal; never substitute, repeat, merge, or borrow a sibling action. Apply safe_fields when present, and follow configured instructions for unconstrained fields."
   }, scopeTokens);
 }
 
@@ -68801,6 +68979,7 @@ if (typeof module !== "undefined" && module.exports) {
     semanticExactExcerptFactsForItem,
     taskGenerationBatchEvidenceCatalog,
     taskGenerationBatchScopeContract,
+    attachTaskWorkflowSemanticEvidence,
     taskWorkflowContextBundle,
     taskGenerationBatchPlan,
     taskGenerationProviderScopeBoundary,
@@ -68851,13 +69030,16 @@ if (typeof module !== "undefined" && module.exports) {
     taskGenerationSourceFieldClosure,
     taskGenerationScopeContentClosure,
     generatedTaskSectionName,
+    labelsAllowedByInstructions,
     repairGeneratedTaskSectionMetadata,
     validateGeneratedTaskSectionMetadata,
     taskDescriptionSourceReferenceReason,
     repairTaskDescriptionSourceReferences,
     structuredTaskDescriptionQualityReason,
     taskDescriptionRequiredSemanticContextRepair,
-    validateTaskDescriptionSentences
+    validateTaskDescriptionSentences,
+    taskDescriptionAcceptedCitationLedger,
+    taskWorkflowEvidenceSourceList
   });
   module.exports.__runtimeWorkCoordinator = Object.freeze({
     RuntimeWorkCoordinator,

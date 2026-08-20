@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.8.37
+
+### Semantic evidence delivery in descriptions
+- Added a semantic-fill pass so task-description generation receives the
+  complete positive task-local semantic evidence union. The description
+  projection previously delivered only coverage-reserved/baseline rows; it now
+  admits every eligible positive optional row (the 16,000-token preflight
+  remains the sole size bound). Verified by live OpenRouter GPT-5.6 Luna runs
+  against the Testing vault index (54/54 eligible rows delivered).
+- Fixed unscoped vault evidence admission so broad semantic-search chunks
+  without task marker scope IDs are retained as task-local evidence instead of
+  being dropped before description generation.
+- Preserved evidence excerpts and restored the shared `factsById` table in the
+  provider context envelope so the model receives full fact/evidence text, not
+  opaque IDs.
+- Removed artificial 8-item candidate shortlist clamps and relaxed material
+  closure pruning so supporting vault evidence is retained in the description
+  request.
+
+### Description generation quality and validation
+- Added an explicit system-prompt instruction forbidding the model from
+  repeating, paraphrasing, or restating the task title inside a description
+  (title-echo), with a concrete counter-example. Live validation confirmed a
+  fully green run (6/6 descriptions accepted, zero title-echo rejections, all
+  validation checks passing).
+- Aligned sentence validation with advisory execution details: a description
+  must select at least one execution detail rather than every candidate, and
+  unselected material facts no longer block acceptance.
+- Pinned the primary source note to citation (1) with supporting sources from
+  (2) in Notes-To-Todoist, and made the source-list renderer resilient to
+  citation-number/identity collisions (no longer wipes the Sources list).
+
+### Task generation and Todoist attribute handling
+- Associated marker-scope due dates, deadlines, and priorities with the owning
+  marker scope so they survive singleton scope filtering and populate the
+  provider contract's safe fields.
+- Relaxed over-constraining `safe_fields`/system instructions so the model may
+  apply configured date, priority, and label instructions to unconstrained
+  fields instead of being forced to `null`/defaults.
+- Fixed label-instruction allowlist normalization so plain-language label
+  settings no longer strip all model-generated labels (empty hashtag set was
+  treated as a strict allowlist).
+- Surfaced non-ISO natural timing phrases (e.g. "by end of August", "before the
+  July meeting", "next week", "ASAP") as content-only guidance in the provider
+  contract so the model can apply the user's configured date instructions to
+  derive due dates/deadlines, while the plugin still never invents or infers an
+  ISO date itself.
+
+### Documentation and packaging
+- Updated AGENTS.md and requirements.md to name
+  `Testing/Canadian Blood Services` as the live Obsidian testing vault and the
+  plugin install location.
+- Bumped version to 0.8.37 in manifest.json and versions.json.
+
 ## 0.8.36
 
 - Automatically repair missing canonical semantic-context fact/evidence links

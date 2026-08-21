@@ -38,9 +38,9 @@ The skill and its prompt templates live in
 ROLE each subagent plays; they deliberately omit a `model` field. Because opencode
 subagents without a `model` field inherit the model of the primary agent that
 invoked them, the dispatcher assigns the model dynamically: before dispatching a
-role, the primary session selects the highest-priority available model from §4 and
+role, the primary session selects the highest-priority available model from the model-selection skill and
 sets its session model to that pick — the role subagent then runs on it. This
-keeps model selection in one place (the §4 priority list) and makes every
+keeps model selection in one place (the model-selection skill's priority list) and makes every
 spawnable profile dynamic.
 
 ## 2. The per-task loop
@@ -99,7 +99,7 @@ many subagents as possible run concurrently.
   present or future. Different providers running a "Free" model CAN run in
   parallel because they are separate rate-limit buckets.
 - **Luna concurrency:** the OpenAI GPT 5.6 Luna agent supports **up to 4 parallel
-  instances** (§4, priority 5). Other agents default to 1 instance unless noted.
+  instances** (model-selection skill, priority 5). Other agents default to 1 instance unless noted.
 - Do not exceed 10 active subagents total. If work is waiting on the cap, dispatch
   the highest-priority work first.
 

@@ -10,7 +10,7 @@
   every agent through `opencode.json` `instructions` and is the complete
   subagent behavior contract. `AGENTS.md` covers how to call subagents
   correctly; it does not restate subagent behavior rules.
-- **The primary chat session is the orchestrator, planner, validator, and final
+- **The primary chat session is the orchestrator, planner, architect, validator, and final
   integrator.** It owns dispatching, coordinating, validating, and integrating all
   subagent work. It breaks work apart into modular, independent units, dispatches
   subagents to implement them, validates all results, and performs final
@@ -34,6 +34,7 @@
   "Free" may run at a time (present or future); different providers running
   "Free" models may run in parallel. The OpenAI GPT 5.6 Luna agent supports up to
   4 parallel instances.
+- **Project override for native superpowers SDD:** The native guidance to serialize implementation subagents does not apply when this project has established independent ownership. The primary may delegate multiple implementations concurrently, including disjoint sections of the same file, only after defining non-overlapping line ranges or symbols, required interfaces and context, merge order, and verification scope. Serialize shared or overlapping regions and unresolved interface dependencies. The primary remains the planner, architect, orchestrator, integrator, and final validator; subagents never coordinate or integrate their own work.
 - **The primary session optimizes for maximum subagent parallelism.** As
   orchestrator and planner, the primary session must structure every plan and
   dispatch to use the maximum feasible number of subagents, by modularizing and

@@ -5,8 +5,9 @@ It defines how the primary chat session dispatches, coordinates, and integrates 
 work of subagents, and — critically — **how to choose which model to dispatch for
 each delegated task**. Read it before dispatching any subagent.
 
-The skill and its prompt templates live in
-`.opencode/skills/subagent-driven-development/`. Supporting scripts there:
+The skill is superpowers' `subagent-driven-development` skill (provided by the
+superpowers plugin); its prompt templates and supporting scripts live in the
+plugin's skill directory. Supporting scripts:
 
 - `scripts/sdd-workspace PLAN_FILE` — resolve/create this plan's scratch directory.
 - `scripts/task-brief PLAN_FILE N` — extract Task N's full text into a brief file.

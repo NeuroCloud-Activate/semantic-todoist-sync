@@ -1,13 +1,10 @@
 # Subagent-Use Optimization Audit (superpowers skills)
 
-**Verdict:** Subagent use is largely well-optimized — fresh isolated subagents,
-review gates, explicit model selection, and the no-sub-subagents contract are
-strong in the core workflow — but parallel-dispatch discipline and the
-supporting (non-SDD) skills lag the project's 10-subagent max-parallelism goal.
+**Verdict:** Project guidance now optimizes subagent use for safe maximum parallelism: fresh isolated subagents, review gates, explicit model selection, and a project-wide override permit concurrent work with provably independent ownership. The native superpowers SDD file remains serial by default, but higher-priority project guidance governs every Superpowers skill and every OpenCode/OpenChamber dispatch function.
 
 | Skill | Fresh subagent | Parallel | Review gate | Explicit model | No sub-subagents |
 |---|---|---|---|---|---|
-| subagent-driven-development | Yes | Gap (sequential impl) | Yes (task+final) | Yes | Yes |
+| subagent-driven-development | Yes | Yes (project override) | Yes (task+final) | Yes | Yes |
 | dispatching-parallel-agents | Yes | Yes | Gap | Gap | Gap |
 | executing-plans | N/A (defers to SDD) | N/A | N/A | N/A | N/A |
 | requesting-code-review | Yes | N/A (single) | Yes (reviewer) | Gap | Gap |
@@ -25,14 +22,10 @@ supporting (non-SDD) skills lag the project's 10-subagent max-parallelism goal.
   redundant subagent machinery of its own.
 - **dispatching-parallel-agents** implements true parallel dispatch (multiple
   dispatches in one response) with focused, self-contained prompts.
+- **Project-wide safe-parallelism override** now permits concurrent implementation, including disjoint same-file sections, only with explicit ownership, context, merge order, and validation scope. The primary retains planning, architecture, orchestration, integration, and final validation.
 
 ## Recommended changes (concrete gaps)
-- **SDD forbids parallel implementation** ("never dispatch multiple
-  implementation subagents in parallel"). This under-uses the 10-agent cap and
-  conflicts with AGENTS.md's max-parallelism rule. Minimal fix: allow parallel
-  implementers only on provably disjoint file ranges with explicit line-range
-  ownership per dispatch (mirroring the AGENTS.md guidance), while keeping
-  single-dispatch for shared regions.
+- **Native SDD serial default:** the external plugin retains it, but project guidance now overrides it safely across every Superpowers/OpenCode/OpenChamber dispatch path. No plugin-cache edit is needed; keep the project rule current if superpowers changes its wording.
 - **dispatching-parallel-agents** lacks explicit model selection, a formal
   review gate, and a no-sub-subagents clause. Minimal fix: add a model-selection
   pointer and a "you do not dispatch subagents" line to its dispatch prompts, and
@@ -45,5 +38,4 @@ supporting (non-SDD) skills lag the project's 10-subagent max-parallelism goal.
   project's model-selection skill, not the plugin skills. Minimal fix: leave the
   cap project-owned (already correct) — no plugin change needed.
 
-**Overall:** Core workflow optimized; recommended fixes are small, additive
-edits to the parallel-dispatch and reviewer templates, not a redesign.
+**Overall:** Project-level subagent use is optimized for maximum safe parallelism; remaining upstream template gaps are governed by the project-wide dispatch rule rather than an unmaintainable plugin-cache fork.

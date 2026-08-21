@@ -62,6 +62,22 @@ it is not powerful enough for adversarial plan challenge.
   rate-limited model. Prefer spreading parallel free work across different
   providers so each free bucket stays under its own cap.
 
+## Safe maximum parallelism
+
+This project supersedes superpowers' native SDD instruction to serialize
+implementation subagents when work has independently provable ownership. Split
+work into modular units and dispatch the maximum feasible number concurrently,
+subject to the 10-agent and per-model limits above. Same-file delegation is
+allowed only when every subagent receives explicit non-overlapping line ranges or
+symbols, the minimal required context and interfaces, a stated merge order, and
+its verification scope. Serialize shared or overlapping regions and unresolved
+interface dependencies.
+
+The primary session remains the planner, architect, orchestrator, integrator of
+subagent work, and final validator. It checks ownership before dispatch,
+integrates all results, resolves conflicts, and validates the combined change;
+subagents never coordinate or integrate their own work.
+
 ## Dispatch procedure
 
 opencode: (1) pick the highest-priority available model above that fits the

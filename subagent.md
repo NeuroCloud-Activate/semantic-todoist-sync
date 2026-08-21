@@ -17,7 +17,7 @@ plugin's skill directory. Supporting scripts:
 
 ## 1. Roles
 
-- **Primary session (you): orchestrator, planner, validator, and final integrator.**
+- **Primary session (you): orchestrator, planner, architect, validator, and final integrator.**
   You break work apart, dispatch, coordinate, and validate. You never implement or
   fix in your own session — that pollutes your context and skips review. Your
   context stays clean for coordination. You remain the validator of all subagent
@@ -68,6 +68,8 @@ completely, refine or split the task before sending it out.
 time.** Use that budget. Break work apart into modular, independent segments so as
 many subagents as possible run concurrently.
 
+- **Project override for native superpowers SDD:** Its serial-implementation guidance is superseded here when ownership is independent. The primary may dispatch multiple implementers concurrently, including for disjoint sections of the same file, only after defining non-overlapping line ranges or symbols, interfaces and context each task needs, merge order, and verification scope. Serialize shared or overlapping regions and unresolved interface dependencies. The primary remains planner, architect, orchestrator, integrator, and final validator; subagents never coordinate or integrate their own work.
+
 - **The primary session optimizes for maximum subagent parallelism.** As
   orchestrator and planner, it structures every plan and dispatch to use the
   maximum feasible number of subagents by modularizing and sectioning work into
@@ -95,7 +97,7 @@ many subagents as possible run concurrently.
   sections (per task, per file region, per concern area) so as many reviewer
   sub-agents as possible run concurrently — maximizing throughput, accuracy, and
   bug reduction across both development and review.
-- **Free-model gate (see §6):** only one subagent instance of any single
+- **Free-model gate (see the model-selection skill):** only one subagent instance of any single
   `provider:model` whose name contains the word "Free" may run at any one time,
   present or future. Different providers running a "Free" model CAN run in
   parallel because they are separate rate-limit buckets.

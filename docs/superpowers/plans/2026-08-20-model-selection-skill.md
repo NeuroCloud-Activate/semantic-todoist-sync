@@ -108,6 +108,17 @@ default.
 openchamber: apply the same priority order when choosing the `model` parameter
 for a session dispatch.
 
+## Decision-making defaults
+
+Pose questions to the human only when absolutely necessary. By default, take the
+recommended approach and proceed, recording the decision as a `Ruling:` line in
+the plan ledger. The only cases that warrant a question are the four stop
+conditions from superpowers' subagent-driven-development skill: an irreversible
+or destructive operation; a security-sensitive action; a side effect outside the
+current worktree that norms say to ask about first (a merge, a push to a shared
+branch, a publish); and a plan so broken that every path forward is a guess. For
+everything else, decide, ledger the ruling, and keep moving.
+
 ## Primary-session planning emphasis
 
 The adversarial reviewer runs before dispatch as part of primary-session
@@ -328,3 +339,40 @@ Expected: no matches (after the deletions and edits above).
 - [ ] **Step 4: Report**
 
 Summarize: which files changed, the commit range, and the validation results. No commit in this task.
+
+---
+
+### Task 7: Audit superpowers' skills for subagent-use optimization across opencode functions
+
+**Files:**
+- Research only (read-only). Produces a report file at `docs/superpowers/audits/subagent-optimization-audit.md`.
+- Create (if empty): `docs/superpowers/audits/`
+
+**Interfaces:**
+- Consumes: the superpowers plugin skill tree under `C:\Users\MattS\.cache\opencode\packages\superpowers@git+https_\github.com\obra\superpowers.git\node_modules\superpowers\skills\`.
+
+**Goal:** Concisely review how superpowers' skills dispatch and use subagents across opencode's functions, and report whether subagent use is maximally optimized — with concrete findings and any minimal, high-value recommendations. Do not modify the superpowers plugin.
+
+- [ ] **Step 1: Inventory the skills that use subagents**
+
+List the skills under the superpowers plugin `skills/` directory. Identify which ones dispatch subagents (via the `task` tool or a Subagent template) — e.g. `subagent-driven-development`, `executing-plans`, `requesting-code-review`, `receiving-code-review`, `brainstorming`, `dispatching-parallel-agents`. Note for each whether it uses fresh subagents, parallel dispatch, task review gates, and explicit model selection.
+
+- [ ] **Step 2: Evaluate optimization across opencode functions**
+
+For each subagent-using skill, assess concisely:
+- Is a fresh subagent used per discrete unit of work (isolated context)?
+- Is independent work dispatched in parallel, up to the concurrency rules in the model-selection skill?
+- Is there a review gate after subagent work?
+- Is model selection explicit per dispatch (not silently inherited)?
+- Are subagents prevented from spawning their own sub-subagents?
+
+- [ ] **Step 3: Write the concise audit report**
+
+Write `docs/superpowers/audits/subagent-optimization-audit.md` with: a one-line summary verdict; a short table of each skill and its subagent-optimization status (Optimized / Gap); and a bulleted list of concrete gaps with minimal recommended fixes. Keep it under ~60 lines. Clearly separate "confirms already optimized" items from "recommended change" items.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docs/superpowers/audits/subagent-optimization-audit.md
+git commit -m "docs(audit): subagent-use optimization across superpowers skills"
+```

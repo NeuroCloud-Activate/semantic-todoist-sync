@@ -1,6 +1,6 @@
 ---
 name: model-selection
-description: Use when choosing which model to dispatch a subagent on, before any subagent dispatch in the superpowers subagent-driven-development workflow, and when selecting a model for openchamber session dispatches. Supplies the project's concrete model priority order, the adversarial-reviewer's dedicated model list, and the rate-limit/concurrency rules. Load before dispatching implementer, task-reviewer, re-reviewer, adversarial-reviewer, final-reviewer, researcher, or explorer.
+description: Use when choosing which model to dispatch a subagent on, before any subagent dispatch from superpowers or OpenCode, and when selecting a model for openchamber session dispatches. Supplies the project's concrete model priority order, the adversarial-reviewer's dedicated model list, and the rate-limit/concurrency rules. Load before dispatching implementer, task-reviewer, re-reviewer, adversarial-reviewer, final-reviewer, researcher, or explorer.
 ---
 
 # Model Selection
@@ -63,6 +63,8 @@ it is not powerful enough for adversarial plan challenge.
   providers so each free bucket stays under its own cap.
 
 ## Safe maximum parallelism
+
+This rule applies to every Superpowers skill and every OpenCode/OpenChamber dispatch function.
 
 This project supersedes superpowers' native SDD instruction to serialize
 implementation subagents when work has independently provable ownership. Split

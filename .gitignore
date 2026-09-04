@@ -83,3 +83,11 @@ scripts/task-generation-live-batch-plan-integration-test.js
 requirements.md
 publishing.md
 subagent-rules.md
+
+# Private dev scaffolding (excluded from published set; kept on local disk only)
+# See publishing.md: only the public-share allowlist is committed/released.
+.opencode/
+AGENTS.md
+subagent.md
+SECURITY.md
+PUBLIC-SHARE-MANIFEST.json

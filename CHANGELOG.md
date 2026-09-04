@@ -54,6 +54,23 @@
   plugin install location.
 - Bumped version to 0.8.37 in manifest.json and versions.json.
 
+### Product contract — diagnostics-guided relative optimization
+- Replaced fixed 20 ms routing and 400 ms complete-retrieval ceilings with
+  relative plugin-controlled duration assessed from timestamps on normal
+  diagnostic activity boundaries for equivalent inputs; provider/model time is
+  opaque and excluded via existing gateway brackets.
+- Removed benchmark harness, repeated fixture run, and platform timing-campaign
+  requirements; built-in final workflow outputs and the opt-in 128-record
+  diagnostic ring are authoritative.
+- Functional validation for this optimization uses the synchronized
+  `Testing/Canadian Blood Services` vault, its Live Semantic Index, and normal
+  Obsidian workflows; no local, synthetic, or harness substitute establishes
+  functional validity. Unrelated product-level validation requirements outside
+  this plan are preserved.
+- Preserved accuracy-first, semantic completeness, local-only retrieval,
+  prepared-view reuse, and functional support on desktop, iPhone, and iPad;
+  only platform-specific timing validation removed.
+
 ## 0.8.36
 
 - Automatically repair missing canonical semantic-context fact/evidence links

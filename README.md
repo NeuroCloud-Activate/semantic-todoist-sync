@@ -94,6 +94,14 @@ after you select `Apply`, and the last applied schedule can be undone.
   device. Todoist receives task fields only when you use Todoist workflows.
 - The plugin does not create a hosted account or require a single AI vendor.
 
+Latency is assessed as relative plugin-controlled duration from timestamps on
+normal diagnostic activity boundaries for equivalent inputs; provider and model
+time is opaque and excluded via the existing gateway bracket. Built-in final
+workflow outputs and the opt-in diagnostic ring are authoritative, and accuracy
+and semantic completeness remain stronger than latency. Functional support on
+desktop, iPhone, and iPad is preserved; only platform-specific timing validation
+is removed.
+
 ## Top five quality models from completed testing
 
 This ranking retains only configurations marked `completed` with all expected

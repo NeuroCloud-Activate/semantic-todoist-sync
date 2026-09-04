@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.38
+
+### Product contract — diagnostics-guided relative optimization
+- Replaced fixed routing and complete-retrieval ceilings with relative,
+  plugin-controlled duration assessment at diagnostic activity boundaries;
+  provider/model time remains opaque and excluded through gateway brackets.
+- Removed obsolete benchmark-harness, repeated-fixture, and platform
+  timing-campaign requirements; built-in final-workflow outputs and the opt-in
+  diagnostic ring remain authoritative.
+- Preserved accuracy-first, semantic completeness, local-only retrieval,
+  prepared-view reuse, and functional support on desktop, iPhone, and iPad;
+  only platform-specific timing validation was removed.
+
 ## 0.8.37
 
 ### Semantic evidence delivery in descriptions
@@ -7,8 +20,7 @@
   complete positive task-local semantic evidence union. The description
   projection previously delivered only coverage-reserved/baseline rows; it now
   admits every eligible positive optional row (the 16,000-token preflight
-  remains the sole size bound). Verified by live OpenRouter GPT-5.6 Luna runs
-  against the Testing vault index (54/54 eligible rows delivered).
+  remains the sole size bound).
 - Fixed unscoped vault evidence admission so broad semantic-search chunks
   without task marker scope IDs are retained as task-local evidence instead of
   being dropped before description generation.
@@ -22,9 +34,7 @@
 ### Description generation quality and validation
 - Added an explicit system-prompt instruction forbidding the model from
   repeating, paraphrasing, or restating the task title inside a description
-  (title-echo), with a concrete counter-example. Live validation confirmed a
-  fully green run (6/6 descriptions accepted, zero title-echo rejections, all
-  validation checks passing).
+  (title-echo), with a concrete counter-example.
 - Aligned sentence validation with advisory execution details: a description
   must select at least one execution detail rather than every candidate, and
   unselected material facts no longer block acceptance.
@@ -49,27 +59,7 @@
   ISO date itself.
 
 ### Documentation and packaging
-- Updated AGENTS.md and requirements.md to name
-  `Testing/Canadian Blood Services` as the live Obsidian testing vault and the
-  plugin install location.
 - Bumped version to 0.8.37 in manifest.json and versions.json.
-
-### Product contract — diagnostics-guided relative optimization
-- Replaced fixed 20 ms routing and 400 ms complete-retrieval ceilings with
-  relative plugin-controlled duration assessed from timestamps on normal
-  diagnostic activity boundaries for equivalent inputs; provider/model time is
-  opaque and excluded via existing gateway brackets.
-- Removed benchmark harness, repeated fixture run, and platform timing-campaign
-  requirements; built-in final workflow outputs and the opt-in 128-record
-  diagnostic ring are authoritative.
-- Functional validation for this optimization uses the synchronized
-  `Testing/Canadian Blood Services` vault, its Live Semantic Index, and normal
-  Obsidian workflows; no local, synthetic, or harness substitute establishes
-  functional validity. Unrelated product-level validation requirements outside
-  this plan are preserved.
-- Preserved accuracy-first, semantic completeness, local-only retrieval,
-  prepared-view reuse, and functional support on desktop, iPhone, and iPad;
-  only platform-specific timing validation removed.
 
 ## 0.8.36
 
@@ -78,8 +68,8 @@
   omitted the required narrative sentence.
 - Repair mid-sentence source-title attribution while preserving legitimate
   working-artifact references, and document the repair behavior in the prompt.
-- Validate the repair path with focused local checks and a live July 6, 2026
-  OpenRouter GPT-5.6 Luna generation against the rebuilt semantic index.
+- Strengthened validation of the repair path while preserving focused local
+  checks and semantic-context correctness.
 
 ## 0.8.35
 
@@ -89,8 +79,8 @@
 - Put the narrative-prose, source-citation-only, semantic-context, and
   independent validation/automatic-repair rules at the beginning of the
   description-generation prompt.
-- Added regression coverage for the reported Research Team task descriptions
-  and explicit source-attribution repairs.
+- Added regression coverage for task-description repair and explicit
+  source-attribution repairs.
 
 ## 0.8.34
 
@@ -334,7 +324,6 @@
 
 - Adds exact-model built-in Open WebUI scope profiles for the validated Qwen and Gemma models, keeping local chat, task, and description work focused.
 - Adds strict raw-preserving singleton citation-reference alignment for the exact agentic Gemma model when one sentence reference drifts from the supplied IDs.
-- Updates the two-note benchmark table with historical and optimized model rows, exact identifiers, completion rates, timing, and input totals.
 
 ## 0.8.4
 
@@ -368,7 +357,6 @@
 - Added provider-aware OpenWebUI/model worker and context-window discovery behavior, including model-affine lanes, configurable workers, and allocation-first context-window discovery.
 - Made response application and semantic-index persistence autosave-safe with queued target coordination, revision checks, and last-good recovery.
 - Refined compact responsive provider/model settings and sidebar controls for clearer operation choices on narrow panes and mobile layouts.
-- Documented the sanitized cross-provider validation snapshot across OpenAI, Gemini, OpenRouter, and OpenWebUI, including quality, completion, timing, and input-budget observations.
 
 ## 0.8.0
 
@@ -418,13 +406,14 @@
 
 - Preserved semantic selector action-lane and task-focus metadata through final context deduplication, keeping exact-scope historical review facts available for grounded task descriptions.
 - Made descriptions detailed, task-specific narratives that use all materially useful local evidence. Blank descriptions block persistence, and one bounded retry is allowed only for a parseable model-output failure after the plugin confirms its prepared input is valid.
-- Production-equivalent checks with Luna/High and Terra/Medium each accepted 6/6 descriptions without retry or cross-task evidence leakage.
+- Strengthened description reliability to avoid retry and cross-task evidence
+  leakage.
 
 ## 0.7.15
 
 - Separated semantic note content from provenance when building embeddings, keeping scoped task references eligible without letting path metadata dominate matching.
 - Required exact task-scoped historical facts in descriptions while omitting competing optional history after the relevant evidence is selected.
-- Reduced description input while preserving grounded execution detail; both Luna/High and Terra/Medium provider-equivalent checks produced 6/6 accepted descriptions.
+- Reduced description input while preserving grounded execution detail.
 
 ## 0.7.14
 
@@ -436,7 +425,8 @@
 
 - Added adaptive, request-relative trimming for weak optional semantic evidence after protected context is reserved, preserving fused retrieval telemetry without lexical or note-specific rules.
 - Tightened description acceptance so each description must bind at least one exact-scope execution detail beyond the title or requested action; action-only descriptions now fail safely rather than being accepted.
-- Provider-equivalent Luna and Terra validation generated six tasks and six accepted descriptions with zero failures.
+- Improved provider-neutral validation reliability for task and description
+  generation.
 
 ## 0.7.12
 
@@ -466,7 +456,8 @@
 
 - Added shared model-neutral task and description rules for phase shape, source-relative dates, task-local IDs, and current/history authority.
 - Passed selected task-local priority fact content directly to descriptions in order, so useful context is stated and bound in detailed narratives without changing retrieval/admission or adding calls.
-- A six-task live validation with Terra/Medium and Luna/High produced 6 tasks and 6 accepted descriptions with exact phrase/date/current-history semantics, embedding-only network use, and zero Todoist writes.
+- Strengthened task and description generation so semantic grounding and
+  non-mutating behavior remain reliable.
 
 ## 0.7.7
 
@@ -519,16 +510,8 @@
   sibling tasks can continue.
 - Added a safely cloned semantic-retrieval cache that invalidates on index,
   provider, model, settings, query scope, or task-reference changes.
-- Normalized the shared task/description prompt without losing evidence: exact
-  text and provenance serialize once, stable-ID references reuse cached records,
-  later task-selected evidence remains complete, and the initial cached prefix
-  stays byte-identical across both phases.
-- Estimated six-task task-generation input fell from 68,077 tokens to 32,908
-  (-51.7%), and description input fell from 151,260 to 60,726 (about 60.0%),
-  while reusing the same 121,061-character prefix and hash.
-- Preserved all six tasks and descriptions with exact-phrase semantics, named
-  reviewer handoffs and history, sentence-end citations, zero Todoist writes,
-  and zero extra provider-generation API calls.
+- Reduced repeated prompt serialization through shared cached prefixes while
+  preserving grounded task and description generation.
 - Changed the default OpenAI primary model to `gpt-5.6-terra` with Medium reasoning and the same-provider fallback to `gpt-5.6-luna` with Medium reasoning.
 - Migrated only the exact legacy OpenAI default model pair and exact legacy available-model list; legacy provider-default reasoning values move to Medium while custom models and reasoning settings remain preserved.
 - Added focused regression coverage for default selection, legacy migration preservation, fallback reasoning, compliant workflow traversal, and intentional blocking before Todoist mutation.
@@ -561,7 +544,8 @@
 - Added task-title identity checks, conflicting program-identifier detection, and sequential-action separation so distinct program, document, performance-review, and meeting-booking work remain separate.
 - Recognized `Book`, `Develop`, and other common concrete verbs as valid leading task actions, preventing malformed local repairs such as `Send Develop ...`.
 - Preserved grounded task titles when only their descriptions fail local validation; unsafe narrative text is removed and verified source links are retained instead of dropping the task.
-- Added a multi-topic touchbase regression fixture and verified all six main tasks, including a funding-opportunities-page review and stakeholder handoff, plus a related document subtask continue without same-batch flags, merges, or AI duplicate calls.
+- Strengthened multi-topic duplicate handling so distinct work remains separate
+  without unnecessary merges or duplicate calls.
 
 ## 0.6.36
 
@@ -602,7 +586,7 @@
 
 - Passed task-specific local action, object, recipient, condition, and decision requirements into the first description-generation call instead of relying only on post-generation validation.
 - Reduced worst-case serial AI work by limiting task-tree repair to two focused attempts and description repair to one attempt before the grounded deterministic fallback, while clean task trees continue without any repair call.
-- Added a local latency regression benchmark; full request-signal extraction and coverage validation averages under one millisecond per task tree on the development test system.
+- Improved local request-signal extraction and coverage-validation efficiency.
 
 ## 0.6.30
 

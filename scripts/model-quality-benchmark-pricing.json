@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "rates": [
+    {
+      "provider": "gemini",
+      "model": "gemini-3.7-flash",
+      "input_usd_per_million_tokens": 0.75,
+      "output_usd_per_million_tokens": 3.75,
+      "currency": "USD",
+      "pricing_tier": "standard-paid",
+      "effective_through": "2026-12-31",
+      "output_includes": "thinking",
+      "source_url": "https://cloud.google.com/vertex-ai/generative-ai/pricing"
+    }
+  ]
+}

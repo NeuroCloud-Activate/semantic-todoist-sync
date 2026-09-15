@@ -79,6 +79,7 @@ live-*.md
 plan-*.md
 root-*.md
 scripts/*.json
+!/scripts/model-quality-benchmark-pricing.json
 scripts/semantic-workflow-quality-*
 scripts/task-generation-live-batch-plan-integration-test.js
 # Core private contract docs (not published per publishing.md)

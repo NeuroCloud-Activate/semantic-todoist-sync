@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.39
+
+### Provider choice and compatibility
+- Added first-class Custom OpenAI-compatible endpoints and OpenCode Go
+  generation routing while keeping embeddings provider-scoped and structured
+  workflows fail-closed.
+- Improved provider capability handling, bounded recovery, request accounting,
+  and provider-settings navigation across supported services.
+
+### Grounded context and task reliability
+- Canonicalized evidence delivery and citations so repeated content is compact
+  without losing source membership, relevance, or traceability.
+- Added bounded batched task-title generation with isolated per-task recovery,
+  deterministic scope closure, and protected task-description handoff.
+- Strengthened prepared semantic views, startup/background coordination, cache
+  bounds, and content-free runtime diagnostics.
+
+### Publishing compliance
+- Renamed the Sync Notes command's internal ID to comply with Obsidian command
+  registration guidance. Existing custom hotkeys for that command may need to
+  be assigned again.
+- Expanded public account, cost, network, and privacy disclosures and removed
+  the obsolete separate publication-staging workflow.
+
 ## 0.8.38
 
 ### Product contract — diagnostics-guided relative optimization

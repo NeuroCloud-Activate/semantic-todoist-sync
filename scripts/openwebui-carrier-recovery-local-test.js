@@ -217,6 +217,30 @@ const conversationSchema = gateway.chatResponseSchema(1, [], "conversation");
 assert(conversationSchema.properties.claims.items.properties.evidence_ids.maxItems === 1, "A provider-compatible conversation schema must also avoid maxItems zero.");
 assert(!groundedWebSchema.properties.claims.items.properties.category.enum.includes("conversation"), "Evidence-grounded chat schemas must not advertise the citation-free conversation category.");
 assert(JSON.stringify(conversationSchema.properties.claims.items.properties.category.enum) === JSON.stringify(["conversation"]), "Standalone conversation schemas must retain their dedicated citation-free category.");
+assert(typeof gateway.normalizeChatEvidencePayload === "function", "The production chat normalization boundary must be available to focused contract tests.");
+const duplicateAllowedClaim = {
+  claims: [{
+    text: "Grounded facts retain distinct citations in first-use order.",
+    established: true,
+    evidence_ids: ["evidence-a", "evidence-b", "evidence-a"],
+    category: "fact"
+  }]
+};
+const deduplicatedAllowedClaim = gateway.normalizeChatEvidencePayload(duplicateAllowedClaim, { allowedEvidenceIds: ["evidence-a", "evidence-b"] });
+assert(JSON.stringify(deduplicatedAllowedClaim.value.claims[0].evidence_ids) === JSON.stringify(["evidence-a", "evidence-b"]), "Repeated allowed chat evidence IDs must collapse in first-use order.");
+assert(JSON.stringify(duplicateAllowedClaim.claims[0].evidence_ids) === JSON.stringify(["evidence-a", "evidence-b", "evidence-a"]), "Bounded chat normalization must not mutate the raw parsed provider payload.");
+assert(deduplicatedAllowedClaim.corrections.some((item) => item.reasonCode === "chat-evidence-ids-deduplicated" && item.claimIndex === 0 && item.removedCount === 1), "Ordered evidence-ID deduplication must emit bounded content-free correction metadata.");
+assert(gateway.validateChatEvidencePayload(deduplicatedAllowedClaim.value, { allowedEvidenceIds: ["evidence-a", "evidence-b"] }).valid === true, "A losslessly deduplicated grounded claim must pass the unchanged validator.");
+const overCapDuplicateIds = Array.from({ length: 16 }, (_, index) => `evidence-${index + 1}`).concat("evidence-1");
+const overCapDuplicateClaim = gateway.normalizeChatEvidencePayload({ claims: [{ text: "Over-cap grounded claim.", established: true, evidence_ids: overCapDuplicateIds, category: "fact" }] }, { allowedEvidenceIds: overCapDuplicateIds });
+assert(JSON.stringify(overCapDuplicateClaim.value.claims[0].evidence_ids) === JSON.stringify(overCapDuplicateIds), "Raw over-cap evidence arrays must remain unchanged rather than becoming valid through deduplication.");
+assert(!overCapDuplicateClaim.corrections.some((item) => item.reasonCode === "chat-evidence-ids-deduplicated"), "Over-cap evidence arrays must not report a deduplication correction.");
+const overCapDuplicateValidation = gateway.validateChatEvidencePayload(overCapDuplicateClaim.value, { allowedEvidenceIds: overCapDuplicateIds });
+assert(overCapDuplicateValidation.reasons.includes("claim-1-evidence-ids-invalid") && overCapDuplicateValidation.reasons.includes("claim-1-evidence-ids-duplicate"), "The unchanged validator must continue rejecting over-cap duplicate evidence arrays.");
+const unsupportedDuplicateClaim = gateway.normalizeChatEvidencePayload({ claims: [{ text: "Unsupported shape.", established: false, evidence_ids: ["evidence-a", "evidence-a"], category: "unsupported" }] }, { allowedEvidenceIds: ["evidence-a"] });
+assert(!unsupportedDuplicateClaim.corrections.some((item) => item.reasonCode === "chat-evidence-ids-deduplicated") && gateway.validateChatEvidencePayload(unsupportedDuplicateClaim.value, { allowedEvidenceIds: ["evidence-a"] }).valid === false, "Unestablished claims with duplicate evidence must remain terminal rather than being normalized.");
+const conversationDuplicateClaim = gateway.normalizeChatEvidencePayload({ claims: [{ text: "Conversation shape.", established: false, evidence_ids: ["evidence-a", "evidence-a"], category: "conversation" }] });
+assert(!conversationDuplicateClaim.corrections.some((item) => item.reasonCode === "chat-evidence-ids-deduplicated") && gateway.validateChatEvidencePayload(conversationDuplicateClaim.value, { mode: "conversation" }).valid === false, "Conversation claims carrying duplicate evidence must remain terminal.");
 const overBoundChat = gateway.normalizeChatEvidencePayloadForValidation(JSON.stringify({
   claims: [1, 2, 3, 4].map((index) => ({
     text: `Supported fact ${index}.`,

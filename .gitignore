@@ -60,6 +60,8 @@ task-generation-live-result.json
 *.log
 scripts/*-local-test*.js
 scripts/sync-live-validation-vault.js
+/scripts/custom-openai-compatible-provider-benchmark.js
+/docs/obsidian-task-generation-performance-report-2026-09-06.md
 *.bak
 main_*.js
 main_diff.txt
@@ -84,10 +86,8 @@ requirements.md
 publishing.md
 subagent-rules.md
 
-# Private dev scaffolding (excluded from published set; kept on local disk only)
-# See publishing.md: only the public-share allowlist is committed/released.
+# Private development scaffolding excluded from the public main branch
 .opencode/
 AGENTS.md
 subagent.md
-SECURITY.md
 PUBLIC-SHARE-MANIFEST.json

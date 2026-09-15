@@ -89,7 +89,7 @@ const LOCAL_SEMANTIC_ROUTING_MAX_ID_VALUES = 32;
 const LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE = "semantic-index-routing.json";
 const SEMANTIC_INDEX_PARTITION_ROOT = "index";
 const SEMANTIC_INDEX_PARTITION_IDENTITY_VERSION = 1;
-const SEMANTIC_INDEX_PARTITION_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui"]);
+const SEMANTIC_INDEX_PARTITION_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai"]);
 // Canonical corpus-preparation-policy version. The prepared view identity
 // includes this so a change to the corpus-preparation policy invalidates warm
 // reuse rather than silently reusing a view prepared under an older policy.
@@ -101,7 +101,8 @@ function semanticIndexProviderManifestCandidates(provider = "") {
     openai: [OPENAI_SEMANTIC_INDEX_FILE, SEMANTIC_INDEX_FILE],
     gemini: [GEMINI_SEMANTIC_INDEX_FILE, SEMANTIC_INDEX_FILE],
     openrouter: ["semantic-index.openrouter.json", "semantic-index.multi-provider.openrouter.json", SEMANTIC_INDEX_FILE],
-    openwebui: ["semantic-index.openwebui.json", "semantic-index.multi-provider.openwebui.json", SEMANTIC_INDEX_FILE]
+    openwebui: ["semantic-index.openwebui.json", "semantic-index.multi-provider.openwebui.json", SEMANTIC_INDEX_FILE],
+    customopenai: ["semantic-index.customopenai.json", SEMANTIC_INDEX_FILE]
   };
   return uniqueValues(byProvider[normalized] || [SEMANTIC_INDEX_FILE]);
 }
@@ -3011,9 +3012,17 @@ function buildSemanticIndexPreparedView(identity, canonicalChunks, routingInputs
   const preparedViewBytes = measurePreparedMetadata(eligibleChunks);
   const metadataBound = PREPARED_VIEW_METADATA_BOUND;
   const frozenIdentity = Object.freeze(Object.assign({}, identity));
+  const todoistInventoryCandidateChunks = Object.freeze(eligibleChunks.filter((chunk) => {
+    const sourceKind = semanticChunkSourceKind(chunk);
+    if (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record") return true;
+    if (sourceKind !== "note-task-reference-row") return false;
+    const records = chunk && chunk.sourceRecords;
+    return Array.isArray(records) && records.some((record) => record && record.relation === "canonicalized-snapshot-source");
+  }));
   return Object.freeze({
     identity: frozenIdentity,
     eligibleChunks,
+    todoistInventoryCandidateChunks,
     evidenceLookup,
     integrity,
     hierarchy,
@@ -3308,8 +3317,8 @@ const DEFAULT_SETTINGS = {
   availableOpenCodeGoModels: [],
   opencodeGoModelMetadata: {},
   opencodeGoModelsFetchedAt: "",
-  manualProviderGenerationModels: { openai: [], gemini: [], openrouter: ["openrouter/free"], openwebui: [], opencodego: [] },
-  manualProviderEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], opencodego: [] },
+  manualProviderGenerationModels: { openai: [], gemini: [], openrouter: ["openrouter/free"], openwebui: [], customopenai: [], opencodego: [] },
+  manualProviderEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [], opencodego: [] },
   openwebuiBaseUrl: "",
   openwebuiAuthMode: "api-key",
   openwebuiApiKey: "",
@@ -3329,6 +3338,12 @@ const DEFAULT_SETTINGS = {
   openwebuiModelConcurrencyLimits: {},
   openwebuiWorkerCount: 1,
   openwebuiModelsFetchedAt: "",
+  customOpenAIBaseUrl: "",
+  customOpenAIAllowInsecureHttp: false,
+  customOpenAIApiKey: "",
+  availableCustomOpenAIModels: [],
+  customOpenAIModelMetadata: {},
+  customOpenAIModelsFetchedAt: "",
   // Discovery APIs do not expose the same model capabilities. Keep provider
   // metadata separate so limits are never inferred across providers.
   openaiModelMetadata: {},
@@ -3795,7 +3810,7 @@ function taskDescriptionSystemInstruction() {
     TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
     TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
     "Treat the current source direction and current-source evidence as authoritative. Preserve epistemic state, named people, recipients, decisions, criteria, chronology, and actor-specific handoffs exactly; never invent or strengthen facts, and never narrate completion, result, handoff, batching, task order, or workflow mechanics.",
-    "Use only canonicalLedger: its task identity, closure reference arrays, compact executionCandidatesByFactId table, bindingsByFactId, and citationsByEvidenceId ledger, with shared-prefix factsById/evidenceById as the canonical fallback. Never borrow neighboring task IDs, scopes, evidence, or facts.",
+    "Use the complete task-local factsById, evidenceById, and citationLedgerByTask tables in the variable suffix as the evidence authority. The canonicalLedger identifies this task and its allowed references. executionCandidatesByFactId is an optional reading aid, not an exhaustive list. Preserve relevant facts from the full tables even when they are not repeated in that aid. Never borrow another task's facts or scope.",
     "State accepted facts directly and never refer to provided, supplied, input, source, context, context notes, or evidence containers. Return exact task-local evidence_ids and fact_refs for every fact stated; prose is citation-marker-free, and the plugin resolves canonical bindings and renders numbered citations locally.",
     TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE,
     "Do not return fact_bindings, required-current scalars, or structural metadata beyond task_id, scope_id, description_sentences, evidence_ids, and fact_refs; the plugin owns those fields after strict acceptance."
@@ -3947,16 +3962,33 @@ function boundedRuntimeConcurrency(value, fallback, maximum) {
 }
 
 function taskDescriptionProviderConcurrency(settings, provider, model) {
-  const normalizedProvider = String(provider || "").trim().toLowerCase();
+  const rawProvider = String(provider || "").trim().toLowerCase();
+  const normalizedProvider = rawProvider;
+  const customProvider = rawProvider.replace(/[-_\s]/g, "");
   if (normalizedProvider === "openwebui") {
     return STS_MULTI_PROVIDER.openWebUIModelConcurrencyLimit(settings, model);
+  }
+  if (customProvider === "customopenai" || customProvider === "openaicompatible") {
+    const limits = normalizeAiModelConcurrencyLimits(settings?.aiModelConcurrencyLimits);
+    const normalizedModel = String(model || "").trim().toLowerCase()
+      .replace(/^(?:customopenai|custom-openai|openai-compatible)[:/]/, "");
+    return limits[`customopenai:${normalizedModel}`] || limits.customopenai || 1;
   }
   const base = boundedRuntimeConcurrency(
     settings?.aiModelConcurrency,
     AI_MODEL_CONCURRENCY_DEFAULT,
     AI_MODEL_CONCURRENCY_MAX
   );
+  if (normalizedProvider === "openai") return Math.min(base, 2);
   return normalizedProvider === "openrouter" ? Math.min(base, 3) : base;
+}
+
+async function taskGenerationRunInitialBatchWorkers(runBatch, workerCount, batchCount, workflowToken = null) {
+  const total = Math.max(0, Math.round(Number(batchCount) || 0));
+  if (!total) return 0;
+  const count = Math.max(1, Math.min(total, Math.round(Number(workerCount) || 1)));
+  await Promise.all(Array.from({ length: count }, () => runBatch(workflowToken)));
+  return count;
 }
 
 function openRouterEffectiveReasoningEffort(model, effort) {
@@ -4342,6 +4374,19 @@ class SemanticRuntimeCache extends Map {
     }
     const genStr = (generation !== undefined && generation !== null && generation !== "") ? String(generation) : null;
     if (genStr !== null) {
+      if (this._currentGeneration !== undefined && String(this._currentGeneration) !== genStr) {
+        for (const existingKey of Array.from(super.keys())) {
+          const existingGeneration = this._generationByKey.get(existingKey);
+          if (existingGeneration === undefined || String(existingGeneration) === genStr || this._isPinned(existingKey)) continue;
+          const existingBytes = this._bytesByKey.get(existingKey);
+          if (existingBytes !== undefined) this._totalBytes -= existingBytes;
+          this._bytesByKey.delete(existingKey);
+          this._generationByKey.delete(existingKey);
+          this._pinCountByKey.delete(existingKey);
+          super.delete(existingKey);
+          this._evictions += 1;
+        }
+      }
       this._currentGeneration = genStr;
     }
     const oldExists = super.has(key);
@@ -4660,12 +4705,18 @@ class RuntimeWorkCoordinator {
   }
 
   _providerConcurrency(provider, model) {
-    const normalizedProvider = String(provider || "").trim().toLowerCase() || "provider";
+    const rawProvider = String(provider || "").trim().toLowerCase();
+    const normalizedProvider = rawProvider || "provider";
+    const customProvider = rawProvider.replace(/[-_\s]/g, "");
     const normalizedModel = String(model || "").trim().toLowerCase();
     if (normalizedProvider === "openwebui" && typeof STS_MULTI_PROVIDER?.openWebUIModelConcurrencyLimit === "function") {
       return STS_MULTI_PROVIDER.openWebUIModelConcurrencyLimit(this.settings(), normalizedModel);
     }
     const limits = normalizeAiModelConcurrencyLimits(this.settings().aiModelConcurrencyLimits);
+    if (customProvider === "customopenai" || customProvider === "openaicompatible") {
+      const customModel = normalizedModel.replace(/^(?:customopenai|custom-openai|openai-compatible)[:/]/, "");
+      return limits[`customopenai:${customModel}`] || limits.customopenai || 1;
+    }
     return limits[`${normalizedProvider}:${normalizedModel}`] || limits[normalizedProvider] || boundedRuntimeConcurrency(this.settings().aiModelConcurrency, AI_MODEL_CONCURRENCY_DEFAULT, AI_MODEL_CONCURRENCY_MAX);
   }
 
@@ -5163,7 +5214,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-note-to-tasks", name: "Create Todoist tasks from active note", callback: () => this.createTasksFromActiveNote() });
     this.addCommand({ id: "semantic-todoist-schedule-today", name: "Schedule today's tasks", callback: () => this.openScheduleTodayPreview() });
     this.addCommand({ id: "semantic-todoist-undo-schedule-today", name: "Undo last schedule today apply", callback: () => this.undoLastScheduleToday(true) });
-    this.addCommand({ id: "semantic-todoist-sync-notes", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
+    this.addCommand({ id: "sync-notes", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
     this.addCommand({ id: "semantic-todoist-rebuild-references", name: "Rebuild local Todoist reference table", callback: () => this.rebuildTodoistReferenceTable(true) });
     this.addCommand({ id: "semantic-todoist-repair-subtask-indentation", name: "Repair synced subtask indentation", callback: () => this.repairCachedSubtaskIndentation(true, { force: true, scanAll: true }) });
     // Startup compatibility is intentionally launched asynchronously after
@@ -5472,7 +5523,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const currentMeta = this.settings?.semanticIndexMeta || {};
     const currentProvider = semanticIndexPartitionProvider(currentMeta.provider || "");
     const currentModel = semanticIndexPartitionModel(currentProvider, currentMeta.model || "");
-    if (currentMeta.provider && currentMeta.model && currentProvider === expected.provider && modelIdentity(currentModel) === modelIdentity(expected.model)) return expected;
+    let currentIdentityMatches = true;
+    if (currentMeta.partitionIdentityHash) {
+      try {
+        const currentIdentity = semanticIndexPartitionContract(this.settings, {
+          provider: currentProvider,
+          model: currentModel,
+          meta: currentMeta,
+          baseUrl: currentMeta.baseUrl,
+          actualDimension: currentMeta.actualDimension || currentMeta.dimension,
+          configuredDimension: currentMeta.configuredDimension || currentMeta.targetDimension || 0
+        });
+        currentIdentityMatches = String(currentIdentity.identityHash) === String(currentMeta.partitionIdentityHash);
+      } catch { currentIdentityMatches = false; }
+    }
+    if (currentMeta.provider && currentMeta.model && currentProvider === expected.provider && modelIdentity(currentModel) === modelIdentity(expected.model) && currentIdentityMatches) return expected;
     const providerDir = `${this.manifest.dir}/${expected.providerDir}`;
     let listed;
     try { listed = await adapter.list(providerDir); } catch { return expected; }
@@ -5730,10 +5795,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const candidates = uniqueValues([
       this.semanticIndexFileName?.(),
       SEMANTIC_INDEX_FILE,
-      OPENAI_SEMANTIC_INDEX_FILE,
-      GEMINI_SEMANTIC_INDEX_FILE,
-      canonicalManifestFile("openrouter", "semantic-index.openrouter.json"),
-      canonicalManifestFile("openwebui", "semantic-index.openwebui.json")
+       OPENAI_SEMANTIC_INDEX_FILE,
+       GEMINI_SEMANTIC_INDEX_FILE,
+       canonicalManifestFile("openrouter", "semantic-index.openrouter.json"),
+       canonicalManifestFile("openwebui", "semantic-index.openwebui.json"),
+       canonicalManifestFile("customopenai", "semantic-index.customopenai.json")
     ].filter(Boolean));
     for (const indexFile of candidates) {
       const raw = await readLegacy(indexFile);
@@ -6467,13 +6533,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const fingerprint = this.taskReferenceIndex.fingerprint || taskReferencePayloadFingerprint(this.settings);
     if (!this.taskReferenceSnapshotDirty && fingerprint === this.taskReferenceSnapshotFingerprint) return false;
     const generation = taskReferenceGenerationToken(fingerprint);
+    const priorSnapshotMeta = this.settings.taskReferenceSnapshotMeta || {};
+    const remoteTaskCount = Number(priorSnapshotMeta.remoteTaskCount);
+    const taskCount = Object.keys(this.settings.taskCache || {}).length;
+    const completePopulationScope = priorSnapshotMeta.populationScope === "complete-current-non-deleted-todoist"
+      && Number.isFinite(remoteTaskCount) && remoteTaskCount >= 0 && remoteTaskCount === taskCount;
     const meta = {
       version: TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION,
       persistenceSchemaVersion: TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION,
       generation,
       updatedAt: deviceTimestamp(),
       fingerprint,
-      taskCount: Object.keys(this.settings.taskCache || {}).length,
+      taskCount,
+      populationScope: completePopulationScope ? priorSnapshotMeta.populationScope : "",
+      remoteTaskCount: completePopulationScope ? remoteTaskCount : null,
       pendingReferenceCount: Object.keys(this.settings.pendingTaskReferences || {}).length,
       pendingDescriptionCount: Object.keys(this.settings.pendingTaskDescriptions || {}).length
     };
@@ -6765,7 +6838,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       && STS_MULTI_PROVIDER.OPERATION_KEYS.some((operation) => [
         STS_MULTI_PROVIDER.operationModelReference(this.settings, operation)?.primary?.provider,
         STS_MULTI_PROVIDER.embeddingModelReference(this.settings)?.provider
-      ].some((provider) => ["openrouter", "openwebui"].includes(provider)));
+      ].some((provider) => ["openrouter", "openwebui", "customopenai"].includes(provider)));
     const normalizedTaskSectionTitleMode = normalizeTaskSectionTitleMode(this.settings.taskSectionTitleMode);
     if (this.settings.taskSectionTitleMode !== normalizedTaskSectionTitleMode) {
       this.settings.taskSectionTitleMode = normalizedTaskSectionTitleMode;
@@ -7235,6 +7308,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async loadSemanticIndexInternal() {
     this.semanticIndexLoadInProgress = true;
     this.refreshSidebarStatus();
+    if (!Array.isArray(this.semanticIndex)) this.semanticIndex = [];
+    let loadSucceeded = false;
     const previousState = {
       index: this.semanticIndex || [],
       revision: Number(this.semanticIndexRevision || 0),
@@ -7278,6 +7353,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let loadedFromDisk = false;
       let compatibilityRefreshCandidate = null;
       let missingIndex = false;
+      let readFailureReason = "";
       const rememberCompatibilityRefresh = (error) => {
         if (error?.code !== "semantic-index-compatibility-refresh-required") return;
         compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
@@ -7324,6 +7400,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       } catch (error) {
         rememberCompatibilityRefresh(error);
         rememberMissingIndex(error);
+        if (!compatibilityRefreshCandidate && !missingIndex) readFailureReason = String(error?.code || "semantic-index-read-failed").slice(0, 120);
         if (!compatibilityRefreshCandidate && !this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
           this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app, this.semanticIndexRevision);
           this.invalidateSemanticRetrievalCache();
@@ -7351,7 +7428,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       if (!loadedFromDisk) {
         restorePreviousState();
-        this.semanticIndexLoadFailure = missingIndex ? "semantic-index-missing" : "semantic-index-no-validated-generation";
+        this.semanticIndexLoadFailure = missingIndex ? "semantic-index-missing" : (readFailureReason || "semantic-index-no-validated-generation");
         this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure });
         return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
       }
@@ -7410,10 +7487,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         };
         window.setTimeout(recover, 1000);
       }
+      if (this.semanticIndex.length && !startupRoutingState) {
+        restorePreviousState();
+        this.semanticIndexLoadFailure = "semantic-index-routing-not-ready";
+        this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure });
+        return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
+      }
       if (settingsChanged) await this.saveSettings();
       this.scheduleDeferredTaskReferenceIntegrityScan("index-load-integrity", 1000);
+      loadSucceeded = true;
+    } catch (error) {
+      restorePreviousState();
+      this.semanticIndexLoadFailure = "semantic-index-load-failed";
+      this.logLocal("Semantic index load failed", { reason: this.semanticIndexLoadFailure, code: String(error?.code || "semantic-index-load-failed").slice(0, 120) });
+      return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
     } finally {
-      this.semanticIndexLoaded = true;
+      this.semanticIndexLoaded = loadSucceeded;
       this.semanticIndexLoadInProgress = false;
       this.refreshSidebarStatus();
     }
@@ -7809,6 +7898,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       encoderId: partition.identity.encoder.id,
       encoderVersion: partition.identity.encoder.version,
       partitionProvider: partition.provider,
+      baseUrl: partition.baseUrl,
       partitionIdentityHash: partition.identityHash,
       partitionRelativeDir: partition.relativeDir,
       embeddingMigrationRequired: false,
@@ -8126,7 +8216,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexPathMeta.clear();
     const chunks = this.semanticIndex || [];
     for (let index = 0; index < chunks.length; index += 1) {
-      if (index && index % 100 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      if (index && index % 100 === 0 && typeof document !== "undefined" && document.visibilityState === "visible") await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       const chunk = chunks[index];
       if (chunk?.stale === true || chunk?.tombstoned === true || chunk?.quarantined === true || chunk?.indexMetadata?.stale === true || chunk?.indexMetadata?.tombstoned === true || chunk?.indexMetadata?.quarantined === true) continue;
       const path = chunk.path || "";
@@ -8142,7 +8232,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (typeof STS_MULTI_PROVIDER !== "undefined") {
       const reference = STS_MULTI_PROVIDER.embeddingModelReference(this.settings);
       const provider = reference?.provider || aiProviderForModel(model);
-      if (["openrouter", "openwebui"].includes(provider)) return STS_MULTI_PROVIDER.semanticIndexFile(provider);
+      if (["openrouter", "openwebui", "customopenai"].includes(provider)) return STS_MULTI_PROVIDER.semanticIndexFile(provider);
     }
     return usesGeminiEmbeddingModel(model) ? GEMINI_SEMANTIC_INDEX_FILE : OPENAI_SEMANTIC_INDEX_FILE;
   }
@@ -9017,7 +9107,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return rows;
   }
 
-  clearActiveSemanticIndexAfterProviderDelete(provider) {
+  clearActiveSemanticIndexAfterProviderDelete(provider, reasonCode = "provider-index-deleted") {
     const activeProvider = semanticIndexPartitionProvider(semanticEmbeddingProviderForSettings(this.settings));
     if (activeProvider !== semanticIndexPartitionProvider(provider)) return false;
     this.semanticIndex = [];
@@ -9035,7 +9125,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexCompatibilityRefreshTelemetry = this.semanticIndexCompatibilityRefresh;
     this.semanticIndexCompatibilityRefreshPromise = null;
     this.semanticIndexCompatibilityRefreshKeys = new Set();
-    this.invalidateProductionSemanticRoutingState("provider-index-deleted");
+    this.invalidateProductionSemanticRoutingState(reasonCode);
     this.invalidateSemanticRetrievalCache?.();
     this.semanticChunkTermCache?.clear?.();
     this.queryEmbeddingCache?.clear?.();
@@ -9052,6 +9142,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       totalBytes: 0,
       purgedAt: deviceTimestamp()
     };
+    return true;
+  }
+
+  clearActiveCustomOpenAISemanticIndexAfterIdentityChange(reasonCode = "custom-openai-identity-changed") {
+    const activeProvider = semanticIndexPartitionProvider(semanticEmbeddingProviderForSettings(this.settings));
+    if (activeProvider !== "customopenai") return false;
+    const changed = this.clearActiveSemanticIndexAfterProviderDelete("customopenai", String(reasonCode || "custom-openai-identity-changed").replace(/[^a-z0-9._:-]+/gi, "-").slice(0, 80));
+    if (!changed) return false;
+    this.taskDeduplicationEmbeddingCache?.clear?.();
+    this.taskGenerationProviderContextCache?.clear?.();
+    this.taskDescriptionProviderContextCache?.clear?.();
+    this.aiProviderPreflightCache?.clear?.();
+    this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta || {}, {
+      partitionIdentityHash: undefined,
+      partitionRelativeDir: undefined,
+      baseUrl: undefined,
+      invalidationReason: String(reasonCode || "custom-openai-identity-changed").replace(/[^a-z0-9._:-]+/gi, "-").slice(0, 80),
+      invalidatedAt: deviceTimestamp()
+    });
     return true;
   }
 
@@ -11284,29 +11393,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const baseKey = this.semanticRetrievalCacheKey(query, limit, plan);
     const preparedKey = String(currentViewIdentity?.key || indexViewIdentity?.key || "");
     const cacheKey = preparedKey ? `${baseKey}|${preparedKey}` : baseKey;
+    const cacheHitObservationStart = localSemanticRoutingNow();
     const cached = this.getSemanticRetrievalCache(cacheKey);
     if (cached) {
       const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
       if (cached.semanticRetrieval?.telemetry) {
         try {
           const t = cached.semanticRetrieval.telemetry;
-          const isValidPhase = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
-          if (!isValidPhase(t.requestNormalizationMs)) t.requestNormalizationMs = requestNormalizationMs;
-          if (!isValidPhase(t.handleResolutionMs)) t.handleResolutionMs = handleResolutionMs;
-          if (!isValidPhase(t.coldPreparationWaitMs)) t.coldPreparationWaitMs = 0;
-          if (!isValidPhase(t.requestCorpusPreparationMs)) t.requestCorpusPreparationMs = 0;
-          if (!isValidPhase(t.routingMs)) t.routingMs = 0;
-          if (!isValidPhase(t.exactScoreMs)) t.exactScoreMs = 0;
-          if (!isValidPhase(t.finalBundleMs)) t.finalBundleMs = 0;
-          if (!t.preparedViewHit) {
-            Object.assign(t, { preparedViewHit: true, preparedViewState: "ready", coldPreparationWaitMs: 0, cacheHit: true, requestCorpusRowsTraversed: 0, requestDecorationRows: 0, requestIntegrityRows: 0, requestHierarchyRows: 0 });
-          } else {
-            Object.assign(t, { cacheHit: true });
-          }
+          t.requestNormalizationMs = requestNormalizationMs;
+          t.handleResolutionMs = handleResolutionMs;
+          Object.assign(t, { cacheHit: true });
           Object.defineProperty(cached, "telemetry", { value: t, enumerable: false, configurable: true });
         } catch {}
       }
-      return this.finalizeSemanticRetrievalContext(cached, request, { _reuseAttachedTelemetry: true });
+      const finalizedCachedContext = this.finalizeSemanticRetrievalContext(cached, request, { _reuseAttachedTelemetry: true });
+      const cachedPreparedView = this.currentPreparedViewRef?.view || this.semanticIndexPreparedView || null;
+      const cachedPreparedViewKey = String(cachedPreparedView?.identity?.key || "");
+      const cachedResult = attachTodoistInventoryCandidateChunks(
+        finalizedCachedContext,
+        !preparedKey || cachedPreparedViewKey === preparedKey ? cachedPreparedView : null,
+        plan
+      );
+      const cacheFinalBundleMs = Math.max(0, localSemanticRoutingNow() - cacheHitObservationStart);
+      if (cachedResult?.semanticRetrieval?.telemetry) Object.assign(cachedResult.semanticRetrieval.telemetry, {
+        requestNormalizationMs,
+        handleResolutionMs,
+        finalBundleMs: cacheFinalBundleMs,
+        elapsedMs: Math.max(0, Date.now() - startedAt)
+      });
+      return cachedResult;
     }
     let expectedIdentity = currentViewIdentity || indexViewIdentity || null;
     if (!expectedIdentity) {
@@ -11371,7 +11486,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return this.setSemanticRetrievalCache(cacheKey, result);
     }
     const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
-    return this.routeAndScorePreparedView({ preparedView, routingState, query, requestIdentity: expectedIdentity, plan, request, startedAt, cacheKey, coldPreparationWaitMs, requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0 });
+    const freshContext = await this.routeAndScorePreparedView({ preparedView, routingState, query, requestIdentity: expectedIdentity, plan, request, startedAt, cacheKey, coldPreparationWaitMs, requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0 });
+    return attachTodoistInventoryCandidateChunks(freshContext, preparedView, plan);
   }
 
   notReadySemanticResult(stateInfo = {}, request = {}, startedAt = Date.now(), coldPreparationWaitMs = 0, extra = {}) {
@@ -11880,7 +11996,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const context = cloneSemanticRetrievalContext(entry.context);
     if (context.semanticRetrieval?.telemetry) {
-      context.semanticRetrieval.telemetry = Object.assign({}, context.semanticRetrieval.telemetry, {
+      const telemetry = context.semanticRetrieval.telemetry;
+      const readyFullResult = telemetry.preparedViewState === "ready"
+        && telemetry.indexState === "ready"
+        && telemetry.degraded !== true
+        && !String(telemetry.degradedReason || "");
+      Object.assign(telemetry, {
         cacheHit: true,
         attemptedLiveQueryEmbeddingCalls: 0,
         successfulLiveQueryEmbeddingCalls: 0,
@@ -11888,8 +12009,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         externalQueryEmbeddingCalls: 0,
         runtimeExternalCalls: 0
       });
-      if (context.semanticRetrieval.telemetry.queryHandleTelemetry) {
-        context.semanticRetrieval.telemetry.queryHandleTelemetry = Object.assign({}, context.semanticRetrieval.telemetry.queryHandleTelemetry, {
+      if (telemetry.queryHandleTelemetry) {
+        telemetry.queryHandleTelemetry = Object.assign({}, telemetry.queryHandleTelemetry, {
           attemptedLiveQueryEmbeddingCalls: 0,
           successfulLiveQueryEmbeddingCalls: 0,
           liveQueryEmbeddingFailure: "",
@@ -11897,7 +12018,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           runtimeExternalCalls: 0
         });
       }
-      Object.defineProperty(context, "telemetry", { value: context.semanticRetrieval.telemetry, enumerable: false, configurable: true });
+      if (readyFullResult) Object.assign(telemetry, {
+        preparedViewHit: true,
+        preparedViewState: "ready",
+        coldPreparationWaitMs: 0,
+        requestCorpusPreparationMs: 0,
+        routingMs: 0,
+        exactScoreMs: 0,
+        requestCorpusRowsTraversed: 0,
+        requestDecorationRows: 0,
+        requestIntegrityRows: 0,
+        requestHierarchyRows: 0,
+        routingRowsScanned: 0,
+        fullCorpusScanCount: 0,
+        fullIndexScanCount: 0,
+        routingElapsedMs: 0,
+        routingCandidateCount: 0,
+        exactScorePairCount: 0,
+        exactScoreCacheHits: 0,
+        routingCacheHits: 0
+      });
+      else if (telemetry.preparedViewState !== "ready") telemetry.preparedViewHit = false;
+      Object.defineProperty(context, "telemetry", { value: telemetry, enumerable: false, configurable: true });
     }
     this.lastSemanticRetrievalTelemetry = context.semanticRetrieval?.telemetry || null;
     return context;
@@ -15024,7 +15166,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       deepAnalysis.telemetry.finalPromptCacheRequested = false;
     }
     this.setSidebarStatus("Ready");
-    let response = await this.withAiActivity("Writing the answer", (workflowToken, workflowObservationHash) => this.openaiResponse({
+    let chatValidationObservationHash = "";
+    let response = await this.withAiActivity("Writing the answer", (workflowToken, workflowObservationHash) => {
+      chatValidationObservationHash = workflowObservationHash;
+      return this.openaiResponse({
       operation: chatDispatchOperation,
       ...(webSearchEnabled ? { fallbackPolicy: "disabled" } : {}),
       ...(webSearchEnabled ? { deepResearchPhase: "deep-research-synthesis" } : {}),
@@ -15043,7 +15188,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       user: phase2User,
       appendFallbackNotice: false,
       background: false
-    }), {
+      });
+    }, {
       request: {
         queryId: context?.semanticRetrieval?.telemetry?.queryId || sourceContract?.id || `query:${shortHash(query)}`,
         sourceContractId: sourceContract?.id || ""
@@ -15059,6 +15205,68 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     response = citationResult.answer;
     this.lastChatCitationTelemetry = citationResult.telemetry;
+    {
+      const citationTelemetry = citationResult.telemetry && typeof citationResult.telemetry === "object" ? citationResult.telemetry : {};
+      const deliveredEvidenceCount = Number.isFinite(citationTelemetry.deliveredEvidenceCount) ? citationTelemetry.deliveredEvidenceCount : null;
+      const citedEvidenceCount = Number.isFinite(citationTelemetry.citedEvidenceCount) ? citationTelemetry.citedEvidenceCount : null;
+      const schemaInvalidCount = Number.isFinite(citationTelemetry.schemaInvalidCount) ? citationTelemetry.schemaInvalidCount : 0;
+      const unsupportedClaimCount = Number.isFinite(citationTelemetry.unsupportedClaimCount) ? citationTelemetry.unsupportedClaimCount : 0;
+      const projectionBundle = typeof chatContextBundle !== "undefined" && chatContextBundle && typeof chatContextBundle === "object" ? chatContextBundle : {};
+      const projectionBundleTelemetry = projectionBundle.telemetry && typeof projectionBundle.telemetry === "object" ? projectionBundle.telemetry : {};
+      const projectionFinalDedup = projectionBundleTelemetry.finalEvidenceDedup && typeof projectionBundleTelemetry.finalEvidenceDedup === "object" ? projectionBundleTelemetry.finalEvidenceDedup : {};
+      const phase2ProjectionSnapshot = typeof phase2Projection !== "undefined" && phase2Projection && typeof phase2Projection === "object" ? phase2Projection : {};
+      const phase2ProjectionTelemetry = phase2ProjectionSnapshot.telemetry && typeof phase2ProjectionSnapshot.telemetry === "object" ? phase2ProjectionSnapshot.telemetry : {};
+      const projectionFiniteOrNull = (input) => {
+        if (input === null || input === undefined || input === "") return null;
+        const parsed = Number(input);
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+      const projectionTrueDedupOutput = projectionFiniteOrNull(projectionFinalDedup.outputRecords);
+      const projectionPreShedSelected = projectionFiniteOrNull(phase2ProjectionTelemetry.completePositiveEvidenceUnionSelected);
+      const projectionPreShedRetained = projectionFiniteOrNull(phase2ProjectionTelemetry.completePositiveEvidenceUnionRetained);
+      const projectionOptionalOmitted = projectionFiniteOrNull(phase2ProjectionTelemetry.optionalEvidenceOmitted);
+      const projectionReservedIds = Array.isArray(phase2ProjectionSnapshot.chatReservedEvidenceIds) ? phase2ProjectionSnapshot.chatReservedEvidenceIds : null;
+      const projectionAllowedIds = Array.isArray(phase2ProjectionSnapshot.allowedEvidenceIds) ? phase2ProjectionSnapshot.allowedEvidenceIds : null;
+      const projectionAllowedIdSet = projectionAllowedIds ? new Set(projectionAllowedIds) : null;
+      const projectionReservedOmittedCount = projectionReservedIds && projectionAllowedIdSet ? projectionReservedIds.filter((id) => !projectionAllowedIdSet.has(id)).length : null;
+      this.recordDebugDiagnostic({
+        operation: chatDispatchOperation,
+        phase: "validate",
+        step: "citation-terminal",
+        observationHash: chatValidationObservationHash,
+        deduplicatedCount: projectionTrueDedupOutput,
+        positiveUnionCount: projectionPreShedSelected !== null ? projectionPreShedSelected : projectionPreShedRetained,
+        providerDeliveredCount: deliveredEvidenceCount,
+        positiveLossCount: projectionOptionalOmitted,
+        citedUsedCount: citedEvidenceCount,
+        projectionProtectedCount: projectionFiniteOrNull(phase2ProjectionTelemetry.evidenceProtectedCount),
+        projectionRequiredCount: projectionFiniteOrNull(phase2ProjectionTelemetry.requiredEvidenceCount),
+        projectionOptionalGroupsAvailable: projectionFiniteOrNull(phase2ProjectionTelemetry.efficiencyTargetOptionalGroupsAvailable),
+        projectionOptionalGroupsOmitted: projectionFiniteOrNull(phase2ProjectionTelemetry.efficiencyTargetOptionalGroupsOmitted),
+        projectionInitialEstimatedInputTokens: projectionFiniteOrNull(phase2ProjectionTelemetry.efficiencyTargetInitialEstimatedInputTokens),
+        projectionFinalEstimatedInputTokens: projectionFiniteOrNull(phase2ProjectionTelemetry.efficiencyTargetFinalEstimatedInputTokens),
+        projectionOperationalInputMaximumTokens: projectionFiniteOrNull(phase2ProjectionTelemetry.operationalInputMaximumTokens),
+        projectionReservedOmittedCount,
+        projectionPruningApplied: phase2ProjectionTelemetry.efficiencyTargetPruningApplied,
+        projectionProtectedCarrierStillOverTarget: phase2ProjectionTelemetry.protectedCarrierStillOverTarget,
+        projectionCutoffLastOmittedHash: phase2ProjectionTelemetry.projectionCutoffLastOmittedHash,
+        projectionCutoffFirstRetainedHash: phase2ProjectionTelemetry.projectionCutoffFirstRetainedHash,
+        projectionCutoffOmittedSetHash: phase2ProjectionTelemetry.projectionCutoffOmittedSetHash,
+        projectionCutoffRetainedSetHash: phase2ProjectionTelemetry.projectionCutoffRetainedSetHash,
+        projectionCutoffLastOmittedScoreBucket: phase2ProjectionTelemetry.projectionCutoffLastOmittedScoreBucket,
+        projectionCutoffFirstRetainedScoreBucket: phase2ProjectionTelemetry.projectionCutoffFirstRetainedScoreBucket,
+        projectionCutoffOmittedMissingScoreCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffOmittedMissingScoreCount),
+        projectionCutoffRetainedMissingScoreCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffRetainedMissingScoreCount),
+        projectionCutoffOmittedReservationCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffOmittedReservationCount),
+        projectionCutoffRetainedReservationCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffRetainedReservationCount),
+        projectionCutoffOmittedPredicateCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffOmittedPredicateCount),
+        projectionCutoffRetainedPredicateCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffRetainedPredicateCount),
+        projectionCutoffOriginalKeyCollisionCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffOriginalKeyCollisionCount),
+        projectionCutoffDeliveryKeyCollisionCount: projectionFiniteOrNull(phase2ProjectionTelemetry.projectionCutoffDeliveryKeyCollisionCount),
+        status: schemaInvalidCount > 0 ? "invalid" : "observed",
+        code: schemaInvalidCount > 0 ? "structured-response-invalid" : (unsupportedClaimCount > 0 && !(citedEvidenceCount > 0) ? "unsupported-only" : (citedEvidenceCount > 0 ? "cited" : "empty"))
+      });
+    }
     const researchSaveEligible = webSearchEnabled
       && this.settings.chatWebSaveResearch !== false
       && !(typeof this.settings.chatWebSaveResearch === "string" && this.settings.chatWebSaveResearch.trim().toLowerCase() === "false")
@@ -16201,15 +16409,81 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       calls: []
     };
     const taskGenerationDispatchBudgets = new Map();
-    const taskGenerationDispatchBudgetFor = (batch = null) => {
+    const taskGenerationInitialAttemptSnapshots = new Map();
+    const taskGenerationDispatchBudgetFor = (batch = null, options = {}) => {
       const key = String(batch?.batchId || "global");
-      if (!taskGenerationDispatchBudgets.has(key)) taskGenerationDispatchBudgets.set(key, aiGenerationDispatchBudgetCreate({
-        operation: "task-generation",
-        lineageId: `task-generation-${shortHash(key)}`
-      }));
+      if (!taskGenerationDispatchBudgets.has(key)) {
+        const requestedLimit = Number(options.limit);
+        const limit = Number.isSafeInteger(requestedLimit) && requestedLimit >= 1
+          ? Math.max(1, Math.min(2, requestedLimit))
+          : undefined;
+        taskGenerationDispatchBudgets.set(key, aiGenerationDispatchBudgetCreate({
+          operation: "task-generation",
+          lineageId: String(options.lineageId || `task-generation-${shortHash(key)}`),
+          ...(limit === undefined ? {} : { limit })
+        }));
+      } else if (Number.isSafeInteger(Number(options.limit)) && Number(options.limit) >= 1) {
+        const budget = taskGenerationDispatchBudgets.get(key);
+        const requestedLimit = Math.max(1, Math.min(2, Number(options.limit)));
+        if (Number(budget.used) === 0 && Number(budget.limit) > requestedLimit) budget.limit = requestedLimit;
+      }
       return taskGenerationDispatchBudgets.get(key);
     };
-    const taskGenerationRetryAvailable = (batch = null) => aiGenerationDispatchBudgetSnapshot(taskGenerationDispatchBudgetFor(batch)).remaining > 0;
+    const taskGenerationInitialAttemptSnapshotFor = (batch = null) => {
+      const key = String(batch?.batchId || "");
+      if (!key) return null;
+      const budget = taskGenerationDispatchBudgetFor(batch);
+      const snapshot = aiGenerationDispatchBudgetSnapshot(budget);
+      const budgetValid = Boolean(
+        budget
+        && typeof budget === "object"
+        && budget.profile === "generation-dispatch-budget-v1"
+        && Number.isSafeInteger(budget.limit)
+        && budget.limit >= 1
+        && Number.isSafeInteger(budget.used)
+        && budget.used >= 0
+        && Array.isArray(budget.dispatches)
+      );
+      const frozen = Object.freeze({
+        ...snapshot,
+        budgetValid,
+        dispatches: Object.freeze((snapshot.dispatches || []).map((entry) => Object.freeze({ ...entry })))
+      });
+      taskGenerationInitialAttemptSnapshots.set(key, frozen);
+      return frozen;
+    };
+    const taskGenerationRetryAllowanceFor = (batch = null) => {
+      const key = String(batch?.batchId || "");
+      const snapshot = key ? taskGenerationInitialAttemptSnapshots.get(key) : null;
+      if (!snapshot
+        || snapshot.budgetValid !== true
+        || !Number.isSafeInteger(Number(snapshot.used))
+        || Number(snapshot.used) < 0
+        || !Number.isSafeInteger(Number(snapshot.limit))
+        || Number(snapshot.limit) < 1) {
+        return { admitted: false, code: "retry-budget-exhausted", snapshot: null, remaining: 0 };
+      }
+      const remaining = Math.max(0, Math.min(2, Number(snapshot.limit)) - Number(snapshot.used));
+      const allowance = Math.min(1, remaining);
+      return allowance > 0
+        ? { admitted: true, code: "", snapshot, remaining: allowance }
+        : { admitted: false, code: "retry-budget-exhausted", snapshot, remaining: 0 };
+    };
+    const taskGenerationRetryAvailable = (batch = null) => taskGenerationRetryAllowanceFor(batch).admitted;
+    const taskGenerationReserveScopeRetry = (scopeId = "") => {
+      const sid = String(scopeId || "");
+      const ledger = perScopeLedger && sid ? perScopeLedger.get(sid) : null;
+      if (!ledger) return { admitted: false, code: "retry-budget-exhausted", ledger: null };
+      const used = Number(ledger.used);
+      const limit = Number(ledger.limit);
+      if (!Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(limit) || limit < 1) {
+        return { admitted: false, code: "retry-budget-exhausted", ledger };
+      }
+      const boundedLimit = Math.min(2, limit);
+      if (used >= boundedLimit) return { admitted: false, code: "retry-budget-exhausted", ledger };
+      ledger.used = used + 1;
+      return { admitted: true, code: "", ledger, remaining: Math.max(0, boundedLimit - ledger.used) };
+    };
     const requestTaskStructure = async (recoveryClosure = null, fallbackOnly = false, requestOptions = {}) => {
       const activeWorkflowContext = requestOptions.workflowContext || workflowContext;
       const batch = requestOptions.batch || null;
@@ -16217,7 +16491,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const scopeRecovery = requestOptions.scopeRecovery || null;
       const structuralRepair = requestOptions.structuralRepair || null;
       const exactDuplicateRecovery = (scopeRecovery?.reasonCodes || []).includes("post-batch-exact-normalized-duplicate");
-      const generationDispatchBudget = taskGenerationDispatchBudgetFor(batch);
+      const generationDispatchBudget = requestOptions.generationDispatchBudget || taskGenerationDispatchBudgetFor(batch);
       const isPreparedBatch = Boolean(batch?.providerEnvelope);
       const localMaxMainTasks = isPreparedBatch ? (Number.isFinite(batch?.members?.length) && batch.members.length > 0 ? batch.members.length : 1) : 1;
       if (isPreparedBatch) {
@@ -16490,8 +16764,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           }
           return m;
         };
-        const validateMemberThroughBatchRecord = (taskClone, member) => {
-          const batchRecord = member && member.batchRecord ? member.batchRecord : null;
+        const validateMemberThroughBatchRecord = (taskClone, member, preparedBatch = null) => {
+          const memberOrdinal = Number(member?.memberOrdinal || member?.localOrdinal);
+          const indexedBatchRecord = preparedBatch && Array.isArray(preparedBatch.batchRecords)
+            && Number.isSafeInteger(memberOrdinal) && memberOrdinal > 0
+            ? preparedBatch.batchRecords[memberOrdinal - 1]
+            : null;
+          const indexedScopeId = String(indexedBatchRecord?.scopeIds?.[0] || "");
+          const memberScopeId = String(member?.scopeId || "");
+          const batchRecord = member && member.batchRecord
+            ? member.batchRecord
+            : indexedBatchRecord && indexedScopeId === memberScopeId
+              ? indexedBatchRecord
+              : null;
           if (!batchRecord) return { valid: false, code: "response-missing-scope" };
           const attached = taskGenerationAttachCanonicalScope(taskClone, batchRecord);
           if (!attached.valid) return { valid: false, code: String(attached.errors[0] || "response-scope-structure-invalid") };
@@ -16546,25 +16831,39 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               continue;
             }
             try {
-              const raw = await requestTaskStructure(null, false, { workflowContext: batch.contextBundle, batch, workflowToken });
+              let raw = null;
+              try {
+                raw = await requestTaskStructure(null, false, { workflowContext: batch.contextBundle, batch, workflowToken });
+              } finally {
+                taskGenerationInitialAttemptSnapshotFor(batch);
+              }
               let parsed = null;
               let parseFailed = false;
               try { parsed = JSON.parse(raw); } catch { parseFailed = true; parsed = null; }
-              let providerResult = null;
+              let providerResult = { tasks: new Array(batch.members.length).fill(null) };
               let ordinalToTask = new Map();
               let memberFailures = [];
-              if (parseFailed) {
-                providerResult = null;
-              } else {
+              let globallyInvalid = parseFailed;
+              let globalFailureCode = parseFailed ? "response-invalid-json" : "";
+              if (!parseFailed) {
                 const contract = taskGenerationProviderOutputContract(parsed, { batchedTitle: true, memberCount: batch.members.length });
                 ordinalToTask = buildOrdinalMap(contract);
                 memberFailures = Array.isArray(contract.memberFailures) ? contract.memberFailures : [];
-                const orderedTasks = [];
-                for (let ord = 1; ord <= batch.members.length; ord += 1) {
-                  const c = ordinalToTask.get(ord) || null;
-                  orderedTasks.push(c || null);
+                const parsedRoot = Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+                const hasTasksArray = parsedRoot && Array.isArray(parsed.tasks);
+                const emptyTasks = hasTasksArray && parsed.tasks.length === 0;
+                const hasUnmappedExtra = Number(contract.unmappedExtraCount || 0) > 0;
+                globallyInvalid = !parsedRoot || !hasTasksArray || emptyTasks || hasUnmappedExtra;
+                if (globallyInvalid) {
+                  globalFailureCode = !parsedRoot
+                    ? "response-root-invalid"
+                    : !hasTasksArray || emptyTasks
+                      ? "response-shape-missing-tasks"
+                      : String(contract.code || "response-task-invalid");
                 }
-                providerResult = parseFailed ? null : { tasks: orderedTasks };
+                for (let ord = 1; ord <= batch.members.length; ord += 1) {
+                  providerResult.tasks[ord - 1] = globallyInvalid ? null : (ordinalToTask.get(ord) || null);
+                }
               }
               const acceptedSigsForBatch = Array.from(acceptedScopeIds).map((sid) => {
                 const found = results.find((r) => r && r.tasks && r.tasks[0] && String(r.tasks[0].scope_id) === String(sid));
@@ -16574,25 +16873,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
                 batch,
                 providerResult,
                 validateMember: (clone, member) => {
+                  if (globallyInvalid) return { valid: false, code: globalFailureCode };
                   const ordinal = Number(member.memberOrdinal || member.localOrdinal);
                   const stripped = ordinalToTask.get(ordinal) || null;
                   if (!stripped) {
                     const mf = memberFailures.find((f) => Number(f.ordinal) === Number(ordinal));
-                    const code = mf ? String(mf.code || "response-missing-scope") : (parseFailed ? "response-invalid-json" : "response-missing-scope");
+                    const code = mf ? String(mf.code || "response-missing-scope") : "response-missing-scope";
                     return { valid: false, code };
                   }
                   const dup = memberFailures.find((f) => Number(f.ordinal) === Number(ordinal) && String(f.code).includes("duplicate"));
                   if (dup) return { valid: false, code: String(dup.code) };
-                  return validateMemberThroughBatchRecord(stripped, member);
+                   return validateMemberThroughBatchRecord(stripped, member, batch);
                 },
                 acceptedSignatures: acceptedSigsForBatch,
-                structuralRetryCodes: ["response-scope-structure-invalid","response-missing-scope","response-multiple-main-tasks","response-cross-scope-exact-duplicate","response-invalid-json","response-missing-member-ordinal"],
+                structuralRetryCodes: globallyInvalid ? [] : ["response-scope-structure-invalid","response-missing-scope","response-multiple-main-tasks","response-cross-scope-exact-duplicate","response-task-invalid","response-duplicate-member-ordinal","response-missing-member-ordinal"],
                 perScopeLedger
               });
               const batchTasks = [];
               let terminalCode = "";
               for (const entry of settle.accepted || []) {
-                const task = entry.task;
+                const task = JSON.parse(JSON.stringify(entry.task));
                 task.scope_id = String(entry.scopeId);
                 task.taskId = String(entry.taskId || `scope:${entry.scopeId}`);
                 task.taskGenerationBatchId = batch.batchId;
@@ -16613,17 +16913,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               if (terminalEntries.length) {
                 for (const t of terminalEntries) terminalScopeIds.add(String(t.scopeId));
                 terminalCode = String(terminalEntries[0].code || terminalEntries[0].reason || "response-scope-structure-invalid");
-              }
-              if (settle.systemic && parseFailed) {
-                for (const m of batch.members) {
-                  const sid = String(m.scopeId);
-                  if (queuedRetryScopeIds.has(sid) || acceptedScopeIds.has(sid) || terminalScopeIds.has(sid)) continue;
-                  queuedRetryScopeIds.add(sid);
-                  const retryEntry = { scopeId: sid, taskId: String(m.taskId), memberOrdinal: Number(m.localOrdinal), localOrdinal: Number(m.localOrdinal), code: "response-invalid-json" };
-                  if (!pendingRetriesByBatch.has(batch.batchId)) pendingRetriesByBatch.set(batch.batchId, []);
-                  pendingRetriesByBatch.get(batch.batchId).push(retryEntry);
-                  allPendingRetries.push(Object.assign({}, retryEntry, { batch, batchIndex }));
-                }
               }
               results[batchIndex] = {
                 batch,
@@ -16676,37 +16965,95 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             }
           }
         };
+        const compareTaskGenerationRecoveryOrder = (a = {}, b = {}) => {
+          const scopeIdFor = (value) => String(value?.scopeId || value?.failedScopeId || value?.batch?.scopeIds?.[0] || "");
+          const sa = scopeIdFor(a);
+          const sb = scopeIdFor(b);
+          const ta = sourceOrderMap ? sourceOrderMap.get(sa) : null;
+          const tb = sourceOrderMap ? sourceOrderMap.get(sb) : null;
+          const markerA = ta && Number.isFinite(ta.marker) ? ta.marker : Number.MAX_SAFE_INTEGER;
+          const markerB = tb && Number.isFinite(tb.marker) ? tb.marker : Number.MAX_SAFE_INTEGER;
+          if (markerA !== markerB) return markerA - markerB;
+          const indexA = ta && Number.isFinite(ta.idx) ? ta.idx : Number.MAX_SAFE_INTEGER;
+          const indexB = tb && Number.isFinite(tb.idx) ? tb.idx : Number.MAX_SAFE_INTEGER;
+          if (indexA !== indexB) return indexA - indexB;
+          const batchA = Number(a.batch?.ordinal ?? a.batchOrdinal ?? a.batchIndex ?? Number.MAX_SAFE_INTEGER);
+          const batchB = Number(b.batch?.ordinal ?? b.batchOrdinal ?? b.batchIndex ?? Number.MAX_SAFE_INTEGER);
+          if (batchA !== batchB) return batchA - batchB;
+          const localA = Number(a.localOrdinal ?? a.memberOrdinal ?? a.ordinal ?? Number.MAX_SAFE_INTEGER);
+          const localB = Number(b.localOrdinal ?? b.memberOrdinal ?? b.ordinal ?? Number.MAX_SAFE_INTEGER);
+          if (localA !== localB) return localA - localB;
+          return sa.localeCompare(sb);
+        };
+        const markTaskGenerationScopeTerminal = (scopeId, batchIndex, code, closureErrors = []) => {
+          const sid = String(scopeId || "");
+          const idx = Number(batchIndex);
+          if (Number.isFinite(idx) && results[idx]) {
+            results[idx] = Object.assign({}, results[idx], {
+              terminalCode: String(code || "response-scope-structure-invalid"),
+              closureErrors: uniqueValues([...(results[idx].closureErrors || []), String(code || "response-scope-structure-invalid"), ...(closureErrors || [])].map(String).filter(Boolean))
+            });
+          }
+          if (sid) terminalScopeIds.add(sid);
+          const outcome = Number.isFinite(idx) ? taskGenerationRecoveryTelemetry.scopeOutcomes[idx] : null;
+          if (outcome && typeof outcome === "object") {
+            outcome.recoveryAttempted = true;
+            outcome.recoveryStatus = "terminal";
+            outcome.recoveryReasonCodes = uniqueValues([...(outcome.recoveryReasonCodes || []), String(code || "response-scope-structure-invalid"), ...(closureErrors || [])].map(String).filter(Boolean));
+            outcome.terminal = true;
+            outcome.terminalCode = String(code || "response-scope-structure-invalid");
+            outcome.reasonCodes = uniqueValues([...(outcome.reasonCodes || []), ...outcome.recoveryReasonCodes].map(String).filter(Boolean));
+            taskGenerationRecoveryTelemetry.scopeOutcomes[idx] = outcome;
+          }
+        };
+        const taskGenerationRecoveryCancelled = () => Boolean(
+          this.isUnloading === true
+          || this.runtimeWorkCoordinator?.closed === true
+        );
+        const taskGenerationRecoveryPreflightCode = (plan = null, batch = null) => {
+          const fail = (code) => {
+            const normalized = String(code || "provider-context-window-overflow");
+            if (Array.isArray(taskGenerationRecoveryTelemetry.preflightReasonCodes)
+              && !taskGenerationRecoveryTelemetry.preflightReasonCodes.includes(normalized)) {
+              taskGenerationRecoveryTelemetry.preflightReasonCodes.push(normalized);
+            }
+            return normalized;
+          };
+          const plannedTerminals = Array.isArray(plan?.terminalScopes) ? plan.terminalScopes : [];
+          const plannedTerminal = plannedTerminals.find((entry) => String(entry?.scopeId || "") === String(batch?.scopeIds?.[0] || ""));
+          if (plannedTerminal) return fail(plannedTerminal.code || "provider-context-window-overflow");
+          if (!batch || !Array.isArray(batch.scopeIds) || batch.scopeIds.length !== 1 || batch.providerEnvelope) return fail("scope-call-not-singleton");
+          if (!batch.contextBundle || batch.contextBundle.contextBundleValidation?.dispatchAllowed !== true) return fail("protected-workflow-evidence-closure-unresolved");
+          if (!batch.preflight || batch.preflight.overflow !== false) return fail("provider-context-window-overflow");
+          const expectedPrefixHash = String(frozenPrefixHash || "");
+          const currentPrefixHash = typeof providerContextProjectionHash === "function"
+            ? providerContextProjectionHash(String(batch.contextBundle.promptCachePrefix || ""))
+            : "";
+          if (!expectedPrefixHash || !currentPrefixHash || currentPrefixHash !== expectedPrefixHash) return fail("retry-prefix-mismatch");
+          const expectedBundleHash = String(frozenBundleHash || "");
+          const currentBundleHash = String(batch.contextBundle.sharedContextBundleHash || batch.contextBundle.bundleHash || "");
+          if (!expectedBundleHash || !currentBundleHash || currentBundleHash !== expectedBundleHash) return fail("retry-bundle-mismatch");
+          const expectedPromptEvidenceHash = String(workflowContext.promptEvidenceHash || "");
+          const currentPromptEvidenceHash = String(batch.contextBundle.promptEvidenceHash || "");
+          if (!expectedPromptEvidenceHash || !currentPromptEvidenceHash || currentPromptEvidenceHash !== expectedPromptEvidenceHash) return fail("retry-prompt-evidence-mismatch");
+          return "";
+        };
         const drainTitleRetriesSerially = async (workflowToken = null) => {
           if (!allPendingRetries || !allPendingRetries.length) return;
-          allPendingRetries.sort((a, b) => {
-            const ao = Number(a.localOrdinal ?? a.memberOrdinal ?? a.ordinal ?? 0);
-            const bo = Number(b.localOrdinal ?? b.memberOrdinal ?? b.ordinal ?? 0);
-            if (ao !== bo) return ao - bo;
-            const sa = String(a.scopeId || "");
-            const sb = String(b.scopeId || "");
-            const ta = sourceOrderMap ? sourceOrderMap.get(sa) : null;
-            const tb = sourceOrderMap ? sourceOrderMap.get(sb) : null;
-            const ma = ta && Number.isFinite(ta.marker) ? ta.marker : Number.MAX_SAFE_INTEGER;
-            const mb = tb && Number.isFinite(tb.marker) ? tb.marker : Number.MAX_SAFE_INTEGER;
-            if (ma !== mb) return ma - mb;
-            const ia = ta && Number.isFinite(ta.idx) ? ta.idx : Number.MAX_SAFE_INTEGER;
-            const ib = tb && Number.isFinite(tb.idx) ? tb.idx : Number.MAX_SAFE_INTEGER;
-            if (ia !== ib) return ia - ib;
-            return sa.localeCompare(sb);
-          });
+          allPendingRetries.sort(compareTaskGenerationRecoveryOrder);
           const seenRetryScopeIds = new Set();
           for (const m of allPendingRetries) {
             const sid = String(m.scopeId || "");
             if (!sid || seenRetryScopeIds.has(sid)) continue;
             seenRetryScopeIds.add(sid);
-            const ledger = perScopeLedger ? perScopeLedger.get(sid) : null;
-            if (!ledger || !Number.isFinite(ledger.used) || !Number.isFinite(ledger.limit) || ledger.used >= ledger.limit) {
-              const idx = Number(m.batchIndex);
-              if (Number.isFinite(idx) && results[idx] && !results[idx].terminalCode) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: "retry-budget-exhausted", closureErrors: uniqueValues([...(results[idx].closureErrors || []), "retry-budget-exhausted"]) });
-                terminalScopeIds.add(sid);
-                if (Array.isArray(taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds)) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(sid);
-              }
+            if (taskGenerationRecoveryCancelled()) {
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, "runtime-work-cancelled");
+              continue;
+            }
+            const initialAllowance = taskGenerationRetryAllowanceFor(m.batch);
+            if (!initialAllowance.admitted) {
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, "retry-budget-exhausted");
+              if (Array.isArray(taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds) && !taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.includes(sid)) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(sid);
               continue;
             }
             const recordFor = (scopeRecords || []).find((r) => String(r.scopeId || r.scope_id || "") === sid);
@@ -16750,52 +17097,51 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             }
             const singletonBatch = singletonPlan && Array.isArray(singletonPlan.batches) ? singletonPlan.batches[0] : null;
             if (!singletonBatch) {
+              const plannedTerminal = Array.isArray(singletonPlan?.terminalScopes)
+                ? singletonPlan.terminalScopes.find((entry) => String(entry?.scopeId || "") === sid)
+                : null;
               const idx = Number(m.batchIndex);
               if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: "response-missing-scope", closureErrors: uniqueValues([...(results[idx].closureErrors || []), "response-missing-scope"]) });
+                const code = String(plannedTerminal?.code || "response-missing-scope");
+                results[idx] = Object.assign({}, results[idx], { terminalCode: code, closureErrors: uniqueValues([...(results[idx].closureErrors || []), code]) });
                 terminalScopeIds.add(sid);
               }
               continue;
             }
-            if (singletonBatch.contextBundle?.contextBundleValidation?.dispatchAllowed === false) {
+            const recoveryPreflightCode = taskGenerationRecoveryPreflightCode(singletonPlan, singletonBatch);
+            if (recoveryPreflightCode) {
               const idx = Number(m.batchIndex);
               if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: "protected-workflow-evidence-closure-unresolved", closureErrors: uniqueValues([...(results[idx].closureErrors || []), "protected-workflow-evidence-closure-unresolved"]) });
+                results[idx] = Object.assign({}, results[idx], { terminalCode: recoveryPreflightCode, closureErrors: uniqueValues([...(results[idx].closureErrors || []), recoveryPreflightCode]) });
                 terminalScopeIds.add(sid);
               }
               continue;
             }
-            const expectedPrefixHash = String(frozenPrefixHash || "");
-            const currentPrefixHash = typeof providerContextProjectionHash === "function" ? providerContextProjectionHash(String(singletonBatch.contextBundle.promptCachePrefix || "")) : "";
-            if (!expectedPrefixHash || !currentPrefixHash || currentPrefixHash !== expectedPrefixHash) {
-              const idx = Number(m.batchIndex);
-              if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: "retry-prefix-mismatch", closureErrors: uniqueValues([...(results[idx].closureErrors || []), "retry-prefix-mismatch"]) });
-                terminalScopeIds.add(sid);
-              }
+            if (taskGenerationRecoveryCancelled()) {
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, "runtime-work-cancelled");
               continue;
             }
-            const expectedBundleHash = String(frozenBundleHash || "");
-            const currentBundleHash = String(singletonBatch.contextBundle.sharedContextBundleHash || singletonBatch.contextBundle.bundleHash || "");
-            if (expectedBundleHash && currentBundleHash && expectedBundleHash !== currentBundleHash) {
-              const idx = Number(m.batchIndex);
-              if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: "retry-bundle-mismatch", closureErrors: uniqueValues([...(results[idx].closureErrors || []), "retry-bundle-mismatch"]) });
-                terminalScopeIds.add(sid);
-              }
+            const reservation = taskGenerationReserveScopeRetry(sid);
+            if (!reservation.admitted) {
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, reservation.code);
+              if (Array.isArray(taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds) && !taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.includes(sid)) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(sid);
+              continue;
+            }
+            const recoveryBudget = taskGenerationDispatchBudgetFor(singletonBatch, {
+              limit: initialAllowance.remaining,
+              lineageId: `task-generation-${shortHash(String(m.batch?.batchId || ""))}-${shortHash(sid)}`
+            });
+            if (taskGenerationRecoveryCancelled()) {
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, "runtime-work-cancelled");
               continue;
             }
             let rawRetry = null;
             try {
-              ledger.used += 1;
-              rawRetry = await requestTaskStructure(null, false, { workflowContext: singletonBatch.contextBundle, batch: singletonBatch, scopeRecovery: { reasonCodes: [String(m.code || "response-scope-structure-invalid")] }, workflowToken });
+              if (Array.isArray(taskGenerationRecoveryTelemetry.retryScopeIds) && !taskGenerationRecoveryTelemetry.retryScopeIds.includes(sid)) taskGenerationRecoveryTelemetry.retryScopeIds.push(sid);
+              rawRetry = await requestTaskStructure(null, false, { workflowContext: singletonBatch.contextBundle, batch: singletonBatch, scopeRecovery: { reasonCodes: [String(m.code || "response-scope-structure-invalid")] }, workflowToken, generationDispatchBudget: recoveryBudget });
             } catch (error) {
               const code = typeof taskGenerationStableFailureCode === "function" ? taskGenerationStableFailureCode(error) : String(error?.providerError?.code || error?.code || "provider-error").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 120) || "provider-error";
-              const idx = Number(m.batchIndex);
-              if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: code });
-                terminalScopeIds.add(sid);
-              }
+              markTaskGenerationScopeTerminal(sid, m.batchIndex, code);
               continue;
             }
             let parsedRetry = null;
@@ -16830,10 +17176,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             }
             const idx = Number(m.batchIndex);
             if (!evaluatedRetry || evaluatedRetry.terminalCode) {
-              if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { terminalCode: String(evaluatedRetry ? evaluatedRetry.terminalCode : "response-scope-structure-invalid"), closureErrors: evaluatedRetry ? evaluatedRetry.closureErrors : [] });
-                terminalScopeIds.add(sid);
-              }
+              markTaskGenerationScopeTerminal(sid, idx, String(evaluatedRetry ? evaluatedRetry.terminalCode : "response-scope-structure-invalid"), evaluatedRetry ? evaluatedRetry.closureErrors : []);
             } else {
               const task = evaluatedRetry.task;
               task.scope_id = String(evaluatedRetry.closure.scopeId);
@@ -16842,244 +17185,300 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               task.taskGenerationBatchOrdinal = Number(singletonBatch.ordinal);
               task.taskGenerationLocalOrdinal = Number(m.localOrdinal ?? m.memberOrdinal ?? m.ordinal ?? 0);
               if (Number.isFinite(idx) && results[idx]) {
-                results[idx] = Object.assign({}, results[idx], { tasks: taskGenerationMergeRecoveredBatchTask(results[idx].tasks || [], task), terminalCode: "", closureErrors: [] });
-                acceptedScopeIds.add(String(evaluatedRetry.closure.scopeId));
-                terminalScopeIds.delete(String(evaluatedRetry.closure.scopeId));
-                if (Array.isArray(taskGenerationRecoveryTelemetry.acceptedRetryScopeIds)) taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.push(sid);
+                const currentResult = results[idx];
+                const recoveredScopeId = String(evaluatedRetry.closure.scopeId);
+                const siblingTerminal = (currentResult.batch?.scopeIds || [])
+                  .map(String)
+                  .some((candidateScopeId) => candidateScopeId !== recoveredScopeId && terminalScopeIds.has(candidateScopeId));
+                results[idx] = Object.assign({}, currentResult, {
+                  tasks: taskGenerationMergeRecoveredBatchTask(currentResult.tasks || [], task),
+                  terminalCode: siblingTerminal ? String(currentResult.terminalCode || "response-scope-structure-invalid") : "",
+                  closureErrors: siblingTerminal ? (currentResult.closureErrors || []).slice() : []
+                });
+                acceptedScopeIds.add(recoveredScopeId);
+                terminalScopeIds.delete(recoveredScopeId);
+                const recoveredOutcomeIndex = taskGenerationRecoveryTelemetry.scopeOutcomes.findIndex((entry) => String(entry?.scopeId || "") === recoveredScopeId);
+                const recoveredOutcome = recoveredOutcomeIndex >= 0
+                  ? taskGenerationRecoveryTelemetry.scopeOutcomes[recoveredOutcomeIndex]
+                  : {
+                    scopeId: recoveredScopeId,
+                    initialStatus: "invalid",
+                    initialReasonCodes: [],
+                    deterministicFallbackAttempted: false,
+                    deterministicFallbackStatus: "not-attempted",
+                    deterministicFallbackReasonCodes: []
+                  };
+                Object.assign(recoveredOutcome, {
+                  recoveryAttempted: true,
+                  recoveryStatus: "accepted",
+                  recoveryReasonCodes: uniqueValues([...(recoveredOutcome.recoveryReasonCodes || []), String(m.code || "response-scope-structure-invalid")]),
+                  terminal: false,
+                  terminalCode: "",
+                  reasonCodes: uniqueValues([...(recoveredOutcome.reasonCodes || []), String(m.code || "response-scope-structure-invalid")])
+                });
+                if (recoveredOutcomeIndex < 0) taskGenerationRecoveryTelemetry.scopeOutcomes.push(recoveredOutcome);
+                if (Array.isArray(taskGenerationRecoveryTelemetry.acceptedRetryScopeIds) && !taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.includes(sid)) taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.push(sid);
               }
-              if (Array.isArray(taskGenerationRecoveryTelemetry.retryScopeIds)) taskGenerationRecoveryTelemetry.retryScopeIds.push(sid);
             }
           }
         };
         const repairPostBatchExactDuplicates = async (workflowToken = null) => {
-          const duplicateGroups = taskGenerationPostBatchExactDuplicateGroups(results);
-          if (!duplicateGroups.length) return;
-          const duplicateIndexes = duplicateGroups.flatMap((group) => group.indexes || []);
-          const initialResults = new Map(duplicateIndexes.map((batchIndex) => [batchIndex, results[batchIndex]]));
-          const terminalizeAmbiguousDuplicate = (batchIndex, code, closureErrors = [], attributionCode = "model-output") => {
-            const result = results[batchIndex];
-            const scopeId = String(result?.batch?.scopeIds?.[0] || "");
-            results[batchIndex] = Object.assign({}, result, {
-              tasks: [],
-              terminalCode: String(code || "response-cross-scope-exact-duplicate"),
-              closureErrors: uniqueValues((closureErrors || []).map(String).filter(Boolean))
-            });
-            if (scopeId) {
-              acceptedScopeIds.delete(scopeId);
-              terminalScopeIds.add(scopeId);
-              taskGenerationRecoveryTelemetry.exactDuplicateTerminalScopeIds.push(scopeId);
-            }
-            const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] || {};
-            scopeOutcome.recoveryStatus = "invalid";
-            scopeOutcome.recoveryReasonCodes = uniqueValues([
-              ...(scopeOutcome.recoveryReasonCodes || []),
-              String(code || "response-cross-scope-exact-duplicate"),
-              ...(closureErrors || [])
-            ].map(String).filter(Boolean));
-            scopeOutcome.exactDuplicateStatus = "terminal";
-            scopeOutcome.terminal = true;
-            scopeOutcome.terminalCode = String(code || "response-cross-scope-exact-duplicate");
-            scopeOutcome.attributionCode = String(attributionCode || "model-output");
-            scopeOutcome.reasonCodes = uniqueValues([
-              ...(scopeOutcome.reasonCodes || []),
-              ...scopeOutcome.recoveryReasonCodes,
-              scopeOutcome.terminalCode
-            ].filter(Boolean));
-            taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] = scopeOutcome;
-            const previousAttribution = String(taskGenerationRecoveryTelemetry.attributionCode || "");
-            const nextAttribution = scopeOutcome.attributionCode;
-            taskGenerationRecoveryTelemetry.attributionCode = !previousAttribution || previousAttribution === nextAttribution
-              ? nextAttribution
-              : previousAttribution === "model-output"
-                ? nextAttribution
-                : nextAttribution === "model-output"
-                  ? previousAttribution
-                  : "plugin-workflow-or-infrastructure";
-          };
-          taskGenerationRecoveryTelemetry.exactDuplicateGroupCount += duplicateGroups.length;
-          for (const batchIndex of duplicateIndexes) {
-            const result = initialResults.get(batchIndex);
-            const batch = result.batch;
-            const scopeId = String(batch?.scopeIds?.[0] || "");
-            const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] || {};
-            if (scopeId) taskGenerationRecoveryTelemetry.exactDuplicateDetectedScopeIds.push(scopeId);
-            scopeOutcome.exactDuplicateDetected = true;
-            scopeOutcome.exactDuplicateStatus = "detected";
-            scopeOutcome.recoveryAttempted = false;
-            scopeOutcome.recoveryReasonCodes = uniqueValues([
-              ...(scopeOutcome.recoveryReasonCodes || []),
-              "post-batch-exact-normalized-duplicate"
-            ]);
-            taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] = scopeOutcome;
-            results[batchIndex] = Object.assign({}, result, {
-              tasks: [],
-              terminalCode: "response-cross-scope-exact-duplicate-retry-pending",
-              closureErrors: ["post-batch-exact-normalized-duplicate"]
-            });
-            if (scopeId) acceptedScopeIds.delete(scopeId);
-          }
-          const duplicateLosers = duplicateIndexes.slice().sort((a, b) => {
-            const ma = initialResults.get(a);
-            const mb = initialResults.get(b);
-            const sa = String(ma?.batch?.scopeIds?.[0] || results[a]?.batch?.scopeIds?.[0] || "");
-            const sb = String(mb?.batch?.scopeIds?.[0] || results[b]?.batch?.scopeIds?.[0] || "");
-            const la = Number(ma?.batch?.members?.find((x) => String(x.scopeId) === sa)?.localOrdinal ?? 0);
-            const lb = Number(mb?.batch?.members?.find((x) => String(x.scopeId) === sb)?.localOrdinal ?? 0);
-            if (la !== lb) return la - lb;
-            const ta = sourceOrderMap ? sourceOrderMap.get(sa) : null;
-            const tb = sourceOrderMap ? sourceOrderMap.get(sb) : null;
-            const maM = ta && Number.isFinite(ta.marker) ? ta.marker : Number.MAX_SAFE_INTEGER;
-            const mbM = tb && Number.isFinite(tb.marker) ? tb.marker : Number.MAX_SAFE_INTEGER;
-            if (maM !== mbM) return maM - mbM;
-            const maI = ta && Number.isFinite(ta.idx) ? ta.idx : Number.MAX_SAFE_INTEGER;
-            const mbI = tb && Number.isFinite(tb.idx) ? tb.idx : Number.MAX_SAFE_INTEGER;
-            if (maI !== mbI) return maI - mbI;
-            return sa.localeCompare(sb);
+        let postBatchViews = [];
+        const replaceTaskGenerationScopeResult = (viewIndex, replacement = null, terminalCode = "", closureErrors = []) => {
+          const view = postBatchViews[viewIndex];
+          const mapping = view?.mapping;
+          if (!mapping) return;
+          const current = results[mapping.batchIndex];
+          if (!current) return;
+          const scopeId = String(mapping.scopeId || "");
+          const nextTasks = (current.tasks || []).filter((task) => String(task?.scope_id || task?.scopeId || "") !== scopeId);
+          if (replacement) nextTasks.push(replacement);
+          nextTasks.sort((left, right) => Number(left?.taskGenerationLocalOrdinal || Number.MAX_SAFE_INTEGER) - Number(right?.taskGenerationLocalOrdinal || Number.MAX_SAFE_INTEGER));
+          results[mapping.batchIndex] = Object.assign({}, current, {
+            tasks: nextTasks,
+            terminalCode: String(terminalCode || ""),
+            closureErrors: uniqueValues([...(current.closureErrors || []), ...(closureErrors || [])].map(String).filter(Boolean))
           });
-          const retryCandidates = [];
-          for (const batchIndex of duplicateLosers) {
-            const initialResult = initialResults.get(batchIndex);
-            const batch = initialResult.batch;
-            const scopeId = String(batch?.scopeIds?.[0] || "");
-            const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] || {};
-            const ledger = perScopeLedger ? perScopeLedger.get(scopeId) : null;
-            if (!ledger || !Number.isFinite(ledger.used) || !Number.isFinite(ledger.limit) || ledger.used >= ledger.limit) {
-              if (scopeId) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(scopeId);
-              terminalizeAmbiguousDuplicate(batchIndex, "response-cross-scope-exact-duplicate-retry-unavailable", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            const recordForDup = (scopeRecords || []).find((r) => String(r.scopeId || r.scope_id || "") === scopeId);
-            if (!recordForDup) {
-              terminalizeAmbiguousDuplicate(batchIndex, "response-missing-scope", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            let singletonPlanDup = null;
-            try {
-              singletonPlanDup = taskGenerationBatchPlan({
-                source, sourceContract, contextBundle: workflowContext, sourceSummary, globalEvidenceCatalog: evidenceCatalog, scopeRecords: [recordForDup], scopeSemanticEvidence: preStructureScopes.byScope, scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry, taskContext, settings: this.settings, provider: modelChoice.provider || "", model: modelChoice.model, system: taskGenerationSystem, globalPreflight: fullTaskGenerationPreflight, promptCachePrefix: workflowContext.promptCachePrefix, user: taskGenerationUser({ batch: { scopeIds: [scopeId], sourceContract: (recordForDup.sourceContract || sourceContract) } }), userForProjection: (projection, scopeIds) => taskGenerationUser({ batch: { scopeIds: scopeIds.slice(), sourceContract: projection.sourceContract, taskLimit: 1 } }), maxSubtasks
+        };
+        const buildPostBatchMemberViews = () => {
+          const views = [];
+          for (let batchIndex = 0; batchIndex < results.length; batchIndex += 1) {
+            const result = results[batchIndex];
+            const batch = result?.batch;
+            if (!result || result.terminalCode || !batch || !Array.isArray(result.tasks) || !Array.isArray(batch.members) || !Array.isArray(batch.batchRecords)) continue;
+            for (const [taskIndex, task] of result.tasks.entries()) {
+              const scopeId = String(task?.scope_id || task?.scopeId || "");
+              const localOrdinal = Number(task?.taskGenerationLocalOrdinal);
+              if (!scopeId || !Number.isSafeInteger(localOrdinal) || localOrdinal < 1) continue;
+              const member = batch.members.find((entry) => String(entry?.scopeId || "") === scopeId
+                && Number(entry?.localOrdinal || entry?.memberOrdinal) === localOrdinal);
+              const preparedRecord = Number.isSafeInteger(localOrdinal) && localOrdinal > 0 ? batch.batchRecords[localOrdinal - 1] : null;
+              if (!scopeId || !member || !preparedRecord || String(preparedRecord?.scopeIds?.[0] || "") !== scopeId) continue;
+              const viewBatch = Object.assign({}, preparedRecord, {
+                ordinal: Number(batch.ordinal),
+                batchId: String(batch.batchId || preparedRecord.batchId || ""),
+                scopeIds: [scopeId],
+                members: [Object.assign({}, member, { localOrdinal: 1, memberOrdinal: 1 })]
               });
-            } catch (e) {
-              terminalizeAmbiguousDuplicate(batchIndex, "response-scope-structure-invalid", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            const singletonBatchDup = singletonPlanDup && Array.isArray(singletonPlanDup.batches) ? singletonPlanDup.batches[0] : null;
-            if (!singletonBatchDup) {
-              terminalizeAmbiguousDuplicate(batchIndex, "response-missing-scope", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            if (singletonBatchDup.contextBundle?.contextBundleValidation?.dispatchAllowed === false) {
-              terminalizeAmbiguousDuplicate(batchIndex, "protected-workflow-evidence-closure-unresolved", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            const expectedPrefixHash = String(frozenPrefixHash || "");
-            const currentPrefixHash = typeof providerContextProjectionHash === "function" ? providerContextProjectionHash(String(singletonBatchDup.contextBundle.promptCachePrefix || "")) : "";
-            if (!expectedPrefixHash || !currentPrefixHash || currentPrefixHash !== expectedPrefixHash) {
-              terminalizeAmbiguousDuplicate(batchIndex, "retry-prefix-mismatch", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            const expectedBundleHash = String(frozenBundleHash || "");
-            const currentBundleHash = String(singletonBatchDup.contextBundle.sharedContextBundleHash || singletonBatchDup.contextBundle.bundleHash || "");
-            if (expectedBundleHash && currentBundleHash && expectedBundleHash !== currentBundleHash) {
-              terminalizeAmbiguousDuplicate(batchIndex, "retry-bundle-mismatch", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
-              continue;
-            }
-            scopeOutcome.recoveryAttempted = true;
-            scopeOutcome.exactDuplicateStatus = "retrying";
-            if (scopeId) {
-              taskGenerationRecoveryTelemetry.retryScopeIds.push(scopeId);
-              taskGenerationRecoveryTelemetry.exactDuplicateRetryScopeIds.push(scopeId);
-            }
-            let evaluated = null;
-            try {
-              ledger.used += 1;
-              const rawDup = await requestTaskStructure(null, false, {
-                workflowContext: singletonBatchDup.contextBundle,
-                batch: singletonBatchDup,
-                scopeRecovery: { reasonCodes: ["post-batch-exact-normalized-duplicate"] },
-                workflowToken
+              views.push({
+                batch: viewBatch,
+                tasks: [task],
+                mapping: { batchIndex, taskIndex, scopeId, localOrdinal, originalBatch: batch }
               });
-              let parsedDup = null;
-              try { parsedDup = JSON.parse(rawDup); } catch { parsedDup = null; }
-              if (parsedDup === null) {
-                evaluated = { terminalCode: "response-invalid-json", closureErrors: ["post-batch-exact-normalized-duplicate", "response-invalid-json"], task: null };
-              } else {
-                const c = taskGenerationProviderOutputContract(parsedDup);
-                if (!c.valid) evaluated = { terminalCode: c.code, closureErrors: ["post-batch-exact-normalized-duplicate", c.code], task: null };
+            }
+          }
+          return views;
+        };
+        postBatchViews = buildPostBatchMemberViews();
+        const duplicateGroups = taskGenerationPostBatchExactDuplicateGroups(postBatchViews);
+        if (!duplicateGroups.length) return;
+        const duplicateIndexes = duplicateGroups.flatMap((group) => group.indexes || []);
+        const initialResults = new Map(duplicateIndexes.map((viewIndex) => [viewIndex, postBatchViews[viewIndex]]));
+        const terminalizeAmbiguousDuplicate = (viewIndex, code, closureErrors = [], attributionCode = "model-output") => {
+          const view = postBatchViews[viewIndex];
+          const mapping = view?.mapping;
+          const scopeId = String(mapping?.scopeId || "");
+          replaceTaskGenerationScopeResult(viewIndex, null, String(code || "response-cross-scope-exact-duplicate"), closureErrors);
+          if (scopeId) {
+            acceptedScopeIds.delete(scopeId);
+            terminalScopeIds.add(scopeId);
+            if (!taskGenerationRecoveryTelemetry.exactDuplicateTerminalScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.exactDuplicateTerminalScopeIds.push(scopeId);
+          }
+          const outcomeIndex = Number(mapping?.batchIndex);
+          const scopeOutcome = Number.isFinite(outcomeIndex) ? taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] || {} : {};
+          scopeOutcome.recoveryStatus = "terminal";
+          scopeOutcome.recoveryAttempted = true;
+          scopeOutcome.recoveryReasonCodes = uniqueValues([...(scopeOutcome.recoveryReasonCodes || []), String(code || "response-cross-scope-exact-duplicate"), ...(closureErrors || [])].map(String).filter(Boolean));
+          scopeOutcome.exactDuplicateStatus = "terminal";
+          scopeOutcome.terminal = true;
+          scopeOutcome.terminalCode = String(code || "response-cross-scope-exact-duplicate");
+          scopeOutcome.attributionCode = String(attributionCode || "model-output");
+          scopeOutcome.reasonCodes = uniqueValues([...(scopeOutcome.reasonCodes || []), ...scopeOutcome.recoveryReasonCodes, scopeOutcome.terminalCode].filter(Boolean));
+          if (Number.isFinite(outcomeIndex)) taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] = scopeOutcome;
+          const previousAttribution = String(taskGenerationRecoveryTelemetry.attributionCode || "");
+          const nextAttribution = scopeOutcome.attributionCode;
+          taskGenerationRecoveryTelemetry.attributionCode = !previousAttribution || previousAttribution === nextAttribution
+            ? nextAttribution
+            : previousAttribution === "model-output"
+              ? nextAttribution
+              : nextAttribution === "model-output"
+                ? previousAttribution
+                : "plugin-workflow-or-infrastructure";
+        };
+        taskGenerationRecoveryTelemetry.exactDuplicateGroupCount += duplicateGroups.length;
+        for (const viewIndex of duplicateIndexes) {
+          const view = initialResults.get(viewIndex);
+          const mapping = view.mapping;
+          const scopeId = String(mapping.scopeId || "");
+          const outcomeIndex = Number(mapping.batchIndex);
+          const scopeOutcome = Number.isFinite(outcomeIndex) ? taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] || {} : {};
+          if (scopeId && !taskGenerationRecoveryTelemetry.exactDuplicateDetectedScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.exactDuplicateDetectedScopeIds.push(scopeId);
+          scopeOutcome.exactDuplicateDetected = true;
+          scopeOutcome.exactDuplicateStatus = "detected";
+          scopeOutcome.recoveryAttempted = false;
+          scopeOutcome.recoveryReasonCodes = uniqueValues([...(scopeOutcome.recoveryReasonCodes || []), "post-batch-exact-normalized-duplicate"]);
+          if (Number.isFinite(outcomeIndex)) taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] = scopeOutcome;
+          replaceTaskGenerationScopeResult(viewIndex, null, "response-cross-scope-exact-duplicate-retry-pending", ["post-batch-exact-normalized-duplicate"]);
+          if (scopeId) acceptedScopeIds.delete(scopeId);
+        }
+        const duplicateLosers = duplicateIndexes.slice().sort((a, b) => {
+          const ma = postBatchViews[a]?.mapping || {};
+          const mb = postBatchViews[b]?.mapping || {};
+          return compareTaskGenerationRecoveryOrder({ scopeId: ma.scopeId, batchOrdinal: ma.originalBatch?.ordinal, localOrdinal: ma.localOrdinal }, { scopeId: mb.scopeId, batchOrdinal: mb.originalBatch?.ordinal, localOrdinal: mb.localOrdinal });
+        });
+        const retryCandidates = [];
+        for (const viewIndex of duplicateLosers) {
+          const initialView = initialResults.get(viewIndex);
+          const mapping = initialView.mapping;
+          const batch = mapping.originalBatch;
+          const scopeId = String(mapping.scopeId || "");
+          if (taskGenerationRecoveryCancelled()) {
+            terminalizeAmbiguousDuplicate(viewIndex, "runtime-work-cancelled", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const initialAllowance = taskGenerationRetryAllowanceFor(batch);
+          if (!initialAllowance.admitted) {
+            if (scopeId && !taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(scopeId);
+            terminalizeAmbiguousDuplicate(viewIndex, "response-cross-scope-exact-duplicate-retry-unavailable", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const recordForDup = (scopeRecords || []).find((r) => String(r.scopeId || r.scope_id || "") === scopeId);
+          if (!recordForDup) {
+            terminalizeAmbiguousDuplicate(viewIndex, "response-missing-scope", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          let singletonPlanDup = null;
+          try {
+            singletonPlanDup = taskGenerationBatchPlan({
+              source, sourceContract, contextBundle: workflowContext, sourceSummary, globalEvidenceCatalog: evidenceCatalog, scopeRecords: [recordForDup], scopeSemanticEvidence: preStructureScopes.byScope, scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry, taskContext, settings: this.settings, provider: modelChoice.provider || "", model: modelChoice.model, system: taskGenerationSystem, globalPreflight: fullTaskGenerationPreflight, promptCachePrefix: workflowContext.promptCachePrefix, user: taskGenerationUser({ batch: { scopeIds: [scopeId], sourceContract: (recordForDup.sourceContract || sourceContract) } }), userForProjection: (projection, scopeIds) => taskGenerationUser({ batch: { scopeIds: scopeIds.slice(), sourceContract: projection.sourceContract, taskLimit: 1 } }), maxSubtasks
+            });
+          } catch (e) {
+            terminalizeAmbiguousDuplicate(viewIndex, "response-scope-structure-invalid", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const singletonBatchDup = singletonPlanDup && Array.isArray(singletonPlanDup.batches) ? singletonPlanDup.batches[0] : null;
+          if (!singletonBatchDup) {
+            const plannedTerminal = Array.isArray(singletonPlanDup?.terminalScopes)
+              ? singletonPlanDup.terminalScopes.find((entry) => String(entry?.scopeId || "") === scopeId)
+              : null;
+            terminalizeAmbiguousDuplicate(viewIndex, String(plannedTerminal?.code || "response-missing-scope"), ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const recoveryPreflightCode = taskGenerationRecoveryPreflightCode(singletonPlanDup, singletonBatchDup);
+          if (recoveryPreflightCode) {
+            terminalizeAmbiguousDuplicate(viewIndex, recoveryPreflightCode, ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          if (taskGenerationRecoveryCancelled()) {
+            terminalizeAmbiguousDuplicate(viewIndex, "runtime-work-cancelled", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const reservation = taskGenerationReserveScopeRetry(scopeId);
+          if (!reservation.admitted) {
+            if (scopeId && !taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.retryBudgetExhaustedScopeIds.push(scopeId);
+            terminalizeAmbiguousDuplicate(viewIndex, reservation.code, ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const recoveryBudget = taskGenerationDispatchBudgetFor(singletonBatchDup, {
+            limit: initialAllowance.remaining,
+            lineageId: `task-generation-${shortHash(String(batch?.batchId || ""))}-${shortHash(scopeId)}`
+          });
+          if (taskGenerationRecoveryCancelled()) {
+            terminalizeAmbiguousDuplicate(viewIndex, "runtime-work-cancelled", ["post-batch-exact-normalized-duplicate"], "plugin-workflow-or-infrastructure");
+            continue;
+          }
+          const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[Number(mapping.batchIndex)] || {};
+          scopeOutcome.recoveryAttempted = true;
+          scopeOutcome.exactDuplicateStatus = "retrying";
+          taskGenerationRecoveryTelemetry.scopeOutcomes[Number(mapping.batchIndex)] = scopeOutcome;
+          if (scopeId) {
+            if (!taskGenerationRecoveryTelemetry.retryScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.retryScopeIds.push(scopeId);
+            if (!taskGenerationRecoveryTelemetry.exactDuplicateRetryScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.exactDuplicateRetryScopeIds.push(scopeId);
+          }
+          let evaluated = null;
+          try {
+            const rawDup = await requestTaskStructure(null, false, {
+              workflowContext: singletonBatchDup.contextBundle,
+              batch: singletonBatchDup,
+              scopeRecovery: { reasonCodes: ["post-batch-exact-normalized-duplicate"] },
+              workflowToken,
+              generationDispatchBudget: recoveryBudget
+            });
+            let parsedDup = null;
+            try { parsedDup = JSON.parse(rawDup); } catch { parsedDup = null; }
+            if (parsedDup === null) {
+              evaluated = { terminalCode: "response-invalid-json", closureErrors: ["post-batch-exact-normalized-duplicate", "response-invalid-json"], task: null };
+            } else {
+              const c = taskGenerationProviderOutputContract(parsedDup);
+              if (!c.valid) evaluated = { terminalCode: c.code, closureErrors: ["post-batch-exact-normalized-duplicate", c.code], task: null };
+              else {
+                const rawTaskDup = Array.isArray(parsedDup.tasks) && parsedDup.tasks[0] ? parsedDup.tasks[0] : null;
+                const attDup = rawTaskDup ? taskGenerationAttachCanonicalScope(rawTaskDup, singletonBatchDup) : { valid: false, errors: ["response-missing-scope"] };
+                if (!attDup.valid) evaluated = { terminalCode: attDup.errors[0], closureErrors: ["post-batch-exact-normalized-duplicate", attDup.errors[0]], task: null };
                 else {
-                  const rawTaskDup = Array.isArray(parsedDup.tasks) && parsedDup.tasks[0] ? parsedDup.tasks[0] : null;
-                  const attDup = rawTaskDup ? taskGenerationAttachCanonicalScope(rawTaskDup, singletonBatchDup) : { valid: false, errors: ["response-missing-scope"] };
-                  if (!attDup.valid) evaluated = { terminalCode: attDup.errors[0], closureErrors: ["post-batch-exact-normalized-duplicate", attDup.errors[0]], task: null };
-                  else {
-                    const cleanedDup = cleanTask(attDup.task, labelsAllowedByInstructions(taskInstructions.tags), this.settings, { allowUnboundedMarkedActionTitles: taskWorkflowAllowsUnboundedMarkedActionTitles(singletonBatchDup?.sourceContract) });
-                    let closureDup = taskGenerationScopeContentClosure(cleanedDup, singletonBatchDup, { settings: this.settings, allowedLabels: labelsAllowedByInstructions(taskInstructions.tags), priorityInstructions: taskInstructions.priorities || "" });
-                    if (!closureDup.valid && closureDup.errors.every((e) => e === "task-safe-field-priority-mismatch")) {
-                      const corrDup = taskGenerationApplyExpectedPriorityCorrection(cleanedDup, singletonBatchDup, { settings: this.settings, priorityInstructions: taskInstructions.priorities || "" });
-                      if (corrDup.applied) {
-                        const ccDup = taskGenerationScopeContentClosure(corrDup.task, singletonBatchDup, { settings: this.settings, allowedLabels: labelsAllowedByInstructions(taskInstructions.tags), priorityInstructions: taskInstructions.priorities || "" });
-                        if (ccDup.valid) { taskGenerationRecoveryTelemetry.priorityCorrectionCount += 1; closureDup = ccDup; evaluated = { terminalCode: "", closureErrors: [], task: corrDup.task, closure: ccDup }; }
-                        else evaluated = { terminalCode: ccDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(ccDup.errors || [])], task: corrDup.task, closure: ccDup };
-                      } else evaluated = { terminalCode: closureDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(closureDup.errors || [])], task: cleanedDup, closure: closureDup };
-                    } else if (!cleanedDup.content || !closureDup.valid) evaluated = { terminalCode: closureDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(closureDup.errors || [])], task: cleanedDup, closure: closureDup };
-                    else evaluated = { terminalCode: "", closureErrors: [], task: cleanedDup, closure: closureDup };
-                  }
+                  const cleanedDup = cleanTask(attDup.task, labelsAllowedByInstructions(taskInstructions.tags), this.settings, { allowUnboundedMarkedActionTitles: taskWorkflowAllowsUnboundedMarkedActionTitles(singletonBatchDup?.sourceContract) });
+                  let closureDup = taskGenerationScopeContentClosure(cleanedDup, singletonBatchDup, { settings: this.settings, allowedLabels: labelsAllowedByInstructions(taskInstructions.tags), priorityInstructions: taskInstructions.priorities || "" });
+                  if (!closureDup.valid && closureDup.errors.every((e) => e === "task-safe-field-priority-mismatch")) {
+                    const corrDup = taskGenerationApplyExpectedPriorityCorrection(cleanedDup, singletonBatchDup, { settings: this.settings, priorityInstructions: taskInstructions.priorities || "" });
+                    if (corrDup.applied) {
+                      const ccDup = taskGenerationScopeContentClosure(corrDup.task, singletonBatchDup, { settings: this.settings, allowedLabels: labelsAllowedByInstructions(taskInstructions.tags), priorityInstructions: taskInstructions.priorities || "" });
+                      if (ccDup.valid) { taskGenerationRecoveryTelemetry.priorityCorrectionCount += 1; closureDup = ccDup; evaluated = { terminalCode: "", closureErrors: [], task: corrDup.task, closure: ccDup }; }
+                      else evaluated = { terminalCode: ccDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(ccDup.errors || [])], task: corrDup.task, closure: ccDup };
+                    } else evaluated = { terminalCode: closureDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(closureDup.errors || [])], task: cleanedDup, closure: closureDup };
+                  } else if (!cleanedDup.content || !closureDup.valid) evaluated = { terminalCode: closureDup.errors[0] || "response-scope-structure-invalid", closureErrors: ["post-batch-exact-normalized-duplicate", ...(closureDup.errors || [])], task: cleanedDup, closure: closureDup };
+                  else evaluated = { terminalCode: "", closureErrors: [], task: cleanedDup, closure: closureDup };
                 }
               }
-            } catch (error) {
-              terminalizeAmbiguousDuplicate(batchIndex, typeof taskGenerationStableFailureCode === "function" ? taskGenerationStableFailureCode(error) : String(error?.providerError?.code || error?.code || "provider-error").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 120) || "provider-error", ["post-batch-exact-normalized-duplicate"], "provider-adapter-infrastructure");
-              continue;
             }
-            if (evaluated.terminalCode || !evaluated.task || !evaluated.closure?.valid) {
-              terminalizeAmbiguousDuplicate(batchIndex, evaluated.terminalCode || "response-scope-structure-invalid", [
-                "post-batch-exact-normalized-duplicate",
-                ...(evaluated.closureErrors || [])
-              ]);
-              continue;
-            }
-            retryCandidates.push({ index: batchIndex, valid: true, terminalized: false, evaluated, task: evaluated.task });
+          } catch (error) {
+            terminalizeAmbiguousDuplicate(viewIndex, typeof taskGenerationStableFailureCode === "function" ? taskGenerationStableFailureCode(error) : String(error?.providerError?.code || error?.code || "provider-error").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 120) || "provider-error", ["post-batch-exact-normalized-duplicate"], "provider-adapter-infrastructure");
+            continue;
           }
-          const retryAdmission = taskGenerationPostBatchExactDuplicateRetryAdmission(results, duplicateGroups, retryCandidates);
-          for (const candidate of retryCandidates) {
-            if (candidate.terminalized) continue;
-            const batchIndex = candidate.index;
-            const initialResult = initialResults.get(batchIndex);
-            const batch = initialResult.batch;
-            const scopeId = String(batch?.scopeIds?.[0] || "");
-            const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] || {};
-            const decision = retryAdmission.get(batchIndex);
-            if (!decision?.admitted) {
-              terminalizeAmbiguousDuplicate(batchIndex, decision?.reasonCode || "response-cross-scope-exact-duplicate", ["post-batch-exact-normalized-duplicate"]);
-              continue;
-            }
-            const replacement = candidate.task;
-            replacement.scope_id = candidate.evaluated.closure.scopeId;
-            replacement.taskId = String(batch.syntheticTaskId || `scope:${candidate.evaluated.closure.scopeId}`);
-            replacement.taskGenerationBatchId = batch.batchId;
-            replacement.taskGenerationBatchOrdinal = Number(batch.ordinal);
-            replacement.taskGenerationLocalOrdinal = 0;
-            results[batchIndex] = Object.assign({}, initialResult, {
-              tasks: [replacement],
-              terminalCode: "",
-              closureErrors: []
-            });
-            scopeOutcome.recoveryStatus = "accepted";
-            scopeOutcome.exactDuplicateStatus = "retry-accepted";
-            scopeOutcome.terminal = false;
-            scopeOutcome.terminalCode = "";
-            scopeOutcome.reasonCodes = uniqueValues([
-              ...(scopeOutcome.reasonCodes || []),
-              "post-batch-exact-normalized-duplicate"
-            ]);
-            taskGenerationRecoveryTelemetry.scopeOutcomes[batchIndex] = scopeOutcome;
-            if (scopeId) {
-              taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.push(scopeId);
-              taskGenerationRecoveryTelemetry.exactDuplicateRetryAcceptedScopeIds.push(scopeId);
-              acceptedScopeIds.add(scopeId);
-              terminalScopeIds.delete(scopeId);
-            }
+          if (evaluated.terminalCode || !evaluated.task || !evaluated.closure?.valid) {
+            terminalizeAmbiguousDuplicate(viewIndex, evaluated.terminalCode || "response-scope-structure-invalid", ["post-batch-exact-normalized-duplicate", ...(evaluated.closureErrors || [])]);
+            continue;
           }
+          retryCandidates.push({ index: viewIndex, valid: true, terminalized: false, evaluated, task: evaluated.task });
+        }
+        const retryAdmission = taskGenerationPostBatchExactDuplicateRetryAdmission(postBatchViews, duplicateGroups, retryCandidates);
+        for (const candidate of retryCandidates) {
+          if (candidate.terminalized) continue;
+          const viewIndex = candidate.index;
+          const initialView = initialResults.get(viewIndex);
+          const mapping = initialView.mapping;
+          const batch = mapping.originalBatch;
+          const scopeId = String(mapping.scopeId || "");
+          const decision = retryAdmission.get(viewIndex);
+          if (!decision?.admitted) {
+            terminalizeAmbiguousDuplicate(viewIndex, decision?.reasonCode || "response-cross-scope-exact-duplicate", ["post-batch-exact-normalized-duplicate"]);
+            continue;
+          }
+          const replacement = candidate.task;
+          replacement.scope_id = candidate.evaluated.closure.scopeId;
+          replacement.taskId = String(batch.syntheticTaskId || `scope:${candidate.evaluated.closure.scopeId}`);
+          replacement.taskGenerationBatchId = batch.batchId;
+          replacement.taskGenerationBatchOrdinal = Number(batch.ordinal);
+          replacement.taskGenerationLocalOrdinal = Number(mapping.localOrdinal || 0);
+          replaceTaskGenerationScopeResult(viewIndex, replacement, "", []);
+          const outcomeIndex = Number(mapping.batchIndex);
+          const scopeOutcome = taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] || {};
+          scopeOutcome.recoveryStatus = "accepted";
+          scopeOutcome.exactDuplicateStatus = "retry-accepted";
+          scopeOutcome.terminal = false;
+          scopeOutcome.terminalCode = "";
+          scopeOutcome.reasonCodes = uniqueValues([...(scopeOutcome.reasonCodes || []), "post-batch-exact-normalized-duplicate"]);
+          taskGenerationRecoveryTelemetry.scopeOutcomes[outcomeIndex] = scopeOutcome;
+          if (scopeId) {
+            if (!taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.acceptedRetryScopeIds.push(scopeId);
+            if (!taskGenerationRecoveryTelemetry.exactDuplicateRetryAcceptedScopeIds.includes(scopeId)) taskGenerationRecoveryTelemetry.exactDuplicateRetryAcceptedScopeIds.push(scopeId);
+            acceptedScopeIds.add(scopeId);
+            terminalScopeIds.delete(scopeId);
+          }
+        }
         };
+        let actualWorkerCount = 0;
         const dispatchBatches = async (workflowToken = null) => {
-          await runBatch(workflowToken);
+          actualWorkerCount = await taskGenerationRunInitialBatchWorkers(runBatch, workerCount, batchPlan.batches.length, workflowToken);
           await drainTitleRetriesSerially(workflowToken);
           await repairPostBatchExactDuplicates(workflowToken);
         };
@@ -17139,55 +17538,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           exactDuplicateRetryAcceptedScopeOrdinals: exactDuplicateScopeOrdinals(taskGenerationRecoveryTelemetry.exactDuplicateRetryAcceptedScopeIds),
           exactDuplicateTerminalScopeOrdinals: exactDuplicateScopeOrdinals(taskGenerationRecoveryTelemetry.exactDuplicateTerminalScopeIds),
           scopeOutcomes: taskGenerationRecoveryTelemetry.scopeOutcomes.filter(Boolean).map((entry) => Object.assign({}, entry)),
-          workerCount: 1,
+          workerCount: actualWorkerCount,
           provider: normalizedProvider
         };
         json = JSON.stringify({ tasks: mergedTasks });
       }
     } catch (error) {
       const providerDiagnostic = aiGatewaySanitizeProviderDiagnostic(error?.providerError?.providerDiagnostic || error?.providerDiagnostic);
-      const stableFailureCode = (v) => String(v || '').replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80);
-      const providerFailure = { code: stableFailureCode(error?.code || error?.message || ""), providerDiagnostic };
+      const providerFailure = { code: taskGenerationStableFailureCode(error), providerDiagnostic };
       this.lastTaskGenerationProviderFailure = providerFailure;
       this.logLocal("Task generation provider failed", providerFailure);
-      const batchDispatchStatePublicProjection = (() => {
-        const b = batchDispatchState;
-        if(!b || typeof b !== "object") return { taskCount:0, rejectedCount:0, terminalScopeIdHashes:[], batchPlanTelemetry:{ mode:"", batchCount:0, scopeCount:0, batchIdHashes:[], calls:[], retrySerialBatches:[] }, perScopeLedgerHashes:[], scopeOutcomes:[] };
-        const mode = String(b.batchPlanTelemetry?.mode || b.mode || "");
-        const batchCount = Number.isFinite(b.batchPlanTelemetry?.batchCount) ? Math.max(0, Math.min(1000, Math.trunc(b.batchPlanTelemetry.batchCount))) : (Array.isArray(b.results)? b.results.length : 0);
-        const scopeCount = Number.isFinite(b.batchPlanTelemetry?.scopeCount) ? Math.max(0, Math.min(1000, Math.trunc(b.batchPlanTelemetry.scopeCount))) : 0;
-        const hashOnly = (v) => { try{ const h=shortHash(String(v||"")); return h ? String(h) : ""; }catch{ return ""; } };
-        const envelopeHashOf = (raw) => { try{ return localSemanticRoutingStableHash(String(raw||"").slice(0,200)) || ""; }catch{ return ""; } };
-        const batchIdHashes = Array.isArray(b.batchPlanTelemetry?.batchIds) ? b.batchPlanTelemetry.batchIds.map(hashOnly)
-          : Array.isArray(b.batchPlanTelemetry?.batchIdHashes) ? b.batchPlanTelemetry.batchIdHashes.map(v=> String(v||"").match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(v) : hashOnly(v))
-          : [];
-        const calls = Array.isArray(b.batchPlanTelemetry?.calls) ? b.batchPlanTelemetry.calls.map(c=>({
-          envelopeHash: envelopeHashOf(c?.envelopeHash || c?.raw || ""),
-          rawEstimated: Number.isFinite(c?.rawEstimated)? Math.trunc(c.rawEstimated): 0,
-          adjustedEstimated: Number.isFinite(c?.adjustedEstimated)? Math.trunc(c.adjustedEstimated): 0,
-          schemaBytes: Number.isFinite(c?.schemaBytes)? Math.trunc(c.schemaBytes): 0,
-          wrapperControlBytes: Number.isFinite(c?.wrapperControlBytes)? Math.trunc(c.wrapperControlBytes): 0
-        })) : [];
-        const retrySerialBatches = Array.isArray(b.batchPlanTelemetry?.retrySerialBatches) ? b.batchPlanTelemetry.retrySerialBatches.map(r=>({
-          retryBatchIdHash: hashOnly(r?.retryBatchId || r?.retryBatchIdHash || ""),
-          failedScopeIdHash: hashOnly(r?.failedScopeId || r?.failedScopeIdHash || ""),
-          ordinalInSerialOrder: Number.isSafeInteger(r?.ordinalInSerialOrder) && r.ordinalInSerialOrder>0 && r.ordinalInSerialOrder<=Math.max(1,scopeCount) ? r.ordinalInSerialOrder : 0
-        })) : [];
-        const terminalScopeIdHashes = Array.isArray(b.terminalScopeIds) ? b.terminalScopeIds.map(hashOnly)
-          : Array.isArray(b.batchPlanTelemetry?.terminalScopeIdHashes) ? b.batchPlanTelemetry.terminalScopeIdHashes.map(v=> String(v).match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(v) : hashOnly(v))
-          : [];
-        const perScopeLedgerHashes = (perScopeLedger instanceof Map) ? Array.from(perScopeLedger.entries()).map(([k,v])=>[hashOnly(k), v])
-          : Array.isArray(b.perScopeLedgerHashes) ? b.perScopeLedgerHashes.map(([kh,v])=> [String(kh||"").match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(kh): hashOnly(kh), v])
-          : [];
-        const scopeOutcomes = Array.isArray(b.scopeOutcomes) ? b.scopeOutcomes.map(o=>{
-          const h = hashOnly(o?.scopeId || o?.scopeIdHash || "");
-          const code = stableFailureCode(o?.code || o?.providerError?.code || "");
-          return { scopeIdHash: h, code: code || "", outcome: String(o?.outcome||"") };
-        }) : [];
-        const taskCount = Number.isFinite(b.taskCount) ? Math.max(0, Math.min(1000, Math.trunc(b.taskCount))) : (Array.isArray(b.results)? b.results.flatMap(r=>r?.tasks||[]).length : 0);
-        const rejectedCount = Number.isFinite(b.rejectedCount) ? Math.max(0, Math.min(1000, Math.trunc(b.rejectedCount))) : 0;
-        return { taskCount, rejectedCount, terminalScopeIdHashes, batchPlanTelemetry:{ mode, batchCount, scopeCount, batchIdHashes, calls, retrySerialBatches }, perScopeLedgerHashes, scopeOutcomes };
-      })();
+      const publishedTaskGenerationBatchTelemetry = taskGenerationRecoveryTelemetryProjection(batchDispatchState, {
+        batchPlanTelemetry,
+        batchCount: batchPlan?.batches?.length || 0,
+        scopeCount: scopeRecords?.length || 0,
+        perScopeLedger
+      });
       return {
         tasks: [],
         sectionName: cleanGeneratedSectionName(source.sectionName),
@@ -17200,7 +17566,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         taskWorkflowContextBundle: workflowContext,
         contextBundle: workflowContext,
         taskGenerationBatchPlan: batchPlan,
-        taskGenerationBatchTelemetry: valueSuppressingRecoveryTelemetry(batchDispatchStatePublicProjection),
+        taskGenerationBatchTelemetry: valueSuppressingRecoveryTelemetry(publishedTaskGenerationBatchTelemetry),
         workflowContextFailure: providerFailure,
         taskGenerationOutcome: taskGenerationOutcome("provider-failure", { code: providerFailure.code })
       };
@@ -17266,8 +17632,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let limitedTasks = limitGeneratedTasks(grounding.tasks, null, maxSubtasks);
     enrichTaskWorkflowSourceContractFacts(limitedTasks, sourceContract);
     const workflowValidationOptions = { settings: this.settings, allowLegacyFactBindings: false };
+    let initialEvidenceResult = null;
     {
-      const initialEvidenceResult = attachTaskWorkflowEvidenceBundles(limitedTasks, sourceContract, evidenceCatalog, workflowValidationOptions);
+      initialEvidenceResult = attachTaskWorkflowEvidenceBundles(limitedTasks, sourceContract, evidenceCatalog, workflowValidationOptions);
       annotateTaskGenerationTelemetry("initial", initialEvidenceResult.tasks);
       if (initialEvidenceResult.rejected.length) {
         const rejectedReasonCodes = uniqueValues((initialEvidenceResult.rejected || [])
@@ -17323,6 +17690,88 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       scopes: taskGenerationRecoveryTelemetry.scopeOutcomes.filter(Boolean).map((entry) => Object.assign({}, entry)),
       calls: taskGenerationRecoveryTelemetry.calls.map((call) => Object.assign({}, call))
     }));
+    const publishedTaskGenerationBatchTelemetry = taskGenerationRecoveryTelemetryProjection(batchDispatchState, {
+      batchPlanTelemetry,
+      batchCount: batchPlan?.batches?.length || 0,
+      scopeCount: scopeRecords?.length || 0,
+      perScopeLedger,
+      taskCount: initialEvidenceResult?.tasks?.length || 0,
+      rejectedCount: Math.max(Number(grounding.rejected?.length || 0), Number(initialEvidenceResult?.rejected?.length || 0))
+    });
+    const terminalBatchScopeIdsBeforeRetrieval = uniqueValues([
+      ...(batchPlan?.terminalScopes || []).map((entry) => String(entry.scopeId || "")),
+      ...(batchDispatchState?.terminalScopeIds || []).map(String),
+      ...(taskGenerationRecoveryTelemetry.terminalScopeIds || []).map(String)
+    ].filter(Boolean));
+    if (terminalBatchScopeIdsBeforeRetrieval.length) {
+      const terminalScopeSet = new Set(terminalBatchScopeIdsBeforeRetrieval);
+      const acceptedTasks = (initialEvidenceResult?.tasks || limitedTasks || [])
+        .filter((task) => !terminalScopeSet.has(String(task?.scope_id || task?.scopeId || "")));
+      const frozenContentSnapshot = acceptedTasks.map((task) => String(task?.content || ""));
+      const frozenTitleSnapshot = acceptedTasks.map((task) => String(task?.title ?? task?.content ?? ""));
+      if (frozenContentSnapshot.some((content) => !content) || frozenTitleSnapshot.some((title) => !title)) throw new Error("post-mutator content/title empty");
+      const frozenLimitedTasks = Object.freeze(acceptedTasks.map((task) => Object.freeze(Object.assign({}, task))));
+      const orderedScope = new Map((scopeRecords || []).map((record, index) => [String(record.scopeId || record.scope_id || ""), index]));
+      parsed.tasks = Object.freeze(frozenLimitedTasks.slice().sort((a, b) => (orderedScope.get(String(a.scope_id || a.scopeId || "")) ?? Number.MAX_SAFE_INTEGER) - (orderedScope.get(String(b.scope_id || b.scopeId || "")) ?? Number.MAX_SAFE_INTEGER) || Number(a.taskGenerationBatchOrdinal || 0) - Number(b.taskGenerationBatchOrdinal || 0) || Number(a.taskGenerationLocalOrdinal || 0) - Number(b.taskGenerationLocalOrdinal || 0)));
+      parsed.sectionName = cleanGeneratedSectionName(source.sectionName);
+      parsed.contextNotes = taskSemanticSourceUsesMarkedActions(sourceContract)
+        ? []
+        : contextNotesForTaskPlan(
+          initialSemanticContext || [],
+          source.path,
+          Math.max(this.settings.taskContextSummaryMaxNotes || 0, adaptiveContextBudget("task-generation").maxNotes),
+          [taskQuery, flattenTaskPlan(parsed.tasks || []).map((task) => task.content || "").join("\n")].join("\n"),
+          this.settings
+        );
+      parsed.sourceSummary = sourceSummary;
+      parsed.semanticContext = initialSemanticContext;
+      parsed.taskContextHydration = this.lastTaskContextHydrationTelemetry || null;
+      parsed.taskContextHydrationTelemetry = this.lastTaskContextHydrationTelemetry || null;
+      parsed.taskWorkflowContextBundle = workflowContext;
+      parsed.contextBundle = workflowContext;
+      parsed.taskGenerationBatchPlan = batchPlan;
+      parsed.taskGenerationBatchTelemetry = valueSuppressingRecoveryTelemetry(publishedTaskGenerationBatchTelemetry);
+      if (!parsed.taskGenerationBatchTelemetry) parsed.taskGenerationBatchTelemetry = valueSuppressingRecoveryTelemetry(batchPlan?.telemetry || null);
+      parsed.adaptiveContextDepth = adaptivePack.depth;
+      parsed.allowedLabels = Array.from(allowedLabels);
+      parsed.requestedActionSignals = requestedActionSignals;
+      parsed.sourceContract = sourceContract;
+      parsed.sourceContractId = sourceContract.id;
+      parsed.evidenceCatalog = evidenceCatalog;
+      parsed.evidenceLedger = initialEvidenceResult?.ledger || null;
+      parsed.evidenceBundlesByTask = initialEvidenceResult?.ledger?.evidenceBundlesByTask || {};
+      parsed.promptBundleHash = workflowContext.promptBundleHash;
+      parsed.validatorBundleHash = workflowContext.validatorBundleHash;
+      parsed.contextBundleId = workflowContext.bundleHash || workflowContext.promptBundleId || "";
+      parsed.contextBundleHash = workflowContext.bundleHash || "";
+      parsed.promptBundleId = workflowContext.promptBundleId || workflowContext.bundleHash || "";
+      parsed.validatorBundleId = workflowContext.validatorBundleId || workflowContext.bundleHash || "";
+      parsed.evidenceValidatorBundleHash = initialEvidenceResult?.ledger?.hash || initialEvidenceResult?.ledger?.catalogHash || "";
+      parsed.batchTerminalScopeIds = terminalBatchScopeIdsBeforeRetrieval;
+      parsed.taskGenerationBatchTerminal = true;
+      const markerFactCoverage = structuredMarkedActionFactCoverage(parsed.tasks, sourceContract);
+      parsed.markedActionFactCoverage = markerFactCoverage;
+      parsed.markedActionFactIds = markerFactCoverage.requiredFactIds;
+      parsed.missingMarkedActionFactIds = markerFactCoverage.missingFactIds;
+      const rejectedCount = Math.max(
+        Number(grounding.rejected?.length || 0),
+        Number(initialEvidenceResult?.rejected?.length || 0)
+      );
+      const outcomeState = parsed.tasks.length ? "task-generation-batch-partial-terminal" : "task-generation-batch-terminal";
+      parsed.taskGenerationOutcome = taskGenerationOutcome(outcomeState, {
+        responseState,
+        taskCount: parsed.tasks.length,
+        rejectedCount,
+        fallbackUsed: false,
+        code: outcomeState
+      });
+      parsed.sectionInstructions = taskInstructions.sectionTitle;
+      parsed.descriptionInstructions = taskInstructions.descriptions;
+      parsed.dateInstructions = taskInstructions.dates;
+      parsed.priorityInstructions = taskInstructions.priorities;
+      parsed.labelInstructions = taskInstructions.tags;
+      return parsed;
+    }
     const taskSemanticRetrieval = await this.retrieveTaskSemanticContexts(limitedTasks, source, sourceContract, {
       limit: this.settings.maxTaskContextChunks,
       mode: "task-generation"
@@ -17424,17 +17873,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // validation failure; exact scope identity and any references the output
     // actually asserts are validated independently below.
     if (grounding.rejected.length) {
+      const groundingReasonCodes = ["primary-source-grounding"];
       this.logLocal("Rejected generated tasks without primary-source grounding", {
         source: source.type || "",
         count: grounding.rejected.length,
-        tasks: grounding.rejected.map((task) => truncateAtWord(task.content || "", 100))
+        reasonCodes: groundingReasonCodes
       });
     }
     if (finalEvidenceResult.rejected.length) {
+      const rejectedReasonCodes = uniqueValues((finalEvidenceResult.rejected || [])
+        .flatMap((entry) => Array.isArray(entry?.errors) ? entry.errors : [])
+        .map((error) => taskGenerationStableFailureCode(error))
+        .filter((code) => code && code !== "provider-error")
+        .slice(0, 32));
       this.logLocal("Rejected generated tasks with invalid source evidence references", {
         source: source.type || "",
         count: finalEvidenceResult.rejected.length,
-        tasks: finalEvidenceResult.rejected.map((entry) => ({ content: truncateAtWord(entry.task?.content || "", 100), errors: entry.errors }))
+        errorCount: (finalEvidenceResult.rejected || []).reduce((total, entry) => total + (Array.isArray(entry?.errors) ? entry.errors.length : (entry?.errors ? 1 : 0)), 0),
+        reasonCodes: rejectedReasonCodes.length ? rejectedReasonCodes : ["source-evidence-reference-invalid"]
       });
     }
     const deterministicFallbackUsed = false;
@@ -17469,27 +17925,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parsed.taskWorkflowContextBundle = workflowContext;
     parsed.contextBundle = workflowContext;
     parsed.taskGenerationBatchPlan = batchPlan;
-    const stableFailureCode = (v) => String(v || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80);
-    const hashOnly = (v) => { try { const h = shortHash(String(v || "")); return h ? String(h) : ""; } catch { return ""; } };
-    const envelopeHashOf = (raw) => { try { return localSemanticRoutingStableHash(String(raw || "").slice(0, 200)) || ""; } catch { return ""; } };
-    const batchDispatchStatePublicProjection = (() => {
-      const b = batchDispatchState;
-      if (!b || typeof b !== "object") return { taskCount: 0, rejectedCount: 0, terminalScopeIdHashes: [], batchPlanTelemetry: { mode: "", batchCount: 0, scopeCount: 0, batchIdHashes: [], calls: [], retrySerialBatches: [] }, perScopeLedgerHashes: [], scopeOutcomes: [] };
-      const mode = String(b.batchPlanTelemetry?.mode || b.mode || "");
-      const batchCount = Number.isFinite(b.batchPlanTelemetry?.batchCount) ? Math.max(0, Math.min(1000, Math.trunc(b.batchPlanTelemetry.batchCount))) : (Array.isArray(b.results) ? Math.max(0, Math.min(1000, b.results.length)) : 0);
-      const scopeCountRaw = Number.isFinite(b.batchPlanTelemetry?.scopeCount) ? b.batchPlanTelemetry.scopeCount : ((Array.isArray(b.terminalScopeIds) || Array.isArray(b.acceptedScopeIds)) ? ((b.terminalScopeIds?.length || 0) + (b.acceptedScopeIds?.length || 0)) : 0);
-      const scopeCount = Number.isFinite(scopeCountRaw) ? Math.max(0, Math.min(1000, Math.trunc(scopeCountRaw))) : 0;
-      const batchIdHashes = Array.isArray(b.batchPlanTelemetry?.batchIds) ? b.batchPlanTelemetry.batchIds.map(hashOnly) : Array.isArray(b.batchPlanTelemetry?.batchIdHashes) ? b.batchPlanTelemetry.batchIdHashes.map((v) => String(v || "").match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(v) : hashOnly(v)) : [];
-      const calls = Array.isArray(b.batchPlanTelemetry?.calls) ? b.batchPlanTelemetry.calls.map((c) => ({ envelopeHash: envelopeHashOf(c?.envelopeHash || c?.raw || ""), rawEstimated: Number.isFinite(c?.rawEstimated) ? Math.trunc(c.rawEstimated) : 0, adjustedEstimated: Number.isFinite(c?.adjustedEstimated) ? Math.trunc(c.adjustedEstimated) : 0, schemaBytes: Number.isFinite(c?.schemaBytes) ? Math.trunc(c.schemaBytes) : 0, wrapperControlBytes: Number.isFinite(c?.wrapperControlBytes) ? Math.trunc(c.wrapperControlBytes) : 0 })) : [];
-      const retrySerialBatches = Array.isArray(b.batchPlanTelemetry?.retrySerialBatches) ? b.batchPlanTelemetry.retrySerialBatches.map((r) => ({ retryBatchIdHash: hashOnly(r?.retryBatchId || r?.retryBatchIdHash || ""), failedScopeIdHash: hashOnly(r?.failedScopeId || r?.failedScopeIdHash || ""), ordinalInSerialOrder: Number.isSafeInteger(r?.ordinalInSerialOrder) && r.ordinalInSerialOrder > 0 && r.ordinalInSerialOrder <= Math.max(1, scopeCount) ? r.ordinalInSerialOrder : 0 })) : [];
-      const terminalScopeIdHashes = Array.isArray(b.terminalScopeIds) ? b.terminalScopeIds.map(hashOnly) : Array.isArray(b.batchPlanTelemetry?.terminalScopeIdHashes) ? b.batchPlanTelemetry.terminalScopeIdHashes.map((v) => String(v).match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(v) : hashOnly(v)) : [];
-      const perScopeLedgerHashes = (perScopeLedger instanceof Map) ? Array.from(perScopeLedger.entries()).map(([k, v]) => [hashOnly(k), v]) : Array.isArray(b.perScopeLedgerHashes) ? b.perScopeLedgerHashes.map(([kh, v]) => [String(kh || "").match(/^[A-Za-z0-9._:-]{1,80}$/) ? String(kh) : hashOnly(kh), v]) : [];
-      const scopeOutcomes = Array.isArray(b.scopeOutcomes) ? b.scopeOutcomes.map((o) => { const h = hashOnly(o?.scopeId || o?.scopeIdHash || ""); const code = stableFailureCode(o?.code || o?.terminalCode || o?.providerError?.code || ""); return { scopeIdHash: h, code: code || "", outcome: String(o?.outcome || o?.terminalCode || "") }; }) : [];
-      const taskCount = Number.isFinite(b.taskCount) ? Math.max(0, Math.min(1000, Math.trunc(b.taskCount))) : Math.max(0, Math.min(1000, parsed.tasks.length));
-      const rejectedCount = Number.isFinite(b.rejectedCount) ? Math.max(0, Math.min(1000, Math.trunc(b.rejectedCount))) : Math.max(0, Math.min(1000, Number(finalEvidenceResult.rejected?.length || 0)));
-      return { taskCount, rejectedCount, terminalScopeIdHashes, batchPlanTelemetry: { mode, batchCount, scopeCount, batchIdHashes, calls, retrySerialBatches }, perScopeLedgerHashes, scopeOutcomes };
-    })();
-    parsed.taskGenerationBatchTelemetry = valueSuppressingRecoveryTelemetry(batchDispatchStatePublicProjection);
+    publishedTaskGenerationBatchTelemetry.taskCount = parsed.tasks.length;
+    publishedTaskGenerationBatchTelemetry.rejectedCount = Math.max(
+      Number(grounding.rejected?.length || 0),
+      Number(finalEvidenceResult.rejected?.length || 0)
+    );
+    parsed.taskGenerationBatchTelemetry = valueSuppressingRecoveryTelemetry(publishedTaskGenerationBatchTelemetry);
+    if (!parsed.taskGenerationBatchTelemetry) parsed.taskGenerationBatchTelemetry = valueSuppressingRecoveryTelemetry(batchPlan?.telemetry || null);
     parsed.adaptiveContextDepth = adaptivePack.depth;
     parsed.allowedLabels = Array.from(allowedLabels);
     parsed.requestedActionSignals = requestedActionSignals;
@@ -17938,12 +18380,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "Dynamic request-local schema fields: index, task_id, description_sentences, scope_id, evidence_ids, and fact_refs. Exact singleton enum values are supplied only in the request-local schema; provider current scalars and fact_bindings are not part of the description output contract.",
       "Description instructions:",
       descriptionInstructions || "",
-      "Provider-neutral prompt guidance: apply the singleton task-description system contract exactly.",
       `Excluded link domains: ${excludedLinkDomains(this.settings).join(", ") || "none"}`,
       "Context-note citation rule:",
       contextCitationInstructions(citeContextNotes, structuredEvidence),
       structuredEvidence
-        ? "The closed canonical ledger/suffix for this singleton contains all task-local fact/evidence/citation tables. The bounded executionCandidatesByFactId rows contain exact task-local fact bodies for execution review; use those local tables as the sole source. Preserve the exact task scope and IDs, never borrow sibling rows, and let the plugin derive canonical output bindings locally after acceptance."
+        ? ""
         : "Use only the supplied singleton task evidence fields; preserve every materially useful task-local fact without inventing or padding details."
     ].filter(Boolean).join("\n");
     const descriptionConcurrency = taskDescriptionProviderConcurrency(this.settings, modelChoice.provider, modelChoice.model);
@@ -20622,6 +21063,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       reason: ""
     };
     this.setSidebarStatus("Rebuilding Todoist references...");
+    const priorTaskCache = this.settings.taskCache;
+    const priorPendingTaskReferences = this.settings.pendingTaskReferences;
+    const priorLastReferenceRebuildAt = this.settings.lastReferenceRebuildAt;
+    const priorLastReferenceRebuildFingerprint = this.settings.lastReferenceRebuildFingerprint;
+    const priorLastReferenceRebuildCandidateCount = this.settings.lastReferenceRebuildCandidateCount;
+    const priorTaskReferenceSnapshotMeta = this.settings.taskReferenceSnapshotMeta;
+    const priorTaskReferenceSnapshotFingerprint = this.taskReferenceSnapshotFingerprint;
+    const priorTaskReferenceSnapshotDirty = this.taskReferenceSnapshotDirty;
+    const priorTaskReferenceStateRevision = this.taskReferenceStateRevision;
+    const completePopulationScope = "complete-current-non-deleted-todoist";
     try {
       this.logLocal("Todoist reference rebuild started", { force });
       if (!this.settings.todoistToken) throw new Error("Add a Todoist API token first.");
@@ -20630,23 +21081,49 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const oldReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app));
       stats.files = files.length;
       stats.scannedTasks = localState.candidateCount;
-      if (!localState.candidateCount) {
-        if (!(allowEmpty === true && confirmedEmpty === true)) {
+      const remote = await this.getAllTodoistReferenceTasks({ force });
+      if (!remote || remote.error || !Array.isArray(remote.tasks)) {
+        const detail = remote?.error?.message || remote?.error || "Todoist inventory unavailable";
+        throw new Error(`${detail}; preserved the current task-reference snapshot.`);
+      }
+      const seenRemoteIds = new Set();
+      const normalizedRemoteTasks = [];
+      for (const rawTask of remote.tasks) {
+        if (!rawTask || rawTask.isDeleted === true || rawTask.is_deleted === true || rawTask.deleted === true) continue;
+        const id = String(rawTask.id ?? rawTask.todoistId ?? "").trim();
+        const content = singleLine(rawTask.content || "");
+        if (!id) throw new Error("Todoist inventory failed integrity validation (empty task ID); preserved the current task-reference snapshot.");
+        if (!content.trim()) throw new Error("Todoist inventory failed integrity validation (empty task content); preserved the current task-reference snapshot.");
+        if (seenRemoteIds.has(id)) throw new Error(`Todoist inventory failed integrity validation (duplicate task ID ${id}); preserved the current task-reference snapshot.`);
+        seenRemoteIds.add(id);
+        normalizedRemoteTasks.push(Object.assign({}, rawTask, { id, content }));
+      }
+      stats.todoistTasksRead = normalizedRemoteTasks.length;
+      const explicitConfirmedEmpty = allowEmpty === true && confirmedEmpty === true;
+      const setCompletePopulationMeta = (remoteTaskCount) => {
+        this.settings.taskReferenceSnapshotMeta = Object.assign({}, this.settings.taskReferenceSnapshotMeta || {}, {
+          populationScope: completePopulationScope,
+          remoteTaskCount
+        });
+      };
+      if (!normalizedRemoteTasks.length) {
+        if (!explicitConfirmedEmpty) {
           stats.skipped = true;
-          stats.reason = "No syncable note task references were found; preserved the current task-reference snapshot.";
-          stats.semanticRefreshDegradedReason = "empty-reference-scan-preserved";
+          stats.reason = "Empty Todoist inventory without explicit confirmed-empty; preserved the current task-reference snapshot.";
+          stats.semanticRefreshDegradedReason = "empty-remote-inventory-preserved";
           this.logLocal("Todoist reference rebuild skipped", Object.assign(stats, {
             preservedLastGood: true
           }));
-          if (showNotice) new Notice("No syncable note task references were found; the current Todoist reference snapshot was preserved.");
+          if (showNotice) new Notice("Empty Todoist inventory; the current Todoist reference snapshot was preserved.");
           return stats;
         }
+        setCompletePopulationMeta(0);
         this.settings.taskCache = {};
         this.settings.pendingTaskReferences = {};
         this.markTaskReferenceStateDirty();
         this.settings.lastReferenceRebuildAt = deviceTimestamp();
         this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
-        this.settings.lastReferenceRebuildCandidateCount = 0;
+        this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
         await this.saveSettings({
           allowEmptyTaskReferenceSnapshot: true,
           confirmedEmptyTaskReferenceSnapshot: true
@@ -20659,30 +21136,86 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         stats.reason = "Explicit confirmed-empty rebuild committed.";
         this.logLocal("Todoist reference rebuild skipped", Object.assign(stats, {
           skipped: true,
-          reason: "No syncable note task references were found."
+          reason: "No Todoist tasks were found."
         }));
-        if (showNotice) new Notice("No syncable note task references were found.");
+        if (showNotice) new Notice("No Todoist tasks were found.");
         return stats;
       }
       const cacheCount = Object.keys(this.settings.taskCache || {}).length;
       const unchanged = localState.fingerprint && localState.fingerprint === this.settings.lastReferenceRebuildFingerprint;
       const hasFreshRemoteSnapshot = this.hasFreshTodoistSnapshot(["items", "projects", "sections"]);
-      if (!force && unchanged && cacheCount >= localState.candidateCount && hasFreshRemoteSnapshot) {
+      const snapshotMeta = this.settings.taskReferenceSnapshotMeta || {};
+      const recordedRemoteTaskCount = Number(snapshotMeta.remoteTaskCount);
+      if (!force && unchanged && snapshotMeta.populationScope === completePopulationScope
+        && Number.isFinite(recordedRemoteTaskCount) && recordedRemoteTaskCount === cacheCount
+        && normalizedRemoteTasks.length === recordedRemoteTaskCount
+        && hasFreshRemoteSnapshot) {
         stats.skipped = true;
-        stats.reason = "Local references unchanged and a fresh Todoist snapshot is already available.";
+        stats.reason = "Local references unchanged and a fresh complete Todoist snapshot is already available.";
         this.settings.lastReferenceRebuildAt = deviceTimestamp();
         this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
         await this.saveSettings();
         this.logLocal("Todoist reference rebuild skipped", stats);
         return stats;
       }
-      const remote = await this.getAllTodoistReferenceTasks({ force });
-      stats.todoistTasksRead = remote.tasks.length;
-      const remoteById = new Map(remote.tasks.map((task) => [task.id, task]));
+      const remoteById = new Map(normalizedRemoteTasks.map((task) => [String(task.id), task]));
       const oldCache = Object.assign({}, this.settings.taskCache || {});
       const oldSettings = Object.assign({}, this.settings, { taskCache: oldCache });
       const nextCache = {};
       const nextSettings = Object.assign({}, this.settings, { taskCache: nextCache });
+      const priorKnowledgeFor = (id) => {
+        const knowledge = oldCache[String(id)]?.knowledge;
+        return knowledge ? { knowledge } : null;
+      };
+      const remoteParsedTask = (remoteTask, {
+        oid = "",
+        path = "",
+        lineNumber = null,
+        parentOid = "",
+        parentLineNumber = null
+      } = {}) => {
+        const id = String(remoteTask.id);
+        const parentId = String(remoteTask.parentId || remoteTask.parent_id || "");
+        const remoteParent = parentId ? remoteById.get(parentId) : null;
+        const dueDate = remoteTask.dueDate || remoteTask.due_date || remoteTask.due?.date || "";
+        const deadlineDate = remoteTask.deadlineDate || remoteTask.deadline_date || remoteTask.deadline?.date || "";
+        const isCompleted = remoteTask.isCompleted != null
+          ? Boolean(remoteTask.isCompleted)
+          : Boolean(remoteTask.is_completed || remoteTask.checked || remoteTask.completed);
+        return {
+          id,
+          oid,
+          path,
+          lineNumber,
+          content: singleLine(remoteTask.content || ""),
+          description: String(remoteTask.description || ""),
+          labels: Array.isArray(remoteTask.labels) ? remoteTask.labels.slice() : [],
+          priority: normalizePriority(remoteTask.priority),
+          due_date: dueDate ? datePart(dueDate) : null,
+          deadline_date: deadlineDate || null,
+          scheduledDueDateTime: isDateTimeString(dueDate) ? dueDate : "",
+          duration: normalizeTodoistDuration(remoteTask.duration),
+          isCompleted,
+          isSubtask: Boolean(parentId),
+          parentId,
+          parentOid: parentId ? String(parentOid || "") : "",
+          parentContent: parentId ? singleLine(remoteParent?.content || "") : "",
+          parentLineNumber: parentId && Number.isFinite(parentLineNumber) ? parentLineNumber : null,
+          section: String(remoteTask.section || ""),
+          sectionId: String(remoteTask.sectionId || remoteTask.section_id || ""),
+          projectId: String(remoteTask.projectId || remoteTask.project_id || ""),
+          projectName: String(remoteTask.projectName || "")
+        };
+      };
+      for (const remoteTask of normalizedRemoteTasks) {
+        const id = String(remoteTask.id);
+        const seed = referenceCacheEntry(id, remoteParsedTask(remoteTask), this.settings, priorKnowledgeFor(id));
+        seed.oid = "";
+        seed.path = "";
+        seed.lineNumber = null;
+        seed.noteRefs = [];
+        nextCache[id] = seed;
+      }
       const workerCount = referenceRebuildWorkerCount(this.settings);
       await asyncPool(files, workerCount, async (file) => {
         this.setSidebarStatus(`Rebuilding references: ${file.basename}`);
@@ -20704,18 +21237,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           const parentId = findMatchedParentId(parsed, lines, matchedByLine);
           const legacyId = (shouldConvertLegacyTodoistIds(this.settings) || hasSemanticSyncMarker(lines[i], this.settings)) ? getLegacyTodoistId(lines[i]) : "";
           const oidId = parsed.oid ? todoistIdForOid(oldSettings, parsed.oid) : "";
-          let match = legacyId ? remoteById.get(legacyId) : null;
+          let match = legacyId ? remoteById.get(String(legacyId)) : null;
           if (match) stats.directIdMatches += 1;
           if (!match && oidId) {
-            match = remoteById.get(oidId);
+            match = remoteById.get(String(oidId));
             if (match) stats.oidMatches += 1;
           }
           if (!match && parsed.id) {
-            match = remoteById.get(parsed.id);
+            match = remoteById.get(String(parsed.id));
             if (match) stats.directIdMatches += 1;
           }
           if (!match) {
-            const matchCandidates = parsed.isCompleted ? remote.tasks : remote.tasks.filter((task) => !task.isCompleted);
+            const matchCandidates = parsed.isCompleted ? normalizedRemoteTasks : normalizedRemoteTasks.filter((task) => !task.isCompleted);
             match = findExistingTodoistTaskMatch(parsed, matchCandidates, parentId);
             if (match) {
               stats.contentMatches += 1;
@@ -20727,15 +21260,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             continue;
           }
           stats.matched += 1;
-          const existingOid = parsed.oid || oldCache[match.id]?.oid || "";
-          const oid = uniqueOidForRebuiltReference(existingOid, match.id, nextSettings);
-          const parentMatch = parentId ? matchedByLine.get(parentLineIndex(parsed, lines)) : null;
-          const remoteParsed = parsedTaskFromTodoistReference(match, parsed, oid, file.path, i, parentMatch);
-          const entry = referenceCacheEntry(match.id, remoteParsed, this.settings, oldCache[match.id]);
-          nextCache[match.id] = nextCache[match.id] ? mergeReferenceCacheEntry(nextCache[match.id], entry) : entry;
-          matchedByLine.set(i, { id: match.id, oid });
+          const matchId = String(match.id);
+          const preferredOid = oidId && String(oidId) === matchId ? parsed.oid : "";
+          const oid = uniqueOidForRebuiltReference(preferredOid, matchId, nextSettings);
+          const localParentLine = parentId ? parentLineIndex(parsed, lines) : -1;
+          const parentMatch = localParentLine >= 0 ? matchedByLine.get(localParentLine) : null;
+          const remoteParentId = String(match.parentId || match.parent_id || "");
+          const verifiedParentMatch = remoteParentId && parentMatch && String(parentMatch.id) === remoteParentId ? parentMatch : null;
+          const remoteParsed = remoteParsedTask(Object.assign({}, match, { id: matchId }), {
+            oid,
+            path: file.path,
+            lineNumber: i,
+            parentOid: verifiedParentMatch?.oid || "",
+            parentLineNumber: verifiedParentMatch ? localParentLine : null
+          });
+          const priorForEntry = nextCache[matchId]?.knowledge ? { knowledge: nextCache[matchId].knowledge } : null;
+          const entry = referenceCacheEntry(matchId, remoteParsed, this.settings, priorForEntry);
+          nextCache[matchId] = nextCache[matchId] ? mergeReferenceCacheEntry(nextCache[matchId], entry) : entry;
+          matchedByLine.set(i, { id: matchId, oid });
           if (singleLine(parsed.content || "") !== singleLine(match.content || "")) stats.conflicts += 1;
-          const normalized = normalizeTaskOidLine(lines[i], oid, this.settings, match.id);
+          const normalized = normalizeTaskOidLine(lines[i], oid, this.settings, matchId);
           if (normalized !== lines[i]) {
             lines[i] = normalized;
             changed = true;
@@ -20747,12 +21291,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           await this.app.vault.modify(file, lines.join("\n"));
         }
       });
+      for (const [id, entry] of Object.entries(nextCache)) {
+        const prior = oldCache[String(id)];
+        if (!prior || parsedTaskSignature(entry) !== parsedTaskSignature(prior)) continue;
+        const priorKnowledgeFingerprint = prior.knowledge?.fingerprint || "";
+        const nextKnowledgeFingerprint = entry.knowledge?.fingerprint || "";
+        if (!prior.knowledge || !priorKnowledgeFingerprint || priorKnowledgeFingerprint !== nextKnowledgeFingerprint) continue;
+        entry.knowledge = prior.knowledge;
+        if (Object.prototype.hasOwnProperty.call(prior, "cachedAt")) entry.cachedAt = prior.cachedAt;
+        if (Object.prototype.hasOwnProperty.call(prior, "rebuiltAt")) entry.rebuiltAt = prior.rebuiltAt;
+      }
       this.settings.taskCache = nextCache;
       this.settings.pendingTaskReferences = {};
       this.markTaskReferenceStateDirty();
       this.settings.lastReferenceRebuildAt = deviceTimestamp();
       this.settings.lastReferenceRebuildFingerprint = localState.fingerprint;
       this.settings.lastReferenceRebuildCandidateCount = localState.candidateCount;
+      setCompletePopulationMeta(normalizedRemoteTasks.length);
       await this.saveSettings();
       await this.repairCachedSubtaskIndentation(false, { force: true });
       const nextReferenceRecords = semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app));
@@ -20765,6 +21320,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (showNotice) new Notice(`Rebuilt ${stats.matched} Todoist reference${stats.matched === 1 ? "" : "s"}. ${stats.unmatched} note task${stats.unmatched === 1 ? "" : "s"} not matched.`);
       return stats;
     } catch (error) {
+      this.settings.taskCache = priorTaskCache;
+      this.settings.pendingTaskReferences = priorPendingTaskReferences;
+      this.settings.lastReferenceRebuildAt = priorLastReferenceRebuildAt;
+      this.settings.lastReferenceRebuildFingerprint = priorLastReferenceRebuildFingerprint;
+      this.settings.lastReferenceRebuildCandidateCount = priorLastReferenceRebuildCandidateCount;
+      if (priorTaskReferenceSnapshotMeta === undefined) delete this.settings.taskReferenceSnapshotMeta;
+      else this.settings.taskReferenceSnapshotMeta = priorTaskReferenceSnapshotMeta;
+      this.taskReferenceSnapshotFingerprint = priorTaskReferenceSnapshotFingerprint;
+      this.taskReferenceSnapshotDirty = priorTaskReferenceSnapshotDirty;
+      this.taskReferenceStateRevision = priorTaskReferenceStateRevision;
       console.error(error);
       this.logLocal("Todoist reference rebuild failed", { error: error.message || String(error) });
       if (showNotice) new Notice(`Reference rebuild failed: ${error.message || error}`);
@@ -21227,19 +21792,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     stats.checked = flat.length;
     if (!tasks?.length || this.settings.enableTaskDeduplication === false) return stats;
     this.setSidebarStatus("Checking for existing tasks...");
+    await idlePause(0);
     const candidates = await this.taskDeduplicationCandidates(options);
-    const semanticDedupeState = await this.prepareSemanticTaskDeduplicationState(tasks, candidates, options);
+    const todoistDuplicateLookup = buildTodoistTaskDuplicateLookup(candidates);
     const matchingOptions = Object.assign({}, options, {
-      semanticDedupeState,
-      semanticIndexRevision: this.semanticIndexRevision || 0
+      todoistDuplicateLookup
     });
-    stats.semanticTelemetry = semanticDedupeState.telemetry;
-    stats.degradedState = semanticDedupeState.degraded ? "degraded" : (semanticDedupeState.enabled ? "ready" : "legacy");
-    stats.degradedReason = semanticDedupeState.reason || "";
+    stats.semanticTelemetry = {
+      mode: "local-todoist-snapshot",
+      candidateCount: candidates.length,
+      providerCalls: 0,
+      providerCost: 0,
+      elapsedMs: 0,
+      degraded: false,
+      degradedReason: ""
+    };
+    stats.degradedState = "local-snapshot";
+    stats.degradedReason = "";
     const generatedDedupe = await deduplicateGeneratedTaskBatch(
       tasks,
       this.settings,
-      matchingOptions,
+      Object.assign({}, matchingOptions, { todoistDuplicateLookup: null }),
       (task, decision, detectionOptions) => this.aiTaskDeduplicationDecision(task, decision, detectionOptions),
       (task, decision, generationOptions) => this.taskGenerationUpdateForDuplicate(task, decision, generationOptions)
     );
@@ -21270,7 +21843,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await this.postTaskDeduplicationCandidateFlags(stats, options);
       return stats;
     }
-    for (const task of tasks) {
+    for (let taskIndex = 0; taskIndex < tasks.length; taskIndex += 1) {
+      if (taskIndex > 0 && taskIndex % 100 === 0) await idlePause(0);
+      const task = tasks[taskIndex];
       const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, matchingOptions, { isSubtask: false }));
       stats.candidateOutcomes.push({
         taskId: String(task?.id || task?.oid || ""),
@@ -21322,7 +21897,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             continue;
           }
         }
-        const generatedUpdate = matchingOptions.semanticDedupeState?.enabled
+        const generatedUpdate = mainDecision.localSnapshotMatch === true || matchingOptions.semanticDedupeState?.enabled
           ? { used: false, task }
           : await this.taskGenerationUpdateForDuplicate(task, mainDecision, matchingOptions);
         if (!generatedUpdate?.task) {
@@ -21403,86 +21978,38 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
   async taskDeduplicationCandidates(options = {}) {
-    const index = this.getTaskReferenceIndex();
-    const semanticRanks = semanticTaskReferenceCandidateRanks(options.semanticContext || []);
-    const semanticChunks = (this.semanticIndex || []).filter((chunk) => {
-      const sourceKind = semanticChunkSourceKind(chunk);
-      return isSemanticTaskDeduplicationChunk(chunk, sourceKind);
-    });
-    const chunkByTaskId = new Map();
-    for (const chunk of semanticChunks) {
-      for (const key of [
-        chunk.taskId, chunk.todoistId, chunk.id, chunk.oid, chunk.workflowTaskId, chunk.workflow_task_id,
-        chunk.taskReference?.id, chunk.taskReference?.oid, chunk.taskReference?.taskId,
-        chunk.taskReference?.task_id, chunk.taskReference?.workflowTaskId, chunk.taskReference?.workflow_task_id
-      ].filter(Boolean)) {
-        const normalized = String(key).toUpperCase();
-        if (!chunkByTaskId.has(normalized)) chunkByTaskId.set(normalized, chunk);
+    await idlePause(0);
+    const tasksById = new Map();
+    const addTask = (task, fallbackId = "") => {
+      const id = String(task?.id || task?.todoistId || fallbackId || "").trim();
+      if (!id) return;
+      if (task?.isCompleted) {
+        tasksById.delete(id);
+        return;
       }
-    }
-    const candidates = [];
-    const candidateByStableKey = new Map();
-    const addCandidate = (candidate) => {
-      const keys = taskDeduplicationStableReferenceKeys(candidate);
-      const existing = keys.map((key) => candidateByStableKey.get(key)).find(Boolean);
-      if (existing) {
-        const merged = mergeTaskDeduplicationCandidate(existing, candidate);
-        const existingIndex = candidates.indexOf(existing);
-        if (existingIndex >= 0) candidates[existingIndex] = merged;
-        for (const [key, value] of candidateByStableKey.entries()) if (value === existing) candidateByStableKey.set(key, merged);
-        for (const key of taskDeduplicationStableReferenceKeys(merged)) candidateByStableKey.set(key, merged);
-        return merged;
-      }
-      candidates.push(candidate);
-      for (const key of keys) candidateByStableKey.set(key, candidate);
-      return candidate;
+      const content = singleLine(task?.content || "");
+      const description = String(task?.description || "");
+      if (!content && !description.trim()) return;
+      tasksById.set(id, Object.assign({}, task, {
+        id,
+        content,
+        description,
+        due_date: task?.due_date || task?.dueDate || "",
+        deadline_date: task?.deadline_date || task?.deadlineDate || ""
+      }));
     };
-    for (const reference of index.pendingReferences || []) {
-      if (!reference?.content || reference.isCompleted || !taskDeduplicationHasRemoteIdentity(reference)) continue;
-      const parentContext = taskReferenceParentContext(reference, index);
-      const pendingTask = Object.assign({}, reference, parentContext, {
-        id: String(reference.id || ""),
-        taskId: String(reference.taskId || reference.task_id || ""),
-        knowledge: reference.knowledge?.intent ? reference.knowledge : taskKnowledgeSnapshot(reference, this.settings, "", reference.knowledge || null)
-      });
-      const pendingChunk = chunkByTaskId.get(String(reference.id || "").toUpperCase())
-        || chunkByTaskId.get(String(reference.taskId || reference.task_id || "").toUpperCase())
-        || chunkByTaskId.get(String(reference.oid || "").toUpperCase())
-        || null;
-      addCandidate({
-        id: stableTaskDeduplicationCandidateId({ task: pendingTask }),
-        taskId: pendingTask.taskId || "",
-        oid: pendingTask.oid || "",
-        sourceId: pendingChunk?.sourceId || reference.sourceId || "",
-        task: pendingTask,
-        semanticChunk: pendingChunk,
-        semanticIndexRank: semanticRanks.get(String(pendingTask.oid || "").toUpperCase()) || 0
-      });
+    let visited = 0;
+    for (const [id, task] of Object.entries(this.settings.taskCache || {})) {
+      addTask(task, id);
+      visited += 1;
+      if (visited % 250 === 0) await idlePause(0);
     }
-    for (const [id, task] of index.entries || []) {
-      if (!id || !task?.content || task.isCompleted) continue;
-      const childText = index.childTextByParentOid.get(String(task.oid || "").toUpperCase()) || "";
-      const parentContext = taskReferenceParentContext(task, index);
-      const enrichedTask = Object.assign({}, task, parentContext, { id: String(id), childText });
-      const knowledge = enrichedTask.knowledge?.intent ? enrichedTask.knowledge : taskKnowledgeSnapshot(enrichedTask, this.settings, childText, enrichedTask.knowledge || null);
-      const semanticIndexRank = semanticRanks.get(String(task.oid || "").toUpperCase()) || 0;
-      const semanticChunk = chunkByTaskId.get(String(id).toUpperCase()) || chunkByTaskId.get(String(task.oid || "").toUpperCase()) || null;
-      addCandidate({ id: String(id), sourceId: semanticChunk?.sourceId || "", task: Object.assign(enrichedTask, { knowledge }), semanticChunk, semanticIndexRank });
+    for (const task of this.todoistSnapshotCache?.snapshot?.tasks || []) {
+      addTask(task);
+      visited += 1;
+      if (visited % 250 === 0) await idlePause(0);
     }
-    for (const chunk of semanticChunks) {
-      const task = semanticTaskDedupeChunkIdentity(chunk);
-      const id = String(task.id || task.oid || task.taskId || chunk.sourceId || "");
-      if (!id || task.isCompleted || !task.content) continue;
-      addCandidate({ id, sourceId: chunk.sourceId || "", task, semanticChunk: chunk, semanticIndexRank: 0 });
-    }
-    if (shouldUseLiveTodoistDeduplicationCandidates(options)) {
-      for (const candidate of await this.liveTodoistTaskDeduplicationCandidates(candidates, options)) addCandidate(candidate);
-    }
-    for (const candidate of candidates) {
-      if (candidate.semanticIndexRank) continue;
-      candidate.semanticIndexRank = semanticRanks.get(String(candidate.task?.oid || "").toUpperCase()) || 0;
-    }
-    return candidates;
+    return Array.from(tasksById, ([id, task]) => ({ id, task }));
   }
 
   async prepareSemanticTaskDeduplicationState(tasks = [], candidates = [], options = {}) {
@@ -21766,7 +22293,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async taskDeduplicationDecision(task, candidates, options = {}) {
-    return bestTaskDeduplicationMatch(task, candidates, this.settings, options);
+    const lookup = options.todoistDuplicateLookup && options.isSubtask !== true
+      ? options.todoistDuplicateLookup
+      : buildTodoistTaskDuplicateLookup(candidates);
+    return todoistSnapshotTaskDuplicateDecision(task, lookup);
   }
 
   async aiTaskDeduplicationDecision(task, localDecision, options = {}) {
@@ -22950,7 +23480,23 @@ class SemanticTodoistView extends ItemView {
       const active = await this.getSelectedActiveContext();
       if (this.promptEl) this.promptEl.value = "";
       const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode });
-      this.renderRelevantNotes(result.context);
+      const usedEvidenceIds = new Set((Array.isArray(result?.citationTelemetry?.usedEvidenceIds) ? result.citationTelemetry.usedEvidenceIds : [])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean));
+      const citationTelemetry = result?.citationTelemetry && typeof result.citationTelemetry === "object" ? result.citationTelemetry : {};
+      const deliveredEvidenceIds = Array.isArray(citationTelemetry.deliveredEvidenceIds) ? citationTelemetry.deliveredEvidenceIds : [];
+      const sourceIds = Array.isArray(citationTelemetry.sourceIds) ? citationTelemetry.sourceIds : [];
+      const activeSourceContractId = String(result?.sourceContractId || "").trim();
+      const activeEvidenceUsed = Boolean(active?.path && activeSourceContractId && deliveredEvidenceIds.some((evidenceId, index) =>
+        usedEvidenceIds.has(String(evidenceId || "").trim())
+        && String(sourceIds[index] || "").trim() === activeSourceContractId));
+      const relevantNoteContext = [
+        ...(activeEvidenceUsed ? [{ path: active.path }] : []),
+        ...(usedEvidenceIds.size && Array.isArray(result?.context)
+          ? result.context.filter((row) => usedEvidenceIds.has(String(row?.evidenceId || row?.evidence_id || row?.id || "").trim()))
+          : [])
+      ];
+      this.renderRelevantNotes(relevantNoteContext);
       if (typeof this.plugin.enqueueResponseApplication === "function") {
         const application = await this.plugin.enqueueResponseApplication({
           operationId,
@@ -23411,7 +23957,6 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this.providerStorageSummaries = null;
     this.providerStorageSummaryPromise = null;
     this.providerSettingsProvider = typeof STS_MULTI_PROVIDER !== "undefined" && STS_MULTI_PROVIDER.normalizeProvider ? STS_MULTI_PROVIDER.normalizeProvider("openai", "openai") : "openai";
-    this.pendingSettingsSectionKey = "";
   }
 
   goTo(tab) {
@@ -23507,38 +24052,12 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     };
     this[renderers[this.activeTab] || "renderSetup"](containerEl);
     organizeSettingsDisclosures(containerEl, this.activeTab, this.sectionOpenState);
-    const pendingKey = this.pendingSettingsSectionKey;
-    const revealPendingSettingsSection = () => {
-      if (!pendingKey || this.activeTab !== "AI & Search") {
-        if (pendingKey && this.activeTab !== "AI & Search") this.pendingSettingsSectionKey = "";
-        return;
-      }
-      let escaped = pendingKey;
-      try { if (typeof CSS !== "undefined" && CSS.escape) escaped = CSS.escape(pendingKey); else escaped = pendingKey.replace(/"/g, '\\"'); } catch { escaped = pendingKey; }
-      let targetEl = null;
-      try { targetEl = containerEl.querySelector(`[data-section-key="${escaped}"]`); } catch {
-        try { targetEl = containerEl.querySelector('[data-section-key="' + pendingKey.replace(/"/g, '\\"') + '"]'); } catch {}
-      }
-      if (!targetEl && typeof containerEl.querySelectorAll === "function") {
-        const all = containerEl.querySelectorAll("[data-section-key]");
-        for (const el of all) if (el.dataset?.sectionKey === pendingKey || el.getAttribute?.("data-section-key") === pendingKey) { targetEl = el; break; }
-      }
-      if (targetEl) {
-        try { targetEl.scrollIntoView({ block: "start", inline: "nearest" }); } catch {}
-        const summary = targetEl.querySelector ? targetEl.querySelector("summary") : null;
-        if (summary) {
-          try { summary.focus({ preventScroll: true }); } catch { try { summary.focus(); } catch {} }
-        }
-      }
-      this.pendingSettingsSectionKey = "";
-    };
     tabs.scrollLeft = Number(this.tabScrollLeft || 0);
     if (activeButton) {
       const alignActiveTab = () => activeButton.scrollIntoView({ block: "nearest", inline: "center" });
       const restoreAfterLayout = () => {
         alignActiveTab();
         this.restoreSettingsScrollPositions(scrollPositions);
-        revealPendingSettingsSection();
       };
       const view = containerEl?.ownerDocument?.defaultView;
       if (view && typeof view.requestAnimationFrame === "function") view.requestAnimationFrame(restoreAfterLayout);
@@ -23546,7 +24065,6 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       else restoreAfterLayout();
     } else {
       this.restoreSettingsScrollPositions(scrollPositions);
-      revealPendingSettingsSection();
     }
   }
 
@@ -23588,39 +24106,24 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     if (this.plugin.settings.enableAiModelFallback) fallbackAiProviderSetting(containerEl, this.plugin, () => this.display());
     toggleSetting(containerEl, "Enable embedding fallback", "Independent from generation fallback. When on, an explicit accessible embedding provider/model may be used after a primary embedding failure; the complete semantic-index candidate is rebuilt in one vector space. Saved embedding fallback selections remain preserved while off.", this.plugin, "enableEmbeddingFallback", () => this.display());
     stsMpRenderUnifiedModelSettings(containerEl, this.plugin, () => this.display(), this.operationOpenState);
-    settingsHeading(containerEl, "AI provider settings", "Quickly open a provider's connection settings. Changing this selection does not change providers, save settings, or start discovery; click Open to navigate.");
-    const initialNavProvider = STS_MULTI_PROVIDER.normalizeProvider(this.providerSettingsProvider, STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER[0] || "openai");
-    this.providerSettingsProvider = initialNavProvider;
-    const navSetting = new Setting(containerEl).setName("Provider").setDesc("Choose a provider disclosure to open below.");
-    let navButtonRef = null;
+    settingsHeading(containerEl, "AI provider settings", "Choose which provider connection settings are shown. This selection does not change AI routing, save settings, or start discovery.");
+    const providerView = stsMpAiProviderSettingsView(this.providerSettingsProvider);
+    this.providerSettingsProvider = providerView.provider;
+    if (!(this.sectionOpenState instanceof Map)) this.sectionOpenState = new Map();
+    const providerSettingsSectionKey = "AI & Search::AI provider settings";
+    if (!this.sectionOpenState.has(providerSettingsSectionKey)) this.sectionOpenState.set(providerSettingsSectionKey, true);
+    if (!this.sectionOpenState.has(providerView.sectionKey)) this.sectionOpenState.set(providerView.sectionKey, true);
+    const navSetting = new Setting(containerEl)
+      .setName("Provider")
+      .setDesc("Choose which provider connection settings are shown. This does not change AI routing, save settings, or start discovery.");
     navSetting.addDropdown((dropdown) => {
       for (const provider of STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER) dropdown.addOption(provider, stsMpProviderSettingsDisplayName(provider, STS_MULTI_PROVIDER));
-      dropdown.setValue(initialNavProvider).onChange((value) => {
-        const next = STS_MULTI_PROVIDER.normalizeProvider(value, initialNavProvider);
-        this.providerSettingsProvider = next;
-        if (navButtonRef) {
-          try { navButtonRef.setButtonText(`Open ${stsMpProviderSettingsDisplayName(next, STS_MULTI_PROVIDER)} settings`); } catch {}
-          try { navButtonRef.buttonEl?.setAttribute?.("aria-label", `Open ${stsMpProviderSettingsDisplayName(next, STS_MULTI_PROVIDER)} settings`); } catch {}
-        }
+      dropdown.setValue(providerView.provider).onChange((value) => {
+        stsMpSelectAiProviderSettingsSection(this, value);
+        this.display();
       });
     });
-    navSetting.addButton((button) => {
-      navButtonRef = button;
-      button.setButtonText(`Open ${stsMpProviderSettingsDisplayName(initialNavProvider, STS_MULTI_PROVIDER)} settings`);
-      try { button.buttonEl?.setAttribute?.("aria-label", `Open ${stsMpProviderSettingsDisplayName(initialNavProvider, STS_MULTI_PROVIDER)} settings`); } catch {}
-      button.onClick(() => {
-        const target = stsMpOpenAiProviderSettingsSection(this, this.providerSettingsProvider);
-        if (target) this.display();
-      });
-    });
-    settingsHeading(containerEl, "OpenAI", "Configure the OpenAI credential used by OpenAI operations.", { status: settingsProviderStatus(this.plugin, "openai") });
-    stsMpProviderApiKeySetting(containerEl, "OpenAI API key", "Saved on blur. A changed non-empty key refreshes the OpenAI model list once; intermediate and empty values do not refresh.", this.plugin, "openaiApiKey", "openai");
-    settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(this.plugin, "gemini") });
-    stsMpProviderApiKeySetting(containerEl, "Google Gemini API key", "Saved on blur. A changed non-empty key refreshes the Gemini model list once; intermediate and empty values do not refresh.", this.plugin, "googleApiKey", "gemini");
-    if (typeof STS_MULTI_PROVIDER !== "undefined") {
-      stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display());
-      stsMpRenderOpenWebUILearnedProfiles(containerEl, this.plugin, () => this.display());
-    }
+    stsMpRenderProviderAccessSettings(containerEl, this.plugin, () => this.display(), providerView.provider);
     settingsHeading(containerEl, "Model catalog maintenance", "Refresh model lists or validate configured AI access.");
     const refreshState = this.plugin.modelCatalogRefreshState || { loading: false, error: "" };
     const refreshDescription = [
@@ -23878,7 +24381,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Reference rebuild interval minutes", this.plugin, "referenceRebuildIntervalMinutes");
     numberSetting(containerEl, "Reference rebuild workers", this.plugin, "referenceRebuildWorkerCount");
     numberSetting(containerEl, "Todoist snapshot cache minutes", this.plugin, "todoistSnapshotCacheMinutes");
-    const rebuildSetting = new Setting(containerEl).setName("Rebuild local references").setDesc("Reads vault references and Todoist to refresh local mappings. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => { try { await this.plugin.rebuildTodoistReferenceTable(true); this.display(); } catch {} })).addButton((button) => button.setButtonText("Recover IDs").onClick(async () => { try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {} }));
+    const rebuildSetting = new Setting(containerEl).setName("Rebuild Todoist inventory").setDesc("Reads the complete current Todoist task snapshot and eligible vault references to refresh local mappings. It does not create, update, complete, or delete Todoist tasks.").addButton((button) => button.setButtonText("Rebuild").setCta().onClick(async () => { try { await this.plugin.rebuildTodoistReferenceTable(true); this.display(); } catch {} })).addButton((button) => button.setButtonText("Recover IDs").onClick(async () => { try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {} }));
     rebuildSetting.settingEl.addClass("semantic-todoist-reference-action-setting");
     const rows = referenceRows(this.plugin.settings);
     containerEl.createDiv({ text: `${rows.length} local reference${rows.length === 1 ? "" : "s"}.` });
@@ -25000,6 +25503,20 @@ function settingsProviderStatus(plugin, provider) {
       return "Not connected";
     }
   }
+  if (provider === "customopenai") {
+    const rawBaseUrl = String(settings.customOpenAIBaseUrl || "").trim();
+    if (!rawBaseUrl) return "Not configured";
+    try {
+      STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(rawBaseUrl, settings.customOpenAIAllowInsecureHttp === true);
+    } catch (error) {
+      if (error?.providerError?.code === "custom-provider-insecure-http") return "Blocked; insecure HTTP is disabled";
+      return "Not configured";
+    }
+    const refreshState = plugin?.modelCatalogRefreshState || {};
+    if (refreshState.provider === "customopenai" && !refreshState.loading && refreshState.error) return "Refresh failed";
+    if (String(settings.customOpenAIModelsFetchedAt || "").trim()) return "Models refreshed";
+    return "Configured; models not refreshed";
+  }
   const configured = provider === "openai"
     ? Boolean(settings.openaiApiKey)
     : provider === "gemini"
@@ -25017,33 +25534,30 @@ function stsMpProviderSettingsDisplayName(normalized, registry) {
   const r = registry && typeof registry.providerDisplayName === "function" ? registry : STS_MULTI_PROVIDER;
   return r.providerDisplayName(normalized);
 }
-function stsMpResolveAiProviderSettingsSection(provider, registry) {
-  const r = registry && typeof registry.normalizeProvider === "function" && typeof registry.providerDisplayName === "function" ? registry : STS_MULTI_PROVIDER;
-  const raw = String(provider || "").trim();
-  if (!raw) return null;
-  const candidate = raw.toLowerCase().replace(/[-_\s]/g, "");
-  const valid = new Set(["openai", "google", "gemini", "openrouter", "router", "openwebui", "webui", "selfhostedopenwebui", "opencodego"]);
-  if (!valid.has(candidate)) return null;
-  const normalized = r.normalizeProvider(provider, "");
-  if (!r.PROVIDERS.includes(normalized)) return null;
-  const sectionName = stsMpProviderSettingsDisplayName(normalized, r);
-  if (!normalized || !sectionName) return null;
-  return { provider: normalized, sectionName, sectionKey: `AI & Search::${sectionName}` };
+function stsMpAiProviderSettingsView(provider, registry = STS_MULTI_PROVIDER) {
+  const order = registry.PROVIDER_DISPLAY_ORDER || registry.PROVIDERS || [];
+  const fallback = order[0] || "openai";
+  const normalized = registry.normalizeProvider(provider, fallback);
+  const sectionName = stsMpProviderSettingsDisplayName(normalized, registry);
+  return {
+    provider: normalized,
+    sectionName,
+    sectionKey: `AI & Search::${sectionName}`,
+    visibleProviders: [normalized]
+  };
 }
 
-function stsMpOpenAiProviderSettingsSection(tab, provider) {
-  const target = stsMpResolveAiProviderSettingsSection(provider);
-  if (!target) return null;
-  if (!tab || typeof tab !== "object") return target;
+function stsMpSelectAiProviderSettingsSection(tab, provider, registry = STS_MULTI_PROVIDER) {
+  const selected = stsMpAiProviderSettingsView(provider, registry);
+  if (!tab || typeof tab !== "object") return selected;
   if (!(tab.sectionOpenState instanceof Map)) tab.sectionOpenState = new Map();
-  const knownProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER || STS_MULTI_PROVIDER.PROVIDERS || [];
-  for (const p of knownProviders) {
-    const section = stsMpResolveAiProviderSettingsSection(p);
-    if (!section) continue;
-    tab.sectionOpenState.set(section.sectionKey, section.sectionKey === target.sectionKey);
+  tab.providerSettingsProvider = selected.provider;
+  const order = registry.PROVIDER_DISPLAY_ORDER || registry.PROVIDERS || [];
+  for (const candidate of order) {
+    const view = stsMpAiProviderSettingsView(candidate, registry);
+    tab.sectionOpenState.set(view.sectionKey, view.provider === selected.provider);
   }
-  tab.pendingSettingsSectionKey = target.sectionKey;
-  return target;
+  return selected;
 }
 
 function organizeSettingsDisclosures(containerEl, tabName, sectionOpenState) {
@@ -26056,6 +26570,14 @@ function stsMpOpenWebUIBaseUrlComplete(plugin, value) {
   } catch { return false; }
 }
 
+function stsMpCustomOpenAIBaseUrlComplete(plugin, value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  try {
+    return Boolean(STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(raw, plugin?.settings?.customOpenAIAllowInsecureHttp === true));
+  } catch { return false; }
+}
+
 function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", options = {}) {
   if (!plugin || typeof plugin.refreshProviderModels !== "function") return Promise.resolve(null);
   const settings = plugin.settings || {};
@@ -26063,6 +26585,9 @@ function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", 
   const credentialReady = normalizedProvider === "openwebui"
     ? (stsMpOpenWebUIBaseUrlComplete(plugin, settings.openwebuiBaseUrl)
       && (stsMpNormalizeOpenWebUIAuthMode(settings.openwebuiAuthMode) === "login" ? Boolean(String(settings.openwebuiJwt || "").trim()) : Boolean(String(settings.openwebuiApiKey || "").trim())))
+    : normalizedProvider === "customopenai"
+      ? (stsMpCustomOpenAIBaseUrlComplete(plugin, settings.customOpenAIBaseUrl)
+        && (options.manual === true || options.trigger !== "key" || Boolean(String(settings.customOpenAIApiKey || "").trim())))
     : Boolean(String(settings[{ openai: "openaiApiKey", gemini: "googleApiKey", openrouter: "openrouterApiKey", opencodego: "opencodeGoApiKey" }[normalizedProvider] || ""] || "").trim());
   if (!normalizedProvider || !credentialReady) return Promise.resolve(null);
   const queuedProviders = plugin.modelCatalogRefreshQueuedProviders || (plugin.modelCatalogRefreshQueuedProviders = Object.create(null));
@@ -26085,7 +26610,7 @@ function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", 
       return queued;
     }
   }
-  const loadingState = { loading: true, error: "" };
+  const loadingState = { provider: normalizedProvider, loading: true, error: "" };
   plugin.modelCatalogRefreshState = loadingState;
   stsMpSetSearchableComboboxCatalogState(loadingState);
   plugin.modelCatalogRefreshProvider = normalizedProvider;
@@ -26093,13 +26618,13 @@ function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", 
     try {
       const result = await plugin.refreshProviderModels(normalizedProvider, false);
       const error = result?.partialFailure ? String(result.summary || "Some provider model lists could not be refreshed.") : "";
-      plugin.modelCatalogRefreshState = { loading: false, error };
+      plugin.modelCatalogRefreshState = { provider: normalizedProvider, loading: false, error };
       stsMpSetSearchableComboboxCatalogState(plugin.modelCatalogRefreshState);
       if (error) new Notice(error);
       return result;
     } catch (error) {
       const message = aiProviderFailureSummary(error);
-      plugin.modelCatalogRefreshState = { loading: false, error: message };
+      plugin.modelCatalogRefreshState = { provider: normalizedProvider, loading: false, error: message };
       stsMpSetSearchableComboboxCatalogState(plugin.modelCatalogRefreshState);
       new Notice(`Could not refresh ${STS_MULTI_PROVIDER.providerDisplayName(normalizedProvider)} models: ${message}`);
       return null;
@@ -26113,6 +26638,69 @@ function stsMpRefreshOpenWebUIModelsAfterCommit(plugin, provider = "openwebui", 
   });
   plugin.modelCatalogRefreshPromise = guarded;
   return guarded;
+}
+
+async function stsMpCommitCustomOpenAIBaseUrl(plugin, value) {
+  const settings = plugin?.settings || {};
+  const raw = String(value || "").trim();
+  const previous = String(settings.customOpenAIBaseUrl || "").trim();
+  if (!raw) {
+    settings.customOpenAIBaseUrl = "";
+    const hadDerivedState = Array.isArray(settings.availableCustomOpenAIModels) && settings.availableCustomOpenAIModels.length > 0
+      || Object.keys(settings.customOpenAIModelMetadata || {}).length > 0
+      || Boolean(String(settings.customOpenAIModelsFetchedAt || "").trim());
+    settings.availableCustomOpenAIModels = [];
+    settings.customOpenAIModelMetadata = {};
+    settings.customOpenAIModelsFetchedAt = "";
+    const invalidated = Boolean(plugin.clearActiveCustomOpenAISemanticIndexAfterIdentityChange?.("custom-endpoint-cleared"));
+    const changed = Boolean(previous || hadDerivedState || invalidated);
+    if (!changed) return { accepted: true, changed: false, normalized: "", refreshed: false, invalidated: false };
+    await plugin.saveSettings?.();
+    return { accepted: true, changed: true, normalized: "", refreshed: false, invalidated };
+  }
+  let normalized;
+  try {
+    normalized = STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(raw, settings.customOpenAIAllowInsecureHttp === true);
+  } catch (error) {
+    return { accepted: false, changed: false, code: error?.providerError?.code || "custom-provider-invalid-url" };
+  }
+  if (normalized === previous) return { accepted: true, changed: false, normalized, refreshed: false };
+  settings.customOpenAIBaseUrl = normalized;
+  settings.availableCustomOpenAIModels = [];
+  settings.customOpenAIModelMetadata = {};
+  settings.customOpenAIModelsFetchedAt = "";
+  plugin.clearActiveCustomOpenAISemanticIndexAfterIdentityChange?.("custom-endpoint-changed");
+  await plugin.saveSettings?.();
+  const result = await stsMpRefreshOpenWebUIModelsAfterCommit(plugin, "customopenai", { trigger: "endpoint" });
+  return { accepted: true, changed: true, normalized, refreshed: Boolean(result) };
+}
+
+async function stsMpCommitCustomOpenAIApiKey(plugin, value) {
+  const settings = plugin?.settings || {};
+  const next = String(value || "").trim();
+  const previous = String(settings.customOpenAIApiKey || "").trim();
+  if (next === previous) return { changed: false, refreshed: false };
+  settings.customOpenAIApiKey = next;
+  await plugin.saveSettings?.();
+  if (!next || !stsMpCustomOpenAIBaseUrlComplete(plugin, settings.customOpenAIBaseUrl)) return { changed: true, refreshed: false };
+  const result = await stsMpRefreshOpenWebUIModelsAfterCommit(plugin, "customopenai", { trigger: "key" });
+  return { changed: true, refreshed: Boolean(result) };
+}
+
+async function stsMpCommitCustomOpenAIAllowInsecureHttp(plugin, value) {
+  const settings = plugin?.settings || {};
+  const next = value === true;
+  if (settings.customOpenAIAllowInsecureHttp === next) return { changed: false, invalidated: false };
+  settings.customOpenAIAllowInsecureHttp = next;
+  await plugin.saveSettings?.();
+  let invalidated = false;
+  if (!next) {
+    try {
+      const endpoint = STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(settings.customOpenAIBaseUrl, true);
+      if (/^http:/i.test(endpoint)) invalidated = Boolean(plugin.clearActiveCustomOpenAISemanticIndexAfterIdentityChange?.("custom-insecure-http-disabled"));
+    } catch {}
+  }
+  return { changed: true, invalidated };
 }
 
 function stsMpOpenWebUICommittedTextSetting(containerEl, name, desc, plugin, key, normalizeValue, shouldRefresh = false, inputType = "text", provider = "openwebui") {
@@ -28709,16 +29297,106 @@ function taskDescriptionReferenceSetSha256(values = []) {
   return aiGatewaySha256(JSON.stringify(normalized));
 }
 
+function taskGenerationStableFailureCode(error = null) {
+  const knownCodes = new Set([
+    "provider-error",
+    "response-invalid-json",
+    "response-root-invalid",
+    "response-shape-missing-tasks",
+    "response-tasks-empty",
+    "response-task-invalid",
+    "response-scope-structure-invalid",
+    "response-missing-scope",
+    "response-multiple-main-tasks",
+    "response-cross-scope-exact-duplicate",
+    "response-duplicate-member-ordinal",
+    "response-missing-member-ordinal",
+    "retry-budget-exhausted",
+    "retry-prefix-mismatch",
+    "retry-bundle-mismatch",
+    "retry-prompt-evidence-mismatch",
+    "scope-call-not-singleton",
+    "protected-workflow-evidence-closure-unresolved",
+    "required-workflow-contract-block-overflow",
+    "post-attachment-evidence-validation-failed",
+    "task-title-batch-adapter-invalid",
+    "task-title-batch-member-count-invalid",
+    "provider-context-window-overflow",
+    "chat-context-window-overflow",
+    "chat-context-stable-prefix-invalid",
+    "context-bundle-foreign-reference",
+    "runtime-work-cancelled",
+    "task-generation-batch-terminal",
+    "task-generation-batch-partial-terminal"
+  ]);
+  const normalize = (value) => {
+    if (typeof value !== "string") return "";
+    const normalized = value.trim().toLowerCase();
+    return /^[a-z0-9][a-z0-9._:-]{0,79}$/.test(normalized) ? normalized : "";
+  };
+  const candidates = [];
+  if (typeof error === "string") candidates.push(error);
+  else if (error && typeof error === "object") {
+    candidates.push(
+      error.code,
+      error.phaseCode,
+      error.reasonCode,
+      error.terminalCode,
+      error.providerError?.code,
+      error.providerDiagnostic?.code
+    );
+  }
+  const tokens = candidates.map(normalize).filter(Boolean);
+  const generic = new Set(["provider-error", "error", "unknown"]);
+  const attributable = tokens.find((token) => !generic.has(token));
+  if (attributable) return attributable;
+  const messageToken = normalize(error && typeof error === "object" ? error.message : "");
+  if (messageToken && knownCodes.has(messageToken)) return messageToken;
+  return tokens.find((token) => generic.has(token)) || "provider-error";
+}
+
+function taskGenerationRecoveryTelemetrySafeToken(value, key = "") {
+  if (typeof value !== "string") return "";
+  const token = value.trim().toLowerCase();
+  if (!token) return "";
+  const allowlists = {
+    mode: new Set(["batched", "singleton", "task-generation", "task-generation-batch"]),
+    phase: new Set(["initial", "retry", "scope-recovery", "structural-repair", "fallback"]),
+    provider: new Set(["openai", "openrouter", "openwebui", "customopenai", "gemini", "google", "anthropic"]),
+    outcome: new Set(["accepted", "terminal", "retrying", "retry-accepted", "not-attempted", "preflight-terminal", "invalid", "provider-failure", "tasks-generated"]),
+    status: new Set(["accepted", "terminal", "retrying", "retry-accepted", "not-attempted", "preflight-terminal", "invalid", "provider-failure"]),
+    state: new Set(["accepted", "terminal", "retrying", "retry-accepted", "not-attempted", "preflight-terminal", "invalid", "provider-failure"]),
+    carrier: new Set(["json", "text", "structured", "unknown"]),
+    classification: new Set(["model-output", "plugin-input", "provider-adapter-infrastructure", "plugin-workflow-or-infrastructure"])
+  };
+  if (key === "provider") return allowlists.provider.has(token) ? token : "unknown-provider";
+  if (allowlists[key]?.has(token)) return token;
+  if (key === "outcome" || key === "status" || key === "state" || key === "code" || key === "reason") {
+    return taskGenerationStableFailureCode({ code: token });
+  }
+  return /^[a-z0-9][a-z0-9._:-]{0,79}$/.test(token) ? token : "unknown";
+}
+
 function valueSuppressingRecoveryTelemetry(value, parentKey = "", depth = 0) {
   if (depth > 8 || value == null) return value == null ? value : null;
   const sensitiveIdentifierKey = (key) => /(?:evidence|fact|task|scope)(?:_?(?:id|ids|ref|refs))$/i.test(key)
     || /^(?:batchId|queryId|planId|parsedRootKeys|malformedFields?|repairedRefs)$/i.test(key);
-  const freeTextKey = (key) => /(?:raw(?:Output|Response|Text|Body)|response(?:Text|Body|Prose)|message|prose|excerpt|content|title|path)$/i.test(key);
+  const freeTextKey = (key) => new Set([
+    "system",
+    "promptCachePrefix",
+    "promptContextSuffix",
+    "suffix",
+    "user",
+    "body",
+    "prompt",
+    "providerBody"
+  ]).has(String(key || ""))
+    || /(?:raw(?:Output|Response|Text|Body)|response(?:Text|Body|Prose)|message|prose|excerpt|content|title|path)$/i.test(key);
   const safeName = (key, suffix) => `${String(key || "value").replace(/_?(?:Ids?|Refs?)$/i, "")}${suffix}`;
-  const reasonToken = (input) => taskDescriptionValidatorReasonPrefix(input).slice(0, 96);
+  const reasonToken = (input, key) => taskGenerationRecoveryTelemetrySafeToken(String(input || ""), key || "reason").slice(0, 96);
   if (Array.isArray(value)) return value.slice(0, 64).map((entry) => valueSuppressingRecoveryTelemetry(entry, parentKey, depth + 1));
   if (typeof value !== "object") {
-    if (typeof value === "string" && /(?:reason|code|status|state|profile|phase|carrier|classification)$/i.test(parentKey)) return reasonToken(value);
+    if (typeof value === "string" && /(?:reason|code|status|state|profile|phase|carrier|classification|provider|outcome|mode|terminal)$/i.test(parentKey)) return reasonToken(value, parentKey.toLowerCase());
     return value;
   }
   const projected = {};
@@ -28730,9 +29408,10 @@ function valueSuppressingRecoveryTelemetry(value, parentKey = "", depth = 0) {
       continue;
     }
     if (freeTextKey(key) || ((key === "from" || key === "to") && /separator|repair/i.test(parentKey))) {
-      const text = typeof entry === "string" ? entry : entry == null ? "" : JSON.stringify(entry);
-      projected[safeName(key, "Present")] = text.length > 0;
-      projected[safeName(key, "ByteCount")] = utf8ByteLength(text);
+      projected[safeName(key, "Present")] = entry !== undefined && entry !== null && (typeof entry !== "string" || entry.length > 0);
+      if (typeof entry === "string") projected[safeName(key, "ByteCount")] = utf8ByteLength(entry);
+      else if (Array.isArray(entry)) projected[safeName(key, "ItemCount")] = Math.min(64, entry.length);
+      else if (entry && typeof entry === "object") projected[safeName(key, "FieldCount")] = Math.min(64, Object.keys(entry).length);
       continue;
     }
     if (/(?:Hash|Sha256)$/i.test(key)) {
@@ -28743,6 +29422,87 @@ function valueSuppressingRecoveryTelemetry(value, parentKey = "", depth = 0) {
     projected[key] = valueSuppressingRecoveryTelemetry(entry, key, depth + 1);
   }
   return projected;
+}
+
+function taskGenerationRecoveryTelemetryProjection(batchState = null, options = {}) {
+  const b = batchState && typeof batchState === "object" ? batchState : {};
+  const batchTelemetry = options.batchPlanTelemetry && typeof options.batchPlanTelemetry === "object"
+    ? options.batchPlanTelemetry
+    : b.batchPlanTelemetry && typeof b.batchPlanTelemetry === "object" ? b.batchPlanTelemetry : {};
+  const boundedInteger = (value, fallback = 0, maximum = 1000) => {
+    const number = Number(value);
+    return Number.isSafeInteger(number) ? Math.max(0, Math.min(maximum, number)) : fallback;
+  };
+  const hashIdentifier = (value) => {
+    if (typeof value !== "string" && typeof value !== "number") return "";
+    const text = String(value).trim();
+    if (!text) return "";
+    if (/^[a-f0-9]{16,96}$/i.test(text)) return text.toLowerCase();
+    try {
+      const digest = typeof aiGatewaySha256 === "function" ? aiGatewaySha256(text) : "";
+      return /^[a-f0-9]{16,96}$/i.test(String(digest || "")) ? String(digest).toLowerCase() : "";
+    } catch {
+      return "";
+    }
+  };
+  const hashList = (value) => Array.isArray(value)
+    ? value.slice(0, 64).map(hashIdentifier).filter(Boolean)
+    : [];
+  const numericEntry = (entry, maximum = 1000000000) => Number.isSafeInteger(Number(entry))
+    ? Math.max(0, Math.min(maximum, Number(entry)))
+    : 0;
+  const calls = Array.isArray(batchTelemetry.calls)
+    ? batchTelemetry.calls.slice(0, 64).map((call) => ({
+      envelopeHash: hashIdentifier(call?.envelopeHash),
+      rawEstimated: numericEntry(call?.rawEstimated),
+      adjustedEstimated: numericEntry(call?.adjustedEstimated),
+      schemaBytes: numericEntry(call?.schemaBytes),
+      wrapperControlBytes: numericEntry(call?.wrapperControlBytes)
+    }))
+    : [];
+  const retrySerialBatches = Array.isArray(batchTelemetry.retrySerialBatches)
+    ? batchTelemetry.retrySerialBatches.slice(0, 64).map((entry) => ({
+      retryBatchIdHash: hashIdentifier(entry?.retryBatchIdHash || entry?.retryBatchId),
+      failedScopeIdHash: hashIdentifier(entry?.failedScopeIdHash || entry?.failedScopeId),
+      ordinalInSerialOrder: boundedInteger(entry?.ordinalInSerialOrder, 0, Math.max(1, boundedInteger(options.scopeCount ?? batchTelemetry.scopeCount, 0, 1000)))
+    }))
+    : [];
+  const ledgerSource = options.perScopeLedger && typeof options.perScopeLedger.entries === "function"
+    ? Array.from(options.perScopeLedger.entries())
+    : Array.isArray(b.perScopeLedgerHashes) ? b.perScopeLedgerHashes : [];
+  const perScopeLedgerHashes = ledgerSource.slice(0, 64).map((entry) => {
+    const key = Array.isArray(entry) ? entry[0] : "";
+    const value = Array.isArray(entry) ? entry[1] : {};
+    const keyHash = hashIdentifier(key);
+    return keyHash ? [keyHash, { used: numericEntry(value?.used, 2), limit: numericEntry(value?.limit, 2) }] : null;
+  }).filter(Boolean);
+  const scopeOutcomes = Array.isArray(b.scopeOutcomes)
+    ? b.scopeOutcomes.slice(0, 64).map((entry) => ({
+      scopeIdHash: hashIdentifier(entry?.scopeIdHash || entry?.scopeId),
+      code: taskGenerationStableFailureCode(entry),
+      outcome: taskGenerationRecoveryTelemetrySafeToken(entry?.outcome || entry?.terminalCode || entry?.status || "", "outcome")
+    }))
+    : [];
+  const batchCount = boundedInteger(options.batchCount ?? batchTelemetry.batchCount, 0, 1000);
+  const scopeCount = boundedInteger(options.scopeCount ?? batchTelemetry.scopeCount, 0, 1000);
+  return {
+    taskCount: boundedInteger(options.taskCount ?? b.taskCount, 0, 1000),
+    rejectedCount: boundedInteger(options.rejectedCount ?? b.rejectedCount, 0, 1000),
+    terminalScopeIdHashes: hashList(b.terminalScopeIds || batchTelemetry.terminalScopeIdHashes),
+    batchPlanTelemetry: {
+      mode: taskGenerationRecoveryTelemetrySafeToken(options.mode ?? batchTelemetry.mode ?? b.mode ?? "", "mode"),
+      batchCount,
+      scopeCount,
+      batchIdHashes: hashList(batchTelemetry.batchIdHashes || batchTelemetry.batchIds),
+      calls,
+      retrySerialBatches,
+      frozenPrefixHash: hashIdentifier(batchTelemetry.frozenPrefixHash),
+      frozenBundleHash: hashIdentifier(batchTelemetry.frozenBundleHash),
+      frozenPrefixHash2: hashIdentifier(batchTelemetry.frozenPrefixHash2)
+    },
+    perScopeLedgerHashes,
+    scopeOutcomes
+  };
 }
 
 function taskDescriptionSingletonContractDiagnostics(contract = null, item = {}, subreason = "") {
@@ -32966,7 +33726,9 @@ function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTING
     const sourceId = suppliedSourceId || (kind === "vault-note" ? `note://${path}` : `todoist://${taskId}`);
     const key = evidenceId || sourceId || (kind === "todoist-task" ? `todoist:${taskId}` : `note:${path}`);
     if (entries.some((item) => item.key === key)) return;
-    const title = singleLine(entry.title || task.content || task.title || path || taskId);
+    const title = kind === "todoist-task"
+      ? singleLine(task.content || task.title || entry.title || path || taskId)
+      : singleLine(entry.title || task.content || task.title || path || taskId);
     const url = kind === "todoist-task"
       ? todoistTaskUrl(taskId, settings)
       : `obsidian://open?file=${encodeURIComponent(path)}`;
@@ -33154,7 +33916,7 @@ function normalizeChatEvidencePayload(parsed = null, options = {}) {
   }
   const corrections = [];
   const addCorrection = (correction) => {
-    if (corrections.length < CHAT_RESPONSE_MAX_CLAIMS * 4) corrections.push(correction);
+    if (corrections.length < CHAT_RESPONSE_MAX_CLAIMS * 5) corrections.push(correction);
   };
   const claims = parsed.claims.map((claim, index) => {
     if (!claim || typeof claim !== "object" || Array.isArray(claim)) return claim;
@@ -33196,6 +33958,26 @@ function normalizeChatEvidencePayload(parsed = null, options = {}) {
         if (claim.established === true && evidenceIds.length === 0) {
           addCorrection({ reasonCode: "chat-established-claim-no-allowed-evidence", claimIndex: index });
         }
+      }
+    }
+    if (claim.established === true
+      && Array.isArray(claim.evidence_ids)
+      && claim.evidence_ids.length > 0
+      && claim.evidence_ids.length <= CHAT_RESPONSE_MAX_EVIDENCE_IDS_PER_CLAIM
+      && claim.evidence_ids.every((value) => typeof value === "string" && String(value || "").trim() !== "")
+      && Array.isArray(next.evidence_ids)) {
+      const seenEvidenceIds = new Set();
+      const deduplicatedEvidenceIds = [];
+      for (const value of next.evidence_ids) {
+        const evidenceId = String(value || "").trim();
+        if (!evidenceId || seenEvidenceIds.has(evidenceId)) continue;
+        seenEvidenceIds.add(evidenceId);
+        deduplicatedEvidenceIds.push(evidenceId);
+      }
+      if (deduplicatedEvidenceIds.length < next.evidence_ids.length) {
+        const removedCount = next.evidence_ids.length - deduplicatedEvidenceIds.length;
+        next.evidence_ids = deduplicatedEvidenceIds;
+        addCorrection({ reasonCode: "chat-evidence-ids-deduplicated", claimIndex: index, removedCount });
       }
     }
     const normalizedCategory = String(next.category || "").trim().toLowerCase();
@@ -33977,10 +34759,20 @@ function contextQueryPlan(prompt = "", mode = "chat", structured = {}) {
   const metadata = structured?.queryPlan && typeof structured.queryPlan === "object" ? structured.queryPlan : structured;
   const natural = classifyContextQueryIntent(text);
   const hasFlag = (name) => Object.prototype.hasOwnProperty.call(metadata || {}, name);
+  const todoistMentioned = /todoist/i.test(text);
+  const inventoryMentioned = /\b(tasks?|items?)\b/i.test(text);
+  const exhaustiveMentioned = /\b(all|every)\b/i.test(text);
+  const priorityMentioned = /(?:priority\s*[-–—]?\s*4|\bp4\b)/i.test(text);
+  const openMentioned = /\bopen\b/i.test(text);
+  const hierarchyMentioned = /(?:\broot\b|\bchild\b|\btrees?\b|do\s+not\s+flatten)/i.test(text);
+  const isTodoistInventory = todoistMentioned && inventoryMentioned && exhaustiveMentioned && priorityMentioned && openMentioned && hierarchyMentioned;
+  const todoistInventoryPredicate = isTodoistInventory
+    ? Object.freeze({ todoist: true, exhaustive: true, priority: 4, currentOpenOnly: true, hierarchy: "ancestors" })
+    : null;
   const history = hasFlag("history") ? metadata.history === true : natural.history;
-  const tasks = hasFlag("tasks") ? metadata.tasks === true : natural.tasks;
+  const tasks = hasFlag("tasks") ? metadata.tasks === true : (natural.tasks || isTodoistInventory);
   const portfolio = hasFlag("portfolio") ? metadata.portfolio === true : natural.portfolio;
-  const broad = hasFlag("broad") ? metadata.broad === true : natural.broad;
+  const broad = hasFlag("broad") ? metadata.broad === true : (natural.broad || isTodoistInventory);
   const action = hasFlag("action") ? metadata.action === true : natural.action;
   const anchorTerms = Array.isArray(metadata?.anchorTerms)
     ? uniqueValues(metadata.anchorTerms.map((term) => String(term || "").trim()).filter(Boolean))
@@ -33997,7 +34789,8 @@ function contextQueryPlan(prompt = "", mode = "chat", structured = {}) {
     strictScope: metadata?.strictScope === true,
     structuredScope: metadata?.structuredScope === true,
     anchorTerms,
-    prompt: text
+    prompt: text,
+    todoistInventoryPredicate
   };
 }
 
@@ -34605,6 +35398,27 @@ function chatSemanticCandidateQueryRelevant(item = {}, profile = {}) {
   return true;
 }
 
+function attachTodoistInventoryCandidateChunks(context = [], preparedView = null, queryPlan = null) {
+  const predicate = queryPlan && typeof queryPlan === "object" ? queryPlan.todoistInventoryPredicate : null;
+  const wantedPriority = Number.parseInt(predicate?.priority, 10);
+  const applyInventoryScope = Boolean(predicate)
+    && predicate.todoist === true
+    && predicate.exhaustive === true
+    && Number.isInteger(wantedPriority)
+    && wantedPriority >= 1
+    && wantedPriority <= 4;
+  if (!applyInventoryScope) return context;
+  const pool = preparedView && Array.isArray(preparedView.todoistInventoryCandidateChunks)
+    ? preparedView.todoistInventoryCandidateChunks
+    : null;
+  if (!pool) return context;
+  if (!Array.isArray(context)) return context;
+  try {
+    Object.defineProperty(context, "todoistInventoryCandidateChunks", { value: pool, enumerable: false, configurable: true, writable: false });
+  } catch { return context; }
+  return context;
+}
+
 function filterChatContextRowsForQuery(rows = [], prompt = "", source = {}, sourceContract = null, queryPlan = null) {
   const contract = sourceContract && typeof sourceContract === "object" ? sourceContract : {};
   const plan = queryPlan && typeof queryPlan === "object" ? queryPlan : contextQueryPlan(prompt, "chat");
@@ -34619,20 +35433,233 @@ function filterChatContextRowsForQuery(rows = [], prompt = "", source = {}, sour
   });
   const relevant = [];
   let droppedCount = 0;
-  for (const row of Array.isArray(rows) ? rows : []) {
-    if (!row || typeof row !== "object") continue;
-    if (chatSemanticCandidateQueryRelevant(row, admissionProfile)) {
+  const inventoryPredicateForScope = plan && typeof plan.todoistInventoryPredicate === "object"
+    ? plan.todoistInventoryPredicate
+    : null;
+  const wantedInventoryPriorityForScope = Number.parseInt(inventoryPredicateForScope?.priority, 10);
+  const applyAttachedInventoryScope = Boolean(inventoryPredicateForScope)
+    && inventoryPredicateForScope.todoist === true
+    && inventoryPredicateForScope.exhaustive === true
+    && Number.isInteger(wantedInventoryPriorityForScope)
+    && wantedInventoryPriorityForScope >= 1
+    && wantedInventoryPriorityForScope <= 4;
+  const exactP4InventoryScope = Boolean(inventoryPredicateForScope) && inventoryPredicateForScope.todoist === true && inventoryPredicateForScope.exhaustive === true && wantedInventoryPriorityForScope === 4 && inventoryPredicateForScope.currentOpenOnly === true && inventoryPredicateForScope.hierarchy === "ancestors";
+  let exactP4Telemetry = null;
+  let exactP4DuplicateCount = 0;
+  const attachedInventoryPool = applyAttachedInventoryScope && rows && Array.isArray(rows.todoistInventoryCandidateChunks)
+    ? rows.todoistInventoryCandidateChunks
+    : null;
+  const useAttachedInventoryPool = Array.isArray(attachedInventoryPool);
+  if (useAttachedInventoryPool) {
+    const normalizeAttachedInventoryId = (candidate) => {
+      if (candidate && typeof candidate === "object") {
+        candidate = candidate.canonicalTaskId ?? candidate.todoistId ?? candidate.taskId ?? candidate.id ?? candidate.oid ?? "";
+      }
+      return String(candidate ?? "").trim().toUpperCase();
+    };
+    const attachedInventoryIdsOf = (row) => {
+      const candidate = row?.chunk && typeof row.chunk === "object" ? row.chunk : row || {};
+      const safeCandidate = candidate && typeof candidate === "object" ? candidate : {};
+      const task = safeCandidate.taskReference || safeCandidate.task || row.taskReference || row.task || null;
+      const ids = new Set();
+      for (const [source, keys] of [
+        [task, ["canonicalTaskId", "todoistId", "taskId", "id", "oid"]],
+        [safeCandidate, ["canonicalTaskId", "todoistId", "taskId", "oid"]]
+      ]) {
+        if (!source || typeof source !== "object") continue;
+        for (const key of keys) {
+          const normalized = normalizeAttachedInventoryId(source?.[key]);
+          if (normalized) ids.add(normalized);
+        }
+      }
+      return ids;
+    };
+    const seenAttachedInventoryIds = new Set();
+    for (const row of attachedInventoryPool) {
+      if (!row || typeof row !== "object") continue;
+      const ids = attachedInventoryIdsOf(row);
+      if (ids.size > 0) {
+        let duplicate = true;
+        for (const id of ids) {
+          if (!seenAttachedInventoryIds.has(id)) { duplicate = false; break; }
+        }
+        if (duplicate) { droppedCount += 1; if (exactP4InventoryScope) exactP4DuplicateCount += 1; continue; }
+        for (const id of ids) seenAttachedInventoryIds.add(id);
+      }
       relevant.push(row);
-    } else {
-      droppedCount += 1;
+    }
+  } else {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row || typeof row !== "object") continue;
+      if (chatSemanticCandidateQueryRelevant(row, admissionProfile)) {
+        relevant.push(row);
+      } else {
+        droppedCount += 1;
+      }
     }
   }
-  const admission = !explicitStructuredExpansion && relevant.length > 1
-    ? chatSemanticAdmissionPool(relevant, relevant.length, admissionProfile)
-    : { candidates: relevant };
+  const inventoryPredicate = plan && typeof plan.todoistInventoryPredicate === "object"
+    ? plan.todoistInventoryPredicate
+    : null;
+  const wantedInventoryPriority = Number.parseInt(inventoryPredicate?.priority, 10);
+  const applyInventoryScope = Boolean(inventoryPredicate)
+    && inventoryPredicate.todoist === true
+    && inventoryPredicate.exhaustive === true
+    && Number.isInteger(wantedInventoryPriority);
+  let scoped = relevant;
+  if (applyInventoryScope) {
+    const inventoryOpenOnly = inventoryPredicate.currentOpenOnly === true;
+    const inventoryWantAncestors = inventoryPredicate.hierarchy === "ancestors";
+    const normalizeInventoryId = (candidate) => {
+      if (candidate && typeof candidate === "object") {
+        candidate = candidate.canonicalTaskId ?? candidate.todoistId ?? candidate.taskId ?? candidate.id ?? candidate.oid ?? "";
+      }
+      return String(candidate ?? "").trim().toUpperCase();
+    };
+    const inventoryTaskOf = (row) => {
+      const candidate = row?.chunk && typeof row.chunk === "object" ? row.chunk : row || {};
+      const safeCandidate = candidate && typeof candidate === "object" ? candidate : {};
+      const task = safeCandidate.taskReference || safeCandidate.task || row.taskReference || row.task || null;
+      return { candidate: safeCandidate, task: task && typeof task === "object" ? task : null };
+    };
+    const inventoryPriorityOf = (meta) => {
+      const raw = meta.task.priority ?? meta.task.todoistPriority ?? meta.task.todoist_priority
+        ?? meta.candidate.priority ?? meta.candidate.todoistPriority ?? null;
+      if (raw === null || raw === undefined || raw === "") return null;
+      const parsed = Number.parseInt(raw, 10);
+      return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : null;
+    };
+    const relevantMeta = relevant.map((row, index) => ({ row, index, meta: inventoryTaskOf(row), ids: new Set() }));
+    const inventoryIdToIndex = new Map();
+    for (const entry of relevantMeta) {
+      if (!entry.meta.task) continue;
+      for (const [source, keys] of [
+        [entry.meta.task, ["canonicalTaskId", "todoistId", "taskId", "id", "oid"]],
+        [entry.meta.candidate, ["canonicalTaskId", "todoistId", "taskId", "oid"]]
+      ]) {
+        for (const key of keys) {
+          const normalized = normalizeInventoryId(source?.[key]);
+          if (normalized) entry.ids.add(normalized);
+        }
+      }
+      for (const id of entry.ids) {
+        if (!inventoryIdToIndex.has(id)) inventoryIdToIndex.set(id, entry.index);
+      }
+    }
+    const matchedIndexes = new Set();
+    const exactP4DirectIndexes = exactP4InventoryScope ? new Set() : null;
+    const exactP4Excluded = exactP4InventoryScope ? { nonTask: 0, wrongPriority: 0, completedNonOpen: 0, unknownPriority: 0, unknownState: 0, duplicate: exactP4DuplicateCount } : null;
+    let exactP4IncompleteAncestry = 0;
+    let exactP4SkippedNonOpenAncestor = 0;
+    const inventoryStateOf = (entry) => taskSemanticReferenceState(
+      Object.assign({}, entry.meta.candidate, { task: entry.meta.task, taskReference: entry.meta.task })
+    );
+    const inventoryOpenRejected = (entry) => {
+      if (!inventoryOpenOnly) return false;
+      const state = inventoryStateOf(entry);
+      return state.completed === true || (state.stateKnown && state.currentOpen !== true);
+    };
+    for (const entry of relevantMeta) {
+      if (!entry.meta.task) { if (exactP4InventoryScope) exactP4Excluded.nonTask += 1; continue; }
+      const priority = inventoryPriorityOf(entry.meta);
+      if (exactP4InventoryScope) {
+        const state = inventoryStateOf(entry);
+        if (state.completed === true || (state.stateKnown === true && state.currentOpen !== true)) { exactP4Excluded.completedNonOpen += 1; continue; }
+        if (priority !== null && priority !== wantedInventoryPriority) { exactP4Excluded.wrongPriority += 1; continue; }
+        if (priority === null) { exactP4Excluded.unknownPriority += 1; continue; }
+        if (state.stateKnown !== true) { exactP4Excluded.unknownState += 1; continue; }
+        matchedIndexes.add(entry.index); exactP4DirectIndexes.add(entry.index); continue;
+      }
+      if (priority !== null && priority !== wantedInventoryPriority) continue;
+      if (inventoryOpenRejected(entry)) continue;
+      matchedIndexes.add(entry.index);
+    }
+    const inventoryPathNodes = (task, candidate) => {
+      const treePath = task.treePath ?? task.tree_path ?? candidate.treePath ?? candidate.tree_path ?? null;
+      const nodes = Array.isArray(treePath)
+        ? treePath
+        : (typeof treePath === "string" && treePath.trim() ? treePath.split(/[/>|,;]+/) : []);
+      const normalized = [];
+      for (const node of nodes) {
+        const id = normalizeInventoryId(node);
+        if (id) normalized.push(id);
+      }
+      return normalized;
+    };
+    if (inventoryWantAncestors) {
+      const ancestorLinkIds = (entry) => {
+        const task = entry.meta.task || {};
+        const candidate = entry.meta.candidate || {};
+        const links = [];
+        for (const key of ["parentTaskId", "parentId", "parentOid", "rootTaskId", "rootId", "rootOid"]) {
+          const normalized = normalizeInventoryId(task[key] ?? candidate[key]);
+          if (normalized && !entry.ids.has(normalized)) links.push(normalized);
+        }
+        for (const node of inventoryPathNodes(task, candidate)) {
+          if (!entry.ids.has(node)) links.push(node);
+        }
+        return links;
+      };
+      const processedLinks = new Set();
+      const pendingLinks = Array.from(matchedIndexes);
+      while (pendingLinks.length) {
+        const currentIndex = pendingLinks.pop();
+        if (processedLinks.has(currentIndex)) continue;
+        processedLinks.add(currentIndex);
+        for (const linkId of ancestorLinkIds(relevantMeta[currentIndex])) {
+          const target = inventoryIdToIndex.get(linkId);
+          if (target === undefined) { if (exactP4InventoryScope) exactP4IncompleteAncestry += 1; continue; }
+          if (matchedIndexes.has(target)) continue;
+          if (exactP4InventoryScope) { const targetState = inventoryStateOf(relevantMeta[target]); if (inventoryPriorityOf(relevantMeta[target].meta) === null || targetState.stateKnown !== true) exactP4IncompleteAncestry += 1; }
+          if (inventoryOpenRejected(relevantMeta[target])) { if (exactP4InventoryScope) exactP4SkippedNonOpenAncestor += 1; continue; }
+          matchedIndexes.add(target);
+          pendingLinks.push(target);
+        }
+      }
+    }
+    const inventoryOrderOf = (entry) => {
+      const task = entry.meta.task || {};
+      const candidate = entry.meta.candidate || {};
+      const pickId = (keys) => {
+        for (const key of keys) {
+          const normalized = normalizeInventoryId(task[key] ?? candidate[key]);
+          if (normalized) return normalized;
+        }
+        return "";
+      };
+      const ownId = pickId(["canonicalTaskId", "todoistId", "taskId", "oid", "id"]);
+      const explicitRoot = pickId(["rootTaskId", "rootId", "rootOid"]);
+      const pathNodes = inventoryPathNodes(task, candidate);
+      const derivedRoot = explicitRoot
+        || pathNodes.find((node) => inventoryIdToIndex.has(node))
+        || pathNodes.find(Boolean)
+        || ownId;
+      const depthRaw = Number.parseInt(task.treeDepth ?? task.tree_depth ?? candidate.treeDepth ?? candidate.tree_depth ?? "", 10);
+      const siblingRaw = Number.parseInt(task.siblingOrder ?? task.sibling_order ?? candidate.siblingOrder ?? candidate.sibling_order ?? "", 10);
+      return {
+        root: derivedRoot,
+        depth: Number.isInteger(depthRaw) ? depthRaw : 0,
+        sibling: Number.isInteger(siblingRaw) ? siblingRaw : 0,
+        id: ownId
+      };
+    };
+    scoped = Array.from(matchedIndexes)
+      .map((index) => ({ entry: relevantMeta[index], order: inventoryOrderOf(relevantMeta[index]) }))
+      .sort((left, right) => (left.order.root < right.order.root ? -1 : left.order.root > right.order.root ? 1 : 0)
+        || (left.order.depth - right.order.depth)
+        || (left.order.sibling - right.order.sibling)
+        || (left.order.id < right.order.id ? -1 : left.order.id > right.order.id ? 1 : 0)
+        || (left.entry.index - right.entry.index))
+      .map((item) => { const base = useAttachedInventoryPool ? Object.assign(annotateContextChunk(item.entry.row, admissionProfile), { required: true }) : Object.assign({}, item.entry.row, { required: true }); if (exactP4InventoryScope) base.exactP4Admission = exactP4DirectIndexes.has(item.entry.index) ? "direct" : "ancestor"; return base; });
+    droppedCount += relevant.length - scoped.length;
+    if (exactP4InventoryScope) exactP4Telemetry = { scope: "exact-p4", direct: exactP4DirectIndexes.size, ancestors: matchedIndexes.size - exactP4DirectIndexes.size, selected: matchedIndexes.size, excludedByReason: exactP4Excluded, incompleteAncestry: exactP4IncompleteAncestry, skippedNonOpenAncestors: exactP4SkippedNonOpenAncestor };
+  }
+  const admission = !explicitStructuredExpansion && scoped.length > 1
+    ? chatSemanticAdmissionPool(scoped, scoped.length, admissionProfile)
+    : { candidates: scoped };
   // Admission metadata can annotate reservations, but it cannot own positive
   // union membership. Every hard-valid row remains available to the model.
-  const selected = relevant;
+  const selected = scoped;
   const fallbackReservations = explicitStructuredExpansion
     ? chatSemanticRecipientHandoffReservations(selected, admissionProfile, selected.length || 1)
     : [];
@@ -34646,12 +35673,13 @@ function filterChatContextRowsForQuery(rows = [], prompt = "", source = {}, sour
     Object.fromEntries(fallbackReservations.map((reservation) => [reservation.evidenceId, "semantic-current-open-recipient-handoff"]))
   );
   return {
-    rows: relevant,
+    rows: selected,
     droppedCount,
     profile: null,
     expansion: explicitStructuredExpansion ? "structured" : "focused",
     reservedEvidenceIds,
-    reservationReasonByEvidenceId
+    reservationReasonByEvidenceId,
+    ...(exactP4Telemetry ? { exactP4Telemetry } : {})
   };
 }
 
@@ -39983,11 +41011,28 @@ function attachSemanticRetrievalMetadata(context = [], request = {}, details = {
 }
 
 function cloneSemanticRetrievalContext(context = []) {
-  const cloned = typeof structuredClone === "function" ? structuredClone(context) : JSON.parse(JSON.stringify(context || []));
+  const cloneValue = (value) => typeof structuredClone === "function" ? structuredClone(value) : JSON.parse(JSON.stringify(value));
+  const cloned = cloneValue(context);
   const metadata = context?.semanticRetrieval;
   const telemetry = context?.telemetry;
-  if (metadata) Object.defineProperty(cloned, "semanticRetrieval", { value: typeof structuredClone === "function" ? structuredClone(metadata) : JSON.parse(JSON.stringify(metadata)), enumerable: false, configurable: true });
-  if (telemetry) Object.defineProperty(cloned, "telemetry", { value: typeof structuredClone === "function" ? structuredClone(telemetry) : JSON.parse(JSON.stringify(telemetry)), enumerable: false, configurable: true });
+  const sharedTelemetry = Boolean(metadata && telemetry && metadata.telemetry === telemetry);
+  let clonedMetadata = null;
+  if (metadata) {
+    if (sharedTelemetry && metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+      const metadataWithoutTelemetry = Object.assign({}, metadata);
+      delete metadataWithoutTelemetry.telemetry;
+      clonedMetadata = cloneValue(metadataWithoutTelemetry);
+      Object.defineProperty(clonedMetadata, "telemetry", { value: cloneValue(telemetry), enumerable: true, configurable: true, writable: true });
+    } else {
+      clonedMetadata = cloneValue(metadata);
+    }
+    Object.defineProperty(cloned, "semanticRetrieval", { value: clonedMetadata, enumerable: false, configurable: true });
+  }
+  if (telemetry) Object.defineProperty(cloned, "telemetry", {
+    value: sharedTelemetry ? clonedMetadata.telemetry : cloneValue(telemetry),
+    enumerable: false,
+    configurable: true
+  });
   return cloned;
 }
 
@@ -44049,8 +45094,8 @@ function taskDescriptionPromptContextSuffix(sharedPayload = {}, options = {}) {
       contractHash: String(singletonContract.contractHash || singletonContract.projectionHash || ""),
       projectionHash: String(singletonContract.projectionHash || singletonContract.contractHash || ""),
       factsById: JSON.parse(JSON.stringify(singletonContract.factsById || singletonContract.facts_by_id || {})),
-      evidenceById: JSON.parse(JSON.stringify(singletonContract.evidenceById || singletonContract.evidence_by_id || {})),
-      citationLedgerByTask: JSON.parse(JSON.stringify(singletonContract.citationLedgerByTask || singletonContract.citation_ledger_by_task || {})),
+      evidenceById: singletonContract.evidenceById || singletonContract.evidence_by_id || {},
+      citationLedgerByTask: singletonContract.citationLedgerByTask || singletonContract.citation_ledger_by_task || {},
       allowedEvidenceIds: Array.isArray(singletonContract.allowedEvidenceIds) ? singletonContract.allowedEvidenceIds.slice() : Array.isArray(singletonContract.allowed_evidence_ids) ? singletonContract.allowed_evidence_ids.slice() : [],
       allowedFactIds: Array.isArray(singletonContract.allowedFactIds) ? singletonContract.allowedFactIds.slice() : Array.isArray(singletonContract.allowed_fact_ids) ? singletonContract.allowed_fact_ids.slice() : [],
       allowedCitationIds: Array.isArray(singletonContract.allowedCitationIds) ? singletonContract.allowedCitationIds.slice() : Array.isArray(singletonContract.allowed_citation_ids) ? singletonContract.allowed_citation_ids.slice() : []
@@ -44069,11 +45114,13 @@ function taskDescriptionPromptContextSuffix(sharedPayload = {}, options = {}) {
   const filteredEvidenceById = {};
   for (const [eid, row] of Object.entries(evidenceById)) {
     if (!row || typeof row !== "object") continue;
+    const effectiveExcerpt = String(row.excerpt || row.text || "");
+    const effectiveText = String(row.text || row.excerpt || "");
     const filtered = {
-      evidenceId: String(row.evidenceId || eid),
-      excerpt: String(row.excerpt || row.text || ""),
-      text: String(row.text || row.excerpt || "")
+      evidenceId: String(row.evidenceId || eid)
     };
+    if (effectiveExcerpt !== effectiveText) filtered.excerpt = effectiveExcerpt;
+    filtered.text = effectiveText;
     if (row.scopeId) filtered.scopeId = String(row.scopeId);
     if (Array.isArray(row.scopeIds)) filtered.scopeIds = row.scopeIds.map(function(v) { return String(v); });
     if (row.taskId) filtered.taskId = String(row.taskId);
@@ -44368,7 +45415,7 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
   };
   const user = [
     phase === "regeneration" ? "Workflow phase: bounded complete task-description regeneration." : phase === "fallback" ? "Workflow phase: bounded task-description fallback." : "Workflow phase: task description.",
-    "Use only this task-local canonicalLedger delta. Its bounded executionCandidatesByFactId rows contain exact task-local fact bodies; resolve those rows as the sole execution source for this task. Return exactly one complete description object for its exact taskId and scopeId, never borrow sibling rows, and never emit prose or fields outside the response schema.",
+    "Task-local canonicalLedger delta:",
     JSON.stringify({ canonicalLedger: providerLedger })
   ].join("\n");
   return Object.freeze({
@@ -48388,53 +49435,41 @@ function semanticEmbeddingProjectContextLabel(path = "", title = "") {
 
 function semanticTaskReferenceEmbeddingProjection(chunk = {}) {
   const reference = chunk?.taskReference || chunk?.task || {};
+  const task = semanticTaskReferenceTaskFromChunk(chunk) || reference || {};
+  const sources = [reference, chunk, task];
+  const clean = (value) => singleLine(value ?? "");
   const read = (...keys) => {
-    for (const source of [reference, chunk]) {
+    for (const source of sources) {
       for (const key of keys) {
-        const value = singleLine(source?.[key] || "");
+        const value = clean(source?.[key]);
         if (value) return value;
       }
     }
     return "";
   };
   const fromText = (label) => semanticTaskReferenceField(chunk?.text || "", label);
-  const title = read("content", "taskTitle") || fromText("Title") || read("title");
+  const title = read("content", "taskTitle", "title") || fromText("Title");
   if (!title) return "";
-  const description = read("description", "narrativeDescription", "detail") || fromText("Description");
-  const parentRecord = reference?.parentTask || chunk?.parentTask || {};
-  const parentTitle = read("parentContent", "parentTitle", "parentTaskTitle")
-    || singleLine(parentRecord.content || parentRecord.title || parentRecord.taskTitle || "")
-    || fromText("Parent task");
-  const state = read("currentState", "state", "status") || (Boolean(reference?.isCompleted ?? chunk?.isCompleted) ? "completed" : fromText("Current state") || fromText("State") || "open");
+  const explicitState = read("currentState", "state", "status");
+  const completed = reference?.isCompleted === true || chunk?.isCompleted === true;
+  const state = explicitState || (completed ? "completed" : fromText("Current state") || fromText("State") || "unknown");
+  const priorityRaw = read("priority", "priorityValue", "todoistPriority", "todoist_priority") || fromText("Priority");
+  const parsedPriority = Number.parseInt(priorityRaw, 10);
+  const priority = Number.isInteger(parsedPriority) && parsedPriority >= 1 && parsedPriority <= 4 ? String(parsedPriority) : "unknown";
   const project = read("projectName", "project", "projectLabel") || fromText("Todoist project") || fromText("Project");
   const section = read("section", "sectionName", "sectionLabel") || fromText("Todoist section") || fromText("Section");
-  const childValues = [];
-  const addChild = (value) => {
-    if (Array.isArray(value)) {
-      for (const item of value) addChild(item);
-      return;
-    }
-    if (value && typeof value === "object") {
-      const text = [value.content || value.title || value.taskTitle, value.description || value.narrativeDescription].filter(Boolean).join(" â€” ");
-      if (text) childValues.push(singleLine(text));
-      return;
-    }
-    const text = singleLine(value || "");
-    if (text) childValues.push(text);
-  };
-  for (const source of [reference, chunk]) {
-    for (const key of ["childSemanticText", "childText", "childTaskText", "subtaskText", "parentChildText", "siblingText", "relatedSubtasks", "subtasks", "childTasks", "children"]) addChild(source?.[key]);
-  }
-  const childText = uniqueValues(childValues).join("; ");
-  return [
-    `Title: ${title}`,
-    description ? `Description: ${description}` : "",
-    parentTitle ? `Parent task: ${parentTitle}` : "",
-    childText ? `Related subtasks: ${childText}` : "",
-    `Current state: ${state}`,
-    project ? `Project: ${project}` : "",
-    section ? `Section: ${section}` : ""
-  ].filter(Boolean).join("\n");
+  const taskId = read("canonicalTaskId", "taskId", "id", "todoistId", "taskID", "task_id", "todoist_id");
+  const oid = read("oid");
+  const sourceId = read("sourceId", "source_id", "todoistSourceId");
+  const evidenceIds = localSemanticRoutingIdValues([reference?.evidence_ids, reference?.evidenceIds, reference?.evidenceId, chunk?.evidence_ids, chunk?.evidenceIds, chunk?.evidenceId, task?.evidence_ids, task?.evidenceIds, task?.evidenceId], ["id", "ref", "evidenceId", "evidence_id"]);
+  const factRefs = localSemanticRoutingIdValues([reference?.fact_refs, reference?.factRefs, chunk?.fact_refs, chunk?.factRefs, task?.fact_refs, task?.factRefs], ["id", "ref", "factId", "fact_id"]);
+  const childIds = localSemanticRoutingIdValues([reference?.childTaskIds, reference?.child_task_ids, reference?.childIds, chunk?.childTaskIds, chunk?.child_task_ids, chunk?.childIds, task?.childTaskIds, task?.child_task_ids, task?.childIds], ["id", "ref", "taskId", "task_id", "todoistId", "todoist_id"]);
+  const due = read("due", "dueDate", "dueDatetime", "due_date") || fromText("Due") || fromText("Due date");
+  const deadline = read("deadline", "deadlineDate", "deadline_date") || fromText("Deadline");
+  const parentRecord = reference?.parentTask || chunk?.parentTask || task?.parentTask || {};
+  const parentId = read("parentTaskId", "parentId", "parentID", "parentOid") || clean(parentRecord?.id || parentRecord?.taskId || parentRecord?.todoistId || parentRecord?.oid);
+  const rootId = read("rootTaskId", "rootId", "rootID", "rootOid");
+  return JSON.stringify({ card: "compact-task-card-v1", id: clean(chunk?.id) || taskId || oid || null, taskId: taskId || null, oid: oid || null, title, status: state, currentState: state, priority, project: project || null, section: section || null, due: due || null, deadline: deadline || null, parentId: parentId || null, rootId: rootId || null, childIds: Array.from(childIds), sourceId: sourceId || null, evidence_ids: Array.from(evidenceIds), fact_refs: Array.from(factRefs) });
 }
 
 function semanticTaskReferenceEmbeddingProjectionVersion(chunk = {}) {
@@ -49460,15 +50495,41 @@ function deduplicateTaskWorkflowEvidenceRecords(records = []) {
     const record = Object.assign({}, rawRecord);
     const identity = taskWorkflowEvidenceStableIdentity(record, ordinal);
     identityByInput.push(identity);
-    const current = byIdentity.get(identity);
-    if (!current) {
-      byIdentity.set(identity, [record]);
+    let identityGroups = byIdentity.get(identity);
+    if (!identityGroups) {
+      identityGroups = {
+        bodyGroups: new Map(),
+        bodyless: { firstOrdinal: ordinal, records: [] }
+      };
+      byIdentity.set(identity, identityGroups);
       order.push(identity);
-    } else {
-      current.push(record);
     }
+    const body = semanticEvidenceRecordBody(record);
+    if (!body) {
+      identityGroups.bodyless.firstOrdinal = Math.min(identityGroups.bodyless.firstOrdinal, ordinal);
+      identityGroups.bodyless.records.push(record);
+      continue;
+    }
+    let bodyGroup = identityGroups.bodyGroups.get(body);
+    if (!bodyGroup) {
+      bodyGroup = { firstOrdinal: ordinal, records: [] };
+      identityGroups.bodyGroups.set(body, bodyGroup);
+    }
+    bodyGroup.records.push(record);
   }
-  const merged = order.map((identity) => mergeTaskWorkflowEvidenceMetadata(byIdentity.get(identity) || []));
+  const merged = [];
+  for (const identity of order) {
+    const identityGroups = byIdentity.get(identity);
+    const bodyGroups = Array.from(identityGroups.bodyGroups.values());
+    const bodyless = identityGroups.bodyless.records.length ? [identityGroups.bodyless] : [];
+    const groups = bodyGroups.length === 1
+      ? [{
+        firstOrdinal: Math.min(bodyGroups[0].firstOrdinal, identityGroups.bodyless.firstOrdinal),
+        records: [...identityGroups.bodyless.records, ...bodyGroups[0].records]
+      }]
+      : [...bodyGroups, ...bodyless].sort((left, right) => left.firstOrdinal - right.firstOrdinal);
+    for (const group of groups) merged.push(mergeTaskWorkflowEvidenceMetadata(group.records));
+  }
   const duplicateCount = Math.max(0, (records || []).length - merged.length);
   const rawChars = JSON.stringify(records || []).length;
   const serializedChars = JSON.stringify(merged).length;
@@ -55187,6 +56248,39 @@ function providerVisibleInputEnvelopeEstimate({
     + (!evidenceDirectorySerialized ? evidenceDirectoryBytes : 0);
   const rawEstimatedInputTokens = Math.ceil(rawEnvelopeBytes / 4);
   const adjustedEstimatedInputTokens = Math.ceil(rawEstimatedInputTokens * PROVIDER_INPUT_ESTIMATE_SAFETY_FACTOR);
+  const envelopeComponentBytes = {
+    system: systemBytes,
+    promptCachePrefix: promptPrefixBytes,
+    promptContextSuffix: promptContextSuffixBytes,
+    user: userBytes,
+    effectiveUser: effectiveUserBytes,
+    schema: schemaBytes,
+    schemaGrounding: schemaGroundingBytes,
+    carrier: carrierBytes,
+    evidenceDirectory: evidenceDirectoryBytes,
+    wrapperControl: wrapperControlBytes,
+    total: rawEnvelopeBytes
+  };
+  const countedEnvelopeComponentBytes = {
+    system: systemBytes,
+    promptCachePrefix: promptPrefixBytes,
+    effectiveUser: effectiveUserBytes,
+    schema: schemaBytes,
+    schemaGrounding: schemaGroundingBytes,
+    carrier: carrierBytes,
+    evidenceDirectory: evidenceDirectorySerialized ? 0 : evidenceDirectoryBytes,
+    wrapperControl: wrapperControlBytes,
+    total: rawEnvelopeBytes
+  };
+  const envelopeComponents = Object.freeze(Object.fromEntries(Object.entries(envelopeComponentBytes).map(([name, bytes]) => Object.freeze([
+    name,
+    Object.freeze({
+      bytes,
+      estimatedTokens: Math.ceil(bytes / 4),
+      countedBytes: countedEnvelopeComponentBytes[name] || 0,
+      countedEstimatedTokens: Math.ceil((countedEnvelopeComponentBytes[name] || 0) / 4)
+    })
+  ]))));
   const envelopeHash = aiGatewaySha256(JSON.stringify({
     system: systemText,
     promptCachePrefix: prefixText,
@@ -55214,6 +56308,7 @@ function providerVisibleInputEnvelopeEstimate({
     carrierBytes,
     evidenceDirectoryBytes,
     evidenceDirectorySerialized: Boolean(evidenceDirectorySerialized),
+    envelopeComponents,
     envelopeHash,
     schemaGroundingTokens: schemaGrounding ? Math.ceil(schemaGrounding.length / 4) : 0,
     schemaGroundingHash: schemaGrounding ? providerContextProjectionHash(schemaGrounding) : "",
@@ -55423,11 +56518,46 @@ function taskWorkflowSharedContextPrefixValidation(prefix = "", expectedHash = "
 
 function chatProviderCardText(kind, card = {}) {
   const id = chatProviderStableId(card, `${kind}:${card?.title || card?.name || "card"}`);
-  const parts = [`${kind}_id=${id}`];
+  const task = card?.taskReference || card?.task || {};
+  const taskSources = [card, task];
+  const readTaskValue = (...keys) => {
+    for (const source of taskSources) {
+      for (const key of keys) {
+        const value = source?.[key];
+        if (value !== undefined && value !== null && value !== "") return String(value).trim();
+      }
+    }
+    return "";
+  };
+  const taskListValue = (...keys) => uniqueValues(taskSources.flatMap((source) => keys.flatMap((key) => {
+    const value = source?.[key];
+    return Array.isArray(value) ? value : value === undefined || value === null || value === "" ? [] : [value];
+  })).map((value) => String(value || "").trim()).filter(Boolean)).join(",");
+  const exactP4Task = kind === "task"
+    && ["direct", "ancestor"].includes(String(card?.exactP4Admission || "").trim().toLowerCase());
+  const parts = [`${exactP4Task ? "task_evidence_id" : kind + "_id"}=${id}`];
   const fields = kind === "note"
     ? [["title", card.title], ["path", card.path], ["evidence_ids", Array.isArray(card.evidenceIds) ? card.evidenceIds.join(",") : ""]]
     : kind === "task"
-      ? [["title", card.title], ["task_id", card.taskId || card.id], ["status", card.currentState || card.status], ["project", card.project], ["description", card.description], ["evidence_ids", Array.isArray(card.evidence_ids) ? card.evidence_ids.join(",") : ""], ["fact_refs", Array.isArray(card.fact_refs) ? card.fact_refs.join(",") : ""]]
+      ? exactP4Task
+        ? [
+          ["title", readTaskValue("title", "content")],
+          ["task_id", readTaskValue("taskId", "task_id", "todoistId", "todoist_id", "canonicalTaskId") || (task.id ? String(task.id) : "")],
+          ["oid", readTaskValue("oid", "taskOid", "task_oid")],
+          ["status", readTaskValue("currentState", "current_state", "status", "state") || "unknown"],
+          ["priority", readTaskValue("priority", "priorityValue", "todoistPriority", "todoist_priority") || "unknown"],
+          ["project", readTaskValue("project", "projectName", "projectLabel")],
+          ["section", readTaskValue("section", "sectionName", "sectionLabel")],
+          ["due", readTaskValue("due", "dueDate", "due_date", "scheduledDueDateTime")],
+          ["deadline", readTaskValue("deadline", "deadlineDate", "deadline_date")],
+          ["parent_id", readTaskValue("parentId", "parentTaskId", "parentOid", "parent_id", "parent_task_id", "parent_oid")],
+          ["root_id", readTaskValue("rootId", "rootTaskId", "rootOid", "root_id", "root_task_id", "root_oid")],
+          ["child_ids", taskListValue("childIds", "childTaskIds", "childOids", "child_ids", "child_task_ids", "child_oids")],
+          ["source_id", readTaskValue("sourceId", "source_id")],
+          ["evidence_ids", taskListValue("evidence_ids", "evidenceIds", "evidenceId", "evidence_id", "selectedSemanticEvidence")],
+          ["fact_refs", taskListValue("fact_refs", "factRefs", "factRef", "fact_refs_ids")]
+        ]
+        : [["title", card.title], ["task_id", card.taskId || card.id], ["status", card.currentState || card.status], ["project", card.project], ["description", card.description], ["evidence_ids", Array.isArray(card.evidence_ids) ? card.evidence_ids.join(",") : ""], ["fact_refs", Array.isArray(card.fact_refs) ? card.fact_refs.join(",") : ""]]
       : [["evidence_ids", Array.isArray(card.evidenceIds) ? card.evidenceIds.join(",") : ""], ["source_titles", Array.isArray(card.sourceTitles) ? card.sourceTitles.join(";") : ""]];
   for (const [key, value] of fields) {
     if (value === undefined || value === null || value === "") continue;
@@ -55448,12 +56578,12 @@ function chatProviderCompactEvidenceMetadata(item = {}, evidenceId = "") {
   if (authorityState && !metadata.authorityState) metadata.authorityState = authorityState;
   if (conflictState && !metadata.conflictState) metadata.conflictState = conflictState;
   const task = item.taskReference || item.task || {};
-  const taskId = String(item.taskId || item.task_id || task.taskId || task.task_id || task.todoistId || task.todoist_id || task.id || "").trim();
-  const rootTaskId = String(item.rootTaskId || item.root_task_id || item.rootId || task.rootTaskId || task.root_task_id || task.rootId || "").trim();
-  const parentTaskId = String(item.parentTaskId || item.parent_task_id || item.parentId || task.parentTaskId || task.parent_task_id || task.parentId || "").trim();
+  const taskId = String(item.taskId || item.task_id || task.taskId || task.task_id || task.todoistId || task.todoist_id || task.id || item.oid || task.oid || "").trim();
+  const rootTaskId = String(item.rootTaskId || item.root_task_id || item.rootId || item.rootOid || task.rootTaskId || task.root_task_id || task.rootId || task.rootOid || "").trim();
+  const parentTaskId = String(item.parentTaskId || item.parent_task_id || item.parentId || item.parentOid || task.parentTaskId || task.parent_task_id || task.parentId || task.parentOid || "").trim();
   const childTaskIds = uniqueValues([
-    ...(item.childTaskIds || item.child_task_ids || item.childIds || []),
-    ...(task.childTaskIds || task.child_task_ids || task.childIds || [])
+    ...(item.childTaskIds || item.child_task_ids || item.childIds || item.childOids || item.child_oids || []),
+    ...(task.childTaskIds || task.child_task_ids || task.childIds || task.childOids || task.child_oids || [])
   ].map((value) => String(value || "").trim()).filter(Boolean));
   const scopeIds = uniqueValues([
     item.scopeId, item.scope_id, ...(item.scopeIds || []), ...(item.scope_ids || []),
@@ -55546,7 +56676,37 @@ function buildChatProviderEvidenceCarrierRows(rows = []) {
     const provenance = source.provenance && typeof source.provenance === "object" && !Array.isArray(source.provenance)
       ? source.provenance
       : {};
-    const taskIds = providerEvidenceUniqueValues(providerEvidenceValues(source, "taskIds", "taskId").concat(providerEvidenceValues(task, "taskIds", "taskId")).map(String).filter(Boolean));
+    const exactP4TaskRow = ["direct", "ancestor"].includes(compactString(source.exactP4Admission).toLowerCase());
+    const canonicalTaskId = compactString(source.taskId || source.task_id || source.todoistId || source.todoist_id || task.taskId || task.task_id || task.todoistId || task.todoist_id || task.canonicalTaskId || task.id);
+    const canonicalTaskOid = compactString(source.oid || source.taskOid || source.task_oid || task.oid);
+    const taskEvidenceIds = providerEvidenceUniqueValues([
+      ...providerEvidenceValues(source, "evidence_ids", "evidenceId"),
+      ...providerEvidenceValues(task, "evidence_ids", "evidenceId")
+    ].map(String).filter(Boolean));
+    const taskFactRefs = providerEvidenceUniqueValues([
+      ...providerEvidenceValues(source, "fact_refs", "factRef"),
+      ...providerEvidenceValues(task, "fact_refs", "factRef")
+    ].map(String).filter(Boolean));
+    const taskChildIds = providerEvidenceUniqueValues([
+      ...providerEvidenceValues(source, "childIds", "childId"),
+      ...providerEvidenceValues(task, "childIds", "childTaskIds"),
+      ...providerEvidenceValues(task, "childOids", "childOid")
+    ].map(String).filter(Boolean));
+    const compactTaskBody = exactP4TaskRow
+      ? chatProviderCardText("task", Object.assign({}, source, {
+        taskReference: task,
+        taskId: canonicalTaskId,
+        oid: canonicalTaskOid,
+        title: compactString(source.title || task.content || task.title),
+        parentId: compactString(source.parentId || source.parentTaskId || source.parentOid || task.parentId || task.parentTaskId || task.parentOid),
+        rootId: compactString(source.rootId || source.rootTaskId || source.rootOid || task.rootId || task.rootTaskId || task.rootOid),
+        childIds: taskChildIds,
+        evidence_ids: taskEvidenceIds,
+        fact_refs: taskFactRefs
+      }))
+      : "";
+    const taskIds = providerEvidenceUniqueValues(providerEvidenceValues(source, "taskIds", "taskId")
+      .concat(providerEvidenceValues(task, "taskIds", "taskId"), canonicalTaskId).map(String).filter(Boolean));
     const scopeIds = providerEvidenceUniqueValues(providerEvidenceValues(source, "scopeIds", "scopeId").concat(providerEvidenceValues(task, "scopeIds", "scopeId")).map(String).filter(Boolean));
     const associations = compactAssociations([...(source.taskScopeAssociations || []), ...(task.taskScopeAssociations || [])]);
     const exactScore = [source.exactScore, source.semanticScore, source.semantic_score, source.score]
@@ -55568,7 +56728,7 @@ function buildChatProviderEvidenceCarrierRows(rows = []) {
     return {
       evidenceId,
       originalEvidenceId: evidenceId,
-      text: semanticEvidenceRecordBody(source),
+      text: exactP4TaskRow ? compactTaskBody : semanticEvidenceRecordBody(source),
       sourceId: compactString(source.sourceId || provenance.sourceId),
       sourceKind: compactString(source.sourceKind || source.source_kind || provenance.sourceKind),
       sourceFamily: compactString(source.sourceFamily || provenance.sourceFamily),
@@ -55818,7 +56978,7 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
     const originalId = String(entry.evidenceId || "");
     const deliveryId = String(semanticEvidenceDeliveryIdentity(entry) || originalId);
     if (!citableLedgerByEvidenceId.has(originalId)) citableLedgerByEvidenceId.set(originalId, entry);
-    citableLedgerByEvidenceId.set(deliveryId, entry);
+    if (!citableLedgerByEvidenceId.has(deliveryId)) citableLedgerByEvidenceId.set(deliveryId, entry);
   }
   const adaptivePack = options.adaptivePack || {};
   const settings = options.settings || DEFAULT_SETTINGS;
@@ -55935,7 +57095,13 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
   const selectedOptionalEvidenceRows = optionalEvidenceCandidates;
   const deliveredEvidenceRows = [...protectedEvidenceRows, ...selectedOptionalEvidenceRows];
   const deliveredEvidenceIds = new Set(deliveredEvidenceRows.flatMap((row) => [row.id, row.originalEvidenceId]).filter(Boolean));
-  const projectedSourceLedger = citableLedgerRows.filter((entry) => entry.role === "Active note" || deliveredEvidenceIds.has(String(entry.evidenceId)));
+  const projectedSourceLedgerEvidenceIds = new Set();
+  const projectedSourceLedger = citableLedgerRows.filter((entry) => {
+    const evidenceId = String(entry.evidenceId || "");
+    if (!(entry.role === "Active note" || deliveredEvidenceIds.has(evidenceId)) || projectedSourceLedgerEvidenceIds.has(evidenceId)) return false;
+    projectedSourceLedgerEvidenceIds.add(evidenceId);
+    return true;
+  });
   const allowedEvidenceIds = uniqueValues(projectedSourceLedger.map((entry) => String(entry.evidenceId || "")).filter(Boolean));
   const allowedEvidenceIdSet = new Set(allowedEvidenceIds);
   const projectedLedgerByEvidenceId = new Map(projectedSourceLedger.map((entry) => [String(entry.evidenceId), entry]));
@@ -56252,6 +57418,33 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
     bodies: chatEvidenceDirectory.bodies,
     records: chatEvidenceDirectory.records
   });
+  const p4Predicate = queryPlan?.todoistInventoryPredicate;
+  const compactP4CardKeys = new Set(["id", "taskId", "oid", "title", "status", "currentState", "priority", "project", "section", "due", "deadline", "parentId", "rootId", "childIds", "sourceId", "evidence_ids", "fact_refs", "selectedSemanticEvidence"]);
+  const originalTaskCards = Array.isArray(adaptivePack.taskCards) ? adaptivePack.taskCards : [];
+  const canonicalBodyByRef = new Map(chatEvidenceDirectory.bodies.map((entry) => [entry.bodyRef, entry.body]));
+  const deliveredBodyPairs = new Set(chatEvidenceDirectory.records.flatMap((record) => {
+    const body = canonicalBodyByRef.get(record.bodyRef);
+    if (typeof body !== "string") return [];
+    return uniqueValues([record.evidenceId, record.originalEvidenceId]).map((evidenceId) => JSON.stringify([String(evidenceId), body]));
+  }));
+  const deliveredP4BodyPairs = new Set(chatCarrierRows.flatMap((carrier, index) => {
+    const admission = String(chatDirectoryRows[index]?.exactP4Admission || "").trim().toLowerCase();
+    const pair = JSON.stringify([String(carrier?.evidenceId || ""), String(carrier?.text || "")]);
+    return ["direct", "ancestor"].includes(admission) && deliveredBodyPairs.has(pair) ? [pair] : [];
+  }));
+  const compactP4CardsCovered = p4Predicate?.todoist === true && p4Predicate?.exhaustive === true
+    && Number.parseInt(p4Predicate?.priority, 10) === 4 && p4Predicate?.currentOpenOnly === true && p4Predicate?.hierarchy === "ancestors"
+    && originalTaskCards.length > 0 && originalTaskCards.length === projectedTaskCards.length && originalTaskCards.every((card) => {
+      if (!card || Object.keys(card).some((key) => !compactP4CardKeys.has(key))) return false;
+      const evidenceId = String(card.selectedSemanticEvidence || "").trim();
+      const evidenceIds = providerEvidenceUniqueValues((Array.isArray(card.evidence_ids) ? card.evidence_ids : []).map(String).filter(Boolean));
+      if (String(card.id || "").trim() !== String(card.taskId || card.oid || "").trim() || String(card.status || "") !== String(card.currentState || "") || !evidenceId || !evidenceIds.includes(evidenceId)) return false;
+      const canonicalCard = Object.assign({}, card, { evidenceId, exactP4Admission: "direct", childIds: providerEvidenceUniqueValues((card.childIds || []).map(String).filter(Boolean)), evidence_ids: evidenceIds, fact_refs: providerEvidenceUniqueValues((card.fact_refs || []).map(String).filter(Boolean)) });
+      return deliveredP4BodyPairs.has(JSON.stringify([evidenceId, chatProviderCardText("task", canonicalCard)]));
+    });
+  const projectedTaskMetadataForProvider = compactP4CardsCovered ? "" : projectedTaskMetadata;
+  const compactedTaskMetadataCount = compactP4CardsCovered ? projectedTaskCards.length : 0;
+  const compactedTaskMetadataBytes = compactP4CardsCovered ? utf8ByteLength(projectedTaskMetadata) : 0;
   const requiredSections = [
     "Active note context:", providerActiveCarrier || "No active note context.",
     "Retrieval state:", retrievalDegraded
@@ -56261,7 +57454,7 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
     facts.length ? facts.map((fact) => `- fact_id=${fact.id} evidence_id=${fact.evidenceId} type=${fact.type} role=${fact.role} temporal=${fact.temporalRelation} current=${fact.current} authority=${fact.authority} conflict=${fact.conflictState} | value=${fact.value}`).join("\n") : "- No typed current source-contract facts were established.",
     "Selected semantic evidence directory (each normalized body is serialized once; use delivery IDs for references):",
     chatDirectoryText,
-    projectedTaskMetadata,
+    projectedTaskMetadataForProvider,
     projectedReservedMetadata,
     "Allowed evidence IDs (return evidence_ids only; never print links, numbered citations, or a source list):",
     allowedEvidenceIds.join(",") || "No allowed evidence IDs.",
@@ -56311,6 +57504,7 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
     adjustedEstimatedInputTokens: envelopeEstimate.adjustedEstimatedInputTokens,
     inputEstimateSafetyFactor: envelopeEstimate.safetyFactor,
     wrapperControlBytes: envelopeEstimate.wrapperControlBytes,
+    envelopeComponents: envelopeEstimate.envelopeComponents,
     schemaBytes: envelopeEstimate.schemaBytes,
     estimateOnly: true,
     historyMessageCount: history.length,
@@ -56410,6 +57604,8 @@ function buildChatProviderContextProjectionCarrier(options = {}) {
   telemetry.carrierBodyRefsValid = carrierBodyRefsValid;
   telemetry.carrierEvidenceIdsPreserved = carrierEvidenceIdsPreserved;
   telemetry.carrierProvenancePreserved = carrierEvidenceIdsPreserved;
+  telemetry.compactedTaskMetadataCount = compactedTaskMetadataCount;
+  telemetry.compactedTaskMetadataBytes = compactedTaskMetadataBytes;
   telemetry.carrierActiveBodyReferenced = Boolean(activeCarrierEntry);
   const providerVisibleElided = projectedSourceLedger.reduce((summary, entry) => {
     const sourceId = String(entry?.sourceId || entry?.provenance?.sourceId || "");
@@ -56588,16 +57784,26 @@ function buildChatProviderContextProjection(options = {}) {
 // Normal chat forms its response schema from the exact citable ID set.  Size
 // each optional-evidence candidate with that matching schema and the focused
 // provider system, then retain the first (therefore most semantically complete)
-// candidate strictly under the resolved operational input boundary.
+// candidate strictly under the smaller of the 16,000-token efficiency target
+// and the resolved operational input boundary.
 function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system = "", webSearchMode = "off") {
   const contextWindow = chatProviderContextWindow(options.settings || DEFAULT_SETTINGS, options.provider, options.model);
   const operationalInputMaximumExclusiveTokens = Math.max(1, Math.floor(Number(
     contextWindow.inputMaximumExclusiveTokens || contextWindow.operationalInputTokenLimitTokens + 1
   )));
-  const candidateGroups = chatProviderOptionalEvidenceGroups(options)
-    .filter((group) => Number.isFinite(group.score));
+  // Use every optional group in the shared missing-score-first/ascending-score/
+  // stable-ID order so the lowest-value evidence is shed first.
+  const candidateGroups = chatProviderOptionalEvidenceGroups(options);
+  // The fitting boundary is the smaller of the declared efficiency target and
+  // the adaptive operational ceiling: at/above target the late pass sheds
+  // optional groups until below 16k even when capacity is larger, while a
+  // smaller operational window still constrains the envelope. Protected-only
+  // target overage is returned (nonterminal); actual operational overflow is
+  // preserved so the preflight hard-window gate fails observably.
+  const fittingBoundaryExclusiveTokens = Math.min(PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS, operationalInputMaximumExclusiveTokens);
   const completeProjection = buildChatProviderContextProjectionCarrier(Object.assign({}, options, { system }));
   const completeDelivered = Number(completeProjection.telemetry?.delivered || 0);
+  const baseOmittedOptionalEvidenceIds = new Set((options.omittedOptionalEvidenceIds || []).map(String).filter(Boolean));
   let initialEstimatedInputTokens = 0;
   let candidate = null;
   let responseSchema = null;
@@ -56609,7 +57815,7 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
   // renderer. Binary search finds the SAME minimal K (identical final
   // membership and telemetry semantics) in O(log groups) carrier builds.
   const buildCandidate = (omitCount) => {
-    const omitted = new Set();
+    const omitted = new Set(baseOmittedOptionalEvidenceIds);
     for (let index = 0; index < omitCount && index < candidateGroups.length; index += 1) {
       for (const key of candidateGroups[index].keys) omitted.add(key);
     }
@@ -56619,7 +57825,9 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
     });
     // Membership is independent of schema; obtain its exact allowed IDs first,
     // then rebuild the same candidate with the schema the provider will see.
-    const membershipProjection = buildChatProviderContextProjectionCarrier(candidateOptions);
+    const membershipProjection = omitCount === 0
+      ? completeProjection
+      : buildChatProviderContextProjectionCarrier(candidateOptions);
     const schema = chatResponseSchema(CHAT_RESPONSE_MAX_CLAIMS, membershipProjection.allowedEvidenceIds, webSearchMode);
     const built = buildChatProviderContextProjectionCarrier(Object.assign({}, candidateOptions, { schema }));
     if (JSON.stringify(membershipProjection.allowedEvidenceIds) !== JSON.stringify(built.allowedEvidenceIds)) {
@@ -56629,7 +57837,7 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
     }
     return { built, schema };
   };
-  const fits = (built) => Number(built.telemetry?.estimatedInputTokens || 0) < operationalInputMaximumExclusiveTokens;
+  const fits = (built) => Number(built.telemetry?.estimatedInputTokens || 0) < fittingBoundaryExclusiveTokens;
   const complete = buildCandidate(0);
   initialEstimatedInputTokens = Number(complete.built.telemetry?.estimatedInputTokens || 0);
   if (fits(complete.built)) {
@@ -56637,7 +57845,7 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
     responseSchema = complete.schema;
   } else {
     // Binary search the minimal omitted-prefix length K in [0, candidateGroups.length]
-    // whose carrier fits the operational budget. The fit predicate is monotone
+    // whose carrier fits the efficiency/operational boundary. The fit predicate is monotone
     // (more omissions never grow the envelope), so this finds the SAME minimal
     // K as the previous one-group-per-iteration scan. If no K fits, K = length,
     // reproducing the original protected-overflow end state.
@@ -56655,6 +57863,115 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
     responseSchema = finalBuild.schema;
     omittedGroups = finalK;
   }
+  // Behavior-neutral final-envelope cutoff diagnostics (privacy-safe scalars
+  // only). The omitted prefix [0, omittedGroups) and retained suffix
+  // [omittedGroups, length) preserve existing order; no ranking, fit,
+  // omission, membership, reservation, or response behavior changes. Only
+  // fixed-width hashes, score buckets, and aggregate counts are exposed —
+  // never raw identities, arrays, content, paths, prompts, or provider data.
+  const projectionCutoffScoreBucket = (score) => {
+    if (!Number.isFinite(score)) return "missing";
+    if (score < 0) return "negative";
+    if (score === 0) return "zero";
+    if (score <= 0.25) return "gt0-le0.25";
+    if (score <= 0.5) return "gt0.25-le0.5";
+    if (score <= 0.75) return "gt0.5-le0.75";
+    if (score <= 1) return "gt0.75-le1";
+    return "gt1";
+  };
+  const projectionCutoffHash16Hex = (text) => {
+    // Deterministic 64-bit FNV-1a (two domain-separated 32-bit passes) as
+    // fixed-width lowercase hex. Pure JS with no crypto dependency; only the
+    // digest leaves this function, never raw identities.
+    const pass = (seed, salt) => {
+      const input = String(text == null ? "" : text);
+      let hash = seed >>> 0;
+      for (let index = 0; index < input.length; index += 1) {
+        hash ^= (input.charCodeAt(index) + salt) & 0xffffffff;
+        hash = Math.imul(hash, 16777619);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    };
+    return `${pass(2166136261, 0)}${pass(2246822519, 97)}`;
+  };
+  const projectionCutoffIdentity = (value) => String(value == null ? "" : value).trim();
+  const projectionCutoffSetHash = (identities) => {
+    const normalized = [...new Set((Array.isArray(identities) ? identities : []).map(projectionCutoffIdentity).filter(Boolean))].sort();
+    if (!normalized.length) return "";
+    return projectionCutoffHash16Hex(normalized.join("\n"));
+  };
+  const projectionCutoffSingleHash = (value) => {
+    const normalized = projectionCutoffIdentity(value);
+    return normalized ? projectionCutoffHash16Hex(normalized) : "";
+  };
+  const projectionCutoffClampedK = Math.max(0, Math.min(omittedGroups, candidateGroups.length));
+  const projectionCutoffOmittedGroups = candidateGroups.slice(0, projectionCutoffClampedK);
+  const projectionCutoffRetainedGroups = candidateGroups.slice(projectionCutoffClampedK);
+  const projectionCutoffLastOmitted = projectionCutoffOmittedGroups.length ? projectionCutoffOmittedGroups[projectionCutoffOmittedGroups.length - 1] : null;
+  const projectionCutoffFirstRetained = projectionCutoffRetainedGroups.length ? projectionCutoffRetainedGroups[0] : null;
+  // Reservation classification compares group keys to existing reserved IDs
+  // only (diagnostic; never promotes or alters reservations).
+  const projectionCutoffReservedIds = new Set();
+  {
+    const reservedSource = options.reservedTaskEvidence || null;
+    const reservedRows = (reservedSource && Array.isArray(reservedSource.sharedEvidence)) ? reservedSource.sharedEvidence : [];
+    for (const row of reservedRows) {
+      if (!row || typeof row !== "object") continue;
+      const stable = projectionCutoffIdentity(chatProviderStableId(row, ""));
+      const delivery = projectionCutoffIdentity(typeof semanticEvidenceDeliveryIdentity === "function" ? (semanticEvidenceDeliveryIdentity(row) || stable) : stable);
+      if (stable) projectionCutoffReservedIds.add(stable);
+      if (delivery) projectionCutoffReservedIds.add(delivery);
+    }
+    for (const field of ["reservedEvidenceIds", "reservedIds", "evidenceIds"]) {
+      const values = reservedSource ? reservedSource[field] : null;
+      if (!Array.isArray(values)) continue;
+      for (const value of values.flatMap((entry) => Array.isArray(entry) ? entry : [entry])) {
+        const normalized = projectionCutoffIdentity(value);
+        if (normalized) projectionCutoffReservedIds.add(normalized);
+      }
+    }
+  }
+  // Required-semantics predicate check mirrors chatProviderOptionalEvidenceGroups
+  // (diagnostic only; candidate groups already exclude required evidence).
+  const projectionCutoffRequiredIds = new Set(([
+    ...(options.requiredEvidenceIds || options.chatEvidenceRefs || []),
+    ...(Array.isArray(options.webEvidenceRows) ? options.webEvidenceRows.map((row) => row?.evidenceId) : [])
+  ]).flatMap((value) => Array.isArray(value) ? value : [value]).map((value) => projectionCutoffIdentity(value)).filter(Boolean));
+  const projectionCutoffGroupIsPredicate = (group) => {
+    if (!group || typeof group !== "object") return false;
+    if (group.required === true) return true;
+    if (projectionCutoffRequiredIds.has(projectionCutoffIdentity(group.evidenceId))) return true;
+    for (const key of (group.keys || [])) {
+      if (projectionCutoffRequiredIds.has(projectionCutoffIdentity(key))) return true;
+    }
+    return false;
+  };
+  const projectionCutoffGroupIsReserved = (group) => {
+    if (!group || typeof group !== "object") return false;
+    for (const key of (group.keys || [])) {
+      if (projectionCutoffReservedIds.has(projectionCutoffIdentity(key))) return true;
+    }
+    return projectionCutoffReservedIds.has(projectionCutoffIdentity(group.evidenceId));
+  };
+  const projectionCutoffCountWhere = (groups, predicate) => {
+    let count = 0;
+    for (const group of groups) if (predicate(group)) count += 1;
+    return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  };
+  // Aggregate key collisions across all candidate groups (counts only):
+  // original-stable-ID duplicates among evidenceIds, and delivery-identity
+  // duplicates among non-original keys.
+  const projectionCutoffOriginalIdentities = candidateGroups.map((group) => projectionCutoffIdentity(group?.evidenceId)).filter(Boolean);
+  const projectionCutoffOriginalKeyCollisionCount = Math.max(0, projectionCutoffOriginalIdentities.length - new Set(projectionCutoffOriginalIdentities).size);
+  const projectionCutoffDeliveryKeys = [];
+  for (const group of candidateGroups) {
+    const original = projectionCutoffIdentity(group?.evidenceId);
+    for (const key of (group?.keys || [])) {
+      const normalized = projectionCutoffIdentity(key);
+      if (normalized && normalized !== original) projectionCutoffDeliveryKeys.push(normalized);
+    }
+  }
+  const projectionCutoffDeliveryKeyCollisionCount = Math.max(0, projectionCutoffDeliveryKeys.length - new Set(projectionCutoffDeliveryKeys).size);
   const telemetry = Object.assign({}, candidate?.telemetry || {}, {
     efficiencyTargetTokens: PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
     efficiencyTargetPruningApplied: omittedGroups > 0,
@@ -56669,10 +57986,24 @@ function buildNormalChatProviderProjectionForFinalEnvelope(options = {}, system 
     completePositiveEvidenceUnionSelected: completeDelivered,
     completePositiveEvidenceUnionRetained: Number(candidate?.telemetry?.delivered || 0),
     optionalEvidenceOmitted: Math.max(0, completeDelivered - Number(candidate?.telemetry?.delivered || 0)),
-    protectedCarrierStillOverTarget: Number(candidate?.telemetry?.estimatedInputTokens || 0) >= operationalInputMaximumExclusiveTokens && omittedGroups === candidateGroups.length,
+    protectedCarrierStillOverTarget: Number(candidate?.telemetry?.estimatedInputTokens || 0) >= PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS && omittedGroups === candidateGroups.length,
     finalEnvelopeCandidateOrdinal: omittedGroups,
     finalEnvelopeSchemaMatchesAllowedIds: true,
-    finalEnvelopeFocusedSystem: true
+    finalEnvelopeFocusedSystem: true,
+    projectionCutoffLastOmittedHash: projectionCutoffSingleHash(projectionCutoffLastOmitted?.evidenceId),
+    projectionCutoffFirstRetainedHash: projectionCutoffSingleHash(projectionCutoffFirstRetained?.evidenceId),
+    projectionCutoffOmittedSetHash: projectionCutoffSetHash(projectionCutoffOmittedGroups.map((group) => group?.evidenceId)),
+    projectionCutoffRetainedSetHash: projectionCutoffSetHash(projectionCutoffRetainedGroups.map((group) => group?.evidenceId)),
+    projectionCutoffLastOmittedScoreBucket: projectionCutoffLastOmitted ? projectionCutoffScoreBucket(projectionCutoffLastOmitted.score) : "empty",
+    projectionCutoffFirstRetainedScoreBucket: projectionCutoffFirstRetained ? projectionCutoffScoreBucket(projectionCutoffFirstRetained.score) : "empty",
+    projectionCutoffOmittedMissingScoreCount: projectionCutoffCountWhere(projectionCutoffOmittedGroups, (group) => !Number.isFinite(group?.score)),
+    projectionCutoffRetainedMissingScoreCount: projectionCutoffCountWhere(projectionCutoffRetainedGroups, (group) => !Number.isFinite(group?.score)),
+    projectionCutoffOmittedReservationCount: projectionCutoffCountWhere(projectionCutoffOmittedGroups, projectionCutoffGroupIsReserved),
+    projectionCutoffRetainedReservationCount: projectionCutoffCountWhere(projectionCutoffRetainedGroups, projectionCutoffGroupIsReserved),
+    projectionCutoffOmittedPredicateCount: projectionCutoffCountWhere(projectionCutoffOmittedGroups, projectionCutoffGroupIsPredicate),
+    projectionCutoffRetainedPredicateCount: projectionCutoffCountWhere(projectionCutoffRetainedGroups, projectionCutoffGroupIsPredicate),
+    projectionCutoffOriginalKeyCollisionCount,
+    projectionCutoffDeliveryKeyCollisionCount
   });
   return Object.freeze({
     projection: chatProviderProjectionWithRebuildOptions(Object.assign({}, candidate, { telemetry: Object.freeze(telemetry) }), options),
@@ -59265,6 +60596,8 @@ function taskGenerationProviderOutputContract(value = null, options = {}) {
       const keys = Object.keys(task);
       const hasCanonical = Object.prototype.hasOwnProperty.call(task, "memberOrdinal");
       const aliasKeys = keys.filter((k) => isMemberOrdinalKey(k) && k !== "memberOrdinal");
+      const rawOrdinal = task.memberOrdinal;
+      const hasValidOrdinal = Number.isSafeInteger(rawOrdinal) && rawOrdinal >= 1 && rawOrdinal <= memberCount;
       if (!hasCanonical) {
         if (aliasKeys.length > 0) {
           memberFailures.push({ index: idx, code: "response-unexpected-provider-field", field: `${path}.${aliasKeys[0]}` });
@@ -59274,10 +60607,10 @@ function taskGenerationProviderOutputContract(value = null, options = {}) {
         continue;
       }
       if (aliasKeys.length > 0) {
-        memberFailures.push({ index: idx, code: "response-unexpected-provider-field", field: `${path}.${aliasKeys[0]}` });
+        memberFailures.push({ index: idx, ...(hasValidOrdinal ? { ordinal: rawOrdinal } : {}), code: "response-unexpected-provider-field", field: `${path}.${aliasKeys[0]}` });
         continue;
       }
-      const ordVal = task.memberOrdinal;
+      const ordVal = rawOrdinal;
       if (!Number.isSafeInteger(ordVal)) {
         memberFailures.push({ index: idx, code: "response-task-invalid", field: `${path}.memberOrdinal` });
         continue;
@@ -59297,11 +60630,11 @@ function taskGenerationProviderOutputContract(value = null, options = {}) {
         if (!taskFields.has(k)) { unexpectedField = k; break; }
       }
       if (unexpectedField) {
-        memberFailures.push({ index: idx, code: classifyField(unexpectedField), field: `${path}.${unexpectedField}` });
+        memberFailures.push({ index: idx, ordinal: ordVal, code: classifyField(unexpectedField), field: `${path}.${unexpectedField}` });
         continue;
       }
       if (hasOrdinalInSubtasks(task.subtasks)) {
-        memberFailures.push({ index: idx, code: classifyField("memberOrdinal"), field: `${path}.subtasks.memberOrdinal` });
+        memberFailures.push({ index: idx, ordinal: ordVal, code: classifyField("memberOrdinal"), field: `${path}.subtasks.memberOrdinal` });
         continue;
       }
       let subtaskInvalid = null;
@@ -59321,7 +60654,7 @@ function taskGenerationProviderOutputContract(value = null, options = {}) {
       if (Array.isArray(task.subtasks)) {
         checkSubtasks(task.subtasks, `${path}.subtasks`);
         if (subtaskInvalid) {
-          memberFailures.push({ index: idx, code: classifyField(subtaskInvalid.split(".").pop()), field: subtaskInvalid });
+          memberFailures.push({ index: idx, ordinal: ordVal, code: classifyField(subtaskInvalid.split(".").pop()), field: subtaskInvalid });
           continue;
         }
       }
@@ -59880,109 +61213,87 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
     return Object.freeze(result);
   }
 
-  if (!batchMembers || !providerTasks) {
-    if (usePerScopeLedger && batchMembers && batchMembers.length > 0) {
-      // Map mode: providerResult null expands response-invalid-json per member respecting caller-owned ledger (read-only).
-      // Caller increments ledger exactly once before dispatch; settlement never mutates Map.
-      const retryEntriesNull = [];
-      const terminalEntriesNull = [];
-      for (let i = 0; i < batchMembers.length; i += 1) {
-        const member = batchMembers[i];
-        const scopeId = String(member.scopeId || "");
-        const ledger = perScopeLedger.get(scopeId);
-        const hasLedger = ledger && typeof ledger === "object";
-        const used = hasLedger ? Number(ledger.used) : NaN;
-        const limit = hasLedger ? Number(ledger.limit) : NaN;
-        const canRetry = hasLedger && Number.isFinite(used) && Number.isFinite(limit) && used < limit;
-        if (canRetry) {
-          const entry = deepFreezeValue(Object.freeze({
-            scopeId: scopeId,
-            taskId: String(member.taskId || ""),
-            memberOrdinal: Number(member.localOrdinal || 0),
-            localOrdinal: Number(member.localOrdinal || 0),
-            code: "response-invalid-json",
-            reason: "response-invalid-json",
-            task: deepFreezeValue(Object.freeze({}))
-          }));
-          retryEntriesNull.push(entry);
-        } else {
-          const term = deepFreezeValue(Object.freeze({
-            scopeId: scopeId,
-            taskId: String(member.taskId || ""),
-            memberOrdinal: Number(member.localOrdinal || 0),
-            localOrdinal: Number(member.localOrdinal || 0),
-            code: "retry-budget-exhausted",
-            reason: "retry-budget-exhausted",
-            originalCode: "response-invalid-json",
-            task: deepFreezeValue(Object.freeze({}))
-          }));
-          terminalEntriesNull.push(term);
-        }
-      }
-      terminalEntriesNull.sort(function(a,b){
-        const ao = Number(a.localOrdinal || a.memberOrdinal || 0);
-        const bo = Number(b.localOrdinal || b.memberOrdinal || 0);
-        if (ao !== bo) return ao - bo;
-        return String(a.scopeId).localeCompare(String(b.scopeId));
-      });
-      const frozenAcceptedNull = Object.freeze([]);
-      const frozenRetryNull = Object.freeze(retryEntriesNull.slice());
-      const frozenTerminalNull = Object.freeze(terminalEntriesNull.slice());
-      const frozenFallbackNull = Object.freeze([]);
-      const telemetryNull = deepFreezeValue(Object.freeze({
-        systemic: false,
-        memberCount: batchMembers.length,
-        acceptedCount: 0,
-        retryCount: frozenRetryNull.length,
-        terminalCount: frozenTerminalNull.length,
-        accepted: 0,
-        retry: frozenRetryNull.length,
-        terminal: frozenTerminalNull.length,
-        fallbackCount: 0,
-        singletonFallbackCount: 0,
-        retryBudgetRemaining: 0,
-        retryBudgetConsumed: frozenRetryNull.length
+  function terminalFailureResult(members, code) {
+    const terminalEntries = (members || []).map(function(member) {
+      return deepFreezeValue(Object.freeze({
+        scopeId: String(member?.scopeId || ""),
+        taskId: String(member?.taskId || ""),
+        memberOrdinal: Number(member?.localOrdinal || member?.memberOrdinal || 0),
+        localOrdinal: Number(member?.localOrdinal || member?.memberOrdinal || 0),
+        code: String(code || "response-root-invalid"),
+        reason: String(code || "response-root-invalid"),
+        task: deepFreezeValue(Object.freeze({}))
       }));
-      const resultNull = {
-        accepted: frozenAcceptedNull,
-        acceptedMembers: frozenAcceptedNull,
-        acceptedEntries: frozenAcceptedNull,
-        retry: frozenRetryNull,
-        retryDispatches: frozenRetryNull,
-        repairDispatches: frozenRetryNull,
-        retries: frozenRetryNull,
-        retryMembers: frozenRetryNull,
-        terminal: frozenTerminalNull,
-        terminalEntries: frozenTerminalNull,
-        terminalMembers: frozenTerminalNull,
-        terminals: frozenTerminalNull,
-        systemic: false,
-        isSystemic: false,
-        systemicFailure: false,
-        singletonFallback: frozenFallbackNull,
-        singletonFallbackMembers: frozenFallbackNull,
-        fallback: frozenFallbackNull,
-        fallbackMembers: frozenFallbackNull,
-        repairDispatchesCount: frozenRetryNull.length,
-        repairDispatchCount: frozenRetryNull.length,
-        retryCount: frozenRetryNull.length,
-        terminalCount: frozenTerminalNull.length,
-        telemetry: telemetryNull
-      };
-      deepFreezeValue(resultNull);
-      return Object.freeze(resultNull);
-    }
-    const membersForFallback = batchMembers || [];
-    return systemicFallback(membersForFallback);
+    });
+    const frozenAccepted = Object.freeze([]);
+    const frozenRetry = Object.freeze([]);
+    const frozenTerminal = Object.freeze(terminalEntries);
+    const frozenFallback = Object.freeze([]);
+    const telemetry = deepFreezeValue(Object.freeze({
+      systemic: false,
+      memberCount: (members || []).length,
+      acceptedCount: 0,
+      retryCount: 0,
+      terminalCount: frozenTerminal.length,
+      fallbackCount: 0,
+      accepted: 0,
+      retry: 0,
+      terminal: frozenTerminal.length,
+      singletonFallbackCount: 0,
+      retryBudgetRemaining: 0,
+      retryBudgetConsumed: 0
+    }));
+    const result = {
+      accepted: frozenAccepted,
+      acceptedMembers: frozenAccepted,
+      acceptedEntries: frozenAccepted,
+      retry: frozenRetry,
+      retryDispatches: frozenRetry,
+      repairDispatches: frozenRetry,
+      retries: frozenRetry,
+      retryMembers: frozenRetry,
+      terminal: frozenTerminal,
+      terminalEntries: frozenTerminal,
+      terminalMembers: frozenTerminal,
+      terminals: frozenTerminal,
+      systemic: false,
+      isSystemic: false,
+      systemicFailure: false,
+      singletonFallback: frozenFallback,
+      singletonFallbackMembers: frozenFallback,
+      fallback: frozenFallback,
+      fallbackMembers: frozenFallback,
+      repairDispatchesCount: 0,
+      repairDispatchCount: 0,
+      retryCount: 0,
+      terminalCount: frozenTerminal.length,
+      telemetry
+    };
+    deepFreezeValue(result);
+    return Object.freeze(result);
+  }
+
+  function scopedLedgerState(ledger) {
+    if (!ledger || typeof ledger !== "object") return null;
+    const used = Number(ledger.used);
+    const limit = Number(ledger.limit);
+    if (!Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(limit) || limit < 1) return null;
+    return { used, limit: Math.min(2, limit) };
+  }
+
+  if (!batchMembers) return systemicFallback([]);
+  if (!providerTasks) {
+    const invalidCode = providerResult === null ? "response-invalid-json" : "response-shape-missing-tasks";
+    return terminalFailureResult(batchMembers, invalidCode);
   }
   if (batchMembers.length !== providerTasks.length) {
-    return systemicFallback(batchMembers);
+    return terminalFailureResult(batchMembers, "response-root-invalid");
   }
   for (let i = 0; i < providerTasks.length; i += 1) {
     const t = providerTasks[i];
     if (t && typeof t === "object") {
       if (Object.prototype.hasOwnProperty.call(t, "scopeId") || Object.prototype.hasOwnProperty.call(t, "taskId") || Object.prototype.hasOwnProperty.call(t, "scope_id") || Object.prototype.hasOwnProperty.call(t, "task_id")) {
-        return systemicFallback(batchMembers);
+        return terminalFailureResult(batchMembers, "response-identifier-field");
       }
     }
   }
@@ -59990,6 +61301,8 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
   const clonedTasks = providerTasks.map(cloneTask);
   const membersOrdered = batchMembers.slice();
   const validatorResults = [];
+  const canonicalTasks = [];
+  const validatorTaskProvided = [];
   let hasSystemicValidator = false;
   for (let i = 0; i < membersOrdered.length; i += 1) {
     const member = membersOrdered[i];
@@ -60002,6 +61315,9 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
     }
     if (res && res.systemic === true) hasSystemicValidator = true;
     validatorResults.push(res);
+    const hasTask = Boolean(res && Object.prototype.hasOwnProperty.call(res, "task"));
+    validatorTaskProvided.push(hasTask);
+    canonicalTasks.push(cloneTask(hasTask ? res.task : taskCloneForValidator));
   }
   if (hasSystemicValidator) {
     return systemicFallback(batchMembers);
@@ -60012,7 +61328,7 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
     const s = normalizeSignature(acceptedSignaturesRaw[i]);
     if (s) acceptedSigsSet.add(s);
   }
-  const sigs = clonedTasks.map(function(t) { return normalizeSignature(t && t.content ? t.content : ""); });
+  const sigs = canonicalTasks.map(function(t) { return normalizeSignature(t && t.content ? t.content : ""); });
   const sigCounts = new Map();
   for (let i = 0; i < sigs.length; i += 1) {
     const s = sigs[i];
@@ -60026,17 +61342,21 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
 
   for (let i = 0; i < membersOrdered.length; i += 1) {
     const member = membersOrdered[i];
-    const taskCloned = cloneTask(clonedTasks[i]);
+    const taskCloned = cloneTask(canonicalTasks[i]);
     const sig = sigs[i];
     const res = validatorResults[i] || { valid: true, code: "" };
     const validFlag = res && res.valid === true;
     const rawCode = String((res && (res.code || res.reason || res.reasonCode)) || "");
+    const validatorTaskInvalid = validatorTaskProvided[i] && (!taskCloned || typeof taskCloned !== "object" || Array.isArray(taskCloned));
     const isDuplicateWithin = sig && (sigCounts.get(sig) || 0) > 1;
     const isDuplicateAccepted = sig && acceptedSigsSet.has(sig);
     const isDuplicate = isDuplicateWithin || isDuplicateAccepted;
     let isFailure = false;
     let failureCode = "";
-    if (isDuplicate) {
+    if (validatorTaskInvalid) {
+      isFailure = true;
+      failureCode = "validator-result-task-invalid";
+    } else if (isDuplicate) {
       isFailure = true;
       failureCode = "response-cross-scope-exact-duplicate";
     } else if (!validFlag) {
@@ -60078,16 +61398,15 @@ function taskGenerationMicroBatchSettleMembers(options = {}) {
   const terminalEntries = [];
 
   if (usePerScopeLedger) {
-    // Map mode: no global at-most-one cap; every structurally retryable member with used < limit retries in index order.
-    // Exhausted members terminalize with retry-budget-exhausted without starving eligible siblings. Never mutates ledger.
+    // Map mode: every structurally retryable member with used below its bounded
+    // lineage limit retries in source/member order. Exhausted or malformed
+    // entries terminalize without starving eligible siblings. Never mutates the
+    // caller-owned ledger.
     for (let j = 0; j < structuralFailures.length; j += 1) {
       const cur = structuralFailures[j];
       const scopeId = String(cur.member.scopeId || "");
-      const ledger = perScopeLedger.get(scopeId);
-      const hasLedger = ledger && typeof ledger === "object";
-      const used = hasLedger ? Number(ledger.used) : NaN;
-      const limit = hasLedger ? Number(ledger.limit) : NaN;
-      const canRetry = hasLedger && Number.isFinite(used) && Number.isFinite(limit) && used < limit;
+      const ledgerState = scopedLedgerState(perScopeLedger.get(scopeId));
+      const canRetry = Boolean(ledgerState && ledgerState.used < ledgerState.limit);
       if (canRetry) {
         const retryEntry = deepFreezeValue(Object.freeze({
           scopeId: scopeId,
@@ -61536,13 +62855,100 @@ function semanticAdaptiveTaskCards(plugin, options = {}) {
   const index = plugin?.getTaskReferenceIndex ? plugin.getTaskReferenceIndex() : emptyTaskReferenceIndex();
   const cards = [];
   const seen = new Set();
+  const inventoryPredicate = options.queryPlan && typeof options.queryPlan.todoistInventoryPredicate === "object"
+    ? options.queryPlan.todoistInventoryPredicate
+    : null;
+  const exactP4Query = Boolean(inventoryPredicate)
+    && inventoryPredicate.todoist === true
+    && inventoryPredicate.exhaustive === true
+    && Number.parseInt(inventoryPredicate.priority, 10) === 4
+    && inventoryPredicate.currentOpenOnly === true
+    && inventoryPredicate.hierarchy === "ancestors";
+  const compactText = (value) => singleLine(value == null ? "" : value);
+  const compactIds = (...values) => semanticDedupeList(values.flatMap((value) => Array.isArray(value) ? value : [value]));
+  const compactPriority = (task) => {
+    const raw = task?.priority ?? task?.todoistPriority ?? task?.todoist_priority;
+    if (raw === undefined || raw === null || raw === "") return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : null;
+  };
+  const compactState = (task, chunk = null) => {
+    const rawSources = [chunk?.taskReference, chunk?.task, chunk, task];
+    for (const source of rawSources) {
+      if (!source || typeof source !== "object") continue;
+      if (source.isCompleted === true) return "completed";
+      const stateKeys = ["currentState", "current_state", "state", "status", "progress"];
+      if (!stateKeys.some((key) => Object.prototype.hasOwnProperty.call(source, key))) continue;
+      return compactText(source.currentState || source.current_state || source.state || source.status || source.progress) || "unknown";
+    }
+    return "unknown";
+  };
   const add = (task, source, chunk = null) => {
     if (!task?.content) return;
+    const exactP4Admission = compactText(chunk?.exactP4Admission || task?.exactP4Admission).toLowerCase();
+    if (exactP4Query && !["direct", "ancestor"].includes(exactP4Admission)) return;
     const id = String(task.id || task.oid || chunk?.sourceId || "");
     const taskId = String(task.id || task.todoistId || "");
     const key = id ? `id:${id}` : `${chunk?.sourceId || ""}:${singleLine(task.content).toLowerCase()}`;
     if (seen.has(key)) return;
     seen.add(key);
+    if (exactP4Query) {
+      const relationship = semanticDedupeRelationship(task);
+      const taskIdValue = compactText(task.id || task.todoistId || task.taskId) || null;
+      const oidValue = compactText(task.oid || task.todoistOid) || null;
+      const sourceIdValue = compactText(chunk?.sourceId || task.sourceId || task.provenance?.sourceId) || null;
+      const evidenceIds = compactIds(
+        task.evidence_ids,
+        task.evidenceIds,
+        task.evidenceId,
+        chunk?.evidence_ids,
+        chunk?.evidenceIds,
+        chunk?.evidenceId
+      );
+      const factRefs = compactIds(task.fact_refs, task.factRefs, chunk?.fact_refs, chunk?.factRefs);
+      const parentId = compactText(
+        relationship.parentId
+        || relationship.parentOid
+        || task.parentTaskId
+        || task.parentId
+        || task.parentOid
+      ) || null;
+      const rootId = compactText(
+        relationship.rootId
+        || relationship.rootOid
+        || task.rootTaskId
+        || task.rootId
+        || task.rootOid
+      ) || null;
+      const selectedSemanticEvidence = compactText(
+        chunk?.evidenceId
+        || chunk?.evidence_id
+        || task.selectedSemanticEvidence
+        || task.evidenceId
+      ) || null;
+      const state = compactState(task, chunk);
+      cards.push({
+        id: compactText(task.id || task.todoistId || task.oid || chunk?.sourceId) || null,
+        taskId: taskIdValue,
+        oid: oidValue,
+        title: compactText(task.content),
+        status: state,
+        currentState: state,
+        priority: compactPriority(task),
+        project: compactText(task.projectName || task.project || task.projectLabel) || null,
+        section: compactText(task.section || task.sectionName || task.sectionLabel) || null,
+        due: compactText(task.due || task.due_date || task.scheduledDueDateTime) || null,
+        deadline: compactText(task.deadline || task.deadline_date) || null,
+        parentId,
+        rootId,
+        childIds: compactIds(relationship.childIds, relationship.childOids, task.childTaskIds, task.childIds, task.childOids),
+        sourceId: sourceIdValue,
+        evidence_ids: evidenceIds,
+        fact_refs: factRefs,
+        selectedSemanticEvidence
+      });
+      return;
+    }
     const knowledge = task.knowledge || task.taskKnowledge || {};
     const relationship = semanticDedupeRelationship(task);
     const eligibleLocations = uniqueValues([
@@ -61612,7 +63018,8 @@ function semanticAdaptiveTaskCards(plugin, options = {}) {
     add(semanticTaskReferenceTaskFromChunk(chunk, index), "selected semantic task reference", chunk);
   }
   const maxCards = Math.max(1, Number(options.maxCards || adaptiveContextBudget(options.mode || "chat").maxTasks));
-  return uniqueAdaptiveTaskCards(cards).slice(0, maxCards);
+  const unique = uniqueAdaptiveTaskCards(cards);
+  return exactP4Query ? unique : unique.slice(0, maxCards);
 }
 
 function uniqueTaskReferenceRows(rows) {
@@ -61883,15 +63290,18 @@ function semanticIndexPartitionProvider(value, fallback = "openai") {
   return SEMANTIC_INDEX_PARTITION_PROVIDERS.includes(provider) ? provider : "openai";
 }
 function semanticIndexPartitionBaseUrl(provider, value = "") {
-  if (provider !== "openwebui") return "";
+  if (!["openwebui", "customopenai"].includes(provider)) return "";
   try {
     if (typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.normalizeOpenWebUIBaseUrl === "function") {
-      return String(STS_MULTI_PROVIDER.normalizeOpenWebUIBaseUrl(value, true) || "").replace(/\/$/, "");
+      if (provider === "openwebui") return String(STS_MULTI_PROVIDER.normalizeOpenWebUIBaseUrl(value, true) || "").replace(/\/$/, "");
+    }
+    if (typeof STS_MULTI_PROVIDER !== "undefined" && typeof STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl === "function") {
+      if (provider === "customopenai") return String(STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(value, true) || "").replace(/\/$/, "");
     }
   } catch {}
   try {
     const parsed = new URL(String(value || "").trim());
-    if (!/^https?:$/i.test(parsed.protocol) || parsed.username || parsed.password) return "";
+    if (!/^https?:$/i.test(parsed.protocol) || parsed.username || parsed.password || (provider === "customopenai" && (parsed.search || parsed.hash))) return "";
     parsed.search = "";
     parsed.hash = "";
     return parsed.toString().replace(/\/$/, "");
@@ -61930,7 +63340,8 @@ function semanticIndexPartitionContract(settings = {}, options = {}) {
   const precision = Math.max(0, Number(options.precision || meta.embeddingPrecision || settings.semanticIndexEmbeddingPrecision || 0));
   const encoderId = String(options.encoderId || meta.encoderId || `${provider}:${model}`).trim();
   const encoderVersion = Number(options.encoderVersion || meta.encoderVersion || meta.embeddingContentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION);
-  const baseUrl = semanticIndexPartitionBaseUrl(provider, options.baseUrl || settings.openwebuiBaseUrl || "");
+  const configuredBaseUrl = provider === "openwebui" ? settings.openwebuiBaseUrl : provider === "customopenai" ? settings.customOpenAIBaseUrl : "";
+  const baseUrl = semanticIndexPartitionBaseUrl(provider, options.baseUrl || meta.baseUrl || configuredBaseUrl || "");
   const authIdentityHash = semanticIndexPartitionAuthIdentity(Object.assign({}, settings, options), provider);
   const identity = {
     identityVersion: SEMANTIC_INDEX_PARTITION_IDENTITY_VERSION,
@@ -61985,7 +63396,11 @@ function normalizeAiProvider(value, fallback = "openai") {
     openwebui: "openwebui",
     webui: "openwebui",
     "self-hosted-openwebui": "openwebui",
-    selfhostedopenwebui: "openwebui"
+    selfhostedopenwebui: "openwebui",
+    customopenai: "customopenai",
+    "custom-openai": "customopenai",
+    "openai-compatible": "customopenai",
+    openaicompatible: "customopenai"
   };
   const normalized = String(value || "").trim().toLowerCase();
   const fallbackKey = String(fallback || "openai").trim().toLowerCase();
@@ -63306,6 +64721,72 @@ function shouldUseLiveTodoistDeduplicationCandidates(options = {}) {
   return /^(email|note|notes|task generation|task-generation)$/i.test(String(options.source || ""));
 }
 
+function normalizeTodoistDuplicateField(value = "") {
+  return singleLine(String(value || "").normalize("NFKC")).toLowerCase();
+}
+
+function buildTodoistTaskDuplicateLookup(candidates = []) {
+  const byTitle = new Map();
+  const byDescription = new Map();
+  for (const candidate of candidates || []) {
+    const task = candidate?.task || candidate?.generatedTask || candidate || {};
+    if (task.isCompleted) continue;
+    const title = normalizeTodoistDuplicateField(task.content || task.title || "");
+    const description = normalizeTodoistDuplicateField(task.description || "");
+    if (title && !byTitle.has(title)) byTitle.set(title, candidate);
+    if (description && !byDescription.has(description)) byDescription.set(description, candidate);
+  }
+  return { byTitle, byDescription };
+}
+
+function todoistSnapshotTaskDuplicateDecision(task = {}, lookup = buildTodoistTaskDuplicateLookup()) {
+  const title = normalizeTodoistDuplicateField(task.content || task.title || "");
+  const description = normalizeTodoistDuplicateField(task.description || "");
+  const titleCandidate = title ? lookup.byTitle?.get(title) || null : null;
+  const descriptionCandidate = description ? lookup.byDescription?.get(description) || null : null;
+  const candidate = titleCandidate || descriptionCandidate;
+  if (!candidate) {
+    return {
+      outcome: "create",
+      decision: "create",
+      resolution: "local",
+      candidateId: "",
+      id: "",
+      confidence: 0,
+      semanticScore: 0,
+      basis: ["no exact local Todoist title or description match"],
+      reasons: ["no exact local Todoist title or description match"],
+      evidence_ids: [],
+      fact_refs: [],
+      candidate: null,
+      localSnapshotMatch: false,
+      telemetry: { mode: "local-todoist-snapshot", providerCalls: 0 }
+    };
+  }
+  const existing = candidate.task || candidate.generatedTask || candidate;
+  const id = String(candidate.id || existing.id || existing.todoistId || "");
+  const reason = titleCandidate
+    ? "exact normalized Todoist title"
+    : "exact normalized non-empty Todoist description";
+  return {
+    outcome: "merge",
+    decision: "merge",
+    resolution: "local",
+    candidateId: id,
+    id,
+    confidence: 100,
+    semanticScore: 0,
+    basis: [reason],
+    reasons: [reason],
+    evidence_ids: [],
+    fact_refs: [],
+    candidate,
+    task: existing,
+    localSnapshotMatch: true,
+    telemetry: { mode: "local-todoist-snapshot", providerCalls: 0 }
+  };
+}
+
 function taskDeduplicationStableReferenceKeys(value = {}) {
   const candidate = value && typeof value === "object" ? value : {};
   const task = candidate.task || candidate.generatedTask || candidate;
@@ -63480,7 +64961,7 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
         continue;
       }
     }
-    const generatedUpdate = options.semanticDedupeState?.enabled
+    const generatedUpdate = decision.localSnapshotMatch === true || options.semanticDedupeState?.enabled
       ? { used: false, task }
       : (typeof taskGenerationFn === "function" ? await taskGenerationFn(task, decision, resolutionOptions) : null);
     if (!generatedUpdate?.task) {
@@ -64148,44 +65629,8 @@ function semanticTaskDedupeDecision(task = {}, candidates = [], options = {}) {
 }
 
 function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
-  if (options.semanticDedupeState?.enabled) {
-    const state = options.semanticDedupeState;
-    const fingerprintOptions = {
-      provider: semanticEmbeddingProviderForSettings(settings),
-      model: settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel,
-      dimension: semanticEmbeddingRequestDimension(settings, "query", settings.semanticIndexMeta || {}),
-      indexRevision: options.semanticIndexRevision || state.indexRevision || 0
-    };
-    const sourceFingerprint = taskTreeFingerprint(task, fingerprintOptions);
-    const sourceEmbedding = state.generatedEmbeddingsByObject?.get(task) || state.generatedEmbeddings?.get(sourceFingerprint) || null;
-    const scoredCandidates = (candidates || []).map((candidate) => {
-      const candidateTask = candidate.generatedTask || candidate.task || semanticTaskDedupeChunkIdentity(candidate.semanticChunk || candidate);
-      const candidateFingerprint = taskTreeFingerprint(candidateTask, fingerprintOptions);
-      const candidateEmbedding = candidate.semanticChunk?.embedding || state.generatedEmbeddingsByObject?.get(candidateTask) || state.generatedEmbeddings?.get(candidateFingerprint) || null;
-      const metadataMatch = candidate.metadataMatch === true
-        || semanticTaskDedupeSameNoteMetadataMatch(task, candidateTask, candidate.semanticChunk || candidate.chunk || candidate, options);
-      const routedScores = state.routedScoresByFingerprint?.get(sourceFingerprint);
-      const evidenceId = String(candidate.semanticChunk?.evidenceId || candidate.semanticChunk?.id || "");
-      const routedScore = routedScores instanceof Map && evidenceId && routedScores.has(evidenceId)
-        ? routedScores.get(evidenceId)
-        : undefined;
-      const semanticScore = routedScore !== undefined
-        ? Number(routedScore || 0)
-        : sourceEmbedding && candidateEmbedding ? cosine(sourceEmbedding, candidateEmbedding) : Number(candidate.semanticScore || 0);
-      return Object.assign({}, candidate, { semanticScore, metadataMatch });
-    });
-    const semanticCandidates = buildSemanticTaskDedupeCandidates(task, scoredCandidates, options);
-    return Object.assign(semanticTaskDedupeDecision(task, semanticCandidates, Object.assign({}, options, { telemetry: options.semanticDedupeState.telemetry })), { sourceTask: task });
-  }
-  return {
-    decision: "create",
-    confidence: 0,
-    reasons: ["semantic dedupe state unavailable; lexical fallback disabled"],
-    candidate: null,
-    degraded: true,
-    degradedReason: "semantic-dedupe-state-unavailable",
-    sourceTask: task
-  };
+  const lookup = options.todoistDuplicateLookup || buildTodoistTaskDuplicateLookup(candidates);
+  return Object.assign(todoistSnapshotTaskDuplicateDecision(task, lookup), { sourceTask: task });
 }
 
 const TASK_DEDUPE_SCOPE_IDENTIFIER_IGNORES = new Set(["ASAP", "FYI", "TODO"]);
@@ -64858,14 +66303,15 @@ const STS_MULTI_PROVIDER = (() => {
     primary: "gpt-5.6-luna",
     fallback: "glm-5.3-flash"
   });
-  const PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "opencodego"]);
-  const PROVIDER_DISPLAY_ORDER = Object.freeze(["gemini", "openai", "openrouter", "openwebui", "opencodego"]);
+  const PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai", "opencodego"]);
+  const PROVIDER_DISPLAY_ORDER = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai", "opencodego"]);
   const OPERATION_KEYS = Object.freeze(["chat-query", "prompt-response", "task-generation", "task-description", "section-title", "scheduler", "policy", "deduplication"]);
   const GENERATION_DEFAULTS = Object.freeze({
     openai: Object.freeze({ primary: "gpt-5.6-luna", primaryReasoning: "high", fallback: "gpt-5.6-terra", fallbackReasoning: "medium" }),
     gemini: Object.freeze({ primary: "gemini-3.5-flash-lite", fallback: "gemini-3.5-flash" }),
     openrouter: Object.freeze({ primary: "openrouter/free", fallback: "" }),
     openwebui: Object.freeze({ primary: "", fallback: "" }),
+    customopenai: Object.freeze({ primary: "", fallback: "" }),
     opencodego: Object.freeze({ primary: "gpt-5.6-luna", fallback: "glm-5.3-flash" })
   });
   const OPENCODE_GO_MODEL_TRANSPORT = Object.freeze({
@@ -64900,7 +66346,8 @@ const STS_MULTI_PROVIDER = (() => {
     openai: "semantic-index.openai.json",
     gemini: "semantic-index.gemini.json",
     openrouter: "semantic-index.openrouter.json",
-    openwebui: "semantic-index.openwebui.json"
+    openwebui: "semantic-index.openwebui.json",
+    customopenai: "semantic-index.customopenai.json"
   });
   const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
   const OPENROUTER_MODEL_METADATA_STALE_MS = 24 * 60 * 60 * 1000;
@@ -64917,6 +66364,11 @@ const STS_MULTI_PROVIDER = (() => {
     "missing-credential": "A credential is required for this provider.",
     "invalid-url": "The Open WebUI base URL must be a valid HTTP(S) URL without credentials, query, or fragment.",
     "insecure-http": "Open WebUI HTTP transport requires explicit insecure-transport opt-in.",
+    "custom-provider-not-configured": "Configure a Custom OpenAI-compatible API root before using this provider.",
+    "custom-provider-invalid-url": "The Custom OpenAI-compatible API root must be a valid HTTP(S) URL without credentials, query, or fragment.",
+    "custom-provider-insecure-http": "Custom OpenAI-compatible HTTP transport requires explicit insecure-transport opt-in.",
+    "custom-provider-missing-route": "The Custom OpenAI-compatible route was not found; verify the complete API root, including /v1 where required.",
+    "custom-provider-unsupported-schema": "The Custom OpenAI-compatible endpoint does not support the required JSON Schema response.",
     "invalid-auth-mode": "Open WebUI authentication mode is invalid.",
     "invalid-header": "The Open WebUI custom header name is invalid.",
     "auth-expired": "Open WebUI authentication expired; log in again.",
@@ -65021,11 +66473,23 @@ const STS_MULTI_PROVIDER = (() => {
     }
     return normalized;
   };
+  const normalizeCustomOpenAIBaseUrl = (value, allowInsecure = false) => {
+    const source = nonEmpty(value);
+    let url;
+    try { url = new URL(source); } catch { throw providerError("customopenai", null, "custom-provider-invalid-url"); }
+    if (!["http:", "https:"].includes(url.protocol)) throw providerError("customopenai", null, "custom-provider-invalid-url");
+    if (url.username || url.password || url.search || url.hash) throw providerError("customopenai", null, "custom-provider-invalid-url");
+    if (url.protocol === "http:" && allowInsecure !== true) throw providerError("customopenai", null, "custom-provider-insecure-http");
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString().replace(/\/$/, "");
+  };
   const normalizeProvider = (value, fallback = "openai") => {
     const candidate = nonEmpty(value).toLowerCase().replace(/[-_\s]/g, "");
     if (candidate === "google" || candidate === "gemini") return "gemini";
     if (candidate === "openrouter" || candidate === "router") return "openrouter";
     if (candidate === "openwebui" || candidate === "webui" || candidate === "selfhostedopenwebui") return "openwebui";
+    if (candidate === "customopenai" || candidate === "openaicompatible") return "customopenai";
+    if (candidate === "custom") return PROVIDERS.includes(fallback) && fallback !== "customopenai" ? fallback : "openai";
     if (candidate === "openai") return "openai";
     if (candidate === "opencodego") return "opencodego";
     return PROVIDERS.includes(fallback) ? fallback : "openai";
@@ -65037,6 +66501,13 @@ const STS_MULTI_PROVIDER = (() => {
     if (normalizedProvider === "gemini") return Boolean(nonEmpty(settings.googleApiKey));
     if (normalizedProvider === "openrouter") return Boolean(nonEmpty(settings.openrouterApiKey));
     if (normalizedProvider === "opencodego") return Boolean(nonEmpty(settings.opencodeGoApiKey));
+    if (normalizedProvider === "customopenai") {
+      try {
+        return Boolean(normalizeCustomOpenAIBaseUrl(settings.customOpenAIBaseUrl, settings.customOpenAIAllowInsecureHttp === true));
+      } catch {
+        return false;
+      }
+    }
     try {
       const baseUrl = normalizeOpenWebUIBaseUrl(settings.openwebuiBaseUrl, settings.openwebuiAllowInsecureHttp === true);
       if (!baseUrl) return false;
@@ -65050,7 +66521,7 @@ const STS_MULTI_PROVIDER = (() => {
       return false;
     }
   };
-  const providerDisplayName = (provider) => ({ openai: "OpenAI", gemini: "Gemini", openrouter: "OpenRouter", openwebui: "Self-Hosted OpenWebUI", opencodego: "OpenCode Go" })[normalizeProvider(provider)];
+  const providerDisplayName = (provider) => ({ openai: "OpenAI", gemini: "Gemini", openrouter: "OpenRouter", openwebui: "Self-Hosted OpenWebUI", customopenai: "Custom OpenAI-compatible", opencodego: "OpenCode Go" })[normalizeProvider(provider)];
   const stripModelPrefix = (model, provider) => {
     const value = nonEmpty(model);
     // Provider scope is serialized with `provider:model`; slash is part of
@@ -65065,6 +66536,9 @@ const STS_MULTI_PROVIDER = (() => {
     let value = stripModelPrefix(model, normalized);
     if (normalized === "opencodego") {
       value = value.replace(/^opencode[-_\s]*go(?:[:/])/i, "").trim();
+    }
+    if (normalized === "customopenai") {
+      value = value.replace(/^(?:custom[-_\s]*openai|openai-compatible)(?:[:/])/i, "").trim();
     }
     if (normalized === "gemini") return value.replace(/^google[/:]/i, "").replace(/^models\//i, "");
     return value;
@@ -65220,6 +66694,7 @@ const STS_MULTI_PROVIDER = (() => {
       gemini: { generation: settings.availableGeminiModels, embedding: settings.availableGeminiEmbeddingModels, fetchedAt: settings.geminiModelsFetchedAt, metadata: settings.geminiModelMetadata, embeddingMetadata: settings.geminiEmbeddingModelMetadata },
       openrouter: { generation: settings.availableOpenRouterModels, embedding: settings.availableOpenRouterEmbeddingModels, fetchedAt: settings.openrouterModelsFetchedAt, metadata: settings.openrouterModelMetadata, embeddingMetadata: settings.openrouterEmbeddingModelMetadata },
       openwebui: { generation: settings.availableOpenWebUIModels, embedding: settings.availableOpenWebUIEmbeddingModels, fetchedAt: settings.openwebuiModelsFetchedAt, metadata: settings.openwebuiModelMetadata },
+      customopenai: { generation: settings.availableCustomOpenAIModels, embedding: settings.availableCustomOpenAIModels, fetchedAt: settings.customOpenAIModelsFetchedAt, metadata: settings.customOpenAIModelMetadata, embeddingMetadata: settings.customOpenAIModelMetadata },
       opencodego: { generation: settings.availableOpenCodeGoModels, embedding: [], fetchedAt: settings.opencodeGoModelsFetchedAt, metadata: settings.opencodeGoModelMetadata, embeddingMetadata: {} }
     }[normalizedProvider] || {};
     const generation = Array.isArray(config.generation) ? config.generation : [];
@@ -65238,7 +66713,7 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const modelRoleCapability = (settings = {}, provider, model) => {
     const providerToken = nonEmpty(provider).toLowerCase().replace(/[-_\s]/g, "");
-    const normalizedProvider = ["openai", "google", "gemini", "openrouter", "router", "openwebui", "webui", "selfhostedopenwebui", "opencodego"].includes(providerToken)
+    const normalizedProvider = ["openai", "google", "gemini", "openrouter", "router", "openwebui", "webui", "selfhostedopenwebui", "customopenai", "openaicompatible", "opencodego"].includes(providerToken)
       ? normalizeProvider(provider, "openai")
       : "";
     const normalizedModel = normalizeModel(normalizedProvider, model);
@@ -65249,6 +66724,14 @@ const STS_MULTI_PROVIDER = (() => {
       return modelRoleCapabilityResult(null, null, "unknown");
     }
     if (normalizedProvider === "openwebui") return openWebUIModelRoleCapabilities(settings, normalizedModel);
+    if (normalizedProvider === "customopenai") {
+      const inventory = providerRoleInventory(settings, normalizedProvider);
+      const identity = modelIdentity(normalizedProvider, normalizedModel);
+      const discovered = inventory.inventoryKnown
+        && (inventory.generation.some((value) => modelIdentity(normalizedProvider, value) === identity)
+          || inventory.embedding.some((value) => modelIdentity(normalizedProvider, value) === identity));
+      return modelRoleCapabilityResult(null, null, discovered ? "custom-openai-models" : "unknown");
+    }
     const inventory = providerRoleInventory(settings, normalizedProvider);
     const identity = modelIdentity(normalizedProvider, normalizedModel);
     const inGeneration = inventory.inventoryKnown && inventory.generation.some((value) => modelIdentity(normalizedProvider, value) === identity);
@@ -65350,8 +66833,10 @@ const STS_MULTI_PROVIDER = (() => {
       ? Object.assign({}, settings.openrouterModelMetadata || {}, settings.openrouterEmbeddingModelMetadata || {})
       : normalizedProvider === "openwebui"
         ? (settings.openwebuiModelMetadata || {})
-        : normalizedProvider === "gemini"
+      : normalizedProvider === "gemini"
           ? (settings.geminiModelMetadata || {})
+          : normalizedProvider === "customopenai"
+            ? (settings.customOpenAIModelMetadata || {})
           : (settings.openaiModelMetadata || {});
     const metadataKey = Object.keys(metadataMap || {}).find((key) => modelIdentity(normalizedProvider, key) === modelIdentity(normalizedProvider, normalizedModel));
     const metadata = metadataKey ? metadataMap[metadataKey] || {} : {};
@@ -65435,6 +66920,7 @@ const STS_MULTI_PROVIDER = (() => {
   const providerForModel = (model, settings = {}) => {
     const value = nonEmpty(model);
     if (/^opencodego(?:[:/])/i.test(value) || /^opencode-go(?:[:/])/i.test(value)) return "opencodego";
+    if (/^customopenai(?:[:/])/i.test(value) || /^custom-openai(?:[:/])/i.test(value) || /^openai-compatible(?:[:/])/i.test(value)) return "customopenai";
     if (/^openai(?:[:/])/i.test(value)) return "openai";
     if (/^openwebui(?:[:/])/i.test(value)) return "openwebui";
     if (/^openrouter(?:[:/])/i.test(value)) return "openrouter";
@@ -65461,7 +66947,7 @@ const STS_MULTI_PROVIDER = (() => {
       .flatMap((provider) => unique(values[provider]).sort((a, b) => a.localeCompare(b)).map((model) => modelOption(provider, model)));
   };
   const REASONING_SOURCE_VALUES = Object.freeze(["automatic", "explicit"]);
-  const validModelReference = (reference) => Boolean(reference && ["gemini", "openai", "openrouter", "openwebui", "opencodego"].includes(nonEmpty(reference.provider).toLowerCase().replace(/[-_\s]/g, "")) && nonEmpty(reference.model));
+  const validModelReference = (reference) => Boolean(reference && ["gemini", "openai", "openrouter", "openwebui", "customopenai", "openaicompatible", "opencodego"].includes(nonEmpty(reference.provider).toLowerCase().replace(/[-_\s]/g, "")) && nonEmpty(reference.model));
   const normalizeReasoningSource = (value, fallback = "automatic") => {
     const normalized = nonEmpty(value).toLowerCase();
     return REASONING_SOURCE_VALUES.includes(normalized) ? normalized : fallback;
@@ -65837,7 +67323,7 @@ const STS_MULTI_PROVIDER = (() => {
   };
   const applyProviderToOperationRole = (settings = {}, provider, role = "primary", catalog = undefined) => {
     const rawProvider = nonEmpty(provider).toLowerCase().replace(/[-_\s]/g, "");
-    const normalizedProvider = ["openai", "gemini", "openrouter", "openwebui", "opencodego"].includes(rawProvider)
+    const normalizedProvider = ["openai", "gemini", "openrouter", "openwebui", "customopenai", "openaicompatible", "opencodego"].includes(rawProvider)
       ? normalizeProvider(rawProvider, "openai")
       : "";
     if (!PROVIDERS.includes(normalizedProvider)) throw providerError(normalizedProvider || "openai", null, "provider-required");
@@ -65992,7 +67478,7 @@ const STS_MULTI_PROVIDER = (() => {
     const migrated = migrateOperationModelSettings(settings).settings;
     const providerToken = nonEmpty(provider).toLowerCase().replace(/[-_\s]/g, "");
     const providerFilter = provider
-      ? ["openai", "gemini", "openrouter", "openwebui", "opencodego"].includes(providerToken) ? normalizeProvider(provider, "") : ""
+      ? ["openai", "gemini", "openrouter", "openwebui", "customopenai", "openaicompatible", "opencodego"].includes(providerToken) ? normalizeProvider(provider, "") : ""
       : "";
     const next = Object.assign({}, migrated, { aiOperationModels: Object.assign({}, migrated.aiOperationModels) });
     const diagnostics = { provider: providerFilter || "all", changed: false, repaired: [], omittedFallbacks: [], unresolved: [] };
@@ -66200,8 +67686,8 @@ const STS_MULTI_PROVIDER = (() => {
   const catalogRows = (settings = {}, catalog = {}, manualReferences = [], role = "generation") => {
     const embeddingRole = role === "embedding";
     const defaults = embeddingRole
-      ? { openai: ["text-embedding-3-large"], gemini: ["gemini-embedding-2", "gemini-embedding-001"], openrouter: [], openwebui: [], opencodego: [] }
-      : { openai: settings.availableChatModels || [], gemini: settings.availableGeminiModels || [], openrouter: settings.availableOpenRouterModels || [], openwebui: settings.availableOpenWebUIModels || [], opencodego: settings.availableOpenCodeGoModels || [] };
+      ? { openai: ["text-embedding-3-large"], gemini: ["gemini-embedding-2", "gemini-embedding-001"], openrouter: [], openwebui: [], customopenai: settings.availableCustomOpenAIModels || [], opencodego: [] }
+      : { openai: settings.availableChatModels || [], gemini: settings.availableGeminiModels || [], openrouter: settings.availableOpenRouterModels || [], openwebui: settings.availableOpenWebUIModels || [], customopenai: settings.availableCustomOpenAIModels || [], opencodego: settings.availableOpenCodeGoModels || [] };
     const source = {};
     for (const provider of PROVIDER_DISPLAY_ORDER) {
       const supplied = catalog && typeof catalog === "object" && Object.prototype.hasOwnProperty.call(catalog, provider)
@@ -66209,7 +67695,7 @@ const STS_MULTI_PROVIDER = (() => {
         : undefined;
       if (supplied !== undefined) source[provider] = Array.isArray(supplied) ? supplied : [];
       else if (embeddingRole) source[provider] = provider === "opencodego" ? [] : (settings[
-        provider === "openai" ? "availableEmbeddingModels" : provider === "gemini" ? "availableGeminiEmbeddingModels" : provider === "openrouter" ? "availableOpenRouterEmbeddingModels" : "availableOpenWebUIEmbeddingModels"
+         provider === "openai" ? "availableEmbeddingModels" : provider === "gemini" ? "availableGeminiEmbeddingModels" : provider === "openrouter" ? "availableOpenRouterEmbeddingModels" : provider === "openwebui" ? "availableOpenWebUIEmbeddingModels" : "availableCustomOpenAIModels"
       ] || defaults[provider] || []);
       else source[provider] = defaults[provider] || [];
     }
@@ -69350,6 +70836,14 @@ const STS_MULTI_PROVIDER = (() => {
   const providerStructuredRetrySnapshot = (state, profile, provider, includeRawOutputs = true) => {
     const token = (value, maximum = 80) => String(value || "").replace(/[^A-Za-z0-9._:/-]/g, "").slice(0, maximum);
     const count = (value, maximum = 1e9) => Math.max(0, Math.min(maximum, Math.round(Number(value) || 0)));
+    const nullableCount = (value, maximum = 1e9) => {
+      if (value == null || value === "") return null;
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return null;
+      return Math.max(0, Math.min(maximum, Math.round(numeric)));
+    };
+    const outputBudgetWireFieldAllowlist = ["max_output_tokens", "max_completion_tokens", "max_tokens", "maxOutputTokens", "options.num_predict"];
+    const outputBudgetWireField = (value) => (outputBudgetWireFieldAllowlist.includes(String(value)) ? token(value, 32) : "");
     const attempts = (Array.isArray(state.attempts) ? state.attempts : []).map((attempt, index) => Object.freeze({
       attempt: count(attempt?.attempt || index + 1, 8),
       status: token(attempt?.status, 24),
@@ -69365,6 +70859,13 @@ const STS_MULTI_PROVIDER = (() => {
       endpoint: token(attempt?.endpoint, 64),
       schemaCarrier: token(attempt?.schemaCarrier, 48),
       outputBudgetCarrier: token(attempt?.outputBudgetCarrier, 48),
+      requestedMaxOutputTokens: nullableCount(attempt?.requestedMaxOutputTokens, 1e9),
+      appliedMaxOutputTokens: nullableCount(attempt?.appliedMaxOutputTokens, 1e9),
+      outputBudgetWireField: outputBudgetWireField(attempt?.outputBudgetWireField),
+      usagePresent: Boolean(attempt?.usagePresent),
+      providerInputTokens: nullableCount(attempt?.providerInputTokens, 1e9),
+      providerOutputTokens: nullableCount(attempt?.providerOutputTokens, 1e9),
+      providerReasoningTokens: nullableCount(attempt?.providerReasoningTokens, 1e9),
       thinkingCarrier: token(attempt?.thinkingCarrier, 32),
       requestBodyHash: token(attempt?.requestBodyHash, 96),
       schemaHash: token(attempt?.schemaHash, 96),
@@ -69673,6 +71174,22 @@ const STS_MULTI_PROVIDER = (() => {
       providerRequestTelemetry.nativeMaxValue = next;
       return true;
     };
+    const openRouterAttemptUsagePrimitives = (rawUsage) => {
+      const hasMeaningfulUsageValue = (value) => {
+        if (value == null || typeof value === "boolean" || Array.isArray(value)) return false;
+        if (typeof value === "number") return Number.isFinite(value);
+        if (typeof value === "string") return value.trim() !== "" && Number.isFinite(Number(value));
+        return false;
+      };
+      const meaningful = rawUsage
+        && typeof rawUsage === "object"
+        && !Array.isArray(rawUsage)
+        && Object.values(rawUsage).some((value) => hasMeaningfulUsageValue(value)
+          || (value && typeof value === "object" && !Array.isArray(value) && Object.values(value).some(hasMeaningfulUsageValue)));
+      if (!meaningful) return { usagePresent: false, providerInputTokens: null, providerOutputTokens: null, providerReasoningTokens: null };
+      const normalized = normalizeUsage(rawUsage);
+      return { usagePresent: true, providerInputTokens: normalized.inputTokens, providerOutputTokens: normalized.outputTokens, providerReasoningTokens: normalized.reasoningTokens };
+    };
     try {
       for (let structuredAttempt = 1; structuredAttempt <= 2; structuredAttempt += 1) {
         let limited = null;
@@ -69750,7 +71267,23 @@ const STS_MULTI_PROVIDER = (() => {
           if (body.provider?.require_parameters === true) aiCloudCapabilityRemember(Object.assign({}, capabilityObservation, { carrier: "provider.require_parameters" }), "supported");
           if (body.plugins?.some((plugin) => plugin?.id === "response-healing")) aiCloudCapabilityRemember(Object.assign({}, capabilityObservation, { carrier: "plugins.response-healing" }), "supported");
           structuredRetryState.rawOutputs.push(rawText);
-          structuredRetryState.attempts.push({ attempt: structuredAttempt, status: "succeeded", code: "ok", requestedModel: model, servedModel: actualModel, finishReason, usage: normalizeUsage(payload.usage || {}) });
+          const succeededAttemptUsage = openRouterAttemptUsagePrimitives(payload.usage);
+          structuredRetryState.attempts.push({
+            attempt: structuredAttempt,
+            status: "succeeded",
+            code: "ok",
+            requestedModel: model,
+            servedModel: actualModel,
+            finishReason,
+            usage: normalizeUsage(payload.usage || {}),
+            requestedMaxOutputTokens: outputBudgetTelemetry.requestedMaxOutputTokens,
+            appliedMaxOutputTokens: outputBudgetTelemetry.appliedMaxOutputTokens,
+            outputBudgetWireField,
+            usagePresent: succeededAttemptUsage.usagePresent,
+            providerInputTokens: succeededAttemptUsage.providerInputTokens,
+            providerOutputTokens: succeededAttemptUsage.providerOutputTokens,
+            providerReasoningTokens: succeededAttemptUsage.providerReasoningTokens
+          });
           return {
             text,
             rawText,
@@ -69815,6 +71348,7 @@ const STS_MULTI_PROVIDER = (() => {
             structuredRetryState.rawOutputs.push(rawOutput);
             const diagnostic = error?.providerError?.providerDiagnostic || {};
             const code = String(error?.providerError?.code || "provider-error");
+            const failedAttemptUsage = openRouterAttemptUsagePrimitives(bodyMetadata?.payload?.usage);
             structuredRetryState.attempts.push({
               attempt: structuredAttempt,
               status: "failed",
@@ -69822,7 +71356,14 @@ const STS_MULTI_PROVIDER = (() => {
               requestedModel: model,
               servedModel: String(diagnostic.servedModel || model),
               finishReason: String(diagnostic.finishReason || finishReason || ""),
-              usage: error?.providerUsage || diagnostic.usage || {}
+              usage: error?.providerUsage || diagnostic.usage || {},
+              requestedMaxOutputTokens: outputBudgetTelemetry.requestedMaxOutputTokens,
+              appliedMaxOutputTokens: outputBudgetTelemetry.appliedMaxOutputTokens,
+              outputBudgetWireField,
+              usagePresent: failedAttemptUsage.usagePresent,
+              providerInputTokens: failedAttemptUsage.providerInputTokens,
+              providerOutputTokens: failedAttemptUsage.providerOutputTokens,
+              providerReasoningTokens: failedAttemptUsage.providerReasoningTokens
             });
             if (structuredAttempt === 1 && openRouterStructuredRetryEligible(error, schema, response)) {
               structuredRetryState.retryEligible = true;
@@ -69986,6 +71527,175 @@ const STS_MULTI_PROVIDER = (() => {
       embeddingMetadata: Object.keys(embeddingMetadata).sort().map((id) => [id, Object.assign({}, embeddingMetadata[id], { fetchedAt: undefined })])
     }));
     return { chat: sortedChat, embeddings: sortedEmbeddings, metadata, embeddingMetadata, fetchedAt, metadataFingerprint, pages: 1 };
+  };
+  const CUSTOM_OPENAI_PATHS = Object.freeze({ models: "/models", chat: "/chat/completions", embeddings: "/embeddings" });
+  const customOpenAIResponseError = (response, path = "") => {
+    const status = statusOf(response);
+    const payload = responseJson(response);
+    const boundedToken = (value) => String(value == null ? "" : value).toLowerCase().replace(/[^a-z0-9_.:-]/g, "").slice(0, 80);
+    const errorShape = payload?.error && typeof payload.error === "object" && !Array.isArray(payload.error) ? payload.error : {};
+    const metadata = [errorShape.code, errorShape.type, errorShape.param].map(boundedToken).filter(Boolean).join("|");
+    const schema = /json.?schema|response.?format|structured.?output|unsupported.?parameter/.test(metadata);
+    const classification = status === 401 || status === 403
+      ? "auth"
+      : status === 404
+        ? "missing-route"
+        : schema
+          ? "schema"
+          : status === 400 || status === 422
+            ? "validation"
+            : retryableStatus(status) ? "transport" : "provider";
+    const code = classification === "auth"
+      ? status === 401 ? "auth-required" : "auth-failed"
+      : classification === "missing-route"
+        ? "custom-provider-missing-route"
+        : classification === "schema"
+          ? "unsupported-schema"
+          : classification === "validation" ? "request-validation" : classification === "transport" ? "transport" : "provider-error";
+    return providerError("customopenai", status, code, classification === "transport", "", {
+      source: "custom-openai-error-metadata",
+      status,
+      classification,
+      httpResponseObserved: status > 0,
+      responseShape: errorShape && Object.keys(errorShape).length ? "error" : "unknown",
+      path: path === CUSTOM_OPENAI_PATHS.models || path === CUSTOM_OPENAI_PATHS.chat || path === CUSTOM_OPENAI_PATHS.embeddings ? path.slice(1) : "",
+      schemaRejected: schema,
+      diagnosticHash: stableHash([status, classification, metadata].join("|"))
+    });
+  };
+  const customOpenAIRequest = async (settings, options = {}, method, path, body = null) => {
+    const normalizedPath = nonEmpty(path);
+    const normalizedMethod = nonEmpty(method).toUpperCase();
+    const expectedMethod = normalizedPath === CUSTOM_OPENAI_PATHS.models ? "GET" : "POST";
+    if (![CUSTOM_OPENAI_PATHS.models, CUSTOM_OPENAI_PATHS.chat, CUSTOM_OPENAI_PATHS.embeddings].includes(normalizedPath) || normalizedMethod !== expectedMethod) {
+      throw providerError("customopenai", null, "custom-provider-missing-route");
+    }
+    if (!nonEmpty(settings?.customOpenAIBaseUrl)) throw providerError("customopenai", null, "custom-provider-not-configured");
+    const baseUrl = normalizeCustomOpenAIBaseUrl(settings.customOpenAIBaseUrl, settings.customOpenAIAllowInsecureHttp === true);
+    const key = nonEmpty(settings.customOpenAIApiKey);
+    const headers = requestHeaders();
+    if (key) headers.authorization = `Bearer ${key}`;
+    const requestOptions = Object.assign(
+      options.requestUrlOptions && typeof options.requestUrlOptions === "object" ? options.requestUrlOptions : {},
+      {
+      url: `${baseUrl}${normalizedPath}`,
+      method: normalizedMethod,
+      headers,
+      body: body == null ? undefined : JSON.stringify(body),
+      throw: false
+      }
+    );
+    if (options.signal) requestOptions.signal = options.signal;
+    if (options.timeoutMs != null) requestOptions.timeout = options.timeoutMs;
+    try {
+      const response = await requestFunction(options.requestUrl)(requestOptions);
+      if (successful(response)) return response;
+      throw customOpenAIResponseError(response, normalizedPath);
+    } catch (error) {
+      if (error?.providerError) throw error;
+      if (options.signal?.aborted) throw providerError("customopenai", null, "request-aborted", false, "", { source: "custom-openai-abort", classification: "abort", settled: true, diagnosticHash: stableHash("customopenai|abort") });
+      throw providerError("customopenai", null, "transport", true, "", { source: "custom-openai-transport", classification: "transport", settled: true, diagnosticHash: stableHash("customopenai|transport") });
+    }
+  };
+  const customOpenAIDiscover = async (settings, options = {}) => {
+    const fetchedAt = new Date(typeof options.now === "function" ? options.now() : Number(options.now) || Date.now()).toISOString();
+    const response = await customOpenAIRequest(settings, options, "GET", CUSTOM_OPENAI_PATHS.models, null);
+    const payload = responseJson(response);
+    if (!Array.isArray(payload?.data)) throw providerError("customopenai", statusOf(response), "invalid-response");
+    const ids = new Map();
+    for (const row of payload.data) {
+      if (!row || typeof row.id !== "string") continue;
+      const id = row.id.trim().slice(0, 160);
+      if (!id || ids.has(id)) continue;
+      const metadata = { source: "custom-openai-models", fetchedAt };
+      const created = Number(row.created);
+      if (Number.isSafeInteger(created) && created >= 0 && created <= 4_102_444_800) metadata.created = created;
+      const ownedBy = nonEmpty(row.owned_by || row.ownedBy).slice(0, 120);
+      if (ownedBy) metadata.ownedBy = ownedBy;
+      ids.set(id, metadata);
+    }
+    const models = Array.from(ids.keys()).sort((left, right) => left.localeCompare(right));
+    const metadata = Object.fromEntries(models.map((id) => [id, ids.get(id)]));
+    return { models, chat: models.slice(), embeddings: [], metadata, fetchedAt };
+  };
+  const customOpenAIGenerate = async (settings, request = {}, options = {}) => {
+    const model = normalizeModel("customopenai", request.model || request.requestedModel || "");
+    if (!model) throw providerError("customopenai", null, "model-required");
+    if (options.generationDispatchBudget && options.signal?.aborted) throw providerError("customopenai", null, "request-aborted");
+    if (options.generationDispatchBudget) aiGenerationDispatchBudgetRequire(options.generationDispatchBudget, { provider: "customopenai", path: "chat-completions", operation: request.operation || "chat-query" });
+    const system = typeof request.system === "string" ? request.system : nonEmpty(request.system) ? String(request.system) : "";
+    const promptCachePrefix = typeof request.promptCachePrefix === "string" ? request.promptCachePrefix : "";
+    const userRaw = typeof request.user === "string" ? request.user : nonEmpty(request.user) ? String(request.user) : "";
+    const suffix = providerContextSuffixJoin(request.promptContextSuffix || "", userRaw);
+    let user = [promptCachePrefix, suffix].filter((value) => value != null && asString(value) !== "").map(asString).join("\n\n") || userRaw;
+    const schema = request.schema || request.jsonSchema || null;
+    const hasSchema = schema && typeof schema === "object" && !Array.isArray(schema);
+    if (hasSchema) user = user ? `${user}\n\nReturn only one JSON value that exactly validates against this JSON Schema; no prose or Markdown.\n${JSON.stringify(schema)}` : `Return only one JSON value that exactly validates against this JSON Schema; no prose or Markdown.\n${JSON.stringify(schema)}`;
+    const body = {
+      model,
+      messages: [
+        ...(system.trim() ? [{ role: "system", content: system }] : []),
+        { role: "user", content: user }
+      ],
+      stream: false,
+      ...(hasSchema ? { response_format: { type: "json_schema", json_schema: { name: "semantic_todoist_sync", strict: true, schema } } } : {})
+    };
+    const maxOutputTokens = Math.max(0, Math.round(Number(request.maxOutputTokens || request.max_tokens || 0)));
+    if (maxOutputTokens > 0) body.max_tokens = maxOutputTokens;
+    const response = await customOpenAIRequest(settings, options, "POST", CUSTOM_OPENAI_PATHS.chat, body);
+    const payload = responseJson(response);
+    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+    const choice = choices.length === 1 ? choices[0] : null;
+    const message = choice?.message && typeof choice.message === "object" ? choice.message : {};
+    const content = typeof message.content === "string" ? message.content : "";
+    if (!content.trim()) throw providerError("customopenai", statusOf(response), message.refusal ? "provider-refusal" : "invalid-response");
+    if (String(choice?.finish_reason || "").toLowerCase() === "length") throw providerError("customopenai", statusOf(response), "incomplete-transport", true);
+    return {
+      text: content,
+      rawText: content,
+      provider: "customopenai",
+      model: normalizeModel("customopenai", payload.model || model),
+      usage: normalizeUsage(payload.usage || {}),
+      outputBudgetTelemetry: {
+        requestedMaxOutputTokens: maxOutputTokens,
+        appliedMaxOutputTokens: maxOutputTokens,
+        wireField: maxOutputTokens ? "max_tokens" : "",
+        capabilityKnown: false,
+        applied: Boolean(maxOutputTokens)
+      },
+      providerRequestTelemetry: {
+        schemaPresent: Boolean(hasSchema),
+        reasoningPresent: false,
+        outputBudgetPresent: Boolean(maxOutputTokens),
+        nativeMaxField: maxOutputTokens ? "max_tokens" : "",
+        nativeMaxFieldPresent: Boolean(maxOutputTokens),
+        nativeMaxValue: maxOutputTokens
+      }
+    };
+  };
+  const customOpenAIEmbeddings = async (settings, texts = [], role = "document", options = {}) => {
+    const values = (texts || []).map(asString);
+    const model = normalizeModel("customopenai", settings.embeddingModel || options.model || "");
+    if (!model) throw providerError("customopenai", null, "model-required");
+    if (!values.length) return { vectors: [], model, provider: "customopenai", dimension: 0, usage: normalizeUsage() };
+    const response = await customOpenAIRequest(settings, options, "POST", CUSTOM_OPENAI_PATHS.embeddings, { model, input: values, encoding_format: "float" });
+    const payload = responseJson(response);
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    if (data.length !== values.length) throw providerError("customopenai", statusOf(response), "embedding-count");
+    const seen = new Set();
+    const indexed = data.map((item) => {
+      const index = Number(item?.index);
+      if (!Number.isSafeInteger(index) || index < 0 || index >= values.length || seen.has(index)) throw providerError("customopenai", statusOf(response), "invalid-response");
+      seen.add(index);
+      const vector = item?.embedding;
+      if (!Array.isArray(vector) || !vector.length || vector.some((value) => typeof value !== "number" || !Number.isFinite(value))) throw providerError("customopenai", statusOf(response), "invalid-response");
+      return { index, vector };
+    });
+    if (seen.size !== values.length) throw providerError("customopenai", statusOf(response), "invalid-response");
+    indexed.sort((left, right) => left.index - right.index);
+    const dimension = indexed[0]?.vector.length || 0;
+    if (!dimension || indexed.some((item) => item.vector.length !== dimension)) throw providerError("customopenai", statusOf(response), "embedding-dimension");
+    return { vectors: indexed.map((item) => item.vector), model, provider: "customopenai", dimension, usage: normalizeUsage(payload.usage || {}) };
   };
   const OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1";
   const openCodeGoRequest = async (settings, options, method, path, body, headers = {}) => {
@@ -72441,7 +74151,11 @@ const STS_MULTI_PROVIDER = (() => {
 
   const semanticIndexIdentity = ({ provider, baseUrl = "", model = "", dimension = 0, configuredDimension = 0, actualDimension = 0, authIdentityHash = "", authMode = "", email = "", customHeader = "" } = {}) => {
     const normalizedProvider = normalizeProvider(provider);
-    const normalizedBase = normalizedProvider === "openwebui" ? normalizeOpenWebUIBaseUrl(baseUrl, true) : normalizedProvider === "openrouter" ? OPENROUTER_BASE_URL : "";
+    const normalizedBase = normalizedProvider === "openwebui"
+      ? normalizeOpenWebUIBaseUrl(baseUrl, true)
+      : normalizedProvider === "customopenai"
+        ? normalizeCustomOpenAIBaseUrl(baseUrl, true)
+        : normalizedProvider === "openrouter" ? OPENROUTER_BASE_URL : "";
     const normalizedModel = normalizeModel(normalizedProvider, model);
     const configured = Math.max(0, Number(configuredDimension || 0));
     const actual = Math.max(0, Number(dimension || actualDimension || 0));
@@ -72460,7 +74174,7 @@ const STS_MULTI_PROVIDER = (() => {
   const semanticIndexCompatible = (expected = {}, actual = {}) => {
     const left = semanticIndexIdentity(expected);
     const right = semanticIndexIdentity(actual);
-    return left.provider === right.provider && left.baseUrl === right.baseUrl && left.authIdentityHash === right.authIdentityHash && left.model.toLowerCase() === right.model.toLowerCase() && left.dimension === right.dimension;
+    return left.provider === right.provider && left.baseUrl === right.baseUrl && left.authIdentityHash === right.authIdentityHash && left.model.toLowerCase() === right.model.toLowerCase() && left.configuredDimension === right.configuredDimension && left.dimension === right.dimension;
   };
   const semanticIndexFile = (provider) => INDEX_FILES[normalizeProvider(provider)] || INDEX_FILES.openai;
   const automaticFallbackReference = (settings = {}, primary = {}, operation = "") => {
@@ -72522,6 +74236,7 @@ const STS_MULTI_PROVIDER = (() => {
     embeddingDimensionOverride,
     operationRequest,
     modelProfileForReference,
+    normalizeCustomOpenAIBaseUrl,
     normalizeOpenWebUIBaseUrl,
     normalizeOpenWebUIThinkingMode,
     OPENWEBUI_THINKING_MODE_VALUES,
@@ -72587,6 +74302,10 @@ const STS_MULTI_PROVIDER = (() => {
     openRouterChat,
     openRouterEmbeddings,
     openRouterDiscover,
+    customOpenAIRequest,
+    customOpenAIDiscover,
+    customOpenAIGenerate,
+    customOpenAIEmbeddings,
     openCodeGoDiscover,
     openCodeGoGenerate,
     OPENCODE_GO_BASE_URL,
@@ -72612,8 +74331,14 @@ const STS_MULTI_PROVIDER = (() => {
 
 if (typeof module !== "undefined" && module.exports) module.exports.__multiProvider = STS_MULTI_PROVIDER;
 if (typeof module !== "undefined" && module.exports) module.exports.__settingsUi = {
-  resolveAiProviderSettingsSection: stsMpResolveAiProviderSettingsSection,
-  openAiProviderSettingsSection: stsMpOpenAiProviderSettingsSection
+  aiProviderSettingsView: stsMpAiProviderSettingsView,
+  selectAiProviderSettingsSection: stsMpSelectAiProviderSettingsSection,
+  providerStatus: settingsProviderStatus,
+  parseProviderScopedValue: stsMpParseProviderScopedValue,
+  commitCustomOpenAIBaseUrl: stsMpCommitCustomOpenAIBaseUrl,
+  commitCustomOpenAIApiKey: stsMpCommitCustomOpenAIApiKey,
+  commitCustomOpenAIAllowInsecureHttp: stsMpCommitCustomOpenAIAllowInsecureHttp,
+  refreshProviderModelsAfterCommit: stsMpRefreshOpenWebUIModelsAfterCommit
 };
 if (typeof module !== "undefined" && module.exports) module.exports.__semanticIndexPartitionContract = semanticIndexPartitionContract;
 if (typeof module !== "undefined" && module.exports) module.exports.__semanticIndexManifestValidation = semanticIndexManifestValidation;
@@ -72962,7 +74687,7 @@ function aiGatewayReference(value, settings, isFallback = false, operation = "",
   if (!value || typeof value !== "object") return null;
   if (allowModelLess) {
     const providerValue = String(value.provider || settings.aiModelProvider || "").trim().toLowerCase().replace(/[-_\s]/g, "");
-    const provider = ["openai", "gemini", "openrouter", "openwebui"].includes(providerValue)
+    const provider = ["openai", "gemini", "openrouter", "openwebui", "customopenai"].includes(providerValue)
       ? providerValue
       : providerValue === "google" ? "gemini"
         : providerValue === "router" ? "openrouter"
@@ -73200,11 +74925,46 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
     if (!Number.isFinite(parsed)) return null;
     return Math.max(0, Math.min(max, Math.round(parsed)));
   };
+  const boundedOutputBudgetWireField = (input) => {
+    const text = String(input || "");
+    return ["max_output_tokens", "max_completion_tokens", "max_tokens", "maxOutputTokens", "options.num_predict"].includes(text) ? text : "";
+  };
+  const boundedFinishReason = (input) => {
+    const text = String(input || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (!text) return "";
+    if (text === "max-tokens" || text === "max-output-tokens") return "length";
+    if (["stop", "length", "truncated", "tool-calls", "content-filter", "error"].includes(text)) return text;
+    return "other";
+  };
+  const boundedFlag = (input) => {
+    if (input === true || input === 1) return true;
+    if (typeof input === "string") {
+      const text = input.trim().toLowerCase();
+      if (text === "true" || text === "1") return true;
+    }
+    return false;
+  };
+  const boundedNullableFlag = (input) => {
+    if (input === null || input === undefined) return null;
+    if (input === true || input === 1) return true;
+    if (input === false || input === 0) return false;
+    if (typeof input === "string") {
+      const text = input.trim().toLowerCase();
+      if (text === "true" || text === "1") return true;
+      if (text === "false" || text === "0") return false;
+    }
+    return null;
+  };
   const pickHash16 = (...inputs) => {
     for (const input of inputs) {
       const normalized = String(input || "").toLowerCase().trim();
       if (/^[a-f0-9]{16}$/.test(normalized)) return normalized;
     }
+    return "";
+  };
+  const boundedCutoffScoreBucket = (input) => {
+    const text = String(input || "").trim().toLowerCase();
+    if (["empty", "missing", "negative", "zero", "gt0-le0.25", "gt0.25-le0.5", "gt0.5-le0.75", "gt0.75-le1", "gt1"].includes(text)) return text;
     return "";
   };
   const providerValue = String(source.provider || "").trim().toLowerCase();
@@ -73217,6 +74977,8 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
     ? source.contextSummary
     : source.context && typeof source.context === "object" ? source.context : {};
   const usage = source.usage && typeof source.usage === "object" ? source.usage : {};
+  const budgetTelemetry = source.outputBudgetTelemetry && typeof source.outputBudgetTelemetry === "object" ? source.outputBudgetTelemetry : {};
+  const observationUsage = observation.usage && typeof observation.usage === "object" ? observation.usage : {};
   const model = String(source.model || source.requestedModel || source.actualModel || "").trim();
   const hashes = source.hashes && typeof source.hashes === "object" ? source.hashes : {};
   const rawDiagnostic = source.providerDiagnostic && typeof source.providerDiagnostic === "object" ? source.providerDiagnostic : {};
@@ -73231,6 +74993,10 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
   })();
   const selectedHash = pickHash16(source.selectedHash, hashes.selectedHash, observation.selectedHash);
   const rejectedHash = pickHash16(source.rejectedHash, hashes.rejectedHash, observation.rejectedHash);
+  const providerInputTokens = boundedNullableCount(firstNumber(source.providerInputTokens, source.provider_input_tokens, usage.providerInputTokens, usage.provider_input_tokens, usage.inputTokens, usage.input_tokens, observationUsage.providerInputTokens, observationUsage.provider_input_tokens, observationUsage.inputTokens, observationUsage.input_tokens, observation.providerInputTokens, observation.provider_input_tokens, observation.inputTokens, observation.input_tokens));
+  const providerOutputTokens = boundedNullableCount(firstNumber(source.providerOutputTokens, source.provider_output_tokens, usage.providerOutputTokens, usage.provider_output_tokens, usage.outputTokens, usage.output_tokens, usage.completion_tokens, observationUsage.providerOutputTokens, observationUsage.provider_output_tokens, observationUsage.outputTokens, observationUsage.output_tokens, observationUsage.completion_tokens, observation.providerOutputTokens, observation.provider_output_tokens, observation.outputTokens, observation.output_tokens, observation.completion_tokens));
+  const providerReasoningTokens = boundedNullableCount(firstNumber(source.providerReasoningTokens, source.provider_reasoning_tokens, usage.providerReasoningTokens, usage.provider_reasoning_tokens, usage.reasoningTokens, usage.reasoning_tokens, observationUsage.providerReasoningTokens, observationUsage.provider_reasoning_tokens, observationUsage.reasoningTokens, observationUsage.reasoning_tokens, observation.providerReasoningTokens, observation.provider_reasoning_tokens, observation.reasoningTokens, observation.reasoning_tokens));
+  const usagePresent = boundedFlag(source.usagePresent ?? usage.usagePresent ?? usage.usage_present ?? observationUsage.usagePresent ?? observationUsage.usage_present ?? observation.usagePresent ?? observation.usage_present) || providerInputTokens !== null || providerOutputTokens !== null || providerReasoningTokens !== null;
   const record = {
     timestamp: new Date().toISOString(),
     operation: aiDebugOperationName(source.operation || context.operation || "workflow"),
@@ -73264,6 +75030,17 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
     rawResponseHash: /^[a-f0-9]{16,96}$/.test(rawResponseHash) ? rawResponseHash : "",
     rawByteCount: number(firstNumber(source.rawByteCount, source.rawUtf8Bytes, hashes.rawByteCount, rawDiagnostic.rawUtf8Bytes, rawDiagnostic.responseByteCount), 2 * 1024 * 1024),
     providerRetry: aiGatewayBoundedProviderRetry(source.providerRetry || observation.providerRetry),
+    gatewayAttemptOrdinal: boundedNullableCount(firstNumber(source.gatewayAttemptOrdinal, source.gateway_attempt_ordinal, budgetTelemetry.gatewayAttemptOrdinal, budgetTelemetry.gateway_attempt_ordinal, observation.gatewayAttemptOrdinal, observation.gateway_attempt_ordinal, source.attempt, observation.attempt)),
+    requestedMaxOutputTokens: boundedNullableCount(firstNumber(source.requestedMaxOutputTokens, source.requested_max_output_tokens, budgetTelemetry.requestedMaxOutputTokens, budgetTelemetry.requested_max_output_tokens, observation.requestedMaxOutputTokens, observation.requested_max_output_tokens)),
+    appliedMaxOutputTokens: boundedNullableCount(firstNumber(source.appliedMaxOutputTokens, source.applied_max_output_tokens, budgetTelemetry.appliedMaxOutputTokens, budgetTelemetry.applied_max_output_tokens, observation.appliedMaxOutputTokens, observation.applied_max_output_tokens)),
+    budgetApplied: boundedFlag(source.budgetApplied ?? source.applied ?? budgetTelemetry.applied ?? budgetTelemetry.budgetApplied ?? observation.applied ?? observation.budgetApplied ?? false),
+    budgetRetryOrdinal: boundedNullableCount(firstNumber(source.budgetRetryOrdinal, source.budget_retry_ordinal, budgetTelemetry.budgetRetryOrdinal, budgetTelemetry.budget_retry_ordinal, budgetTelemetry.retryOrdinal, observation.budgetRetryOrdinal, observation.budget_retry_ordinal, observation.retryOrdinal)),
+    outputBudgetWireField: boundedOutputBudgetWireField(source.wireField ?? source.outputBudgetWireField ?? source.output_budget_wire_field ?? budgetTelemetry.wireField ?? budgetTelemetry.outputBudgetWireField ?? budgetTelemetry.output_budget_wire_field ?? observation.wireField ?? observation.outputBudgetWireField ?? observation.output_budget_wire_field ?? ""),
+    finishReason: boundedFinishReason(source.finishReason ?? source.finish_reason ?? budgetTelemetry.finishReason ?? budgetTelemetry.finish_reason ?? observation.finishReason ?? observation.finish_reason ?? ""),
+    usagePresent,
+    providerInputTokens,
+    providerOutputTokens,
+    providerReasoningTokens,
     observationHash,
     indexedApplicableCount: boundedNullableCount(firstNumber(source.indexedApplicableCount, context.indexedApplicableCount, observation.indexedApplicableCount)),
     routedCount: boundedNullableCount(firstNumber(source.routedCount, context.routedCount, observation.routedCount, queueTelemetry.routedCandidateCount)),
@@ -73275,6 +75052,30 @@ function aiGatewayDebugDiagnosticRecord(value = {}) {
     distinctBodyCount: boundedNullableCount(firstNumber(source.distinctBodyCount, context.distinctBodyCount, observation.distinctBodyCount)),
     missingProvenanceCount: boundedNullableCount(firstNumber(source.missingProvenanceCount, context.missingProvenanceCount, observation.missingProvenanceCount)),
     positiveLossCount: boundedNullableCount(firstNumber(source.positiveLossCount, context.positiveLossCount, observation.positiveLossCount)),
+    projectionProtectedCount: boundedNullableCount(firstNumber(source.projectionProtectedCount, context.projectionProtectedCount, observation.projectionProtectedCount)),
+    projectionRequiredCount: boundedNullableCount(firstNumber(source.projectionRequiredCount, context.projectionRequiredCount, observation.projectionRequiredCount)),
+    projectionOptionalGroupsAvailable: boundedNullableCount(firstNumber(source.projectionOptionalGroupsAvailable, context.projectionOptionalGroupsAvailable, observation.projectionOptionalGroupsAvailable)),
+    projectionOptionalGroupsOmitted: boundedNullableCount(firstNumber(source.projectionOptionalGroupsOmitted, context.projectionOptionalGroupsOmitted, observation.projectionOptionalGroupsOmitted)),
+    projectionInitialEstimatedInputTokens: boundedNullableCount(firstNumber(source.projectionInitialEstimatedInputTokens, context.projectionInitialEstimatedInputTokens, observation.projectionInitialEstimatedInputTokens)),
+    projectionFinalEstimatedInputTokens: boundedNullableCount(firstNumber(source.projectionFinalEstimatedInputTokens, context.projectionFinalEstimatedInputTokens, observation.projectionFinalEstimatedInputTokens)),
+    projectionOperationalInputMaximumTokens: boundedNullableCount(firstNumber(source.projectionOperationalInputMaximumTokens, context.projectionOperationalInputMaximumTokens, observation.projectionOperationalInputMaximumTokens)),
+    projectionReservedOmittedCount: boundedNullableCount(firstNumber(source.projectionReservedOmittedCount, context.projectionReservedOmittedCount, observation.projectionReservedOmittedCount)),
+    projectionPruningApplied: boundedNullableFlag(source.projectionPruningApplied ?? context.projectionPruningApplied ?? observation.projectionPruningApplied),
+    projectionProtectedCarrierStillOverTarget: boundedNullableFlag(source.projectionProtectedCarrierStillOverTarget ?? context.projectionProtectedCarrierStillOverTarget ?? observation.projectionProtectedCarrierStillOverTarget),
+    projectionCutoffLastOmittedHash: pickHash16(source.projectionCutoffLastOmittedHash, hashes.projectionCutoffLastOmittedHash, context.projectionCutoffLastOmittedHash, observation.projectionCutoffLastOmittedHash),
+    projectionCutoffFirstRetainedHash: pickHash16(source.projectionCutoffFirstRetainedHash, hashes.projectionCutoffFirstRetainedHash, context.projectionCutoffFirstRetainedHash, observation.projectionCutoffFirstRetainedHash),
+    projectionCutoffOmittedSetHash: pickHash16(source.projectionCutoffOmittedSetHash, hashes.projectionCutoffOmittedSetHash, context.projectionCutoffOmittedSetHash, observation.projectionCutoffOmittedSetHash),
+    projectionCutoffRetainedSetHash: pickHash16(source.projectionCutoffRetainedSetHash, hashes.projectionCutoffRetainedSetHash, context.projectionCutoffRetainedSetHash, observation.projectionCutoffRetainedSetHash),
+    projectionCutoffLastOmittedScoreBucket: boundedCutoffScoreBucket(source.projectionCutoffLastOmittedScoreBucket ?? context.projectionCutoffLastOmittedScoreBucket ?? observation.projectionCutoffLastOmittedScoreBucket ?? ""),
+    projectionCutoffFirstRetainedScoreBucket: boundedCutoffScoreBucket(source.projectionCutoffFirstRetainedScoreBucket ?? context.projectionCutoffFirstRetainedScoreBucket ?? observation.projectionCutoffFirstRetainedScoreBucket ?? ""),
+    projectionCutoffOmittedMissingScoreCount: boundedNullableCount(firstNumber(source.projectionCutoffOmittedMissingScoreCount, context.projectionCutoffOmittedMissingScoreCount, observation.projectionCutoffOmittedMissingScoreCount)),
+    projectionCutoffRetainedMissingScoreCount: boundedNullableCount(firstNumber(source.projectionCutoffRetainedMissingScoreCount, context.projectionCutoffRetainedMissingScoreCount, observation.projectionCutoffRetainedMissingScoreCount)),
+    projectionCutoffOmittedReservationCount: boundedNullableCount(firstNumber(source.projectionCutoffOmittedReservationCount, context.projectionCutoffOmittedReservationCount, observation.projectionCutoffOmittedReservationCount)),
+    projectionCutoffRetainedReservationCount: boundedNullableCount(firstNumber(source.projectionCutoffRetainedReservationCount, context.projectionCutoffRetainedReservationCount, observation.projectionCutoffRetainedReservationCount)),
+    projectionCutoffOmittedPredicateCount: boundedNullableCount(firstNumber(source.projectionCutoffOmittedPredicateCount, context.projectionCutoffOmittedPredicateCount, observation.projectionCutoffOmittedPredicateCount)),
+    projectionCutoffRetainedPredicateCount: boundedNullableCount(firstNumber(source.projectionCutoffRetainedPredicateCount, context.projectionCutoffRetainedPredicateCount, observation.projectionCutoffRetainedPredicateCount)),
+    projectionCutoffOriginalKeyCollisionCount: boundedNullableCount(firstNumber(source.projectionCutoffOriginalKeyCollisionCount, context.projectionCutoffOriginalKeyCollisionCount, observation.projectionCutoffOriginalKeyCollisionCount)),
+    projectionCutoffDeliveryKeyCollisionCount: boundedNullableCount(firstNumber(source.projectionCutoffDeliveryKeyCollisionCount, context.projectionCutoffDeliveryKeyCollisionCount, observation.projectionCutoffDeliveryKeyCollisionCount)),
     lexicalFallbackCount: boundedNullableCount(firstNumber(source.lexicalFallbackCount, context.lexicalFallbackCount, observation.lexicalFallbackCount)),
     fullCorpusScanCount: boundedNullableCount(firstNumber(source.fullCorpusScanCount, context.fullCorpusScanCount, observation.fullCorpusScanCount)),
     selectedHash,
@@ -73669,6 +75470,8 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
   );
   const shapeRequestedOutputTokens = outputShapeLimits.estimatedMaxVisibleTokens + profile.reasoning;
   const normalizedProvider = String(provider || "").trim().toLowerCase();
+  const ordinaryStructuredOpenRouterChat = !explicitMaxOutputTokens && normalizedProvider === "openrouter"
+    && (normalizedOperation === "chat-query" || normalizedOperation === "prompt-response") && schema != null;
   const dynamicRouter = normalizedProvider === "openrouter"
     ? openRouterAdaptiveModelProfile(settings, model).dynamicRouter
     : false;
@@ -73680,10 +75483,10 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
   // silently replace it with a smaller operation-derived value. This keeps
   // cross-provider benchmark envelopes comparable while retaining dynamic
   // efficiency for ordinary calls that do not specify a ceiling.
-  const boundedOutputCeiling = explicitMaxOutputTokens || profile.ceiling;
+  const boundedOutputCeiling = explicitMaxOutputTokens || (ordinaryStructuredOpenRouterChat ? 8192 : profile.ceiling);
   const dynamicTaskGenerationMinimum = normalizedOperation === "task-generation" && normalizedProvider === "openrouter" ? 6144 : profile.minimum;
   const dynamicShapeRequestedOutputTokens = outputShapeLimits.estimatedMaxVisibleTokens + dynamicReasoningHeadroom;
-  const requestedOutputTokens = explicitMaxOutputTokens || Math.min(boundedOutputCeiling, Math.max(dynamicTaskGenerationMinimum, profileRequestedOutputTokens, shapeRequestedOutputTokens, dynamicShapeRequestedOutputTokens, effortMinimum));
+  const requestedOutputTokens = explicitMaxOutputTokens || (ordinaryStructuredOpenRouterChat ? boundedOutputCeiling : Math.min(boundedOutputCeiling, Math.max(dynamicTaskGenerationMinimum, profileRequestedOutputTokens, shapeRequestedOutputTokens, dynamicShapeRequestedOutputTokens, effortMinimum)));
   const metadata = taskDescriptionProviderModelMetadata(settings, provider, model);
   const limits = taskDescriptionProviderLimits(metadata, provider);
   const providerOutputLimitTokens = Math.max(0, Number(limits.outputTokenLimitTokens || 0));
@@ -73731,7 +75534,7 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
     : effortMinimum;
   const minimumUsefulOutputTokens = Math.min(requestedOutputTokens, operationMinimumOutputTokens);
   const constrainedOutputTokens = Math.max(1, Math.floor(Math.min(...constraints)));
-  const dynamicRetryReserveTokens = !explicitMaxOutputTokens && dynamicRouter
+  const dynamicRetryReserveTokens = !explicitMaxOutputTokens && dynamicRouter && !ordinaryStructuredOpenRouterChat
     ? Math.min(AI_DYNAMIC_ROUTER_RETRY_RESERVE_TOKENS, Math.max(0, constrainedOutputTokens - minimumUsefulOutputTokens))
     : 0;
   const maxOutputTokens = Math.max(1, constrainedOutputTokens - dynamicRetryReserveTokens);
@@ -73754,7 +75557,7 @@ function aiDynamicOutputBudget({ operation = "", schema = null, request = {}, se
     reasoningHeadroomTokens: dynamicReasoningHeadroom,
     reasoningHeadroomMinimumTokens: dynamicRouter ? 3072 : profile.reasoning,
     requestedOutputTokens,
-    outputCeilingTokens: profile.ceiling,
+    outputCeilingTokens: ordinaryStructuredOpenRouterChat ? boundedOutputCeiling : profile.ceiling,
     retryReserveTokens: dynamicRetryReserveTokens,
     maxOutputTokens,
     minimumUsefulOutputTokens,
@@ -74273,6 +76076,23 @@ function aiGatewayBoundedProviderRetry(value = null) {
       ? value
       : "";
   };
+  const nullableCount = (input) => {
+    if (input === null || input === undefined || input === "") return null;
+    const num = Number(input);
+    if (!Number.isFinite(num) || num < 0) return null;
+    return Math.max(0, Math.min(1e9, Math.round(num)));
+  };
+  const boundedFinishReason = (input) => {
+    const text = String(input || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (!text) return "";
+    if (text === "max-tokens" || text === "max-output-tokens") return "length";
+    if (["stop", "length", "truncated", "tool-calls", "content-filter", "error"].includes(text)) return text;
+    return "other";
+  };
+  const boundedOutputBudgetWireField = (input) => {
+    const text = String(input || "");
+    return ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens", "options.num_predict"].includes(text) ? token(text, 32) : "";
+  };
   const provider = String(value.provider || "").trim().toLowerCase();
   const providerAttemptCeiling = 2;
   const attempts = (Array.isArray(value.attempts) ? value.attempts : []).slice(0, providerAttemptCeiling);
@@ -74314,7 +76134,15 @@ function aiGatewayBoundedProviderRetry(value = null) {
       }),
       retryOrdinal: number(source.retryOrdinal),
       rawHash: boundedHash(source.rawHash || source.rawSha256),
-      rawByteCount: number(source.rawByteCount || source.rawUtf8Bytes)
+      rawByteCount: number(source.rawByteCount || source.rawUtf8Bytes),
+      requestedMaxOutputTokens: nullableCount(source.requestedMaxOutputTokens ?? source.requested_max_output_tokens),
+      appliedMaxOutputTokens: nullableCount(source.appliedMaxOutputTokens ?? source.applied_max_output_tokens),
+      outputBudgetWireField: boundedOutputBudgetWireField(source.outputBudgetWireField ?? source.output_budget_wire_field),
+      finishReason: boundedFinishReason(source.finishReason ?? source.finish_reason),
+      usagePresent: Boolean(source.usagePresent ?? source.usage_present ?? false),
+      providerInputTokens: nullableCount(source.providerInputTokens ?? source.provider_input_tokens),
+      providerOutputTokens: nullableCount(source.providerOutputTokens ?? source.provider_output_tokens),
+      providerReasoningTokens: nullableCount(source.providerReasoningTokens ?? source.provider_reasoning_tokens)
     });
   });
   const first = boundedAttempts[0] || null;
@@ -75330,6 +77158,11 @@ class AIModelGateway {
       if (provider === "gemini" && !settings.googleApiKey) missing.add("Google API key");
       if (provider === "openrouter" && !settings.openrouterApiKey) missing.add("OpenRouter API key");
       if (provider === "opencodego" && !settings.opencodeGoApiKey) missing.add("OpenCode Go API key");
+      if (provider === "customopenai") {
+        try {
+          if (!STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(settings.customOpenAIBaseUrl, settings.customOpenAIAllowInsecureHttp === true)) missing.add("Custom OpenAI-compatible API root");
+        } catch { missing.add("Custom OpenAI-compatible API root"); }
+      }
       if (provider === "openwebui") {
         try {
           const auth = STS_MULTI_PROVIDER.openWebUIAuth(settings, { requestUrl: this.transport || requestUrl });
@@ -75926,15 +77759,20 @@ class AIModelGateway {
           text: typeof response?.text === "string" ? response.text : raw == null ? undefined : String(raw),
           rawText: typeof raw === "string" ? raw : raw == null ? undefined : String(raw),
           vectors: Array.isArray(response?.vectors) ? response.vectors : undefined,
-          models: response?.models || (plan.kind === "discover" ? {
-            chat: response?.chat || [],
-            embeddings: response?.embeddings || [],
-            metadata: response?.metadata || {},
-            embeddingMetadata: response?.embeddingMetadata || {},
-            contextTelemetry: response?.contextTelemetry || null,
-            fetchedAt: response?.fetchedAt || "",
-            metadataFingerprint: response?.metadataFingerprint || ""
-          } : undefined),
+          models: plan.kind === "discover"
+            ? response?.models && !Array.isArray(response.models)
+              ? response.models
+              : {
+                ...(Array.isArray(response?.models) ? { models: response.models } : {}),
+                chat: response?.chat || (Array.isArray(response?.models) ? response.models : []),
+                embeddings: response?.embeddings || [],
+                metadata: response?.metadata || {},
+                embeddingMetadata: response?.embeddingMetadata || {},
+                contextTelemetry: response?.contextTelemetry || null,
+                fetchedAt: response?.fetchedAt || "",
+                metadataFingerprint: response?.metadataFingerprint || ""
+              }
+            : response?.models,
           provider: String(response?.provider || reference.provider),
           model: String(response?.model || reference.model),
           requestedModel: String(response?.requestedModel || reference.model),
@@ -76568,6 +78406,7 @@ if (typeof module !== "undefined" && module.exports) {
     selectContextCandidatesForPlan,
     buildChatContextBundle,
     filterChatContextRowsForQuery,
+    attachTodoistInventoryCandidateChunks,
     finiteContextCandidateNumber,
     contextCandidateRelevanceScore,
     contextCandidateScore,
@@ -76587,7 +78426,8 @@ if (typeof module !== "undefined" && module.exports) {
     assertTaskReservedSemanticEvidenceDelivery,
     taskReservedSemanticEvidenceLineRange,
     taskSemanticScopeLineRanges,
-    taskDescriptionProviderConcurrency
+    taskDescriptionProviderConcurrency,
+    taskGenerationRunInitialBatchWorkers
   });
   module.exports.__taskGenerationValidation = Object.freeze({
     taskGenerationMicroBatchSettleMembers,
@@ -76675,6 +78515,7 @@ if (typeof module !== "undefined" && module.exports) {
     webResearchRequestSpecificInstruction,
     validateEvidenceAdequacy,
     classifyChatConversationRequest,
+    normalizeChatEvidencePayload,
     normalizeChatEvidencePayloadForValidation,
     normalizeChatProviderResponse,
     validateChatEvidencePayload,
@@ -76703,6 +78544,7 @@ if (typeof module !== "undefined" && module.exports) {
     aiGatewayAbsoluteDeadline,
     taskDescriptionProviderStructuredRetryReasonCode,
     taskDescriptionReferenceSetSha256,
+    taskGenerationStableFailureCode,
     valueSuppressingRecoveryTelemetry,
     taskGenerationProviderOutputContract,
     taskGenerationProviderFinalScopeContract,
@@ -77081,7 +78923,7 @@ function stsCreateRuntimeAiModelGateway(plugin) {
         openwebui: (request, adapterContext = {}) => {
           const auth = STS_MULTI_PROVIDER.openWebUIAuth(plugin.settings, adapterOptions);
           const requestOptions = Object.assign({}, adapterOptions, { timeoutMs: request.attemptDeadlineMs, signal: request.signal, onModelDispatch: request.onOpenWebUIModelDispatch, onRawOutput: request.hooks?.onRawOutput });
-          return STS_MULTI_PROVIDER.openWebUIChat(auth, plugin.settings, {
+            return STS_MULTI_PROVIDER.openWebUIChat(auth, plugin.settings, {
             model: request.model,
             system: request.system || "",
             user: request.user || "",
@@ -77107,6 +78949,25 @@ function stsCreateRuntimeAiModelGateway(plugin) {
             if (response?.usage && typeof plugin.recordAiTokenUsage === "function") plugin.recordAiTokenUsage(request.operation, response.model || request.model, response.usage, "openwebui");
             return response;
           });
+        },
+        customopenai: async (request, adapterContext = {}) => {
+          const response = await STS_MULTI_PROVIDER.customOpenAIGenerate(plugin.settings, {
+            model: request.model,
+            system: request.system || "",
+            user: request.user || "",
+            promptContextSuffix: request.promptContextSuffix || request.cacheMetadata?.promptContextSuffix || "",
+            promptCachePrefix: request.promptCachePrefix || request.cacheMetadata?.promptCachePrefix || "",
+            schema: request.schema || null,
+            maxOutputTokens: request.maxOutputTokens,
+            operation: request.operation
+          }, Object.assign({}, adapterOptions, {
+            timeoutMs: request.attemptDeadlineMs,
+            signal: adapterContext.signal || request.signal || null,
+            generationDispatchBudget: request.generationDispatchBudget,
+            attemptDeadlineMs: request.attemptDeadlineMs
+          }));
+          if (response?.usage && typeof plugin.recordAiTokenUsage === "function") plugin.recordAiTokenUsage(request.operation, response.model || request.model, response.usage, "customopenai");
+          return response;
         },
         opencodego: async (request, adapterContext = {}) => {
           const response = await STS_MULTI_PROVIDER.openCodeGoGenerate(plugin.settings, {
@@ -77141,7 +79002,13 @@ function stsCreateRuntimeAiModelGateway(plugin) {
         openwebui: (request) => {
           const auth = STS_MULTI_PROVIDER.openWebUIAuth(plugin.settings, adapterOptions);
           return STS_MULTI_PROVIDER.openWebUIEmbeddings(auth, Object.assign({}, plugin.settings, { embeddingModel: request.model }), request.texts || [], request.role || "document", Object.assign({}, adapterOptions, { timeoutMs: request.attemptDeadlineMs, signal: request.signal, onModelDispatch: request.onOpenWebUIModelDispatch }));
-        }
+        },
+        customopenai: (request, adapterContext = {}) => STS_MULTI_PROVIDER.customOpenAIEmbeddings(
+          Object.assign({}, plugin.settings, { embeddingModel: request.model }),
+          request.texts || [],
+          request.role || "document",
+          Object.assign({}, adapterOptions, { timeoutMs: request.attemptDeadlineMs, signal: adapterContext.signal || request.signal || null, attemptDeadlineMs: request.attemptDeadlineMs })
+        )
       },
       discover: {
         openai: () => plugin._openAiDiscoveryAdapter(),
@@ -77153,14 +79020,16 @@ function stsCreateRuntimeAiModelGateway(plugin) {
             requestedModelIds: request.requestedModelIds || []
           }));
         },
-        opencodego: () => STS_MULTI_PROVIDER.openCodeGoDiscover(plugin.settings, adapterOptions)
+        opencodego: () => STS_MULTI_PROVIDER.openCodeGoDiscover(plugin.settings, adapterOptions),
+        customopenai: () => STS_MULTI_PROVIDER.customOpenAIDiscover(plugin.settings, adapterOptions)
       },
       "setup-check": {
         openai: () => ({ provider: "openai", connected: Boolean(plugin.settings.openaiApiKey) }),
         gemini: () => ({ provider: "gemini", connected: Boolean(plugin.settings.googleApiKey) }),
         openrouter: () => ({ provider: "openrouter", connected: Boolean(plugin.settings.openrouterApiKey) }),
         openwebui: () => ({ provider: "openwebui", connected: Boolean(plugin.settings.openwebuiBaseUrl) }),
-        opencodego: () => ({ provider: "opencodego", connected: Boolean(plugin.settings.opencodeGoApiKey) })
+        opencodego: () => ({ provider: "opencodego", connected: Boolean(plugin.settings.opencodeGoApiKey) }),
+        customopenai: () => ({ provider: "customopenai", connected: STS_MULTI_PROVIDER.providerAccessReady(plugin.settings, "customopenai") })
       }
     }
   });
@@ -77171,7 +79040,11 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
   const embeddingIdentity = (settings = {}) => {
     const reference = STS_MULTI_PROVIDER.embeddingModelReference(settings) || {};
     const dimension = embeddingDimensionOverride(settings, reference.provider, reference.model);
-    return `${reference.provider || ""}:${reference.model || ""}:${dimension}`;
+    let baseUrl = "";
+    if (reference.provider === "customopenai") {
+      try { baseUrl = STS_MULTI_PROVIDER.normalizeCustomOpenAIBaseUrl(settings.customOpenAIBaseUrl, true); } catch {}
+    }
+    return `${reference.provider || ""}:${baseUrl}:${reference.model || ""}:${dimension}`;
   };
   const invalidateOpenRouterMetadataCaches = (plugin) => {
     plugin.contextQueryProfileCache?.clear?.();
@@ -77901,10 +79774,11 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     if (this.settings.googleApiKey) providers.add("gemini");
     if (this.settings.openrouterApiKey) providers.add("openrouter");
     if (this.settings.openwebuiBaseUrl) providers.add("openwebui");
+    if (this.settings.customOpenAIBaseUrl) providers.add("customopenai");
     if (this.settings.opencodeGoApiKey) providers.add("opencodego");
-    if (!providers.size) throw new Error("Add an OpenAI, Google Gemini, OpenRouter, Open WebUI, or OpenCode Go credential first.");
+    if (!providers.size) throw new Error("Add an OpenAI, Google Gemini, OpenRouter, Open WebUI, Custom OpenAI-compatible endpoint, or OpenCode Go credential first.");
     const orderedProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.filter((provider) => providers.has(provider) && (!normalizedProviderFilter || provider === normalizedProviderFilter));
-    const loaded = { openai: 0, gemini: 0, openrouter: 0, openwebui: 0, opencodego: 0 };
+    const loaded = { openai: 0, gemini: 0, openrouter: 0, openwebui: 0, customopenai: 0, opencodego: 0 };
     const successfulProviders = [];
     const providerFailures = [];
     const discoveryAttempts = {};
@@ -77974,6 +79848,13 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
           derivedChangedKeys.push("availableOpenCodeGoModels", "opencodeGoModelMetadata", "opencodeGoModelsFetchedAt");
           repairDiscoveredProvider(provider);
         }
+        if (provider === "customopenai") {
+          this.settings.availableCustomOpenAIModels = Array.isArray(models.models) ? models.models : chat;
+          this.settings.customOpenAIModelMetadata = models.metadata || {};
+          this.settings.customOpenAIModelsFetchedAt = models.fetchedAt || deviceTimestamp();
+          derivedChangedKeys.push("availableCustomOpenAIModels", "customOpenAIModelMetadata", "customOpenAIModelsFetchedAt");
+          repairDiscoveredProvider(provider);
+        }
         loaded[provider] = chat.length + embeddings.length;
         successfulProviders.push(provider);
       } catch (error) {
@@ -78033,6 +79914,8 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
             ? ["availableOpenWebUIModels", "availableOpenWebUIEmbeddingModels", "openwebuiModelMetadata", "openwebuiModelsFetchedAt"]
             : normalizedProviderFilter === "opencodego"
               ? ["availableOpenCodeGoModels", "opencodeGoModelMetadata", "opencodeGoModelsFetchedAt"]
+              : normalizedProviderFilter === "customopenai"
+                ? ["availableCustomOpenAIModels", "customOpenAIModelMetadata", "customOpenAIModelsFetchedAt"]
               : [];
     const changedKeys = Array.from(new Set([...derivedChangedKeys, ...providerDerivedKeys, ...(this.providerModelRoleRepairTelemetry?.changed ? ["aiOperationModels"] : [])]));
     await this.saveSettings(normalizedProviderFilter
@@ -78042,7 +79925,7 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
     if (embeddingIdentity(this.settings) !== previousEmbeddingIdentity) this.queryEmbeddingCache?.clear?.();
     stsMpRefreshSearchableComboboxes();
     if (showNotice) {
-      const loadedSummary = `Loaded ${loaded.openai} OpenAI, ${loaded.gemini} Gemini, ${loaded.openrouter} OpenRouter, and ${loaded.openwebui} Open WebUI models.`;
+       const loadedSummary = `Loaded ${loaded.openai} OpenAI, ${loaded.gemini} Gemini, ${loaded.openrouter} OpenRouter, ${loaded.openwebui} Open WebUI, ${loaded.customopenai} Custom OpenAI-compatible, and ${loaded.opencodego} OpenCode Go models.`;
       new Notice(providerFailures.length ? `${loadedSummary} ${refreshResult.summary}` : loadedSummary);
     }
     return refreshResult;
@@ -78065,9 +79948,12 @@ function stsMpParseProviderScopedValue(value) {
   const separator = raw.indexOf(":");
   if (separator < 1) return null;
   const token = raw.slice(0, separator).trim().toLowerCase().replace(/[-_\s]/g, "");
-  const provider = ({ openai: "openai", gemini: "gemini", google: "gemini", openrouter: "openrouter", router: "openrouter", openwebui: "openwebui", webui: "openwebui", selfhostedopenwebui: "openwebui" })[token];
+  const provider = ({ openai: "openai", gemini: "gemini", google: "gemini", openrouter: "openrouter", router: "openrouter", openwebui: "openwebui", webui: "openwebui", selfhostedopenwebui: "openwebui", customopenai: "customopenai", openaicompatible: "customopenai", opencodego: "opencodego" })[token];
   if (!provider) return null;
-  return STS_MULTI_PROVIDER.normalizeModelReference({ provider, model: raw.slice(separator + 1).trim() });
+  const reference = STS_MULTI_PROVIDER.normalizeModelReference({ provider, model: raw.slice(separator + 1).trim() });
+  if (!reference) return null;
+  if (provider === "opencodego" && !STS_MULTI_PROVIDER.openCodeGoTransportForModel?.(reference.model)) return null;
+  return reference;
 }
 
 function stsMpManualModelRow(value, allowedProviders = STS_MULTI_PROVIDER.PROVIDERS, settings = null) {
@@ -78791,20 +80677,37 @@ function stsMpEmbeddingModelSetting(containerEl, plugin, refreshDisplay = null) 
 }
 
 function stsMpEmbeddingFallbackModelSetting(containerEl, plugin, refreshDisplay = null) {
-  const settings = plugin.settings || {};
+  let settings = plugin.settings || {};
   const primary = STS_MULTI_PROVIDER.embeddingModelReference(settings);
-  const current = STS_MULTI_PROVIDER.embeddingFallbackModelReference(settings);
-  const provider = STS_MULTI_PROVIDER.normalizeProvider(current?.provider || settings.embeddingFallbackProvider || primary?.provider, "openai");
+  let current = STS_MULTI_PROVIDER.embeddingFallbackModelReference(settings);
+  if (current?.provider === "opencodego" || settings.embeddingFallbackProvider === "opencodego") {
+    plugin.settings = STS_MULTI_PROVIDER.clearEmbeddingFallbackModelReference(settings);
+    plugin.settings.embeddingFallbackProvider = "";
+    settings = plugin.settings;
+    current = null;
+    Promise.resolve(plugin.saveSettings?.()).catch(() => {});
+  }
+  const configuredProvider = STS_MULTI_PROVIDER.normalizeProvider(current?.provider || settings.embeddingFallbackProvider || primary?.provider, "openai");
+  const provider = configuredProvider === "opencodego" ? STS_MULTI_PROVIDER.normalizeProvider(primary?.provider, "openai") : configuredProvider;
+  const fallbackProviders = STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER.filter((candidate) => candidate !== "opencodego");
   const providerSetting = new Setting(containerEl)
     .setName("Embedding fallback provider")
     .setDesc("Choose the provider scope for the explicit embedding fallback selector. The fallback is never synthesized automatically.");
   providerSetting.settingEl?.addClass?.("semantic-todoist-provider-setting");
   providerSetting.addDropdown((dropdown) => {
-    for (const candidate of STS_MULTI_PROVIDER.PROVIDER_DISPLAY_ORDER) dropdown.addOption(candidate, STS_MULTI_PROVIDER.providerDisplayName(candidate));
+    for (const candidate of fallbackProviders) dropdown.addOption(candidate, STS_MULTI_PROVIDER.providerDisplayName(candidate));
     dropdown.setValue(provider || STS_MULTI_PROVIDER.normalizeProvider(primary?.provider, "openai"));
     dropdown.onChange(async (value) => {
       try {
-        plugin.settings.embeddingFallbackProvider = STS_MULTI_PROVIDER.normalizeProvider(value, "openai");
+        const nextProvider = STS_MULTI_PROVIDER.normalizeProvider(value, "openai");
+        if (nextProvider === "opencodego") {
+          plugin.settings = STS_MULTI_PROVIDER.clearEmbeddingFallbackModelReference(plugin.settings);
+          plugin.settings.embeddingFallbackProvider = "";
+          await plugin.saveSettings();
+          refreshDisplay?.();
+          return;
+        }
+        plugin.settings.embeddingFallbackProvider = nextProvider;
         plugin.settings = STS_MULTI_PROVIDER.clearEmbeddingFallbackModelReference(plugin.settings);
         await plugin.saveSettings();
         refreshDisplay?.();
@@ -78831,6 +80734,7 @@ function stsMpEmbeddingFallbackModelSetting(containerEl, plugin, refreshDisplay 
     onSelect: async (row) => {
       const selected = stsMpParseProviderScopedValue(row?.value || "");
       if (!selected) return;
+      if (STS_MULTI_PROVIDER.normalizeProvider(selected.provider, "") === "opencodego") return;
       if (row?.source === "manual-entry") stsMpRememberManualProviderModel(plugin, "manualProviderEmbeddingModels", selected);
       try {
         plugin.settings = STS_MULTI_PROVIDER.setEmbeddingFallbackModelReference(plugin.settings, selected);
@@ -79406,36 +81310,117 @@ function stsMpRenderOpenWebUILearnedProfiles(containerEl, plugin, refreshDisplay
   return list;
 }
 
-function stsMpRenderProviderAccessSettings(containerEl, plugin, refreshDisplay = null) {
-  settingsHeading(containerEl, "OpenRouter", "Full provider/model slugs use the non-streaming Chat Completions and embeddings endpoints. Keys stay local and are never included in diagnostics.", { status: settingsProviderStatus(plugin, "openrouter") });
+function stsMpRenderProviderAccessSettings(containerEl, plugin, refreshDisplay = null, selectedProvider = "openai") {
+  const { provider } = stsMpAiProviderSettingsView(selectedProvider);
+  if (provider === "openai") {
+    settingsHeading(containerEl, "OpenAI", "Configure the OpenAI credential used by OpenAI operations.", { status: settingsProviderStatus(plugin, "openai") });
+    stsMpProviderApiKeySetting(containerEl, "OpenAI API key", "Saved on blur. A changed non-empty key refreshes the OpenAI model list once; intermediate and empty values do not refresh.", plugin, "openaiApiKey", "openai");
+    return;
+  }
+  if (provider === "gemini") {
+    settingsHeading(containerEl, "Google Gemini", "Configure the Google Gemini credential used by Gemini operations.", { status: settingsProviderStatus(plugin, "gemini") });
+    stsMpProviderApiKeySetting(containerEl, "Google Gemini API key", "Saved on blur. A changed non-empty key refreshes the Gemini model list once; intermediate and empty values do not refresh.", plugin, "googleApiKey", "gemini");
+    return;
+  }
+  if (provider === "openrouter") {
+    settingsHeading(containerEl, "OpenRouter", "Full provider/model slugs use the non-streaming Chat Completions and embeddings endpoints. Keys stay local and are never included in diagnostics.", { status: settingsProviderStatus(plugin, "openrouter") });
     stsMpProviderApiKeySetting(containerEl, "OpenRouter API key", "Saved on blur. A changed non-empty key refreshes the OpenRouter model list once; intermediate and empty values do not refresh.", plugin, "openrouterApiKey", "openrouter");
-  new Setting(containerEl)
-    .setName("OpenRouter adaptive profiles")
-    .setDesc(stsMpOpenRouterAdaptiveProfileSummary(plugin));
-  settingsHeading(containerEl, "Self-Hosted OpenWebUI", "Open WebUI can use an API key or an explicit email/password login. Passwords are held only in the login action and discarded after authentication.", { status: settingsProviderStatus(plugin, "openwebui") });
-  stsMpOpenWebUICommittedTextSetting(containerEl, "Open WebUI base URL", "Saved on blur. HTTPS is required unless insecure HTTP is explicitly enabled. A changed complete URL refreshes the current model list once; intermediate and empty values do not refresh.", plugin, "openwebuiBaseUrl", (value) => String(value || "").trim(), true);
-  stsMpRenderOpenWebUIAuthModeSetting(containerEl, plugin, refreshDisplay);
-  stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin);
-  toggleSetting(containerEl, "Allow insecure Open WebUI HTTP", "Disabled by default. Enable only for a deliberately trusted local HTTP endpoint.", plugin, "openwebuiAllowInsecureHttp");
-  new Setting(containerEl)
-    .setName("OpenWebUI native thinking")
-    .setDesc(settingDescription("OpenWebUI native thinking", "openwebuiThinkingMode", "Enabled sends native Ollama thinking only when the exact model advertises thinking. Model default normally omits native thinking fields; an exact model profile may enable thinking when live discovery advertises support."))
-    .addDropdown((dropdown) => {
-      dropdown.addOption("enabled", "Enabled");
-      dropdown.addOption("model-default", "Model default");
-      dropdown.setValue(normalizeOpenWebUIThinkingMode(plugin.settings.openwebuiThinkingMode)).onChange(async (value) => {
-        plugin.settings.openwebuiThinkingMode = normalizeOpenWebUIThinkingMode(value);
-        await plugin.saveSettings();
+    new Setting(containerEl)
+      .setName("OpenRouter adaptive profiles")
+      .setDesc(stsMpOpenRouterAdaptiveProfileSummary(plugin));
+    return;
+  }
+  if (provider === "openwebui") {
+    settingsHeading(containerEl, "Self-Hosted OpenWebUI", "Open WebUI can use an API key or an explicit email/password login. Passwords are held only in the login action and discarded after authentication.", { status: settingsProviderStatus(plugin, "openwebui") });
+    stsMpOpenWebUICommittedTextSetting(containerEl, "Open WebUI base URL", "Saved on blur. HTTPS is required unless insecure HTTP is explicitly enabled. A changed complete URL refreshes the current model list once; intermediate and empty values do not refresh.", plugin, "openwebuiBaseUrl", (value) => String(value || "").trim(), true);
+    stsMpRenderOpenWebUIAuthModeSetting(containerEl, plugin, refreshDisplay);
+    stsMpRenderOpenWebUIAuthCredentials(containerEl, plugin);
+    toggleSetting(containerEl, "Allow insecure Open WebUI HTTP", "Disabled by default. Enable only for a deliberately trusted local HTTP endpoint.", plugin, "openwebuiAllowInsecureHttp");
+    new Setting(containerEl)
+      .setName("OpenWebUI native thinking")
+      .setDesc(settingDescription("OpenWebUI native thinking", "openwebuiThinkingMode", "Enabled sends native Ollama thinking only when the exact model advertises thinking. Model default normally omits native thinking fields; an exact model profile may enable thinking when live discovery advertises support."))
+      .addDropdown((dropdown) => {
+        dropdown.addOption("enabled", "Enabled");
+        dropdown.addOption("model-default", "Model default");
+        dropdown.setValue(normalizeOpenWebUIThinkingMode(plugin.settings.openwebuiThinkingMode)).onChange(async (value) => {
+          plugin.settings.openwebuiThinkingMode = normalizeOpenWebUIThinkingMode(value);
+          await plugin.saveSettings();
+        });
+      });
+    setupStatusSetting(containerEl, "Open WebUI status", (() => {
+      try {
+        const status = plugin.openWebUIAuthStatus();
+        return status.authenticated ? `Connected (${status.authMode})` : `Not connected (${status.authMode})`;
+      } catch (error) { return error.message || String(error); }
+    })());
+    stsMpRenderOpenWebUIContextSettings(containerEl, plugin);
+    stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin);
+    stsMpRenderOpenWebUILearnedProfiles(containerEl, plugin, refreshDisplay);
+    return;
+  }
+  if (provider === "customopenai") {
+    settingsHeading(containerEl, "Custom OpenAI-compatible", "Use one complete OpenAI-compatible API root, such as http://127.0.0.1:11434/v1 for Ollama. Structured workflows require native response_format.json_schema support; model capabilities are not inferred.", { status: settingsProviderStatus(plugin, "customopenai") });
+    const endpointSetting = new Setting(containerEl)
+      .setName("Custom API root")
+      .setDesc("Saved on blur. Include the complete versioned root such as /v1. Invalid values stay unsaved; a changed valid root clears the old catalog and refreshes once.");
+    let pendingEndpoint = String(plugin.settings.customOpenAIBaseUrl || "");
+    let committedEndpoint = pendingEndpoint;
+    endpointSetting.addText((text) => {
+      text.inputEl.type = "text";
+      text.inputEl.placeholder = "http://127.0.0.1:11434/v1";
+      text.setValue(committedEndpoint);
+      text.inputEl.addEventListener("input", () => { pendingEndpoint = text.inputEl.value; });
+      text.inputEl.addEventListener("blur", async () => {
+        const result = await stsMpCommitCustomOpenAIBaseUrl(plugin, pendingEndpoint);
+        if (!result.accepted) {
+          text.setValue(committedEndpoint);
+          pendingEndpoint = committedEndpoint;
+          const message = result.code === "custom-provider-insecure-http"
+            ? "Insecure HTTP is disabled. Enable it only for a deliberately trusted local network."
+            : "Enter a valid HTTP(S) API root without credentials, query parameters, or fragments.";
+          new Notice(message);
+          return;
+        }
+        committedEndpoint = result.normalized;
+        pendingEndpoint = committedEndpoint;
+        text.setValue(committedEndpoint);
+        refreshDisplay?.();
       });
     });
-  setupStatusSetting(containerEl, "Open WebUI status", (() => {
-    try {
-      const status = plugin.openWebUIAuthStatus();
-      return status.authenticated ? `Connected (${status.authMode})` : `Not connected (${status.authMode})`;
-    } catch (error) { return error.message || String(error); }
-  })());
-  stsMpRenderOpenWebUIContextSettings(containerEl, plugin);
-  stsMpRenderOpenWebUIConcurrencySettings(containerEl, plugin);
+    new Setting(containerEl)
+      .setName("Allow insecure custom-provider HTTP")
+      .setDesc("Off by default. Enable only on a deliberately trusted local network; disabling it immediately blocks HTTP dispatch and unloads the active custom semantic partition.")
+      .addToggle((toggle) => {
+        toggle.setValue(plugin.settings.customOpenAIAllowInsecureHttp === true);
+        toggle.onChange(async (value) => {
+          await stsMpCommitCustomOpenAIAllowInsecureHttp(plugin, value === true);
+          refreshDisplay?.();
+        });
+      });
+    const keySetting = new Setting(containerEl)
+      .setName("Custom API key (optional)")
+      .setDesc("Stored as a password and sent as Bearer authentication only when non-empty. A changed non-empty key refreshes once; clearing it does not.");
+    let pendingKey = String(plugin.settings.customOpenAIApiKey || "");
+    keySetting.addText((text) => {
+      text.inputEl.type = "password";
+      text.setValue(pendingKey);
+      text.inputEl.addEventListener("input", () => { pendingKey = text.inputEl.value; });
+      text.inputEl.addEventListener("blur", async () => {
+        await stsMpCommitCustomOpenAIApiKey(plugin, pendingKey);
+        text.setValue(String(plugin.settings.customOpenAIApiKey || ""));
+        pendingKey = String(plugin.settings.customOpenAIApiKey || "");
+        refreshDisplay?.();
+      });
+    });
+    new Setting(containerEl)
+      .setName("Custom model list")
+      .setDesc(settingsProviderStatus(plugin, "customopenai"))
+      .addButton((button) => button.setButtonText("Refresh").onClick(async () => {
+        await stsMpRefreshOpenWebUIModelsAfterCommit(plugin, "customopenai", { manual: true });
+        refreshDisplay?.();
+      }));
+    return;
+  }
   settingsHeading(containerEl, "OpenCode Go", "OpenCode Go provides generation only. It does not provide embeddings.", { status: settingsProviderStatus(plugin, "opencodego") });
   stsMpProviderApiKeySetting(containerEl, "OpenCode Go API key", "Saved on blur. A changed non-empty key refreshes the OpenCode Go generation model list once. OpenCode Go does not provide embeddings; choose an embedding provider separately above.", plugin, "opencodeGoApiKey", "opencodego");
 }

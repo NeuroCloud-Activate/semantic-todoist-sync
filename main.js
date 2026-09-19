@@ -3968,19 +3968,19 @@ const TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE = "Semantic disambiguation: 
 const TASK_DESCRIPTION_EXECUTION_SELECTION_RULE = "Silently inspect every task-local execution candidate and every supplied semantic-context evidence bundle item before drafting. Efficiently use each supported detail that materially changes how the task can be acted on, including applicable intent, current state, actor or recipient, artifact details, criteria or conditions, dependencies or handoffs, timing, and substantive review history. Include all materially necessary semantic-context detail accurately and relevantly; do not omit context needed to execute the task. Omit a candidate only when it is stale, irrelevant, redundant, non-actionable, or already fully expressed by another selected detail. Never mention the semantic bundle, retrieval process, scores, or internal evidence metadata in prose.";
 const TASK_DESCRIPTION_CANONICAL_REFERENCE_AUDIT_RULE = "Before returning a description, audit its canonical references. Sentence-local fact_refs are asserted claims, never related-source tags. Never attach a requested-action fact_ref merely because it describes the task. Never reuse one fact_ref as a placeholder for a different sentence; and each sentence containing fact_ref F must contain the evidenceId from executionCandidatesByFactId[F] or shared factsById[F] in that sentence's evidence_ids and must affirmatively and independently state that canonical fact with the same polarity and epistemic state, preserving its exact names, codes, numbers, and other identifying anchors. If one sentence cannot independently state every referenced fact, split the claims into separate sentences or remove each unstated fact_ref and its evidence_id. The union of description_sentences[].fact_refs must exactly equal the top-level fact_refs actually stated.";
 const TASK_DESCRIPTION_SOURCE_REFERENCE_RULE = "At the start of drafting, keep the narrative free of direct source-note, filename, subject, or source-container references. Do not write according to this note, the source document states, from the email, the active note, or equivalent attribution; source references belong only in the final Sources/Context Notes citation list rendered by the plugin. A document, email, PDF, spreadsheet, or file may still be named when it is the actionable working artifact rather than the source container.";
-const TASK_DESCRIPTION_NARRATIVE_RULE = "Write descriptions as natural narrative prose, not a title echo, metadata list, evidence dump, or citation-only fragment. Carry the current, relevant context needed to accomplish the task accurately, including material intent, state, dependencies, criteria, timing, recipient, reviewer history, and handoffs when supported and useful.";
-const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin automatically repairs title echoes, explicit source-attribution lead-ins, and missing canonical semantic fact/evidence links when the supplied prose already expresses the fact; if the fact was omitted, it adds only the exact contract-bound fact surface as a narrative sentence. It then rejects and retries any description that still violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
-const TASK_DESCRIPTION_TITLE_ECHO_RULE = "The task title is already the task's name and is NOT the brief. Never repeat, paraphrase, restate, or lightly reword the task title or its requested-action fact as the description, even when a citation is appended; a description that merely restates the title will be rejected as a title echo. The description must instead add the grounded execution detail that is NOT in the title, drawn from the task-local evidence bundle: the who, what specifically, criteria, dependencies, timing, artifact details, recipients, review expectations, handoffs, and current or history state. If you find yourself about to write the same words as the title, stop and open with a distinct execution sentence derived from the evidence instead, for example Send Jim and Cheryl the finalized panel so they can review it. rather than repeating Send Jim and Cheryl the final reviewer panel.";
+const TASK_DESCRIPTION_NARRATIVE_RULE = "Write descriptions as natural narrative prose, not merely a title echo, metadata list, evidence dump, or citation-only fragment. First inspect the complete task-local evidence bundle. When supported material or execution detail exists, carry the relevant current context needed to accomplish the task accurately, including intent, state, dependencies, criteria, timing, recipient, reviewer history, and handoffs. If the closed contract contains no additional supported detail beyond the requested action, write a complete grounded action sentence without inventing detail merely to create stylistic novelty.";
+const TASK_DESCRIPTION_VALIDATION_REPAIR_RULE = "Every description is validated independently after the cached batched generation call. The plugin may remove explicit source-attribution lead-ins and attach missing canonical semantic fact/evidence links only when the supplied prose already expresses the fact; it does not rewrite prose merely to reduce title similarity. If the fact was omitted, it adds only the exact contract-bound fact surface as a narrative sentence. It then rejects and retries any description that violates the narrative, evidence, citation, or semantic-context contract; write output that already satisfies these rules.";
+const TASK_DESCRIPTION_TITLE_ECHO_RULE = "The task title names the requested action but is not always the complete execution brief. When the task-local evidence contains supported material or execution detail, use the relevant who, what specifically, criteria, dependencies, timing, artifact details, recipients, review expectations, handoffs, and current or history state. If the closed contract contains no additional supported detail, a complete grounded restatement is acceptable; never invent detail merely to make the wording differ from the title. Keep every stated fact bound to its exact canonical evidence_id and fact_ref.";
 const TASK_GENERATION_EXPLICIT_URGENCY_RULE = "Map explicit task-local urgency faithfully: ASAP, urgent, immediately, critical, blocking, overdue, highest priority, and top priority require Todoist priority 4 unless the configured priority instructions explicitly assign that exact task a different priority. Do not convert urgency into an invented calendar date; a due date or deadline requires the configured date rules and supplied timing evidence, and may be derived from that supplied natural timing guidance per those rules. Never fabricate a date when no timing basis is supplied.";
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be concise but standalone and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Action/requested-action facts and current-source grounding are required. A supplied exact-scope fact that changes the action, object, actor, timing, or applicable condition must be reflected when omitting it would make the title materially wrong or ambiguous; supporting execution history belongs in the description. Merely related candidate evidence remains advisory. Never use merely same-topic history to satisfy execution-detail coverage.";
-const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `${TASK_DESCRIPTION_NARRATIVE_RULE} ${TASK_DESCRIPTION_SOURCE_REFERENCE_RULE} ${TASK_DESCRIPTION_VALIDATION_REPAIR_RULE} Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Do not open by repeating or paraphrasing the title. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
+const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = `${TASK_DESCRIPTION_NARRATIVE_RULE} ${TASK_DESCRIPTION_SOURCE_REFERENCE_RULE} ${TASK_DESCRIPTION_VALIDATION_REPAIR_RULE} Descriptions must be complete, actionable, and bounded by supplied task-local evidence. Prefer supported execution detail over title restatement, but do not invent detail when the closed contract has none. ${TASK_DESCRIPTION_EXECUTION_SELECTION_RULE} Every fact actually stated must carry its exact canonical fact_ref and evidence_id.`;
 const TASK_GENERATION_PROMPT_CONTRACT_ID = "semantic-todoist-task-generation";
 const TASK_GENERATION_PROMPT_CONTRACT_VERSION = 1;
 const TASK_GENERATION_PROMPT_CONTRACT = Object.freeze({
   id: TASK_GENERATION_PROMPT_CONTRACT_ID,
   version: TASK_GENERATION_PROMPT_CONTRACT_VERSION,
   taskGuidance: `${TASK_GENERATION_SHARED_TASK_GUIDANCE} Before stopping at the first useful fact, inspect supported exact-scope dependencies, handoffs, and reviewer history.`,
-  descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Do not compress a supported execution brief into a one-line title or action restatement.`
+  descriptionGuidance: `${TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE} Do not compress a supported execution brief into a one-line action when the evidence supplies more detail; a grounded action restatement is permitted only when no additional supported detail exists.`
 });
 
 function taskGenerationPromptContract() {
@@ -4034,7 +4034,7 @@ function taskDescriptionSystemInstruction() {
     "Write a standalone, task-specific execution brief as one continuous natural narrative with complete sentences.",
     TASK_DESCRIPTION_EXECUTION_SELECTION_RULE,
     "When selected conditional criteria are useful to execution, translate them into the concrete review, verification, or decision needed: state what must be confirmed and which requirement applies in each supported branch. When one selected fact names a person or item and another selected fact says a rule applies only if a condition is true, explicitly tell the user to confirm whether that person or item meets the condition and apply the rule only if they do. Never claim that the conditional rule applies merely because the person or item was named. Do not open with From <date>, From the note, or similar source-container narration, and omit message-history narration unless the communication itself changes execution.",
-    "Do not use a title-only or slight-restatement description. Open with direct execution sentences rather than repeating or paraphrasing the task title.",
+    "Open with direct execution sentences using supported material and execution detail. When the closed contract has no additional supported detail, a complete grounded action sentence is acceptable; never invent detail merely to avoid title similarity.",
     "Do not refer to the source note, filename, or subject directly in the narrative; source references belong only in the final Sources/Context Notes citation list rendered by the plugin.",
     TASK_DESCRIPTION_ANTI_FILLER_RULE,
     TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
@@ -21173,19 +21173,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         task,
         descriptionSourceContext,
         options.sourceContract,
-        this.settings
+        this.settings,
+        { preserveStructuredProse: true }
       );
       summary = repairedDescription.summary;
+      // Advisory-only title-similarity state for telemetry; never gates here.
+      const advisoryTitleState = structuredTaskTitleOverlapState(summary, task.content || "");
       const contractReason = structuredEvidence
         ? structuredTaskDescriptionQualityReason(summary, task, structuredRefs.bundle, descriptionSourceContext)
         : descriptionQualityReason(summary, task.content, this.settings, descriptionSourceContext, options.sourceContract);
       if (structuredEvidence && contractReason !== "passed") {
-        this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality") });
+        this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality"), advisoryTitleState });
       } else if (!structuredEvidence && contractReason !== "passed") {
-        this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality") });
+        this.logLocal("Task description style diagnostic", { taskIndex: item.index, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality"), advisoryTitleState });
       }
       const blockingDescriptionShape = !singleLine(summary).trim()
-        || /description has no task-focused narrative|prompt commentary|prompt-injection text|directly references source note|repeats task title/i.test(contractReason);
+        || /description has no task-focused narrative|prompt commentary|prompt-injection text|directly references source note/i.test(contractReason);
       if (blockingDescriptionShape) {
         failures.push({ taskIndex: item.index, reason: contractReason, reasonCode: taskDescriptionFailureReasonCode(contractReason, "quality"), stage: "quality" });
         continue;
@@ -32317,6 +32320,71 @@ function taskDescriptionSingletonContractDiagnostics(contract = null, item = {},
     selectedProtectedCurrentEvidenceCount: Math.max(0, Number(safe.selectedProtectedCurrentEvidenceCount || 0)),
     selectedProtectedFactCount: Math.max(0, Number(safe.selectedProtectedFactCount || 0)),
     invalidSingletonSubreason: String(safe.invalidSingletonSubreason || "")
+  };
+}
+function taskDescriptionContextAvailability(contract = {}, options = {}) {
+  const safe = contract || {};
+  const factsById = safe.factsById || safe.facts_by_id || {};
+  const evidenceById = safe.evidenceById || safe.evidence_by_id || {};
+  const executionCandidatesByFactId = safe.executionCandidatesByFactId || safe.execution_candidates_by_fact_id || {};
+
+  const refList = (camel, snake) => uniqueValues(
+    [...(camel || []), ...(snake || [])].map((value) => String(value)).filter((value) => value !== undefined && value !== null && value !== "")
+  );
+
+  const allowedFactIds = refList(safe.allowedFactIds, safe.allowed_fact_ids);
+  const materialDescriptionFactRefs = refList(safe.materialDescriptionFactRefs, safe.material_description_fact_refs);
+  const executionDetailFactRefs = refList(safe.executionDetailFactRefs, safe.execution_detail_fact_refs);
+  const availableDescriptionFactRefs = refList(safe.availableDescriptionFactRefs, safe.available_description_fact_refs);
+  const candidateSupportingFactRefs = refList(safe.candidateSupportingFactRefs, safe.candidate_supporting_fact_refs);
+  const requiredCurrentFactIds = refList(safe.requiredCurrentFactIds, safe.required_current_fact_ids);
+
+  const factValues = (fact) => [fact?.type, fact?.kind, fact?.role].map((value) => String(value || "").trim().toLowerCase());
+  const isClosureFact = (fact) => Boolean(fact)
+    && (factValues(fact).includes("requested-action")
+      || factValues(fact).includes("requested_action")
+      || factValues(fact).includes("current-source")
+      || factValues(fact).includes("current_source"));
+
+  const closureFactIds = uniqueValues(
+    allowedFactIds.filter((factId) => isClosureFact(factsById[factId] || executionCandidatesByFactId[factId]))
+  );
+  const closureExists = closureFactIds.length > 0;
+  const contractValid = safe.valid !== false;
+
+  const usableSourceFacts = (fact) => {
+    if (!fact) return false;
+    if (fact.current !== true) return false;
+    const authorityState = String(fact?.authorityState || fact?.authority_state || "authoritative").trim().toLowerCase();
+    if (authorityState !== "authoritative") return false;
+    const conflictState = String(fact?.conflictState || fact?.conflict_state || "none").trim().toLowerCase();
+    if (conflictState !== "none") return false;
+    const terminal = ["stale", "superseded", "tombstoned", "rejected", "blocked", "quarantined"].includes(String(fact?.currentState || fact?.current_state || fact?.status || "").trim().toLowerCase());
+    if (terminal) return false;
+    const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
+    if (!evidenceId || !evidenceById[evidenceId]) return false;
+    return true;
+  };
+
+  const candidateDetailRefs = uniqueValues([...materialDescriptionFactRefs, ...executionDetailFactRefs, ...candidateSupportingFactRefs]);
+  const usableDetailIds = uniqueValues(
+    candidateDetailRefs.filter((factId) => {
+      if (allowedFactIds.length > 0 && !allowedFactIds.includes(factId)) return false;
+      if (closureFactIds.includes(factId)) return false;
+      return usableSourceFacts(factsById[factId] || executionCandidatesByFactId[factId]);
+    })
+  );
+
+  const missingDetailAnomaly = contractValid && closureExists && usableDetailIds.length === 0;
+
+  return {
+    allowedFactCount: allowedFactIds.length,
+    materialFactCount: materialDescriptionFactRefs.length,
+    executionDetailFactCount: executionDetailFactRefs.length,
+    currentFactCount: requiredCurrentFactIds.length,
+    supportingFactCount: candidateSupportingFactRefs.length,
+    optionalEvidenceOmittedCount: Number(options?.omittedOptionalEvidenceIds?.length || 0),
+    missingDetailAnomaly: missingDetailAnomaly
   };
 }
 
@@ -48869,6 +48937,21 @@ function taskStructureTitleOverlap(left = "", right = "") {
   return tokenDiceScore(taskStructureObjectTokens(left), taskStructureObjectTokens(right));
 }
 
+// Advisory-only title-similarity label for the structured path. Non-blocking:
+// it reports how strongly a description echoes the task title (exact title,
+// title prefix, or high overlap at the existing diagnostic threshold) so
+// telemetry/contract can record it without affecting acceptance. Returns "none"
+// when either side is missing or the description diverges.
+function structuredTaskTitleOverlapState(left = "", taskTitle = "") {
+  const l = singleLine(left).trim();
+  const t = singleLine(taskTitle).trim();
+  if (!l || !t) return "none";
+  if (l.toLowerCase() === t.toLowerCase()) return "exact-title";
+  if (l.toLowerCase().startsWith(t.toLowerCase()) && l.length > t.length) return "prefix";
+  if (l.length <= t.length + 80 && taskStructureTitleOverlap(l, t) >= 0.86) return "high-overlap";
+  return "none";
+}
+
 function generatedTaskStructureIssues(tasks = []) {
   const issues = [];
   const add = (code, taskIndex, details = {}) => issues.push(Object.assign({ code, taskIndex, blocking: false }, details));
@@ -49868,7 +49951,8 @@ function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFA
   const currentSource = (bundle.items || []).find((item) => item.sourceKind === "current-source") || {};
   const repairedSummary = repairTaskDescriptionSourceReferences(summaryInput, task, {
     sourceTitle: active?.title || bundle.sourceContract?.title || currentSource.provenance?.title || "",
-    sourcePath: active?.path || bundle.sourceContract?.path || currentSource.provenance?.path || ""
+    sourcePath: active?.path || bundle.sourceContract?.path || currentSource.provenance?.path || "",
+    preserveStructuredProse: true
   }, bundle.sourceContract || null, settings);
   if (repairedSummary.reason !== "passed" && repairedSummary.summary) return "";
   const summary = normalizeDescriptionLinks(repairedSummary.summary, linkContext, settings);
@@ -50146,11 +50230,14 @@ function referencesSourceContainer(summary = "", task = {}, sourceContext = {}, 
   return false;
 }
 
-function taskDescriptionSourceReferenceReason(summary = "", task = {}, sourceContext = {}, sourceContract = null) {
+function taskDescriptionSourceReferenceReason(summary = "", task = {}, sourceContext = {}, sourceContract = null, options = {}) {
   const text = singleLine(splitDescriptionSourceListBlock(summary).summary || summary).trim();
   if (!text) return "description has no task-focused narrative";
   const taskTitle = singleLine(task.content || "");
-  if (taskTitle && (text.toLowerCase() === taskTitle.toLowerCase()
+  // Structured-path title suppression: the `repeats task title` block is now
+  // advisory-only in the structured path ({ structured: true }) and is removed
+  // from that gate entirely. It remains a hard block in the legacy path.
+  if (taskTitle && !options?.structured && (text.toLowerCase() === taskTitle.toLowerCase()
     || (text.length <= taskTitle.length + 80 && taskStructureTitleOverlap(text, taskTitle) >= 0.86))) {
     return "description repeats task title";
   }
@@ -50169,11 +50256,17 @@ function taskDescriptionSourceReferenceReason(summary = "", task = {}, sourceCon
   return "passed";
 }
 
-function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceContext = {}, sourceContract = null, settings = DEFAULT_SETTINGS) {
+function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceContext = {}, sourceContract = null, settings = DEFAULT_SETTINGS, options = {}) {
   const split = splitDescriptionSourceListBlock(value);
   const sourceTitle = singleLine(sourceContext.sourceTitle || sourceContext.title || sourceContract?.title || "");
+  // In the structured path, keep the provider's prose intact, including any
+  // task-title lead (advisory-only title suppression). Preserve when either the
+  // 6th options bag or the sourceContext advertises preserveStructuredProse.
+  const preserveStructuredProse = Boolean(options?.preserveStructuredProse || sourceContext?.preserveStructuredProse);
   let summary = cleanGeneratedDescriptionSummary(split.summary || "", settings);
-  summary = removeTitleEcho(summary, task.content || "");
+  if (!preserveStructuredProse) {
+    summary = removeTitleEcho(summary, task.content || "");
+  }
   for (const alias of sourceTitleAliases(sourceTitle)) {
     const lead = new RegExp(`^${escapeRegExp(alias).replace(/\s+/g, "\\s+")}(?:\\.md)?\\s+(?:records?|notes?|states?|says?|indicates?|mentions?|highlights?|identifies?|establishes?|describes?|explains?|shows?|captures?)(?:\\s+that)?\\s*`, "i");
     summary = summary.replace(lead, "");
@@ -50197,7 +50290,7 @@ function repairTaskDescriptionSourceReferences(value = "", task = {}, sourceCont
   return {
     summary: capitalizeSentenceStart(summary),
     sourceList: split.sourceList || "",
-    reason: taskDescriptionSourceReferenceReason(summary, task, sourceContext, sourceContract)
+    reason: taskDescriptionSourceReferenceReason(summary, task, sourceContext, sourceContract, { structured: preserveStructuredProse })
   };
 }
 
@@ -56468,11 +56561,16 @@ function validateTaskDescriptionEvidenceReferences(item = {}, task = {}, sourceC
   };
 }
 
-function structuredTaskDescriptionQualityReason(summary = "", task = {}, bundle = null, sourceContext = {}) {
+function structuredTaskDescriptionQualityReason(summary = "", task = {}, bundle = null, sourceContext = {}, options = {}) {
   const text = singleLine(summary);
   if (!text) return "description was empty";
   if (/\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior|system|developer)\s+instructions?\b/i.test(text)) return "description contained prompt-injection text";
-  return taskDescriptionSourceReferenceReason(text, task, sourceContext, bundle?.sourceContract || null);
+  // The structured gate never blocks on title repetition. Title similarity is
+  // advisory-only here. Preserve structured prose by default so a
+  // title-prefixed structured description is accepted rather than stripped;
+  // only explicit `preserveStructuredProse: false` would restore the block.
+  const preserveStructuredProse = options?.preserveStructuredProse !== false;
+  return taskDescriptionSourceReferenceReason(text, task, sourceContext, bundle?.sourceContract || null, { structured: preserveStructuredProse });
 }
 
 function taskWorkflowRequiredPromptBlock(sourceContract = {}, evidenceCatalog = {}, settings = DEFAULT_SETTINGS) {
@@ -81785,9 +81883,10 @@ if (typeof module !== "undefined" && module.exports) {
     validateTaskDescriptionSentences,
     taskDescriptionAcceptedCitationLedger,
     taskDescriptionProviderEnvelopeFit,
-    taskDescriptionOptionalPrunedContractView,
-    taskDescriptionProviderEvidenceGroups,
-    taskWorkflowEvidenceSourceList,
+     taskDescriptionOptionalPrunedContractView,
+     taskDescriptionProviderEvidenceGroups,
+     taskDescriptionContextAvailability,
+     taskWorkflowEvidenceSourceList,
     deduplicateGeneratedTaskBatch,
     taskGenerationBatchClosureState
   });

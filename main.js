@@ -32,7 +32,7 @@ const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
 const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
 const SCHEDULER_RELATED_GROUPING_POLICY_ID = "related-task-grouping";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
-const SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION = 2;
+const SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION = 3;
 const SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION = 3;
 const SEMANTIC_INDEX_PATH_META_SCHEMA_VERSION = 2;
 const TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION = 2;
@@ -542,18 +542,18 @@ const TASK_WORKFLOW_DESCRIPTION_SENTENCE_MAX_CHARS = 4000;
 // source context to disambiguate an otherwise terse marked action. Never
 // truncate or rewrite a fact to fit these bounds; an oversized fact remains
 // available in the immutable shared prefix and is simply omitted here.
-const TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_ITEMS = 8;
-const TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_CHARS = 4000;
 // Candidate fact refs are navigation hints, not a provider-row budget. Every
 // positive task-local evidence row enters the description request after final
 // deduplication; the shared late-stage 16,000-token efficiency pass manages
 // overall payload size instead of an early candidate shortlist clamp.
-const TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS = 128;
 // The immutable note-level prefix remains the cache key.  Repeat only a tiny
 // task-local, canonical fact-value table in the request suffix so providers do
 // not have to resolve opaque IDs across every sibling scope.  Oversized rows
 // remain available in the shared prefix and are omitted rather than truncated.
-const TASK_DESCRIPTION_EXECUTION_CANDIDATE_MAX_ITEMS = TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS;
+// executionCandidatesByFactId is an optional reading aid only: this item bound
+// applies solely to that aid and never to evidence admission. The authoritative
+// factsById table remains complete.
+const TASK_DESCRIPTION_EXECUTION_CANDIDATE_AID_MAX_ITEMS = 128;
 const TASK_DESCRIPTION_EXECUTION_CANDIDATE_MAX_ROW_BYTES = 2048;
 const TASK_DESCRIPTION_EXECUTION_CANDIDATE_MAX_TOTAL_BYTES = 12288;
 // Description preflight reserves explicit output and reasoning headroom. These
@@ -1485,25 +1485,36 @@ function semanticRoutingStableHandleKey(handle = {}, vectorIdentityCache = new W
   return String(`${explicit}|${handle.encoderId || `${handle.provider || ""}:${handle.model || ""}`}|${handle.encoderVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION}|${handle.dimension || vector?.length || 0}|${vectorIdentity}`);
 }
 
-function buildLocalSemanticTextSeedIndex(chunks = []) {
-  const corpus = (Array.isArray(chunks) ? chunks : []).filter((chunk) => {
-    if (!chunk || typeof chunk !== "object" || chunk.retrievalEligible === false) return false;
-    return Array.isArray(chunk.embedding) && chunk.embedding.length > 0;
-  });
-  const postings = new Map();
-  const addTokens = (frequencies, value, weight = 1) => {
+// --- Lane C1 cooperative preparation stride (bounded inner-loop yields) ---
+// Every cooperative preparation kernel checkpoints at multiples of this row
+// stride so each host yield bounds a fixed amount of pure work. The slice
+// itself always performs a real macrotask/host yield per checkpoint.
+const SEMANTIC_PREPARED_GENERATION_STRIDE = 64;
+
+function localSemanticTextSeedFrequenciesForChunk(chunk) {
+  const frequencies = new Map();
+  const addTokens = (value, weight = 1) => {
     const tokens = String(value || "").normalize("NFKC").toLowerCase().match(LOCAL_SEMANTIC_TEXT_SEED_TOKEN_PATTERN) || [];
     for (const token of tokens) {
       if (LOCAL_SEMANTIC_TEXT_SEED_STOP_WORDS.has(token)) continue;
       frequencies.set(token, Math.min(4, Number(frequencies.get(token) || 0) + weight));
     }
   };
+  if (!chunk || typeof chunk !== "object") return frequencies;
+  addTokens(chunk.title || chunk.heading || chunk.provenance?.title, 2);
+  addTokens(chunk.path || chunk.provenance?.path, 1);
+  addTokens(chunk.text || chunk.content || chunk.description, 1);
+  return frequencies;
+}
+
+function buildLocalSemanticTextSeedIndex(chunks = []) {
+  const corpus = (Array.isArray(chunks) ? chunks : []).filter((chunk) => {
+    if (!chunk || typeof chunk !== "object" || chunk.retrievalEligible === false) return false;
+    return Array.isArray(chunk.embedding) && chunk.embedding.length > 0;
+  });
+  const postings = new Map();
   for (let row = 0; row < corpus.length; row += 1) {
-    const chunk = corpus[row];
-    const frequencies = new Map();
-    addTokens(frequencies, chunk.title || chunk.heading || chunk.provenance?.title, 2);
-    addTokens(frequencies, chunk.path || chunk.provenance?.path, 1);
-    addTokens(frequencies, chunk.text || chunk.content || chunk.description, 1);
+    const frequencies = localSemanticTextSeedFrequenciesForChunk(corpus[row]);
     for (const [term, frequency] of frequencies) {
       let posting = postings.get(term);
       if (!posting) {
@@ -1515,6 +1526,72 @@ function buildLocalSemanticTextSeedIndex(chunks = []) {
   }
   for (const [term, posting] of postings) postings.set(term, Uint32Array.from(posting));
   return Object.freeze({ chunks: Object.freeze(corpus), postings });
+}
+
+function semanticPreparedSliceFor(options = {}, phase = "") {
+  const opts = options && typeof options === "object" ? options : {};
+  if (opts.slice && typeof opts.slice.checkpoint === "function" && typeof opts.slice.finish === "function") {
+    return { slice: opts.slice, ownsSlice: false };
+  }
+  return {
+    slice: createSemanticWorkSlice({
+      signal: opts.signal || opts.abortSignal,
+      isCurrent: opts.isCurrent,
+      phase,
+      budgetMs: opts.budgetMs
+    }),
+    ownsSlice: true
+  };
+}
+
+function semanticPreparedRecordProgress(options = {}, ownsSlice = false, slice = null, extra = null) {
+  const opts = options && typeof options === "object" ? options : {};
+  if (!ownsSlice || !opts.progress || typeof opts.progress !== "object" || !slice) return;
+  try {
+    Object.assign(opts.progress, slice.finish(), extra && typeof extra === "object" ? extra : null);
+  } catch (error) { /* progress reporting never fails preparation */ }
+}
+
+async function buildLocalSemanticTextSeedIndexAsync(chunks = [], options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "text-seed");
+  try {
+    const source = Array.isArray(chunks) ? chunks : [];
+    const corpus = [];
+    for (let index = 0; index < source.length; index += 1) {
+      const chunk = source[index];
+      if (chunk && typeof chunk === "object" && chunk.retrievalEligible !== false
+        && Array.isArray(chunk.embedding) && chunk.embedding.length > 0) {
+        corpus.push(chunk);
+      }
+      if ((index + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const postings = new Map();
+    for (let row = 0; row < corpus.length; row += 1) {
+      const frequencies = localSemanticTextSeedFrequenciesForChunk(corpus[row]);
+      for (const [term, frequency] of frequencies) {
+        let posting = postings.get(term);
+        if (!posting) {
+          posting = [];
+          postings.set(term, posting);
+        }
+        posting.push(row, frequency);
+      }
+      if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    let converted = 0;
+    for (const [term, posting] of postings) {
+      postings.set(term, Uint32Array.from(posting));
+      converted += 1;
+      if (converted % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const result = Object.freeze({ chunks: Object.freeze(corpus), postings });
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return result;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
 }
 
 function resolveIndexedLocalTextSeedQueryHandles(input = {}) {
@@ -1619,23 +1696,58 @@ function localSemanticRoutingStableHash(value) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+function localSemanticRoutingHashText(hash, value) {
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash;
+}
+
 function localSemanticRoutingIndexIntegrity(index) {
   const descriptor = index.encoder || {};
   const values = index.vectorStore?.values || [];
   let hash = 2166136261;
-  const update = (value) => {
-    const text = String(value || "");
-    for (let index = 0; index < text.length; index += 1) {
-      hash ^= text.charCodeAt(index);
-      hash = Math.imul(hash, 16777619);
-    }
-  };
-  update([index.schemaVersion, index.generation, descriptor.id, descriptor.version, descriptor.dimension, descriptor.normalization, descriptor.quantization?.type, descriptor.quantization?.scale].join("|"));
+  hash = localSemanticRoutingHashText(hash, [index.schemaVersion, index.generation, descriptor.id, descriptor.version, descriptor.dimension, descriptor.normalization, descriptor.quantization?.type, descriptor.quantization?.scale].join("|"));
   for (let row = 0; row < index.evidenceIds.length; row += 1) {
-    update(`|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
+    hash = localSemanticRoutingHashText(hash, `|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
   }
-  for (let indexValue = 0; indexValue < values.length; indexValue += 1) update(`|${values[indexValue]}`);
+  for (let indexValue = 0; indexValue < values.length; indexValue += 1) hash = localSemanticRoutingHashText(hash, `|${values[indexValue]}`);
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+async function localSemanticRoutingIndexIntegrityAsync(index, options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "routing-integrity");
+  try {
+    const descriptor = index.encoder || {};
+    const values = index.vectorStore?.values || [];
+    let hash = 2166136261;
+    hash = localSemanticRoutingHashText(hash, [index.schemaVersion, index.generation, descriptor.id, descriptor.version, descriptor.dimension, descriptor.normalization, descriptor.quantization?.type, descriptor.quantization?.scale].join("|"));
+    for (let row = 0; row < index.evidenceIds.length; row += 1) {
+      hash = localSemanticRoutingHashText(hash, `|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
+      if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    for (let indexValue = 0; indexValue < values.length; indexValue += 1) {
+      hash = localSemanticRoutingHashText(hash, `|${values[indexValue]}`);
+      if ((indexValue + 1) % (SEMANTIC_PREPARED_GENERATION_STRIDE * 32) === 0) await slice.checkpoint();
+    }
+    const result = (hash >>> 0).toString(16).padStart(8, "0");
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return result;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
+}
+
+function localSemanticRoutingQuantizeInto(quantized, offset, vector, scale, row) {
+  for (let dimension = 0; dimension < vector.length; dimension += 1) {
+    const value = vector[dimension];
+    if (Math.abs(value) > 1 + 1e-9) throw localSemanticRoutingError("vector-invalid", "Document vector exceeds the normalized quantization range.", { row, dimension, value });
+    quantized[offset + dimension] = Math.max(-128, Math.min(127, Math.round(value * scale)));
+  }
 }
 
 function buildLocalSemanticRoutingIndex(chunks = [], descriptor = {}, options = {}) {
@@ -1671,11 +1783,7 @@ function buildLocalSemanticRoutingIndex(chunks = [], descriptor = {}, options = 
       : localSemanticRoutingVectorFromChunk(chunk, row);
     const vector = localSemanticRoutingVector(adaptedVector, encoder.dimension, "Document", row, encoder.normalization);
     const offset = row * encoder.dimension;
-    for (let dimension = 0; dimension < encoder.dimension; dimension += 1) {
-      const value = vector[dimension];
-      if (Math.abs(value) > 1 + 1e-9) throw localSemanticRoutingError("vector-invalid", "Document vector exceeds the normalized quantization range.", { row, dimension, value });
-      quantized[offset + dimension] = Math.max(-128, Math.min(127, Math.round(value * encoder.quantization.scale)));
-    }
+    localSemanticRoutingQuantizeInto(quantized, offset, vector, encoder.quantization.scale, row);
     evidenceIds.push(evidenceId);
     sourceIds.push(sourceId);
     shardRefs.push(localSemanticRoutingIdentity(chunk.shardRef ?? chunk.shard ?? `shard-${Math.floor(row / shardSize)}`, "shard", row));
@@ -1707,12 +1815,85 @@ function buildLocalSemanticRoutingIndex(chunks = [], descriptor = {}, options = 
   return index;
 }
 
+async function buildLocalSemanticRoutingIndexAsync(chunks = [], descriptor = {}, options = {}) {
+  const opts = options && typeof options === "object" && !Array.isArray(options) ? options : {};
+  if (!Array.isArray(chunks)) throw localSemanticRoutingError("count-malformed", "Routing chunks must be an array.");
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw localSemanticRoutingError("options-malformed", "Routing build options must be an object.");
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "routing-build");
+  try {
+    const encoder = localSemanticRoutingDescriptor(descriptor);
+    const count = chunks.length;
+    const shardSize = Number.isInteger(opts.shardSize) && opts.shardSize > 0 ? opts.shardSize : 256;
+    // Private candidates only: no shared or active-generation state is
+    // touched until the frozen index is published at the end.
+    const evidenceIds = [];
+    const sourceIds = [];
+    const shardRefs = [];
+    const scopeRefs = [];
+    const taskRefs = [];
+    const temporalMetadata = [];
+    const routingMetadata = [];
+    const quantized = new Int8Array(count * encoder.dimension);
+    const seenEvidence = new Set();
+    const seenSource = new Set();
+    for (let row = 0; row < count; row += 1) {
+      const chunk = chunks[row];
+      if (!chunk || typeof chunk !== "object") throw localSemanticRoutingError("count-malformed", "Routing chunk is malformed.", { row });
+      const evidenceId = localSemanticRoutingIdentity(chunk.evidenceId ?? chunk.id, "evidence", row);
+      if (seenEvidence.has(evidenceId)) throw localSemanticRoutingError("identity-duplicate", `Duplicate evidence identity: ${evidenceId}.`, { row, evidenceId });
+      seenEvidence.add(evidenceId);
+      const sourceId = localSemanticRoutingIdentity(chunk.sourceId ?? chunk.source?.id ?? chunk.path ?? chunk.file, "source", row);
+      if (seenSource.has(`${evidenceId}\u0000${sourceId}`)) throw localSemanticRoutingError("identity-duplicate", `Duplicate evidence/source identity: ${evidenceId}.`, { row, evidenceId, sourceId });
+      seenSource.add(`${evidenceId}\u0000${sourceId}`);
+      const adaptedVector = typeof opts.vectorAdapter === "function"
+        ? opts.vectorAdapter(chunk, row, encoder)
+        : localSemanticRoutingVectorFromChunk(chunk, row);
+      const vector = localSemanticRoutingVector(adaptedVector, encoder.dimension, "Document", row, encoder.normalization);
+      const offset = row * encoder.dimension;
+      localSemanticRoutingQuantizeInto(quantized, offset, vector, encoder.quantization.scale, row);
+      evidenceIds.push(evidenceId);
+      sourceIds.push(sourceId);
+      shardRefs.push(localSemanticRoutingIdentity(chunk.shardRef ?? chunk.shard ?? `shard-${Math.floor(row / shardSize)}`, "shard", row));
+      const rowMetadata = localSemanticRoutingCanonicalMetadata(chunk, evidenceId, sourceId);
+      scopeRefs.push(rowMetadata.scope.ids);
+      taskRefs.push(rowMetadata.task.ids);
+      temporalMetadata.push(rowMetadata.temporal);
+      routingMetadata.push(rowMetadata);
+      if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const generation = localSemanticRoutingIdentity(opts.generation ?? localSemanticRoutingStableHash(`${encoder.id}|${encoder.version}|${count}|${evidenceIds.join("|")}`), "generation", 0);
+    const asyncVectorStore = Object.freeze({ format: encoder.quantization.type, scale: encoder.quantization.scale, dimension: encoder.dimension, count, values: quantized });
+    const asyncIndex = {
+      schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
+      generation,
+      encoder,
+      evidenceIds: Object.freeze(evidenceIds),
+      sourceIds: Object.freeze(sourceIds),
+      shardRefs: Object.freeze(shardRefs),
+      scopeRefs: Object.freeze(scopeRefs),
+      taskRefs: Object.freeze(taskRefs),
+      temporalMetadata: Object.freeze(temporalMetadata),
+      routingMetadata: Object.freeze(routingMetadata),
+      vectorStore: asyncVectorStore,
+      integrityHash: "",
+      count
+    };
+    asyncIndex.integrityHash = await localSemanticRoutingIndexIntegrityAsync(asyncIndex, { slice });
+    Object.freeze(asyncIndex);
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return asyncIndex;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
+}
+
 function localSemanticRoutingHeapBetter(score, row, otherScore, otherRow, evidenceIds) {
   if (score !== otherScore) return score > otherScore;
   return String(evidenceIds[row]) < String(evidenceIds[otherRow]);
 }
 
-function routeLocalSemanticEvidence(index, queryHandle = {}, options = {}) {
+function localSemanticRoutingRequestContext(index, queryHandle = {}, options = {}) {
   if (!index || typeof index !== "object" || index.schemaVersion !== LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION) throw localSemanticRoutingError("index-malformed", "Routing index schema is invalid.");
   if (!options || typeof options !== "object" || Array.isArray(options)) throw localSemanticRoutingError("options-malformed", "Routing options must be an object.");
   const encoder = localSemanticRoutingDescriptor(index.encoder);
@@ -1734,6 +1915,82 @@ function routeLocalSemanticEvidence(index, queryHandle = {}, options = {}) {
   const numericTopK = Number(requestedTopK);
   if (!Number.isInteger(numericTopK) || numericTopK < 0) throw localSemanticRoutingError("options-malformed", "Routing top-K must be a non-negative integer.");
   const topK = Math.min(count, numericTopK);
+  const requiredEvidenceIds = Array.isArray(options.requiredEvidenceIds)
+    ? options.requiredEvidenceIds.map(String).filter(Boolean)
+    : [];
+  return { encoder, count, routingMetadata, vectorStore, query, topK, requiredEvidenceIds };
+}
+
+function scoreLocalSemanticRoutingRow(values, offset, dimension, scale, query) {
+  let score = 0;
+  let operationCount = 0;
+  let rowDimension = 0;
+  for (; rowDimension + 3 < dimension; rowDimension += 4) {
+    score += (values[offset + rowDimension] * query[rowDimension]
+      + values[offset + rowDimension + 1] * query[rowDimension + 1]
+      + values[offset + rowDimension + 2] * query[rowDimension + 2]
+      + values[offset + rowDimension + 3] * query[rowDimension + 3]) / scale;
+    operationCount += 4;
+  }
+  for (; rowDimension < dimension; rowDimension += 1) {
+    score += (values[offset + rowDimension] * query[rowDimension]) / scale;
+    operationCount += 1;
+  }
+  return { score, operationCount };
+}
+
+function buildLocalSemanticRoutingCandidate(index, routingMetadata, topK, row, score, position) {
+  const temporal = index.temporalMetadata[row];
+  const temporalRelation = typeof temporal === "string" ? temporal : temporal?.temporalRelation ?? temporal?.relation ?? "unknown";
+  const metadata = routingMetadata[row] || Object.freeze({
+    source: Object.freeze({ id: index.sourceIds[row], ids: Object.freeze([index.sourceIds[row]]), kind: "", path: "" }),
+    evidence: Object.freeze({ id: index.evidenceIds[row], ids: Object.freeze([index.evidenceIds[row]]), fingerprint: "", semanticUnitKind: "", metadataOnly: false, evidenceEligibility: "evidence" }),
+    scope: Object.freeze({ ids: index.scopeRefs[row] || Object.freeze([]) }),
+    task: Object.freeze({ ids: index.taskRefs[row] || Object.freeze([]), taskId: "", oid: "", parentId: "", parentOid: "", rootId: "", rootOid: "", isSubtask: false, childTaskIds: Object.freeze([]), childOids: Object.freeze([]), childEvidenceIds: Object.freeze([]), treeDepth: 0, treePath: Object.freeze([]), siblingOrder: null }),
+    factIds: Object.freeze([]),
+    temporal: index.temporalMetadata[row] || null,
+    provenance: Object.freeze({})
+  });
+  return Object.freeze({
+    evidenceId: index.evidenceIds[row],
+    evidenceIds: metadata.evidence?.ids || Object.freeze([index.evidenceIds[row]]),
+    routingScore: score,
+    routingRank: position + 1,
+    inTopK: position < topK,
+    sourceId: index.sourceIds[row],
+    sourceIds: metadata.source?.ids || Object.freeze([index.sourceIds[row]]),
+    sourceKind: metadata.source?.kind || "",
+    path: metadata.source?.path || "",
+    shardRef: index.shardRefs[row],
+    scopeRefs: metadata.scope?.ids || index.scopeRefs[row],
+    taskRefs: metadata.task?.ids || index.taskRefs[row],
+    factIds: metadata.factIds || Object.freeze([]),
+    temporalMetadata: metadata.temporal,
+    temporalRelation,
+    metadataOnly: metadata.evidence?.metadataOnly === true,
+    evidenceEligibility: metadata.evidence?.evidenceEligibility || "evidence",
+    semanticUnitKind: metadata.evidence?.semanticUnitKind || "",
+    provenance: metadata.provenance || Object.freeze({}),
+    routingMetadata: metadata,
+    parentId: metadata.task?.parentId || "",
+    parentOid: metadata.task?.parentOid || "",
+    rootId: metadata.task?.rootId || "",
+    rootOid: metadata.task?.rootOid || "",
+    isSubtask: metadata.task?.isSubtask === true,
+    childTaskIds: metadata.task?.childTaskIds || Object.freeze([]),
+    childOids: metadata.task?.childOids || Object.freeze([]),
+    childEvidenceIds: metadata.task?.childEvidenceIds || Object.freeze([])
+  });
+}
+
+function routeLocalSemanticEvidence(index, queryHandle = {}, options = {}) {
+  const routeRequest = localSemanticRoutingRequestContext(index, queryHandle, options);
+  const encoder = routeRequest.encoder;
+  const count = routeRequest.count;
+  const routingMetadata = routeRequest.routingMetadata;
+  const vectorStore = routeRequest.vectorStore;
+  const query = routeRequest.query;
+  const topK = routeRequest.topK;
   const startedAt = localSemanticRoutingNow();
   const scoredRows = new Array(count);
   let operationCount = 0;
@@ -1741,73 +1998,65 @@ function routeLocalSemanticEvidence(index, queryHandle = {}, options = {}) {
   // score. topK is an ordering/annotation hint only and never removes a
   // candidate: every row identity and score is retained so the caller can
   // exact-score every compatible candidate without a second scan or reroute.
+  const routeValues = vectorStore.values;
+  const routeScale = encoder.quantization.scale;
   for (let row = 0; row < count; row += 1) {
-    let score = 0;
-    const offset = row * encoder.dimension;
-    const values = vectorStore.values;
-    const scale = encoder.quantization.scale;
-    let dimension = 0;
-    for (; dimension + 3 < encoder.dimension; dimension += 4) {
-      score += (values[offset + dimension] * query[dimension]
-        + values[offset + dimension + 1] * query[dimension + 1]
-        + values[offset + dimension + 2] * query[dimension + 2]
-        + values[offset + dimension + 3] * query[dimension + 3]) / scale;
-      operationCount += 4;
-    }
-    for (; dimension < encoder.dimension; dimension += 1) {
-      score += (values[offset + dimension] * query[dimension]) / scale;
-      operationCount += 1;
-    }
-    scoredRows[row] = { row, score };
+    const scoredRow = scoreLocalSemanticRoutingRow(routeValues, row * encoder.dimension, encoder.dimension, routeScale, query);
+    operationCount += scoredRow.operationCount;
+    scoredRows[row] = { row, score: scoredRow.score };
   }
   scoredRows.sort((left, right) => localSemanticRoutingHeapBetter(right.score, right.row, left.score, left.row, index.evidenceIds) ? 1 : -1);
-  const candidates = scoredRows.map(({ row, score }, position) => {
-    const temporal = index.temporalMetadata[row];
-    const temporalRelation = typeof temporal === "string" ? temporal : temporal?.temporalRelation ?? temporal?.relation ?? "unknown";
-    const metadata = routingMetadata[row] || Object.freeze({
-      source: Object.freeze({ id: index.sourceIds[row], ids: Object.freeze([index.sourceIds[row]]), kind: "", path: "" }),
-      evidence: Object.freeze({ id: index.evidenceIds[row], ids: Object.freeze([index.evidenceIds[row]]), fingerprint: "", semanticUnitKind: "", metadataOnly: false, evidenceEligibility: "evidence" }),
-      scope: Object.freeze({ ids: index.scopeRefs[row] || Object.freeze([]) }),
-      task: Object.freeze({ ids: index.taskRefs[row] || Object.freeze([]), taskId: "", oid: "", parentId: "", parentOid: "", rootId: "", rootOid: "", isSubtask: false, childTaskIds: Object.freeze([]), childOids: Object.freeze([]), childEvidenceIds: Object.freeze([]), treeDepth: 0, treePath: Object.freeze([]), siblingOrder: null }),
-      factIds: Object.freeze([]),
-      temporal: index.temporalMetadata[row] || null,
-      provenance: Object.freeze({})
-    });
-    return Object.freeze({
-      evidenceId: index.evidenceIds[row],
-      evidenceIds: metadata.evidence?.ids || Object.freeze([index.evidenceIds[row]]),
-      routingScore: score,
-      routingRank: position + 1,
-      inTopK: position < topK,
-      sourceId: index.sourceIds[row],
-      sourceIds: metadata.source?.ids || Object.freeze([index.sourceIds[row]]),
-      sourceKind: metadata.source?.kind || "",
-      path: metadata.source?.path || "",
-      shardRef: index.shardRefs[row],
-      scopeRefs: metadata.scope?.ids || index.scopeRefs[row],
-      taskRefs: metadata.task?.ids || index.taskRefs[row],
-      factIds: metadata.factIds || Object.freeze([]),
-      temporalMetadata: metadata.temporal,
-      temporalRelation,
-      metadataOnly: metadata.evidence?.metadataOnly === true,
-      evidenceEligibility: metadata.evidence?.evidenceEligibility || "evidence",
-      semanticUnitKind: metadata.evidence?.semanticUnitKind || "",
-      provenance: metadata.provenance || Object.freeze({}),
-      routingMetadata: metadata,
-      parentId: metadata.task?.parentId || "",
-      parentOid: metadata.task?.parentOid || "",
-      rootId: metadata.task?.rootId || "",
-      rootOid: metadata.task?.rootOid || "",
-      isSubtask: metadata.task?.isSubtask === true,
-      childTaskIds: metadata.task?.childTaskIds || Object.freeze([]),
-      childOids: metadata.task?.childOids || Object.freeze([]),
-      childEvidenceIds: metadata.task?.childEvidenceIds || Object.freeze([])
-    });
-  });
-  const requiredEvidenceIds = Array.isArray(options.requiredEvidenceIds)
-    ? options.requiredEvidenceIds.map(String).filter(Boolean)
-    : [];
+  const candidates = scoredRows.map(({ row, score }, position) => buildLocalSemanticRoutingCandidate(index, routingMetadata, topK, row, score, position));
+  const requiredEvidenceIds = routeRequest.requiredEvidenceIds;
   const telemetry = Object.freeze({ routeElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt), candidateCount: count, routingRowsScanned: count, returnedCount: candidates.length, topK, dimension: encoder.dimension, operationCount, boundedCandidateAllocation: false, completeCandidateAllocation: true, networkCalls: 0, encoderId: encoder.id, encoderVersion: encoder.version, generation: index.generation, requiredEvidenceIdsIncluded: requiredEvidenceIds.length });
+  return Object.freeze({ candidates: Object.freeze(candidates), telemetry });
+}
+
+// Lane G cooperative route companion: the complete mathematics of
+// routeLocalSemanticEvidence (shared request/score/row kernel, identical
+// ordering and telemetry shape) with real host yields at bounded row strides.
+// The synchronous helper above is unchanged for existing consumers; the
+// production batch path awaits this companion. A borrowed slice (options.slice)
+// is checkpointed but never finished; an owned slice uses budgetMs 8 and folds
+// its content-free work stats into telemetry. Cancellation surfaces as a
+// semantic-work-cancelled error before any cache publication.
+async function routeLocalSemanticEvidenceAsync(index, queryHandle = {}, options = {}) {
+  const routeOpts = options && typeof options === "object" ? options : {};
+  const request = localSemanticRoutingRequestContext(index, queryHandle, routeOpts);
+  const holder = semanticPreparedSliceFor(Object.assign({}, routeOpts, { budgetMs: 8 }), "route-local-evidence");
+  const slice = holder.slice;
+  const ownsSlice = holder.ownsSlice;
+  const startedAt = localSemanticRoutingNow();
+  const encoder = request.encoder;
+  const count = request.count;
+  const routingMetadata = request.routingMetadata;
+  const vectorStore = request.vectorStore;
+  const query = request.query;
+  const topK = request.topK;
+  const requiredEvidenceIds = request.requiredEvidenceIds;
+  const scoredRows = new Array(count);
+  let operationCount = 0;
+  const values = vectorStore.values;
+  const scale = encoder.quantization.scale;
+  for (let row = 0; row < count; row += 1) {
+    const scoredRow = scoreLocalSemanticRoutingRow(values, row * encoder.dimension, encoder.dimension, scale, query);
+    operationCount += scoredRow.operationCount;
+    scoredRows[row] = { row, score: scoredRow.score };
+    if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+  }
+  scoredRows.sort((left, right) => localSemanticRoutingHeapBetter(right.score, right.row, left.score, left.row, index.evidenceIds) ? 1 : -1);
+  const candidates = new Array(count);
+  for (let position = 0; position < scoredRows.length; position += 1) {
+    const scoredEntry = scoredRows[position];
+    candidates[position] = buildLocalSemanticRoutingCandidate(index, routingMetadata, topK, scoredEntry.row, scoredEntry.score, position);
+    if ((position + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+  }
+  let workStats = { routingYieldCount: 0, routingMaxSliceMs: 0, routingWorkMs: 0 };
+  if (ownsSlice) {
+    const done = slice.finish();
+    workStats = { routingYieldCount: done.yieldCount, routingMaxSliceMs: done.maxSliceMs, routingWorkMs: done.workMs };
+  }
+  const telemetry = Object.freeze({ routeElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt), candidateCount: count, routingRowsScanned: count, returnedCount: candidates.length, topK, dimension: encoder.dimension, operationCount, boundedCandidateAllocation: false, completeCandidateAllocation: true, networkCalls: 0, encoderId: encoder.id, encoderVersion: encoder.version, generation: index.generation, requiredEvidenceIdsIncluded: requiredEvidenceIds.length, routingYieldCount: workStats.routingYieldCount, routingMaxSliceMs: workStats.routingMaxSliceMs, routingWorkMs: workStats.routingWorkMs });
   return Object.freeze({ candidates: Object.freeze(candidates), telemetry });
 }
 
@@ -2285,222 +2534,63 @@ function taskSemanticMarkedActionSupportingCandidateDecision(item = {}, source =
   const activeSourcePath = vaultRelativePath(options.activeSourcePath || source?.path || sourceContract?.path || "");
   const candidatePath = vaultRelativePath(chunk.path || chunk.provenance?.path || "");
   const candidateSourceKind = String(item?.sourceKind || item?.source_kind || chunk.sourceKind || chunk.source_kind || "").trim().toLowerCase();
-  const sameActiveCurrentSourceContext = Boolean(activeSourcePath && candidatePath === activeSourcePath
-    && candidateSourceKind === "current-source-context");
-  // A current-source-context row is supporting evidence, not the primary
-  // marked action. Sharing the active note path cannot make every neighboring
-  // action in that note relevant to this task; require the normal subject and
-  // artifact checks below. Other active-source rows retain their native path
-  // admission because their scope is established by the source contract.
-  // Replace blanket same-path admission with exact requested-scope ownership
-  // or a validated adjacent continuation. Rows positively owned by another
-  // source-contract action scope are foreign. Rows without enough line metadata
-  // cause explicit degradation rather than sibling borrowing.
+  // A current-source-context row is supporting evidence admitted by the
+  // current-source decision below, not by this gate. Every other same-note
+  // row needs exact requested-scope line ownership; rows positively owned by
+  // another source-contract action scope are foreign. Rows without enough
+  // line metadata cause explicit degradation rather than sibling borrowing.
   if (activeSourcePath && candidatePath === activeSourcePath && candidateSourceKind !== "current-source-context") {
     const lineOwnership = taskSemanticChunkLineOwnership(chunk);
     if (!lineOwnership) return { admitted: false, reasonCode: "scope-degradation-no-line-metadata", item };
     const requestedScopeId = String(options.scopeId || task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || "");
     const requestedRanges = taskSemanticScopeLineRanges(sourceContract, requestedScopeId, task);
     const overlapsRequested = requestedRanges.some((range) => lineOwnership.start <= range.end && lineOwnership.end >= range.start);
-    if (overlapsRequested) return { admitted: true, item };
-    const foreignScopes = (sourceContract?.scopes || []).filter((entry) => {
+    const siblingScopeIds = new Set((sourceContract?.scopes || []).filter((entry) => {
       const sid = String(entry?.scopeId || entry?.id || "");
       if (!sid || sid === requestedScopeId) return false;
       const fam = String(entry?.family || "");
       if (!["marked-action", "unmarked-action"].includes(fam)) return false;
       return taskSemanticScopeLineRanges(sourceContract, sid, task).length > 0;
-    });
+    }).map((entry) => String(entry.scopeId || entry.id || "")));
+    // Same-contract native identity conflict: a row natively owned by another
+    // explicit action scope of this source contract is foreign even when its
+    // line range touches the requested scope. Request-assigned taskId/scopeId
+    // wrappers and advisory associations are associations, not native
+    // ownership, and never prove foreignness.
+    const nativeOwnership = taskSemanticNativeOwnershipMetadata(item);
+    const nativeScopeIds = uniqueValues([
+      nativeOwnership.evidenceScopeId,
+      ...(nativeOwnership.nativeAssociations || []).map((association) => association?.scopeId || association?.scope_id || "")
+    ].map((value) => String(value || "").trim()).filter(Boolean));
+    const nativeSiblingConflict = nativeScopeIds.some((candidateScopeId) => siblingScopeIds.has(candidateScopeId));
+    if (overlapsRequested && !nativeSiblingConflict) return { admitted: true, item };
+    if (overlapsRequested) return { admitted: false, reasonCode: "scope-native-ownership-conflict", item };
+    const foreignScopes = (sourceContract?.scopes || []).filter((entry) => siblingScopeIds.has(String(entry?.scopeId || entry?.id || "")));
     const foreignRanges = foreignScopes.flatMap((entry) => taskSemanticScopeLineRanges(sourceContract, String(entry.scopeId || entry.id || ""), task));
     const overlapsForeign = foreignRanges.some((range) => lineOwnership.start <= range.end && lineOwnership.end >= range.start);
     if (overlapsForeign) return { admitted: false, reasonCode: "scope-foreign-sibling", item };
+    if (nativeSiblingConflict) return { admitted: false, reasonCode: "scope-native-ownership-conflict", item };
     return { admitted: false, reasonCode: "scope-not-requested-active", item };
   }
-  if (semanticTaskReferenceChunkSelected(chunk)) {
-    return taskSemanticMarkedActionTaskReferencesAllowed(task, true)
-      ? { admitted: true, item }
-      : { admitted: false, item, reasonCode: "marked-action-task-reference-unbound" };
-  }
-  const temporalRelation = String(item?.temporalRelation || chunk.temporalRelation || chunk.provenance?.temporalRelation || "").toLowerCase();
-  if (temporalRelation === "historical" && !taskSemanticMarkedActionHistoryAllowed(task, true)) {
-    return { admitted: false, item, reasonCode: "marked-action-history-not-requested" };
-  }
-  const markerSettings = options.settings || DEFAULT_SETTINGS;
-  const subjectText = String(options.subjectText || task?.semanticQuery || task?.content || "");
-  const subjectTerms = new Set(localSemanticTextSeedTerms(subjectText
-    .replace(noteActionMarkerRegex(markerSettings, true), " "))
-    .values());
-  const candidateBody = String(chunk.text || chunk.content || chunk.description || chunk.excerpt || chunk.evidence || chunk.sourceSurface || chunk.source_surface
-    || (chunk.structuredFacts || []).map((fact) => fact?.sourceSurface || fact?.source_surface || fact?.value || fact?.text || "").filter(Boolean).join("\n")
-    || "");
-  // Applicability proof uses only body/fact terms. Title/path may remain for
-  // discovery and provenance but must never feed the companions, anchors, or
-  // shared-phrase gates that establish cross-note applicability.
-  const candidateBodyTerms = new Set(localSemanticTextSeedTerms(candidateBody).values());
-  const allSharedSubjectTerms = Array.from(subjectTerms).filter((term) => candidateBodyTerms.has(term));
-  const shared = Array.from(subjectTerms).filter((term) => candidateBodyTerms.has(term) && !TASK_SEMANTIC_MARKED_ACTION_GENERIC_TERMS.has(term));
-  const distinctiveSingleton = shared.some((term) => term.length >= 12 || (term.includes("-") && term.length >= 8));
-  const distinctiveAnchors = taskSemanticMarkedActionDistinctiveSubjectAnchors(subjectText, markerSettings);
-  const sharedDistinctiveAnchors = distinctiveAnchors.filter((anchor) => candidateBodyTerms.has(anchor));
-  const sharesDistinctiveAnchor = sharedDistinctiveAnchors.length > 0;
-  const strongCodeAnchors = taskSemanticMarkedActionStrongCodeAnchors(subjectText, markerSettings);
-  const candidateContainsStrongCodeAnchor = (terms, anchor) => terms.has(anchor) || terms.has(`${anchor}s`);
-  const sharedStrongCodeAnchors = strongCodeAnchors.filter((anchor) => candidateContainsStrongCodeAnchor(candidateBodyTerms, anchor));
-  const sharesStrongCodeAnchor = sharedStrongCodeAnchors.length > 0;
-  const sharedPersonAnchors = sharedDistinctiveAnchors.filter((anchor) => !strongCodeAnchors.includes(anchor));
-  const distinctiveAnchorTerms = new Set(distinctiveAnchors.map(taskSemanticMarkedActionSupportRoot));
-  const sharedSubjectPhrases = taskSemanticMarkedActionSharedSubjectPhrases(subjectText, candidateBody)
-    .filter((phrase) => {
-      const roots = phrase.split(/\s+/).map(taskSemanticMarkedActionSupportRoot).filter(Boolean);
-      const exactCompoundArtifact = roots.filter((root) => TASK_SEMANTIC_MARKED_ACTION_ARTIFACT_TERMS.has(root)).length >= 2
-        || roots.includes("full") && roots.some((root) => TASK_SEMANTIC_MARKED_ACTION_ARTIFACT_TERMS.has(root));
-      return exactCompoundArtifact || roots.some((root) => !distinctiveAnchorTerms.has(root)
-        && !TASK_SEMANTIC_MARKED_ACTION_ANCHOR_COMPANION_GENERIC_TERMS.has(root)
-        && !TASK_SEMANTIC_MARKED_ACTION_GENERIC_TERMS.has(root)
-        && !TASK_STRUCTURE_ACTION_WORDS.has(root)
-        && !/^\d+$/.test(root));
-    });
-  const sharedBodyPersonAnchors = sharedPersonAnchors.filter((anchor) => candidateBodyTerms.has(anchor));
-  const sharedBodyStrongCodeAnchors = strongCodeAnchors.filter((anchor) => candidateContainsStrongCodeAnchor(candidateBodyTerms, anchor));
-  if ((shared.length >= 2 || distinctiveSingleton) && taskSemanticMarkedActionCandidateExplicitlyNegatesSubject(candidateBody, shared)) {
-    return { admitted: false, item, reasonCode: "marked-action-subject-explicitly-negated" };
-  }
-  // When the subject has a hard anchor, the anchor plus a generic word is not
-  // enough: require another non-generic overlap (or exact structural proof).
-  // This keeps related criteria/conditions while excluding broad same-program
-  // records that merely repeat an application/document label.
-  const organizationTitleTerms = new Set(Array.from(subjectText.matchAll(/\b(?:[A-Z][a-z]{2,})(?:\s+[A-Z][a-z]{2,})+\b/g))
-    .filter((match) => TASK_SEMANTIC_MARKED_ACTION_ORGANIZATION_SUFFIX_TERMS.has(match[0].trim().split(/\s+/).pop().toLowerCase()))
-    .flatMap((match) => match[0].toLowerCase().split(/\s+/)));
-  const advisoryTerms = new Set();
-  for (const match of subjectText.matchAll(/["â€œâ€]([^"â€œâ€]+)["â€œâ€]/g)) {
-    for (const term of localSemanticTextSeedTerms(match[1]).values()) advisoryTerms.add(term);
-  }
-  for (const match of subjectText.matchAll(/\b(?:avoid|avoiding|not\s+use|do\s+not\s+use)\b[^.!?\n]{0,80}/gi)) {
-    for (const term of localSemanticTextSeedTerms(match[0]).values()) advisoryTerms.add(term);
-  }
-  const anchorCompanionTerms = allSharedSubjectTerms.filter((term) => !distinctiveAnchors.includes(term)
-    && !TASK_SEMANTIC_MARKED_ACTION_ANCHOR_COMPANION_GENERIC_TERMS.has(term)
-    && !organizationTitleTerms.has(term)
-    && !advisoryTerms.has(term));
-  const normalizedCandidateBodyTerms = new Set(Array.from(candidateBodyTerms).map(taskSemanticMarkedActionSupportRoot).filter(Boolean));
-  const normalizedDistinctiveAnchors = new Set(distinctiveAnchors.map(taskSemanticMarkedActionSupportRoot).filter(Boolean));
-  const normalizedStrongCodeAnchors = new Set(strongCodeAnchors.map(taskSemanticMarkedActionSupportRoot).filter(Boolean));
-  const normalizedAdvisoryTerms = new Set(Array.from(advisoryTerms).map(taskSemanticMarkedActionSupportRoot).filter(Boolean));
-  const normalizedAnchorCompanionTerms = uniqueValues(Array.from(subjectTerms)
-    .map(taskSemanticMarkedActionSupportRoot)
-    .filter((term) => term
-      && normalizedCandidateBodyTerms.has(term)
-      && !normalizedDistinctiveAnchors.has(term)
-      && !normalizedStrongCodeAnchors.has(term)
-      && !TASK_SEMANTIC_MARKED_ACTION_ANCHOR_COMPANION_GENERIC_TERMS.has(term)
-      && !TASK_SEMANTIC_MARKED_ACTION_GENERIC_TERMS.has(term)
-      && !normalizedAdvisoryTerms.has(term)
-      && !/^\d+$/.test(term)));
-  const effectiveAnchorCompanionTerms = uniqueValues([
-    ...anchorCompanionTerms.map(taskSemanticMarkedActionSupportRoot),
-    ...normalizedAnchorCompanionTerms
-  ].filter(Boolean));
-  const subjectArtifactAnchors = taskSemanticMarkedActionArtifactAnchors(subjectText);
-  const candidateArtifactAnchors = new Set(taskSemanticMarkedActionArtifactAnchors(candidateBody));
-  const sharedArtifactAnchors = subjectArtifactAnchors.filter((anchor) => candidateArtifactAnchors.has(anchor));
-  // A shared subject phrase that contains a requested artifact root is the only
-  // phrase that can tie the candidate's use of that artifact back to the
-  // requested artifact. A broad non-artifact phrase (people/program/criterion
-  // wording) is never this tie.
-  const requestedArtifactAnchorRoots = new Set(subjectArtifactAnchors.map(taskSemanticMarkedActionSupportRoot).filter(Boolean));
-  // Generic container words commonly occur in headings (for example,
-  // "Meeting Notes"). If the action names a more specific artifact, a
-  // generic note/document overlap is not an artifact match by itself.
-  const specificSubjectArtifactAnchors = subjectArtifactAnchors.filter((anchor) => !["note", "document"].includes(anchor));
-  const artifactMatchSufficient = specificSubjectArtifactAnchors.length
-    ? specificSubjectArtifactAnchors.some((anchor) => candidateArtifactAnchors.has(anchor))
-    : sharedArtifactAnchors.length > 0;
-  const explicitStructuralProof = taskSemanticMarkedActionExplicitStructuralProof(item, chunk, task, options);
-  // Two acronyms can identify a program pair while still retrieving a wholly
-  // different artifact (for example, guidelines or event communications when
-  // the action is about concept notes). When the action names an artifact,
-  // require that artifact, a named participant, or three substantive companion
-  // terms before admitting an external same-code row.
-  if (strongCodeAnchors.length >= 2
-    && sharedBodyStrongCodeAnchors.length >= 2
-    && subjectArtifactAnchors.length > 0
-    && !artifactMatchSufficient
-    && sharedBodyPersonAnchors.length === 0
-    && effectiveAnchorCompanionTerms.length < 3
-    && !explicitStructuralProof) {
-    return { admitted: false, item, reasonCode: "marked-action-artifact-anchor-missing" };
-  }
-  const artifactStateSignalPattern = /\b(?:approved|awaiting|blocked|comments?|complete|completed|edits?|eligible|eligibility|open|pending|ready|responded|reviewed|sent|submitted|updat(?:e|ed|ing)|with\s+[A-Z][a-z]{2,})\b/i;
-  const artifactStateSignal = artifactStateSignalPattern.test(candidateBody);
-  const artifactStateSignalSameSentence = taskSemanticMarkedActionSameSentenceArtifactState(candidateBody, candidateArtifactAnchors);
-  const nonArtifactCompanionTerms = effectiveAnchorCompanionTerms.filter((term) => !TASK_SEMANTIC_MARKED_ACTION_ARTIFACT_TERMS.has(term));
-  // Artifact-tied proof requires artifact + concrete state/criterion/decision/
-  // handoff signal + substantive non-artifact companion in the SAME candidate
-  // sentence/fact as a shared subject phrase containing a requested artifact
-  // root. A scattered/global companion elsewhere is not a tie.
-  const artifactTiedSameSentenceProof = taskSemanticMarkedActionArtifactTiedSameSentenceProof(
-    candidateBody, sharedSubjectPhrases, requestedArtifactAnchorRoots, subjectArtifactAnchors, specificSubjectArtifactAnchors, artifactStateSignalPattern, nonArtifactCompanionTerms);
-  const possessiveOwnerArtifactMatch = Array.from(subjectText.matchAll(/\b([A-Z][a-z]{2,})['Ã¢â‚¬â„¢]s\s+(?:the\s+)?(application|brief|concept|document|draft|form|guideline|letter|memo|note|packet|plan|policy|proposal|report|template)s?\b/g))
-    .some((match) => candidateBodyTerms.has(String(match[1] || "").toLowerCase())
-      && candidateArtifactAnchors.has(taskSemanticMarkedActionSupportRoot(String(match[2] || "").toLowerCase())));
-  const possessiveOwnerArtifactMatchSameSentence = taskSemanticMarkedActionPossessiveOwnerSameSentence(candidateBody, subjectText, candidateArtifactAnchors);
-  const currentSourceContextTaskSpecificProof = sharedSubjectPhrases.length > 0
-    || sharedBodyStrongCodeAnchors.length >= 1 && effectiveAnchorCompanionTerms.length >= 1
-    || artifactMatchSufficient && sharedBodyPersonAnchors.length >= 2
-    || possessiveOwnerArtifactMatch;
-  if (sameActiveCurrentSourceContext && !currentSourceContextTaskSpecificProof) {
-    return { admitted: false, item, reasonCode: "marked-action-current-source-context-task-specific-support-insufficient" };
-  }
-  if (strongCodeAnchors.length >= 2
-    && sharedBodyStrongCodeAnchors.length >= 2
-    && artifactMatchSufficient
-    && sharedBodyPersonAnchors.length === 0
-    && nonArtifactCompanionTerms.length === 0
-    && !artifactStateSignal) {
-    // Structural task/scope proof establishes that the row belongs to this
-    // request, but it cannot make a content-free historical restatement useful
-    // evidence. Rows that only repeat the codes + artifact (for example,
-    // "needs to be addressed") add no state, owner, decision, or concrete step.
-    return { admitted: false, item, reasonCode: "marked-action-artifact-status-insufficient" };
-  }
-  if (distinctiveAnchors.length
-    && !sharesDistinctiveAnchor
-    && effectiveAnchorCompanionTerms.length < 2
-    && !(sameActiveCurrentSourceContext && currentSourceContextTaskSpecificProof)
-    && !explicitStructuralProof) {
-    return { admitted: false, item, reasonCode: "marked-action-distinctive-anchor-missing" };
-  }
-  const localPersonCompanionTerms = taskSemanticMarkedActionLocalPersonCompanionTerms(subjectText, sharedPersonAnchors, distinctiveAnchors, markerSettings)
-    .filter((term) => candidateBodyTerms.has(term));
-  // Extend cued person phrase to single-name forms such as "to Aditi" which the
-  // subject anchor extractor already accepts. Require companion co-location in the
-  // same candidate sentence for cross-note applicability.
-  const sharedCuedPersonPhrase = Array.from(subjectText.matchAll(/\b(?:[Tt]o|[Ww]ith|[Ff]rom|[Bb]y|[Aa]sk|[Aa]sked|[Tt]ell|[Tt]old|[Ee]mail|[Ee]mailed|[Ss]end|[Ss]ent)\s+([A-Z][a-z]{2,})(?:\s+([A-Z][a-z]{2,}))?\b/g))
-    .map((match) => [match[1], match[2]].filter(Boolean).join(" ").trim().toLowerCase())
-    .filter(Boolean)
-    .some((phrase) => new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+")}\\b`, "i").test(candidateBody));
-  const sharedCuedPersonPhraseWithCompanion = taskSemanticMarkedActionCuedPersonPhraseWithCompanion(candidateBody, subjectText, effectiveAnchorCompanionTerms, subjectArtifactAnchors);
-  const personCompanionSameSentence = taskSemanticMarkedActionCandidateSentenceHasPersonAndCompanion(candidateBody, sharedPersonAnchors, effectiveAnchorCompanionTerms);
-  const hasPhraseOrOwnerOrCued = sharedSubjectPhrases.length > 0 || possessiveOwnerArtifactMatchSameSentence || sharedCuedPersonPhraseWithCompanion;
-  if (strongCodeAnchors.length && !sharesStrongCodeAnchor && !(sharedCuedPersonPhrase && anchorCompanionTerms.length >= 1)) {
-    return { admitted: false, item, reasonCode: "marked-action-strong-code-anchor-missing" };
-  }
-  // Cross-note applicability requires a concrete subject/artifact relationship.
-  // People/org/program/generic artifact/generic workflow/scattered companions
-  // alone cannot establish applicability. Gate leaky branches behind phrase,
-  // owner-artifact, or cued-person+companion same-sentence ties.
-  if (explicitStructuralProof
-    || sharedStrongCodeAnchors.length >= 2
-    || sharedBodyStrongCodeAnchors.length >= 1 && effectiveAnchorCompanionTerms.length >= 1 && artifactMatchSufficient && (hasPhraseOrOwnerOrCued || artifactStateSignalSameSentence)
-    || sharesStrongCodeAnchor && effectiveAnchorCompanionTerms.length >= 2 && artifactMatchSufficient
-    || sharedCuedPersonPhraseWithCompanion && effectiveAnchorCompanionTerms.length >= 1 && personCompanionSameSentence
-      && (!sharesStrongCodeAnchor || sharedBodyStrongCodeAnchors.length >= 1 || effectiveAnchorCompanionTerms.length >= 2)
-    || sameActiveCurrentSourceContext && sharedSubjectPhrases.length > 0
-    || artifactMatchSufficient && artifactStateSignalSameSentence && nonArtifactCompanionTerms.length >= 1 && hasPhraseOrOwnerOrCued
-    || artifactTiedSameSentenceProof
-    || sharedPersonAnchors.length >= 2 && localPersonCompanionTerms.length >= 2 && effectiveAnchorCompanionTerms.length >= 2 && hasPhraseOrOwnerOrCued && personCompanionSameSentence
-    || sharedPersonAnchors.length === 1 && localPersonCompanionTerms.length >= 2 && effectiveAnchorCompanionTerms.length >= 1 && hasPhraseOrOwnerOrCued && personCompanionSameSentence) return { admitted: true, item };
-  return { admitted: false, item, reasonCode: "marked-action-subject-support-insufficient" };
+  // Lane-specific retrieval owns explicit continuity/history/task-reference
+  // selection (laneRouted plus allowTaskReferences/allowHistoricalEvidence
+  // filters at the retrieval call site). This structural gate must not
+  // re-apply those legacy flags as a second blanket membership gate:
+  // positive, compatible rows admitted here stay available with their state
+  // labels and provenance; retrieval excludes them explicitly when the
+  // request opts out.
+  // Cross-note structural admission: semantic routing and exact positive
+  // scoring have already established whether this row is positive and
+  // request-applicable, so no word/phrase/path/title/person/program scan may
+  // re-admit or re-exclude it here. Missing or ambiguous ownership is not
+  // foreignness proof: unknown-owned positive external rows are retained with
+  // their original provenance and state labels. An independent structural
+  // foreignness proof across notes cannot come from note-local scope IDs of
+  // unrelated contracts, differing paths, unmatched names, missing line
+  // metadata, old dates, or action wording; same-note native conflicts are
+  // resolved in the exact line-ownership branch above. Request-assigned
+  // taskId/scopeId wrappers are associations, not ownership proof.
+  return { admitted: true, item };
 }
 
 function taskSemanticChunkLineOwnership(chunk = {}) {
@@ -2562,187 +2652,39 @@ function taskSemanticMarkedActionAdjacentCriteriaContinuations(admitted = [], re
   const sourceContract = options.sourceContract && typeof options.sourceContract === "object" ? options.sourceContract : {};
   const scopeId = String(options.scopeId || "");
   if (!activeSourcePath || !scopeId || options.markedActionScope !== true) return [];
-  const eligibleRejectionReasons = new Set([
-    "marked-action-current-source-context-task-specific-support-insufficient",
-    "marked-action-subject-support-insufficient",
-    "scope-not-requested-active",
-    "current-source-not-requested-scope"
-  ]);
-  const obligationPattern = /\b(?:condition(?:al|ally)?|eligib(?:le|ility)|faculty|if\s+(?:he|she|they|the|a|an)|intend(?:s|ed|ing)?|must|need(?:s|ed)?|only\s+if|required?|shall|should)\b/i;
-  const bodyTerms = (value = {}) => new Set(Array.from(localSemanticTextSeedTerms(taskSemanticEvidenceBodyText(value)).values())
-    .map(taskSemanticMarkedActionSupportRoot)
-    .filter((term) => term
-      && !TASK_SEMANTIC_MARKED_ACTION_GENERIC_TERMS.has(term)
-      && !TASK_SEMANTIC_MARKED_ACTION_ANCHOR_COMPANION_GENERIC_TERMS.has(term)
-      && !TASK_STRUCTURE_ACTION_WORDS.has(term)
-      && !/^\d+$/.test(term)));
-  const authoritativeAnchorRanges = taskSemanticScopeLineRanges(sourceContract, scopeId, {});
-  const anchors = (admitted || []).filter((item) => {
-    const chunk = item?.chunk || item || {};
-    const chunkOwnership = taskSemanticChunkLineOwnership(chunk);
-    if (!chunkOwnership) return false;
-    if (vaultRelativePath(chunk.path || chunk.provenance?.path || "") !== activeSourcePath) return false;
-    if (semanticCanonicalUnitKind(item) !== "list-item") return false;
-    const sourceKindLower = String(item?.sourceKind || chunk.sourceKind || "").toLowerCase();
-    if (sourceKindLower === "current-source-context") return true;
-    if (sourceKindLower === "note") {
-      const overlaps = authoritativeAnchorRanges.some((range) => chunkOwnership.start <= range.end && chunkOwnership.end >= range.start);
-      // debug
-      // console.log("anchor check note:", item?.evidenceId||chunk.evidenceId, "kind", semanticCanonicalUnitKind(item), "ownership", chunkOwnership, "ranges", authoritativeAnchorRanges, "overlaps", overlaps);
-      return overlaps;
-    }
-    return false;
-  });
+  // Structural-only recovery: a rejected row returns only through exact native
+  // source-contract identity for the requested scope, with its original
+  // provenance preserved. Line adjacency, lexical term overlap, sentence
+  // proximity, and deterministic text-pattern matching never admit a row, and
+  // no authoritative context (sourceKind, authority, selection codes, scores)
+  // is fabricated or assigned here.
   const recovered = [];
   const recoveredKeys = new Set();
   for (const entry of rejected || []) {
-    if (!eligibleRejectionReasons.has(String(entry?.reasonCode || ""))) continue;
     const item = entry?.item || {};
-    const chunk = item?.chunk || item;
-    const candidatePath = vaultRelativePath(chunk.path || chunk.provenance?.path || "");
-    const candidateRange = taskSemanticChunkLineOwnership(chunk);
-    const candidateBody = taskSemanticEvidenceBodyText(item);
-    const candidateScore = Number(item.semanticBaseScore ?? item.semanticScore ?? item.semantic ?? item.matchScore ?? 0);
-    const candidateAuthority = String(item.authorityState || chunk.authorityState || "authoritative").toLowerCase();
-    const candidateConflict = String(item.conflictState || chunk.conflictState || "none").toLowerCase();
-    const nativeOwned = taskSemanticMarkedActionAdjacentCriteriaNativeOwnership(chunk, { activeSourcePath, sourceContract, scopeId });
-    const candidateSourceKindLower = String(item?.sourceKind || chunk.sourceKind || "").toLowerCase();
-    const candidateSourceKindAllowed = candidateSourceKindLower === "current-source-context" || (candidateSourceKindLower === "note" && nativeOwned);
-    const unitKind = semanticCanonicalUnitKind(item);
-    if (candidatePath !== activeSourcePath
-      || !candidateSourceKindAllowed
-      || unitKind !== "list-item"
-      || !candidateRange
-      || !nativeOwned
-      || !candidateBody
-      || !obligationPattern.test(candidateBody)
-      || !Number.isFinite(candidateScore)
-      || candidateScore <= 0
-      || ["rejected", "conflict", "conflicted"].includes(candidateAuthority)
-      || ["rejected", "conflict", "conflicted"].includes(candidateConflict)) continue;
-    const candidateTerms = bodyTerms(item);
-    const anchor = anchors.find((anchorItem) => {
-      const anchorChunk = anchorItem?.chunk || anchorItem || {};
-      const anchorRange = taskSemanticChunkLineOwnership(anchorChunk);
-      if (!anchorRange || candidateRange.start !== anchorRange.end + 1) return false;
-      const anchorTerms = bodyTerms(anchorItem);
-      const sharedTerms = Array.from(candidateTerms).filter((term) => anchorTerms.has(term));
-      return sharedTerms.some((term) => term.includes("-") || term.length >= 4);
-    });
-    if (!anchor) continue;
-    const anchorChunk = anchor.chunk || anchor;
-    const metadata = {
-      adjacentCriteriaContinuation: true,
-      adjacentCriteriaAnchorEvidenceId: String(anchorChunk.evidenceId || anchorChunk.id || ""),
-      adjacentCriteriaReasonCode: "task-semantic-current-source-adjacent-criteria-reserved",
-      selectionReasonCode: "task-semantic-current-source-context-selected",
-      admissionReason: "task-semantic-current-source-adjacent-criteria",
-      sourceKind: "current-source-context"
-    };
-    const recoveredItem = Object.assign({}, item, metadata, { chunk: Object.assign({}, chunk, metadata) });
-    const key = semanticTaskCandidateStableKey(recoveredItem);
+    const chunk = item?.chunk || item || {};
+    if (vaultRelativePath(chunk.path || chunk.provenance?.path || "") !== activeSourcePath) continue;
+    if (!taskSemanticMarkedActionAdjacentCriteriaNativeOwnership(chunk, { activeSourcePath, sourceContract, scopeId })) continue;
+    if (semanticCanonicalUnitKind(item) !== "list-item") continue;
+    if (!taskSemanticEvidenceBodyText(item)) continue;
+    const score = Number(item.semanticBaseScore ?? item.semanticScore ?? item.semantic ?? item.matchScore ?? 0);
+    if (!Number.isFinite(score) || score <= 0) continue;
+    const key = semanticTaskCandidateStableKey(item);
     if (!key || recoveredKeys.has(key)) continue;
     recoveredKeys.add(key);
-    recovered.push(recoveredItem);
+    recovered.push(item);
   }
   return recovered;
 }
 
 function taskSemanticMarkedActionAdjacentCriteriaIndexExpansion(ranked = [], usableIndex = [], source = {}, sourceContract = {}, task = {}, options = {}) {
-  if (options.markedActionScope !== true || !Array.isArray(usableIndex) || !usableIndex.length) return [];
-  const activeSourcePath = vaultRelativePath(options.activeSourcePath || source?.path || sourceContract?.path || "");
-  if (!activeSourcePath) return [];
-  const anchors = [];
-  for (const item of ranked || []) {
-    const currentDecision = taskSemanticCurrentSourceCandidateDecision(item, source, sourceContract, options.scopeId, task, {
-      supportingEvidenceOnly: true,
-      activeSourcePath,
-      taskId: options.taskId,
-      queryId: options.queryId
-    });
-    if (!currentDecision.admitted) continue;
-    const supportDecision = taskSemanticMarkedActionSupportingCandidateDecision(currentDecision.item || item, source, sourceContract, task, {
-      markedActionScope: true,
-      activeSourcePath,
-      subjectText: options.subjectText,
-      settings: options.settings
-    });
-    if (supportDecision.admitted) anchors.push(supportDecision.item || currentDecision.item || item);
-  }
-  if (!anchors.length) return [];
-  const routedEvidenceIds = new Set((ranked || []).map((item) => {
-    const chunk = item?.chunk || item || {};
-    return String(chunk.evidenceId || chunk.id || "");
-  }).filter(Boolean));
-  const rejected = [];
-  for (const anchor of anchors) {
-    const anchorChunk = anchor?.chunk || anchor || {};
-    const anchorRange = taskSemanticChunkLineOwnership(anchorChunk);
-    if (!anchorRange || semanticCanonicalUnitKind(anchor) !== "list-item") continue;
-    const anchorScore = Number(anchor.semanticBaseScore ?? anchor.semanticScore ?? anchor.semantic ?? anchor.matchScore ?? 0);
-    if (!Number.isFinite(anchorScore) || anchorScore <= 0) continue;
-    for (const adjacentChunk of usableIndex) {
-      const adjacentRange = taskSemanticChunkLineOwnership(adjacentChunk);
-      const adjacentEvidenceId = String(adjacentChunk?.evidenceId || adjacentChunk?.id || "");
-      if (!adjacentRange
-        || adjacentRange.start !== anchorRange.end + 1
-        || routedEvidenceIds.has(adjacentEvidenceId)
-        || vaultRelativePath(adjacentChunk?.path || adjacentChunk?.provenance?.path || "") !== activeSourcePath
-        || semanticCanonicalUnitKind(adjacentChunk) !== "list-item"
-        || !taskSemanticMarkedActionAdjacentCriteriaNativeOwnership(adjacentChunk, { activeSourcePath, sourceContract, scopeId: options.scopeId })
-        || !semanticRetrievalChunkEligible(adjacentChunk, { allowTaskReference: false })) continue;
-      const queryEmbedding = Array.isArray(options.embedding) || ArrayBuffer.isView(options.embedding) ? options.embedding : [];
-      const adjacentEmbedding = Array.isArray(adjacentChunk?.embedding) || ArrayBuffer.isView(adjacentChunk?.embedding) ? adjacentChunk.embedding : [];
-      const embeddingScore = queryEmbedding.length > 0 && queryEmbedding.length === adjacentEmbedding.length
-        ? Number(cosine(queryEmbedding, adjacentEmbedding))
-        : Number.NaN;
-      const structuralScore = Number.isFinite(embeddingScore) && embeddingScore > 0
-        ? embeddingScore
-        : Math.max(0.000001, Math.min(0.1, anchorScore * 0.25));
-      const native = taskSemanticNativeOwnershipMetadata(adjacentChunk);
-      const candidate = Object.assign({
-        chunk: adjacentChunk,
-        semantic: structuralScore,
-        semanticScore: structuralScore,
-        semanticBaseScore: structuralScore,
-        semanticRankScore: structuralScore,
-        adjacentCriteriaScoreDerivation: Number.isFinite(embeddingScore) && embeddingScore > 0
-          ? "adjacent-index-embedding-cosine"
-          : "retrieved-anchor-structural-continuation",
-        evidenceTaskId: native.evidenceTaskId,
-        evidenceScopeId: native.evidenceScopeId,
-        taskId: options.taskId,
-        scopeId: options.scopeId,
-        queryTaskId: options.taskId,
-        queryScopeId: options.scopeId,
-        queryId: options.queryId,
-        lane: options.lane,
-        sourceKind: semanticChunkSourceKind(adjacentChunk),
-        temporalRelation: semanticTemporalRelation(adjacentChunk, options.profile || {})
-      }, contextCandidateScopeMetadata(adjacentChunk, options.profile || {}, {}));
-      const currentDecision = taskSemanticCurrentSourceCandidateDecision(candidate, source, sourceContract, options.scopeId, task, {
-        supportingEvidenceOnly: true,
-        activeSourcePath,
-        taskId: options.taskId,
-        queryId: options.queryId
-      });
-      if (!currentDecision.admitted) continue;
-      const supportDecision = taskSemanticMarkedActionSupportingCandidateDecision(currentDecision.item || candidate, source, sourceContract, task, {
-        markedActionScope: true,
-        activeSourcePath,
-        subjectText: options.subjectText,
-        settings: options.settings
-      });
-      if (supportDecision.admitted) continue;
-      rejected.push({ item: supportDecision.item || currentDecision.item || candidate, reasonCode: supportDecision.reasonCode || "marked-action-current-source-context-task-specific-support-insufficient" });
-    }
-  }
-  return taskSemanticMarkedActionAdjacentCriteriaContinuations(anchors, rejected, {
-    activeSourcePath,
-    markedActionScope: true,
-    sourceContract,
-    scopeId: options.scopeId
-  });
+  // Adjacency broadening removed: rows enter only through the normal semantic
+  // selection path with exact native source-contract identity. Expanding the
+  // usable index by line adjacency would admit rows by proximity, score them
+  // with a second scorer, and fabricate authoritative context — all forbidden
+  // by the structural contract. The signature is retained for call-site
+  // compatibility.
+  return [];
 }
 
 function taskSemanticCurrentSourceCandidateDecision(item = {}, source = {}, sourceContract = {}, scopeId = "", task = {}, options = {}) {
@@ -2978,13 +2920,19 @@ function measureCanonicalBodies(canonicalChunks) {
   return bytes;
 }
 
+// Lane C1: body/vector keys are never serialized for metadata accounting.
+// Bodies are measured separately by measureCanonicalBodies and vectors are
+// shared by reference; stringifying them here would copy megabytes only to
+// weigh metadata.
+const SEMANTIC_PREPARED_METADATA_SKIP_KEYS = new Set(["body", "text", "embedding", "vector", "routingVector", "routingEmbedding"]);
+
 function measurePreparedMetadata(eligibleChunks) {
   let bytes = 0;
   for (const chunk of eligibleChunks || []) {
     if (!chunk || typeof chunk !== "object") continue;
     for (const key of Object.keys(chunk)) {
-      if (key === "body" || key === "text") continue;
-      let value = chunk[key];
+      if (SEMANTIC_PREPARED_METADATA_SKIP_KEYS.has(key)) continue;
+      const value = chunk[key];
       try {
         const serialized = JSON.stringify(value);
         if (serialized) {
@@ -3033,15 +2981,113 @@ function buildSemanticIndexPreparedView(identity, canonicalChunks, routingInputs
   });
 }
 
+async function buildSemanticIndexPreparedViewAsync(identity, canonicalChunks, routingInputs, options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "prepared-view");
+  try {
+    const canonical = Array.isArray(canonicalChunks) ? canonicalChunks : [];
+    // Private candidates only: frozen inputs are only read, never mutated.
+    const eligibleList = [];
+    for (let index = 0; index < canonical.length; index += 1) {
+      const chunk = canonical[index];
+      if (isEligibleSemanticChunk(chunk)) eligibleList.push(decorateSemanticChunkHandle(chunk));
+      if ((index + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const eligibleChunks = Object.freeze(eligibleList);
+    const evidenceLookup = freezeLookup(eligibleChunks);
+    await slice.checkpoint();
+    const integrity = Object.freeze(validatePreparedIntegrity(eligibleChunks));
+    const hierarchy = Object.freeze(validatePreparedHierarchy(eligibleChunks));
+    const preparationRows = canonical.length;
+    const canonicalCorpusBytes = measureCanonicalBodies(canonical);
+    const preparedViewBytes = measurePreparedMetadata(eligibleChunks);
+    await slice.checkpoint();
+    const todoistList = [];
+    for (let index = 0; index < eligibleChunks.length; index += 1) {
+      const chunk = eligibleChunks[index];
+      const sourceKind = semanticChunkSourceKind(chunk);
+      let keep = false;
+      if (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record") keep = true;
+      else if (sourceKind === "note-task-reference-row") {
+        const records = chunk && chunk.sourceRecords;
+        keep = Array.isArray(records) && records.some((record) => record && record.relation === "canonicalized-snapshot-source");
+      }
+      if (keep) todoistList.push(chunk);
+      if ((index + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const todoistInventoryCandidateChunks = Object.freeze(todoistList);
+    const frozenIdentity = Object.freeze(Object.assign({}, identity));
+    const result = Object.freeze({
+      identity: frozenIdentity,
+      eligibleChunks,
+      todoistInventoryCandidateChunks,
+      evidenceLookup,
+      integrity,
+      hierarchy,
+      preparationRows,
+      canonicalCorpusBytes,
+      preparedViewBytes,
+      metadataBound: PREPARED_VIEW_METADATA_BOUND
+    });
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return result;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
+}
+
+// Lane E: the expected retrieval identity is always derived from the active
+// manifest/settings/revision — never from the published view itself — so a
+// stale view cannot self-validate after settings drift. Resolution mirrors
+// the C2 warm-path identity inputs exactly.
+function semanticExpectedRetrievalIdentity(instance) {
+  const settings = (instance && instance.settings && typeof instance.settings === "object") ? instance.settings : {};
+  const meta = (settings.semanticIndexMeta && typeof settings.semanticIndexMeta === "object") ? settings.semanticIndexMeta : {};
+  return semanticPreparedViewIdentity({
+    generation: String(meta.generation || (instance && instance.semanticIndexManifestPublishedGeneration) || ""),
+    revision: Number((instance && instance.semanticIndexRevision) ?? 0),
+    storageFingerprint: String((instance && instance.semanticIndexStorageFingerprint) ?? ""),
+    provider: String(semanticEmbeddingProviderForSettings(settings)).toLowerCase(),
+    model: String(settings.embeddingModel || ""),
+    dimension: Number(meta.dimension || semanticEmbeddingTargetDimension(settings) || 0),
+    policyVersion: SEMANTIC_CORPUS_PREPARATION_POLICY_VERSION
+  });
+}
+
 function semanticIsRetrievalReady(instance, expectedIdentity) {
-  const view = instance && (instance.currentPreparedViewRef && instance.currentPreparedViewRef.view || instance.semanticIndexPreparedView);
-  if (!view || !view.identity || !expectedIdentity || typeof expectedIdentity !== "object") {
+  // Lane E: constant-time, no-I/O, no-build readiness over one captured
+  // immutable active prepared reference. Legacy partial state
+  // (`semanticIndexPreparedView`, `productionSemanticRoutingState`) is never
+  // consulted here; without an active `currentPreparedViewRef` the request is
+  // visibly not-ready.
+  const ref = (instance && instance.currentPreparedViewRef) || null;
+  if (!expectedIdentity || typeof expectedIdentity !== "object") {
     return Object.freeze({ ready: false, state: "not-ready", reasonCode: "identity-missing" });
   }
-  const fields = ["generation", "storageFingerprint", "provider", "model", "dimension", "policyVersion", "revision"];
-  for (const field of fields) {
+  const expectedFields = ["generation", "storageFingerprint", "provider", "model", "dimension", "policyVersion", "revision"];
+  for (const field of expectedFields) {
+    const value = expectedIdentity[field];
+    if (field === "dimension" || field === "policyVersion" || field === "revision") {
+      if (!Number.isFinite(Number(value))) return Object.freeze({ ready: false, state: "not-ready", reasonCode: "identity-missing" });
+    } else if (value === undefined || value === null) {
+      return Object.freeze({ ready: false, state: "not-ready", reasonCode: "identity-missing" });
+    }
+  }
+  const view = (ref && ref.view) || null;
+  if (!view || !view.identity || typeof view.identity !== "object") {
+    return Object.freeze({ ready: false, state: "not-ready", reasonCode: "prepared-view-not-ready" });
+  }
+  for (const field of expectedFields) {
+    if (view.identity[field] === undefined || view.identity[field] === null) {
+      return Object.freeze({ ready: false, state: "not-ready", reasonCode: `identity-mismatch-${field}` });
+    }
+  }
+  for (const field of expectedFields) {
     const expected = field === "provider" ? String(expectedIdentity[field] || "").toLowerCase() : expectedIdentity[field];
     const actual = field === "provider" ? String(view.identity[field] || "").toLowerCase() : view.identity[field];
+    // Revision zero is a valid active identity; only a non-finite revision is
+    // rejected (already gated above).
     const expectedNorm = field === "dimension" || field === "policyVersion" || field === "revision" ? Number(expected) : String(expected ?? "");
     const actualNorm = field === "dimension" || field === "policyVersion" || field === "revision" ? Number(actual) : String(actual ?? "");
     if (field === "model") {
@@ -3050,9 +3096,20 @@ function semanticIsRetrievalReady(instance, expectedIdentity) {
       return Object.freeze({ ready: false, state: "not-ready", reasonCode: `identity-mismatch-${field}` });
     }
   }
-  if (!instance.currentPreparedViewRef && !instance.semanticIndexPreparedView) return Object.freeze({ ready: false, state: "not-ready", reasonCode: "view-missing" });
-  // Never mutate published view.
-  return Object.freeze({ ready: true, state: "ready", preparedView: view });
+  if (expectedIdentity.key !== undefined && expectedIdentity.key !== null && String(view.identity.key || "") !== String(expectedIdentity.key || "")) {
+    return Object.freeze({ ready: false, state: "not-ready", reasonCode: "identity-mismatch-key" });
+  }
+  const routingState = (ref && ref.routingState) || null;
+  if (!routingState || !routingState.routingIndex) {
+    return Object.freeze({ ready: false, state: "not-ready", reasonCode: "prepared-view-not-ready" });
+  }
+  const routingSourceKey = String(routingState.preparedIdentityKey || routingState.identityKey || "");
+  if (routingSourceKey && routingSourceKey !== String(view.identity.key || "")) {
+    return Object.freeze({ ready: false, state: "not-ready", reasonCode: "identity-mismatch-source" });
+  }
+  // Never mutate the published view or routing state; hand out the captured
+  // immutable reference for the whole request.
+  return Object.freeze({ ready: true, state: "ready", ref, preparedView: view, routingState });
 }
 
 function prepareProductionSemanticRoutingState(chunks = [], settings = {}, revision = 0, storageFingerprint = "", options = {}) {
@@ -3102,6 +3159,76 @@ function prepareProductionSemanticRoutingState(chunks = [], settings = {}, revis
   return Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, textSeedIndex, sourceChunksIdentity: chunks, telemetry });
 }
 
+async function prepareProductionSemanticRoutingStateAsync(chunks = [], settings = {}, revision = 0, storageFingerprint = "", options = {}) {
+  const startedAt = localSemanticRoutingNow();
+  settings = settings && typeof settings === "object" ? settings : {};
+  const opts = options && typeof options === "object" ? options : {};
+  // No synchronous full-corpus fallback: any failure below rejects so the
+  // caller observes it instead of silently receiving a blocking build.
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "production-routing");
+  try {
+    if (!Array.isArray(chunks)) throw localSemanticRoutingError("routing-state-chunks-malformed", "Production routing chunks must be an array.");
+    const descriptor = productionSemanticRoutingDescriptor(chunks, settings, opts);
+    const sourceChunks = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      if (chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true) sourceChunks.push(chunk);
+      if ((index + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    for (let row = 0; row < sourceChunks.length; row += 1) {
+      if (!productionSemanticRoutingChunkCompatibility(sourceChunks[row], descriptor, settings)) throw localSemanticRoutingError("routing-state-incompatible", "Persisted embedding is incompatible with the production routing descriptor.", { row, dimension: descriptor.dimension });
+      if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const generation = String(opts.generation || localSemanticRoutingStableHash(`${descriptor.id}|${descriptor.version}|${revision}|${storageFingerprint}|${sourceChunks.map((chunk) => chunk.evidenceId || chunk.id || "").join("|")}`));
+    const expectedShardCount = Number(opts.shardCount || settings.semanticIndexMeta?.shardCount || 0);
+    const explicitShardRefs = sourceChunks.map((chunk) => String(chunk?.shardRef ?? chunk?.shard ?? ""));
+    const explicitShardLayoutUsable = explicitShardRefs.length > 0 && explicitShardRefs.every(Boolean)
+      && (!expectedShardCount || new Set(explicitShardRefs).size === expectedShardCount);
+    const shardSize = Number.isInteger(opts.shardSize) && opts.shardSize > 0
+      ? opts.shardSize
+      : expectedShardCount > 0 && sourceChunks.length > 0
+        ? Math.max(1, Math.ceil(sourceChunks.length / expectedShardCount))
+        : undefined;
+    const routingChunks = !explicitShardLayoutUsable && expectedShardCount > 0 && sourceChunks.length > 0
+      ? sourceChunks.map((chunk, row) => Object.assign({}, chunk, { shardRef: `shard-${Math.floor(row / shardSize)}` }))
+      : sourceChunks;
+    const routingIndex = await buildLocalSemanticRoutingIndexAsync(routingChunks, descriptor, {
+      generation,
+      shardSize,
+      vectorAdapter: (chunk, row, encoder) => localSemanticRoutingVector(chunk.embedding, encoder.dimension, "Provider document", row, encoder.normalization),
+      slice
+    });
+    const chunkByEvidenceId = new Map();
+    for (let row = 0; row < sourceChunks.length; row += 1) {
+      chunkByEvidenceId.set(routingIndex.evidenceIds[row], sourceChunks[row]);
+      if ((row + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    const handleLookup = productionSemanticRoutingHandleLookup(sourceChunks, routingIndex);
+    await slice.checkpoint();
+    const textSeedIndex = await buildLocalSemanticTextSeedIndexAsync(sourceChunks, { slice });
+    const progress = ownsSlice ? slice.finish() : null;
+    const telemetry = {
+      state: "ready",
+      coldBuild: true,
+      loadHit: false,
+      providerCalls: 0,
+      networkCalls: 0,
+      revision: Number(revision || 0),
+      storageFingerprint: String(storageFingerprint || ""),
+      count: routingIndex.count,
+      dimension: routingIndex.encoder.dimension,
+      buildElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt),
+      cooperativeYields: progress ? progress.yieldCount : 0,
+      cooperativeMaxSliceMs: progress ? progress.maxSliceMs : 0
+    };
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, textSeedIndex, sourceChunksIdentity: chunks, telemetry });
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
+}
+
 function productionSemanticRoutingBytesToBase64(values) {
   const bytes = values instanceof Uint8Array ? values : new Uint8Array(values?.buffer || values || []);
   if (typeof btoa === "function") {
@@ -3122,6 +3249,55 @@ function productionSemanticRoutingBytesToBase64(values) {
     output += offset + 2 < bytes.length ? alphabet[c & 63] : "=";
   }
   return output;
+}
+
+function productionSemanticRoutingBytesToBase64Async(values, options = {}) {
+  // Lane D1 bounded serialization kernel: sliced/async counterpart of
+  // productionSemanticRoutingBytesToBase64. Encodes the raw quantized bytes
+  // directly in 3-byte-aligned slices (per-slice btoa output stitches exactly
+  // because every non-final slice holds a multiple of 3 bytes), so the only
+  // string built is the required base64 payload itself — never a redundant
+  // whole-vector JSON/string copy. Cooperative checkpoints come from lane A's
+  // accepted slice primitive; no worker pool, scheduler, or fixed sleep.
+  const opts = options && typeof options === "object" ? options : {};
+  const bytes = values instanceof Uint8Array ? values : new Uint8Array(values?.buffer || values || []);
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "routing-base64");
+  const finish = (result) => {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return result;
+  };
+  const fail = (error) => {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  };
+  const run = async () => {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (typeof btoa === "function") {
+      let output = "";
+      const step = 3 * 8192;
+      let slices = 0;
+      for (let offset = 0; offset < bytes.length; offset += step) {
+        const end = Math.min(bytes.length, offset + step);
+        output += btoa(String.fromCharCode(...bytes.subarray(offset, end)));
+        slices += 1;
+        if (slices % 4 === 0 || end === bytes.length) await slice.checkpoint();
+      }
+      return output;
+    }
+    let output = "";
+    for (let offset = 0; offset < bytes.length; offset += 3) {
+      const a = bytes[offset];
+      const b = offset + 1 < bytes.length ? bytes[offset + 1] : 0;
+      const c = offset + 2 < bytes.length ? bytes[offset + 2] : 0;
+      output += alphabet[a >> 2];
+      output += alphabet[((a & 3) << 4) | (b >> 4)];
+      output += offset + 1 < bytes.length ? alphabet[((b & 15) << 2) | (c >> 6)] : "=";
+      output += offset + 2 < bytes.length ? alphabet[c & 63] : "=";
+      if ((offset / 3 + 1) % 8192 === 0) await slice.checkpoint();
+    }
+    return output;
+  };
+  return run().then(finish, fail);
 }
 
 function productionSemanticRoutingBase64ToBytes(value) {
@@ -3248,6 +3424,60 @@ function serializeProductionSemanticRoutingArtifact(state = {}, options = {}) {
   };
   artifact.integrityHash = productionSemanticRoutingArtifactIntegrity(artifact);
   return artifact;
+}
+
+async function serializeProductionSemanticRoutingArtifactAsync(state = {}, options = {}) {
+  // Lane D1 bounded serialization kernel: sliced/async counterpart of
+  // serializeProductionSemanticRoutingArtifact. Field order, values, and the
+  // integrity hash are identical to the synchronous serializer; only the
+  // vector-bytes-to-base64 step streams through the cooperative async
+  // encoder on the shared slice. The synchronous serializer is preserved
+  // untouched for existing callers.
+  const opts = options && typeof options === "object" ? options : {};
+  const index = state.routingIndex;
+  if (!index || typeof index !== "object") throw localSemanticRoutingError("artifact-state-missing", "Production routing state is missing.");
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "routing-artifact");
+  try {
+    const vectorStore = index.vectorStore || {};
+    const data = await productionSemanticRoutingBytesToBase64Async(
+      new Uint8Array(vectorStore.values.buffer, vectorStore.values.byteOffset, vectorStore.values.byteLength),
+      { slice }
+    );
+    await slice.checkpoint();
+    const artifact = {
+      schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
+      persistenceSchemaVersion: LOCAL_SEMANTIC_ROUTING_PERSISTENCE_SCHEMA_VERSION,
+      provider: String(opts.provider || String(index.encoder?.id || "").split(":")[1] || ""),
+      model: String(opts.model || String(index.encoder?.id || "").split(":").slice(2).join(":") || ""),
+      dimension: Number(index.encoder?.dimension || vectorStore.dimension || 0),
+      contentVersion: index.encoder?.version,
+      indexRevision: Number(opts.revision || state.telemetry?.revision || 0),
+      storageFingerprint: String(opts.storageFingerprint || state.telemetry?.storageFingerprint || ""),
+      generation: String(index.generation || ""),
+      count: Number(index.count || 0),
+      evidenceIds: Array.from(index.evidenceIds || []),
+      sourceIds: Array.from(index.sourceIds || []),
+      shardRefs: Array.from(index.shardRefs || []),
+      scopeRefs: Array.from(index.scopeRefs || [], (value) => Array.from(value || [])),
+      taskRefs: Array.from(index.taskRefs || [], (value) => Array.from(value || [])),
+      temporalMetadata: Array.from(index.temporalMetadata || []),
+      routingMetadata: Array.from(index.routingMetadata || []),
+      vectorStore: {
+        format: vectorStore.format,
+        scale: Number(vectorStore.scale),
+        dimension: Number(vectorStore.dimension),
+        count: Number(vectorStore.count),
+        encoding: "base64",
+        data
+      }
+    };
+    artifact.integrityHash = productionSemanticRoutingArtifactIntegrity(artifact);
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return artifact;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    throw error;
+  }
 }
 
 function deserializeProductionSemanticRoutingArtifact(artifact = {}) {
@@ -4441,8 +4671,394 @@ class RuntimeWorkCoordinator {
       rejected: 0,
       rejectedProviderFull: 0,
       rejectedIndexFull: 0,
-      expired: 0
+      expired: 0,
+      maxRendererOwners: 0,
+      rendererPhases: 0,
+      rendererCoalesced: 0
     };
+    // Lane A renderer admission lane: one heavy renderer owner at a time plus
+    // one outstanding plugin-owned host data-I/O operation. This private queue
+    // never touches the provider/index queues above.
+    this.rendererSequence = 0;
+    this.rendererQueue = [];
+    this.rendererPendingByKey = new Map();
+    this.rendererLive = new Set();
+    this.rendererActive = null;
+    this.rendererOwners = 0;
+    this.rendererHostIOActive = false;
+    this.rendererControlPaintDepth = 0;
+    this.rendererInteractiveBypass = 0;
+  }
+
+  // --- Lane A renderer admission lane (adjacent to the constructor) ---
+
+  _rendererError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  _rendererPriority(value) {
+    return String(value || "").trim().toLowerCase() === "background" ? "background" : "interactive";
+  }
+
+  _rendererSignalAborted(signal) {
+    try {
+      return Boolean(signal && signal.aborted);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  _rendererRejectEntry(entry, error) {
+    if (!entry || entry.done) return;
+    entry.done = true;
+    this.rendererPendingByKey.delete(entry.coalesceKey || "");
+    this.rendererLive.delete(entry);
+    // A released continuation re-queued for re-admission holds two live
+    // handles: the outer phase promise and the in-flight waiter. Settle both
+    // so close can never strand a caller; the admit handlers skip done
+    // entries, so the later run settlement cannot double-settle.
+    const waiter = entry.waiter;
+    entry.waiter = null;
+    entry.reject(error);
+    if (waiter) waiter.reject(error);
+  }
+
+  _rendererSelectNextIndex() {
+    // FIFO with bounded interactive bypass: interactive phases may precede
+    // background work, but a background phase ages out after 3 bypasses so it
+    // can never starve.
+    let firstBackground = -1;
+    let firstInteractive = -1;
+    for (let i = 0; i < this.rendererQueue.length; i++) {
+      const item = this.rendererQueue[i];
+      if (!item || item.done || this._rendererSignalAborted(item.signal)) continue;
+      if (item.priority === "background") {
+        if (firstBackground < 0) firstBackground = i;
+      } else if (firstInteractive < 0) firstInteractive = i;
+      if (firstBackground >= 0 && firstInteractive >= 0) break;
+    }
+    if (firstBackground >= 0 && this.rendererQueue[firstBackground].bypassed >= 3) return firstBackground;
+    if (firstInteractive >= 0) {
+      for (let i = 0; i < this.rendererQueue.length; i++) {
+        const item = this.rendererQueue[i];
+        if (item && !item.done && !this._rendererSignalAborted(item.signal) && item.priority === "background") {
+          item.bypassed = (item.bypassed || 0) + 1;
+        }
+      }
+      this.rendererInteractiveBypass += 1;
+      return firstInteractive;
+    }
+    return firstBackground;
+  }
+
+  _rendererPurgeSettled() {
+    for (let i = this.rendererQueue.length - 1; i >= 0; i--) {
+      const item = this.rendererQueue[i];
+      if (!item) {
+        this.rendererQueue.splice(i, 1);
+        continue;
+      }
+      if (item.done) {
+        this.rendererQueue.splice(i, 1);
+        continue;
+      }
+      if (this.closed || this._rendererSignalAborted(item.signal)) {
+        this.rendererQueue.splice(i, 1);
+        this._rendererRejectEntry(item, this._rendererError(
+          "runtime-work-cancelled",
+          this.closed ? "Runtime work coordinator is closed." : "Renderer phase was cancelled."
+        ));
+        this.telemetry.cancelled += 1;
+      }
+    }
+  }
+
+  _rendererPump() {
+    if (this.rendererActive || this.closed) return;
+    this._rendererPurgeSettled();
+    if (this.closed) return;
+    const index = this._rendererSelectNextIndex();
+    if (index < 0) return;
+    const entry = this.rendererQueue.splice(index, 1)[0];
+    if (!entry || entry.done) {
+      this._rendererPump();
+      return;
+    }
+    if (this._rendererSignalAborted(entry.signal)) {
+      this._rendererRejectEntry(entry, this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled."));
+      this.telemetry.cancelled += 1;
+      this._rendererPump();
+      return;
+    }
+    if (entry.waiter) {
+      // A released owner re-admits the same continuation; never re-run it.
+      const waiter = entry.waiter;
+      entry.waiter = null;
+      this.rendererActive = entry;
+      this.rendererOwners = 1;
+      this.telemetry.maxRendererOwners = Math.max(this.telemetry.maxRendererOwners, 1);
+      waiter.resolve();
+      return;
+    }
+    this._rendererAdmit(entry);
+  }
+
+  _rendererAdmit(entry) {
+    this.rendererActive = entry;
+    this.rendererOwners = 1;
+    this.telemetry.maxRendererOwners = Math.max(this.telemetry.maxRendererOwners, 1);
+    this.telemetry.rendererPhases += 1;
+    if (entry.priority === "background") this.rendererInteractiveBypass = 0;
+    entry.started = true;
+    const token = this._rendererTokenFor(entry);
+    let result;
+    try {
+      result = entry.run(token);
+    } catch (error) {
+      this._rendererReleaseOwner(entry);
+      entry.done = true;
+      this.rendererPendingByKey.delete(entry.coalesceKey || "");
+      this.rendererLive.delete(entry);
+      entry.reject(error);
+      this._rendererPump();
+      return;
+    }
+    Promise.resolve(result).then(
+      (value) => {
+        if (this.rendererActive === entry) this._rendererReleaseOwner(entry);
+        if (!entry.done) {
+          entry.done = true;
+          this.rendererPendingByKey.delete(entry.coalesceKey || "");
+          this.rendererLive.delete(entry);
+          entry.resolve(value);
+        }
+        this._rendererPump();
+      },
+      (error) => {
+        if (this.rendererActive === entry) this._rendererReleaseOwner(entry);
+        if (!entry.done) {
+          entry.done = true;
+          this.rendererPendingByKey.delete(entry.coalesceKey || "");
+          this.rendererLive.delete(entry);
+          entry.reject(error);
+        }
+        this._rendererPump();
+      }
+    );
+  }
+
+  _rendererReleaseOwner(entry) {
+    if (this.rendererActive === entry) {
+      this.rendererActive = null;
+      this.rendererOwners = 0;
+    }
+  }
+
+  _rendererReacquire(entry) {
+    if (entry.done) {
+      return Promise.reject(this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled."));
+    }
+    if (this.closed || this._rendererSignalAborted(entry.signal)) {
+      return Promise.reject(this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled."));
+    }
+    return new Promise((resolve, reject) => {
+      entry.waiter = { resolve, reject };
+      this.rendererQueue.unshift(entry);
+      this._rendererPump();
+    }).then(() => {
+      if (entry.done || this.closed || this._rendererSignalAborted(entry.signal)) {
+        throw this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled.");
+      }
+      // The pump installed this entry as the single active owner on resume.
+      if (this.rendererActive !== entry) {
+        throw this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled.");
+      }
+    });
+  }
+
+  _rendererTokenFor(entry) {
+    const coordinator = this;
+    const mustHoldOwner = () => {
+      if (coordinator.rendererActive !== entry || entry.done) {
+        throw coordinator._rendererError("runtime-work-cancelled", "Renderer phase no longer holds the renderer turn.");
+      }
+      if (coordinator.closed || coordinator._rendererSignalAborted(entry.signal)) {
+        throw coordinator._rendererError("runtime-work-cancelled", "Renderer phase was cancelled.");
+      }
+    };
+    return {
+      checkpoint() {
+        if (coordinator.rendererControlPaintDepth > 0) {
+          throw coordinator._rendererError("renderer-control-paint-forbidden", "Renderer checkpoint is forbidden inside a control paint turn.");
+        }
+        mustHoldOwner();
+        return (async () => {
+          await semanticHostYield();
+          mustHoldOwner();
+        })();
+      },
+      hostIO(call) {
+        if (coordinator.rendererControlPaintDepth > 0) {
+          throw coordinator._rendererError("renderer-control-paint-forbidden", "Host data-I/O is forbidden inside a control paint turn.");
+        }
+        mustHoldOwner();
+        if (typeof call !== "function") {
+          throw coordinator._rendererError("renderer-host-io-invalid", "Host data-I/O requires a call.");
+        }
+        if (coordinator.rendererHostIOActive) {
+          throw coordinator._rendererError("renderer-host-io-busy", "Another plugin-owned host data-I/O operation is outstanding.");
+        }
+        return (async () => {
+          coordinator.rendererHostIOActive = true;
+          // Release the renderer turn while the single host call settles so the
+          // host event loop stays available; no whole-workflow mutex is held.
+          coordinator._rendererReleaseOwner(entry);
+          coordinator._rendererPump();
+          let value;
+          let failure = null;
+          try {
+            value = await call();
+          } catch (error) {
+            failure = error;
+          }
+          coordinator.rendererHostIOActive = false;
+          if (coordinator.closed || coordinator._rendererSignalAborted(entry.signal) || entry.done) {
+            const cancelError = coordinator._rendererError("runtime-work-cancelled", "Renderer phase was cancelled.");
+            coordinator._rendererPump();
+            if (failure) throw failure;
+            throw cancelError;
+          }
+          await coordinator._rendererReacquire(entry);
+          coordinator._rendererPump();
+          if (failure) throw failure;
+          return value;
+        })();
+      },
+      externalWait(promise) {
+        if (coordinator.rendererControlPaintDepth > 0) {
+          throw coordinator._rendererError("renderer-control-paint-forbidden", "External wait is forbidden inside a control paint turn.");
+        }
+        mustHoldOwner();
+        return (async () => {
+          // Release renderer ownership while the external promise waits so two
+          // external waits may overlap; re-admit before local continuation.
+          coordinator._rendererReleaseOwner(entry);
+          coordinator._rendererPump();
+          let value;
+          let failure = null;
+          try {
+            value = await promise;
+          } catch (error) {
+            failure = error;
+          }
+          if (coordinator.closed || coordinator._rendererSignalAborted(entry.signal) || entry.done) {
+            coordinator._rendererPump();
+            if (failure) throw failure;
+            throw coordinator._rendererError("runtime-work-cancelled", "Renderer phase was cancelled.");
+          }
+          await coordinator._rendererReacquire(entry);
+          coordinator._rendererPump();
+          if (failure) throw failure;
+          return value;
+        })();
+      },
+      controlPaint(call) {
+        // Bounded read-free status/cancellation turn only: runs already-
+        // computed work or sets a cancellation flag. It needs no renderer
+        // ownership, so it stays available while external/host waiting.
+        // Enforcement boundary (deliberately minimal): the turn must be a
+        // synchronous function returning a plain value, and it may not
+        // acquire token turns (checkpoint/hostIO/externalWait) or re-enter
+        // paint-tracked work. Broader rules (no Vault/API calls, no corpus
+        // formatting, no logical data locks) are a caller contract: a generic
+        // callback guard cannot introspect arbitrary host calls.
+        if (typeof call !== "function") {
+          throw coordinator._rendererError("renderer-control-paint-invalid", "Control paint requires a call.");
+        }
+        coordinator.rendererControlPaintDepth += 1;
+        try {
+          const result = call();
+          if (result && typeof result.then === "function") {
+            throw coordinator._rendererError("renderer-control-paint-forbidden", "Control paint must be synchronous read-free work.");
+          }
+          return result;
+        } finally {
+          coordinator.rendererControlPaintDepth = Math.max(0, coordinator.rendererControlPaintDepth - 1);
+        }
+      }
+    };
+  }
+
+  runRendererPhase(request = {}, run) {
+    request = request || {};
+    if (typeof run !== "function") {
+      return Promise.reject(this._rendererError("renderer-phase-invalid", "Renderer phase requires a run function."));
+    }
+    if (this.closed) {
+      return Promise.reject(this._rendererError("runtime-work-closed", "Runtime work coordinator is closed."));
+    }
+    const signal = request && (request.signal || request.abortSignal) ? (request.signal || request.abortSignal) : null;
+    if (this._rendererSignalAborted(signal)) {
+      return Promise.reject(this._rendererError("runtime-work-cancelled", "Renderer phase was cancelled."));
+    }
+    const coalesceKey = String(request.coalesceKey || "").slice(0, 240);
+    if (coalesceKey) {
+      const pending = this.rendererPendingByKey.get(coalesceKey);
+      if (pending && !pending.done && !this._rendererSignalAborted(pending.signal)) {
+        // Renderer-lane coalescing only: keep the legacy provider/index
+        // `coalesced` metric untouched for existing callers.
+        this.telemetry.rendererCoalesced += 1;
+        return pending.promise;
+      }
+    }
+    const entry = {
+      id: `renderer-phase-${++this.rendererSequence}`,
+      jobId: String(request.jobId || "").slice(0, 160),
+      priority: this._rendererPriority(request.priority),
+      coalesceKey,
+      signal,
+      run,
+      bypassed: 0,
+      started: false,
+      done: false,
+      waiter: null,
+      resolve: null,
+      reject: null,
+      promise: null
+    };
+    entry.promise = new Promise((resolve, reject) => {
+      entry.resolve = resolve;
+      entry.reject = reject;
+    });
+    // Avoid unhandled rejection noise when a coalesced/queued entry is later
+    // rejected by close/cancel while a caller only awaits the original handle.
+    entry.promise.catch(() => {});
+    if (coalesceKey) this.rendererPendingByKey.set(coalesceKey, entry);
+    this.rendererLive.add(entry);
+    this.rendererQueue.push(entry);
+    this._rendererPump();
+    return entry.promise;
+  }
+
+  _rendererCancelQueued() {
+    // Settle every live renderer continuation: queued phases, the active
+    // owner, and owners released while awaiting an external/host promise.
+    const cancelError = this._rendererError("runtime-work-cancelled", "Runtime work was cancelled during unload.");
+    this.rendererQueue.splice(0);
+    this.rendererPendingByKey.clear();
+    for (const entry of Array.from(this.rendererLive)) {
+      if (!entry.done) {
+        this._rendererRejectEntry(entry, cancelError);
+        this.telemetry.cancelled += 1;
+      }
+    }
+    this.rendererLive.clear();
+    this.rendererActive = null;
+    this.rendererOwners = 0;
+    this.rendererHostIOActive = false;
+    this.rendererControlPaintDepth = 0;
   }
 
   settings() { return this.runtime?.settings || {}; }
@@ -4750,8 +5366,31 @@ class RuntimeWorkCoordinator {
     // Calls made from an existing workflow lease (the normal gateway path), or
     // explicitly marked as the active index operation's own embedding/publication
     // call, reuse that admission to avoid nested leases and self-deadlock.
-    if (allowActiveIndex || this._ownsWorkflowToken(workflowToken)) return Promise.resolve().then(run);
-    return this.runAiWorkflow({ operation: operation || `${normalizedProvider || "provider"}-provider`, execute: () => run(), priority: effectivePriority, deadlineAt: effectiveDeadline });
+    // Lane J bridge: only local initiation (normalized above) and result
+    // processing are admitted. Transport never holds a renderer turn: when the
+    // caller holds one, release it across the provider wait via
+    // rendererToken.externalWait (waits may overlap) and re-enter before local
+    // adoption. Provider capacity, leases, deadlines and transport semantics
+    // below are untouched.
+    const dispatchTransport = () => {
+      if (allowActiveIndex || this._ownsWorkflowToken(workflowToken)) return Promise.resolve().then(run);
+      return this.runAiWorkflow({ operation: operation || `${normalizedProvider || "provider"}-provider`, execute: () => run(), priority: effectivePriority, deadlineAt: effectiveDeadline });
+    };
+    // Lane J bridge (fail-closed): dispatchTransport is deferred behind a
+    // release gate resolved only after rendererToken.externalWait accepts the
+    // wait, so transport never enqueues before the turn is released and a
+    // synchronous token error propagates with dispatch never started (never
+    // a fallback redispatch). No-token callers dispatch directly below.
+    const heldEntry = this.rendererActive;
+    if (heldEntry && !heldEntry.done && !this.closed && !this._rendererSignalAborted(heldEntry.signal)) {
+      const rendererToken = this._rendererTokenFor(heldEntry);
+      let releaseGate;
+      const gate = new Promise((resolve) => { releaseGate = resolve; });
+      const wait = rendererToken.externalWait(gate.then(() => dispatchTransport()));
+      releaseGate();
+      return wait;
+    }
+    return dispatchTransport();
   }
 
   _ownsWorkflowToken(workflowToken = null) {
@@ -4925,6 +5564,7 @@ class RuntimeWorkCoordinator {
 
   cancelRuntimeWork() {
     this.closed = true;
+    this._rendererCancelQueued();
     this._cancelIndexWriterWaiters();
     this._cancelLeaseWaiters();
     for (const state of this.capacityQueues.values()) {
@@ -5058,6 +5698,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexManifestPublishedGeneration = "";
     this.semanticIndexActivePartition = null;
     this.semanticIndexReshardTimer = null;
+    // Lane S idle startup hydration (keyed, shared, idle-gated). At most one
+    // active hydration identity and one shared promise; startup-load
+    // promises/tickets are never duplicated.
+    this.semanticIdleStartupGateAt = 0;
+    this.semanticIdleLastInputAt = 0;
+    this.semanticIdleTicket = null;
+    this.semanticIdleCallbackId = null;
+    this.semanticIdleListenersRegistered = false;
+    this.semanticIdleListenerRefs = [];
+    this.semanticIdleLayoutReady = false;
+    this.semanticIdleHydrationId = 0;
+    this.semanticIdleHydrationPromise = null;
+    this.semanticIdleHydrationResolve = null;
+    this.semanticIdleHydrationActive = false;
+    this.semanticIdleHydrationCancelled = false;
+    this.semanticIdleHydrationPaused = false;
+    this.semanticIdleHydrationResumeResolve = null;
+    this.semanticIdleHydrationState = "queued";
+    this.semanticIdleHydrationSource = "";
+    this.semanticIdleStorageMigrationStarted = false;
     // Worker lifecycle (Task 3): numeric epoch starts at 0; the pool is created
     // lazily on first note preparation, never at onload.
     this.semanticIndexWorkerEpoch = 0;
@@ -5096,8 +5756,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticIndexOptimizeInProgress = false;
     this.internalNoteWriteUntil = new Map();
     await this.migrateSettings();
-    await this.migrateSemanticIndexStorage();
-    if (this.semanticIndexStorageMigrationReadyForRebuild) this.queueSemanticIndexStorageRebuild();
     this.semanticIndexStartupEventBuffer = new Map();
     this.semanticIndexStartupBuffering = true;
     this.runtimeStartupTelemetry = {
@@ -5112,6 +5770,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       try { return vaultRelativePath(rawPath || "", vaultBasePath(this.app)); } catch { return String(rawPath || "").trim().replace(/\\/g, "/").replace(/^\.\/+/,""); }
     };
     this.registerEvent(this.app.vault.on("modify", (file) => {
+      this.notifySemanticIdleInput("vault-modify");
       const normalized = _startupBufferNormalizePath(file?.path || "");
       if (!normalized) return;
       if (!(file instanceof TFile) || file.extension !== "md") return;
@@ -5124,6 +5783,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (this.settings.notesAutoSync && this.settings.todoistToken) this.queueNoteSync(file.path);
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
+      this.notifySemanticIdleInput("vault-create");
       const normalized = _startupBufferNormalizePath(file?.path || "");
       if (!normalized) return;
       if (!(file instanceof TFile) || file.extension !== "md") return;
@@ -5134,6 +5794,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.queueSemanticIndexUpdate(file.path, "create");
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
+      this.notifySemanticIdleInput("vault-delete");
       const normalized = _startupBufferNormalizePath(file?.path || "");
       if (!normalized) return;
       if (!(file instanceof TFile) || file.extension !== "md") return;
@@ -5144,6 +5805,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       Promise.resolve().then(() => this.removePathFromSemanticIndex(file.path)).catch((error) => this.logLocal("Semantic index delete deferred", { path: file.path, error: error.message || String(error) }));
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.notifySemanticIdleInput("vault-rename");
       const newNormalized = _startupBufferNormalizePath(file?.path || "");
       const oldNormalized = _startupBufferNormalizePath(oldPath || "");
       if (!(file instanceof TFile) || file.extension !== "md") return;
@@ -5176,11 +5838,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         _startupActive -= 1;
       }
     };
-    await Promise.allSettled([
-      _runStartupPhase("schedulerMemory", () => this.loadSchedulerMemory()),
-      _runStartupPhase("taskReferenceSnapshot", () => this.loadTaskReferenceSnapshot()),
-      _runStartupPhase("semanticIndexPathMetaSnapshot", () => this.loadSemanticIndexPathMetaSnapshot())
-    ]);
+    // Startup metadata is plugin-owned adapter I/O. Keep the three phase
+    // boundaries serial so a task-reference read cannot overlap scheduler or
+    // semantic path metadata reads on the Obsidian adapter.
+    await _runStartupPhase("schedulerMemory", () => this.loadSchedulerMemory());
+    await _runStartupPhase("taskReferenceSnapshot", () => this.loadTaskReferenceSnapshot());
+    await _runStartupPhase("semanticIndexPathMetaSnapshot", () => this.loadSemanticIndexPathMetaSnapshot());
     this.runtimeStartupTelemetry.maxConcurrentLocalPhases = _startupMaxConcurrent;
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     this.semanticIndexStartupBuffering = false;
@@ -5217,11 +5880,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "sync-notes", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
     this.addCommand({ id: "semantic-todoist-rebuild-references", name: "Rebuild local Todoist reference table", callback: () => this.rebuildTodoistReferenceTable(true) });
     this.addCommand({ id: "semantic-todoist-repair-subtask-indentation", name: "Repair synced subtask indentation", callback: () => this.repairCachedSubtaskIndentation(true, { force: true, scanAll: true }) });
-    // Startup compatibility is intentionally launched asynchronously after
-    // commands/views are registered so the UI is not synchronously blocked,
-    // but retrieval readiness still awaits the active generation lifecycle.
+    // Lane S: semantic shard hydration is manifest/metadata-first and
+    // idle-gated. UI/commands are already registered above, so schedule one
+    // keyed, shared hydration job instead of starting an eager load.
+    // Retrieval readiness still awaits the active generation lifecycle.
     if (!compatibleIndexLoaded || !this.semanticIndexLoaded) {
-      this.startSemanticIndexCompatibilityLoad().catch((error) => this.logLocal("Semantic index startup compatibility load failed", { error: error?.message || String(error) }));
+      this.scheduleSemanticIdleStartup("startup");
     }
 
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => this.handleActiveLeafChange(leaf)));
@@ -5280,6 +5944,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
       this.semanticIndexCompatibilityRefreshTimer = null;
       this.semanticIndexStartupCompatibilityPromise = null;
+      // Lane S: cancel idle tickets, listeners, and shared hydration
+      // continuations so no late hydration publishes after unload. The
+      // explicitly authorized final persistence flushes below are retained.
+      this._cancelSemanticIdleStartup("plugin-unloading");
       window.clearTimeout(this.semanticIndexReshardTimer);
       this.semanticIndexReshardTimer = null;
       window.clearTimeout(this.semanticIndexStorageMigrationQueueTimer);
@@ -5373,6 +6041,151 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  // --- Lane J admission bridges (renderer-lane entry points) ---
+  // All plugin-owned substantial local work runs through the lane A serial
+  // renderer admission policy (`RuntimeWorkCoordinator.runRendererPhase`).
+  // These helpers preserve each logical queue's ordering: the persistence
+  // write tail stays the persistence ordering source, and response lanes keep
+  // per-target FIFO via their own `running` gate. When already inside a
+  // renderer turn, work continues on that turn instead of re-queuing (which
+  // would self-deadlock). The fallback runs directly when no coordinator
+  // exists (mobile serial fallback, unit stubs) or during unload/close, so
+  // authorized final persistence still settles. No host objects are patched.
+  // With options.noRetry, a lost-turn error propagates instead of re-queuing:
+  // mutation bodies (response apply, persistence writes) must run exactly
+  // once, so only reads/idempotent work may use the default retry.
+  _admitRendererPhase(jobId, run, options = {}) {
+    const coordinator = this.runtimeWorkCoordinator;
+    const allowTurnReuseRetry = options.noRetry !== true;
+    const phaseRequest = () => ({
+      jobId: String(jobId || "plugin-work").slice(0, 160),
+      priority: options.priority,
+      coalesceKey: options.coalesceKey,
+      signal: options.signal
+    });
+    const fallbackToken = {
+      checkpoint: async () => {},
+      hostIO: (call) => call(),
+      externalWait: (promise) => promise,
+      controlPaint: (call) => {
+        if (typeof call !== "function") {
+          const error = new Error("Control paint requires a call.");
+          error.code = "renderer-control-paint-invalid";
+          throw error;
+        }
+        const result = call();
+        if (result && typeof result.then === "function") {
+          const error = new Error("Control paint must be synchronous read-free work.");
+          error.code = "renderer-control-paint-forbidden";
+          throw error;
+        }
+        return result;
+      }
+    };
+    if (!coordinator || typeof coordinator.runRendererPhase !== "function" || coordinator.closed || this.isUnloading) {
+      return Promise.resolve().then(() => run(fallbackToken));
+    }
+    try {
+      const active = coordinator.rendererActive;
+      if (active && !active.done && !coordinator._rendererSignalAborted(active.signal)) {
+        // Already admitted: continue on the held turn; never re-queue behind
+        // self. Only a lost-turn error re-queues, and only when allowTurnReuseRetry:
+        // mutation bodies never retry (no double side effects); read bodies are
+        // idempotent. Business-logic failures always propagate.
+        const token = coordinator._rendererTokenFor(active);
+        return Promise.resolve().then(() => run(token)).catch((error) => {
+          if (allowTurnReuseRetry && error && /no longer holds the renderer turn/i.test(String((error && error.message) || ""))) {
+            return coordinator.runRendererPhase(phaseRequest(), run);
+          }
+          throw error;
+        });
+      }
+    } catch (error) { /* fall through to queued admission */ }
+    return coordinator.runRendererPhase(phaseRequest(), run);
+  }
+
+  _admitPersistenceOperation(kind, operation) {
+    // Lane J: persistence tail elements run as admitted renderer phases with
+    // the token threaded in (as the operation argument and as the ambient
+    // `_persistenceRendererToken` for deep adapter calls via
+    // `_persistenceHostIO`). The `persistenceWriteTail` chain remains the sole
+    // persistence ordering source; no second persistence queue is created.
+    // noRetry: a lost turn fails the write once — writes must never double-run.
+    return this._admitRendererPhase(`persistence:${String(kind || "persistence").slice(0, 80)}`, async (token) => {
+      this._persistenceRendererToken = token || null;
+      try {
+        return await operation(token);
+      } finally {
+        this._persistenceRendererToken = null;
+      }
+    }, { noRetry: true });
+  }
+
+  // Lane J: one Vault/adapter/saveData call at a time with bounded
+  // busy-retry. Peak-one is preserved (retries only run while no host call is
+  // outstanding); the retry spins inside the operation, so the persistence
+  // write tail (or the calling lane) stays the sole ordering source. The
+  // backoff never sleeps while holding a renderer owner: with an admitted
+  // token it releases across the wait via rendererToken.externalWait and
+  // re-enters before the next attempt (direct timer fallback only with no
+  // turn). Lost-turn and business failures propagate immediately — never
+  // retried, never re-queued. A synchronous token externalWait error also
+  // propagates fail-closed (never a bare on-turn timer). Falls back to a direct call with no ambient
+  // token (mobile fallback, stubs, unload) or when unloading.
+  async _admittedHostIO(token, call) {
+    const hasToken = token && typeof token.hostIO === "function" && typeof token.externalWait === "function";
+    const hostIO = token && typeof token.hostIO === "function" ? (candidate) => token.hostIO(candidate) : (candidate) => candidate();
+    const releaseWait = (ms) => {
+      const wait = new Promise((resolve) => setTimeout(resolve, ms));
+      if (hasToken && !this.isUnloading) {
+        return token.externalWait(wait);
+      }
+      return wait;
+    };
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await hostIO(call);
+      } catch (error) {
+        if (error && error.code === "renderer-host-io-busy" && attempt < 30 && !this.isUnloading) {
+          await releaseWait(10);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  // Lane J: deferred persistence wait. The acquire thunk (usually () =>
+  // this.saveSettings()) is invoked only after the admitted renderer turn is
+  // released, so persistence/tail acquisition never runs while holding
+  // renderer ownership; the wait re-enters before adoption. Exactly one
+  // externalWait per call — never wrap this helper's result in another
+  // externalWait/releaseWait. The acquire chain hangs off a release gate that
+  // is resolved only after externalWait accepts the wait, so a synchronous
+  // token error propagates fail-closed with acquire never scheduled (never
+  // direct acquisition, never an orphaned on-turn acquire). No-token callers
+  // invoke acquire directly (mobile fallback, stubs, unload).
+  _deferredPersistenceWait(rendererToken, acquire) {
+    if (typeof acquire !== "function") return Promise.reject(new Error("Deferred persistence wait requires an acquire callback."));
+    if (rendererToken && typeof rendererToken.externalWait === "function" && !this.isUnloading) {
+      let releaseGate;
+      const gate = new Promise((resolve) => { releaseGate = resolve; });
+      const wait = rendererToken.externalWait(gate.then(() => acquire()));
+      releaseGate();
+      return wait;
+    }
+    return acquire();
+  }
+
+  _persistenceHostIO(call) {
+    if (this.isUnloading) {
+      const token = this._persistenceRendererToken;
+      if (token && typeof token.hostIO === "function") return token.hostIO(call);
+      return call();
+    }
+    return this._admittedHostIO(this._persistenceRendererToken, call);
+  }
+
   _drainResponseApplicationLane(laneKey) {
     this._ensureResponseApplicationCoordinator();
     const lane = this.responseApplicationLanes.get(laneKey);
@@ -5382,10 +6195,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     item.started = true;
     lane.running = true;
     lane.activeItem = item;
-    Promise.resolve().then(async () => {
+    // Lane J: local validation/apply continuation admitted through
+    // RuntimeWorkCoordinator.runRendererPhase with the renderer token threaded
+    // into both callbacks (trailing argument; ignored by callbacks that do not
+    // need it). Remote/worker waits inside callbacks must use
+    // rendererToken.externalWait (releases the turn so unrelated targets
+    // overlap) and Vault calls rendererToken.hostIO; local validation and
+    // mutation stay on the admitted turn and serial. Per-target FIFO is
+    // preserved by the lane.running gate above. noRetry: apply side effects
+    // run exactly once — a lost turn settles as failure, never re-queues.
+    this._admitRendererPhase(`response-application:${String(laneKey || "response").slice(0, 120)}`, async (rendererToken) => {
       this._assertResponseApplicationActive(item);
       let validation = { ok: true };
-      if (typeof item.request.validate === "function") validation = await item.request.validate(item.request, this);
+      if (typeof item.request.validate === "function") validation = await item.request.validate(item.request, this, rendererToken);
       if (validation === false) validation = { ok: false, conflict: { code: "source-conflict" } };
       if (!validation || validation.ok === false) return this._responseApplicationResult(item, "blocked", { conflict: validation?.conflict || { code: "source-conflict" } });
       this._assertResponseApplicationActive(item);
@@ -5393,12 +6215,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       item.guard = () => this._assertResponseApplicationActive(item);
       this.responseApplicationActiveItem = item;
       try {
-        const sideEffects = await item.request.apply(item.request.result, item.request, this, item.guard);
+        const sideEffects = await item.request.apply(item.request.result, item.request, this, item.guard, rendererToken);
         return this._responseApplicationResult(item, "applied", { sideEffects: sideEffects || null });
       } finally {
         if (this.responseApplicationActiveItem === item) this.responseApplicationActiveItem = null;
       }
-    }).catch((error) => item.cancelled || item.terminal
+    }, { noRetry: true }).catch((error) => item.cancelled || item.terminal
       ? this._responseApplicationResult(item, "blocked", { conflict: { code: "response-application-cancelled" } })
       : this._responseApplicationResult(item, "failed", {
         error: { code: String(error?.code || "application-failed").slice(0, 80), message: String(error?.message || error).slice(0, 240) }
@@ -5457,11 +6279,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async currentResponseApplicationSourceState(path) {
     const normalizedPath = vaultRelativePath(path || "", vaultBasePath(this.app));
     if (!normalizedPath) return { path: "", revision: 0, fingerprint: "" };
-    const file = this.app?.vault?.getAbstractFileByPath?.(normalizedPath);
-    if (!file) return { path: normalizedPath, revision: 0, fingerprint: "" };
-    let text = "";
-    try { text = await this.app.vault.read(file); } catch { try { text = await this.app.vault.cachedRead(file); } catch {} }
-    return { path: normalizedPath, revision: Number(file?.stat?.mtime || 0) || 0, fingerprint: shortHash(text) };
+    // Lane J: source-state read admitted through
+    // RuntimeWorkCoordinator.runRendererPhase; the Vault read goes through
+    // rendererToken.hostIO one call at a time and re-enters after settlement.
+    return this._admitRendererPhase("response-source-state", async (rendererToken) => {
+      // Lane J classification: getAbstractFileByPath is a synchronous read-free
+      // lookup; no hostIO needed. Only the async file reads below are admitted.
+      const file = this.app?.vault?.getAbstractFileByPath?.(normalizedPath);
+      if (!file) return { path: normalizedPath, revision: 0, fingerprint: "" };
+      let text = "";
+      try { text = await this._admittedHostIO(rendererToken, () => this.app.vault.read(file)); } catch { try { text = await this._admittedHostIO(rendererToken, () => this.app.vault.cachedRead(file)); } catch {} }
+      return { path: normalizedPath, revision: Number(file?.stat?.mtime || 0) || 0, fingerprint: shortHash(text) };
+    });
   }
 
   responseApplicationSourceConflict(expected, current, options = {}) {
@@ -5489,6 +6318,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return semanticIndexPartitionContract(settings, options);
   }
 
+  async cleanupSettledSemanticIndexStorage(activePartition, activeManifestMeta = {}) {
+    return cleanupSettledSemanticIndexStorage(this, activePartition, activeManifestMeta);
+  }
+
   semanticIndexStorageDir(options = {}) {
     const partition = options.providerDir || options.relativeDir ? options : this.semanticIndexStoragePartition(options);
     const relativeDir = String(partition.relativeDir || "");
@@ -5509,7 +6342,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
-      try { await adapter.mkdir(current); } catch (error) {
+      try { await this._persistenceHostIO(() => adapter.mkdir(current)); } catch (error) {
         if (!/exist|already/i.test(String(error?.message || error))) throw error;
       }
     }
@@ -5598,7 +6431,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const run = predecessor.then(async () => {
       this.persistenceActiveOperation = String(kind || "persistence");
       try {
-        return await operation();
+        // Lane J: admitted through RuntimeWorkCoordinator.runRendererPhase via
+        // _admitPersistenceOperation; the persistenceWriteTail chain stays the
+        // ordering source and no second persistence queue is created.
+        return await this._admitPersistenceOperation(kind, operation);
       } catch (error) {
         this._persistenceErrorSnapshot(kind, error);
         throw error;
@@ -5643,7 +6479,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const batch = this.settingsPersistencePending;
         this.settingsPersistencePending = null;
         try {
-          await this.enqueuePersistenceOperation("settings", () => this.saveData(batch.snapshot));
+          await this.enqueuePersistenceOperation("settings", () => this._persistenceHostIO(() => this.saveData(batch.snapshot)));
           this._resolveSettingsPersistenceWaiters(batch.revision);
         } catch (error) {
           this._resolveSettingsPersistenceWaiters(batch.revision, error);
@@ -5726,7 +6562,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.schedulerMemorySaveTimer = null;
     const compact = compactSchedulerMemory(this.schedulerMemory);
     compact.updatedAt = deviceTimestamp();
-    await this.app.vault.adapter.write(`${this.manifest.dir}/${SCHEDULER_MEMORY_FILE}`, JSON.stringify(compact));
+    await this._persistenceHostIO(() => this.app.vault.adapter.write(`${this.manifest.dir}/${SCHEDULER_MEMORY_FILE}`, JSON.stringify(compact)));
     this.schedulerMemory = compact;
     this.schedulerMemoryDirty = false;
     return true;
@@ -5740,8 +6576,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const adapter = this.app?.vault?.adapter;
     if (!adapter?.read || !adapter?.write) return false;
     let migratedAny = false;
+    const isHydrationCancellation = (error) => String(error?.code || "") === "semantic-index-hydration-cancelled";
+    const checkpoint = async (boundary) => {
+      // Lane S owns migration as part of the idle hydration job. Recheck that
+      // ownership before each adapter/staging boundary so input, visibility,
+      // and unload can pause or cancel before the next operation.
+      if (typeof this._semanticIdleHydrationCheckpoint === "function") {
+        await this._semanticIdleHydrationCheckpoint(`migration:${String(boundary || "boundary").slice(0, 48)}`);
+      }
+    };
+    await checkpoint("start");
     const readLegacy = async (file) => {
-      try { return await adapter.read(`${this.manifest.dir}/${normalizedPluginBasename(file, "legacy semantic-index file")}`); } catch { return null; }
+      await checkpoint("legacy-read");
+      try {
+        return await adapter.read(`${this.manifest.dir}/${normalizedPluginBasename(file, "legacy semantic-index file")}`);
+      } catch (error) {
+        if (isHydrationCancellation(error)) throw error;
+        return null;
+      }
     };
     const canonicalManifestFile = (provider, fallback) => {
       try {
@@ -5752,6 +6604,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return fallback;
     };
     const cleanupLegacy = async (indexFile, parsed, reasonCode) => {
+      await checkpoint("cleanup-start");
       const plan = semanticIndexLegacyCleanupPlan(parsed, indexFile);
       this.semanticIndexStorageMigrationPending = true;
       this.semanticIndexStorageMigrationReason = String(reasonCode || "legacy-generation-invalid");
@@ -5766,16 +6619,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return false;
       }
       const removeExact = async (file) => {
+        await checkpoint("cleanup-remove");
         try {
           await adapter.remove(`${this.manifest.dir}/${file}`);
           return true;
         } catch (error) {
+          if (isHydrationCancellation(error)) throw error;
           return /enoent|not[ -]?found|missing/i.test(String(error?.message || error));
         }
       };
       // Remove shards before the manifest so a failed cleanup leaves a
       // discoverable candidate for a safe retry on the next startup.
       for (const file of plan.shardFiles) {
+        await checkpoint("cleanup-shard");
         if (!await removeExact(file)) {
           this.lastSemanticIndexPersistenceError = { phase: "migration-cleanup", message: "Legacy semantic index cleanup failed." };
           this.logLocal("Legacy semantic index cleanup failed", { reason: "remove-failed" });
@@ -5844,22 +6700,37 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const sourceFiles = uniqueValues([indexFile, ...validation.shardFiles, validation.pathMetaFile, SEMANTIC_INDEX_PATH_META_FILE, LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE]).filter(Boolean);
       let targetAlreadyValid = false;
       try {
+        await checkpoint("target-manifest");
         const existing = JSON.parse(await adapter.read(targetManifestPath));
         const targetValidation = semanticIndexManifestValidation(existing, indexFile, legacySettings);
         const targetFiles = uniqueValues([indexFile, ...targetValidation.shardFiles, targetValidation.pathMetaFile]).filter(Boolean);
         for (const file of targetFiles) {
+          await checkpoint("target-file");
           const targetBody = await adapter.read(`${targetDir}/${file}`);
           if (targetBody === null || targetBody === undefined) throw new Error(`Migrated semantic-index file missing: ${file}`);
         }
         const targetRoutingPath = `${targetDir}/${LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE}`;
-        try { await adapter.read(targetRoutingPath); } catch {}
+        try {
+          await checkpoint("target-routing");
+          await adapter.read(targetRoutingPath);
+        } catch (error) {
+          if (isHydrationCancellation(error)) throw error;
+        }
         targetAlreadyValid = true;
-      } catch {}
+      } catch (error) {
+        if (isHydrationCancellation(error)) throw error;
+      }
       if (targetAlreadyValid) {
         let cleanedLegacy = false;
         for (const file of sourceFiles) {
           if (await readLegacy(file) === null) continue;
-          try { await adapter.remove(`${this.manifest.dir}/${file}`); cleanedLegacy = true; } catch {}
+          try {
+            await checkpoint("legacy-cleanup");
+            await adapter.remove(`${this.manifest.dir}/${file}`);
+            cleanedLegacy = true;
+          } catch (error) {
+            if (isHydrationCancellation(error)) throw error;
+          }
         }
         if (cleanedLegacy) migratedAny = true;
         continue;
@@ -5867,6 +6738,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let staged = [];
       const published = [];
       try {
+        await checkpoint("storage-directory");
         await this.ensureSemanticIndexStorageDirectory(partition);
         const files = [];
         for (const file of uniqueValues(sourceFiles)) {
@@ -5897,33 +6769,59 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const stage = async (entry) => {
           const stagedName = normalizedPluginBasename(`${entry.file}.${token}.migration.json`, "semantic-index migration staging file");
           const stagedPath = `${targetDir}/${stagedName}`;
+          await checkpoint("stage-write");
           await adapter.write(stagedPath, entry.body);
           staged.push({ stagedPath, finalPath: `${targetDir}/${entry.file}` });
-          if (adapter.read && shortHash(await adapter.read(stagedPath)) !== shortHash(entry.body)) throw new Error(`Legacy semantic-index migration verification failed: ${entry.file}`);
+          if (adapter.read) {
+            await checkpoint("stage-readback");
+            if (shortHash(await adapter.read(stagedPath)) !== shortHash(entry.body)) throw new Error(`Legacy semantic-index migration verification failed: ${entry.file}`);
+          }
         };
         for (const entry of files) await stage(entry);
         const promote = async ({ stagedPath, finalPath }) => {
+          await checkpoint("promote-start");
           try {
             if (typeof adapter.rename === "function") await adapter.rename(stagedPath, finalPath);
             else throw new Error("rename-unavailable");
-          } catch {
+          } catch (error) {
+            if (isHydrationCancellation(error)) throw error;
+            await checkpoint("promote-fallback-read");
             await adapter.write(finalPath, await adapter.read(stagedPath));
-            try { await adapter.remove(stagedPath); } catch {}
+            try {
+              await checkpoint("promote-fallback-remove");
+              await adapter.remove(stagedPath);
+            } catch (removeError) {
+              if (isHydrationCancellation(removeError)) throw removeError;
+            }
           }
           published.push(finalPath);
-          if (adapter.read && shortHash(await adapter.read(finalPath)) !== shortHash(files.find((entry) => entry.file === finalPath.split("/").pop())?.body || "")) throw new Error(`Legacy semantic-index migration publish verification failed: ${finalPath}`);
+          if (adapter.read) {
+            await checkpoint("promote-readback");
+            if (shortHash(await adapter.read(finalPath)) !== shortHash(files.find((entry) => entry.file === finalPath.split("/").pop())?.body || "")) throw new Error(`Legacy semantic-index migration publish verification failed: ${finalPath}`);
+          }
         };
         // Publish all generation files first; the manifest/pointer is the final stable publication step.
         for (const entry of staged.filter((item) => !item.finalPath.endsWith(`/${indexFile}`))) await promote(entry);
         const manifestStage = staged.find((item) => item.finalPath.endsWith(`/${indexFile}`));
         await promote(manifestStage);
+        await checkpoint("manifest-verify");
         const migrated = JSON.parse(await adapter.read(targetManifestPath));
         semanticIndexManifestValidation(migrated, indexFile, legacySettings);
         for (const entry of staged) {
-          try { await adapter.remove(entry.stagedPath); } catch {}
+          try {
+            await checkpoint("staged-cleanup");
+            await adapter.remove(entry.stagedPath);
+          } catch (error) {
+            if (isHydrationCancellation(error)) throw error;
+          }
         }
         for (const file of uniqueValues(files.map((entry) => entry.file))) {
-          try { await adapter.remove(`${this.manifest.dir}/${file}`); } catch {}
+          try {
+            await checkpoint("legacy-cleanup");
+            await adapter.remove(`${this.manifest.dir}/${file}`);
+          } catch (error) {
+            if (isHydrationCancellation(error)) throw error;
+          }
         }
         this.logLocal("Legacy semantic index migrated", { provider, model, partition: partition.relativeDir });
         migratedAny = true;
@@ -5935,6 +6833,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         for (const file of published) {
           try { await adapter.remove(file); } catch {}
         }
+        if (isHydrationCancellation(error)) throw error;
         this.semanticIndexStorageMigrationPending = true;
         this.lastSemanticIndexPersistenceError = { phase: "migration", message: error?.message || String(error) };
         this.logLocal("Legacy semantic index migration failed; preserving legacy generation", { error: error?.message || String(error) });
@@ -5956,7 +6855,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       this.semanticIndexStorageMigrationReadyForRebuild = false;
       this.semanticIndexStorageMigrationPending = false;
-      Promise.resolve(this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(false)))
+      Promise.resolve(this.withSemanticIndexOperation("rebuild", (migrationToken) => this.rebuildSemanticIndex(false, { indexToken: migrationToken })))
         .then((result) => {
           if (result === true || result?.ok) return;
           this.semanticIndexStorageMigrationPending = true;
@@ -6114,7 +7013,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const snapshotFile = taskReferenceGenerationFile("task-reference-snapshot", generation);
         const indexFile = taskReferenceGenerationFile("task-reference-index", generation);
         if (pointer.snapshotFile !== snapshotFile || pointer.indexFile !== indexFile) throw new Error("Task-reference manifest filenames are invalid.");
-        [snapshot, parsedIndex] = await Promise.all([readJsonFile(snapshotFile), readJsonFile(indexFile)]);
+        snapshot = await readJsonFile(snapshotFile);
+        parsedIndex = await readJsonFile(indexFile);
         const snapshotMeta = snapshot?.meta || {};
         const indexMeta = parsedIndex?.meta || {};
         if (!snapshot || !parsedIndex || snapshotMeta.generation !== generation || indexMeta.generation !== generation ||
@@ -6129,10 +7029,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return false;
       }
     } else {
-      [parsedIndex, snapshot] = await Promise.all([
-        readJsonFile(TASK_REFERENCE_INDEX_FILE),
-        readJsonFile(TASK_REFERENCE_SNAPSHOT_FILE)
-      ]);
+      parsedIndex = await readJsonFile(TASK_REFERENCE_INDEX_FILE);
+      snapshot = await readJsonFile(TASK_REFERENCE_SNAPSHOT_FILE);
       const snapshotFingerprint = snapshot?.meta?.fingerprint || "";
       const indexFingerprint = parsedIndex?.meta?.fingerprint || parsedIndex?.index?.fingerprint || "";
       if (snapshot && parsedIndex && snapshotFingerprint && indexFingerprint && snapshotFingerprint !== indexFingerprint) {
@@ -6353,6 +7251,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (counts && typeof counts.chunkCount === "number") telemetry.chunkCount = counts.chunkCount;
       this.lastTaskReferenceRepairTelemetry = telemetry;
     };
+    // A presented token bypasses the top-level deferral pre-checks: the
+    // serialized queue validates the exact active object and owner relation.
+    // An invalid token fails closed inside withSemanticIndexOperation.
+    const repairNestedToken = options?.indexToken;
+    const targetFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || taskReferencePayloadFingerprint(this.settings);
+    if (repairNestedToken === undefined || repairNestedToken === null) {
     if (this.isUnloading) {
       _setRepairTerminal("cancelled", "cancelled", "unloading");
       return semanticOperationResult({ ok: false, reasonCode: "unloading" });
@@ -6377,7 +7281,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       _setRepairTerminal("deferred", "deferred", "embedding-dimension-migration-required");
       return semanticOperationResult({ ok: false, reasonCode: "embedding-dimension-migration-required" });
     }
-    const targetFingerprint = this.taskReferenceSnapshotFingerprint || this.settings.taskReferenceSnapshotMeta?.fingerprint || taskReferencePayloadFingerprint(this.settings);
     if (targetFingerprint && this.settings.semanticIndexMeta?.taskReferenceSnapshotFingerprint === targetFingerprint) {
       _setRepairTerminal("completed", "completed", "already-aligned");
       return semanticOperationResult({ ok: true, reasonCode: "already-aligned" });
@@ -6394,7 +7297,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: "semantic-index-unavailable", repairQueued: true });
       }
     }
-    const repairResult = await this.withSemanticIndexOperation("task-reference-repair", async () => {
+    }
+    const repairResult = await this.withSemanticIndexOperation("task-reference-repair", async (indexToken) => {
       const repairStartRevision = this.taskReferenceStateRevision;
       this.taskReferenceRepairInProgress = true;
       const previousIndex = this.semanticIndex || [];
@@ -6419,7 +7323,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       _setRepairRunning("embedding");
       this.requireAiAccess("embedding");
       const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
-      const embedded = await this.embedSemanticChunks(repaired.chunks, reuseMap, "task-reference repair", { fallbackPolicy: "disabled" });
+      const embedded = await this.embedSemanticChunks(repaired.chunks, reuseMap, "task-reference repair", { fallbackPolicy: "disabled", indexToken });
       const indexedTaskChunks = normalizeSemanticIndexPaths(embedded.indexed || [], this.app, this.semanticIndexRevision);
       const candidate = previousIndex.filter((chunk) => !semanticTaskReferenceChunkSelected(chunk)).concat(indexedTaskChunks);
       const candidateIntegrity = semanticTaskReferenceCorpusIntegrity(
@@ -6487,7 +7391,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const followUpOptions = operationResultForFollowUp && operationResultForFollowUp.ok === false ? { delayMs: failureDelay } : {};
       await this.consumeSemanticTaskReferenceRepairFollowUp("snapshot-fingerprint-mismatch", followUpOptions);
     }
-    });
+    }, { coalesceKey: "semantic-index:task-reference-repair", token: options?.indexToken });
     if (repairResult?.embeddingFallbackRequired) {
       const rebuilt = await this.rebuildSemanticIndex(false);
       if (!rebuilt?.ok) {
@@ -6573,16 +7477,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const stagedFiles = [];
     const stage = async (file, body) => {
       const path = `${this.manifest.dir}/${file}`;
-      await adapter.write(path, body);
+      await this._persistenceHostIO(() => adapter.write(path, body));
       stagedFiles.push(path);
       if (typeof adapter.read === "function") {
-        const readBack = await adapter.read(path);
+        const readBack = await this._persistenceHostIO(() => adapter.read(path));
         if (shortHash(readBack) !== shortHash(body)) throw new Error(`Task-reference staged file verification failed: ${file}`);
       }
     };
     const cleanup = async () => {
       for (const path of stagedFiles.splice(0)) {
-        try { await adapter.remove(path); } catch (error) {
+        try { await this._persistenceHostIO(() => adapter.remove(path)); } catch (error) {
           this.lastTaskReferencePersistenceError = { phase: "staged-cleanup", message: error?.message || String(error) };
         }
       }
@@ -6594,7 +7498,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let hadPreviousPointer = false;
     if (typeof adapter.read === "function") {
       try {
-        previousPointerBody = await adapter.read(pointerPath);
+        previousPointerBody = await this._persistenceHostIO(() => adapter.read(pointerPath));
         hadPreviousPointer = true;
       } catch {}
     }
@@ -6604,16 +7508,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
     const restorePreviousPointer = async () => {
       if (hadPreviousPointer) {
-        await adapter.write(pointerPath, previousPointerBody);
+        await this._persistenceHostIO(() => adapter.write(pointerPath, previousPointerBody));
       } else if (typeof adapter.read === "function" && typeof adapter.remove === "function") {
-        await adapter.remove(pointerPath);
+        await this._persistenceHostIO(() => adapter.remove(pointerPath));
       }
     };
     const publishPointerByStableWrite = async () => {
       try {
-        await adapter.write(pointerPath, pointerBody);
+        await this._persistenceHostIO(() => adapter.write(pointerPath, pointerBody));
         if (typeof adapter.read === "function") {
-          const readBack = await adapter.read(pointerPath);
+          const readBack = await this._persistenceHostIO(() => adapter.read(pointerPath));
           if (shortHash(readBack) !== shortHash(pointerBody)) throw new Error("Task-reference pointer fallback verification failed.");
         }
       } catch (fallbackError) {
@@ -6626,7 +7530,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       if (typeof adapter.remove === "function") {
         try {
-          await adapter.remove(stagedPointerPath);
+          await this._persistenceHostIO(() => adapter.remove(stagedPointerPath));
           removeStagedFile(stagedPointerPath);
         } catch {}
       }
@@ -6637,7 +7541,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await stage(pointerFile, pointerBody);
       if (typeof adapter.rename === "function") {
         try {
-          await adapter.rename(stagedPointerPath, pointerPath);
+          await this._persistenceHostIO(() => adapter.rename(stagedPointerPath, pointerPath));
           removeStagedFile(stagedPointerPath);
         } catch {
           await publishPointerByStableWrite();
@@ -6657,13 +7561,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceSnapshotFingerprint = fingerprint;
     this.taskReferenceSnapshotDirty = false;
     try {
-      const listed = await adapter.list(this.manifest.dir);
+      const listed = await this._persistenceHostIO(() => adapter.list(this.manifest.dir));
       const generationPattern = /^task-reference-(?:snapshot|index)\.[a-z0-9-]+\.json$/i;
       const pointerTempPattern = /^task-reference-manifest\.[a-z0-9-]+\.tmp\.json$/i;
       for (const path of listed?.files || []) {
         const name = path.split("/").pop() || "";
         if ((!generationPattern.test(name) && !pointerTempPattern.test(name)) || name === snapshotFile || name === indexFile || name === pointerFile) continue;
-        try { await adapter.remove(path); } catch (error) {
+        try { await this._persistenceHostIO(() => adapter.remove(path)); } catch (error) {
           this.lastTaskReferencePersistenceError = { phase: "old-generation-cleanup", message: error?.message || String(error) };
           this.logLocal("Task-reference old-generation cleanup incomplete", { error: error?.message || String(error) });
         }
@@ -6689,7 +7593,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     const files = await externalMcpExportFiles(this, folder);
     for (const file of files) {
-      await this.app.vault.adapter.write(file.path, file.body);
+      await this._persistenceHostIO(() => this.app.vault.adapter.write(file.path, file.body));
     }
     this.logLocal("External MCP bridge refreshed", { folder, files: files.length, mode: "bridge-manifest-only" });
     if (showNotice) new Notice(`External MCP bridge refreshed in ${folder}.`);
@@ -7231,7 +8135,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         : "Rebuilding semantic index compatibility...");
       let operation;
       try {
-        operation = this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(false));
+        operation = this.withSemanticIndexOperation("rebuild", (compatibilityToken) => this.rebuildSemanticIndex(false, { indexToken: compatibilityToken }));
       } catch (error) {
         operation = Promise.reject(error);
       }
@@ -7294,6 +8198,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let loadError = null;
     try {
       const result = await loadPromise;
+      // Lane S: an input/foreground/unload pause takes effect at this safe
+      // adoption boundary without discarding the completed load. No-op
+      // unless a Lane S hydration is active.
+      await this._semanticIdleHydrationCheckpoint("adopt");
       if (this.semanticIndexLoadFailure) loadError = new Error(this.semanticIndexLoadFailure);
       return result;
     } catch (error) {
@@ -7455,7 +8363,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // Prepare the provider-free routing generation before the index becomes
       // observable as warm. Persistence/load may refine this state later, but
       // a missing artifact never authorizes an unbounded retrieval scan.
-      let startupRoutingState = await this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: true, allowPersistedRevisionHydration: true });
+      let startupRoutingState = await this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: false, allowPersistedRevisionHydration: true, allowLegacyStableSidecar: true });
       // A persisted sidecar can be stale even when the semantic chunks are
       // valid (for example after a revision-only cache invalidation). Retry a
       // provider-free in-memory build before exposing the index as warm. This
@@ -7509,34 +8417,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   startSemanticIndexCompatibilityLoad() {
-    if (this.isUnloading || this.semanticIndexLoaded) {
-      return this.semanticIndexLoadPromise || Promise.resolve(this.semanticIndexLoaded);
-    }
-    if (this.semanticIndexStartupCompatibilityPromise) return this.semanticIndexStartupCompatibilityPromise;
-    if (this.semanticIndexLoadPromise) return this.semanticIndexLoadPromise;
-    window.clearTimeout(this.semanticIndexLoadTimer);
-    this.semanticIndexLoadTimer = null;
-    this.semanticIndexPendingLoadMode = "deferred";
-    this.updateSemanticIndexLoadTelemetry({
-      state: "queued",
-      mode: "deferred",
-      deferred: true,
-      forced: false,
-      completed: false,
-      error: ""
-    });
-    const startupPromise = Promise.resolve()
-      .then(() => this.loadSemanticIndex())
-      .then((result) => {
-        this.queueAutomaticMissingSemanticIndexRebuild?.(result);
-        return result;
-      });
-    let sharedPromise;
-    sharedPromise = startupPromise.finally(() => {
-      if (this.semanticIndexStartupCompatibilityPromise === sharedPromise) this.semanticIndexStartupCompatibilityPromise = null;
-    });
-    this.semanticIndexStartupCompatibilityPromise = sharedPromise;
-    return sharedPromise;
+    // Lane S: the startup compatibility load joins the single keyed, shared,
+    // idle-gated hydration job instead of launching its own eager load.
+    return this.scheduleSemanticIdleStartup("compatibility-load");
   }
 
   queueSemanticIndexLoad(delayMs = STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS) {
@@ -7553,7 +8436,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = window.setTimeout(() => {
       this.semanticIndexLoadTimer = null;
-      this.loadSemanticIndexWhenIdle().catch((error) => this.logLocal("Semantic index cache load failed", { error: error.message || String(error) }));
+      const scheduled = this.scheduleSemanticIdleStartup("deferred-load");
+      scheduled.catch((error) => this.logLocal("Semantic index cache load failed", { error: error.message || String(error) }));
     }, Math.max(1000, delayMs || 0));
     this.refreshSidebarStatus();
   }
@@ -7565,8 +8449,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return false;
     }
     this.semanticIndexPendingLoadMode = this.semanticIndexPendingLoadMode || "deferred";
-    await this.loadSemanticIndex();
-    return true;
+    const shared = this.scheduleSemanticIdleStartup("background-load");
+    if (this.semanticIdleStartupEligible().eligible) this._startSemanticIdleLoad("background");
+    const result = await shared;
+    return result?.ok === true;
   }
 
   async ensureSemanticIndexLoaded(reason = "semantic index") {
@@ -7574,9 +8460,461 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
     if (!this.semanticIndexLoaded) this.setSidebarIndexStatus(`Loading ${reason}...`);
+    // Lane S: an explicit foreground caller promotes/joins the shared cold
+    // load and receives a ready generation identity or a bounded failure.
+    // Fall back to a forced load only when promotion cannot become ready so
+    // the historical foreground contract is preserved.
+    try {
+      const prepared = await this.prepareSemanticWorkflow({ operation: `ensure-loaded:${reason}`, sourceState: "foreground" });
+      if (prepared && prepared.ok === true) return Boolean((this.semanticIndex || []).length);
+    } catch {}
     this.semanticIndexPendingLoadMode = "forced";
     await this.loadSemanticIndex();
     return Boolean((this.semanticIndex || []).length);
+  }
+
+  // --- Lane S idle startup hydration scheduler ---
+  // One keyed, shared hydration job. It begins only after the existing
+  // 15-second startup eligibility, at least 500 ms of input quiet, layout
+  // readiness, no active foreground plugin phase, and a visible/eligible
+  // document. requestIdleCallback is used when available; otherwise one
+  // cancelable quiet-delay ticket plus visibility/input events (never
+  // interval polling). didTimeout is never treated as proof of idleness:
+  // an ineligible fire simply re-queues a single ticket.
+
+  semanticIdleStartupEligible() {
+    if (this.isUnloading) return { eligible: false, reasonCode: "unloading" };
+    if (this.semanticIndexLoaded) return { eligible: false, reasonCode: "already-loaded" };
+    const now = Date.now();
+    if (now < Number(this.semanticIdleStartupGateAt || 0)) return { eligible: false, reasonCode: "startup-gate" };
+    if (now - Number(this.semanticIdleLastInputAt || 0) < 500) return { eligible: false, reasonCode: "input-quiet" };
+    if (this.semanticIdleLayoutReady === false) return { eligible: false, reasonCode: "layout-not-ready" };
+    try {
+      if (typeof this.canStartBackgroundWork === "function" && !this.canStartBackgroundWork()) {
+        return { eligible: false, reasonCode: "foreground-active" };
+      }
+    } catch {
+      return { eligible: false, reasonCode: "foreground-active" };
+    }
+    if (this.semanticIndexInProgress || this.syncInProgress) return { eligible: false, reasonCode: "foreground-active" };
+    try {
+      if (typeof document !== "undefined" && document && document.visibilityState === "hidden") {
+        return { eligible: false, reasonCode: "hidden-document" };
+      }
+    } catch {
+      return { eligible: false, reasonCode: "hidden-document" };
+    }
+    return { eligible: true, reasonCode: "eligible" };
+  }
+
+  scheduleSemanticIdleStartup(reason = "startup") {
+    const source = String(reason || "startup").slice(0, 80);
+    if (this.isUnloading) return Promise.resolve({ ok: false, reasonCode: "unloading", source });
+    if (this.semanticIndexLoaded) {
+      const ready = this.isSemanticHydrationReady();
+      if (ready.ready) return Promise.resolve({ ok: true, generation: ready.generation, identityKey: ready.identityKey, source });
+      return Promise.resolve({ ok: false, reasonCode: "already-loaded", source });
+    }
+    if (this.semanticIdleHydrationPromise) return this.semanticIdleHydrationPromise;
+    if (!Number(this.semanticIdleStartupGateAt || 0)) {
+      this.semanticIdleStartupGateAt = Date.now() + STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS;
+    }
+    this.semanticIdleHydrationCancelled = false;
+    this.semanticIdleHydrationState = "queued";
+    this.semanticIdleHydrationSource = source;
+    let resolveShared = null;
+    const shared = new Promise((resolve) => { resolveShared = resolve; });
+    shared.catch(() => {});
+    this.semanticIdleHydrationPromise = shared;
+    this.semanticIndexStartupCompatibilityPromise = shared;
+    this.semanticIdleHydrationResolve = resolveShared;
+    this._ensureSemanticIdleListeners();
+    this._requestSemanticIdleTicket();
+    return shared;
+  }
+
+  _ensureSemanticIdleListeners() {
+    if (this.semanticIdleListenersRegistered) return;
+    this.semanticIdleListenersRegistered = true;
+    try {
+      if (typeof document !== "undefined" && document && typeof document.addEventListener === "function") {
+        const onVisibility = () => {
+          if (this.isUnloading) return;
+          try {
+            if (typeof document !== "undefined" && document && document.visibilityState === "visible") {
+              this._requestSemanticIdleTicket();
+            } else {
+              this.notifySemanticIdleInput("visibility-hidden");
+            }
+          } catch {}
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        if (!Array.isArray(this.semanticIdleListenerRefs)) this.semanticIdleListenerRefs = [];
+        this.semanticIdleListenerRefs.push({ target: document, event: "visibilitychange", handler: onVisibility });
+      }
+    } catch {}
+    try {
+      const workspace = this.app?.workspace;
+      if (!this.semanticIdleLayoutReady && workspace && typeof workspace.onLayoutReady === "function") {
+        workspace.onLayoutReady(() => { this.semanticIdleLayoutReady = true; });
+      } else {
+        this.semanticIdleLayoutReady = true;
+      }
+    } catch {
+      this.semanticIdleLayoutReady = true;
+    }
+  }
+
+  _cancelSemanticIdleTickets() {
+    try {
+      if (this.semanticIdleTicket !== null && this.semanticIdleTicket !== undefined) {
+        try {
+          if (typeof window !== "undefined" && typeof window.clearTimeout === "function") window.clearTimeout(this.semanticIdleTicket);
+          else clearTimeout(this.semanticIdleTicket);
+        } catch {}
+      }
+    } catch {}
+    this.semanticIdleTicket = null;
+    try {
+      if (this.semanticIdleCallbackId !== null && this.semanticIdleCallbackId !== undefined) {
+        const scope = typeof globalThis !== "undefined" ? globalThis : window;
+        const cancel = scope && scope.cancelIdleCallback;
+        if (typeof cancel === "function") {
+          try { cancel.call(scope, this.semanticIdleCallbackId); } catch {}
+        } else if (typeof window !== "undefined" && typeof window.cancelIdleCallback === "function") {
+          try { window.cancelIdleCallback(this.semanticIdleCallbackId); } catch {}
+        }
+      }
+    } catch {}
+    this.semanticIdleCallbackId = null;
+  }
+
+  _requestSemanticIdleTicket() {
+    if (this.isUnloading || this.semanticIndexLoaded) return;
+    if (this.semanticIdleHydrationActive) {
+      if (this.semanticIdleHydrationPaused && this.semanticIdleHydrationPromise) this._requestSemanticIdleResumeTicket();
+      return;
+    }
+    if (!this.semanticIdleHydrationPromise) return;
+    this._cancelSemanticIdleTickets();
+    const scope = typeof globalThis !== "undefined" ? globalThis : window;
+    const ric = scope && scope.requestIdleCallback;
+    if (typeof ric !== "function") {
+      this._requestSemanticIdleFallbackTicket();
+      return;
+    }
+    try {
+      const now = Date.now();
+      const waitMs = Math.max(
+        0,
+        Number(this.semanticIdleStartupGateAt || 0) - now,
+        Number(this.semanticIdleLastInputAt || 0) + 500 - now
+      );
+      this.semanticIdleCallbackId = scope.requestIdleCallback(
+        () => this._semanticIdleTicketFired(true),
+        { timeout: Math.max(1000, waitMs + 1000) }
+      );
+    } catch {
+      this.semanticIdleCallbackId = null;
+      this._requestSemanticIdleFallbackTicket();
+    }
+  }
+
+  _requestSemanticIdleResumeTicket() {
+    if (this.isUnloading || this.semanticIndexLoaded || !this.semanticIdleHydrationActive || !this.semanticIdleHydrationPaused || !this.semanticIdleHydrationPromise) return;
+    const isHidden = () => {
+      try { return typeof document !== "undefined" && document && document.visibilityState === "hidden"; }
+      catch { return true; }
+    };
+    // A hidden document must resume only after a visible event re-arms this
+    // ticket; input quiet alone is not permission to continue in a suspended
+    // mobile/background document.
+    if (isHidden()) return;
+    this._cancelSemanticIdleTickets();
+    const waitMs = Math.max(0, Number(this.semanticIdleLastInputAt || 0) + 500 - Date.now());
+    let ticket = null;
+    try {
+      ticket = window.setTimeout(() => {
+        this.semanticIdleTicket = null;
+        if (this.isUnloading || this.semanticIndexLoaded || !this.semanticIdleHydrationActive || !this.semanticIdleHydrationPaused) return;
+        if (isHidden()) return;
+        if (Date.now() - Number(this.semanticIdleLastInputAt || 0) < 500) {
+          this._requestSemanticIdleResumeTicket();
+          return;
+        }
+        this.resumeSemanticIdleHydration();
+      }, waitMs);
+    } catch { return; }
+    try { if (ticket && typeof ticket.unref === "function") ticket.unref(); } catch {}
+    this.semanticIdleTicket = ticket;
+  }
+
+  _requestSemanticIdleFallbackTicket() {
+    if (this.isUnloading || this.semanticIndexLoaded || this.semanticIdleHydrationActive) return;
+    if (!this.semanticIdleHydrationPromise) return;
+    const now = Date.now();
+    const waitMs = Math.max(
+      0,
+      Number(this.semanticIdleStartupGateAt || 0) - now,
+      Number(this.semanticIdleLastInputAt || 0) + 500 - now
+    );
+    if (waitMs <= 0) {
+      this._semanticIdleTicketFired(false);
+      return;
+    }
+    let ticket = null;
+    try {
+      ticket = window.setTimeout(() => {
+        this.semanticIdleTicket = null;
+        this._semanticIdleTicketFired(false);
+      }, waitMs);
+    } catch {
+      return;
+    }
+    try { if (ticket && typeof ticket.unref === "function") ticket.unref(); } catch {}
+    this.semanticIdleTicket = ticket;
+  }
+
+  _semanticIdleTicketFired(fromIdle = false) {
+    void fromIdle;
+    this.semanticIdleTicket = null;
+    this.semanticIdleCallbackId = null;
+    if (this.isUnloading || this.semanticIndexLoaded || !this.semanticIdleHydrationPromise || this.semanticIdleHydrationActive) return;
+    const eligibility = this.semanticIdleStartupEligible();
+    if (eligibility.eligible) {
+      this._startSemanticIdleLoad("idle");
+      return;
+    }
+    this._requestSemanticIdleTicket();
+  }
+
+  _startSemanticIdleLoad(source = "idle") {
+    const shared = this.semanticIdleHydrationPromise;
+    if (!shared || this.isUnloading) return shared;
+    if (this.semanticIdleHydrationActive) return shared;
+    if (this.semanticIndexLoaded) {
+      const ready = this.isSemanticHydrationReady();
+      try {
+        if (typeof this.semanticIdleHydrationResolve === "function") {
+          this.semanticIdleHydrationResolve(ready.ready
+            ? { ok: true, generation: ready.generation, identityKey: ready.identityKey, source }
+            : { ok: false, reasonCode: "already-loaded", source });
+        }
+      } catch {}
+      return shared;
+    }
+    this._cancelSemanticIdleTickets();
+    const identity = Number(this.semanticIdleHydrationId || 0) + 1;
+    this.semanticIdleHydrationId = identity;
+    this.semanticIdleHydrationActive = true;
+    this.semanticIdleHydrationCancelled = false;
+    this.semanticIdleHydrationState = String(source) === "foreground-promotion" ? "preparing" : "loading";
+    this.semanticIndexPendingLoadMode = "deferred";
+    try {
+      this.updateSemanticIndexLoadTelemetry({ state: "queued", mode: "deferred", deferred: true, forced: false, completed: false, error: "" });
+    } catch {}
+    const resolveShared = this.semanticIdleHydrationResolve;
+    (async () => {
+      let adopted;
+      try {
+        // Legacy storage migration is part of the same keyed hydration job;
+        // keeping it here prevents the synchronous onload path from reading,
+        // staging, or deleting a full legacy generation before the UI is live.
+        await this._semanticIdleHydrationCheckpoint("migration-start");
+        if (!this.semanticIdleStorageMigrationStarted) {
+          this.semanticIdleStorageMigrationStarted = true;
+          await this.migrateSemanticIndexStorage?.();
+          if (this.semanticIndexStorageMigrationReadyForRebuild) this.queueSemanticIndexStorageRebuild();
+        }
+        await this._semanticIdleHydrationCheckpoint("migration-complete");
+        const result = await this.loadSemanticIndex();
+        if (this.semanticIdleHydrationCancelled || this.isUnloading || this.semanticIdleHydrationId !== identity) {
+          adopted = { ok: false, reasonCode: this.isUnloading ? "unloading" : "stale-hydration", source };
+        } else if ((!result || result.ok !== false) && !this.semanticIndexLoadFailure) {
+          // Lane S note: loadSemanticIndexInternal resolves undefined on the
+          // success path and returns a result object only for terminal
+          // outcomes, so an empty result with no load failure is adopted.
+          try { this.queueAutomaticMissingSemanticIndexRebuild?.(result); } catch {}
+          const ready = this.isSemanticHydrationReady();
+          if (ready.ready) {
+            this.semanticIdleHydrationState = "ready";
+            adopted = { ok: true, generation: ready.generation, identityKey: ready.identityKey, source };
+          } else {
+            this.semanticIdleHydrationState = "degraded";
+            adopted = { ok: false, reasonCode: String(ready.reasonCode || "not-ready").slice(0, 80), source };
+          }
+        } else {
+          this.semanticIdleHydrationState = "failed";
+          adopted = { ok: false, reasonCode: String(result?.reasonCode || this.semanticIndexLoadFailure || "hydration-failed").slice(0, 80), source };
+        }
+      } catch (error) {
+        if (this.semanticIdleHydrationCancelled || this.isUnloading) {
+          adopted = { ok: false, reasonCode: "hydration-cancelled", source };
+        } else {
+          if (this.semanticIdleHydrationId === identity) this.semanticIdleHydrationState = "failed";
+          adopted = { ok: false, reasonCode: String(error?.code || "hydration-failed").slice(0, 80), source };
+        }
+      } finally {
+        if (this.semanticIdleHydrationPromise === shared) {
+          this.semanticIdleHydrationPromise = null;
+          this.semanticIdleHydrationResolve = null;
+          this.semanticIndexStartupCompatibilityPromise = null;
+        }
+        this.semanticIdleHydrationActive = false;
+      }
+      try { if (typeof resolveShared === "function") resolveShared(adopted); } catch {}
+      return adopted;
+    })();
+    return shared;
+  }
+
+  // The only Lane S entry-point preflight. It promotes/joins the shared cold
+  // load but is never called from pure retrieval helpers: retrieval keeps
+  // failing closed via lane E while only explicit foreground work prepares.
+  async prepareSemanticWorkflow({ operation = "", sourceState = "", signal = null } = {}) {
+    const source = `foreground:${String(operation || "prepare").slice(0, 80)}`;
+    void sourceState;
+    if (signal && signal.aborted === true) return { ok: false, reasonCode: "preparation-aborted", source };
+    try {
+      const ready = this.isSemanticHydrationReady();
+      if (ready.ready) return { ok: true, generation: ready.generation, identityKey: ready.identityKey, source: "already-ready" };
+    } catch {
+      return { ok: false, reasonCode: "not-ready", source };
+    }
+    if (this.isUnloading) return { ok: false, reasonCode: "unloading", source };
+    const shared = this.scheduleSemanticIdleStartup(source);
+    this.semanticIdleHydrationState = "preparing";
+    try { this.setSidebarIndexStatus("Preparing semantic index..."); } catch {}
+    this._startSemanticIdleLoad("foreground-promotion");
+    if (signal && typeof signal.addEventListener === "function" && signal.aborted !== true) {
+      let onAbort = null;
+      try {
+        const abandoned = await Promise.race([shared, new Promise((resolve) => {
+          onAbort = () => resolve(null);
+          try { signal.addEventListener("abort", onAbort, { once: true }); } catch { resolve("signal-unsupported"); }
+        })]);
+        try { if (onAbort && typeof signal.removeEventListener === "function") signal.removeEventListener("abort", onAbort); } catch {}
+        if (abandoned === null) return { ok: false, reasonCode: "preparation-aborted", source };
+        return abandoned;
+      } catch {
+        try { if (onAbort && typeof signal.removeEventListener === "function") signal.removeEventListener("abort", onAbort); } catch {}
+        return { ok: false, reasonCode: "preparation-aborted", source };
+      }
+    }
+    return await shared;
+  }
+
+  isSemanticHydrationReady() {
+    const generation = String(this.settings?.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "");
+    const routing = this.productionSemanticRoutingState;
+    const identityKey = String(routing?.identityKey || routing?.preparedIdentityKey || "");
+    if (!this.semanticIndexLoaded) return { ready: false, reasonCode: "not-loaded", generation, identityKey };
+    if (!generation) return { ready: false, reasonCode: "no-generation", generation, identityKey };
+    if (!routing || !routing.routingIndex) return { ready: false, reasonCode: "routing-not-ready", generation, identityKey };
+    if (String(routing.routingIndex.generation || "") !== generation) {
+      return { ready: false, reasonCode: "generation-mismatch", generation, identityKey };
+    }
+    return { ready: true, reasonCode: "ready", generation, identityKey };
+  }
+
+  semanticHydrationStatus() {
+    const telemetry = this.semanticIndexLoadTelemetry || {};
+    const ready = (() => { try { return this.isSemanticHydrationReady(); } catch { return { ready: false, reasonCode: "not-ready" }; } })();
+    let state = String(this.semanticIdleHydrationState || "queued");
+    if (state === "idle") state = "queued";
+    if (state === "cancelled") state = "failed";
+    if (!["queued", "loading", "preparing", "ready", "degraded", "failed"].includes(state)) state = "queued";
+    if (state === "queued" || state === "loading" || state === "preparing") {
+      if (this.semanticIndexLoaded && ready.ready) state = "ready";
+    }
+    return {
+      state,
+      mode: String(telemetry.mode || "deferred"),
+      generationReady: Boolean(ready.ready),
+      shardCount: Number(telemetry.shardCount || 0),
+      shardsLoaded: Number(telemetry.shardsLoaded || 0),
+      reads: Number(telemetry.reads || 0),
+      yields: Number(telemetry.yields || 0),
+      bytes: Number(telemetry.totalBytes || 0),
+      failureCode: String(this.semanticIndexLoadFailure || "").slice(0, 80)
+    };
+  }
+
+  notifySemanticIdleInput(source = "") {
+    void source;
+    try { this.semanticIdleLastInputAt = Date.now(); } catch {}
+    if (this.isUnloading) return;
+    if (this.semanticIdleHydrationActive && this.semanticIdleHydrationPromise) {
+      this.semanticIdleHydrationPaused = true;
+      this._requestSemanticIdleResumeTicket();
+      return;
+    }
+    if (this.semanticIdleHydrationPromise && !this.semanticIdleHydrationActive) {
+      this._requestSemanticIdleTicket();
+    }
+  }
+
+  resumeSemanticIdleHydration() {
+    try { this._cancelSemanticIdleTickets(); } catch {}
+    this.semanticIdleHydrationPaused = false;
+    const resume = this.semanticIdleHydrationResumeResolve;
+    this.semanticIdleHydrationResumeResolve = null;
+    try { if (typeof resume === "function") resume(false); } catch {}
+  }
+
+  async _semanticIdleHydrationCheckpoint(boundary = "") {
+    void boundary;
+    if (this.semanticIdleHydrationCancelled || this.isUnloading) {
+      const error = new Error("Semantic hydration was cancelled.");
+      error.code = "semantic-index-hydration-cancelled";
+      throw error;
+    }
+    if (!this.semanticIdleHydrationActive) return;
+    while (this.semanticIdleHydrationPaused && !this.semanticIdleHydrationCancelled && !this.isUnloading) {
+      await new Promise((resolve, reject) => {
+        this.semanticIdleHydrationResumeResolve = (cancelled) => {
+          this.semanticIdleHydrationResumeResolve = null;
+          if (cancelled) reject(Object.assign(new Error("Semantic hydration was cancelled."), { code: "semantic-index-hydration-cancelled" }));
+          else resolve();
+        };
+      });
+    }
+    if (this.semanticIdleHydrationCancelled || this.isUnloading) {
+      const error = new Error("Semantic hydration was cancelled.");
+      error.code = "semantic-index-hydration-cancelled";
+      throw error;
+    }
+    try { this.recordSemanticIndexLoadYield(); } catch {}
+  }
+
+  _cancelSemanticIdleStartup(reason = "cancelled") {
+    const code = String(reason || "cancelled").slice(0, 80);
+    this.semanticIdleHydrationCancelled = true;
+    this.semanticIdleHydrationPaused = false;
+    this.semanticIdleHydrationId = Number(this.semanticIdleHydrationId || 0) + 1;
+    try { this._cancelSemanticIdleTickets(); } catch {}
+    try {
+      for (const ref of this.semanticIdleListenerRefs || []) {
+        try { ref?.target?.removeEventListener?.(ref.event, ref.handler); } catch {}
+      }
+    } catch {}
+    this.semanticIdleListenerRefs = [];
+    this.semanticIdleListenersRegistered = false;
+    const resume = this.semanticIdleHydrationResumeResolve;
+    this.semanticIdleHydrationResumeResolve = null;
+    try { if (typeof resume === "function") resume(true); } catch {}
+    const pending = this.semanticIdleHydrationPromise;
+    const resolvePending = this.semanticIdleHydrationResolve;
+    this.semanticIdleHydrationPromise = null;
+    this.semanticIdleHydrationResolve = null;
+    this.semanticIndexStartupCompatibilityPromise = null;
+    this.semanticIdleHydrationActive = false;
+    if (pending && typeof resolvePending === "function") {
+      try { resolvePending({ ok: false, reasonCode: this.isUnloading ? "unloading" : code }); } catch {}
+    }
+    if (this.semanticIdleHydrationState === "queued" || this.semanticIdleHydrationState === "loading" || this.semanticIdleHydrationState === "preparing") {
+      this.semanticIdleHydrationState = "failed";
+    }
   }
 
   semanticIndexPathMetaFingerprint(meta = this.settings.semanticIndexMeta || {}) {
@@ -7660,27 +8998,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const stagedFile = semanticIndexPathMetaGenerationFile(stagedGeneration);
     await this.ensureSemanticIndexStorageDirectory();
     const stagedPath = this.semanticIndexStoragePath(stagedFile);
-    await adapter.write(stagedPath, body);
+    await this._persistenceHostIO(() => adapter.write(stagedPath, body));
     if (typeof adapter.read === "function") {
-      const readBack = await adapter.read(stagedPath);
+      const readBack = await this._persistenceHostIO(() => adapter.read(stagedPath));
       if (shortHash(readBack) !== shortHash(body)) {
-        try { await adapter.remove(stagedPath); } catch {}
+        try { await this._persistenceHostIO(() => adapter.remove(stagedPath)); } catch {}
         throw new Error("Semantic-index path metadata verification failed.");
       }
     }
     const path = this.semanticIndexStoragePath(SEMANTIC_INDEX_PATH_META_FILE);
-    await adapter.write(path, body);
+    await this._persistenceHostIO(() => adapter.write(path, body));
     if (typeof adapter.read === "function") {
-      const readBack = await adapter.read(path);
+      const readBack = await this._persistenceHostIO(() => adapter.read(path));
       if (shortHash(readBack) !== shortHash(body)) throw new Error("Semantic-index path metadata stable-copy verification failed.");
     }
     // Keep the generation-specific artifact when a manifest points to it.
     try {
-      const listed = await adapter.list(this.semanticIndexStorageDir());
+      const listed = await this._persistenceHostIO(() => adapter.list(this.semanticIndexStorageDir()));
       for (const candidatePath of listed?.files || []) {
         const name = candidatePath.split("/").pop() || "";
         if (!isSemanticIndexPathMetaGenerationFile(name) || name === stagedFile || name === committedPathMetaFile) continue;
-        try { await adapter.remove(candidatePath); } catch (error) {
+        try { await this._persistenceHostIO(() => adapter.remove(candidatePath)); } catch (error) {
           this.lastSemanticIndexPersistenceError = { phase: "path-meta-cleanup", message: error?.message || String(error) };
           this.logLocal("Semantic index path metadata cleanup incomplete", { error: error?.message || String(error) });
         }
@@ -7699,6 +9037,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.setSidebarIndexStatus("Loading semantic index manifest...");
     this.recordSemanticIndexLoadYield();
     await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+    // Lane S: manifest-first hydration pauses here at the next safe boundary
+    // on input/foreground/unload without discarding the load. No-op unless a
+    // Lane S hydration is active; adapter ordering is unchanged.
+    await this._semanticIdleHydrationCheckpoint("manifest");
     this.updateSemanticIndexLoadTelemetry({
       manifestFirst: true,
       reads: Number(this.semanticIndexLoadTelemetry?.reads || 0) + 1
@@ -7720,6 +9062,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       ? semanticIndexCompatibilityRefreshClassification(settings, parsed.meta, "")
       : { compatible: true };
     if (!preflightCompatibility.compatible) throw semanticIndexCompatibilityRefreshError(preflightCompatibility);
+    // Lane S: parsed-manifest boundary for pause/cancel. Manifest-first
+    // validation above is preserved; shard bodies still load sequentially
+    // below, one at a time.
+    await this._semanticIdleHydrationCheckpoint("parsed");
     if (Array.isArray(parsed.shards)) {
       if (!parsed.meta) throw new Error("Semantic-index manifest metadata is missing.");
         const manifestValidation = semanticIndexManifestValidation(parsed, indexFile, settings);
@@ -7746,6 +9092,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         this.updateSemanticIndexLoadTelemetry({ reads: Number(this.semanticIndexLoadTelemetry?.reads || 0) + 1 });
         const shardMeta = parsed.shards.find((candidate) => String(candidate?.file || candidate?.path || "") === shardFile);
+        // Lane S: one-at-a-time adapter ordering is preserved; each shard
+        // read pauses here on input/foreground/unload.
+        await this._semanticIdleHydrationCheckpoint("shard");
         const shardRaw = await this.app.vault.adapter.read(`${storageDir}/${shardFile}`);
         const shardBytes = utf8ByteLength(shardRaw);
         if (Number(shardMeta?.bytes || 0) > 0 && Number(shardMeta.bytes) !== shardBytes) throw new Error(`Semantic-index shard byte count mismatch: ${shardFile}`);
@@ -7813,6 +9162,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
   }
 
+  // Lane D2: generation-specific routing pair member. Creates the validated
+  // routing basename for a generation (never a path); the v3 manifest links
+  // it via routingFile/routingGeneration and restart loading pair-checks it.
+  semanticIndexRoutingGenerationFile(generation = "") {
+    const token = String(generation || "");
+    if (!token) throw new Error("Semantic-index routing generation is missing.");
+    return normalizedPluginBasename(`${LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE.replace(/\.json$/i, "")}.${token}.json`, "semantic-index routing artifact");
+  }
+
   async _saveSemanticIndex(options = {}) {
     const persistenceStart = Date.now();
     let persistencePhase = "prepare";
@@ -7846,44 +9204,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }), { skipped: true, degraded: true });
     }
     const indexFile = this.semanticIndexFileName();
-    const previousSaveState = {
-      stats: this.semanticIndexStats,
-      knownShardFiles: this.semanticIndexKnownShardFiles,
-      storageFingerprint: this.semanticIndexStorageFingerprint,
-      manifestPublishedGeneration: this.semanticIndexManifestPublishedGeneration,
-      pathMetaSnapshotFingerprint: this.semanticIndexPathMetaSnapshotFingerprint,
-      pathMeta: this.semanticIndexPathMeta instanceof Map
-        ? new Map(Array.from(this.semanticIndexPathMeta.entries()).map(([path, value]) => [path, Object.assign({}, value || {})]))
-        : this.semanticIndexPathMeta,
-      settingsMeta: Object.assign({}, this.settings.semanticIndexMeta || {})
-    };
-    const restorePreviousSaveState = () => {
-      this.semanticIndexStats = previousSaveState.stats;
-      this.semanticIndexKnownShardFiles = previousSaveState.knownShardFiles;
-      this.semanticIndexStorageFingerprint = previousSaveState.storageFingerprint;
-      this.semanticIndexManifestPublishedGeneration = previousSaveState.manifestPublishedGeneration;
-      this.semanticIndexPathMetaSnapshotFingerprint = previousSaveState.pathMetaSnapshotFingerprint;
-      this.semanticIndexPathMeta = previousSaveState.pathMeta instanceof Map
-        ? new Map(Array.from(previousSaveState.pathMeta.entries()).map(([path, value]) => [path, Object.assign({}, value || {})]))
-        : previousSaveState.pathMeta;
-      this.settings.semanticIndexMeta = Object.assign({}, previousSaveState.settingsMeta);
-    };
     const activeDimension = Number(candidateChunks.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
     const targetDimension = semanticEmbeddingTargetDimension(this.settings);
     const partition = this.semanticIndexStoragePartition({ indexFile, actualDimension: activeDimension || targetDimension, configuredDimension: targetDimension });
     this.semanticIndexActivePartition = partition;
-    // A provider/model/dimension change can select a brand-new identity
-    // partition. Stage every generation only after its directory exists;
-    // otherwise the first shard write fails with ENOENT before the manifest
-    // can establish the generation gate.
-    await this.ensureSemanticIndexStorageDirectory(partition);
     if (candidateChunks.some((chunk) => !Array.isArray(chunk?.embedding) || !chunk.embedding.length)) {
       throw new Error("Semantic-index save rejected empty embedding vectors.");
     }
     if (activeDimension && targetDimension && activeDimension !== targetDimension) {
       throw new Error("Semantic-index save rejected an embedding dimension mismatch.");
     }
-    const meta = Object.assign({}, this.settings.semanticIndexMeta || {}, {
+    // Lane D2: the candidate generation must be a pure function of
+    // content/provenance identity, not of the previous generation's storage
+    // linkage — otherwise an identical candidate could never reproduce its
+    // generation and the no-op contract below would be unreachable. Strip the
+    // output linkage this save publishes (generation file links, counts);
+    // they are re-added fresh from the staged candidate before the manifest
+    // text finalizes. All other meta (anchors, versions, identity,
+    // caller build markers) still participates in the seed.
+    const candidateBaseMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
+    for (const linkageKey of ["generation", "chunks", "shardCount", "shardBytes", "pathMetaFile", "pathMetaGeneration", "pathMetaFingerprint", "routingFile", "routingGeneration"]) delete candidateBaseMeta[linkageKey];
+    const meta = Object.assign({}, candidateBaseMeta, {
       persistenceSchemaVersion: SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION,
       contentSchemaVersion: SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION,
       embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
@@ -7927,11 +9268,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       shardCount: 0,
       shardBytes: 0
     });
-    const seed = shortHash(JSON.stringify({ meta: seedMeta, chunks: candidateChunks }));
+    // Lane D1: incremental hash over the exact JSON representation of
+    // `{ meta: seedMeta, chunks: candidateChunks }` — equal to the previous
+    // shortHash(JSON.stringify(...)) without building one full-corpus string.
+    const seed = semanticIndexGenerationSeedHash(seedMeta, candidateChunks);
     const generation = semanticIndexGenerationToken(seed, 0);
+    // Lane D2: the generation-specific routing pair member is named before
+    // the manifest text is finalized, so the manifest can link it without a
+    // circular hash dependency.
+    const routingFile = this.semanticIndexRoutingGenerationFile(generation);
     const generationMeta = Object.assign({}, meta, { generation, chunks: candidateChunks.length });
     _markPersistence("shard-build", "running");
-    const shards = await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, SEMANTIC_INDEX_SHARD_MAX_BYTES, generation);
+    // Lane D2: bounded first streaming pass. Shard bodies flow through the D1
+    // consumer one at a time and only body-free descriptors are retained, so
+    // the manifest fingerprint below finalizes without any adapter I/O and a
+    // content-identical candidate can settle as a write-free no-op.
+    const collectDescriptors = [];
+    await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, SEMANTIC_INDEX_SHARD_MAX_BYTES, generation, {
+      onShard: async (shard) => { collectDescriptors.push({ file: shard.file, bytes: shard.bytes, chunkCount: shard.chunkCount, hash: shard.hash }); },
+      ...(options.signal ? { signal: options.signal } : {})
+    });
+    const shards = collectDescriptors;
     persistenceShardCount = Number(shards.length) || 0;
     const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
     const stagePathMetaFile = semanticIndexPathMetaGenerationFile(generation);
@@ -7941,7 +9298,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         shardCount: shards.length,
         shardBytes,
         pathMetaFile: stagePathMetaFile,
-        pathMetaGeneration: generation
+        pathMetaGeneration: generation,
+        routingFile,
+        routingGeneration: generation
       }),
       shards: shards.map((shard, index) => ({
         file: shard.file,
@@ -7996,33 +9355,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         shardBytes,
         pathMetaFile: stagePathMetaFile,
         pathMetaGeneration: generation,
-        pathMetaFingerprint
+        pathMetaFingerprint,
+        routingFile,
+        routingGeneration: generation
       });
-      _markPersistence("routing-publication", "running");
-      const routingState = await this.ensureProductionSemanticRoutingState({ chunks: candidateChunks, revision: this.semanticIndexRevision || 0, storageFingerprint, allowLoad: true, persist: true });
-      if (candidateChunks.length && !routingState) {
-        restorePreviousSaveState();
-        throw new Error("Semantic-index routing artifact is not ready.");
-      }
-      await this.writeExternalMcpExport(false);
+      // Lane D2: true content/provenance-identical no-op. The fingerprint
+      // above finalized from the pure streaming pass, so no generation,
+      // routing, shard, or path-metadata writes happened (no adapter I/O at
+      // all) and none follow. Explicit non-commit result with the valid
+      // generation; maintenance coalescing semantics are unchanged.
       _markPersistence("cleanup", "completed");
-      return;
+      return Object.assign(semanticOperationResult({ ok: true, changed: false, reasonCode: "semantic-index-no-op-content-identical" }), { committed: false, generation });
     }
     const adapter = this.app.vault.adapter;
     const stagedFiles = [];
+    // A provider/model/dimension change can select a brand-new identity
+    // partition. Stage every generation only after its directory exists;
+    // otherwise the first shard write fails with ENOENT before the manifest
+    // can establish the generation gate.
+    await this.ensureSemanticIndexStorageDirectory(partition);
+    const saveSignal = options.signal || null;
+    const throwIfSaveAborted = () => {
+      if (saveSignal && saveSignal.aborted === true) {
+        const abortError = new Error("Semantic-index save aborted before commit.");
+        abortError.code = "semantic-index-save-aborted";
+        throw abortError;
+      }
+    };
     const stage = async (file, body) => {
       const path = this.semanticIndexStoragePath(file);
-      await adapter.write(path, body);
+      await this._persistenceHostIO(() => adapter.write(path, body));
       stagedFiles.push(path);
       if (typeof adapter.read === "function") {
-        const readBack = await adapter.read(path);
+        const readBack = await this._persistenceHostIO(() => adapter.read(path));
         if (shortHash(readBack) !== shortHash(body)) throw new Error(`Semantic-index staged file verification failed: ${file}`);
       }
     };
     const cleanupStaged = async () => {
       const errors = [];
       for (const path of stagedFiles) {
-        try { await adapter.remove(path); } catch (error) { errors.push(error); }
+        try { await this._persistenceHostIO(() => adapter.remove(path)); } catch (error) { errors.push(error); }
       }
       if (errors.length) this.lastSemanticIndexPersistenceError = { phase: "staged-cleanup", count: errors.length };
     };
@@ -8032,35 +9404,76 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let hadPreviousManifest = false;
     if (typeof adapter.read === "function") {
       try {
-        previousManifestBody = await adapter.read(manifestPath);
+        previousManifestBody = await this._persistenceHostIO(() => adapter.read(manifestPath));
         hadPreviousManifest = true;
       } catch {}
     }
     const restorePreviousManifest = async () => {
-      if (hadPreviousManifest) await adapter.write(manifestPath, previousManifestBody);
+      if (hadPreviousManifest) await this._persistenceHostIO(() => adapter.write(manifestPath, previousManifestBody));
       else {
-        try { await adapter.remove(manifestPath); } catch {}
-      }
-    };
-    const rollbackPublishedGeneration = async () => {
-      let restoreError = null;
-      try {
-        await restorePreviousManifest();
-      } catch (error) {
-        restoreError = error;
-      }
-      await cleanupStaged();
-      for (const file of [...shardFiles, stagePathMetaFile, stageManifestFile]) {
-        try { await adapter.remove(this.semanticIndexStoragePath(file)); } catch {}
-      }
-      restorePreviousSaveState();
-      if (restoreError) {
-        this.lastSemanticIndexPersistenceError = { phase: "manifest-restore", message: restoreError?.message || String(restoreError) };
+        try { await this._persistenceHostIO(() => adapter.remove(manifestPath)); } catch {}
       }
     };
     _markPersistence("stage-shards", "running");
+    let stagedRouting = null;
     try {
-      await asyncPool(shards, 3, async (shard) => stage(shard.file, shard.body));
+      throwIfSaveAborted();
+      // Lane D2: second streaming pass — stage each complete shard body
+      // serially (write plus full readback/hash verification) and release it
+      // before the next body is produced. Never a retained body array, never
+      // a concurrent adapter pool: at most one outstanding data-I/O
+      // operation through the admission seam.
+      await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, SEMANTIC_INDEX_SHARD_MAX_BYTES, generation, {
+        onShard: async (shard) => {
+          throwIfSaveAborted();
+          await stage(shard.file, shard.body);
+        },
+        ...(saveSignal ? { signal: saveSignal } : {})
+      });
+      throwIfSaveAborted();
+      // Lane D2: validate the staged routing candidate without publishing
+      // active state (C2 stageOnly contract), then persist the
+      // generation-specific routing pair member with full readback/integrity
+      // discipline. The full candidate pair exists and validates before the
+      // manifest pointer moves below.
+      //
+      // The accepted C2 contract settles an identity-matching staged
+      // candidate even while an older identity remains published (staging
+      // never publishes or mutates active state); superseded, mismatched,
+      // drifted, or cancelled work still settles to null. This lane performs
+      // no active-state mutation here — the previously published state stays
+      // exactly observable until the commit region below.
+      stagedRouting = await this.ensureProductionSemanticRoutingState({
+          chunks: candidateChunks,
+          revision: this.semanticIndexRevision || 0,
+          storageFingerprint,
+          generation,
+          provider: generationMeta.provider,
+          model: generationMeta.model,
+          dimension: generationMeta.dimension,
+          shardCount: shards.length,
+          allowLoad: false,
+          forceBuild: true,
+          persist: false,
+          stageOnly: true
+        });
+      if (!stagedRouting) {
+        throw new Error("Semantic-index routing artifact is not ready.");
+      }
+      stagedFiles.push(this.productionSemanticRoutingArtifactPath(routingFile));
+      const routingStaged = await this._persistProductionSemanticRoutingArtifact(stagedRouting.routingState, {
+        routingFile,
+        provider: generationMeta.provider,
+        model: generationMeta.model,
+        revision: this.semanticIndexRevision || 0,
+        storageFingerprint,
+        ...(saveSignal ? { signal: saveSignal } : {})
+      });
+      if (!routingStaged) {
+        if (saveSignal && saveSignal.aborted === true) throwIfSaveAborted();
+        throw new Error("Semantic-index routing artifact staging failed.");
+      }
+      throwIfSaveAborted();
       _markPersistence("stage-path-meta", "running");
       await stage(stagePathMetaFile, pathMetaBody);
       semanticIndexPathMetaArtifactValidation(JSON.parse(pathMetaBody), manifest.meta, indexFile, this.settings);
@@ -8070,32 +9483,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const stagedManifestPath = this.semanticIndexStoragePath(stageManifestFile);
       if (typeof adapter.rename === "function") {
         try {
-          await adapter.rename(stagedManifestPath, manifestPath);
+          await this._persistenceHostIO(() => adapter.rename(stagedManifestPath, manifestPath));
           if (typeof adapter.read === "function") {
-            const readBack = await adapter.read(manifestPath);
+            const readBack = await this._persistenceHostIO(() => adapter.read(manifestPath));
             if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest promotion verification failed.");
           }
         } catch (renameError) {
-          this.lastSemanticIndexPersistenceError = { phase: "manifest-promote-rename", message: renameError?.message || String(renameError) };
           try {
-            await adapter.write(manifestPath, manifestBody);
+            await this._persistenceHostIO(() => adapter.write(manifestPath, manifestBody));
             if (typeof adapter.read === "function") {
-              const readBack = await adapter.read(manifestPath);
+              const readBack = await this._persistenceHostIO(() => adapter.read(manifestPath));
               if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest fallback verification failed.");
             }
           } catch (fallbackError) {
+            this.lastSemanticIndexPersistenceError = { phase: "manifest-promote-rename", message: renameError?.message || String(renameError) };
             try { await restorePreviousManifest(); } catch (restoreError) {
               this.lastSemanticIndexPersistenceError = { phase: "manifest-restore", message: restoreError?.message || String(restoreError) };
             }
             throw fallbackError;
           }
-          try { await adapter.remove(stagedManifestPath); } catch {}
+          try { await this._persistenceHostIO(() => adapter.remove(stagedManifestPath)); } catch {}
         }
         stagedFiles.splice(stagedFiles.indexOf(stagedManifestPath), 1);
       } else {
-        await adapter.write(manifestPath, manifestBody);
+        await this._persistenceHostIO(() => adapter.write(manifestPath, manifestBody));
         if (typeof adapter.read === "function") {
-          const readBack = await adapter.read(manifestPath);
+          const readBack = await this._persistenceHostIO(() => adapter.read(manifestPath));
           if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest verification failed.");
         }
       }
@@ -8103,13 +9516,40 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await cleanupStaged();
       throw error;
     }
+    // Lane D2 commit point: the staged manifest pointer above is verified,
+    // so the full candidate pair (generation shards, generation path
+    // metadata, generation routing artifact, staged manifest) exists and
+    // validates. Publish active settings metadata and the immutable
+    // prepared/routing reference in one synchronous assignment region.
+    // Nothing after this point restores a prior pointer or rolls back the
+    // newly verified generation.
+    const commitIdentityKey = String(stagedRouting.identityKey || "");
+    const mayPublishRoutingRefs = !this.isUnloading && (!commitIdentityKey || this._productionSemanticRoutingMayPublish(commitIdentityKey));
+    const finalRoutingTelemetry = Object.freeze(Object.assign({}, stagedRouting.terminalState, {
+      state: "ready",
+      persistenceState: "committed",
+      persistenceWrites: 1,
+      revision: this.semanticIndexRevision || 0,
+      storageFingerprint
+    }));
+    const finalRoutingState = Object.freeze(Object.assign({}, stagedRouting.routingState, {
+      telemetry: finalRoutingTelemetry,
+      preparedIdentityKey: commitIdentityKey,
+      identityKey: commitIdentityKey
+    }));
+    const finalPreparedRef = Object.freeze({
+      view: stagedRouting.view,
+      routingState: finalRoutingState,
+      terminalState: finalRoutingTelemetry,
+      preparedView: stagedRouting.preparedView
+    });
     this.semanticIndexStats = stats;
     this.semanticIndexKnownShardFiles = shardFiles;
     this.semanticIndexStorageFingerprint = storageFingerprint;
     this.semanticIndexManifestPublishedGeneration = generation;
     // The manifest generation is the canonical router generation. Keep the
-    // active settings metadata aligned before rebuilding the sidecar so a
-    // stale router can never be accepted as current after an incremental save.
+    // active settings metadata aligned so a stale router can never be
+    // accepted as current after an incremental save.
     this.settings.semanticIndexMeta = Object.assign({}, this.settings.semanticIndexMeta || {}, manifest.meta, {
       generation,
       chunks: candidateChunks.length,
@@ -8117,27 +9557,27 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       shardBytes,
       pathMetaFile: stagePathMetaFile,
       pathMetaGeneration: generation,
-      pathMetaFingerprint
+      pathMetaFingerprint,
+      routingFile,
+      routingGeneration: generation
     });
+    if (mayPublishRoutingRefs) {
+      this.semanticIndexPreparedView = stagedRouting.preparedView;
+      this.currentPreparedViewRef = finalPreparedRef;
+      this.productionSemanticRoutingState = finalRoutingState;
+      this.productionSemanticRoutingTelemetry = finalRoutingTelemetry;
+    }
     _markPersistence("routing-publication", "running");
-    let routingState = null;
-    try {
-      routingState = await this.ensureProductionSemanticRoutingState({
-        chunks: candidateChunks,
-        revision: this.semanticIndexRevision || 0,
-        storageFingerprint,
-        allowLoad: false,
-        persist: true,
-        forceBuild: true
-      });
-    } catch (error) {
-      await rollbackPublishedGeneration();
-      throw error;
-    }
-    if (candidateChunks.length && !routingState) {
-      await rollbackPublishedGeneration();
-      throw new Error("Semantic-index routing artifact is not ready.");
-    }
+    // Lane D2 post-commit discipline: every step below is best-effort. A
+    // failure records a degraded warning but never restores a prior pointer
+    // or removes the newly verified generation.
+    let postCommitDegraded = null;
+    const markPostCommitDegraded = (phase, message) => {
+      const detail = String(message || "").slice(0, 240);
+      postCommitDegraded = { phase, message: detail };
+      this.lastSemanticIndexPersistenceError = { phase, message: detail };
+      this.logLocal("Semantic index post-commit warning", { phase, message: detail });
+    };
     for (const shardFile of shardFiles) {
       const stagedShardIndex = stagedFiles.indexOf(this.semanticIndexStoragePath(shardFile));
       if (stagedShardIndex >= 0) stagedFiles.splice(stagedShardIndex, 1);
@@ -8145,12 +9585,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const stagedPathMetaPath = this.semanticIndexStoragePath(stagePathMetaFile);
     const stagedPathMetaIndex = stagedFiles.indexOf(stagedPathMetaPath);
     if (stagedPathMetaIndex >= 0) stagedFiles.splice(stagedPathMetaIndex, 1);
+    const stagedRoutingPath = this.productionSemanticRoutingArtifactPath(routingFile);
+    const stagedRoutingIndex = stagedFiles.indexOf(stagedRoutingPath);
+    if (stagedRoutingIndex >= 0) stagedFiles.splice(stagedRoutingIndex, 1);
     _markPersistence("path-meta-publication", "running");
     try {
       const pathMetaPath = this.semanticIndexStoragePath(SEMANTIC_INDEX_PATH_META_FILE);
-      await adapter.write(pathMetaPath, pathMetaBody);
+      await this._persistenceHostIO(() => adapter.write(pathMetaPath, pathMetaBody));
       if (typeof adapter.read === "function") {
-        const readBack = await adapter.read(pathMetaPath);
+        const readBack = await this._persistenceHostIO(() => adapter.read(pathMetaPath));
         if (shortHash(readBack) !== shortHash(pathMetaBody)) throw new Error("Semantic-index path metadata promotion verification failed.");
       }
       // Keep the generation-specific artifact: the committed manifest points
@@ -8158,11 +9601,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // only a compatibility snapshot for older readers.
       this.semanticIndexPathMetaSnapshotFingerprint = pathMetaFingerprint;
       try {
-        const listed = await adapter.list(this.semanticIndexStorageDir());
+        const listed = await this._persistenceHostIO(() => adapter.list(this.semanticIndexStorageDir()));
         for (const candidatePath of listed?.files || []) {
           const name = candidatePath.split("/").pop() || "";
           if (!isSemanticIndexPathMetaGenerationFile(name) || name === stagePathMetaFile) continue;
-          try { await adapter.remove(candidatePath); } catch (error) {
+          try { await this._persistenceHostIO(() => adapter.remove(candidatePath)); } catch (error) {
             this.lastSemanticIndexPersistenceError = { phase: "path-meta-cleanup", message: error?.message || String(error) };
             this.logLocal("Semantic index path metadata cleanup incomplete", { error: error?.message || String(error) });
           }
@@ -8171,23 +9614,67 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.lastSemanticIndexPersistenceError = { phase: "path-meta-cleanup", message: error?.message || String(error) };
       }
     } catch (error) {
-      this.lastSemanticIndexPersistenceError = { phase: "path-meta-promote", message: error?.message || String(error) };
+      markPostCommitDegraded("path-meta-promote", error?.message || String(error));
       this.logLocal("Semantic index path metadata promotion failed", { error: error?.message || String(error) });
     }
     _markPersistence("cleanup", "running");
     const cleanup = await this.removeSemanticIndexShardFiles(indexFile, shardFiles);
     if (cleanup?.errors?.length) {
-      this.lastSemanticIndexPersistenceError = { phase: "old-generation-cleanup", count: cleanup.errors.length };
+      markPostCommitDegraded("old-generation-cleanup", `${cleanup.errors.length} old-generation shard(s) could not be removed.`);
       this.logLocal("Semantic index old-generation cleanup incomplete", { count: cleanup.errors.length });
     }
+    // Lane D2: sweep superseded generation routing pair members, keeping only
+    // the committed manifest-linked member in the current schema.
+    try {
+      const routingBase = escapeRegExp(LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE.replace(/\.json$/i, ""));
+      const routingGenerationPattern = new RegExp(`^${routingBase}\\.[a-z0-9-]+\\.json$`, "i");
+      const listedRouting = await this._persistenceHostIO(() => adapter.list(this.semanticIndexStorageDir()));
+      for (const candidatePath of listedRouting?.files || []) {
+        const name = candidatePath.split("/").pop() || "";
+        if (!routingGenerationPattern.test(name) || name === routingFile) continue;
+        try { await this._persistenceHostIO(() => adapter.remove(candidatePath)); } catch (error) {
+          markPostCommitDegraded("routing-cleanup", error?.message || String(error));
+        }
+      }
+    } catch (error) {
+      markPostCommitDegraded("routing-cleanup", error?.message || String(error));
+    }
     for (const stagedPath of stagedFiles.splice(0)) {
-      try { await adapter.remove(stagedPath); } catch (error) {
-        this.lastSemanticIndexPersistenceError = { phase: "staged-cleanup", message: error?.message || String(error) };
+      try { await this._persistenceHostIO(() => adapter.remove(stagedPath)); } catch (error) {
+        markPostCommitDegraded("staged-cleanup", error?.message || String(error));
         this.logLocal("Semantic index staged cleanup incomplete", { error: error?.message || String(error) });
       }
     }
+    // Lane D2: finish the post-commit settled-storage contract only after the
+    // active old-generation/staged cleanup above. The helper removes the
+    // obsolete current-schema stable sidecar, measures the complete index
+    // root, conditionally removes validated inactive partitions, and measures
+    // the root again. It never rolls back the committed pointer.
+    let settledBytes = null;
+    try {
+      const settledCleanup = await this.cleanupSettledSemanticIndexStorage(partition, manifest.meta);
+      settledBytes = settledCleanup?.settledBytes ?? null;
+      if (settledCleanup?.degraded) {
+        const detail = settledCleanup.errors?.[0]?.code || "settled-storage-degraded";
+        markPostCommitDegraded(settledCleanup.degradedPhase || "settled-cleanup", detail);
+      }
+    } catch (error) {
+      markPostCommitDegraded("settled-verify", error?.message || String(error));
+    }
     await this.writeExternalMcpExport(false);
     _markPersistence("cleanup", "completed");
+    return Object.assign(semanticOperationResult({
+      ok: true,
+      changed: true,
+      reasonCode: postCommitDegraded ? "semantic-index-committed-degraded" : "semantic-index-generation-committed"
+    }), {
+      committed: true,
+      generation,
+      shardCount: shards.length,
+      settledBytes,
+      ready: settledBytes !== null && settledBytes < 100 * 1024 * 1024 && !postCommitDegraded,
+      ...(postCommitDegraded ? { degraded: true, degradedPhase: postCommitDegraded.phase } : {})
+    });
     } catch (error) {
       _failPersistence(error);
     }
@@ -8376,6 +9863,42 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return this.semanticIndexStoragePath(file);
   }
 
+  // Lane S: current v3 runtime routing reads only the generation-linked
+  // routing file from the validated manifest. When a linked
+  // routingFile/routingGeneration is present, it is the only artifact read;
+  // a missing linked file fails closed and is never silently satisfied by
+  // the stable sidecar. Without a linked file the legacy stable-sidecar
+  // path is preserved for the explicit startup/migration boundary.
+  _resolveLinkedSemanticRoutingFile(options = {}, settings = {}) {
+    const explicit = String(options.routingFile || settings.semanticIndexMeta?.routingFile || "").trim();
+    if (explicit) return explicit;
+    const routingGeneration = String(options.routingGeneration || settings.semanticIndexMeta?.routingGeneration || "").trim();
+    if (!routingGeneration) return "";
+    try {
+      return this.semanticIndexRoutingGenerationFile(routingGeneration);
+    } catch {
+      return "";
+    }
+  }
+
+  _resolveProductionSemanticRoutingLoadPath(options = {}, settings = {}) {
+    const linkedRoutingFile = this._resolveLinkedSemanticRoutingFile(options, settings);
+    if (linkedRoutingFile) return this.productionSemanticRoutingArtifactPath(linkedRoutingFile);
+    const meta = settings?.semanticIndexMeta || {};
+    const hasExplicitLink = Boolean(
+      String(options.routingFile || "").trim()
+      || String(options.routingGeneration || "").trim()
+      || String(meta.routingFile || "").trim()
+      || String(meta.routingGeneration || "").trim()
+    );
+    // The stable sidecar is a compatibility input only at the explicit
+    // startup/migration boundary. Current-schema runtime callers fail closed
+    // rather than turning an unlinked sidecar into an active generation.
+    if (options.allowLegacyStableSidecar !== true || hasExplicitLink
+      || Number(meta.persistenceSchemaVersion || 0) >= SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION) return "";
+    return this.productionSemanticRoutingArtifactPath();
+  }
+
   async loadProductionSemanticRoutingArtifact(options = {}) {
     const startedAt = localSemanticRoutingNow();
     const chunks = Array.isArray(options.chunks) ? options.chunks : (this.semanticIndex || []);
@@ -8396,7 +9919,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       policyVersion: options.policyVersion
     }).key;
     try {
-      const raw = await adapter.read(this.productionSemanticRoutingArtifactPath());
+      // Lane S: resolve the validated manifest's linked routing file for
+      // current runtime loading; the stable sidecar is not a request-time
+      // fallback when the linked file is absent.
+       const routingArtifactPath = this._resolveProductionSemanticRoutingLoadPath(options, settings);
+       if (!routingArtifactPath) return null;
+      const raw = await adapter.read(routingArtifactPath);
       const artifact = JSON.parse(raw || "{}");
       const expectedProvider = String(options.provider || semanticEmbeddingProviderForSettings(settings)).toLowerCase();
       const expectedModel = String(options.model || settings.embeddingModel || "");
@@ -8459,12 +9987,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // Atomic publication gate: a load whose identity is no longer the latest
       // requested active view must not publish into the global current state.
       if (!this._productionSemanticRoutingMayPublish(loadExpectedIdentityKey)) return null;
+      // Lane C2 fix: a stage-only load returns the validated candidate
+      // without publishing active routing state or shared telemetry.
+      if (options.stageOnly === true) return state;
       this.productionSemanticRoutingState = state;
       this.productionSemanticRoutingTelemetry = telemetry;
       return state;
     } catch (error) {
       // A stale load failure must not overwrite a newer request's telemetry.
       if (!this._productionSemanticRoutingMayPublish(loadExpectedIdentityKey)) return null;
+      // Lane C2 fix: a stage-only load failure settles to null without
+      // touching shared telemetry.
+      if (options.stageOnly === true) return null;
       const reasonCode = String(error?.code || "artifact-load-failed");
       this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, { state: "migration-required", reasonCode, artifactCompatibility: reasonCode, loadError: String(error?.message || "").slice(0, 240), providerCalls: 0, networkCalls: 0, revision, storageFingerprint });
       return null;
@@ -8482,7 +10016,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const expectedGeneration = String(options.generation || settings.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "");
     if (!expectedGeneration) return null;
     try {
-      const raw = await adapter.read(this.productionSemanticRoutingArtifactPath());
+      // Lane S: hydrate only from the manifest-linked generation routing
+      // file when one is known; never silently hydrate from the stable
+      // sidecar when the linked file is absent.
+       const revisionArtifactPath = this._resolveProductionSemanticRoutingLoadPath(options, settings);
+       if (!revisionArtifactPath) return null;
+      const raw = await adapter.read(revisionArtifactPath);
       const artifact = JSON.parse(raw || "{}");
       if (String(artifact.integrityHash || "") !== productionSemanticRoutingArtifactIntegrity(artifact)) return null;
       const expectedProvider = String(options.provider || semanticEmbeddingProviderForSettings(settings)).toLowerCase();
@@ -8533,6 +10072,43 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async _persistProductionSemanticRoutingArtifact(state, options = {}) {
     if (!state?.routingIndex || !this.app?.vault?.adapter?.write) return false;
     const adapter = this.app.vault.adapter;
+    // Lane D2: generation pair-member branch. Serializes the staged routing
+    // state with the accepted async D1 codec, then stages the
+    // generation-specific routing file with full readback/hash verification
+    // plus integrity and identity validation of the re-parsed bytes. Never
+    // touches the stable sidecar, shared telemetry, or active state; the
+    // caller stages this member before the manifest pointer moves. Write/read
+    // errors propagate to the caller's pre-commit handling; verification
+    // mismatches settle to false.
+    if (options.routingFile) {
+      const routingName = normalizedPluginBasename(options.routingFile, "semantic-index routing artifact");
+      const routingSignal = options.signal || null;
+      if (routingSignal && routingSignal.aborted === true) return false;
+      const artifact = await serializeProductionSemanticRoutingArtifactAsync(state, {
+        provider: options.provider || semanticEmbeddingProviderForSettings(this.settings),
+        model: options.model || this.settings.embeddingModel || "",
+        revision: options.revision ?? this.semanticIndexRevision ?? 0,
+        storageFingerprint: options.storageFingerprint ?? ""
+      });
+      const body = JSON.stringify(artifact);
+      const routingPath = this.productionSemanticRoutingArtifactPath(routingName);
+      await this._persistenceHostIO(() => adapter.write(routingPath, body));
+      if (typeof adapter.read === "function") {
+        const readBack = await this._persistenceHostIO(() => adapter.read(routingPath));
+        if (shortHash(readBack) !== shortHash(body)) return false;
+        let parsed;
+        try {
+          parsed = JSON.parse(readBack);
+        } catch {
+          return false;
+        }
+        if (!parsed || typeof parsed !== "object") return false;
+        if (productionSemanticRoutingArtifactIntegrity(parsed) !== parsed.integrityHash) return false;
+        if (String(parsed.generation || "") !== String(artifact.generation || "")) return false;
+        if (String(parsed.storageFingerprint || "") !== String(artifact.storageFingerprint || "")) return false;
+      }
+      return true;
+    }
     await this.ensureSemanticIndexStorageDirectory();
     const artifact = serializeProductionSemanticRoutingArtifact(state, {
       provider: options.provider || semanticEmbeddingProviderForSettings(this.settings),
@@ -8592,26 +10168,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return true;
     };
     let previousBody = null;
-    try { if (adapter.read) previousBody = await adapter.read(stablePath); } catch {}
+    try { if (adapter.read) previousBody = await this._persistenceHostIO(() => adapter.read(stablePath)); } catch {}
     try {
-      await adapter.write(stagedPath, body);
-      if (adapter.read && shortHash(await adapter.read(stagedPath)) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact staged verification failed.");
+      await this._persistenceHostIO(() => adapter.write(stagedPath, body));
+      if (adapter.read && shortHash(await this._persistenceHostIO(() => adapter.read(stagedPath))) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact staged verification failed.");
       if (!persistenceIsCurrent()) throw localSemanticRoutingError("routing-artifact-stale-build", "Production routing artifact build became stale before promotion.");
       if (typeof adapter.rename === "function") {
         try {
-          await adapter.rename(stagedPath, stablePath);
+          await this._persistenceHostIO(() => adapter.rename(stagedPath, stablePath));
         } catch {
           // Some mobile adapters reject rename-over-existing. Preserve the
           // staged verification and fall back to a verified stable write; the
           // previous body remains available for rollback if this fails too.
-          await adapter.write(stablePath, body);
-          try { await adapter.remove(stagedPath); } catch {}
+          await this._persistenceHostIO(() => adapter.write(stablePath, body));
+          try { await this._persistenceHostIO(() => adapter.remove(stagedPath)); } catch {}
         }
       } else {
-        await adapter.write(stablePath, body);
-        try { await adapter.remove(stagedPath); } catch {}
+        await this._persistenceHostIO(() => adapter.write(stablePath, body));
+        try { await this._persistenceHostIO(() => adapter.remove(stagedPath)); } catch {}
       }
-      if (adapter.read && shortHash(await adapter.read(stablePath)) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact promotion verification failed.");
+      if (adapter.read && shortHash(await this._persistenceHostIO(() => adapter.read(stablePath))) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact promotion verification failed.");
       if (!persistenceIsCurrent()) throw localSemanticRoutingError("routing-artifact-stale-build", "Production routing artifact build became stale after promotion.");
       this.productionSemanticRoutingArtifactMeta = { schemaVersion: artifact.persistenceSchemaVersion, generation: artifact.generation, count: artifact.count, integrityHash: artifact.integrityHash, revision: artifact.indexRevision, storageFingerprint: artifact.storageFingerprint };
       this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, { persistenceWrites: 1, persistenceState: "committed" });
@@ -8623,14 +10199,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         // A stale build that aborted before or after promotion must never
         // clobber a newer, already-committed artifact from a later request.
         let stableBody = null;
-        if (adapter.read) { try { stableBody = await adapter.read(stablePath); } catch {} }
+        if (adapter.read) { try { stableBody = await this._persistenceHostIO(() => adapter.read(stablePath)); } catch {} }
         const weOwnStable = stableBody !== null && shortHash(stableBody) === shortHash(body);
         if (weOwnStable) {
-          if (previousBody !== null) await adapter.write(stablePath, previousBody);
-          else await adapter.remove(stablePath);
+          if (previousBody !== null) await this._persistenceHostIO(() => adapter.write(stablePath, previousBody));
+          else await this._persistenceHostIO(() => adapter.remove(stablePath));
         }
       } catch {}
-      try { await adapter.remove(stagedPath); } catch {}
+      try { await this._persistenceHostIO(() => adapter.remove(stagedPath)); } catch {}
       this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, {
         state: "migration-required",
         reasonCode: "routing-artifact-persistence-failed",
@@ -8679,9 +10255,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const model = String(options.model || settings.embeddingModel || "");
     const dimension = Number(options.dimension || settings.semanticIndexMeta?.dimension || semanticEmbeddingTargetDimension(settings) || 0);
     const identity = semanticPreparedViewIdentity({ generation, revision, storageFingerprint, provider, model, dimension, policyVersion: options.policyVersion });
-    const inFlightKey = identity.key;
+    // Lane C2: stage-only activation shares one preparation per full prepared
+    // identity among stage callers, but never joins (or disturbs) a durable
+    // publish activation for the same identity. The publish key is unchanged
+    // so the existing outward contract for non-stage callers is preserved.
+    const stageOnly = options.stageOnly === true;
+    const inFlightKey = stageOnly ? `${identity.key}|stage` : identity.key;
     const invalidationSerial = Number(this.productionSemanticRoutingInvalidationSerial || 0);
     if (this.isUnloading) {
+      // Lane C2 fix: a stage-only activation never mutates shared telemetry,
+      // even on the unload path.
+      if (stageOnly) return null;
       this.productionSemanticRoutingTelemetry = { state: "migration-required", reasonCode: "plugin-unloading", providerCalls: 0, networkCalls: 0, revision, storageFingerprint };
       return null;
     }
@@ -8698,6 +10282,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const existingPromise = existing.promise || existing;
       const existingAllowsBuild = existing.allowBuild === true;
       if (options.allowBuild === false && existingAllowsBuild) {
+        // Lane C2 fix: a stage-only waiter settles to null without touching
+        // shared telemetry.
+        if (stageOnly) return null;
         this.productionSemanticRoutingTelemetry = {
           state: "migration-required",
           reasonCode: "routing-build-in-progress",
@@ -8731,6 +10318,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const currentStateIdentityKey = String(this.productionSemanticRoutingState?.identityKey || this.productionSemanticRoutingState?.preparedIdentityKey || "");
         const stillCurrent = (!identity?.key || !currentStateIdentityKey || currentStateIdentityKey === identity.key);
         if (!stillCurrent) {
+          // Lane C2 fix: an identity-matching staged candidate settles even
+          // while a different identity remains published (staging never
+          // publishes or mutates active state). A superseded stage result —
+          // one whose requested identity no longer matches the latest
+          // request — still settles to null, as do missing/mismatched staged
+          // identities, invalidation-serial drift, and stale/cancelled work.
+          if (stageOnly) {
+            const latestKey = String(this.productionSemanticRoutingLatestRequest?.identityKey || "");
+            const serialCurrent = Number(this.productionSemanticRoutingInvalidationSerial || 0) === invalidationSerial;
+            const stagedKey = String(result?.identityKey || "");
+            if (result && serialCurrent && identity?.key && String(identity.key) === latestKey && stagedKey && stagedKey === String(identity.key)) return result;
+            return null;
+          }
           if (this.productionSemanticRoutingState === result) this.productionSemanticRoutingState = null;
           if (this.currentPreparedViewRef?.routingState === result || this.currentPreparedViewRef?.view && result && String(this.currentPreparedViewRef.view.identity?.key || "") === String(identity?.key || "")) {
             // Do not clear newer view if it was already superseded; only clear if this stale result was the published ref.
@@ -8747,7 +10347,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (this.productionSemanticRoutingInFlight.get(inFlightKey)?.promise === sharedPromise) this.productionSemanticRoutingInFlight.delete(inFlightKey);
       }
     })();
-    this.productionSemanticRoutingInFlight.set(inFlightKey, { promise: sharedPromise, allowBuild: options.allowBuild !== false, invalidationSerial });
+    this.productionSemanticRoutingInFlight.set(inFlightKey, { promise: sharedPromise, allowBuild: options.allowBuild !== false, invalidationSerial, stageOnly });
     return sharedPromise;
   }
 
@@ -8802,6 +10402,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // active source only. Preserve zero while still rejecting a missing
     // revision.
     if (!options.forceBuild && current?.routingIndex && current.sourceChunksIdentity === chunks && currentGenerationMatches && currentShardLayoutMatches && currentIdentityMatches && warmCountMatches) {
+      // Lane C2 fix: a stage-only warm hit returns a staged reference to the
+      // already-validated current state without repairing or replacing the
+      // published view refs and without mutating shared telemetry. The
+      // terminal state is a fresh diagnostic copy, never the shared alias.
+      if (options.stageOnly === true) {
+        const stagedView = this.currentPreparedViewRef?.view || this.semanticIndexPreparedView || null;
+        const stagedTerminal = Object.freeze(Object.assign({}, current.telemetry, { cacheHit: true, coldBuild: false, loadHit: Boolean(current.telemetry?.loadHit), corpusPreparationRows: 0 }));
+        return Object.freeze({ view: stagedView, routingState: current, terminalState: stagedTerminal, preparedView: stagedView, stageOnly: true, identityKey: expectedIdentityKey });
+      }
       if (!this.currentPreparedViewRef || !this.semanticIndexPreparedView || String(this.currentPreparedViewRef?.view?.identity?.key || "") !== String(expectedIdentityKey)) {
         try {
           const viewIdentityForWarm = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
@@ -8820,8 +10429,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // work needed for a load or rebuild.
     const routableChunkCount = chunks.filter((chunk) => chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true).length;
     if (!options.forceBuild && options.allowLoad !== false && (storageFingerprint || generation)) {
-      const loaded = await this.loadProductionSemanticRoutingArtifact({ chunks, settings, revision, storageFingerprint, generation: options.generationCanonical === false ? "" : options.generation, provider: options.provider, model: options.model, dimension: options.dimension, shardCount: options.shardCount });
+      const loaded = await this.loadProductionSemanticRoutingArtifact({ chunks, settings, revision, storageFingerprint, generation: options.generationCanonical === false ? "" : options.generation, provider: options.provider, model: options.model, dimension: options.dimension, shardCount: options.shardCount, stageOnly: options.stageOnly === true, allowLegacyStableSidecar: options.allowLegacyStableSidecar === true });
       if (loaded) {
+        // Lane C2: a stage-only load returns a staged reference to the
+        // validated artifact without publishing view refs. Durable promotion
+        // stays with D2/S storage and identity gates. The staged view is
+        // built cooperatively and identity-checked; a mismatch or failure
+        // settles to null rather than handing out a mixed candidate.
+        if (options.stageOnly === true) {
+          try {
+            // Lane C2 fix: stage-load view preparation observes the same
+            // unload/invalidation/latest-identity liveness as the fresh-build
+            // kernels, so a superseded or unloaded staged load cancels
+            // instead of handing out a stale candidate.
+            const stagedLoadLiveness = () => !this.isUnloading
+              && Number(this.productionSemanticRoutingInvalidationSerial || 0) === invalidationSerial
+              && this._productionSemanticRoutingMayPublish(expectedIdentityKey);
+            if (!stagedLoadLiveness()) return null;
+            const stagedViewIdentity = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
+            const stagedView = await buildSemanticIndexPreparedViewAsync(stagedViewIdentity, chunks, {}, Object.assign({}, options, {
+              generation: String(options.generation || generation),
+              isCurrent: stagedLoadLiveness
+            }));
+            if (!stagedLoadLiveness()) return null;
+            if (String(stagedView.identity.key) !== String(expectedIdentityKey) || String(loaded.preparedIdentityKey || loaded.identityKey || "") !== String(expectedIdentityKey)) return null;
+            return Object.freeze({ view: stagedView, routingState: loaded, terminalState: loaded.telemetry, preparedView: stagedView, stageOnly: true, identityKey: expectedIdentityKey });
+          } catch {
+            return null;
+          }
+        }
         try {
           const loadedViewIdentity = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
           const loadedView = buildSemanticIndexPreparedView(loadedViewIdentity, chunks, {});
@@ -8836,6 +10472,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       artifactCompatibilityReason = String(this.productionSemanticRoutingTelemetry?.artifactCompatibility || this.productionSemanticRoutingTelemetry?.reasonCode || "artifact-load-failed");
     }
     if (!chunks.length && !generation) {
+      // Lane C2 fix: a stage-only activation settles to null without
+      // invalidating published state.
+      if (options.stageOnly === true) return null;
       this.invalidateProductionSemanticRoutingState("routing-state-migration-required");
       return null;
     }
@@ -8845,6 +10484,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // A request that cannot build may degrade (return null), but only if it
       // is still the latest requested identity. An older/incompatible request
       // must not clear a newer already-published state.
+      // Lane C2 fix: a stage-only no-build settles to null without clearing
+      // or changing active state or shared telemetry.
+      if (options.stageOnly === true) return null;
       if (!this._productionSemanticRoutingMayPublish(expectedIdentityKey)) return null;
       this.productionSemanticRoutingState = null;
       this.productionSemanticRoutingTelemetry = {
@@ -8858,14 +10500,42 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return null;
     }
     try {
-      const prepared = prepareProductionSemanticRoutingState(chunks, settings, revision, storageFingerprint, options);
+      // Lane C2: local candidate preparation runs as one admitted renderer
+      // phase through the C1 cooperative async kernels. The admitted body is
+      // side-effect-free (pure compute over chunks/settings); publication and
+      // persistence stay outside admission in the existing regions below. An
+      // async preparation failure rejects explicitly — production never falls
+      // back to a synchronous full-corpus build merely because the async
+      // preparation failed. The kernels observe liveness (unload,
+      // invalidation serial, latest-requested identity) so a superseded or
+      // unloaded build cancels promptly instead of blocking the renderer.
+      const candidateLiveness = () => !this.isUnloading
+        && Number(this.productionSemanticRoutingInvalidationSerial || 0) === invalidationSerial
+        && this._productionSemanticRoutingMayPublish(expectedIdentityKey);
+      const candidateKernels = Object.assign({}, options, {
+        generation: String(options.generation || generation),
+        isCurrent: candidateLiveness
+      });
+      const admittedCandidate = await this._admitRendererPhase("production-routing:prepare", async () => {
+        const prepared = await prepareProductionSemanticRoutingStateAsync(chunks, settings, revision, storageFingerprint, candidateKernels);
+        const viewIdentityForPublish = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
+        const preparedViewForPublish = await buildSemanticIndexPreparedViewAsync(viewIdentityForPublish, chunks, {}, candidateKernels);
+        if (String(preparedViewForPublish.identity.key) !== String(expectedIdentityKey) || String(preparedViewForPublish.identity.key) !== String(viewIdentityForPublish.key)) return null;
+        return { prepared, preparedViewForPublish };
+      });
+      if (!admittedCandidate) return null;
+      const { prepared, preparedViewForPublish } = admittedCandidate;
       const telemetryBeforePersist = Object.freeze(Object.assign({}, prepared.telemetry, { cacheHit: false, coldBuild: true, loadHit: false, artifactCompatibility: "rebuilt-local", artifactCompatibilityReason: artifactCompatibilityReason || "forced-rebuild", corpusPreparationRows: routableChunkCount, preparedIdentityKey: expectedIdentityKey }));
       const stateBeforePersist = Object.freeze(Object.assign({}, prepared, { telemetry: telemetryBeforePersist, preparedIdentityKey: expectedIdentityKey, identityKey: expectedIdentityKey }));
       const isCancelled = () => this.isUnloading || !this._productionSemanticRoutingMayPublish(expectedIdentityKey);
       if (isCancelled()) return null;
-      const viewIdentityForPublish = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
-      const preparedViewForPublish = buildSemanticIndexPreparedView(viewIdentityForPublish, chunks, {});
-      if (String(preparedViewForPublish.identity.key) !== String(expectedIdentityKey) || String(preparedViewForPublish.identity.key) !== String(viewIdentityForPublish.key)) return null;
+      // Lane C2: stage-only activation returns the fully validated candidate
+      // here. It never reaches persistence, cache eviction, settings writes,
+      // or the durable assignment region below; durable publication belongs
+      // to D2/S after their storage and identity gates.
+      if (options.stageOnly === true) {
+        return Object.freeze({ view: preparedViewForPublish, routingState: stateBeforePersist, terminalState: telemetryBeforePersist, preparedView: preparedViewForPublish, stageOnly: true, identityKey: expectedIdentityKey });
+      }
       const atomicPreparedRefBeforePersist = Object.freeze({ view: preparedViewForPublish, routingState: stateBeforePersist, terminalState: telemetryBeforePersist, preparedView: preparedViewForPublish });
       if (isCancelled()) return null;
       let persisted = true;
@@ -8996,6 +10666,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       return finalState;
     } catch (error) {
+      // Lane C2: a stage-only build failure settles to null without touching
+      // published state, view refs, settings, or telemetry. The degraded
+      // encoder-identity fallback below is a durable-path recovery and must
+      // never publish (or stage) a degraded candidate on behalf of a caller
+      // that asked only to stage.
+      if (options.stageOnly === true) return null;
       // If settings were switched after an index was built, the persisted
       // chunks still carry the encoder identity that produced their vectors.
       // Build a provider-free fallback from that durable identity instead of
@@ -9010,7 +10686,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           embeddingProvider: sample?.embeddingProvider || sampleMeta.provider || settings.embeddingProvider,
           embeddingModel: sample?.embeddingModel || sampleMeta.model || settings.embeddingModel
         });
-        const preparedFallback = prepareProductionSemanticRoutingState(fallbackChunks, fallbackSettings, revision, storageFingerprint, options);
+        // Lane C2: the encoder-identity fallback also builds through an
+        // admitted renderer phase and the C1 async kernels — never a
+        // synchronous full-corpus build. Publication still happens only in
+        // the existing assignment region below.
+        const fallbackKernels = Object.assign({}, options, {
+          generation: String(options.generation || generation),
+          isCurrent: () => !this.isUnloading
+            && Number(this.productionSemanticRoutingInvalidationSerial || 0) === invalidationSerial
+            && this._productionSemanticRoutingMayPublish(expectedIdentityKey)
+        });
+        const admittedFallback = await this._admitRendererPhase("production-routing:prepare-fallback", async () => {
+          const preparedFallback = await prepareProductionSemanticRoutingStateAsync(fallbackChunks, fallbackSettings, revision, storageFingerprint, fallbackKernels);
+          const fallbackViewIdentity = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
+          const fallbackView = await buildSemanticIndexPreparedViewAsync(fallbackViewIdentity, fallbackChunks, {}, fallbackKernels);
+          return { preparedFallback, fallbackView };
+        });
+        // Lane C2 fix: an admitted fallback that settles to null (cancellation
+        // or rejection) must not be destructured.
+        if (!admittedFallback) return null;
+        const { preparedFallback, fallbackView } = admittedFallback;
         const fallbackTelemetry = Object.freeze(Object.assign({}, preparedFallback.telemetry, {
           state: "ready",
           degraded: true,
@@ -9023,8 +10718,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const fallbackState = Object.freeze(Object.assign({}, preparedFallback, { sourceChunksIdentity: chunks, telemetry: fallbackTelemetry, preparedIdentityKey: expectedIdentityKey, identityKey: expectedIdentityKey }));
         if (!this._productionSemanticRoutingMayPublish(expectedIdentityKey) || this.isUnloading || Number(this.productionSemanticRoutingInvalidationSerial || 0) !== invalidationSerial) return null;
         try {
-          const fallbackViewIdentity = semanticPreparedViewIdentity({ generation: String(options.generation || generation), revision, storageFingerprint, provider: resolvedProvider, model: resolvedModel, dimension: resolvedDimension, policyVersion: options.policyVersion });
-          const fallbackView = buildSemanticIndexPreparedView(fallbackViewIdentity, fallbackChunks, {});
           const fallbackRef = Object.freeze({ view: fallbackView, routingState: fallbackState, terminalState: fallbackTelemetry, preparedView: fallbackView });
           this.semanticIndexPreparedView = fallbackView;
           this.currentPreparedViewRef = fallbackRef;
@@ -9071,8 +10764,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }, delayMs);
   }
 
-  async reshardSemanticIndexWhenIdle() {
-    if (!this.semanticIndexOperationActive) return this.withSemanticIndexOperation("reshard", () => this.reshardSemanticIndexWhenIdle());
+  async reshardSemanticIndexWhenIdle(options = {}) {
+    return this.withSemanticIndexOperation("reshard", async () => {
     if (!(this.semanticIndex || []).length) return semanticOperationResult({ ok: true, reasonCode: "empty-index" });
     if (!this.canStartBackgroundWork() || this.semanticIndexLoadInProgress) {
       this.queueSemanticIndexReshard(30000);
@@ -9096,9 +10789,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     } finally {
       this.semanticIndexInProgress = false;
       this.semanticIndexOptimizeInProgress = false;
-      this.setSidebarIndexStatus("Ready");
       await this.consumeSemanticTaskReferenceRepairFollowUp("snapshot-fingerprint-mismatch");
+      this.refreshSidebarStatus();
     }
+    }, { coalesceKey: "semantic-index:reshard", token: options?.indexToken });
   }
 
   async getSemanticIndexProviderStorageSummaries() {
@@ -9334,16 +11028,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         let name = "";
         try { name = semanticIndexShardName(indexFile, candidate, { allowLegacy: true }); } catch { return; }
         if (!isSemanticIndexShardFile(indexFile, name) || keep.has(name)) return;
-        try { await this.app.vault.adapter.remove(this.semanticIndexStoragePath(name)); } catch (error) { errors.push(error); }
+        try { await this._persistenceHostIO(() => this.app.vault.adapter.remove(this.semanticIndexStoragePath(name))); } catch (error) { errors.push(error); }
       });
       return { errors };
     }
     try {
-      const listed = await this.app.vault.adapter.list(this.semanticIndexStorageDir());
+      const listed = await this._persistenceHostIO(() => this.app.vault.adapter.list(this.semanticIndexStorageDir()));
       for (const path of listed?.files || []) {
         const name = path.split("/").pop() || "";
         if (!isSemanticIndexShardFile(indexFile, name) || keep.has(name)) continue;
-        try { await this.app.vault.adapter.remove(path); } catch (error) { errors.push(error); }
+        try { await this._persistenceHostIO(() => this.app.vault.adapter.remove(path)); } catch (error) { errors.push(error); }
       }
     } catch (error) { errors.push(error); }
     return { errors };
@@ -9482,7 +11176,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   refreshSidebarStatus() {
-    this.schedulePendingSemanticIndexFlush?.();
+    // Pure rendering: inspect already-held state and paint text. Never
+    // schedule a flush/build/load, read the Vault, or mutate queues.
+    const items = allActiveWorkflowStatusItems(this);
+    const indexItem = (items || []).find((item) => String(item?.label || "").toLowerCase() === "index");
+    this.lastSidebarIndexStatus = indexItem ? String(indexItem.value || "") : "ready";
     const compatibilityState = this.semanticIndexCompatibilityRefresh?.state || "";
     const indexActive = compatibilityState === "queued" || compatibilityState === "running"
       || Boolean(this.semanticIndexLoadInProgress || this.semanticIndexLoadTimer || this.semanticIndexOptimizeInProgress
@@ -9678,6 +11376,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async withSemanticIndexOperation(owner, operation, options = {}) {
+    const normalizedOwner = String(owner || "semantic-index");
     const nestedOwners = {
       "incremental-flush": new Set(["reindex-file", "remove-path", "rebuild"]),
       rebuild: new Set(["reindex-file", "remove-path"]),
@@ -9686,13 +11385,77 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       "task-reference-repair": new Set(),
       reshard: new Set()
     };
-    if (this.semanticIndexOperationActive && nestedOwners[this.semanticIndexOperationOwner]?.has(String(owner || ""))) return operation();
-    // Top-level only: bump the worker generation inside the serialized run
-    // before entering the operation, so two queued top-level operations bump
-    // sequentially when each run executes. Nested runs reuse the outer epoch.
-    const _shouldBumpEpoch = !(this.semanticIndexOperationActive && nestedOwners[this.semanticIndexOperationOwner]?.has(String(owner || "")));
+    const isAllowedNestedChild = (parent, child) => String(parent || "") === String(child || "")
+      || Boolean(nestedOwners[String(parent || "")]?.has(String(child || "")));
+    const presentedToken = options && Object.prototype.hasOwnProperty.call(options, "token") ? options.token : undefined;
+    // Single-owner nesting: only the exact active token object, with an
+    // allowed parent/child owner relation, may nest. A copied/expired token
+    // or a wrong-owner use fails closed; the bare global active flag never
+    // grants nested execution.
+    if (presentedToken !== undefined && presentedToken !== null) {
+      if (presentedToken === this._semanticIndexActiveToken
+        && this._semanticIndexActiveToken
+        && isAllowedNestedChild(this._semanticIndexActiveToken.owner, normalizedOwner)) {
+        return operation(this._semanticIndexActiveToken);
+      }
+      const tokenError = new Error("Semantic index operation token rejected.");
+      tokenError.code = "semantic-index-token-rejected";
+      throw tokenError;
+    }
+    const coalesceKey = String((options && options.coalesceKey) || `semantic-index:${normalizedOwner}`);
+    // Equivalent requests join the current run and share its result instead
+    // of starting a parallel writer.
+    if (this._semanticIndexActiveToken && coalesceKey === this._semanticIndexActiveCoalesceKey && this._semanticIndexActivePromise) {
+      return this._semanticIndexActivePromise;
+    }
+    // Changed inputs merge into one pending successor behind the active run.
+    if (this._semanticIndexActiveToken) {
+      this.pendingIndexPaths = this.pendingIndexPaths instanceof Set ? this.pendingIndexPaths : new Set();
+      const mergePaths = (target, paths) => {
+        for (const candidate of Array.isArray(paths) ? paths : []) {
+          const path = String(candidate || "");
+          if (path) target.add(path);
+        }
+      };
+      mergePaths(this.pendingIndexPaths, options && options.paths);
+      let slot = this._semanticIndexPendingSuccessor;
+      if (!slot || typeof slot !== "object") {
+        slot = {
+          owner: normalizedOwner,
+          operation,
+          options: {
+            paths: [],
+            coalesceKey,
+            force: Boolean(options && options.force)
+          },
+          waiters: []
+        };
+        this._semanticIndexPendingSuccessor = slot;
+      }
+      slot.options.paths = Array.from(new Set([...(slot.options.paths || []), ...((options && options.paths) || [])].map((path) => String(path || "")).filter(Boolean)));
+      return new Promise((resolve, reject) => {
+        slot.waiters.push({ resolve, reject });
+      });
+    }
+    // Top-level acquisition. The token is registered synchronously so
+    // concurrent equivalent requests join instead of racing a second writer.
+    // Top-level runs bump the worker epoch sequentially at acquisition;
+    // nested runs reuse the outer epoch.
     const previous = this.semanticIndexOperationPromise || Promise.resolve();
     const coordinatorSchedulesIndex = Boolean(this.runtimeWorkCoordinator?.enqueueIndexWork);
+    this._semanticIndexTokenSequence = Number.isFinite(Number(this._semanticIndexTokenSequence)) ? Number(this._semanticIndexTokenSequence) + 1 : 1;
+    this.semanticIndexWorkerEpoch = (Number.isFinite(Number(this.semanticIndexWorkerEpoch)) ? Number(this.semanticIndexWorkerEpoch) : 0) + 1;
+    const activeToken = Object.freeze({
+      id: `semantic-index-op-${this._semanticIndexTokenSequence}`,
+      epoch: Number(this.semanticIndexWorkerEpoch),
+      owner: normalizedOwner,
+      inputRevision: Number(this.semanticIndexRevision || 0)
+    });
+    this._semanticIndexActiveToken = activeToken;
+    this._semanticIndexActiveCoalesceKey = coalesceKey;
+    this._semanticIndexGatewayAllowActive = true;
+    this.semanticIndexOperationActive = true;
+    this.semanticIndexOperationOwner = normalizedOwner;
     const run = async () => {
       // The coordinator's single semantic-index lane serializes publication
       // operations. Keep the old promise chain only for provider-free hosts
@@ -9704,14 +11467,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         error.code = "runtime-work-cancelled";
         throw error;
       }
-      if (_shouldBumpEpoch) {
-        this.semanticIndexWorkerEpoch = (Number.isFinite(Number(this.semanticIndexWorkerEpoch)) ? Number(this.semanticIndexWorkerEpoch) : 0) + 1;
-      }
-      this.semanticIndexOperationActive = true;
-      this.semanticIndexOperationOwner = String(owner || "semantic-index");
       try {
-        return await operation();
+        return await operation(activeToken);
       } finally {
+        this._semanticIndexActiveToken = null;
+        this._semanticIndexActiveCoalesceKey = "";
+        this._semanticIndexGatewayAllowActive = false;
         this.semanticIndexOperationActive = false;
         this.semanticIndexOperationOwner = "";
         // Recompute owner-scoped sidebar state after every top-level index
@@ -9719,15 +11480,43 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         // operation is a task-reference embedding update that has no separate
         // `semanticIndexInProgress` flag; active/queued work remains visible.
         this.refreshSidebarStatus();
+        // Drain at most the single pending successor as a fresh top-level
+        // acquisition. Current callers already hold this run's result; the
+        // successor's waiters settle on the detached chain.
+        const successor = this._semanticIndexPendingSuccessor;
+        this._semanticIndexPendingSuccessor = null;
+        if (successor && successor.operation) {
+          if (this.isUnloading) {
+            const cancelled = new Error("Semantic index work was cancelled during unload.");
+            cancelled.code = "runtime-work-cancelled";
+            for (const waiter of successor.waiters || []) {
+              try { waiter.reject(cancelled); } catch {}
+            }
+          } else {
+            // Re-acquire synchronously (no yield) so no interleaving request
+            // can slip a second top-level writer between release and drain.
+            // Current callers already hold this run's result; the successor's
+            // waiters settle on the detached chain.
+            const successorRun = this.withSemanticIndexOperation(successor.owner, successor.operation, {
+              paths: Array.isArray(successor.options?.paths) ? successor.options.paths : [],
+              coalesceKey: successor.options?.coalesceKey || `semantic-index:${String(successor.owner || "semantic-index")}`,
+              force: Boolean(successor.options?.force)
+            });
+            Promise.resolve(successorRun).then(
+              (result) => { for (const waiter of successor.waiters || []) { try { waiter.resolve(result); } catch {} } },
+              (error) => { for (const waiter of successor.waiters || []) { try { waiter.reject(error); } catch {} } }
+            );
+          }
+        }
       }
     };
     const execute = this.runtimeWorkCoordinator?.enqueueIndexWork
       ? this.runtimeWorkCoordinator.enqueueIndexWork({
-        jobId: `semantic-index-${String(owner || "semantic-index")}`,
+        jobId: `semantic-index-${String(normalizedOwner)}`,
         partition: "semantic-index",
-        kind: String(owner || "semantic-index"),
-        paths: options.paths || [],
-        coalesceKey: options.coalesceKey || `semantic-index:${String(owner || "semantic-index")}`,
+        kind: String(normalizedOwner),
+        paths: (options && options.paths) || [],
+        coalesceKey,
         execute: run
       }).then((envelope) => {
         if (envelope?.status === "completed") return envelope.result;
@@ -9737,6 +11526,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       })
       : Promise.resolve().then(run);
     const current = execute;
+    this._semanticIndexActivePromise = current;
     this.semanticIndexOperationPromise = current.catch(() => {});
     return current;
   }
@@ -9964,58 +11754,68 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async getActiveMarkdownContext(pathOverride = "") {
-    if (pathOverride) {
-      const selected = this.app.vault.getAbstractFileByPath(pathOverride);
-      if (selected instanceof TFile) {
-        if (this.isExcludedPath(selected.path)) return { title: "", path: "", text: "", selection: "" };
-        const text = await this.app.vault.cachedRead(selected);
-        return { title: selected.basename, path: selected.path, text, selection: "" };
-      }
-    }
-    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const lastView = this.lastActiveMarkdownLeaf?.view instanceof MarkdownView ? this.lastActiveMarkdownLeaf.view : null;
-    let view = activeView?.file ? activeView : lastView?.file ? lastView : activeView || lastView;
-    if (!view?.file) {
-      let fallbackLeaf = null;
-      const markdownLeaves = typeof this.app.workspace.getLeavesOfType === "function"
-        ? this.app.workspace.getLeavesOfType("markdown")
-        : [];
-      for (const leaf of markdownLeaves || []) {
-        if (leaf?.view instanceof MarkdownView && leaf.view.file) {
-          fallbackLeaf = leaf;
-          break;
+    // Lane J: local source-read phase admitted through
+    // RuntimeWorkCoordinator.runRendererPhase; file text goes through
+    // rendererToken.hostIO one call at a time. Sync workspace lookups stay
+    // read-free and direct. Never holds a renderer turn across a wait: hostIO
+    // releases ownership and re-enters before local context adoption.
+    return this._admitRendererPhase("active-markdown-context", async (rendererToken) => {
+      // Lane J classification: getAbstractFileByPath is a synchronous read-free
+      // lookup; no hostIO needed. Only the async cachedRead calls below are
+      // admitted (with bounded busy-retry so overlapping readers settle).
+      if (pathOverride) {
+        const selected = this.app.vault.getAbstractFileByPath(pathOverride);
+        if (selected instanceof TFile) {
+          if (this.isExcludedPath(selected.path)) return { title: "", path: "", text: "", selection: "" };
+          const selectedText = await this._admittedHostIO(rendererToken, () => this.app.vault.cachedRead(selected));
+          return { title: selected.basename, path: selected.path, text: selectedText, selection: "" };
         }
       }
-      if (!fallbackLeaf && typeof this.app.workspace.iterateAllLeaves === "function") {
-        this.app.workspace.iterateAllLeaves((leaf) => {
-          if (fallbackLeaf || !(leaf?.view instanceof MarkdownView) || !leaf.view.file) return;
-          fallbackLeaf = leaf;
-        });
+      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      const lastView = this.lastActiveMarkdownLeaf?.view instanceof MarkdownView ? this.lastActiveMarkdownLeaf.view : null;
+      let view = activeView?.file ? activeView : lastView?.file ? lastView : activeView || lastView;
+      if (!view?.file) {
+        let fallbackLeaf = null;
+        const markdownLeaves = typeof this.app.workspace.getLeavesOfType === "function"
+          ? this.app.workspace.getLeavesOfType("markdown")
+          : [];
+        for (const leaf of markdownLeaves || []) {
+          if (leaf?.view instanceof MarkdownView && leaf.view.file) {
+            fallbackLeaf = leaf;
+            break;
+          }
+        }
+        if (!fallbackLeaf && typeof this.app.workspace.iterateAllLeaves === "function") {
+          this.app.workspace.iterateAllLeaves((leaf) => {
+            if (fallbackLeaf || !(leaf?.view instanceof MarkdownView) || !leaf.view.file) return;
+            fallbackLeaf = leaf;
+          });
+        }
+        if (fallbackLeaf) {
+          this.lastActiveMarkdownLeaf = fallbackLeaf;
+          view = fallbackLeaf.view;
+        }
       }
-      if (fallbackLeaf) {
-        this.lastActiveMarkdownLeaf = fallbackLeaf;
-        view = fallbackLeaf.view;
+      const file = view?.file;
+      if (!view || !file) return { title: "", path: "", text: "", selection: "" };
+      if (this.isExcludedPath(file.path)) return { title: "", path: "", text: "", selection: "" };
+      const editor = view.editor;
+      const selection = editor?.getSelection?.() || "";
+      const text = await this._admittedHostIO(rendererToken, () => this.app.vault.cachedRead(file));
+      const context = { title: file.basename, path: file.path, text, selection };
+      if (selection) {
+        const from = editor?.getCursor?.("from") || editor?.getCursor?.() || null;
+        const line = Number(from?.line);
+        context.sourceLineOffset = Number.isSafeInteger(line) && line >= 0 ? line : 0;
       }
-    }
-    const file = view?.file;
-    if (!view || !file) return { title: "", path: "", text: "", selection: "" };
-    if (this.isExcludedPath(file.path)) return { title: "", path: "", text: "", selection: "" };
-    const editor = view.editor;
-    const selection = editor?.getSelection?.() || "";
-    const text = await this.app.vault.cachedRead(file);
-    const context = { title: file.basename, path: file.path, text, selection };
-    if (selection) {
-      const from = editor?.getCursor?.("from") || editor?.getCursor?.() || null;
-      const line = Number(from?.line);
-      context.sourceLineOffset = Number.isSafeInteger(line) && line >= 0 ? line : 0;
-    }
-    return context;
+      return context;
+    });
   }
 
-  async rebuildSemanticIndex(showNotice) {
-    if (!this.semanticIndexOperationActive) return this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(showNotice));
-    const nestedIncrementalFallbackRebuild = this.semanticIndexOperationOwner === "incremental-flush";
-    if (this.semanticIndexInProgress && this.semanticIndexOperationOwner !== "rebuild" && !nestedIncrementalFallbackRebuild) {
+  async rebuildSemanticIndex(showNotice, options = {}) {
+    return this.withSemanticIndexOperation("rebuild", async (indexToken) => {
+    const nestedIncrementalFallbackRebuild = indexToken?.owner === "incremental-flush";
+    if (this.semanticIndexInProgress && indexToken?.owner !== "rebuild" && !nestedIncrementalFallbackRebuild) {
       if (showNotice) new Notice("Semantic indexing is already running.");
       return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths?.size || 0, reasonCode: "semantic-index-busy", repairQueued: true });
     }
@@ -10160,22 +11960,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       try {
         // The ordinary candidate is primary-only so compatible primary rows
         // remain reusable and a late failure cannot publish mixed vectors.
-        embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks", { fallbackPolicy: "disabled" });
+        embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks", { fallbackPolicy: "disabled", indexToken });
         materialityAnchors = await this.embedSemanticMaterialityAnchors({
           fallbackOnly: false,
-          embeddingIdentity: embedded.embeddingIdentity
+          embeddingIdentity: embedded.embeddingIdentity,
+          indexToken
         });
       } catch (error) {
         if (!semanticEmbeddingFallbackEligible(error, this.settings)) throw error;
         embeddingFallbackReference = semanticEmbeddingFallbackReference(this.settings);
         embedded = await this.embedSemanticChunks(chunks, new Map(), "vault chunks (fallback candidate)", Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), {
-          embeddingIdentity: null
+          embeddingIdentity: null,
+          indexToken
         }));
         embeddingFallbackUsed = true;
         materialityAnchors = await this.embedSemanticMaterialityAnchors({
           fallbackOnly: true,
           explicitFallback: embeddingFallbackReference,
-          embeddingIdentity: embedded.embeddingIdentity
+          embeddingIdentity: embedded.embeddingIdentity,
+          indexToken
         });
       }
       if (embedded.embeddingIdentity && materialityAnchors.embeddingIdentity
@@ -10270,10 +12073,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: String(error?.message || "semantic-rebuild-failed").split("\n")[0].slice(0, 120), repairQueued: Boolean(this.scheduleSemanticTaskReferenceRepair?.("incremental-integrity")) });
     } finally {
       this.semanticIndexInProgress = false;
-      this.setSidebarIndexStatus("Ready");
-      this.refreshSidebarStatus();
       await this.consumeSemanticTaskReferenceRepairFollowUp("snapshot-fingerprint-mismatch");
+      this.refreshSidebarStatus();
     }
+    }, { coalesceKey: "semantic-index:rebuild", token: options?.indexToken });
   }
 
   getIndexableFiles() {
@@ -10351,27 +12154,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return true;
   }
 
-  async flushSemanticIndexUpdates() {
-    if (this.semanticIndexInProgress && !this.semanticIndexOperationActive) {
-      window.clearTimeout(this.semanticIndexTimer);
-      this.semanticIndexTimer = null;
-      this.schedulePendingSemanticIndexFlush(10000);
-      this.refreshSidebarStatus();
-      return semanticOperationResult({ ok: true, queued: this.pendingIndexPaths.size, reasonCode: "semantic-index-busy" });
-    }
-    return this.withSemanticIndexOperation("incremental-flush", async () => {
+  async flushSemanticIndexUpdates(options = {}) {
+    // No busy bypass: every no-token flush enters the serialized owner queue
+    // so equivalent requests join the current run and changed paths form one
+    // pending successor. Timer/status settlement happens in the queue's
+    // finalizers and the pure status refresh.
+    return this.withSemanticIndexOperation("incremental-flush", async (indexToken) => {
+      // Drain-snapshot delete: only inputs covered by this drain are consumed;
+      // dirty paths arriving after the snapshot stay pending.
+      const consumeDrainedPaths = (drained) => {
+        for (const path of Array.isArray(drained) ? drained : []) this.pendingIndexPaths.delete(path);
+      };
       if (!this.pendingIndexPaths.size) {
         this.semanticIndexTimer = null;
         this.refreshSidebarStatus();
         return semanticOperationResult({ ok: true, reasonCode: "nothing-pending" });
       }
       if (this.pendingIndexPaths.size >= SEMANTIC_INDEX_PENDING_REBUILD_THRESHOLD) {
-        const rebuilt = await this.rebuildSemanticIndex(false);
+        const nestedDrain = Array.from(this.pendingIndexPaths);
+        const rebuilt = await this.rebuildSemanticIndex(false, { indexToken });
         if (!rebuilt?.ok) {
           this.schedulePendingSemanticIndexFlush();
           return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || "rebuild-failed", repairQueued: Boolean(rebuilt?.repairQueued) });
         }
-        this.pendingIndexPaths.clear();
+        consumeDrainedPaths(nestedDrain);
         this.semanticIndexTimer = null;
         this.refreshSidebarStatus();
         return semanticOperationResult({ ok: true, changed: true, changedCount: rebuilt.changedCount, reasonCode: "rebuilt-pending-burst" });
@@ -10380,30 +12186,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await this.ensureSemanticIndexLoaded("semantic index cache");
       }
       if (!this.hasUsableSemanticIndex()) {
-        const rebuilt = await this.rebuildSemanticIndex(false);
+        const nestedDrain = Array.from(this.pendingIndexPaths);
+        const rebuilt = await this.rebuildSemanticIndex(false, { indexToken });
         if (!rebuilt?.ok) {
           this.schedulePendingSemanticIndexFlush();
           return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || "rebuild-failed", repairQueued: Boolean(rebuilt?.repairQueued) });
         }
-        this.pendingIndexPaths.clear();
+        consumeDrainedPaths(nestedDrain);
         return semanticOperationResult({ ok: true, changed: true, reasonCode: "rebuilt" });
       }
       const anchorCompatibility = semanticMaterialityAnchorCompatibility(this.settings, this.settings.semanticIndexMeta || {});
       if (!anchorCompatibility.compatible) {
-        const rebuilt = await this.rebuildSemanticIndex(false);
+        const nestedDrain = Array.from(this.pendingIndexPaths);
+        const rebuilt = await this.rebuildSemanticIndex(false, { indexToken });
         if (!rebuilt?.ok) {
           this.schedulePendingSemanticIndexFlush();
           return semanticOperationResult({ ok: false, queued: this.pendingIndexPaths.size, reasonCode: rebuilt?.reasonCode || `materiality-anchors-${anchorCompatibility.reasonCode}`, repairQueued: Boolean(rebuilt?.repairQueued) });
         }
-        this.pendingIndexPaths.clear();
+        consumeDrainedPaths(nestedDrain);
         return semanticOperationResult({ ok: true, changed: true, reasonCode: "rebuilt-materiality-anchors" });
       }
       const paths = Array.from(this.pendingIndexPaths);
-      this.pendingIndexPaths.clear();
+      consumeDrainedPaths(paths);
       this.semanticIndexTimer = null;
       const previousIndex = this.semanticIndex;
       const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
       const previousIntegrity = this.taskReferenceIntegrity;
+      let persistenceCommitted = false;
       this.semanticIndexInProgress = true;
       this.setSidebarIndexStatus("Indexing vault changes...");
       const result = semanticOperationResult({ ok: true, queued: paths.length, reasonCode: "updated" });
@@ -10414,11 +12223,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           const path = paths[index];
           this.setSidebarIndexStatus(`Indexing changed note ${index + 1}/${paths.length}...`);
           await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-          const operation = await this.reindexFile(path);
+          const operation = await this.reindexFile(path, { indexToken });
           if (operation?.embeddingFallbackRequired) {
-            const rebuilt = await this.rebuildSemanticIndex(false);
+            const rebuilt = await this.rebuildSemanticIndex(false, { indexToken });
             if (!rebuilt?.ok) throw new Error(rebuilt?.reasonCode || "embedding-fallback-rebuild-failed");
-            this.pendingIndexPaths.clear();
+            consumeDrainedPaths(paths);
             return semanticOperationResult({ ok: true, changed: true, changedCount: Math.max(1, changedFiles), reasonCode: "rebuilt-embedding-fallback" });
           }
           if (!operation?.ok) throw new Error(operation?.reasonCode || "semantic-reindex-failed");
@@ -10450,13 +12259,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
           ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
         });
-        await this.saveSemanticIndex();
+        const saveResult = await this.saveSemanticIndex();
+        // A confirmed manifest commit is never rolled back: an explicit
+        // commit-aware D2 result wins, otherwise a successful save counts as
+        // committed unless it reports skipped/deferred.
+        persistenceCommitted = saveResult?.committed === true
+          || (saveResult?.committed !== false && saveResult?.skipped !== true && saveResult?.degraded !== true);
         await this.saveSettings();
         result.changed = true;
         result.changedCount = changedFiles;
         this.logLocal("Semantic index updated", { files: changedFiles, checked: paths.length, chunks: this.settings.semanticIndexMeta.chunks });
         return result;
       } catch (error) {
+        if (persistenceCommitted) {
+          this.lastSemanticIndexPersistenceError = { phase: "post-commit-flush", message: error?.message || String(error), generation: this.semanticIndexManifestPublishedGeneration || "" };
+          this.logLocal("Semantic index updated with a post-commit warning", { error: error?.message || String(error), generation: this.semanticIndexManifestPublishedGeneration || "" });
+          return semanticOperationResult({ ok: true, changed: true, changedCount: (this.semanticIndex || []).length, reasonCode: "updated-post-commit-warning", repairQueued: this.taskReferenceRepairFollowUp });
+        }
         this.semanticIndex = previousIndex;
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
@@ -10471,20 +12290,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return result;
       } finally {
         this.semanticIndexInProgress = false;
-        this.setSidebarIndexStatus("Ready");
         await this.consumeSemanticTaskReferenceRepairFollowUp();
+        this.refreshSidebarStatus();
       }
-    });
+    }, { coalesceKey: "semantic-index:flush", token: options?.indexToken });
   }
 
-  async reindexFile(path) {
-    return this.withSemanticIndexOperation("reindex-file", async () => {
+  async reindexFile(path, options = {}) {
+    return this.withSemanticIndexOperation("reindex-file", async (indexToken) => {
       const previousIndex = this.semanticIndex;
       const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
       const previousIntegrity = this.taskReferenceIntegrity;
       try {
         const file = this.app.vault.getAbstractFileByPath(path);
-        if (!(file instanceof TFile) || !this.isIndexablePath(path)) return this.removePathFromSemanticIndex(path, false);
+        if (!(file instanceof TFile) || !this.isIndexablePath(path)) return this.removePathFromSemanticIndex(path, false, { indexToken });
         this.requireAiAccess("embedding");
         const text = await this.app.vault.cachedRead(file);
         const taskReferenceLocationIndex = await this.buildSemanticTaskReferenceLocationIndex();
@@ -10526,7 +12345,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         const reuseMap = buildSemanticChunkReuseMap(previousIndex || [], this.settings, this.settings.semanticIndexMeta || {});
-        const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`, { fallbackPolicy: "disabled" });
+        const embedded = await this.embedSemanticChunks(chunks, reuseMap, `changed chunks for ${file.basename || path}`, { fallbackPolicy: "disabled", indexToken });
         const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
         const activeTaskReferenceRecords = taskReferenceChunks.taskReferenceRecords || semanticTaskReferenceRecords(this.settings, vaultBasePath(this.app), taskReferenceLocationIndex);
         const candidateIndex = (previousIndex || []).filter((chunk) => {
@@ -10565,7 +12384,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: String(error?.message || "semantic-reindex-failed").split("\n")[0].slice(0, 120), repairQueued: Boolean(this.scheduleSemanticTaskReferenceRepair?.("incremental-integrity")) });
       }
-    }, { paths: [path], coalesceKey: `semantic-index:reindex-file:${String(path || "")}` });
+    }, { paths: [path], coalesceKey: `semantic-index:reindex-file:${String(path || "")}`, token: options?.indexToken });
   }
 
   async embedSemanticTextsWithProvenance(texts, role = "document", options = {}) {
@@ -10645,8 +12464,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const batch = candidateGroups.slice(0, budgetPlan.admitted);
       this.setSidebarIndexStatus(`Embedding ${label} ${Math.min(providerInputs + batch.length, pendingGroups.length)}/${pendingGroups.length}${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
       const embeddingResult = await this.embedSemanticTextsWithProvenance(candidateTexts.slice(0, batch.length), "document", fallbackOnly
-        ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity })
-        : { fallbackPolicy: "disabled" });
+        ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity, indexToken: options.indexToken })
+        : { fallbackPolicy: "disabled", indexToken: options.indexToken });
       const embeddings = Array.isArray(embeddingResult?.vectors) ? embeddingResult.vectors : [];
       const embeddingProvider = String(embeddingResult?.provider || semanticEmbeddingProviderForSettings(this.settings)).trim().toLowerCase();
       const embeddingModel = String(embeddingResult?.actualModel || embeddingResult?.model || this.settings.embeddingModel || "").trim();
@@ -10706,8 +12525,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const startedAt = Date.now();
     const texts = SEMANTIC_MATERIALITY_ANCHOR_KEYS.map((kind) => SEMANTIC_MATERIALITY_ANCHOR_TEXTS[kind]);
     const embeddingResult = await this.embedSemanticTextsWithProvenance(texts, "document", options.fallbackOnly
-      ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity: options.embeddingIdentity || null })
-      : { fallbackPolicy: "disabled" });
+      ? Object.assign({}, semanticEmbeddingFallbackRequest(this.settings), { embeddingIdentity: options.embeddingIdentity || null, indexToken: options.indexToken })
+      : { fallbackPolicy: "disabled", indexToken: options.indexToken });
     const vectors = Array.isArray(embeddingResult?.vectors) ? embeddingResult.vectors : [];
     const embeddingProvider = String(embeddingResult?.provider || semanticEmbeddingProviderForSettings(this.settings)).trim().toLowerCase();
     const embeddingModel = String(embeddingResult?.actualModel || embeddingResult?.model || this.settings.embeddingModel || "").trim();
@@ -11213,14 +13032,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return decorated;
   }
 
-  async removePathFromSemanticIndex(path, save = true) {
-    return this.withSemanticIndexOperation("remove-path", async () => {
+  async removePathFromSemanticIndex(path, save = true, options = {}) {
+    return this.withSemanticIndexOperation("remove-path", async (indexToken) => {
       const normalizedPath = vaultRelativePath(path, vaultBasePath(this.app));
       if (!normalizedPath || isNonVaultTaskReferencePath(normalizedPath)) return semanticOperationResult({ ok: true, reasonCode: "synthetic-task-reference-preserved" });
       const previousIndex = this.semanticIndex || [];
       const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
       const previousIntegrity = this.taskReferenceIntegrity;
       const before = previousIndex.length;
+      let persistenceCommitted = false;
       const hasRemovableNoteChunk = previousIndex.some((chunk) => !semanticTaskReferenceChunkSelected(chunk) && chunk.path === normalizedPath);
       if (!hasRemovableNoteChunk) return semanticOperationResult({ ok: true, reasonCode: "path-not-indexed" });
       try {
@@ -11231,7 +13051,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ? this.semanticTaskReferenceChunks("", locationIndex, { removedPath: normalizedPath })
           : previousIndex.filter((chunk) => semanticTaskReferenceChunkSelected(chunk));
         const taskEmbedding = currentTaskChunks.length && this.embedSemanticChunks
-          ? await this.embedSemanticChunks(currentTaskChunks, buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta), "task-reference path cleanup", { fallbackPolicy: "disabled" })
+          ? await this.embedSemanticChunks(currentTaskChunks, buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta), "task-reference path cleanup", { fallbackPolicy: "disabled", indexToken })
           : { indexed: [], embedded: 0, reused: 0, fallbackOnly: false };
         const taskChunks = currentTaskChunks.length && this.embedSemanticChunks
           ? normalizeSemanticIndexPaths(taskEmbedding.indexed || [], this.app, this.semanticIndexRevision)
@@ -11267,11 +13087,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             chunks: this.semanticIndex.length,
             ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
           });
-          await this.saveSemanticIndex();
+          const saveResult = await this.saveSemanticIndex();
+          persistenceCommitted = saveResult?.committed === true
+            || (saveResult?.committed !== false && saveResult?.skipped !== true && saveResult?.degraded !== true);
           await this.saveSettings();
         }
         return semanticOperationResult({ ok: true, changed: true, changedCount: Math.max(0, before - candidateIndex.length), reasonCode: "removed" });
       } catch (error) {
+        if (persistenceCommitted) {
+          this.lastSemanticIndexPersistenceError = { phase: "post-commit-remove-path", message: error?.message || String(error), generation: this.semanticIndexManifestPublishedGeneration || "" };
+          this.logLocal("Semantic index path removal completed with a post-commit warning", { error: error?.message || String(error), generation: this.semanticIndexManifestPublishedGeneration || "" });
+          return semanticOperationResult({ ok: true, changed: true, changedCount: Math.max(0, before - (this.semanticIndex || []).length), reasonCode: "removed-post-commit-warning", repairQueued: this.taskReferenceRepairFollowUp });
+        }
         this.semanticIndex = previousIndex;
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
@@ -11285,7 +13112,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const repairQueued = Boolean(this.scheduleSemanticTaskReferenceRepair?.("path-removal-integrity"));
         return semanticOperationResult({ ok: false, queued: 1, reasonCode: String(error?.message || "path-removal-failed").split("\n")[0].slice(0, 120), repairQueued });
       }
-    }, { paths: [path], coalesceKey: `semantic-index:remove-path:${String(path || "")}` });
+    }, { paths: [path], coalesceKey: `semantic-index:remove-path:${String(path || "")}`, token: options?.indexToken });
   }
 
   async openAiEmbeddingProvider(texts, role = "document", model = this.settings.embeddingModel, attempt = null) {
@@ -11388,13 +13215,34 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         cacheHit: false
       });
     }
-    const currentViewIdentity = this.currentPreparedViewRef?.view?.identity || null;
-    const indexViewIdentity = this.semanticIndexPreparedView?.identity || null;
+    // Lane E: one captured immutable active prepared reference per request.
+    // The expected identity is derived from the active manifest/settings/
+    // revision (never from the view itself) so a stale view cannot
+    // self-validate after settings drift.
+    const activePreparedRef = this.currentPreparedViewRef || null;
+    const expectedIdentity = semanticExpectedRetrievalIdentity(this);
     const baseKey = this.semanticRetrievalCacheKey(query, limit, plan);
-    const preparedKey = String(currentViewIdentity?.key || indexViewIdentity?.key || "");
+    const preparedKey = String(expectedIdentity.key || "");
     const cacheKey = preparedKey ? `${baseKey}|${preparedKey}` : baseKey;
     const cacheHitObservationStart = localSemanticRoutingNow();
-    const cached = this.getSemanticRetrievalCache(cacheKey);
+    let cached = this.getSemanticRetrievalCache(cacheKey);
+    if (cached) {
+      // Lane E: a cache entry is only reusable while the same complete
+      // prepared identity is still active. A stale entry can never satisfy a
+      // request for a newer (or absent) generation.
+      const activeIdentityKey = String(this.currentPreparedViewRef?.view?.identity?.key || "");
+      if (!preparedKey || activeIdentityKey !== preparedKey) {
+        try {
+          if (typeof this.semanticRetrievalCache?.delete === "function") this.semanticRetrievalCache.delete(cacheKey);
+        } catch {}
+        cached = null;
+      }
+    }
+    // Lane E fix round 1: no bare base-key fallback. A cache entry without a
+    // complete-identity suffix cannot satisfy the identity-key contract, so a
+    // suffix-less (directly seeded or legacy) entry is never served as a
+    // retrieval hit — including a seeded not-ready entry, which is never a
+    // successful retrieval.
     if (cached) {
       const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
       if (cached.semanticRetrieval?.telemetry) {
@@ -11407,7 +13255,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         } catch {}
       }
       const finalizedCachedContext = this.finalizeSemanticRetrievalContext(cached, request, { _reuseAttachedTelemetry: true });
-      const cachedPreparedView = this.currentPreparedViewRef?.view || this.semanticIndexPreparedView || null;
+      const cachedPreparedView = activePreparedRef?.view || null;
       const cachedPreparedViewKey = String(cachedPreparedView?.identity?.key || "");
       const cachedResult = attachTodoistInventoryCandidateChunks(
         finalizedCachedContext,
@@ -11423,42 +13271,29 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       return cachedResult;
     }
-    let expectedIdentity = currentViewIdentity || indexViewIdentity || null;
-    if (!expectedIdentity) {
-      expectedIdentity = {
-        generation: String(this.settings.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || ""),
-        revision: Number(this.semanticIndexRevision || 0),
-        storageFingerprint: String(this.semanticIndexStorageFingerprint || ""),
-        provider: String(semanticEmbeddingProviderForSettings(this.settings)).toLowerCase(),
-        model: String(this.settings.embeddingModel || ""),
-        dimension: Number(this.settings.semanticIndexMeta?.dimension || semanticEmbeddingTargetDimension(this.settings) || 0),
-        policyVersion: SEMANTIC_CORPUS_PREPARATION_POLICY_VERSION
-      };
-    }
-    let ready = this.isRetrievalReady(expectedIdentity);
-    let coldPreparationWaitMs = 0;
-    if (!ready.ready && ready.inFlightPromise) {
-      const waitStart = Date.now();
-      try { await ready.inFlightPromise; } catch {}
-      coldPreparationWaitMs = Date.now() - waitStart;
-      ready = this.isRetrievalReady(expectedIdentity);
-    }
+    // Lane E: readiness is a constant-time check of the captured active
+    // prepared reference. Retrieval never waits on, builds, or loads
+    // preparation — cold preparation is an explicit entry-point concern.
+    const ready = this.isRetrievalReady(expectedIdentity);
+    const coldPreparationWaitMs = 0;
+    const notReadyResult = (reasonCode, state = ready.state || "not-ready") => {
+      const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
+      // Lane E: a not-ready outcome is never a successful empty retrieval and
+      // is never inserted into the retrieval cache.
+      return this.notReadySemanticResult({ state, reasonCode, indexHealth: ready.indexHealth || null }, request, startedAt, coldPreparationWaitMs, { requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0 });
+    };
     if (!ready.ready) {
       const allowed = ["semantic-index-compatibility-refresh-pending","semantic-index-empty","index-integrity-failed","index-load-failed","chat-local-routing-unavailable","prepared-view-not-ready","generation-mismatch","local-warmup-required","query-vector-unavailable","chat-local-query-handle-unavailable","identity-missing","view-missing"];
       let degradedReason = String(ready.reasonCode || "prepared-view-not-ready");
       if (degradedReason.startsWith("identity-mismatch")) degradedReason = "prepared-view-not-ready";
       if (!allowed.includes(degradedReason)) degradedReason = "prepared-view-not-ready";
       if (degradedReason === "identity-missing" || degradedReason === "view-missing") degradedReason = "prepared-view-not-ready";
-      const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
-      const result = this.notReadySemanticResult({ state: ready.state || "not-ready", reasonCode: degradedReason, indexHealth: ready.indexHealth || null }, request, startedAt, coldPreparationWaitMs, { requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0 });
-      return this.setSemanticRetrievalCache(cacheKey, result);
+      return notReadyResult(degradedReason);
     }
-    const preparedView = ready.preparedView || this.currentPreparedViewRef?.view || this.semanticIndexPreparedView;
-    const routingState = ready.routingState || this.currentPreparedViewRef?.routingState || this.productionSemanticRoutingState;
+    const preparedView = (ready.ref && ready.ref.view) || ready.preparedView || activePreparedRef?.view || null;
+    const routingState = (ready.ref && ready.ref.routingState) || ready.routingState || activePreparedRef?.routingState || null;
     if (!preparedView || !routingState?.routingIndex) {
-      const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
-      const result = this.notReadySemanticResult({ state: "not-ready", reasonCode: "prepared-view-not-ready" }, request, startedAt, coldPreparationWaitMs, { requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0 });
-      return this.setSemanticRetrievalCache(cacheKey, result);
+      return notReadyResult("prepared-view-not-ready", "not-ready");
     }
     if (!Array.isArray(preparedView.eligibleChunks) || preparedView.eligibleChunks.length === 0) {
       const handleResolutionMs = Math.max(0, localSemanticRoutingNow() - handleResolutionStart);
@@ -11670,7 +13505,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const poolSize = Math.max(effectiveLimit * 6, 40);
     const profile = buildContextQueryProfile(this, usableIndex, plan);
     const useNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
-    const routedBatch = await this.routeProductionSemanticCandidateBatches([{
+    const viewSliceHolder = semanticPreparedSliceFor(Object.assign({}, options, { budgetMs: 8 }), "route-score-prepared-view");
+    const viewSlice = viewSliceHolder.slice;
+    let viewStrideCount = 0;
+    const viewWorkStride = async () => {
+      viewStrideCount += 1;
+      if (viewStrideCount % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await viewSlice.checkpoint();
+    };
+    let routedBatch = null;
+    try {
+    routedBatch = await this.routeProductionSemanticCandidateBatches([{
       groupId: "chat",
       handles: queryHandles,
       topK: poolSize,
@@ -11680,8 +13524,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       policyVersion: plan.semanticPolicyVersion || plan.policyVersion || TASK_SEMANTIC_DIMENSION_POLICY_VERSION,
       indexRevision: this.semanticIndexRevision || 0,
       storageFingerprint: this.semanticIndexStorageFingerprint || "",
+      signal: options.signal || options.abortSignal,
+      isCurrent: options.isCurrent,
       routingState
     });
+    } catch (routeBatchError) {
+      // Lane G: a cancelled batch synthesizes an empty degraded batch so the
+      // existing degraded path below returns the bounded degraded shape with
+      // request-time corpus preparation telemetry zeros intact.
+      const routeBatchCancelled = String(routeBatchError?.code || "") === "semantic-work-cancelled" || (viewSlice && typeof viewSlice.cancelled === "function" && viewSlice.cancelled());
+      if (!routeBatchCancelled) throw routeBatchError;
+      routedBatch = { groups: Object.freeze([]), handles: Object.freeze([]), telemetry: {}, degradedReason: "route-cancelled", routingState: null };
+    }
+    try {
     const routed = {
       candidates: routedBatch.groups[0]?.candidates || [],
       telemetry: routedBatch.telemetry,
@@ -11724,7 +13579,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         Object.assign(result.semanticRetrieval.telemetry, { requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0, routingMs: routedRoutingMs, exactScoreMs: routedExactScoreMs, finalBundleMs });
         try { Object.defineProperty(result, "telemetry", { value: result.semanticRetrieval.telemetry, enumerable: false, configurable: true }); } catch {}
       }
-      return this.setSemanticRetrievalCache(cacheKey, result);
+      return routed.degradedReason === "route-cancelled"
+        ? result
+        : this.setSemanticRetrievalCache(cacheKey, result);
     }
     const routedCandidates = routed.candidates;
     const chatEvidencePartition = retrievalMode === "chat"
@@ -11732,20 +13589,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       : { selected: routedCandidates, rejected: [] };
     const executionRoutedCandidates = chatEvidencePartition.selected;
     const routedCandidateCountValue = Array.isArray(routedCandidates) ? routedCandidates.length : null;
-    const semanticRawCandidates = executionRoutedCandidates.map((item) => {
-      const chunk = item.chunk;
+    const semanticRawCandidates = [];
+    for (const executionItem of executionRoutedCandidates) {
+      const chunk = executionItem.chunk;
       const rawCandidate = {
-        ...item,
+        ...executionItem,
         ...contextCandidateScopeMetadata(chunk, profile, {}),
         lexicalSeedReserved: lexicalSeedEvidenceIdSet.has(String(chunk?.evidenceId || chunk?.id || "")),
-        semanticAnchorContribution: retrievalMode === "chat" ? chatSemanticExactAnchorContribution(plan.prompt || query, item) : 0
+        semanticAnchorContribution: retrievalMode === "chat" ? chatSemanticExactAnchorContribution(plan.prompt || query, executionItem) : 0
       };
-      return {
+      semanticRawCandidates.push({
         ...rawCandidate,
         useNoteCreatedTime,
         recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime }))
-      };
-    });
+      });
+      await viewWorkStride();
+    }
     const scopedCandidates = filterContextCandidatesForPlan(semanticRawCandidates, profile);
     const eligibleCandidates = scopedCandidates.filter(semanticCandidateIsAdmissible);
     const candidates = (retrievalMode === "chat"
@@ -11772,6 +13631,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         exactPositiveCandidateCountValue += 1;
       }
       positiveUnionInput.push(decorated);
+      await viewWorkStride();
     }
     if (!Array.isArray(candidates)) exactPositiveCandidateCountValue = null;
     else if (candidates.length === 0) exactPositiveCandidateCountValue = 0;
@@ -11858,6 +13718,47 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       try { Object.defineProperty(result, "telemetry", { value: result.semanticRetrieval.telemetry, enumerable: false, configurable: true }); } catch {}
     }
     return this.setSemanticRetrievalCache(cacheKey, result);
+    } catch (viewAssemblyError) {
+      // Lane G cooperative stop: cancellation/invalidation halts local
+      // candidate assembly at the next checkpoint and returns the existing
+      // bounded degraded shape without publishing a partial result.
+      const viewCancelled = String(viewAssemblyError?.code || "") === "semantic-work-cancelled" || (viewSlice && typeof viewSlice.cancelled === "function" && viewSlice.cancelled());
+      if (!viewCancelled) throw viewAssemblyError;
+      const cancelFinalStart = localSemanticRoutingNow();
+      const cancelFinalMs = Math.max(0, localSemanticRoutingNow() - cancelFinalStart);
+      const cancelResult = this.finalizeSemanticRetrievalContext([], request, {
+        indexState: "degraded-source-only",
+        degradedReason: "route-cancelled",
+        candidateCount: usableIndex.length,
+        indexHealth: preparedView.integrity || null,
+        queryHandleSource: queryHandles[0]?.source || retrievalMode,
+        queryHandleTelemetry,
+        externalQueryEmbeddingCalls: queryHandleTelemetry.externalQueryEmbeddingCalls || 0,
+        runtimeExternalCalls: queryHandleTelemetry.runtimeExternalCalls || 0,
+        ...((routedBatch && routedBatch.telemetry) || {}),
+        routingMs: 0,
+        exactScoreMs: 0,
+        finalBundleMs: cancelFinalMs,
+        requestNormalizationMs,
+        handleResolutionMs,
+        requestCorpusPreparationMs: 0,
+        coldPreparationWaitMs,
+        contextBundleElapsedMs: Date.now() - startedAt,
+        elapsedMs: Date.now() - startedAt,
+        preparedViewState: "ready",
+        preparedViewHit: false,
+        requestCorpusRowsTraversed: 0,
+        requestDecorationRows: 0,
+        requestIntegrityRows: 0,
+        requestHierarchyRows: 0,
+        cacheHit: false
+      });
+      if (cancelResult && cancelResult.semanticRetrieval && cancelResult.semanticRetrieval.telemetry) {
+        Object.assign(cancelResult.semanticRetrieval.telemetry, { requestNormalizationMs, handleResolutionMs, requestCorpusPreparationMs: 0, routingMs: 0, exactScoreMs: 0, finalBundleMs: cancelFinalMs });
+        try { Object.defineProperty(cancelResult, "telemetry", { value: cancelResult.semanticRetrieval.telemetry, enumerable: false, configurable: true }); } catch {}
+      }
+      return cancelResult;
+    }
   }
 
   finalizeSemanticRetrievalContext(context = [], request = {}, details = {}) {
@@ -12047,6 +13948,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   setSemanticRetrievalCache(cacheKey = "", context = []) {
     this.semanticRetrievalCache = this.semanticRetrievalCache || new Map();
+    // Lane E promotion guard: identity-suffixed retrieval keys (`${base}|${identityKey}`)
+    // may only populate the cache while that exact prepared identity is still
+    // active. A late old-generation result can never repopulate the cache
+    // after an invalidation or rotation. Keys without an identity suffix keep
+    // their historical behavior.
+    const keyText = String(cacheKey ?? "");
+    const separatorIndex = keyText.lastIndexOf("|");
+    if (separatorIndex > 0) {
+      const entryIdentityKey = keyText.slice(separatorIndex + 1);
+      const activeIdentityKey = String(this.currentPreparedViewRef?.view?.identity?.key || "");
+      if (!entryIdentityKey || activeIdentityKey !== entryIdentityKey) {
+        const cloned = cloneSemanticRetrievalContext(context);
+        this.lastSemanticRetrievalTelemetry = cloned.semanticRetrieval?.telemetry || null;
+        return cloned;
+      }
+    }
     const generation = this.semanticIndexRevision ?? 0;
     const entry = { createdAt: Date.now(), context: cloneSemanticRetrievalContext(context) };
     if (typeof this.semanticRetrievalCache.setScoped === "function") this.semanticRetrievalCache.setScoped(cacheKey, entry, generation);
@@ -12068,27 +13985,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticExactScoreCache?.clear?.();
     this.semanticIndexRevision = (this.semanticIndexRevision || 0) + 1;
     this.invalidateProductionSemanticRoutingState("semantic-index-revision");
-    // Cache invalidation also invalidates the sidecar's revision. Rebuild the
-    // provider-free router automatically once the current index is loaded so
-    // background note/task sync cannot leave the UI permanently unavailable.
+    // Invalidation inside the active writer is consumed by that writer: the
+    // running maintenance already covers the new revision, so no second build
+    // is scheduled.
+    if (this._semanticIndexActiveToken) {
+      this._semanticIndexWriterConsumedInvalidation = true;
+      return;
+    }
+    // Otherwise enqueue one owner-controlled follow-up through the serialized
+    // maintenance queue when a usable index is loaded. The unowned timer
+    // bypass is removed: coalesced invalidations share one follow-up.
     if (!this.isUnloading && this.semanticIndexLoaded && Array.isArray(this.semanticIndex) && this.semanticIndex.length) {
-      window.clearTimeout(this.productionSemanticRoutingRebuildTimer);
-      this.productionSemanticRoutingRebuildTimer = window.setTimeout(() => {
-        this.productionSemanticRoutingRebuildTimer = null;
-        this.ensureProductionSemanticRoutingState({
-          chunks: this.semanticIndex,
-          settings: this.settings,
-          revision: this.semanticIndexRevision || 0,
-          storageFingerprint: this.semanticIndexStorageFingerprint || "",
-          allowLoad: true,
-          allowBuild: true,
-          persist: false,
-          forceBuild: true
-        }).catch((error) => this.logLocal?.("Production semantic routing rebuild failed", {
-          reasonCode: String(error?.code || "routing-state-build-failed"),
-          error: String(error?.message || "").slice(0, 240)
-        }));
-      }, 250);
+      if (!this._semanticIndexInvalidationFollowUp) {
+        this._semanticIndexInvalidationFollowUp = true;
+        Promise.resolve().then(() => {
+          this._semanticIndexInvalidationFollowUp = false;
+          if (this.isUnloading) return;
+          return this.flushSemanticIndexUpdates().catch((error) => {
+            this.logLocal?.("Semantic index invalidation follow-up failed", {
+              reasonCode: String(error?.code || "invalidation-follow-up-failed"),
+              error: String(error?.message || "").slice(0, 240)
+            });
+          });
+        });
+      }
     }
   }
 
@@ -12147,27 +14067,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!groups.some((group) => group.handles.length)) {
       return Object.freeze({ groups: emptyGroups(), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, { contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) })), degradedReason: "query-vector-unavailable", routingState: null });
     }
-    let routingState = Object.prototype.hasOwnProperty.call(options, "routingState") ? options.routingState : await this.ensureProductionSemanticRoutingState({
-      chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-      settings: this.settings,
-      revision,
-      storageFingerprint,
-      allowLoad: true,
-      allowBuild: false,
-      persist: false
-    });
-    if (!routingState && !Object.prototype.hasOwnProperty.call(options, "routingState") && Array.isArray(this.semanticIndex) && this.semanticIndex.length) {
-      routingState = await this.ensureProductionSemanticRoutingState({
-        chunks: this.semanticIndex,
-        settings: this.settings,
-        revision,
-        storageFingerprint,
-        allowLoad: false,
-        allowBuild: true,
-        persist: false,
-        forceBuild: true
-      });
-    }
+    // Lane E: routing consumes an explicitly supplied routing state or the
+    // already-active prepared reference. Retrieval never builds, loads, or
+    // force-builds routing state; without a compatible active state the
+    // request degrades visibly instead of preparing inline.
+    let routingState = Object.prototype.hasOwnProperty.call(options, "routingState")
+      ? options.routingState
+      : (this.currentPreparedViewRef && this.currentPreparedViewRef.routingState) || null;
     if (!routingState?.routingIndex || !routingState.chunkByEvidenceId) {
       const reason = this.productionSemanticRoutingTelemetry?.reasonCode || "local-warmup-required";
       return Object.freeze({ groups: emptyGroups(reason), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, { contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) })), degradedReason: reason, routingState: null });
@@ -12179,6 +14085,41 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // prepared views or query fixtures never collide in the shared caches.
     const preparedIdentity = String(routingState.preparedIdentityKey || routingState.identityKey || "")
       || `${generation}|${revision}|${storageFingerprint}|${String(routingState.routingIndex.encoder?.id || "")}|${Number(routingState.routingIndex.encoder?.dimension || 0)}|${SEMANTIC_CORPUS_PREPARATION_POLICY_VERSION}`;
+    // Lane G cooperative assembly: one owned 8 ms work slice bounds every
+    // expensive loop below (unique-handle routes, exact pairs, group rows).
+    // Cancellation/invalidation surfaces at the next checkpoint as a
+    // semantic-work-cancelled error; the trailing handler converts it into a
+    // bounded degraded result without publishing partial candidates or partial
+    // route/exact cache writes (both caches promote only on success, and the
+    // request-local exact memo keeps one score per handle/evidence pair even
+    // when the bounded global cache evicts entries mid-request).
+    const routeSliceHolder = semanticPreparedSliceFor(Object.assign({}, options, { budgetMs: 8 }), "route-production-batches");
+    const routeSlice = routeSliceHolder.slice;
+    const ownsRouteSlice = routeSliceHolder.ownsSlice;
+    const requestExactScores = new Map();
+    const stagedExactScoreKeys = [];
+    const stagedRouteEntries = [];
+    let routingCacheHits = 0;
+    let routingCacheSupersetHits = 0;
+    let routingElapsedMs = 0;
+    let routingRowsScanned = 0;
+    let routingCandidateCount = 0;
+    let exactScorePairCount = 0;
+    let exactScoreCacheHits = 0;
+    let exactScoreMs = 0;
+    let routedCandidateCount = 0;
+    let routeStrideCount = 0;
+    const routeStride = async () => {
+      routeStrideCount += 1;
+      if (routeStrideCount % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await routeSlice.checkpoint();
+    };
+    const isRouteWorkCancelled = (error) => String(error?.code || "") === "semantic-work-cancelled" || (routeSlice && typeof routeSlice.cancelled === "function" && routeSlice.cancelled());
+    const finishRouteWork = () => {
+      if (!ownsRouteSlice) return { routingYieldCount: 0, routingMaxSliceMs: 0, routingWorkMs: 0 };
+      const done = routeSlice.finish();
+      return { routingYieldCount: done.yieldCount, routingMaxSliceMs: done.maxSliceMs, routingWorkMs: done.workMs };
+    };
+    try {
     const requestViewByEvidenceId = new Map();
     const requestViewByIdentity = new Map();
     const requestViewOrderByEvidenceId = new Map();
@@ -12211,6 +14152,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const handleKeysByGroup = new Map();
     for (const group of groups) {
       const keys = [];
+      await routeSlice.checkpoint();
       for (const handle of group.handles) {
         const handleKey = stableHandleKey(handle);
         if (!handlesByKey.has(handleKey)) handlesByKey.set(handleKey, handle);
@@ -12218,14 +14160,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       handleKeysByGroup.set(group.groupId, keys);
     }
-    let routingCacheHits = 0;
-    let routingCacheSupersetHits = 0;
-    let routingElapsedMs = 0;
-    let routingRowsScanned = 0;
-    let routingCandidateCount = 0;
     const routedByHandle = new Map();
     const handleTelemetryByKey = new Map();
     for (const [handleKey, handle] of handlesByKey) {
+      await routeSlice.checkpoint();
       const topK = Math.max(...groups.filter((group) => handleKeysByGroup.get(group.groupId)?.includes(handleKey)).map((group) => group.topK), 1);
       let routed;
       let cacheHit = false;
@@ -12253,23 +14191,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
       }
       if (!routed) {
-        const routeAttemptStart = localSemanticRoutingNow();
         try {
           const routingHandle = productionSemanticRoutingQueryAdapter(handle, routingState, this.settings);
-          routed = routeLocalSemanticEvidence(routingState.routingIndex, routingHandle, { topK });
+          routed = await routeLocalSemanticEvidenceAsync(routingState.routingIndex, routingHandle, { topK, slice: routeSlice });
         } catch (error) {
-          const failedRouteMs = Math.max(0, localSemanticRoutingNow() - routeAttemptStart);
-          const routingMsForError = Math.max(0, routingElapsedMs + failedRouteMs);
-          const reason = String(error?.code || "local-warmup-required");
-          return Object.freeze({ groups: emptyGroups(reason), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, { routingElapsedMs, routingMs: routingMsForError, exactScoreMs, requestCorpusPreparationMs: 0, finalBundleMs: 0, routingCacheHits, routingHandleCount: handlesByKey.size, uniqueHandleRouteCount: handlesByKey.size, routingGeneration: generation, contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) })), degradedReason: reason, routingState });
+          // Every route failure, including non-cancellation errors, must flow
+          // through the outer finalizer so the owned slice is finished and its
+          // bounded work/yield telemetry is retained.
+          throw error;
         }
-        if (typeof routeCache.setScoped === "function") {
-          routeCache.setScoped(handleKey, routed, preparedIdentity);
-        } else {
-          const cacheKey = `${preparedIdentity}|${handleKey}`;
-          routeCache.set(cacheKey, routed);
-          while (routeCache.size > SEMANTIC_ROUTING_ROUTE_CACHE_MAX_ENTRIES) routeCache.delete(routeCache.keys().next().value);
-        }
+        // Lane G: stage the completed route for end-of-request promotion so a
+        // cancelled request leaves no partial route cache entries behind.
+        stagedRouteEntries.push([handleKey, routed]);
       }
       const sourceRouteElapsedMs = Number(routed.telemetry?.routeElapsedMs || 0);
       if (!cacheHit && !cacheSupersetHit) routingElapsedMs += sourceRouteElapsedMs;
@@ -12285,11 +14218,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         candidateCount: (routed.candidates || []).length
       }));
     }
-    let exactScorePairCount = 0;
-    let exactScoreCacheHits = 0;
-    let exactScoreMs = 0;
     const exactScore = (handleKey, handle, evidenceId, chunk) => {
       const exactScopedKey = `${handleKey}|${evidenceId}`;
+      const requestLocalScore = requestExactScores.get(exactScopedKey);
+      if (requestLocalScore !== undefined) {
+        exactScoreCacheHits += 1;
+        return requestLocalScore;
+      }
       let score;
       if (typeof exactCache.getScoped === "function") score = exactCache.getScoped(exactScopedKey, preparedIdentity);
       else {
@@ -12300,16 +14235,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const before = localSemanticRoutingNow();
         score = cosine(handle.vector, chunk.embedding);
         exactScoreMs += Math.max(0, localSemanticRoutingNow() - before);
-        if (typeof exactCache.setScoped === "function") exactCache.setScoped(exactScopedKey, score, preparedIdentity);
-        else {
-          const exactKey = `${preparedIdentity}|${handleKey}|${evidenceId}`;
-          exactCache.set(exactKey, score);
-        }
+        // Lane G: stage the completed pair in the request-local memo and
+        // promote it to the shared cache only on success, so one exact score
+        // per handle/evidence pair holds per request even when the bounded
+        // global cache evicts entries mid-request, and a cancelled request
+        // leaves no partial exact-score writes behind.
+        const stagedScore = Number(score || 0);
+        requestExactScores.set(exactScopedKey, stagedScore);
+        stagedExactScoreKeys.push(exactScopedKey);
         exactScorePairCount += 1;
-      } else {
-        exactScoreCacheHits += 1;
+        return stagedScore;
       }
-      return Number(score || 0);
+      const cachedScore = Number(score || 0);
+      requestExactScores.set(exactScopedKey, cachedScore);
+      exactScoreCacheHits += 1;
+      return cachedScore;
     };
     const routedEvidenceIds = new Set();
     for (const routed of routedByHandle.values()) {
@@ -12328,6 +14268,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
     const semanticDistinctivenessSources = new Map();
     for (const evidenceId of routedEvidenceIds) {
+      await routeStride();
       const identity = ordinaryNoteFingerprint(routingState.chunkByEvidenceId.get(evidenceId));
       if (!identity) continue;
       let sourceIds = semanticDistinctivenessSources.get(identity.key);
@@ -12348,15 +14289,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let semanticDistinctivenessAdjustedCandidateCount = 0;
     let semanticDistinctivenessMaxSourceCount = 0;
     for (const evidenceId of routedEvidenceIds) {
+      await routeStride();
       const metadata = semanticDistinctiveness(routingState.chunkByEvidenceId.get(evidenceId));
       if (metadata.adjusted) semanticDistinctivenessAdjustedCandidateCount += 1;
       semanticDistinctivenessMaxSourceCount = Math.max(semanticDistinctivenessMaxSourceCount, metadata.sourceCount);
     }
     const handleViews = [];
     for (const [handleKey, handle] of handlesByKey) {
+      await routeSlice.checkpoint();
       const rows = new Map((routedByHandle.get(handleKey)?.candidates || []).map((row) => [row.evidenceId, row]));
       const candidates = [];
       for (const [evidenceId, routeRow] of rows) {
+        await routeStride();
         const canonicalChunk = routingState.chunkByEvidenceId.get(evidenceId);
         if (!canonicalChunk) continue;
         const chunk = requestViewChunk(evidenceId, canonicalChunk);
@@ -12402,9 +14346,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       handleViews.push(Object.freeze({ handleKey, candidates: Object.freeze(candidates), telemetry: Object.freeze(handleTelemetry) }));
     }
     const groupViews = [];
-    let routedCandidateCount = 0;
     const metadataOnlyRejectedEvidenceIds = new Set();
     for (const group of groups) {
+      await routeSlice.checkpoint();
       const groupStartedAt = localSemanticRoutingNow();
       const groupHandleKeys = handleKeysByGroup.get(group.groupId) || [];
       if (!groupHandleKeys.length) {
@@ -12414,6 +14358,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const rows = new Map();
       for (const handleKey of groupHandleKeys) {
         for (const row of routedByHandle.get(handleKey)?.candidates || []) {
+          await routeStride();
           const existing = rows.get(row.evidenceId);
           if (!existing || Number(row.routingScore || 0) > Number(existing.routingScore || 0)) rows.set(row.evidenceId, row);
         }
@@ -12490,9 +14435,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           requiredIdentity: true
         });
       }
-      const buildCandidates = () => {
+      const buildCandidates = async () => {
         const next = [];
         for (const [evidenceId, routeRow] of rows) {
+          await routeStride();
           const canonicalChunk = routingState.chunkByEvidenceId.get(evidenceId);
           if (!canonicalChunk) continue;
           const chunk = requestViewChunk(evidenceId, canonicalChunk);
@@ -12539,7 +14485,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         return next;
       };
-      let candidates = buildCandidates();
+      let candidates = await buildCandidates();
       const requestViewOrder = (candidate) => {
         const chunk = candidate?.chunk || {};
         const evidenceId = String(chunk.evidenceId || "");
@@ -12558,6 +14504,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const boundedCandidates = selectableCandidates;
       groupViews.push(Object.freeze({ groupId: group.groupId, candidates: Object.freeze(boundedCandidates), degradedReason: "", telemetry: Object.freeze({ assemblyElapsedMs: Math.max(0, localSemanticRoutingNow() - groupStartedAt), candidateCount: boundedCandidates.length, requestedTopK: group.topK, metadataOnlyRejectedCandidateCount: evidencePartition.rejected.length, metadataOnlyRejectedEvidenceIds: evidencePartition.telemetry.metadataOnlyRejectedEvidenceIds, metadataOnlyRejectionReasonCodes: evidencePartition.telemetry.reasonCodes, semanticDistinctivenessAdjustedCandidateCount: boundedCandidates.filter((candidate) => Number(candidate.semanticDistinctivenessFactor || 1) < 1).length, semanticDistinctivenessMaxSourceCount: boundedCandidates.reduce((maximum, candidate) => Math.max(maximum, Number(candidate.semanticDistinctSourceCount || 1)), 0) }) }));
     }
+    // Lane G success promotion: publish staged route entries and staged exact
+    // scores only for a completed request, preserving the original cache
+    // keying, namespaces, and bounded route-cache eviction behavior.
+    for (const [stagedHandleKey, stagedRouted] of stagedRouteEntries) {
+      if (typeof routeCache.setScoped === "function") routeCache.setScoped(stagedHandleKey, stagedRouted, preparedIdentity);
+      else {
+        const cacheKey = `${preparedIdentity}|${stagedHandleKey}`;
+        routeCache.set(cacheKey, stagedRouted);
+        while (routeCache.size > SEMANTIC_ROUTING_ROUTE_CACHE_MAX_ENTRIES) routeCache.delete(routeCache.keys().next().value);
+      }
+    }
+    for (const stagedExactKey of stagedExactScoreKeys) {
+      const stagedScore = requestExactScores.get(stagedExactKey);
+      if (stagedScore === undefined) continue;
+      if (typeof exactCache.setScoped === "function") exactCache.setScoped(stagedExactKey, stagedScore, preparedIdentity);
+      else exactCache.set(`${preparedIdentity}|${stagedExactKey}`, stagedScore);
+    }
+    const routeWorkStats = finishRouteWork();
     const telemetry = frozenTelemetry(Object.assign(emptyTelemetry, {
       routingElapsedMs,
       routingMs: routingElapsedMs,
@@ -12581,9 +14545,44 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       routingHandleCount: handlesByKey.size,
       uniqueHandleRouteCount: handlesByKey.size,
       routingGeneration: generation,
+      routingYieldCount: routeWorkStats.routingYieldCount,
+      routingMaxSliceMs: routeWorkStats.routingMaxSliceMs,
+      routingWorkMs: routeWorkStats.routingWorkMs,
       contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt)
     }));
     return Object.freeze({ groups: Object.freeze(groupViews), handles: Object.freeze(handleViews), telemetry, degradedReason: "", routingState });
+    } catch (routeWorkError) {
+      // Lane G cooperative stop: cancellation, invalidation, unload, or a
+      // stale prepared identity halts at the next checkpoint and returns a
+      // bounded degraded result. Staged route/exact entries are discarded, so
+      // the shared caches carry no partial writes from this request.
+      const routeWorkStats = finishRouteWork();
+      const routeCancelled = isRouteWorkCancelled(routeWorkError);
+      const routeDegradedReason = routeCancelled ? "route-cancelled" : String(routeWorkError?.code || "local-warmup-required");
+      let cancelledHandleCount = 0;
+      try { cancelledHandleCount = handlesByKey.size; } catch {}
+      return Object.freeze({ groups: emptyGroups(routeDegradedReason), handles: Object.freeze([]), telemetry: frozenTelemetry(Object.assign(emptyTelemetry, {
+        routingElapsedMs,
+        routingMs: routingElapsedMs,
+        exactScoreMs,
+        finalBundleMs: 0,
+        requestCorpusPreparationMs: 0,
+        routingCacheHits,
+        routingCacheSupersetHits,
+        routedCandidateCount,
+        routingRowsScanned,
+        routingCandidateCount,
+        exactScorePairCount,
+        exactScoreCacheHits,
+        routingHandleCount: cancelledHandleCount,
+        uniqueHandleRouteCount: cancelledHandleCount,
+        routingGeneration: generation,
+        routingYieldCount: routeWorkStats.routingYieldCount,
+        routingMaxSliceMs: routeWorkStats.routingMaxSliceMs,
+        routingWorkMs: routeWorkStats.routingWorkMs,
+        contextBundleElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt)
+      })), degradedReason: routeDegradedReason, routingState });
+    }
   }
 
   async routeProductionSemanticCandidates(queryHandles = [], usableIndex = [], options = {}) {
@@ -12752,7 +14751,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.lastSemanticRetrievalTelemetry = telemetry;
       return { byTask, taskKeyByIndex, telemetry };
     }
-    const resultCacheKey = taskSemanticRetrievalCacheKey({
+    const taskResultCacheKeyBase = taskSemanticRetrievalCacheKey({
       request: {
         requestId: `task-semantic-batch-${shortHash(JSON.stringify(flattened.map(([indexValue, task]) => [indexValue, makeTaskKey(task, indexValue)])))}`,
         mode: options.mode || "task-generation",
@@ -12797,10 +14796,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }))
     });
     this.taskSemanticContextCache = this.taskSemanticContextCache || (typeof SemanticRuntimeCache === "function" ? new SemanticRuntimeCache({ maxEntries: SEMANTIC_TASK_CONTEXT_CACHE_MAX_ENTRIES, maxBytes: SEMANTIC_TASK_CONTEXT_CACHE_MAX_BYTES, name: "taskSemanticContext" }) : new Map());
-    const taskContextGeneration = String(revision);
+    // Lane E: one captured immutable active prepared reference per request,
+    // and task cache entries are keyed by the complete prepared identity so a
+    // generation/revision/fingerprint/provider/model/dimension/policy change
+    // can never reuse a stale cache result.
+    const taskActivePreparedRef = this.currentPreparedViewRef || null;
+    const taskExpectedIdentity = semanticExpectedRetrievalIdentity(this);
+    const taskPreparedIdentityKey = String(taskExpectedIdentity.key || "");
+    const resultCacheKey = taskPreparedIdentityKey ? `${taskResultCacheKeyBase}|${taskPreparedIdentityKey}` : taskResultCacheKeyBase;
+    const taskContextGeneration = taskPreparedIdentityKey || String(revision);
     let cachedResultEntry;
     if (typeof this.taskSemanticContextCache.getScoped === "function") cachedResultEntry = this.taskSemanticContextCache.getScoped(resultCacheKey, taskContextGeneration);
     else cachedResultEntry = this.taskSemanticContextCache.get(resultCacheKey);
+    if (cachedResultEntry) {
+      // Lane E: serve a cached task result only while the same complete
+      // prepared identity is still active and ready.
+      const taskReady = this.isRetrievalReady(taskExpectedIdentity);
+      const taskActiveKey = String(this.currentPreparedViewRef?.view?.identity?.key || "");
+      if (!taskReady.ready || !taskPreparedIdentityKey || taskActiveKey !== taskPreparedIdentityKey) {
+        try {
+          if (typeof this.taskSemanticContextCache.delete === "function") this.taskSemanticContextCache.delete(resultCacheKey);
+        } catch {}
+        cachedResultEntry = null;
+      }
+    }
     if (cachedResultEntry && Date.now() - cachedResultEntry.createdAt <= SEMANTIC_RETRIEVAL_CACHE_TTL_MS) {
       const cachedResult = cloneTaskSemanticRetrievalResult(cachedResultEntry.result);
       const cachedTelemetry = Object.assign({}, cachedResult.telemetry || {}, {
@@ -12847,21 +14866,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return cachedResult;
     }
     if (cachedResultEntry) this.taskSemanticContextCache.delete(resultCacheKey);
-    const coldWaitStart = Date.now();
-    let indexLoadError = null;
-    if (options.mode !== "chat" && !(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
-      try { await this.ensureSemanticIndexLoaded("task semantic search index"); } catch (error) { indexLoadError = error; }
-    }
-    telemetry.coldPreparationWaitMs = Math.max(0, Date.now() - coldWaitStart);
-    const taskCorpusPrepStart = localSemanticRoutingNow();
-    const rawIndex = (this.semanticIndex || [])
-      .filter((chunk) => semanticRetrievalChunkEligible(chunk, { isIndexablePath: (path) => this.isIndexablePath(path) }));
-    const index = decorateSemanticIndexChunks(rawIndex, revision);
-    const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
-    const usableIndex = integrity.validChunks;
-    telemetry.requestCorpusPreparationMs = Math.max(0, localSemanticRoutingNow() - taskCorpusPrepStart);
-    telemetry.candidateCount = Number.isFinite(integrity.health?.validCount) && integrity.health.validCount >= 0 ? integrity.health.validCount : null;
-    telemetry.indexHealth = integrity.health || null;
+    // Lane E: zero request-time loads, builds, or corpus passes. Readiness is
+    // checked against the captured active prepared reference and the request
+    // consumes the prepared view's immutable eligible records, evidence
+    // lookup, and integrity metadata directly.
+    telemetry.coldPreparationWaitMs = 0;
+    const taskReady = this.isRetrievalReady(taskExpectedIdentity);
+    const taskPreparedView = (taskReady.ref && taskReady.ref.view) || taskActivePreparedRef?.view || null;
+    const usableIndex = Array.isArray(taskPreparedView?.eligibleChunks) ? taskPreparedView.eligibleChunks : [];
+    const integrity = taskPreparedView?.integrity || null;
+    telemetry.requestCorpusPreparationMs = 0;
+    telemetry.candidateCount = Number.isFinite(integrity?.health?.validCount) && integrity.health.validCount >= 0 ? integrity.health.validCount : null;
+    telemetry.indexHealth = integrity?.health || null;
     const materialityAnchors = semanticMaterialityAnchorSetForSettings(this.settings, this.settings.semanticIndexMeta || {});
     telemetry.semanticMaterialityAnchorVersion = Number(materialityAnchors?.version || 0);
     telemetry.semanticMaterialityAnchorAvailable = Boolean(materialityAnchors);
@@ -12880,28 +14896,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.lastSemanticRetrievalTelemetry = telemetry;
       return { byTask, taskKeyByIndex, telemetry };
     };
-    if (indexLoadError) return degraded("index-load-failed");
-    if (!usableIndex.length) return degraded(index.length ? "index-integrity-failed" : "semantic-index-empty");
-    const productionRoutingState = options.mode === "chat"
-      ? (this.productionSemanticRoutingState?.routingIndex ? this.productionSemanticRoutingState : await this.ensureProductionSemanticRoutingState({
-        chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-        settings: this.settings,
-        revision,
-        storageFingerprint: this.semanticIndexStorageFingerprint || "",
-        allowLoad: true,
-        allowBuild: false,
-        persist: false
-      }))
-      : await this.ensureProductionSemanticRoutingState({
-        chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-        settings: this.settings,
-        revision,
-        storageFingerprint: this.semanticIndexStorageFingerprint || "",
-        allowLoad: true,
-        allowBuild: false,
-        persist: false
-      });
-    if (!productionRoutingState) return degraded(this.productionSemanticRoutingTelemetry?.reasonCode || "local-warmup-required");
+    if (!taskReady.ready) {
+      let taskNotReadyReason = String(taskReady.reasonCode || "prepared-view-not-ready");
+      if (taskNotReadyReason.startsWith("identity-mismatch")) taskNotReadyReason = "prepared-view-not-ready";
+      if (taskNotReadyReason === "identity-missing" || taskNotReadyReason === "view-missing") taskNotReadyReason = "prepared-view-not-ready";
+      telemetry.preparedViewState = "not-ready";
+      telemetry.preparedViewHit = false;
+      return degraded(taskNotReadyReason);
+    }
+    if (!usableIndex.length) return degraded(taskPreparedView && Number(taskPreparedView.preparationRows || 0) > 0 ? "index-integrity-failed" : "semantic-index-empty");
+    // Lane E: routing consumes the captured active prepared reference only.
+    // Without it the request degrades visibly instead of loading or building.
+    const productionRoutingState = (taskReady.ref && taskReady.ref.routingState) || taskActivePreparedRef?.routingState || null;
+    if (!productionRoutingState?.routingIndex) {
+      telemetry.preparedViewState = "not-ready";
+      telemetry.preparedViewHit = false;
+      return degraded(this.productionSemanticRoutingTelemetry?.reasonCode || "local-warmup-required");
+    }
 
     const handleResolutionStart = localSemanticRoutingNow();
     const laneDataByTask = new Map();
@@ -13143,11 +15154,34 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         allLaneRoutingGroups.push({ groupId: lane.queryId, handles: Array.isArray(lane.queryHandles) ? lane.queryHandles : [], topK });
       }
     }
+    // Lane G cooperative task-local assembly: the post-route per-task/
+    // per-lane/per-item loops below run under one owned 8 ms work slice. The
+    // F-owned admission/ownership/union decisions are unchanged; checkpoints
+    // sit around their existing loops. Cancellation returns a bounded
+    // degraded result without publishing partial contexts or writing the
+    // result cache.
+    let finalBundleStart = 0;
+    let taskSlice = null;
+    let ownsTaskSlice = false;
+    let taskStrideCount = 0;
+    const taskWorkStride = async () => {
+      if (!taskSlice) return;
+      taskStrideCount += 1;
+      if (taskStrideCount % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await taskSlice.checkpoint();
+    };
+    const finishTaskAssemblyWork = () => {
+      if (!ownsTaskSlice || !taskSlice) return { taskAssemblyYieldCount: 0, taskAssemblyMaxSliceMs: 0, taskAssemblyWorkMs: 0 };
+      const done = taskSlice.finish();
+      return { taskAssemblyYieldCount: done.yieldCount, taskAssemblyMaxSliceMs: done.maxSliceMs, taskAssemblyWorkMs: done.workMs };
+    };
+    try {
     const allLaneRoutingBatch = await this.routeProductionSemanticCandidateBatches(allLaneRoutingGroups, usableIndex, {
       mode: String(options.mode || "task-generation"),
       policyVersion: TASK_SEMANTIC_DIMENSION_POLICY_VERSION,
       indexRevision: revision,
       storageFingerprint: this.semanticIndexStorageFingerprint || "",
+      signal: options.signal || options.abortSignal,
+      isCurrent: options.isCurrent,
       routingState: productionRoutingState
     });
     telemetry.routingElapsedMs += Number(allLaneRoutingBatch.telemetry?.routingElapsedMs || 0);
@@ -13159,10 +15193,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     telemetry.exactScorePairCount += Number(allLaneRoutingBatch.telemetry?.exactScorePairCount || 0);
     telemetry.exactScoreCacheHits += Number(allLaneRoutingBatch.telemetry?.exactScoreCacheHits || 0);
     telemetry.contextBundleElapsedMs += Number(allLaneRoutingBatch.telemetry?.contextBundleElapsedMs || 0);
+    // The task assembly slice starts after the batch call so batch time is
+    // measured by the batch's own slice, never by this one.
+    const taskSliceHolder = semanticPreparedSliceFor(Object.assign({}, options, { budgetMs: 8 }), "task-route-assembly");
+    taskSlice = taskSliceHolder.slice;
+    ownsTaskSlice = taskSliceHolder.ownsSlice;
+    await taskSlice.checkpoint();
     const isValidRoutePhase = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
     telemetry.routingMs = isValidRoutePhase(allLaneRoutingBatch.telemetry?.routingMs) ? allLaneRoutingBatch.telemetry.routingMs : null;
     telemetry.exactScoreMs = isValidRoutePhase(allLaneRoutingBatch.telemetry?.exactScoreMs) ? allLaneRoutingBatch.telemetry.exactScoreMs : null;
-    const finalBundleStart = localSemanticRoutingNow();
+    finalBundleStart = localSemanticRoutingNow();
     const allLaneRoutedById = new Map((allLaneRoutingBatch.groups || []).map((group) => [group.groupId, group]));
     if (allLaneRoutingBatch.degradedReason) {
       telemetry.degraded = true;
@@ -13182,7 +15222,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     telemetry.siblingOwnershipCandidateCount = siblingOwnershipIndex.candidateCount;
     telemetry.siblingOwnershipEntriesCount = siblingOwnershipIndex.entriesCount;
     telemetry.siblingOwnershipSharedOptionalCount = siblingOwnershipIndex.sharedOptionalCount;
+    await taskSlice.checkpoint();
     for (const [indexValue, task] of flattened) {
+      await taskSlice.checkpoint();
       const key = taskKeyByIndex[String(indexValue)];
       const laneData = laneDataByTask.get(key) || { key, queryId: taskSemanticQueryId(sourceContract, task, indexValue, revision), scopeId: String(task?.scope_id || task?.scopeId || sourceContract?.defaultScopeId || ""), lanes: [] };
       const actionLane = laneData.lanes.find((lane) => lane.name === "action") || laneData.lanes[0] || { text: `${source?.title || ""}\n${task?.content || ""}`, embedding: [] };
@@ -13194,6 +15236,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const supportingEvidenceOnly = retrievalMode.startsWith("task-generation") || retrievalMode === "description";
       const laneResults = [];
       for (const lane of laneData.lanes) {
+        await taskSlice.checkpoint();
         const lanePlan = contextQueryPlan(lane.text, options.mode || "task-generation");
         Object.assign(lanePlan, { sourceContractId: sourceContract?.id || "", sourceContract: sourceContract || null, task, taskId: key, queryId: lane.queryId, scopeId: lane.scopeId });
         const laneProfile = buildContextQueryProfile(this, usableIndex, lanePlan);
@@ -13203,10 +15246,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           telemetry.degraded = true;
           telemetry.degradedReason = telemetry.degradedReason || routed.degradedReason;
         }
-        const ranked = routed.candidates.map((item) => {
-          const chunk = item.chunk;
-          const native = taskSemanticNativeOwnershipMetadata(item);
-          return Object.assign({}, item, {
+        const ranked = [];
+        for (const rankItem of routed.candidates) {
+          const chunk = rankItem.chunk;
+          const native = taskSemanticNativeOwnershipMetadata(rankItem);
+          ranked.push(Object.assign({}, rankItem, {
             ...contextCandidateScopeMetadata(chunk, laneProfile, {}),
             evidenceTaskId: native.evidenceTaskId,
             evidenceScopeId: native.evidenceScopeId,
@@ -13219,8 +15263,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             lane: lane.name,
             sourceKind: semanticChunkSourceKind(chunk),
             temporalRelation: semanticTemporalRelation(chunk, laneProfile)
-          });
-        });
+          }));
+          await taskWorkStride();
+        }
         const relevanceRanked = lane.queryHandleTelemetry?.adaptiveRecovery === true
           ? semanticAdaptiveLiveTaskCandidates(ranked, lane.text, productionRoutingState?.textSeedIndex, this.settings)
           : ranked;
@@ -13241,6 +15286,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           profile: laneProfile
         });
         const scoped = rankTaskSemanticCandidates(deduplicateTaskSemanticCandidates(scopedBase.concat(adjacentCriteriaExpansion)));
+        await taskSlice.checkpoint();
         const allowTaskReferences = taskSemanticMarkedActionTaskReferencesAllowed(task, laneData.markedActionScope);
         const allowHistoricalEvidence = taskSemanticMarkedActionHistoryAllowed(task, laneData.markedActionScope);
         const laneRouted = lane.name === "continuity"
@@ -13253,6 +15299,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const sourceAdmissible = [];
         const sourceExclusions = [];
         for (const item of laneRouted.filter(semanticCandidateIsAdmissible)) {
+          await taskWorkStride();
           const decision = taskSemanticCurrentSourceCandidateDecision(item, source, sourceContract || {}, lane.scopeId, task, {
             supportingEvidenceOnly,
             activeSourcePath,
@@ -13290,11 +15337,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const ownershipExclusions = [];
         const ownershipAdmissible = [];
         for (const item of admissible) {
+          await taskWorkStride();
           const ownershipDecision = taskSemanticApplySiblingOwnership(item, siblingOwnershipIndex, key, laneData.scopeId, { expandTaskReferences: task?.expandTaskReferences === true });
           if (ownershipDecision.admitted) ownershipAdmissible.push(ownershipDecision.item || item);
           else ownershipExclusions.push({ item, reasonCode: ownershipDecision.reasonCode || "scope-unknown-unassigned", stableKey: ownershipDecision.stableKey || semanticTaskCandidateStableKey(item), ownership: ownershipDecision.ownership || null });
         }
         const admitted = deduplicateTaskSemanticCandidates(taskRelativeSemanticAdmissionPool(ownershipAdmissible, taskItemLimit));
+        await taskSlice.checkpoint();
         // Only ownership winners may enter the lane window, fusion, or
         // coverage selector. Losers remain diagnostic-only telemetry.
         const candidateWindowInput = ownershipAdmissible.map((item) => Object.assign({}, item, {
@@ -13388,6 +15437,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       const laneCandidatePools = laneResults.map((result) => ({ lane: result.lane, candidates: (result.admissible || []).filter((item) => item?.semanticOwnershipExcluded !== true) }));
       const fusedAll = fuseTaskSemanticCandidates(laneCandidatePools, telemetry.fusionMode);
+      await taskSlice.checkpoint();
       const laneCoverage = selectTaskSemanticLaneCoverage(laneResults, taskItemLimit, telemetry.fusionMode, {
         allowHistoricalTaskReferences: task?.expandTaskHistory === true,
         evidenceRequest: laneData.evidenceRequest,
@@ -13396,6 +15446,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         scopeId: laneData.scopeId,
         materialityAnchors
       });
+      await taskSlice.checkpoint();
       for (const laneTelemetry of telemetry.laneTelemetryByTask[key] || []) {
         const alignment = laneCoverage.laneAlignment?.[laneTelemetry.lane];
         if (alignment) laneTelemetry.alignment = alignment;
@@ -13426,7 +15477,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       telemetry.sourceThreadReservationCount += Number(noteThreadExpansion.reservationCount || 0);
       telemetry.sourceThreadCandidateCount += Number(noteThreadExpansion.candidateCount || 0);
       telemetry.sourceThreadByTask[key] = noteThreadExpansion;
-      const selectedDimensionRecords = selectedCandidates.map((item) => {
+      const selectedDimensionRecords = [];
+      for (const item of selectedCandidates) {
         const stableKey = semanticTaskCandidateStableKey(item);
         const reservationReason = laneCoverage.reservedReasonByKey?.[stableKey] || "";
         const referenceAdmissionReason = laneCoverage.referenceAdmissionReasons?.[stableKey] || "";
@@ -13446,7 +15498,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           evidenceTaskId: item.evidenceTaskId || item.chunk?.evidenceTaskId || "",
           evidenceScopeId: item.evidenceScopeId || item.chunk?.evidenceScopeId || ""
         });
-        return Object.assign(annotateContextChunk(selectedInput, profile), {
+        selectedDimensionRecords.push(Object.assign(annotateContextChunk(selectedInput, profile), {
           selectionReasonCode,
           dimension: item.dimension || "",
           dimensions: Array.isArray(item.dimensions) ? item.dimensions.slice() : [],
@@ -13487,8 +15539,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ].filter(Boolean).map(String)),
           queryId: laneData.queryId,
           sourceContractId: sourceContract?.id || ""
-        });
-      });
+        }));
+        await taskWorkStride();
+      }
       const selected = completePositiveSemanticUnion(selectedDimensionRecords.map((item) => Object.assign({}, item, {
         compatible: item.compatible !== false,
         applicable: item.applicable !== false,
@@ -13549,6 +15602,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         };
       });
       const rejected = sourceRejected.concat(ownershipRejected, fusedRejected).slice(0, SEMANTIC_RETRIEVAL_MAX_REJECTED);
+      await taskSlice.checkpoint();
       const selectedRows = selected.map((chunk) => ({
         evidenceId: chunk.evidenceId || "",
         reasonCode: chunk.selectionReasonCode || "task-relative-semantic-fused-selected",
@@ -13656,18 +15710,44 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       telemetry.selectedEvidenceByTask[key] = localTelemetry.selected;
       telemetry.rejectedEvidenceByTask[key] = rejected;
     }
+    const taskAssemblyWork = finishTaskAssemblyWork();
+    telemetry.taskAssemblyYieldCount = taskAssemblyWork.taskAssemblyYieldCount;
+    telemetry.taskAssemblyMaxSliceMs = taskAssemblyWork.taskAssemblyMaxSliceMs;
+    telemetry.taskAssemblyWorkMs = taskAssemblyWork.taskAssemblyWorkMs;
+    } catch (taskAssemblyError) {
+      // Lane G cooperative stop: cancellation/invalidation halts task-local
+      // assembly at the next checkpoint. Completed task diagnostics stay
+      // diagnostic-only; every delivered context is emptied through the
+      // existing degraded helper and the result-cache promotion below is
+      // skipped, so no partial result is published or cached.
+      const taskCancelled = String(taskAssemblyError?.code || "") === "semantic-work-cancelled" || (taskSlice && typeof taskSlice.cancelled === "function" && taskSlice.cancelled());
+      if (!taskCancelled) throw taskAssemblyError;
+      telemetry.selectedEvidenceByTask = {};
+      const taskCancelWork = finishTaskAssemblyWork();
+      telemetry.taskAssemblyYieldCount = taskCancelWork.taskAssemblyYieldCount;
+      telemetry.taskAssemblyMaxSliceMs = taskCancelWork.taskAssemblyMaxSliceMs;
+      telemetry.taskAssemblyWorkMs = taskCancelWork.taskAssemblyWorkMs;
+      return degraded("route-cancelled");
+    }
     telemetry.finalBundleMs = Math.max(0, localSemanticRoutingNow() - finalBundleStart);
     telemetry.contextBundleElapsedMs = Date.now() - startedAt;
     telemetry.elapsedMs = telemetry.contextBundleElapsedMs;
     telemetry.indexState = telemetry.degraded ? "degraded-source-only" : "ready";
-    telemetry.indexHealth = integrity.health;
+    telemetry.indexHealth = integrity?.health || null;
     telemetry.queryId = taskWorkflowHash({ sourceContractId: sourceContract?.id || "", tasks: Object.keys(byTask).map((key) => byTask[key].queryId) });
     telemetry.preparedViewState = String(productionRoutingState?.routingIndex ? "ready" : "not-ready");
     telemetry.preparedViewHit = false;
     telemetry.cacheHit = false;
     this.lastSemanticRetrievalTelemetry = telemetry;
     const result = { byTask, taskKeyByIndex, telemetry };
-    if (typeof this.taskSemanticContextCache.setScoped === "function") this.taskSemanticContextCache.setScoped(resultCacheKey, { createdAt: Date.now(), result: cloneTaskSemanticRetrievalResult(result) }, String(revision));
+    // Lane E promotion guard: persist the successful result only while the
+    // same complete prepared identity is still active, so a late
+    // old-generation result cannot repopulate the cache after an
+    // invalidation or rotation.
+    const taskWriteActiveKey = String(this.currentPreparedViewRef?.view?.identity?.key || "");
+    const taskWriteIdentityMatches = Boolean(taskPreparedIdentityKey) && taskWriteActiveKey === taskPreparedIdentityKey;
+    if (!taskWriteIdentityMatches) return result;
+    if (typeof this.taskSemanticContextCache.setScoped === "function") this.taskSemanticContextCache.setScoped(resultCacheKey, { createdAt: Date.now(), result: cloneTaskSemanticRetrievalResult(result) }, taskContextGeneration);
     else {
       this.taskSemanticContextCache.set(resultCacheKey, { createdAt: Date.now(), result: cloneTaskSemanticRetrievalResult(result) });
       while (this.taskSemanticContextCache.size > SEMANTIC_TASK_CONTEXT_CACHE_MAX_ENTRIES) {
@@ -13756,19 +15836,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: telemetry.indexState, degradedReason })), telemetry };
     }
 
-    let indexLoadError = null;
-    if (!(this.semanticIndex || []).length && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
-      try {
-        await this.ensureSemanticIndexLoaded("scheduler semantic search index");
-      } catch (error) {
-        indexLoadError = error;
-      }
-    }
-    const rawIndex = (this.semanticIndex || [])
-      .filter((chunk) => this.isIndexablePath(chunk.path || "") && !isSemanticNoiseChunk(chunk));
-    const index = decorateSemanticIndexChunks(rawIndex, revision);
-    const integrity = semanticIndexIntegrity(rawIndex, index, this.settings);
-    const usableIndex = integrity.validChunks;
+    // Lane E: one captured immutable active prepared reference per request.
+    // Retrieval never loads the index, builds routing state, or walks the
+    // raw corpus — it consumes the prepared view's immutable eligible
+    // records and integrity metadata directly.
+    const schedulerActivePreparedRef = this.currentPreparedViewRef || null;
+    const schedulerExpectedIdentity = semanticExpectedRetrievalIdentity(this);
+    const schedulerReady = this.isRetrievalReady(schedulerExpectedIdentity);
+    const schedulerPreparedView = (schedulerReady.ref && schedulerReady.ref.view) || schedulerActivePreparedRef?.view || null;
+    const usableIndex = Array.isArray(schedulerPreparedView?.eligibleChunks) ? schedulerPreparedView.eligibleChunks : [];
+    const integrity = schedulerPreparedView?.integrity || null;
     const telemetry = {
       schemaVersion: SEMANTIC_RETRIEVAL_SCHEMA_VERSION,
       queryId: schedulerSemanticBatchQueryId(list, revision, provider, model, dimension),
@@ -13799,35 +15876,33 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       queryHandleSource: "indexed",
       queryHandleCount: 0,
       degraded: false,
-      indexHealth: integrity.health,
+      indexHealth: integrity?.health || null,
       indexState: "ready",
       degradedReason: "",
       elapsedMs: 0
     };
-    if (indexLoadError) {
-      telemetry.indexState = "failed";
-      telemetry.degradedReason = "index-load-failed";
+    if (!schedulerReady.ready) {
+      let schedulerNotReadyReason = String(schedulerReady.reasonCode || "prepared-view-not-ready");
+      if (schedulerNotReadyReason.startsWith("identity-mismatch")) schedulerNotReadyReason = "prepared-view-not-ready";
+      if (schedulerNotReadyReason === "identity-missing" || schedulerNotReadyReason === "view-missing") schedulerNotReadyReason = "prepared-view-not-ready";
+      telemetry.indexState = "degraded-source-only";
+      telemetry.degraded = true;
+      telemetry.degradedReason = schedulerNotReadyReason;
       telemetry.elapsedMs = Date.now() - startedAt;
       this.lastSemanticRetrievalTelemetry = telemetry;
-      return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: "failed", degradedReason: "index-load-failed" })), telemetry };
+      return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: telemetry.indexState, degradedReason: telemetry.degradedReason })), telemetry };
     }
     if (!usableIndex.length) {
       telemetry.indexState = "degraded-source-only";
-      telemetry.degradedReason = index.length ? "index-integrity-failed" : "semantic-index-empty";
+      telemetry.degradedReason = schedulerPreparedView && Number(schedulerPreparedView.preparationRows || 0) > 0 ? "index-integrity-failed" : "semantic-index-empty";
       telemetry.elapsedMs = Date.now() - startedAt;
       this.lastSemanticRetrievalTelemetry = telemetry;
       return { context: [], bundles: emptyBundles.map((bundle) => Object.assign(bundle, { indexState: telemetry.indexState, degradedReason: telemetry.degradedReason })), telemetry };
     }
 
-    const productionRoutingState = await this.ensureProductionSemanticRoutingState({
-      chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-      settings: this.settings,
-      revision,
-      storageFingerprint: this.semanticIndexStorageFingerprint || "",
-      allowLoad: true,
-      allowBuild: false,
-      persist: false
-    });
+    // Lane E: routing consumes the captured active prepared reference only.
+    // Without it the request degrades visibly instead of loading or building.
+    const productionRoutingState = (schedulerReady.ref && schedulerReady.ref.routingState) || schedulerActivePreparedRef?.routingState || null;
     if (!productionRoutingState) {
       telemetry.indexState = "degraded-source-only";
       telemetry.degraded = true;
@@ -18089,10 +20164,26 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       lineageId: `task-description-${task.index}`
     })]));
     const descriptionGenerationRetryAvailable = (taskIndex) => aiGenerationDispatchBudgetSnapshot(generationDispatchBudgets.get(taskIndex)).remaining > 0;
+    const singletonNormalizationObservations = new Map();
+    const singletonNormalizationObservationKey = (phase, taskIndex) => `${String(phase || "")}:${Number(taskIndex)}`;
+    const clearSingletonNormalizationObservations = (phase, targetMainTasks = mainTasks) => {
+      for (const task of targetMainTasks || []) singletonNormalizationObservations.delete(singletonNormalizationObservationKey(phase, task?.index));
+    };
+    const promoteSingletonNormalizationObservation = (phase, taskIndex, corrections = []) => {
+      const key = singletonNormalizationObservationKey(phase, taskIndex);
+      const observation = singletonNormalizationObservations.get(key);
+      if (observation) corrections.push(Object.assign({}, observation));
+      singletonNormalizationObservations.delete(key);
+    };
     const recordDescriptionNormalizationCorrections = (phase, corrections = []) => {
       for (const correction of corrections || []) {
         if (!correction || !Number.isInteger(correction.taskIndex)) continue;
-        const record = Object.assign({ phase }, correction);
+        const record = Object.assign({}, correction, { phase });
+        const duplicate = recoveryTelemetry.normalizationCorrections.some((existing) => existing
+          && existing.phase === record.phase
+          && existing.taskIndex === record.taskIndex
+          && existing.reasonCode === record.reasonCode);
+        if (duplicate) continue;
         recoveryTelemetry.normalizationCorrections.push(record);
         if (["description-canonical-reference-metadata-repaired", "description-unexpressed-selected-reference-removed"].includes(correction.reasonCode)) {
           recoveryTelemetry.attributionCode = "model-output";
@@ -18117,7 +20208,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (!Number.isInteger(entry?.taskIndex) || !tasks[entry.taskIndex]) continue;
         const reasonCode = taskDescriptionFailureReasonCode(entry.reasonCode || entry.reason, entry.stage || "");
         const existing = failures.get(entry.taskIndex);
-        if (!existing || failurePriority(reasonCode) >= failurePriority(existing)) failures.set(entry.taskIndex, reasonCode);
+        // Keep the first failure when priorities tie; later synthetic
+        // observations must not mask the owning failure.
+        if (!existing || failurePriority(reasonCode) > failurePriority(existing)) failures.set(entry.taskIndex, reasonCode);
       }
       for (const item of mainTasks) {
         if (failures.has(item.index)) {
@@ -18305,6 +20398,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const taskLocalSharedEvidencePayloadCache = new Map();
     const taskLocalSharedEvidencePayloadState = new Map();
     const singletonContractByTaskIndex = new Map();
+    const descriptionOmittedOptionalEvidenceByPhase = new Map();
     const singletonContractFor = (requestTask, sharedPayload) => {
       const taskIndex = Number(requestTask?.index);
       const existing = singletonContractByTaskIndex.get(taskIndex);
@@ -18450,13 +20544,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             const singletonJson = await requestDescriptionBatch([requestTask], localEvidence, phase, Object.assign({}, requestOptions, {
               generationDispatchBudget: generationDispatchBudgets.get(requestTask.index)
             }));
-            let singletonParsed;
-            try { singletonParsed = JSON.parse(singletonJson); } catch {
-              singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description response JSON could not be parsed", stage: "response-parse" });
-              return;
-            }
-            applyDescriptionIdentityEchoFromParsed(singletonParsed, phase, requestTask);
-            const singletonEnvelopeFailure = taskDescriptionProviderEnvelopeFailure(singletonParsed);
+             let singletonParsed;
+             try { singletonParsed = JSON.parse(singletonJson); } catch {
+               singletonFailures.push({ taskIndex: requestTask.index, reason: "singleton description response JSON could not be parsed", stage: "response-parse" });
+               return;
+             }
+             applyDescriptionIdentityEchoFromParsed(singletonParsed, phase, requestTask);
+             const singletonEnvelopeFailure = taskDescriptionProviderEnvelopeFailure(singletonParsed);
             if (singletonEnvelopeFailure) {
               singletonFailures.push({ taskIndex: requestTask.index, reason: singletonEnvelopeFailure.reason, reasonCode: singletonEnvelopeFailure.reasonCode, stage: "response" });
               return;
@@ -18530,11 +20624,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         recoveryTelemetry.singletonPreflightDiagnostics.push(diagnostics);
         throw Object.assign(new Error(reasonCode), { code: reasonCode, diagnostics });
       }
-      const singletonPromptMainTasks = requestMainTasks.length === 1
-        ? requestMainTasks.map((task) => taskDescriptionPromptTask(task, singletonSharedTaskEvidence, singletonContract))
-        : requestPromptMainTasks;
-      const singletonPromptTask = singletonPromptMainTasks.length === 1 ? singletonPromptMainTasks[0] : null;
-      const requestSchemaVocabulary = normalizeTaskWorkflowSchemaVocabulary({
+       let singletonPromptMainTasks = requestMainTasks.length === 1
+         ? requestMainTasks.map((task) => taskDescriptionPromptTask(task, singletonSharedTaskEvidence, singletonContract))
+         : requestPromptMainTasks;
+       const singletonPromptTask = singletonPromptMainTasks.length === 1 ? singletonPromptMainTasks[0] : null;
+       let requestSchemaVocabulary = normalizeTaskWorkflowSchemaVocabulary({
         evidenceIds: singletonSharedTaskEvidence?.providerEvidenceIds || Object.keys(singletonSharedTaskEvidence?.evidenceById || {}),
         factIds: singletonSharedTaskEvidence?.providerFactIds || Object.keys(singletonSharedTaskEvidence?.factsById || {}),
         scopeIds: uniqueValues([
@@ -18547,8 +20641,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         taskIndexes: Number.isInteger(singletonContract?.expectedIndex) ? [singletonContract.expectedIndex] : [],
         contractHash: singletonContract?.contractHash || ""
       });
-      const requestSchema = taskDescriptionSchema(null, generationSubtaskLimit(this.settings), requestSchemaVocabulary);
-      const canonicalRequest = taskDescriptionCanonicalRequestLedger(singletonPromptTask, singletonSharedTaskEvidence, singletonContract, {
+       let requestSchema = taskDescriptionSchema(null, generationSubtaskLimit(this.settings), requestSchemaVocabulary);
+       let canonicalRequest = taskDescriptionCanonicalRequestLedger(singletonPromptTask, singletonSharedTaskEvidence, singletonContract, {
         phase,
         repairReasonCodes: requestOptions.repairReasonCodes || []
       });
@@ -18557,11 +20651,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           code: `plugin-input-${canonicalRequest.invalidReasonCode || "description-canonical-ledger-invalid"}`
         });
       }
-      const descriptionRepairReasonCode = String((requestOptions.repairReasonCodes || [])[0] || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80);
-      let descriptionEnvelope;
+       const descriptionRepairReasonCode = String((requestOptions.repairReasonCodes || [])[0] || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80);
+       let descriptionEnvelope;
       if (requestOptions.preparedEnvelope && typeof requestOptions.preparedEnvelope === "object" && requestOptions.preparedEnvelope.envelopeHash) {
         const prepared = requestOptions.preparedEnvelope;
-        const expected = buildDescriptionProviderEnvelope(singletonContract, { repairReasonCode: descriptionRepairReasonCode || undefined });
+         const expected = buildDescriptionProviderEnvelope(singletonContract, {
+           repairReasonCode: descriptionRepairReasonCode || undefined,
+           omittedOptionalEvidenceIds: prepared.omittedOptionalEvidenceIds || []
+         });
         const preparedProjectionHash = String(prepared.projectionHash || "");
         const expectedProjectionHash = String(expected.projectionHash || singletonContract?.projectionHash || singletonContract?.contractHash || "");
         if (!singletonContract || preparedProjectionHash !== expectedProjectionHash || String(prepared.envelopeHash) !== String(expected.envelopeHash)) {
@@ -18571,10 +20668,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       } else {
         descriptionEnvelope = buildDescriptionProviderEnvelope(singletonContract, { repairReasonCode: descriptionRepairReasonCode || undefined });
       }
-      const descriptionRequestSuffix = [descriptionOperationInstructions, descriptionEnvelope.taskLocalSuffix, canonicalRequest.user].filter(Boolean).join("\n\n");
-      const compactedPreflight = taskDescriptionProviderContextPreflight({
-        settings: this.settings,
-        provider: modelChoice.provider,
+       let descriptionRequestSuffix = [descriptionOperationInstructions, descriptionEnvelope.taskLocalSuffix, canonicalRequest.user].filter(Boolean).join("\n\n");
+       let compactedPreflight = taskDescriptionProviderContextPreflight({
+         settings: this.settings,
+         provider: modelChoice.provider,
         model: modelChoice.model,
         operation: "task-description",
         system: taskDescriptionSystemInstruction(),
@@ -18583,9 +20680,96 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         user: descriptionRequestSuffix,
         schema: requestSchema,
         originalSchema: requestSchema,
-        schemaVocabulary: requestSchemaVocabulary
-      });
-      requestPreflights.push(compactedPreflight);
+         schemaVocabulary: requestSchemaVocabulary
+       });
+       let efficiencyTargetTelemetry = null;
+       if (requestMainTasks.length === 1 && singletonContract && singletonProjection) {
+         const optionalGroups = taskDescriptionProviderEvidenceGroups(singletonProjection, singletonSharedTaskEvidence, singletonContract);
+         const contextWindow = chatProviderContextWindow(this.settings, modelChoice.provider, modelChoice.model);
+         const operationalBoundaryExclusiveTokens = Math.max(1, Math.floor(Number(
+           contextWindow.inputMaximumExclusiveTokens || contextWindow.operationalInputTokenLimitTokens + 1
+         )));
+         const fit = taskDescriptionProviderEnvelopeFit({
+           optionalGroups,
+           operationalBoundaryExclusiveTokens,
+           buildCandidate: (omittedOptionalEvidenceIds) => {
+             const omitted = uniqueValues((omittedOptionalEvidenceIds || []).map(String).filter(Boolean));
+             const pruningApplied = omitted.length > 0;
+             const candidateContractView = taskDescriptionOptionalPrunedContractView(singletonContract, omitted);
+             const candidateSchemaVocabulary = normalizeTaskWorkflowSchemaVocabulary({
+               evidenceIds: candidateContractView.allowedEvidenceIds || candidateContractView.allowed_evidence_ids || [],
+               factIds: candidateContractView.allowedFactIds || candidateContractView.allowed_fact_ids || [],
+               scopeIds: uniqueValues([
+                 ...singletonPromptMainTasks.map((task) => task?.taskLocalEvidence?.scopeId || task?.scope_id),
+                 ...Object.values(candidateContractView.factsById || {}).map((fact) => fact?.scopeId || fact?.scope_id)
+               ].map((value) => String(value || "").trim()).filter(Boolean)),
+               taskIds: uniqueValues(singletonPromptMainTasks.map((task) => String(task?.taskLocalEvidence?.taskId || task?.taskId || "").trim()).filter(Boolean)),
+               requiredCurrentEvidenceIds: candidateContractView.requiredCurrentEvidenceIds || [],
+               requiredCurrentFactIds: candidateContractView.requiredCurrentFactIds || [],
+               taskIndexes: Number.isInteger(singletonContract?.expectedIndex) ? [singletonContract.expectedIndex] : [],
+               contractHash: singletonContract?.contractHash || ""
+             });
+             const candidateSchema = taskDescriptionSchema(null, generationSubtaskLimit(this.settings), candidateSchemaVocabulary);
+             const candidateCanonicalRequest = taskDescriptionCanonicalRequestLedger(singletonPromptTask, singletonSharedTaskEvidence, singletonContract, Object.assign({
+               phase,
+               repairReasonCodes: requestOptions.repairReasonCodes || []
+             }, pruningApplied ? {
+               allowOptionalEvidencePruning: true,
+               omittedOptionalEvidenceIds: omitted
+             } : {}));
+             if (!candidateCanonicalRequest.valid) {
+               throw Object.assign(new Error(candidateCanonicalRequest.invalidReasonCode || "canonical task-description request was invalid"), {
+                 code: `plugin-input-${candidateCanonicalRequest.invalidReasonCode || "description-canonical-ledger-invalid"}`
+               });
+             }
+             const candidateEnvelope = buildDescriptionProviderEnvelope(singletonContract, {
+               repairReasonCode: descriptionRepairReasonCode || undefined,
+               omittedOptionalEvidenceIds: omitted
+             });
+             const candidateRequestSuffix = [descriptionOperationInstructions, candidateEnvelope.taskLocalSuffix, candidateCanonicalRequest.user].filter(Boolean).join("\n\n");
+             const candidatePreflight = taskDescriptionProviderContextPreflight({
+                settings: this.settings,
+               provider: modelChoice.provider,
+               model: modelChoice.model,
+               operation: "task-description",
+               system: taskDescriptionSystemInstruction(),
+               promptCachePrefix: candidateEnvelope.cachePrefix,
+               promptContextSuffix: "",
+               user: candidateRequestSuffix,
+               schema: candidateSchema,
+               originalSchema: candidateSchema,
+               schemaVocabulary: candidateSchemaVocabulary
+             });
+             return {
+               preflight: candidatePreflight,
+               requestSchemaVocabulary: candidateSchemaVocabulary,
+               requestSchema: candidateSchema,
+               canonicalRequest: candidateCanonicalRequest,
+               descriptionEnvelope: candidateEnvelope,
+               descriptionRequestSuffix: candidateRequestSuffix,
+               providerDeliveredEvidenceCount: (candidateContractView.allowedEvidenceIds || []).length,
+               providerDeliveredFactCount: (candidateContractView.allowedFactIds || []).length,
+                providerDeliveredOptionalCount: Math.max(0, (candidateContractView.allowedEvidenceIds || []).length - (singletonProjection.protectedEvidenceIds || []).length)
+             };
+           }
+         });
+         requestSchemaVocabulary = fit.candidate.requestSchemaVocabulary;
+         requestSchema = fit.candidate.requestSchema;
+         canonicalRequest = fit.candidate.canonicalRequest;
+         descriptionEnvelope = fit.candidate.descriptionEnvelope;
+         descriptionRequestSuffix = fit.candidate.descriptionRequestSuffix;
+         compactedPreflight = fit.candidate.preflight;
+          efficiencyTargetTelemetry = Object.assign({}, fit.telemetry, {
+            providerDeliveredEvidenceCount: fit.candidate.providerDeliveredEvidenceCount,
+            providerDeliveredFactCount: fit.candidate.providerDeliveredFactCount,
+            providerDeliveredOptionalCount: fit.candidate.providerDeliveredOptionalCount
+          });
+          descriptionOmittedOptionalEvidenceByPhase.set(
+            `${String(phase)}:${String(requestMainTasks[0]?.index ?? "")}`,
+            Object.freeze((descriptionEnvelope.omittedOptionalEvidenceIds || []).slice())
+          );
+        }
+       requestPreflights.push(compactedPreflight);
       let descriptionIdentityEcho = null;
       recoveryTelemetry.callCount += 1;
       try {
@@ -18628,6 +20812,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             requestPreflight = Object.assign({}, preflight || {});
             requestPreflights.push(requestPreflight);
           },
+          // Gateway is the single source of truth for singleton index inference.
+          // Retain only a content-free candidate until downstream validation accepts
+          // the normalized item; static singleton restoration remains excluded.
+          onGatewayResult: (gatewayResult) => {
+            const telemetry = gatewayResult?.singletonDescriptionTelemetry;
+            if (telemetry
+              && telemetry.singletonIndexInferred === true
+              && telemetry.normalizationReasonCode === "description-response-singleton-index-inferred") {
+              const taskIndex = requestMainTasks[0]?.index;
+              if (Number.isInteger(taskIndex)) singletonNormalizationObservations.set(singletonNormalizationObservationKey(phase, taskIndex), {
+                phase,
+                taskIndex,
+                reasonCode: "singleton-missing-index-repaired"
+              });
+              return { singletonIndexInferred: true };
+            }
+            return null;
+          },
           user: descriptionRequestSuffix
         }), {
           workflowToken: options.workflowToken || null,
@@ -18636,16 +20838,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             sourceContractId: String(singletonContract?.contractHash || "")
           }
         });
-        return providerJson;
-      } finally {
-        const usage = requestUsage;
-        recoveryTelemetry.calls.push(Object.assign({
+          // Gateway already normalized the omitted singleton index; return its
+          // normalized consumer bytes directly. Validation promotes any
+          // accepted correction from the transient gateway observation.
+          return providerJson;
+        } finally {
+          const usage = requestUsage;
+          recoveryTelemetry.calls.push(Object.assign({
           phase,
           indexes: requestIndexes,
           elapsedMs: Math.max(0, Date.now() - startedAt),
           localCandidateCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.candidateCount || 0), 0),
           protectedDeliveredCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.protectedCount || 0), 0),
-          optionalDeliveredCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.selectedOptionalCount || 0), 0),
+           optionalDeliveredCount: requestMainTasks.length === 1 && efficiencyTargetTelemetry
+             ? Number(efficiencyTargetTelemetry.providerDeliveredOptionalCount || 0)
+             : requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.selectedOptionalCount || 0), 0),
           optionalUtilization: requestMainTasks.reduce((total, task) => {
             const telemetry = taskLocalProviderProjectionCache.get(task.index)?.telemetry || {};
             const ceiling = Number(telemetry.recordCeiling || 0);
@@ -18659,9 +20866,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           semanticShortlistSelectedCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.semanticShortlistSelectedCount || 0), 0),
           semanticShortlistSidecarCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.semanticShortlistSidecarCount || 0), 0),
           semanticShortlistSidecarJoinCount: requestMainTasks.reduce((total, task) => total + Number(taskLocalProviderProjectionCache.get(task.index)?.telemetry?.semanticShortlistSidecarJoinCount || 0), 0),
-          preflight: requestPreflight,
-          preflights: requestPreflights.map((preflight) => Object.assign({}, preflight)),
-          inputEstimateObservation: providerInputEstimateObservation(requestPreflight, usage),
+           preflight: requestPreflight,
+           preflights: requestPreflights.map((preflight) => Object.assign({}, preflight)),
+           efficiencyTargetTokens: Number(efficiencyTargetTelemetry?.efficiencyTargetTokens || 0),
+           efficiencyTargetBoundaryExclusiveTokens: Number(efficiencyTargetTelemetry?.efficiencyTargetBoundaryExclusiveTokens || 0),
+           efficiencyTargetPruningApplied: efficiencyTargetTelemetry?.efficiencyTargetPruningApplied === true,
+           efficiencyTargetOptionalGroupsAvailable: Number(efficiencyTargetTelemetry?.efficiencyTargetOptionalGroupsAvailable || 0),
+           efficiencyTargetOptionalGroupsOmitted: Number(efficiencyTargetTelemetry?.efficiencyTargetOptionalGroupsOmitted || 0),
+           efficiencyTargetInitialEstimatedInputTokens: Number(efficiencyTargetTelemetry?.efficiencyTargetInitialEstimatedInputTokens || 0),
+           efficiencyTargetFinalEstimatedInputTokens: Number(efficiencyTargetTelemetry?.efficiencyTargetFinalEstimatedInputTokens || 0),
+           efficiencyTargetReached: efficiencyTargetTelemetry?.efficiencyTargetReached === true,
+           efficiencyTargetExceeded: efficiencyTargetTelemetry?.efficiencyTargetExceeded === true,
+           efficiencyTargetFits: efficiencyTargetTelemetry?.efficiencyTargetFits === true,
+           protectedCarrierStillOverTarget: efficiencyTargetTelemetry?.protectedCarrierStillOverTarget === true,
+           inputEstimateObservation: providerInputEstimateObservation(requestPreflight, usage),
           outputBudgetObservation: providerOutputBudgetObservation(requestPreflight, usage),
           canonicalRequestLedger: {
             version: canonicalRequest.ledger.version,
@@ -18689,8 +20907,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           postDispatchRequestProfile: usage?.postDispatchRequestProfile || null,
           eligibleLedgerEvidenceCount: requestMainTasks.reduce((total, task) => total + (task.taskLocalEvidence?.citationLedger || []).length, 0),
           eligibleFactBindingCount: requestMainTasks.reduce((total, task) => total + (task.taskLocalEvidence?.factBindings || task.taskLocalEvidence?.fact_bindings || []).length, 0),
-          providerDeliveredEvidenceCount: Object.keys(singletonSharedTaskEvidence?.evidenceById || {}).length,
-          providerDeliveredFactCount: Object.keys(singletonSharedTaskEvidence?.factsById || {}).length,
+           providerDeliveredEvidenceCount: Number(efficiencyTargetTelemetry?.providerDeliveredEvidenceCount || Object.keys(singletonSharedTaskEvidence?.evidenceById || {}).length),
+           providerDeliveredFactCount: Number(efficiencyTargetTelemetry?.providerDeliveredFactCount || Object.keys(singletonSharedTaskEvidence?.factsById || {}).length),
           selectedModel: modelChoice.model,
           selectedProvider: modelChoice.provider || "",
           providerDeliveredModel: modelChoice.model,
@@ -18703,7 +20921,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           actualOutputBoundFactCount: 0,
           citedCount: 0,
           boundCount: 0,
-          uncitedCount: Object.keys(singletonSharedTaskEvidence?.evidenceById || {}).length,
+           uncitedCount: Number(efficiencyTargetTelemetry?.providerDeliveredEvidenceCount || Object.keys(singletonSharedTaskEvidence?.evidenceById || {}).length),
           outputValidationState: "unvalidated",
           descriptionIdentityEcho,
           ...(singletonContract ? taskDescriptionSingletonContractDiagnostics(singletonContract, {}, "") : {}),
@@ -18803,12 +21021,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       };
     }
     __stsRefinePhase = "response-shape";
-    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.descriptions)) return failAll("description response shape was invalid", "response");
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.descriptions)) {
+      clearSingletonNormalizationObservations(responsePhase, mainTasks);
+      return failAll("description response shape was invalid", "response");
+    }
     if ((parsed.tasks || []).length || String(parsed.section_name || "").trim()) {
+      clearSingletonNormalizationObservations(responsePhase, mainTasks);
       return failAll("description response contained unexpected task or section content", "response");
     }
     __stsRefinePhase = "validate-batch";
-    const validateDescriptionBatch = (parsedBatch, targetMainTasks) => {
+    const validateDescriptionBatch = (parsedBatch, targetMainTasks, phase = responsePhase) => {
       const descriptions = Array.isArray(parsedBatch?.descriptions) ? parsedBatch.descriptions : [];
       const expectedIndexes = new Set(targetMainTasks.map((task) => task.index));
       const expectedIdentityByIndex = new Map(targetMainTasks.map((task) => {
@@ -18826,6 +21048,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const envelopeFailure = taskDescriptionProviderEnvelopeFailure(parsedBatch, { allowInternalFailures: true });
       if (envelopeFailure) {
         for (const target of targetMainTasks) closureFailure(target.index, envelopeFailure.reason, envelopeFailure.reasonCode);
+        clearSingletonNormalizationObservations(phase, targetMainTasks);
         return { validatedDescriptions, failures, normalizationCorrections: [] };
       }
       for (const item of descriptions) {
@@ -18989,7 +21212,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ? uniqueValues(sentenceValidation.sentences.flatMap((sentence) => sentence.evidence_ids || []).map(String).filter(Boolean))
           : undefined
       } : summary);
+      promoteSingletonNormalizationObservation(phase, item.index, normalizationCorrections);
       }
+      clearSingletonNormalizationObservations(phase, targetMainTasks);
       for (const index of expectedIndexes) if (!seenIndexes.has(index)) failures.push({
         taskIndex: index,
         reason: "description response omitted the task index",
@@ -19022,9 +21247,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ...taskDescriptionValidatorReasonCodes(failure?.reason ? [failure.reason] : [])
         ]).slice(0, 64));
       }
-      const correctionByIndex = new Map();
-      for (const correction of normalizationCorrections || []) {
-        if (Number.isInteger(correction?.taskIndex)) correctionByIndex.set(correction.taskIndex, correction);
+      // Attribute every distinct correction tuple to its phase/task call without
+      // collapsing separate same-attempt correction reasons.
+      const correctionsByIndex = new Map();
+      const authoritativeCorrections = recoveryTelemetry?.normalizationCorrections || normalizationCorrections || [];
+      for (const correction of authoritativeCorrections) {
+        if (correction?.phase && correction.phase !== phase) continue;
+        if (!Number.isInteger(correction?.taskIndex)) continue;
+        const list = correctionsByIndex.get(correction.taskIndex) || [];
+        if (!list.some((existing) => existing.reasonCode === correction.reasonCode && existing.phase === correction.phase)) list.push(correction);
+        correctionsByIndex.set(correction.taskIndex, list);
       }
       const outputReferences = (item = {}) => {
         const sentenceRows = Array.isArray(item.description_sentences) ? item.description_sentences : [];
@@ -19066,11 +21298,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ["regeneration", "fallback"].includes(phase)
           || call.generationDispatchBudget?.exhausted === true
         );
-        const normalizationCorrection = correctionByIndex.get(taskIndex);
-        call.normalizationCorrections = normalizationCorrection ? [Object.assign({}, normalizationCorrection)] : [];
-        call.singletonIndexCorrectionApplied = normalizationCorrection?.reasonCode === "singleton-missing-index-repaired";
-        call.singletonSentenceEvidenceCorrectionApplied = normalizationCorrection?.reasonCode === "description-canonical-reference-metadata-repaired";
-        call.singletonUnexpressedSelectedReferenceRemoved = normalizationCorrection?.reasonCode === "description-unexpressed-selected-reference-removed";
+        const normalizationCorrectionsForCall = correctionsByIndex.get(taskIndex) || [];
+        call.normalizationCorrections = normalizationCorrectionsForCall.map((correction) => Object.assign({}, correction));
+        call.singletonIndexCorrectionApplied = normalizationCorrectionsForCall.some((correction) => correction.reasonCode === "singleton-missing-index-repaired");
+        call.singletonSentenceEvidenceCorrectionApplied = normalizationCorrectionsForCall.some((correction) => correction.reasonCode === "description-canonical-reference-metadata-repaired");
+        call.singletonUnexpressedSelectedReferenceRemoved = normalizationCorrectionsForCall.some((correction) => correction.reasonCode === "description-unexpressed-selected-reference-removed");
         if (call.singletonSentenceEvidenceCorrectionApplied || call.singletonUnexpressedSelectedReferenceRemoved) call.attributionCode = "model-output";
         const contract = singletonContractByTaskIndex.get(taskIndex);
         if (contract) Object.assign(call, taskDescriptionSingletonContractDiagnostics(contract, raw || {}, validated ? "passed" : "output-rejected"));
@@ -19199,9 +21431,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         || recoveryTelemetry.calls.find((call) => Array.isArray(call.indexes) && call.indexes.includes(taskIndex));
       let effectiveFirstEnvelope = null;
       if (firstCall && firstCall.envelopeHash) {
-        effectiveFirstEnvelope = { envelopeHash: firstCall.envelopeHash, inputBytes: firstCall.inputBytes, projectionHash: firstCall.projectionHash };
+        effectiveFirstEnvelope = {
+          envelopeHash: firstCall.envelopeHash,
+          inputBytes: firstCall.inputBytes,
+          projectionHash: firstCall.projectionHash,
+          omittedOptionalEvidenceIds: descriptionOmittedOptionalEvidenceByPhase.get(`initial:${String(taskIndex)}`) || []
+        };
       } else {
-        try { effectiveFirstEnvelope = buildDescriptionProviderEnvelope(contract, {}); } catch { effectiveFirstEnvelope = null; }
+        try {
+          effectiveFirstEnvelope = buildDescriptionProviderEnvelope(contract, {
+            omittedOptionalEvidenceIds: descriptionOmittedOptionalEvidenceByPhase.get(`initial:${String(taskIndex)}`) || []
+          });
+        } catch { effectiveFirstEnvelope = null; }
       }
       const callsUsed = recoveryTelemetry.calls.filter((call) => Array.isArray(call.indexes) && call.indexes.includes(taskIndex)).length;
       const decision = maybeRetryDescription({ contract, firstEnvelope: effectiveFirstEnvelope, reasonCode, callsUsed });
@@ -19251,7 +21492,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               || (singletonRetryParsed.tasks || []).length || String(singletonRetryParsed.section_name || "").trim()) {
               singletonRetryFailures = [{ taskIndex, reason: "description regeneration response shape was invalid", stage: "response" }];
             } else {
-              const retryValidation = validateDescriptionBatch(singletonRetryParsed, [task]);
+              const retryValidation = validateDescriptionBatch(singletonRetryParsed, [task], "regeneration");
               recordDescriptionNormalizationCorrections("regeneration", retryValidation.normalizationCorrections);
               singletonRetryCorrections = retryValidation.normalizationCorrections;
               for (const [idx, validated] of retryValidation.validatedDescriptions) validatedDescriptions.set(idx, validated);
@@ -19623,7 +21864,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       target: { kind: "todoist-task-set", taskIds },
       result: preview,
       conflictPolicy: "material-remote-snapshot",
-      validate: async () => {
+      validate: async (request, _plugin, rendererToken) => {
         const currentTime = schedulePreviewStaleState(preview);
         if (currentTime.stale) {
           new Notice(currentTime.notice);
@@ -19631,11 +21872,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
         const expected = String(preview?.responseApplicationSnapshotFingerprint || preview?.snapshotFingerprint || "");
         if (!expected) return { ok: true };
-        const currentSnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+        // Lane J: the snapshot wait releases the admitted turn via the
+        // threaded renderer token; local staleness checks stay on-turn.
+        const currentSnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true, rendererToken);
         const current = this.responseApplicationRemoteSnapshotFingerprint(currentSnapshot, preview.responseApplicationTargetIds || taskIds);
         return current === expected ? { ok: true } : { ok: false, conflict: { code: "remote-task-snapshot-changed" } };
       },
-      apply: (applicationPreview, _request, _plugin, assertActive) => this._applyScheduleTodayNow(applicationPreview, assertActive)
+      apply: (applicationPreview, _request, _plugin, assertActive, rendererToken) => this._applyScheduleTodayNow(applicationPreview, assertActive, rendererToken)
     }).then((result) => {
       if (result.status === "applied") return result.sideEffects || { updated: 0, created: 0 };
       if (result.conflict?.code === "schedule-preview-stale") return {
@@ -19651,7 +21894,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
   }
 
-  async _applyScheduleTodayNow(preview, assertActive = null) {
+  async _applyScheduleTodayNow(preview, assertActive = null, rendererToken = null) {
     const scheduled = (preview?.scheduled || []).filter((item) => item.id && !item.fixed);
     const splitSubtasks = preview?.splitSubtasks || [];
     if (!scheduled.length && !splitSubtasks.length) {
@@ -19705,7 +21948,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         });
       }
       assertActive?.();
-      const response = await this.todoistSync(commands);
+      // Lane J: the Todoist sync wait releases the admitted turn via the
+      // threaded renderer token; command building stays local and serial.
+      const response = await this.todoistSync(commands, rendererToken);
       const created = [];
       for (const [tempId, item] of tempMap.entries()) {
         assertActive?.();
@@ -19725,7 +21970,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           parentLineNumber: item.parentLineNumber ?? null,
           description: ""
         }));
-        await this.insertScheduledSubtaskIntoNote(item, assertActive);
+        await this.insertScheduledSubtaskIntoNote(item, assertActive, rendererToken);
       }
       assertActive?.();
       const responseApplicationTargetIds = uniqueValues([
@@ -19735,7 +21980,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let responseApplicationPostApplyFingerprint = "";
       try {
         assertActive?.();
-        const postApplySnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+        // Lane J: the post-apply snapshot wait releases the admitted turn via
+        // the threaded renderer token before local fingerprint adoption.
+        const postApplySnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true, rendererToken);
         assertActive?.();
         responseApplicationPostApplyFingerprint = this.responseApplicationRemoteSnapshotFingerprint(postApplySnapshot, responseApplicationTargetIds);
       } catch (error) {
@@ -19756,7 +22003,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           duration: { amount: item.durationMinutes, unit: "minute" },
           cachedAt: deviceTimestamp()
         });
-        await this.updateScheduleMarkersInNote(item.id, item.scheduledDateTime, item.durationMinutes, { assertActive });
+        await this.updateScheduleMarkersInNote(item.id, item.scheduledDateTime, item.durationMinutes, { assertActive, rendererToken });
       }
       assertActive?.();
       this.recordSchedulerApplyMemory(preview, scheduled, splitSubtasks);
@@ -19771,7 +22018,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       assertActive?.();
       this.markTaskReferenceStateDirty();
       assertActive?.();
-      await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
       this.logLocal("Schedule today applied", { updated: scheduled.length, created: created.length, date: preview?.config?.today || today() });
       new Notice(`Scheduled ${scheduled.length} task${scheduled.length === 1 ? "" : "s"}${created.length ? ` and created ${created.length} continuation subtask${created.length === 1 ? "" : "s"}` : ""}.`);
       return { updated: scheduled.length, created: created.length };
@@ -19795,21 +22044,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       target: { kind: "todoist-task-set", taskIds },
       result: { undo, showNotice },
       conflictPolicy: "material-remote-snapshot",
-      validate: async () => {
+      validate: async (request, _plugin, rendererToken) => {
         const expected = String(undo.responseApplicationPostApplyFingerprint || undo.snapshotFingerprint || "");
         if (!expected) return { ok: true };
-        const currentSnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+        // Lane J: the snapshot wait releases the admitted turn via the
+        // threaded renderer token.
+        const currentSnapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true, rendererToken);
         const current = this.responseApplicationRemoteSnapshotFingerprint(currentSnapshot, undo.responseApplicationTargetIds || taskIds);
         return current === expected ? { ok: true } : { ok: false, conflict: { code: "remote-task-snapshot-changed" } };
       },
-      apply: (applicationResult, _request, _plugin, assertActive) => this._undoLastScheduleTodayNow(applicationResult.undo, applicationResult.showNotice, assertActive)
+      apply: (applicationResult, _request, _plugin, assertActive, rendererToken) => this._undoLastScheduleTodayNow(applicationResult.undo, applicationResult.showNotice, assertActive, rendererToken)
     }).then((result) => {
       if (result.status === "applied") return result.sideEffects || { restored: 0, removed: 0 };
       return result;
     });
   }
 
-  async _undoLastScheduleTodayNow(undo, showNotice = true, assertActive = null) {
+  async _undoLastScheduleTodayNow(undo, showNotice = true, assertActive = null, rendererToken = null) {
     this.schedulerInProgress = true;
     this.setSidebarStatus("Undoing schedule...");
     try {
@@ -19823,17 +22074,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         commands.push({ type: "item_update", uuid: uuid(), args });
       }
       assertActive?.();
-      if (commands.length) await this.todoistSync(commands);
+      // Lane J: Todoist waits release the admitted turn via the threaded
+      // renderer token; command building stays local and serial.
+      if (commands.length) await this.todoistSync(commands, rendererToken);
       let removed = 0;
       for (const item of undo.created || []) {
         assertActive?.();
         if (!item.id) continue;
-        const ok = await this.deleteTodoistTask(item.id).catch((error) => {
+        const ok = await this.deleteTodoistTask(item.id, rendererToken).catch((error) => {
           this.logLocal("Schedule undo delete failed", { id: item.id, error: error.message || String(error) });
           return false;
         });
         if (!ok) continue;
-        await this.removeScheduledSubtaskFromNote(item, assertActive);
+        await this.removeScheduledSubtaskFromNote(item, assertActive, rendererToken);
         assertActive?.();
         this.forgetCachedTaskReference(item.id);
         removed += 1;
@@ -19846,14 +22099,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         cached.due_date = item.dueDate ? datePart(item.dueDate) : null;
         cached.duration = normalizeTodoistDuration(item.duration);
         cached.cachedAt = deviceTimestamp();
-        await this.updateScheduleMarkersInNote(item.id, cached.scheduledDueDateTime, durationMinutes(cached.duration), { removeIfEmpty: true, assertActive });
+        await this.updateScheduleMarkersInNote(item.id, cached.scheduledDueDateTime, durationMinutes(cached.duration), { removeIfEmpty: true, assertActive, rendererToken });
       }
       assertActive?.();
       this.settings.scheduleTodayLastUndo = null;
       assertActive?.();
       this.markTaskReferenceStateDirty();
       assertActive?.();
-      await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
       this.logLocal("Schedule today undone", { restored: undo.previous?.length || 0, removed });
       if (showNotice) new Notice(`Undid schedule changes for ${undo.previous?.length || 0} task${undo.previous?.length === 1 ? "" : "s"}.`);
       return { restored: undo.previous?.length || 0, removed };
@@ -19865,11 +22120,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async updateScheduleMarkersInNote(taskId, scheduledDateTime, minutes, options = {}) {
     options.assertActive?.();
+    // Lane J: optional admitted renderer token routes Vault reads/writes one
+    // call at a time with busy-retry; sync lookups stay read-free and direct.
+    const rendererToken = options.rendererToken || null;
     const cached = this.settings.taskCache?.[taskId];
     if (!cached?.path) return false;
     const file = this.app.vault.getAbstractFileByPath(cached.path);
     if (!(file instanceof TFile)) return false;
-    const lines = (await this.app.vault.read(file)).split("\n");
+    const lines = (await this._admittedHostIO(rendererToken, () => this.app.vault.read(file))).split("\n");
     options.assertActive?.();
     const idx = lines.findIndex((line) => getTodoistId(line, this.settings) === taskId || (cached.oid && getTaskOid(line) === cached.oid));
     if (idx === -1) return false;
@@ -19880,16 +22138,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.cancelQueuedNoteSync(cached.path);
     this.markInternalNoteWrite(cached.path);
     options.assertActive?.();
-    await this.app.vault.modify(file, lines.join("\n"));
+    await this._admittedHostIO(rendererToken, () => this.app.vault.modify(file, lines.join("\n")));
     return true;
   }
 
-  async insertScheduledSubtaskIntoNote(item, assertActive = null) {
+  async insertScheduledSubtaskIntoNote(item, assertActive = null, rendererToken = null) {
     assertActive?.();
     if (!item?.path || !item?.parentOid) return false;
     const file = this.app.vault.getAbstractFileByPath(item.path);
     if (!(file instanceof TFile)) return false;
-    const lines = (await this.app.vault.read(file)).split("\n");
+    // Lane J: Vault reads/writes go through the admitted renderer token one
+    // call at a time; sync lookups stay read-free and direct.
+    const lines = (await this._admittedHostIO(rendererToken, () => this.app.vault.read(file))).split("\n");
     assertActive?.();
     const parentIndex = lines.findIndex((line) => getTaskOid(line) === item.parentOid || getTodoistId(line, this.settings) === item.parentId);
     if (parentIndex < 0) return false;
@@ -19920,16 +22180,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.cancelQueuedNoteSync(item.path);
     this.markInternalNoteWrite(item.path);
     assertActive?.();
-    await this.app.vault.modify(file, lines.join("\n"));
+    await this._admittedHostIO(rendererToken, () => this.app.vault.modify(file, lines.join("\n")));
     return true;
   }
 
-  async removeScheduledSubtaskFromNote(item, assertActive = null) {
+  async removeScheduledSubtaskFromNote(item, assertActive = null, rendererToken = null) {
     assertActive?.();
     if (!item?.path) return false;
     const file = this.app.vault.getAbstractFileByPath(item.path);
     if (!(file instanceof TFile)) return false;
-    const lines = (await this.app.vault.read(file)).split("\n");
+    // Lane J: Vault reads/writes go through the admitted renderer token one
+    // call at a time; sync lookups stay read-free and direct.
+    const lines = (await this._admittedHostIO(rendererToken, () => this.app.vault.read(file))).split("\n");
     assertActive?.();
     const idx = lines.findIndex((line) => (item.oid && getTaskOid(line) === item.oid) || (item.id && getTodoistId(line, this.settings) === item.id));
     if (idx < 0) return false;
@@ -19937,7 +22199,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.cancelQueuedNoteSync(item.path);
     this.markInternalNoteWrite(item.path);
     assertActive?.();
-    await this.app.vault.modify(file, lines.join("\n"));
+    await this._admittedHostIO(rendererToken, () => this.app.vault.modify(file, lines.join("\n")));
     return true;
   }
 
@@ -20050,14 +22312,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       result: { item, email, parsed, subject, receivedAt, cloudflareReceivedAt, sectionName, tasks, prepared },
       conflictPolicy: "email-item",
       validate: async (request) => request.result?.item?.id ? { ok: true } : { ok: false, conflict: { code: "email-item-missing" } },
-      apply: async (value, _request, _plugin, assertActive) => {
+      apply: async (value, _request, _plugin, assertActive, rendererToken) => {
         assertActive?.();
         this.setSidebarStatus("Syncing Todoist section...");
-        const created = await this.createTodoistTaskBatch(value.sectionName, value.tasks, value.prepared.sectionId);
+        // Lane J: Todoist, Vault, persistence, and worker waits release the
+        // admitted turn via the threaded renderer token; local status and
+        // mutation order stay on-turn and serial.
+        const created = await this.createTodoistTaskBatch(value.sectionName, value.tasks, value.prepared.sectionId, rendererToken);
         assertActive?.();
-        await this.appendEmailLog({ subject: value.subject, from: value.email.from || value.parsed.from, receivedAt: value.receivedAt, cloudflareReceivedAt: value.cloudflareReceivedAt, sectionName: value.sectionName, tasks: created, assertActive });
+        await this.appendEmailLog({ subject: value.subject, from: value.email.from || value.parsed.from, receivedAt: value.receivedAt, cloudflareReceivedAt: value.cloudflareReceivedAt, sectionName: value.sectionName, tasks: created, assertActive, rendererToken });
         assertActive?.();
-        await this.workerJson("/complete", "POST", { id: value.item.id });
+        await this.workerJson("/complete", "POST", { id: value.item.id }, rendererToken);
         return { created };
       }
     });
@@ -20080,11 +22345,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
   }
 
-  async workerJson(path, method, body) {
+  async workerJson(path, method, body, rendererToken = null) {
     if (!isHttpsUrl(this.settings.workerUrl)) {
       throw new Error("Cloudflare Worker URL must be a valid HTTPS URL.");
     }
-    const response = await requestUrl({
+    // Lane J: the worker wait releases an admitted renderer turn via
+    // rendererToken.externalWait so unrelated response targets overlap; local
+    // adoption re-enters before the response is read. No-token callers keep
+    // the direct wait.
+    const request = requestUrl({
       url: `${this.settings.workerUrl.replace(/\/+$/, "")}${path}`,
       method,
       headers: {
@@ -20094,6 +22363,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       body: body ? JSON.stringify(body) : undefined,
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Cloudflare returned ${response.status}: ${redactSecrets(response.text)}`);
     }
@@ -20350,14 +22622,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             const conflict = this.responseApplicationSourceConflict(responseSourceState, current, { requireRevision: false });
             return conflict ? { ok: false, conflict } : { ok: true };
           },
-          apply: async (applicationResult, _request, _plugin, assertActive) => {
+          apply: async (applicationResult, _request, _plugin, assertActive, rendererToken) => {
             assertActive?.();
             const file = this.app.vault.getAbstractFileByPath(active.path);
             if (!(file instanceof TFile)) throw Object.assign(new Error("Active note was not found."), { code: "target-missing" });
             assertActive?.();
             this.cancelQueuedNoteSync(active.path);
             this.markInternalNoteWrite(active.path);
-            await appendMarkdownBlock(this.app, file, applicationResult.markdown, assertActive);
+            // Lane J: Vault calls go through the admitted token one at a time;
+            // Todoist waits release the turn via the threaded token;
+            // persistence acquisition is deferred until after the turn is
+            // released; file sync threads the token to its own admitted
+            // boundaries. Local validation, mutation order, and adoption stay
+            // on-turn serial.
+            const hostIO = (call) => this._admittedHostIO(rendererToken, call);
+            const releaseWait = (promise) => rendererToken && typeof rendererToken.externalWait === "function"
+              ? rendererToken.externalWait(promise)
+              : promise;
+            await appendMarkdownBlock(this.app, file, applicationResult.markdown, assertActive, hostIO);
             assertActive?.();
             this.savePendingTaskDescriptions(active.path, applicationResult.tasks);
             this.savePendingTaskReferences(active.path, applicationResult.tasks);
@@ -20365,20 +22647,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
               assertActive?.();
               this.cancelQueuedNoteSync(active.path);
               this.setSidebarStatus("Syncing Todoist tasks...");
-              const sectionId = applicationResult.prepared.sectionId || await this.ensureTodoistSectionId(applicationResult.prepared.projectId || await this.getTaskProjectId(), applicationResult.sectionName, assertActive);
+              const sectionId = applicationResult.prepared.sectionId || await this.ensureTodoistSectionId(applicationResult.prepared.projectId || await this.getTaskProjectId(rendererToken), applicationResult.sectionName, assertActive, rendererToken);
               assertActive?.();
               assignGeneratedTaskSectionId(applicationResult.tasks, sectionId);
               this.savePendingTaskReferences(active.path, applicationResult.tasks);
               assertActive?.();
-              await this.saveSettings();
+              await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
               assertActive?.();
               this.setSidebarStatus("Syncing Todoist tasks...");
-              await delay(1000);
+              await releaseWait(delay(1000));
               assertActive?.();
-              await this.syncFileNotes(active.path, false);
+              await this.syncFileNotes(active.path, false, rendererToken);
             } else {
               assertActive?.();
-              await this.saveSettings();
+              await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
             }
             return { note: true, synced: Boolean(shouldSyncAfterInsert) };
           }
@@ -20857,14 +23139,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             const file = this.app.vault.getAbstractFileByPath(active.path);
             return file instanceof TFile ? { ok: true } : { ok: false, conflict: { code: "target-missing" } };
           },
-          apply: async (applicationResult, _request, _plugin, assertActive) => {
+          apply: async (applicationResult, _request, _plugin, assertActive, rendererToken) => {
             assertActive?.();
             const file = this.app.vault.getAbstractFileByPath(active.path);
             if (!(file instanceof TFile)) throw Object.assign(new Error("Active note was not found."), { code: "target-missing" });
             assertActive?.();
             this.cancelQueuedNoteSync(active.path);
             this.markInternalNoteWrite(active.path);
-            await appendMarkdownBlock(this.app, file, applicationResult.markdown, assertActive);
+            // Lane J: the Vault append goes through the admitted renderer
+            // token one call at a time; local checks stay on-turn serial.
+            await appendMarkdownBlock(this.app, file, applicationResult.markdown, assertActive, (call) => this._admittedHostIO(rendererToken, call));
             return { note: true, rebased: true };
           }
         });
@@ -21363,15 +23647,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return state;
   }
 
-  async getAllTodoistReferenceTasks({ force = false } = {}) {
-    const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], force);
+  async getAllTodoistReferenceTasks({ force = false, rendererToken = null } = {}) {
+    const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], force, rendererToken);
     const projects = snapshot.projects;
     const sectionsById = new Map(snapshot.sections.map((section) => [section.id, section]));
     const tasks = enrichTodoistTasksWithSnapshot(snapshot);
     return { tasks, projects, sectionsById };
   }
 
-  async getTodoistSnapshot(resourceTypes = ["items", "projects", "sections"], force = false) {
+  async getTodoistSnapshot(resourceTypes = ["items", "projects", "sections"], force = false, rendererToken = null) {
     const requested = Array.from(new Set(resourceTypes)).sort();
     const key = requested.join(",");
     const cached = this.todoistSnapshotCache;
@@ -21380,13 +23664,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const body = new URLSearchParams();
     body.set("sync_token", "*");
     body.set("resource_types", JSON.stringify(requested));
-    const response = await requestUrl({
+    // Lane J: the snapshot wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}/sync`,
       method: "POST",
       headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist snapshot returned ${response.status}: ${redactSecrets(response.text)}`);
     const json = response.json || {};
     const projects = normalizeTodoistProjects(json.projects || []);
@@ -21413,7 +23702,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.todoistSectionCache[projectId] = { fetchedAt: deviceTimestamp(), sections: list };
       }
     }
-    await this.saveSettings();
+    // Lane J: persistence acquisition is deferred until after the admitted
+    // turn is released (single deferred wait; never double-wrapped).
+    await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return snapshot;
   }
 
@@ -21424,7 +23715,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return Boolean(this.todoistSnapshotCache?.key === key && elapsedMs(this.todoistSnapshotCache.fetchedAt) < ttlMs);
   }
 
-  async syncFileNotes(path, showNotice = true) {
+  // Lane J: optional admitted renderer token threads through this response
+  // path. Vault reads/writes go through _admittedHostIO one call at a time;
+  // token-aware network/persistence waits release the turn and re-enter.
+  // No-token callers keep the direct waits. Sync lookups stay read-free.
+  async syncFileNotes(path, showNotice = true, rendererToken = null) {
     this.fileSyncInProgress = this.fileSyncInProgress || new Set();
     if (this.fileSyncInProgress.has(path)) return emptySyncStats();
     this.fileSyncInProgress.add(path);
@@ -21432,7 +23727,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     try {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return stats;
-    const original = await this.app.vault.read(file);
+    const original = await this._admittedHostIO(rendererToken, () => this.app.vault.read(file));
     const lines = original.split("\n");
     const creations = [];
     const existingUpdates = [];
@@ -21442,7 +23737,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let changed = false;
     let remoteTasksById = new Map();
     try {
-      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
+      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false, rendererToken);
       remoteTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for file sync compare", { path, error: error.message || String(error) });
@@ -21495,7 +23790,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         parsed.oid = parsed.oid || generateUniqueOid(this.settings);
         parsed.sectionId = this.pendingSectionIdForParsedTask(parsed);
         if (!parsed.isSubtask && parsed.section && !parsed.sectionId) {
-          parsed.sectionId = await this.ensureTodoistSectionId(await this.getTaskProjectId(), parsed.section);
+          parsed.sectionId = await this.ensureTodoistSectionId(await this.getTaskProjectId(rendererToken), parsed.section, null, rendererToken);
         }
         Object.assign(parsed, this.descriptionStateForParsedTask(parsed));
         creations.push(parsed);
@@ -21503,7 +23798,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
     }
 
-    const remoteRelinked = await this.relinkCreationsToExistingTodoistTasks(creations, lineToTemp);
+    const remoteRelinked = await this.relinkCreationsToExistingTodoistTasks(creations, lineToTemp, rendererToken);
     for (const parsed of remoteRelinked) {
       presentIds.add(parsed.id);
       existingUpdates.push(parsed);
@@ -21511,7 +23806,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
 
     if (creations.length) this.setSidebarStatus(`Creating ${creations.length} Todoist task${creations.length === 1 ? "" : "s"}...`);
-    const tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp);
+    const tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp, rendererToken);
     for (const parsed of relinked) {
       lines[parsed.lineNumber] = syncLocationMarkersOnTaskLine(addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid), parsed, this.settings);
       changed = true;
@@ -21563,7 +23858,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.cacheTask(parsed.id, remoteParsed || parsed);
         continue;
       }
-      const conflict = await this.todoistConflictForLocalUpdate(parsed, cached, remote);
+      const conflict = await this.todoistConflictForLocalUpdate(parsed, cached, remote, rendererToken);
       if (conflict) {
         const todoistContent = conflict.content || parsed.content;
         lines[parsed.lineNumber] = ensureSubtaskIndent(
@@ -21578,14 +23873,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.cacheTask(parsed.id, parsed);
         continue;
       }
-      const todoistUpdated = await this.updateTodoistFromParsedTask(parsed, remote);
+      const todoistUpdated = await this.updateTodoistFromParsedTask(parsed, remote, rendererToken);
       if (todoistUpdated === false) continue;
       this.cacheTask(parsed.id, parsed);
       stats.updated += 1;
     }
 
     this.setSidebarStatus("Checking removed note tasks...");
-    const removalStats = await this.deleteTodoistTasksMissingFromFile(path, presentIds);
+    const removalStats = await this.deleteTodoistTasksMissingFromFile(path, presentIds, rendererToken);
     stats.deleted = removalStats.deleted;
     stats.completedForgotten = removalStats.completedForgotten;
     const repairedSubtaskIndentation = repairSyncedSubtaskIndentationLines(lines, this.settings);
@@ -21595,9 +23890,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (changed) {
       this.markInternalNoteWrite(path);
-      await this.app.vault.modify(file, lines.join("\n"));
+      await this._admittedHostIO(rendererToken, () => this.app.vault.modify(file, lines.join("\n")));
     }
-    await this.saveSettings();
+    await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     if (showNotice) new Notice(`Synced ${creations.length + existingUpdates.length} task line${creations.length + existingUpdates.length === 1 ? "" : "s"}${stats.deleted ? ` and deleted ${stats.deleted} removed Todoist task${stats.deleted === 1 ? "" : "s"}` : ""}.`);
     return stats;
     } finally {
@@ -21605,10 +23900,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
-  async createTodoistTasksFromNote(tasks, lineToTemp) {
+  // Lane J: optional admitted renderer token threads the file-sync response
+  // path through its token-aware network waits.
+  async createTodoistTasksFromNote(tasks, lineToTemp, rendererToken = null) {
     if (!tasks.length) return {};
-    const projectId = await this.getTaskProjectId();
-    const projectName = await this.todoistProjectNameForId(projectId);
+    const projectId = await this.getTaskProjectId(rendererToken);
+    const projectName = await this.todoistProjectNameForId(projectId, rendererToken);
     const commands = [];
     const sectionRefs = new Map();
     for (const task of tasks) {
@@ -21616,7 +23913,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       task.projectName = task.projectName || projectName;
       if (task.isSubtask || !task.section) continue;
       if (sectionRefs.has(task.section)) continue;
-      sectionRefs.set(task.section, task.sectionId || this.pendingSectionIdForParsedTask(task) || await this.ensureTodoistSectionId(projectId, task.section));
+      sectionRefs.set(task.section, task.sectionId || this.pendingSectionIdForParsedTask(task) || await this.ensureTodoistSectionId(projectId, task.section, null, rendererToken));
     }
     for (const task of tasks) {
       const parent = findParentForTask(task, lineToTemp, this.settings);
@@ -21635,7 +23932,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       rootTasks: tasks.filter((task) => !task.isSubtask).length,
       sections: Array.from(sectionRefs.entries()).map(([name, id]) => ({ name, id }))
     });
-    const response = await this.todoistSync(commands);
+    const response = await this.todoistSync(commands, rendererToken);
     const mapping = response.temp_id_mapping || {};
     for (const parsed of tasks) {
       if (mapping[parsed.tempId]) parsed.id = mapping[parsed.tempId];
@@ -21643,15 +23940,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return mapping;
   }
 
-  async relinkCreationsToExistingTodoistTasks(creations, lineToTemp) {
+  // Lane J: optional admitted renderer token threads the file-sync response
+  // path through its token-aware network waits.
+  async relinkCreationsToExistingTodoistTasks(creations, lineToTemp, rendererToken = null) {
     if (!creations.length) return [];
     let existing = [];
     try {
-      const remote = await this.getAllTodoistReferenceTasks({ force: false });
+      const remote = await this.getAllTodoistReferenceTasks({ force: false, rendererToken });
       existing = remote.tasks.filter((task) => !task.isCompleted);
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for relink check", { error: error.message || String(error) });
-      existing = (await this.getTodoistProjectTasks(await this.getTaskProjectId())).filter((task) => !task.isCompleted);
+      existing = (await this.getTodoistProjectTasks(await this.getTaskProjectId(rendererToken), rendererToken)).filter((task) => !task.isCompleted);
     }
     if (!existing.length) return [];
     const relinked = [];
@@ -21673,31 +23972,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return relinked.reverse();
   }
 
-  async getTodoistProjectTasks(projectId) {
+  async getTodoistProjectTasks(projectId, rendererToken = null) {
     if (!projectId) return [];
     const cached = this.todoistSnapshotCache;
     const ttlMs = Math.max(1, Number(this.settings.todoistSnapshotCacheMinutes || 5)) * 60 * 1000;
     if (cached?.snapshot?.tasks && elapsedMs(cached.fetchedAt) < ttlMs) {
       return cached.snapshot.tasks.filter((task) => String(task.projectId || "") === String(projectId));
     }
-    const response = await this.todoistRequest(`/tasks?project_id=${encodeURIComponent(projectId)}`).catch(() => []);
+    const response = await this.todoistRequest(`/tasks?project_id=${encodeURIComponent(projectId)}`, "GET", undefined, rendererToken).catch(() => []);
     const tasks = Array.isArray(response) ? response : response.results || [];
     return tasks.map(normalizeTodoistTask).filter((task) => task.id && task.content);
   }
 
-  async createTodoistTaskBatch(sectionName, tasks, existingSectionId = "") {
+  async createTodoistTaskBatch(sectionName, tasks, existingSectionId = "", rendererToken = null) {
     const activeApplication = this.responseApplicationActiveItem;
     if (activeApplication?.request?.kind === "email-task-application") {
       activeApplication.guard?.();
-      return this._createTodoistTaskBatchNow(sectionName, tasks, existingSectionId, activeApplication.guard, activeApplication.request.result?.prepared?.projectId, activeApplication.request.result?.prepared?.projectName);
+      return this._createTodoistTaskBatchNow(sectionName, tasks, existingSectionId, activeApplication.guard, activeApplication.request.result?.prepared?.projectId, activeApplication.request.result?.prepared?.projectName, rendererToken);
     }
     const taskIds = uniqueValues(flattenTaskPlan(tasks || []).map((task) => String(task?.id || "")).filter(Boolean));
     const firstTask = flattenTaskPlan(tasks || [])[0] || {};
-    const projectId = firstTask.projectId || (tasks?.length ? await this.getTaskProjectId() : "");
-    const projectName = firstTask.projectName || (projectId ? await this.todoistProjectNameForId(projectId) : "");
+    const projectId = firstTask.projectId || (tasks?.length ? await this.getTaskProjectId(rendererToken) : "");
+    const projectName = firstTask.projectName || (projectId ? await this.todoistProjectNameForId(projectId, rendererToken) : "");
     let existingSnapshotFingerprint = "";
     if (taskIds.length) {
-      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+      const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true, rendererToken);
       existingSnapshotFingerprint = this.responseApplicationRemoteSnapshotFingerprint(snapshot, taskIds);
     }
     const application = await this.enqueueResponseApplication({
@@ -21706,27 +24005,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       target: { kind: "todoist-task-set", key: taskIds.length ? `todoist-task-set:${taskIds.join(",")}` : `todoist-section:${singleLine(sectionName)}`, taskIds },
       result: { sectionName, tasks, existingSectionId, taskIds, existingSnapshotFingerprint, projectId, projectName },
       conflictPolicy: "remote-task-state",
-      validate: async (request) => {
+      validate: async (request, _plugin, rendererToken) => {
         const value = request.result || {};
         if (!value.existingSnapshotFingerprint || !value.taskIds.length) return { ok: true };
-        const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+        // Lane J: the snapshot wait releases the admitted turn via the
+        // threaded renderer token.
+        const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], true, rendererToken);
         const current = this.responseApplicationRemoteSnapshotFingerprint(snapshot, value.taskIds);
         return current === value.existingSnapshotFingerprint ? { ok: true } : { ok: false, conflict: { code: "remote-task-snapshot-changed" } };
       },
-      apply: (value, _request, _plugin, assertActive) => this._createTodoistTaskBatchNow(value.sectionName, value.tasks, value.existingSectionId, assertActive, value.projectId, value.projectName)
+      apply: (value, _request, _plugin, assertActive, rendererToken) => this._createTodoistTaskBatchNow(value.sectionName, value.tasks, value.existingSectionId, assertActive, value.projectId, value.projectName, rendererToken)
     });
     if (application.status === "applied") return application.sideEffects || [];
     return application;
   }
 
-  async _createTodoistTaskBatchNow(sectionName, tasks, existingSectionId = "", assertActive = null, suppliedProjectId = "", suppliedProjectName = "") {
+  async _createTodoistTaskBatchNow(sectionName, tasks, existingSectionId = "", assertActive = null, suppliedProjectId = "", suppliedProjectName = "", rendererToken = null) {
     if (!tasks.length) return [];
     assertActive?.();
-    const projectId = suppliedProjectId || await this.getTaskProjectId();
+    // Lane J: Todoist network waits release the admitted turn via the
+    // threaded renderer token; command building stays local and serial.
+    const projectId = suppliedProjectId || await this.getTaskProjectId(rendererToken);
     assertActive?.();
-    const projectName = suppliedProjectName || await this.todoistProjectNameForId(projectId);
+    const projectName = suppliedProjectName || await this.todoistProjectNameForId(projectId, rendererToken);
     const taskTemps = [];
-    const sectionId = existingSectionId || await this.ensureTodoistSectionId(projectId, sectionName, assertActive);
+    const sectionId = existingSectionId || await this.ensureTodoistSectionId(projectId, sectionName, assertActive, rendererToken);
     assertActive?.();
     assignGeneratedTaskSectionId(tasks, sectionId);
     const commands = [];
@@ -21765,7 +24068,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     if (commands.length) {
       assertActive?.();
-      const response = await this.todoistSync(commands);
+      const response = await this.todoistSync(commands, rendererToken);
       assertActive?.();
       for (const item of taskTemps) if (response.temp_id_mapping?.[item.tempId]) item.task.id = response.temp_id_mapping[item.tempId];
     }
@@ -21773,14 +24076,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let remoteById = new Map();
       try {
         assertActive?.();
-        const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
+        // Lane J: the dedupe snapshot wait releases the admitted turn via the
+        // threaded renderer token.
+        const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false, rendererToken);
         remoteById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
       } catch (error) {
         this.logLocal("Todoist snapshot unavailable for dedupe update compare", { error: error.message || String(error) });
       }
       for (const task of existingUpdates) {
         assertActive?.();
-        await this.updateTodoistFromParsedTask(task, remoteById.get(task.id) || null);
+        await this.updateTodoistFromParsedTask(task, remoteById.get(task.id) || null, rendererToken);
       }
     }
     return tasks;
@@ -22070,15 +24375,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return state;
     }
     if (!(this.taskDeduplicationEmbeddingCache instanceof Map)) this.taskDeduplicationEmbeddingCache = new Map();
-    const productionRoutingState = await this.ensureProductionSemanticRoutingState({
-      chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-      settings: this.settings,
-      revision: state.indexRevision,
-      storageFingerprint: this.semanticIndexStorageFingerprint || "",
-      allowLoad: true,
-      allowBuild: false,
-      persist: false
-    });
+    // Lane E: dedupe routing consumes the already-active prepared reference
+    // when it satisfies the complete expected identity. Retrieval never
+    // loads or builds routing state; without a compatible active state the
+    // request degrades visibly instead of preparing inline.
+    const dedupeReady = this.isRetrievalReady(semanticExpectedRetrievalIdentity(this));
+    const productionRoutingState = (dedupeReady.ready && dedupeReady.ref && dedupeReady.ref.routingState) || null;
     if (!productionRoutingState) {
       state.degraded = true;
       state.reason = this.productionSemanticRoutingTelemetry?.reasonCode || "local-warmup-required";
@@ -22521,9 +24823,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parentTask.subtasks = nextSubtasks;
   }
 
-  async ensureTodoistSectionId(projectId, sectionName, assertActive = null) {
+  async ensureTodoistSectionId(projectId, sectionName, assertActive = null, rendererToken = null) {
     assertActive?.();
-    const existing = await this.resolveTodoistSectionId(projectId, sectionName, assertActive);
+    const existing = await this.resolveTodoistSectionId(projectId, sectionName, assertActive, rendererToken);
     if (existing) return existing;
     assertActive?.();
     const tempId = uuid();
@@ -22532,40 +24834,44 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       temp_id: tempId,
       uuid: uuid(),
       args: { project_id: projectId, name: sectionName }
-    }]);
+    }], rendererToken);
     assertActive?.();
     const sectionId = response.temp_id_mapping?.[tempId] || "";
     if (!sectionId) throw new Error(`Todoist section could not be created: ${sectionName}`);
     this.rememberTodoistSection(projectId, sectionName, sectionId);
     assertActive?.();
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return sectionId;
   }
 
-  async resolveTodoistSectionId(projectId, sectionName, assertActive = null) {
+  async resolveTodoistSectionId(projectId, sectionName, assertActive = null, rendererToken = null) {
     const name = singleLine(sectionName);
     if (!projectId || !name) return "";
     const key = sectionKey(name);
-    let sections = await this.getTodoistSections(projectId, false, assertActive);
+    let sections = await this.getTodoistSections(projectId, false, assertActive, rendererToken);
     let match = sections.find((section) => sectionKey(section.name) === key);
     if (!match) {
-      sections = await this.getTodoistSections(projectId, true, assertActive);
+      sections = await this.getTodoistSections(projectId, true, assertActive, rendererToken);
       match = sections.find((section) => sectionKey(section.name) === key);
     }
     return match?.id || "";
   }
 
-  async getTodoistSections(projectId, force = false, assertActive = null) {
+  async getTodoistSections(projectId, force = false, assertActive = null, rendererToken = null) {
     assertActive?.();
     this.settings.todoistSectionCache = this.settings.todoistSectionCache || {};
     const cached = this.settings.todoistSectionCache[projectId];
     if (!force && cached?.sections && elapsedMs(cached.fetchedAt) < 10 * 60 * 1000) return cached.sections;
-    const sectionsJson = await this.todoistRequest(`/sections?project_id=${encodeURIComponent(projectId)}`);
+    const sectionsJson = await this.todoistRequest(`/sections?project_id=${encodeURIComponent(projectId)}`, "GET", undefined, rendererToken);
     assertActive?.();
     const sections = normalizeTodoistSections(Array.isArray(sectionsJson) ? sectionsJson : sectionsJson.results || [], projectId);
     this.settings.todoistSectionCache[projectId] = { fetchedAt: deviceTimestamp(), sections };
     assertActive?.();
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return sections;
   }
 
@@ -22590,16 +24896,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.todoistSectionCache[projectId] = { fetchedAt: deviceTimestamp(), sections };
   }
 
-  async todoistSync(commands) {
+  async todoistSync(commands, rendererToken = null) {
     const body = new URLSearchParams();
     body.set("commands", JSON.stringify(commands));
-    const response = await requestUrl({
+    // Lane J: the sync wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}/sync`,
       method: "POST",
       headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist sync returned ${response.status}: ${redactSecrets(response.text)}`);
     const failed = response.json.sync_status && Object.entries(response.json.sync_status).find(([, status]) => status !== "ok");
     if (failed) throw new Error(`Todoist command failed: ${JSON.stringify(failed)}`);
@@ -22607,33 +24918,43 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return response.json;
   }
 
-  async todoistRequest(path, method = "GET", body) {
-    const response = await requestUrl({
+  async todoistRequest(path, method = "GET", body, rendererToken = null) {
+    // Lane J: the request wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}${path}`,
       method,
       headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/json" },
       body: body ? JSON.stringify(body) : undefined,
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist returned ${response.status}: ${redactSecrets(response.text)}`);
     if (String(method || "GET").toUpperCase() !== "GET") this.todoistSnapshotCache = null;
     return response.json;
   }
 
-  async deleteTodoistTask(taskId) {
-    const response = await requestUrl({
+  async deleteTodoistTask(taskId, rendererToken = null) {
+    // Lane J: the delete wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}/tasks/${taskId}`,
       method: "DELETE",
       headers: { authorization: `Bearer ${this.settings.todoistToken}` },
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status === 404) return true;
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist delete returned ${response.status}: ${redactSecrets(response.text)}`);
     this.todoistSnapshotCache = null;
     return true;
   }
 
-  async deleteTodoistTasksMissingFromFile(path, presentIds) {
+  async deleteTodoistTasksMissingFromFile(path, presentIds, rendererToken = null) {
     let deleted = 0;
     let forgotCompleted = 0;
     const deletedSections = new Map();
@@ -22645,7 +24966,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         forgotCompleted += 1;
         continue;
       }
-      const ok = await this.deleteTodoistTask(id).catch((error) => {
+      const ok = await this.deleteTodoistTask(id, rendererToken).catch((error) => {
         this.logLocal("Todoist delete failed", { id, path, error: error.message || String(error) });
         return false;
       });
@@ -22662,16 +24983,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (deleted || forgotCompleted) this.markTaskReferenceStateDirty();
     if (forgotCompleted) this.logLocal("Completed note task references forgotten after local line removal", { path, tasks: forgotCompleted });
-    if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()));
+    if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()), rendererToken);
     return { deleted, completedForgotten: forgotCompleted };
   }
 
-  async cleanupEmptyTodoistSections(sections) {
+  async cleanupEmptyTodoistSections(sections, rendererToken = null) {
     const candidates = uniqueSectionCleanupCandidates(sections);
     if (!candidates.length) return 0;
     let snapshot = null;
     try {
-      snapshot = await this.getTodoistSnapshot(["items", "sections"], true);
+      snapshot = await this.getTodoistSnapshot(["items", "sections"], true, rendererToken);
     } catch (error) {
       this.logLocal("Todoist section cleanup skipped", { error: error.message || String(error) });
       return 0;
@@ -22684,7 +25005,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (hasLocalTasks) continue;
       const hasRemoteTasks = (snapshot.tasks || []).some((task) => String(task.sectionId || "") === String(section.sectionId));
       if (hasRemoteTasks) continue;
-      const ok = await this.deleteTodoistSection(section.sectionId).catch((error) => {
+      const ok = await this.deleteTodoistSection(section.sectionId, rendererToken).catch((error) => {
         this.logLocal("Todoist section delete failed", { sectionId: section.sectionId, section: section.section || "", error: error.message || String(error) });
         return false;
       });
@@ -22696,14 +25017,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return deleted;
   }
 
-  async deleteTodoistSection(sectionId) {
+  async deleteTodoistSection(sectionId, rendererToken = null) {
     if (!sectionId) return false;
-    const response = await requestUrl({
+    // Lane J: the delete wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}/sections/${encodeURIComponent(sectionId)}`,
       method: "DELETE",
       headers: { authorization: `Bearer ${this.settings.todoistToken}` },
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status === 404) return true;
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist section delete returned ${response.status}: ${redactSecrets(response.text)}`);
     this.todoistSnapshotCache = null;
@@ -22811,28 +25137,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return noteTouched;
   }
 
-  async getInboxProjectId() {
+  async getInboxProjectId(rendererToken = null) {
     if (this.settings.todoistInboxProjectId) return this.settings.todoistInboxProjectId;
-    const projects = await this.getTodoistProjects();
+    const projects = await this.getTodoistProjects(rendererToken);
     const inbox = projects.find((project) => project.isInbox) ||
       projects.find((project) => String(project.name || "").toLowerCase() === "inbox");
     if (!inbox) throw new Error("Todoist Inbox project was not found.");
     this.settings.todoistInboxProjectId = inbox.id;
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return inbox.id;
   }
 
-  async getTaskProjectId() {
+  async getTaskProjectId(rendererToken = null) {
     if (this.settings.todoistTaskProjectId) return this.settings.todoistTaskProjectId;
-    const inboxId = await this.getInboxProjectId();
+    const inboxId = await this.getInboxProjectId(rendererToken);
     this.settings.todoistTaskProjectId = inboxId;
     this.settings.todoistTaskProjectName = this.settings.todoistTaskProjectName || "Inbox";
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return inboxId;
   }
 
-  async getTodoistProjects() {
-    const projectsJson = await this.todoistRequest("/projects");
+  async getTodoistProjects(rendererToken = null) {
+    const projectsJson = await this.todoistRequest("/projects", "GET", undefined, rendererToken);
     const projects = normalizeTodoistProjects(Array.isArray(projectsJson) ? projectsJson : projectsJson.results || []);
     this.settings.availableTodoistProjects = projects;
     this.settings.todoistProjectsFetchedAt = deviceTimestamp();
@@ -22844,7 +25174,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.todoistTaskProjectName = inbox.name;
       }
     }
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return projects;
   }
 
@@ -22861,34 +25193,39 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (showNotice) new Notice(`Loaded ${projects.length} Todoist project${projects.length === 1 ? "" : "s"}.`);
   }
 
-  async updateTodoistFromParsedTask(task, remote = null) {
+  async updateTodoistFromParsedTask(task, remote = null, rendererToken = null) {
     const cached = this.settings.taskCache?.[task.id] || null;
     const cachedCompleted = Boolean(cached?.isCompleted);
     const remoteCompleted = remote ? Boolean(remote.isCompleted) : cachedCompleted;
     if (task.isCompleted) {
       if (!remoteCompleted) {
-        await this.setTodoistTaskCompletionState(task.id, true);
+        await this.setTodoistTaskCompletionState(task.id, true, rendererToken);
       }
       return true;
     }
     if (remoteCompleted) {
-      const reopened = await this.setTodoistTaskCompletionState(task.id, false);
+      const reopened = await this.setTodoistTaskCompletionState(task.id, false, rendererToken);
       if (!reopened) return false;
       remote = null;
     }
     const updates = todoistUpdatePayload(task, remote, this.settings);
-    if (Object.keys(updates).length) await this.todoistRequest(`/tasks/${task.id}`, "POST", updates);
+    if (Object.keys(updates).length) await this.todoistRequest(`/tasks/${task.id}`, "POST", updates, rendererToken);
     return true;
   }
 
-  async setTodoistTaskCompletionState(taskId, completed) {
+  async setTodoistTaskCompletionState(taskId, completed, rendererToken = null) {
     const endpoint = completed ? "close" : "reopen";
-    const response = await requestUrl({
+    // Lane J: the completion wait releases an admitted renderer turn via
+    // rendererToken.externalWait; no-token callers keep the direct wait.
+    const request = requestUrl({
       url: `${TODOIST_API}/tasks/${encodeURIComponent(taskId)}/${endpoint}`,
       method: "POST",
       headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/json" },
       throw: false
     });
+    const response = rendererToken && typeof rendererToken.externalWait === "function"
+      ? await rendererToken.externalWait(request)
+      : await request;
     if (response.status === 404) {
       this.logLocal("Todoist completion update skipped because task was not found", { id: taskId, completed });
       return false;
@@ -22898,9 +25235,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return true;
   }
 
-  async todoistConflictForLocalUpdate(parsed, cached, remoteOverride = null) {
+  async todoistConflictForLocalUpdate(parsed, cached, remoteOverride = null, rendererToken = null) {
     if (!cached || !parsed?.id) return null;
-    const remote = remoteOverride || await this.todoistRequest(`/tasks/${parsed.id}`).catch(() => null);
+    const remote = remoteOverride || await this.todoistRequest(`/tasks/${parsed.id}`, "GET", undefined, rendererToken).catch(() => null);
     if (!remote) return null;
     const remoteContent = singleLine(remote.content || "");
     const cachedContent = singleLine(cached.content || "");
@@ -22992,11 +25329,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.cacheTask(taskId, parsed);
   }
 
-  async todoistProjectNameForId(projectId) {
+  async todoistProjectNameForId(projectId, rendererToken = null) {
     if (!projectId) return "";
     let project = (this.settings.availableTodoistProjects || []).find((item) => String(item.id) === String(projectId));
     if (project) return project.name || "";
-    const projects = await this.getTodoistProjects().catch(() => []);
+    const projects = await this.getTodoistProjects(rendererToken).catch(() => []);
     project = projects.find((item) => String(item.id) === String(projectId));
     return project?.name || "";
   }
@@ -23216,11 +25553,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return "";
   }
 
-  async cacheLoggedTasks(path, tasks, sectionName, assertActive = null) {
+  async cacheLoggedTasks(path, tasks, sectionName, assertActive = null, rendererToken = null) {
     assertActive?.();
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return 0;
-    const lines = (await this.app.vault.read(file)).split("\n");
+    // Lane J: the Vault read goes through the admitted renderer token one
+    // call at a time; the sync lookup above stays read-free and direct.
+    const lines = (await this._admittedHostIO(rendererToken, () => this.app.vault.read(file))).split("\n");
     const byId = new Map();
     const byOid = new Map();
     let cached = 0;
@@ -23264,14 +25603,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       cached += 1;
     }
     assertActive?.();
-    await this.saveSettings();
+      // Lane J: persistence acquisition is deferred until after the admitted
+      // turn is released (single deferred wait; never double-wrapped).
+      await this._deferredPersistenceWait(rendererToken, () => this.saveSettings());
     return cached;
   }
 
-  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks, assertActive = null }) {
+  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks, assertActive = null, rendererToken = null }) {
     assertActive?.();
+    // Lane J: the admitted renderer token routes Vault calls one at a time;
+    // persistence acquisition is deferred until after the turn is released
+    // and file sync threads the token to its own admitted boundaries; sync
+    // lookups stay read-free and direct.
+    const hostIO = (call) => this._admittedHostIO(rendererToken, call);
     const folder = trimSlashes(this.settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder);
-    await ensureVaultFolder(this.app, folder);
+    await ensureVaultFolder(this.app, folder, hostIO);
     assertActive?.();
     const noteTitle = emailTaskNoteTitle(receivedAt, subject);
     const path = uniqueMarkdownPath(this.app, folder, noteTitle);
@@ -23298,13 +25644,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!tasks?.length) lines.push("- No actionable tasks were found.");
     assertActive?.();
     this.markInternalNoteWrite(path);
-    await this.app.vault.create(path, `${lines.join("\n")}\n`);
+    await this._admittedHostIO(rendererToken, () => this.app.vault.create(path, `${lines.join("\n")}\n`));
     assertActive?.();
-    const cached = await this.cacheLoggedTasks(path, tasks || [], sectionName, assertActive);
+    const cached = await this.cacheLoggedTasks(path, tasks || [], sectionName, assertActive, rendererToken);
     let syncStats = emptySyncStats();
     try {
       assertActive?.();
-      syncStats = await this.syncFileNotes(path, false);
+      syncStats = await this.syncFileNotes(path, false, rendererToken);
     } catch (error) {
       this.logLocal("Email task note sync initialization failed", { path, error: error.message || String(error) });
     }
@@ -23353,6 +25699,11 @@ class SemanticTodoistView extends ItemView {
   }
 
   render() {
+    // Lane J control rendering path: synchronous, already-computed DOM paint
+    // only (status/cancellation display). No Vault/API read, corpus
+    // formatting, queue scheduling, logical lock, heavy continuation, or
+    // renderer-token turn may be placed here; async context loads go through
+    // getSelectedActiveContext/getActiveMarkdownContext instead.
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("semantic-todoist-view");
@@ -27600,6 +29951,201 @@ function semanticIndexProviderSafeFileName(name, manifestFile = "") {
   return value === SEMANTIC_INDEX_PATH_META_FILE || isSemanticIndexPathMetaGenerationFile(value) || semanticIndexProviderRoutingFile(value);
 }
 
+async function cleanupSettledSemanticIndexStorage(plugin, activePartition = {}, activeManifestMeta = {}) {
+  const adapter = plugin?.app?.vault?.adapter;
+  const ceiling = 100 * 1024 * 1024;
+  const result = {
+    settledBytes: null,
+    initialSettledBytes: null,
+    removedPartitions: 0,
+    removedFiles: 0,
+    errors: [],
+    degraded: false,
+    degradedPhase: "",
+    ready: false
+  };
+  const hostIO = (operation) => typeof plugin?._persistenceHostIO === "function" ? plugin._persistenceHostIO(operation) : operation();
+  const recordError = (phase, code, message = "", path = "") => {
+    const entry = { phase: String(phase || "settled-cleanup"), code: String(code || "cleanup-failed").slice(0, 80) };
+    if (path) entry.path = String(path).slice(-160);
+    if (message) entry.message = String(message).slice(0, 240);
+    result.errors.push(entry);
+    if (!result.degradedPhase) result.degradedPhase = entry.phase;
+  };
+  const normalizeRelativePartition = (value) => {
+    const raw = String(value || "").replace(/\\/g, "/");
+    const parts = raw.split("/");
+    if (parts.length !== 3 || parts[0] !== SEMANTIC_INDEX_PARTITION_ROOT) return null;
+    const provider = String(parts[1] || "").toLowerCase();
+    if (!SEMANTIC_INDEX_PARTITION_PROVIDERS.includes(provider)) return null;
+    const identity = semanticIndexProviderIdentityName(parts[2]);
+    if (!identity || identity !== parts[2]) return null;
+    return Object.freeze({ provider, identity, relativeDir: parts.join("/") });
+  };
+  const activePath = normalizeRelativePartition(activePartition?.relativeDir);
+  const metaPath = normalizeRelativePartition(activeManifestMeta?.partitionRelativeDir);
+  const activeIdentityHash = String(activePartition?.identityHash || "").trim().toLowerCase();
+  const manifestIdentityHash = String(activeManifestMeta?.partitionIdentityHash || "").trim().toLowerCase();
+  if (!activePath || !metaPath || activePath.relativeDir !== metaPath.relativeDir
+      || (activeIdentityHash && activeIdentityHash !== activePath.identity.toLowerCase())
+      || (manifestIdentityHash && manifestIdentityHash !== activePath.identity.toLowerCase())) {
+    recordError("active-identity", "active-partition-unresolved", "The committed active partition identity was empty, malformed, or inconsistent.");
+  }
+  const rootDir = `${String(plugin?.manifest?.dir || "").replace(/\/+$/, "")}/${SEMANTIC_INDEX_PARTITION_ROOT}`;
+  const resolveChild = (dir, value) => {
+    const text = String(value || "");
+    const prefix = `${String(dir || "").replace(/\/+$/, "")}/`;
+    return text.startsWith(prefix) ? text : `${prefix}${text.replace(/^\/+/, "")}`;
+  };
+  const listDirectory = async (dir, phase) => {
+    if (!adapter?.list) {
+      recordError(phase, "adapter-list-unavailable");
+      return null;
+    }
+    try { return await hostIO(() => adapter.list(dir)); }
+    catch (error) {
+      recordError(phase, String(error?.code || "list-failed"), error?.message || String(error), dir);
+      return null;
+    }
+  };
+  const measureRoot = async () => {
+    const walk = async (dir) => {
+      const listed = await listDirectory(dir, "settled-verify");
+      if (!listed) throw new Error("settled-root-list-failed");
+      let total = 0;
+      for (const value of listed.files || []) {
+        const filePath = resolveChild(dir, value);
+        if (typeof adapter.stat === "function") {
+          try {
+            total += Math.max(0, Number((await hostIO(() => adapter.stat(filePath)))?.size || 0));
+            continue;
+          } catch {}
+        }
+        if (typeof adapter.read !== "function") throw new Error("settled-root-file-read-unavailable");
+        try { total += utf8ByteLength(await hostIO(() => adapter.read(filePath))); }
+        catch (error) { throw Object.assign(new Error(error?.message || String(error)), { code: String(error?.code || "settled-root-read-failed") }); }
+      }
+      const folders = Array.from(listed.folders || []).map((value) => resolveChild(dir, value)).sort((a, b) => a.localeCompare(b));
+      for (const folder of folders) total += await walk(folder);
+      return total;
+    };
+    return walk(rootDir);
+  };
+  let rootBytes;
+  try { rootBytes = await measureRoot(); result.initialSettledBytes = rootBytes; }
+  catch (error) {
+    recordError("settled-verify", String(error?.code || "settled-root-measure-failed"), error?.message || String(error));
+    result.degraded = true;
+    result.settledBytes = null;
+    return result;
+  }
+  result.settledBytes = rootBytes;
+  if (activePath && metaPath && activePath.relativeDir === metaPath.relativeDir && !result.errors.length) {
+    const activeDir = `${String(plugin.manifest.dir || "").replace(/\/+$/, "")}/${activePath.relativeDir}`;
+    const linkedFile = String(activeManifestMeta.routingFile || "").trim();
+    const linkedGeneration = String(activeManifestMeta.routingGeneration || "").trim();
+    const generation = String(activeManifestMeta.generation || "").trim();
+    const currentLinked = Number(activeManifestMeta.persistenceSchemaVersion || 0) >= SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION
+      && linkedFile && linkedGeneration && generation && linkedGeneration === generation;
+    if (currentLinked) {
+      const stableName = LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE;
+      const listed = await listDirectory(activeDir, "stable-routing-cleanup");
+      if (listed) {
+        const hasStable = (listed.files || []).some((value) => String(value) === stableName || String(value).endsWith(`/${stableName}`));
+        if (hasStable) {
+          try { await hostIO(() => adapter.remove(`${activeDir}/${stableName}`)); }
+          catch (error) { recordError("stable-routing-cleanup", String(error?.code || "stable-routing-remove-failed"), error?.message || String(error), stableName); }
+        }
+      }
+    } else {
+      recordError("stable-routing-cleanup", "current-routing-link-missing");
+    }
+  }
+  try { rootBytes = await measureRoot(); result.settledBytes = rootBytes; }
+  catch (error) {
+    recordError("settled-verify", String(error?.code || "settled-root-measure-failed"), error?.message || String(error));
+    result.degraded = true;
+    return result;
+  }
+  if (result.errors.length) {
+    result.degraded = true;
+  } else if (rootBytes >= ceiling) {
+    const rootListed = await listDirectory(rootDir, "inactive-enumeration");
+    if (!rootListed) result.degraded = true;
+    else {
+      const directRootFiles = (rootListed.files || []).map((value) => String(value || "")).filter(Boolean);
+      if (directRootFiles.length) recordError("inactive-enumeration", "unknown-root-files", "Unknown direct files under the semantic-index root are preserved.");
+      const providerNames = new Set();
+      for (const value of rootListed.folders || []) {
+        const name = semanticIndexProviderChildName(rootDir, value);
+        if (!name || !SEMANTIC_INDEX_PARTITION_PROVIDERS.includes(name.toLowerCase())) recordError("inactive-enumeration", "unknown-provider-folder");
+        else providerNames.add(name.toLowerCase());
+      }
+      for (const provider of Array.from(providerNames).sort()) {
+        const providerDir = `${rootDir}/${provider}`;
+        const providerListed = await listDirectory(providerDir, "inactive-enumeration");
+        if (!providerListed) continue;
+        if ((providerListed.files || []).length) recordError("inactive-enumeration", "unknown-provider-files");
+        const identities = [];
+        for (const value of providerListed.folders || []) {
+          const name = semanticIndexProviderIdentityName(semanticIndexProviderChildName(providerDir, value));
+          if (!name) { recordError("inactive-enumeration", "unknown-identity-folder"); continue; }
+          identities.push(name);
+        }
+        for (const identity of Array.from(new Set(identities)).sort()) {
+          const relativeDir = `${SEMANTIC_INDEX_PARTITION_ROOT}/${provider}/${identity}`;
+          if (activePath && relativeDir === activePath.relativeDir) continue;
+          const inspected = await inspectSemanticIndexProviderPartition(plugin, provider, identity);
+          const partitionDir = `${rootDir}/${provider}/${identity}`;
+          const listedPartition = await listDirectory(partitionDir, "inactive-inspection");
+          const hasNested = Boolean(listedPartition?.folders?.length);
+          const unknownFiles = (inspected.files || []).filter((name) => !semanticIndexProviderSafeFileName(name, inspected.manifestFile));
+          let manifestMeta = null;
+          if (inspected.manifestFile && adapter.read) {
+            try { manifestMeta = JSON.parse(await hostIO(() => adapter.read(`${partitionDir}/${inspected.manifestFile}`)))?.meta || null; } catch {}
+          }
+          let validIdentity = Boolean(inspected.manifestFile && manifestMeta);
+          if (validIdentity) {
+            const manifestProvider = semanticIndexPartitionProvider(manifestMeta.provider || "");
+            const manifestIdentity = String(manifestMeta.partitionIdentityHash || "").toLowerCase();
+            validIdentity = manifestProvider === provider
+              && String(manifestMeta.partitionRelativeDir || "") === relativeDir
+              && manifestIdentity === identity.toLowerCase();
+          }
+          if (!inspected.complete || hasNested || unknownFiles.length || !validIdentity) {
+            recordError("inactive-inspection", !validIdentity ? "inactive-partition-unresolved" : hasNested ? "nested-partition-content" : unknownFiles.length ? "unknown-direct-files" : "inactive-partition-inspection-failed", "Questionable inactive partition is preserved.", relativeDir);
+            continue;
+          }
+          for (const name of inspected.files) {
+            if (!semanticIndexProviderSafeFileName(name, inspected.manifestFile)) continue;
+            try {
+              await hostIO(() => adapter.remove(`${partitionDir}/${name}`));
+              result.removedFiles += 1;
+            } catch (error) {
+              recordError("inactive-cleanup", String(error?.code || "inactive-remove-failed"), error?.message || String(error), relativeDir);
+            }
+          }
+          const after = await listDirectory(partitionDir, "inactive-cleanup");
+          if (after && !(after.files || []).length && !(after.folders || []).length) {
+            if (typeof adapter.rmdir === "function") {
+              try { await hostIO(() => adapter.rmdir(partitionDir, false)); result.removedPartitions += 1; }
+              catch (error) { recordError("inactive-cleanup", String(error?.code || "partition-remove-failed"), error?.message || String(error), relativeDir); }
+            }
+          }
+        }
+      }
+    }
+  }
+  try { result.settledBytes = await measureRoot(); }
+  catch (error) { recordError("settled-verify", String(error?.code || "settled-root-measure-failed"), error?.message || String(error)); }
+  result.degraded = result.degraded || result.errors.length > 0 || result.settledBytes === null || result.settledBytes >= ceiling;
+  if (result.settledBytes !== null && result.settledBytes >= ceiling && !result.errors.some((entry) => entry.code === "settled-over-budget")) {
+    recordError("settled-verify", "settled-over-budget", `Settled semantic-index storage is ${result.settledBytes} bytes (budget ${ceiling}).`);
+  }
+  result.ready = result.settledBytes !== null && result.settledBytes < ceiling && !result.errors.length;
+  return result;
+}
+
 function semanticIndexProviderStorageSummaryText(row = {}) {
   if (!row.hasIndex) return "No local index retained.";
   const manifest = row.manifestFile ? `Manifest: ${row.manifestFile}.` : "Manifest: unavailable.";
@@ -29223,13 +31769,211 @@ function buildDescriptionProviderEnvelope(contract = {}, options = {}) {
   if (!contract || typeof contract !== "object") throw new Error("contract required");
   const cachePrefix = options.cachePrefix === undefined || options.cachePrefix === null ? "TASK_DESCRIPTION_STABLE_PREFIX_v1" : String(options.cachePrefix);
   const repairReasonCode = options.repairReasonCode == null ? "" : String(options.repairReasonCode).trim();
-  const taskLocalSuffix = taskDescriptionPromptContextSuffix({}, { singletonContract: contract });
+  const omittedOptionalEvidenceIds = uniqueValues((options.omittedOptionalEvidenceIds || []).map(String).filter(Boolean));
+  const taskLocalSuffix = taskDescriptionPromptContextSuffix({}, { singletonContract: contract, omittedOptionalEvidenceIds });
   const projectionHash = String(contract.projectionHash || contract.contractHash || "");
   if (!projectionHash) throw new Error("contract projectionHash missing");
   const envelopeHash = taskWorkflowHash({ projectionHash: projectionHash, cachePrefixHash: taskWorkflowHash(cachePrefix), suffixHash: taskWorkflowHash(taskLocalSuffix), repairReasonCode: repairReasonCode });
   const inputBytes = typeof Buffer !== "undefined" && Buffer.byteLength ? Buffer.byteLength(cachePrefix + "\n" + taskLocalSuffix + (repairReasonCode ? "\n" + repairReasonCode : ""), "utf8") : (cachePrefix.length + taskLocalSuffix.length + repairReasonCode.length);
-  const envelope = { cachePrefix: cachePrefix, taskLocalSuffix: taskLocalSuffix, projectionHash: projectionHash, envelopeHash: envelopeHash, inputBytes: Number(inputBytes) };
+  const envelope = { cachePrefix: cachePrefix, taskLocalSuffix: taskLocalSuffix, projectionHash: projectionHash, envelopeHash: envelopeHash, inputBytes: Number(inputBytes), omittedOptionalEvidenceIds };
   return deepFreezeTaskWorkflow(envelope);
+}
+
+// Find the smallest score-ordered optional prefix whose rebuilt candidate is
+// strictly below the final provider-input boundary. The builder owns the
+// actual contract/envelope reconstruction; this helper only controls the
+// monotone search and emits aggregate, content-free diagnostics.
+function taskDescriptionProviderEnvelopeFit({
+  optionalGroups = [],
+  buildCandidate,
+  targetExclusiveTokens = PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS,
+  operationalBoundaryExclusiveTokens = 0
+} = {}) {
+  if (typeof buildCandidate !== "function") throw new Error("description envelope candidate builder required");
+  const normalizeGroup = (group = {}) => {
+    const evidenceId = String(group.evidenceId || group.id || "").trim();
+    const keys = uniqueValues([
+      evidenceId,
+      ...(Array.isArray(group.keys) ? group.keys : group.keys instanceof Set ? [...group.keys] : [])
+    ].map(String).filter(Boolean));
+    const score = [group.exactScore, group.semanticScore, group.semantic_score, group.score]
+      .map(Number)
+      .find(Number.isFinite);
+    return { evidenceId, keys, score };
+  };
+  const groups = (Array.isArray(optionalGroups) ? optionalGroups : [])
+    .map(normalizeGroup)
+    .filter((group) => group.evidenceId && group.keys.length)
+    .sort((left, right) => {
+      const leftMissing = !Number.isFinite(left.score);
+      const rightMissing = !Number.isFinite(right.score);
+      if (leftMissing !== rightMissing) return leftMissing ? -1 : 1;
+      if (!leftMissing && left.score !== right.score) return left.score - right.score;
+      return left.evidenceId.localeCompare(right.evidenceId);
+    });
+  const target = Math.max(1, Math.floor(Number(targetExclusiveTokens) || PROVIDER_INPUT_MAX_EXCLUSIVE_TOKENS));
+  const operational = Number(operationalBoundaryExclusiveTokens);
+  const boundary = Math.max(1, Math.min(target, Number.isFinite(operational) && operational > 0 ? Math.floor(operational) : target));
+  const estimate = (candidate) => {
+    const value = candidate?.preflight?.estimatedInputTokens
+      ?? candidate?.telemetry?.estimatedInputTokens
+      ?? candidate?.estimatedInputTokens;
+    return Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : Number.POSITIVE_INFINITY;
+  };
+  const omittedIdsForCount = (count) => uniqueValues(groups
+    .slice(0, Math.max(0, Math.min(groups.length, Number(count) || 0)))
+    .flatMap((group) => group.keys));
+  const buildWithCount = (count) => buildCandidate(omittedIdsForCount(count));
+  const initialCandidate = buildWithCount(0);
+  const initialEstimatedInputTokens = estimate(initialCandidate);
+  const fits = (candidate) => estimate(candidate) < boundary;
+  let omittedGroups = 0;
+  let candidate = initialCandidate;
+  if (!fits(initialCandidate)) {
+    let fittingPrefixFound = false;
+    for (let count = 1; count <= groups.length; count += 1) {
+      const candidateAtCount = buildWithCount(count);
+      if (fits(candidateAtCount)) {
+        omittedGroups = count;
+        candidate = candidateAtCount;
+        fittingPrefixFound = true;
+        break;
+      }
+    }
+    if (!fittingPrefixFound) {
+      omittedGroups = groups.length;
+      candidate = groups.length > 0 ? buildWithCount(groups.length) : initialCandidate;
+    }
+  }
+  const finalEstimatedInputTokens = estimate(candidate);
+  return Object.freeze({
+    candidate,
+    initialCandidate,
+    omittedOptionalEvidenceIds: Object.freeze(omittedIdsForCount(omittedGroups)),
+    omittedGroups,
+    optionalGroupsAvailable: groups.length,
+    telemetry: Object.freeze({
+      efficiencyTargetTokens: target,
+      efficiencyTargetBoundaryExclusiveTokens: boundary,
+      efficiencyTargetPruningApplied: omittedGroups > 0,
+      efficiencyTargetOptionalGroupsAvailable: groups.length,
+      efficiencyTargetOptionalGroupsOmitted: omittedGroups,
+      efficiencyTargetInitialEstimatedInputTokens: initialEstimatedInputTokens,
+      efficiencyTargetFinalEstimatedInputTokens: finalEstimatedInputTokens,
+      efficiencyTargetReached: initialEstimatedInputTokens >= target,
+      efficiencyTargetExceeded: initialEstimatedInputTokens >= boundary,
+      efficiencyTargetFits: finalEstimatedInputTokens < boundary,
+      protectedCarrierStillOverTarget: finalEstimatedInputTokens >= target && omittedGroups === groups.length
+    })
+  });
+}
+
+function taskDescriptionOptionalPrunedContractView(contract = {}, omittedOptionalEvidenceIds = []) {
+  const omitted = new Set((omittedOptionalEvidenceIds || []).map(String).filter(Boolean));
+  if (!omitted.size) return contract;
+  const values = (primary, secondary = []) => uniqueValues([
+    ...(Array.isArray(primary) ? primary : []),
+    ...(Array.isArray(secondary) ? secondary : [])
+  ].map(String).filter(Boolean));
+  const sourceFactsById = contract.factsById || contract.facts_by_id || {};
+  const sourceEvidenceById = contract.evidenceById || contract.evidence_by_id || {};
+  const requiredFactIds = new Set(values([
+    ...(contract.requiredCurrentFactIds || contract.required_current_fact_ids || []),
+    ...(contract.requiredFactIds || contract.required_fact_ids || []),
+    ...(contract.requiredDescriptionFactRefs || contract.required_description_fact_refs || []),
+    ...(contract.materialDescriptionFactRefs || contract.material_description_fact_refs || []),
+    ...(contract.executionDetailFactRefs || contract.execution_detail_fact_refs || [])
+  ]));
+  const requiredEvidenceIds = new Set(values(contract.requiredCurrentEvidenceIds || contract.required_current_evidence_ids || []));
+  for (const factId of requiredFactIds) {
+    const fact = sourceFactsById[factId] || {};
+    for (const evidenceId of [fact.evidenceId, fact.evidence_id, fact.valueEvidenceId, fact.value_evidence_id]) {
+      if (evidenceId) requiredEvidenceIds.add(String(evidenceId));
+    }
+  }
+  const evidenceIsProtected = (evidenceId) => {
+    const row = sourceEvidenceById[evidenceId] || {};
+    const sourceKind = String(row.sourceKind || row.source_kind || "").toLowerCase();
+    return requiredEvidenceIds.has(evidenceId)
+      || sourceKind === "current-source"
+      || row.current === true;
+  };
+  const sourceAllowedEvidenceIds = values(contract.allowedEvidenceIds || contract.allowed_evidence_ids || Object.keys(sourceEvidenceById));
+  const allowedEvidenceIds = sourceAllowedEvidenceIds.filter((evidenceId) => !omitted.has(evidenceId) || evidenceIsProtected(evidenceId));
+  const allowedEvidenceSet = new Set(allowedEvidenceIds);
+  const sourceAllowedFactIds = values(contract.allowedFactIds || contract.allowed_fact_ids || Object.keys(sourceFactsById));
+  const allowedFactIds = sourceAllowedFactIds.filter((factId) => {
+    if (requiredFactIds.has(factId)) return true;
+    const fact = sourceFactsById[factId] || {};
+    const evidenceId = String(fact.evidenceId || fact.evidence_id || fact.valueEvidenceId || fact.value_evidence_id || "");
+    return !evidenceId || allowedEvidenceSet.has(evidenceId);
+  });
+  const allowedFactSet = new Set(allowedFactIds);
+  const evidenceById = Object.fromEntries(allowedEvidenceIds
+    .filter((evidenceId) => sourceEvidenceById[evidenceId])
+    .map((evidenceId) => [evidenceId, sourceEvidenceById[evidenceId]]));
+  const factsById = Object.fromEntries(allowedFactIds
+    .filter((factId) => sourceFactsById[factId])
+    .map((factId) => [factId, sourceFactsById[factId]]));
+  const factBindings = (contract.factBindings || contract.fact_bindings || []).filter((binding) => {
+    const factId = String(binding?.factId || binding?.fact_id || "");
+    const evidenceId = String(binding?.evidenceId || binding?.evidence_id || "");
+    return allowedFactSet.has(factId) && allowedEvidenceSet.has(evidenceId);
+  });
+  const citationLedgerByTask = Object.fromEntries(Object.entries(contract.citationLedgerByTask || contract.citation_ledger_by_task || {}).map(([index, rows]) => [
+    index,
+    (Array.isArray(rows) ? rows : []).filter((row) => allowedEvidenceSet.has(String(row?.evidenceId || row?.evidence_id || "")))
+  ]));
+  const allowedCitationIds = values(contract.allowedCitationIds || contract.allowed_citation_ids || []).filter((evidenceId) => allowedEvidenceSet.has(evidenceId));
+  const copy = Object.assign({}, contract, {
+    allowedEvidenceIds,
+    allowed_evidence_ids: allowedEvidenceIds.slice(),
+    allowedFactIds,
+    allowed_fact_ids: allowedFactIds.slice(),
+    allowedCitationIds,
+    allowed_citation_ids: allowedCitationIds.slice(),
+    evidenceById,
+    evidence_by_id: evidenceById,
+    factsById,
+    facts_by_id: factsById,
+    factBindings,
+    fact_bindings: factBindings.slice(),
+    citationLedgerByTask,
+    citation_ledger_by_task: citationLedgerByTask,
+    availableDescriptionFactRefs: values(contract.availableDescriptionFactRefs || contract.available_description_fact_refs || []).filter((factId) => allowedFactSet.has(factId)),
+    available_description_fact_refs: values(contract.availableDescriptionFactRefs || contract.available_description_fact_refs || []).filter((factId) => allowedFactSet.has(factId))
+  });
+  return copy;
+}
+
+function taskDescriptionProviderEvidenceGroups(projection = {}, sharedPayload = {}, contract = null) {
+  const protectedEvidenceIds = new Set((projection.protectedEvidenceIds || []).map(String).filter(Boolean));
+  for (const evidenceId of contract?.requiredCurrentEvidenceIds || []) protectedEvidenceIds.add(String(evidenceId));
+  for (const factId of [
+    ...(contract?.requiredCurrentFactIds || []),
+    ...(contract?.requiredFactIds || []),
+    ...(contract?.requiredDescriptionFactRefs || []),
+    ...(contract?.materialDescriptionFactRefs || []),
+    ...(contract?.executionDetailFactRefs || [])
+  ]) {
+    const fact = (contract?.factsById || {})[String(factId)] || {};
+    for (const evidenceId of [fact.evidenceId, fact.evidence_id, fact.valueEvidenceId, fact.value_evidence_id]) {
+      if (evidenceId) protectedEvidenceIds.add(String(evidenceId));
+    }
+  }
+  const rowsById = projection.providerEvidenceById || {};
+  const selectedIds = uniqueValues((Array.isArray(sharedPayload.providerEvidenceIds) && sharedPayload.providerEvidenceIds.length
+    ? sharedPayload.providerEvidenceIds
+    : projection.selectedEvidenceIds || []).map(String).filter(Boolean));
+  return selectedIds
+    .filter((evidenceId) => !protectedEvidenceIds.has(evidenceId))
+    .map((evidenceId) => {
+      const row = rowsById[evidenceId] || {};
+      const score = [row.exactScore, row.semanticScore, row.semantic_score, row.score]
+        .map(Number)
+        .find(Number.isFinite);
+      return { evidenceId, keys: [evidenceId], score };
+    });
 }
 
 const TASK_DESCRIPTION_VALIDATOR_REASON_CATEGORIES = Object.freeze([
@@ -31677,22 +34421,36 @@ function allActiveWorkflowStatusItems(plugin) {
   if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: "Processing" });
   if (plugin.syncInProgress || fileSyncCount) items.push({ label: "Notes", value: `Syncing${fileSyncCount ? ` (${fileSyncCount})` : ""}` });
   else if (plugin.noteSyncTimer) items.push({ label: "Notes", value: "Sync queued" });
+  // Index status is coarse-first (`state: phase`) so terminal failures can
+  // never read as Ready. Running states precede failure states: an active run
+  // may still recover, but an idle failure stays visible.
   const compatibilityState = plugin.semanticIndexCompatibilityRefresh?.state || "";
-  if (compatibilityState === "queued") items.push({ label: "Index", value: "Compatibility rebuild queued" });
-  else if (compatibilityState === "running") items.push({ label: "Index", value: "Compatibility rebuild running" });
-  else if (compatibilityState === "failed") items.push({ label: "Index", value: `Compatibility rebuild failed${plugin.semanticIndexCompatibilityRefresh?.reasonCode ? ` (${plugin.semanticIndexCompatibilityRefresh.reasonCode})` : ""}` });
-  else if (plugin.semanticIndexLoadInProgress) items.push({ label: "Index", value: "Loading" });
-  else if (plugin.semanticIndexLoadTimer) items.push({ label: "Index", value: "Cache queued" });
-  else if (plugin.semanticIndexOptimizeInProgress) items.push({ label: "Index", value: "Optimizing" });
-  else if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
+  const persistenceError = plugin.lastSemanticIndexPersistenceError;
+  const integrityFailed = plugin.taskReferenceIntegrity && plugin.taskReferenceIntegrity.ok === false;
+  if (compatibilityState === "queued") items.push({ label: "Index", value: "queued: compatibility rebuild" });
+  else if (compatibilityState === "running") items.push({ label: "Index", value: "running: compatibility rebuild" });
+  else if (plugin.semanticIndexLoadInProgress) items.push({ label: "Index", value: "running: loading" });
+  else if (plugin.semanticIndexLoadTimer) items.push({ label: "Index", value: "queued: cache load" });
+  else if (plugin.semanticIndexOptimizeInProgress) items.push({ label: "Index", value: "running: optimizing" });
+  else if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "running: indexing vault" });
+  else if (compatibilityState === "failed") items.push({ label: "Index", value: `failed: compatibility rebuild${plugin.semanticIndexCompatibilityRefresh?.reasonCode ? ` (${plugin.semanticIndexCompatibilityRefresh.reasonCode})` : ""}` });
+  else if (persistenceError) items.push({ label: "Index", value: `failed: ${String(persistenceError.phase || "persistence").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48)}${persistenceError.generation ? ` (${String(persistenceError.generation).slice(0, 48)})` : ""}` });
+  else if (integrityFailed) {
+    const codes = Array.isArray(plugin.taskReferenceIntegrity.reasonCodes) && plugin.taskReferenceIntegrity.reasonCodes.length
+      ? plugin.taskReferenceIntegrity.reasonCodes.map((code) => String(code || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 40)).filter(Boolean).join(",")
+      : String(plugin.taskReferenceIntegrity.reasonCode || "integrity").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 48);
+    items.push({ label: "Index", value: `degraded: task references${codes ? ` (${codes})` : ""}` });
+  }
+  else if (plugin.lastTaskReferenceRepairTelemetry?.state === "cancelled") items.push({ label: "Index", value: "cancelled: reference repair" });
   else if (plugin.semanticIndexLoaded && (plugin.semanticIndex || []).length && !plugin.productionSemanticRoutingState?.routingIndex) {
     const reason = String(plugin.productionSemanticRoutingTelemetry?.reasonCode || "routing-state-unavailable")
       .replace(/[^A-Za-z0-9._:-]/g, "")
       .slice(0, 80);
-    items.push({ label: "Index", value: `Routing unavailable${reason ? ` (${reason})` : ""}` });
+    items.push({ label: "Index", value: `degraded: routing unavailable${reason ? ` (${reason})` : ""}` });
   }
-  else if (indexCount) items.push({ label: "Index", value: `Queued (${indexCount})` });
-  else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "Queued" });
+  else if (indexCount) items.push({ label: "Index", value: `queued: ${indexCount} pending` });
+  else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "queued: flush scheduled" });
+  else if (plugin.taskReferenceRepairFollowUp) items.push({ label: "Index", value: "queued: reference repair" });
   if (plugin.referenceRebuildInProgress) items.push({ label: "References", value: "Rebuilding" });
   return items;
 }
@@ -43721,8 +46479,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
       && fact.authorityState !== "rejected"
       && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase()))
     .map((fact) => String(fact.factId || "")))
-    .filter(Boolean)
-    .slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+    .filter(Boolean);
   const factsById = new Map(facts.map((fact) => [String(fact.factId), fact]));
   const evidenceById = new Map(supporting.concat(taskLocalPrimary.evidenceId ? [taskLocalPrimary] : []).map((entry) => [String(entry.evidenceId || ""), entry]));
   const executionDetailFactRefs = [];
@@ -45086,19 +47843,22 @@ function taskDescriptionSharedEvidencePayload(mainTasks = [], sourceContract = n
 
 function taskDescriptionPromptContextSuffix(sharedPayload = {}, options = {}) {
   const singletonContract = options.singletonContract || null;
-  const payload = singletonContract
+  const promptContract = singletonContract
+    ? taskDescriptionOptionalPrunedContractView(singletonContract, options.omittedOptionalEvidenceIds || [])
+    : null;
+  const payload = promptContract
     ? {
-      version: singletonContract.version,
-      sourceContractId: String(singletonContract.sourceContractId || ""),
-      promptEvidenceHash: String(singletonContract.promptEvidenceHash || ""),
-      contractHash: String(singletonContract.contractHash || singletonContract.projectionHash || ""),
-      projectionHash: String(singletonContract.projectionHash || singletonContract.contractHash || ""),
-      factsById: JSON.parse(JSON.stringify(singletonContract.factsById || singletonContract.facts_by_id || {})),
-      evidenceById: singletonContract.evidenceById || singletonContract.evidence_by_id || {},
-      citationLedgerByTask: singletonContract.citationLedgerByTask || singletonContract.citation_ledger_by_task || {},
-      allowedEvidenceIds: Array.isArray(singletonContract.allowedEvidenceIds) ? singletonContract.allowedEvidenceIds.slice() : Array.isArray(singletonContract.allowed_evidence_ids) ? singletonContract.allowed_evidence_ids.slice() : [],
-      allowedFactIds: Array.isArray(singletonContract.allowedFactIds) ? singletonContract.allowedFactIds.slice() : Array.isArray(singletonContract.allowed_fact_ids) ? singletonContract.allowed_fact_ids.slice() : [],
-      allowedCitationIds: Array.isArray(singletonContract.allowedCitationIds) ? singletonContract.allowedCitationIds.slice() : Array.isArray(singletonContract.allowed_citation_ids) ? singletonContract.allowed_citation_ids.slice() : []
+      version: promptContract.version,
+      sourceContractId: String(promptContract.sourceContractId || ""),
+      promptEvidenceHash: String(promptContract.promptEvidenceHash || ""),
+      contractHash: String(promptContract.contractHash || promptContract.projectionHash || ""),
+      projectionHash: String(promptContract.projectionHash || promptContract.contractHash || ""),
+      factsById: JSON.parse(JSON.stringify(promptContract.factsById || promptContract.facts_by_id || {})),
+      evidenceById: promptContract.evidenceById || promptContract.evidence_by_id || {},
+      citationLedgerByTask: promptContract.citationLedgerByTask || promptContract.citation_ledger_by_task || {},
+      allowedEvidenceIds: Array.isArray(promptContract.allowedEvidenceIds) ? promptContract.allowedEvidenceIds.slice() : Array.isArray(promptContract.allowed_evidence_ids) ? promptContract.allowed_evidence_ids.slice() : [],
+      allowedFactIds: Array.isArray(promptContract.allowedFactIds) ? promptContract.allowedFactIds.slice() : Array.isArray(promptContract.allowed_fact_ids) ? promptContract.allowed_fact_ids.slice() : [],
+      allowedCitationIds: Array.isArray(promptContract.allowedCitationIds) ? promptContract.allowedCitationIds.slice() : Array.isArray(promptContract.allowed_citation_ids) ? promptContract.allowed_citation_ids.slice() : []
     }
     : JSON.parse(JSON.stringify(sharedPayload || {}));
   const evidenceById = payload.evidenceById && typeof payload.evidenceById === "object" ? payload.evidenceById : {};
@@ -45215,14 +47975,31 @@ function taskDescriptionProtectedClosureSnapshot(value = {}) {
   const task = ledger?.task || {};
   const factsById = ledger?.factsById || contract?.factsById || {};
   const evidenceById = ledger?.evidenceById || contract?.evidenceById || {};
-  const requiredFactIds = uniqueValues((closure.availableDescriptionFactRefs
-    || contract?.availableDescriptionFactRefs
-    || contract?.available_description_fact_refs
-    || closure.requiredDescriptionFactRefs
-    || contract?.requiredDescriptionFactRefs
-    || contract?.required_description_fact_refs
-    || contract?.requiredFactIds
-    || []).map(String).filter(Boolean));
+  const factRefSources = value?.includeAvailableDescriptionFactRefs === false
+    ? [
+      closure.requiredDescriptionFactRefs,
+      contract?.requiredDescriptionFactRefs,
+      contract?.required_description_fact_refs,
+      closure.requiredCurrentFactIds,
+      contract?.requiredCurrentFactIds,
+      contract?.required_current_fact_ids,
+      contract?.requiredFactIds,
+      contract?.required_fact_ids
+    ]
+    : [
+      closure.availableDescriptionFactRefs,
+      contract?.availableDescriptionFactRefs,
+      contract?.available_description_fact_refs,
+      closure.requiredDescriptionFactRefs,
+      contract?.requiredDescriptionFactRefs,
+      contract?.required_description_fact_refs,
+      contract?.requiredFactIds,
+      contract?.required_fact_ids
+    ];
+  const requiredFactIds = uniqueValues(factRefSources
+    .flatMap((refs) => Array.isArray(refs) ? refs : [])
+    .map(String)
+    .filter(Boolean));
   const requiredCurrentEvidenceIds = uniqueValues((closure.requiredCurrentEvidenceIds
     || contract?.requiredCurrentEvidenceIds
     || contract?.required_current_evidence_ids
@@ -45255,10 +48032,13 @@ function taskDescriptionProtectedClosureSnapshot(value = {}) {
 function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = {}, singletonContract = null, options = {}) {
   const errors = [];
   if (!singletonContract || singletonContract.valid === false) errors.push("canonical-singleton-contract-invalid");
-  const factIds = uniqueValues((singletonContract?.allowedFactIds || sharedPayload?.providerFactIds || Object.keys(sharedPayload?.factsById || {})).map(String).filter(Boolean));
-  const evidenceIds = uniqueValues((singletonContract?.allowedEvidenceIds || sharedPayload?.providerEvidenceIds || Object.keys(sharedPayload?.evidenceById || {})).map(String).filter(Boolean));
-  const sourceFactsById = singletonContract?.factsById || sharedPayload?.factsById || {};
-  const sourceEvidenceById = singletonContract?.evidenceById || sharedPayload?.evidenceById || {};
+  const dispatchContract = options.allowOptionalEvidencePruning === true
+    ? taskDescriptionOptionalPrunedContractView(singletonContract, options.omittedOptionalEvidenceIds || [])
+    : singletonContract;
+  const factIds = uniqueValues((dispatchContract?.allowedFactIds || sharedPayload?.providerFactIds || Object.keys(sharedPayload?.factsById || {})).map(String).filter(Boolean));
+  const evidenceIds = uniqueValues((dispatchContract?.allowedEvidenceIds || sharedPayload?.providerEvidenceIds || Object.keys(sharedPayload?.evidenceById || {})).map(String).filter(Boolean));
+  const sourceFactsById = dispatchContract?.factsById || sharedPayload?.factsById || {};
+  const sourceEvidenceById = dispatchContract?.evidenceById || sharedPayload?.evidenceById || {};
   const factsById = {};
   for (const factId of factIds) {
     if (!sourceFactsById[factId]) errors.push("canonical-fact-row-missing");
@@ -45283,18 +48063,24 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
     evidenceById[evidenceId] = row;
   }
   const bindingsByFactId = {};
-  for (const bindingValue of singletonContract?.factBindings || promptTask?.taskLocalEvidence?.factBindings || []) {
+  for (const bindingValue of dispatchContract?.factBindings || promptTask?.taskLocalEvidence?.factBindings || []) {
     const binding = taskDescriptionCanonicalLedgerRow(bindingValue, errors);
     const factId = String(binding.factId || "");
     if (!factId || !factIds.includes(factId)) continue;
     if (bindingsByFactId[factId] && JSON.stringify(bindingsByFactId[factId]) !== JSON.stringify(binding)) errors.push("canonical-binding-conflict");
     else bindingsByFactId[factId] = binding;
   }
-  const requiredDescriptionFactRefs = [];
-  const availableDescriptionFactRefs = uniqueValues((singletonContract?.availableDescriptionFactRefs
-    || singletonContract?.available_description_fact_refs
+  const requiredDescriptionFactRefs = options.allowOptionalEvidencePruning === true
+    ? uniqueValues((singletonContract?.requiredDescriptionFactRefs
+      || singletonContract?.required_description_fact_refs
+      || singletonContract?.requiredFactIds
+      || singletonContract?.required_fact_ids
+      || []).map(String).filter((factId) => factIds.includes(factId)))
+    : [];
+  const availableDescriptionFactRefs = uniqueValues((dispatchContract?.availableDescriptionFactRefs
+    || dispatchContract?.available_description_fact_refs
     || []).map(String).filter(Boolean));
-  const citationRows = singletonContract?.citationLedgerByTask?.[String(promptTask.index)]
+  const citationRows = dispatchContract?.citationLedgerByTask?.[String(promptTask.index)]
     || sharedPayload?.citationLedgerByTask?.[String(promptTask.index)]
     || [];
   const citationsByEvidenceId = {};
@@ -45340,7 +48126,7 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
       candidateSupportingFactRefs: uniqueValues([
         ...availableDescriptionFactRefs,
         ...(rich.candidateSupportingFactRefs || [])
-      ].map(String).filter(Boolean))
+      ].map(String).filter((factId) => factIds.includes(factId)))
     },
     factsById,
     evidenceById,
@@ -45353,8 +48139,11 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
     .map((code) => String(code || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 80))
     .filter(Boolean)).slice(0, 8);
   if (repairReasonCodes.length) ledger.repair = { reasonCodes: repairReasonCodes };
-  const beforeSnapshot = taskDescriptionProtectedClosureSnapshot({ promptTask, singletonContract });
-  const afterSnapshot = taskDescriptionProtectedClosureSnapshot({ canonicalLedger: ledger });
+  const protectedSnapshotOptions = options.allowOptionalEvidencePruning === true
+    ? { includeAvailableDescriptionFactRefs: false }
+    : {};
+  const beforeSnapshot = taskDescriptionProtectedClosureSnapshot(Object.assign({ promptTask, singletonContract }, protectedSnapshotOptions));
+  const afterSnapshot = taskDescriptionProtectedClosureSnapshot(Object.assign({ canonicalLedger: ledger }, protectedSnapshotOptions));
   const protectedClosureHashBefore = taskWorkflowHash(beforeSnapshot);
   const protectedClosureHashAfter = taskWorkflowHash(afterSnapshot);
   const protectedClosureEquivalent = protectedClosureHashBefore === protectedClosureHashAfter;
@@ -45371,7 +48160,7 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
   let executionCandidateOmittedForRowByteBoundCount = 0;
   let executionCandidateOmittedForTotalByteBoundCount = 0;
   for (const factId of executionCandidateFactIds) {
-    if (Object.keys(executionCandidatesByFactId).length >= TASK_DESCRIPTION_EXECUTION_CANDIDATE_MAX_ITEMS) {
+    if (Object.keys(executionCandidatesByFactId).length >= TASK_DESCRIPTION_EXECUTION_CANDIDATE_AID_MAX_ITEMS) {
       executionCandidateOmittedForItemBoundCount += 1;
       continue;
     }
@@ -45489,7 +48278,7 @@ function taskDescriptionPromptTask(item = {}, providerPayload = null, singletonC
           && String(fact.authorityState || "").toLowerCase() !== "rejected"
           && !["conflict", "conflicted", "rejected"].includes(String(fact.conflictState || "").toLowerCase());
       })
-  ).slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+  );
   const ids = (values = []) => uniqueValues((values || []).map(String).filter((value) => value && (!providerFactIds || providerFactIds.has(value))));
   const hierarchy = {
     parentId: String(rich.hierarchy?.parentId || ""),
@@ -46452,7 +49241,7 @@ function sourceExplicitDateKeys(value = "") {
 function taskWorkflowInternalIdentifierValues(...roots) {
   const identifiers = new Set();
   const seen = new WeakSet();
-  const identifierKeys = new Set(["scopeid", "scopeids", "taskid", "taskids", "evidenceid", "evidenceids", "factid", "factids", "factref", "factrefs", "bindingid", "bindingids", "queryid", "queryids", "batchid", "batchids", "sourcecontractid", "promptbundleid", "validatorbundleid", "bundleid"]);
+  const identifierKeys = new Set(["scopeid", "scopeids", "taskid", "taskids", "evidenceid", "evidenceids", "batchevidenceids", "factid", "factids", "factref", "factrefs", "bindingid", "bindingids", "queryid", "queryids", "batchid", "batchids", "sourcecontractid", "promptbundleid", "validatorbundleid", "bundleid"]);
   const add = (value) => {
     if (value === undefined || value === null || typeof value === "object") return;
     const identifier = String(value).trim();
@@ -46873,7 +49662,10 @@ function maybeRetryDescription({ contract, firstEnvelope, reasonCode, callsUsed 
   if (!firstEnvelope || typeof firstEnvelope !== "object" || !firstEnvelope.envelopeHash) return Object.freeze({ retry: false });
   let retryEnvelope;
   try {
-    retryEnvelope = buildDescriptionProviderEnvelope(contract, { repairReasonCode: code });
+    retryEnvelope = buildDescriptionProviderEnvelope(contract, {
+      repairReasonCode: code,
+      omittedOptionalEvidenceIds: firstEnvelope.omittedOptionalEvidenceIds || []
+    });
   } catch (e) {
     return Object.freeze({ retry: false });
   }
@@ -48300,7 +51092,6 @@ function semanticTaskReferenceRecords(settings = DEFAULT_SETTINGS, basePath = ""
     records.push({ id: String(id || normalized.id || ""), path: snapshotTask.path, task: snapshotTask, source, sourceKind, sourceId, children: [], parentRecord: null, rootRecord: null, treeDepth: 0, treePath: [], siblingOrder: Number.isFinite(snapshotTask.siblingOrder) ? snapshotTask.siblingOrder : null, hierarchyIssue: "" });
   };
   for (const [id, task] of Object.entries(settings.taskCache || {})) add(id, task, "cache");
-  for (const reference of Object.values(settings.pendingTaskReferences || {})) add(reference?.id || "", reference, "pending");
   if (locationIndex) {
     const locationOnlyRecords = new Map();
     const locationOnlyIdentityGroups = new Map();
@@ -52941,13 +55732,7 @@ function taskWorkflowPreStructureSyntheticTask(record = {}, sourceContract = nul
     const temporalRelation = String(item?.temporalRelation || item?.temporal_relation || "").toLowerCase();
     return sourceKind === "current-source" || item?.primarySource === true || item?.current === true || temporalRelation === "current";
   };
-  let optionalSelectedCount = 0;
-  const selectedOptionalItems = selectedCandidateItems.filter((item) => {
-    if (protectedCurrentRow(item)) return true;
-    if (optionalSelectedCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return false;
-    optionalSelectedCount += 1;
-    return true;
-  });
+  const selectedOptionalItems = selectedCandidateItems.slice();
   const selectedIds = new Set(uniqueValues([
     sourceContract?.primaryEvidenceId,
     record.fact?.evidenceId,
@@ -53940,6 +56725,25 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     }
     if (bundle?.factId && factsById.has(String(bundle.factId))) addProtectedFact(bundle.factId, "scope-primary-fact");
   }
+  // Index fact rows by their evidence identity once. Provider projection is a
+  // closed positive set and must not rescan the entire fact catalog per row.
+  const factsByEvidenceId = new Map();
+  const indexFactByEvidenceId = (fact = {}) => {
+    const factId = String(fact.factId || fact.fact_id || "").trim();
+    if (!factId) return;
+    const evidenceIds = uniqueValues([
+      fact.evidenceId,
+      fact.evidence_id,
+      fact.valueEvidenceId,
+      fact.value_evidence_id
+    ].filter((value) => value !== undefined && value !== null && String(value).trim() !== "").map(String));
+    for (const evidenceId of evidenceIds) {
+      const rows = factsByEvidenceId.get(evidenceId) || [];
+      if (!rows.some((row) => String(row.factId || row.fact_id || "") === factId)) rows.push(fact);
+      factsByEvidenceId.set(evidenceId, rows);
+    }
+  };
+  for (const fact of factsById.values()) indexFactByEvidenceId(fact);
   const missingProtectedFactIds = Array.from(requiredProtectedFactIds).filter((factId) => !factsById.has(factId));
   const missingProtectedEvidenceIds = Array.from(requiredProtectedEvidenceIds).filter((evidenceId) => !itemById.has(evidenceId));
   const associationsForItem = (item) => {
@@ -54031,12 +56835,20 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   bindingDiagnostics.exactTaskSemanticFactBindingsCount = exactTaskSemanticFactBindings.size;
   const optionalSemanticFactsForItem = (item = {}) => {
     const evidenceId = String(item.evidenceId || item.id || "");
-    return [...(item.structuredFacts || []), ...Array.from(factsById.values())].filter((fact, index, rows) => {
+    const itemScopeIds = new Set(uniqueValues([
+      item.scopeId,
+      item.scope_id,
+      ...(item.scopeIds || []),
+      ...(item.scope_ids || []),
+      ...(item.taskScopeAssociations || []).map((association) => association?.scopeId || association?.scope_id)
+    ].filter((value) => value !== undefined && value !== null && String(value).trim() !== "").map(String)));
+    return [...(item.structuredFacts || []), ...(factsByEvidenceId.get(evidenceId) || [])].filter((fact, index, rows) => {
       const factId = String(fact?.factId || fact?.fact_id || "");
-      const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || evidenceId);
+      const factEvidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || evidenceId);
       const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
       return factId && rows.findIndex((row) => String(row?.factId || row?.fact_id || "") === factId) === index
         && factEvidenceId === evidenceId && factScopeId
+        && (!itemScopeIds.size || itemScopeIds.has(factScopeId))
         && !["rejected", "conflict"].includes(String(fact?.authorityState || "").toLowerCase())
         && !["rejected", "conflict", "conflicted"].includes(String(fact?.conflictState || "").toLowerCase());
     });
@@ -54056,10 +56868,7 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     }
     return { facts, exactFactIds, bound: exactFactIds.size > 0 };
   };
-  const optionalCandidates = items
-    .filter((item) => !protectedEvidenceIds.has(item.evidenceId))
-    .filter((item) => !options.descriptionProjection
-      || taskDescriptionProviderOptionalFactBackedProjectionEligible(item, factsById, options.tasks || []));
+  const optionalCandidates = items.filter((item) => !protectedEvidenceIds.has(item.evidenceId));
   const requireExactTaskFactBinding = options.requireExactTaskFactBinding === true;
   const optionalBindingStates = new Map();
   let optionalFactsPresentCount = 0;
@@ -54077,8 +56886,10 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     if (state.facts.length && !state.bound) optionalExactKeyMissEvidenceCount += 1;
   }
   const optionalSemanticFactBound = (item = {}) => optionalBindingStates.get(String(item.evidenceId || item.id || ""))?.bound === true;
-  const optionalItems = requireExactTaskFactBinding ? optionalCandidates.filter(optionalSemanticFactBound) : optionalCandidates;
-  const unboundOptionalEvidenceIds = requireExactTaskFactBinding ? optionalCandidates.filter((item) => !optionalSemanticFactBound(item)).map((item) => item.evidenceId) : [];
+  // Exact fact binding is a closure diagnostic, not an evidence membership
+  // gate. Positive rows without an exact fact remain deliverable.
+  const optionalItems = optionalCandidates;
+  const unboundOptionalEvidenceIds = optionalCandidates.filter((item) => !optionalSemanticFactBound(item)).map((item) => item.evidenceId);
   const coverageEligibleEvidenceIds = Array.isArray(options.coverageEligibleEvidenceIds)
     ? new Set(options.coverageEligibleEvidenceIds.map(String).filter(Boolean))
     : null;
@@ -54090,8 +56901,8 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     .filter(Boolean));
   const reservedCoverageItems = optionalItems
     .filter((item) => reservedCoverageEvidenceIds.has(item.evidenceId));
-  // The configured ceiling applies to optional provider evidence. Protected
-  // source/fact rows are additive and may intentionally exceed that ceiling.
+  // Preserve the configured ceiling as compatibility telemetry only. It no
+  // longer admits, reserves, or limits provider evidence membership.
   const baselineSelectedEvidenceIds = new Set((options.baselineSelectedEvidenceIds || []).map(String).filter(Boolean));
   const comparator = (left, right) => {
     const upstreamOrder = (item) => {
@@ -54123,9 +56934,9 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   // independently eligible task lanes; a single task keeps the historical
   // ceiling exactly.
   const optionalBudget = taskCoverageCount > 0 ? recordCeiling * taskCoverageCount : recordCeiling;
-  // When the description path disables the count ceiling, the effective
-  // optional budget is effectively unbounded; the token preflight governs.
-  const effectiveOptionalBudget = descriptionCeilingDisabled ? Number.POSITIVE_INFINITY : optionalBudget;
+  // The final serialized-envelope preflight is the only provider-size bound;
+  // optional membership is closed before that preflight.
+  const effectiveOptionalBudget = Number.POSITIVE_INFINITY;
   const selectedOptional = [];
   const selectedIds = new Set();
   const selectedReasonsByEvidenceId = new Map();
@@ -54139,7 +56950,7 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
       selectedReasonsByEvidenceId.set(key, reasons);
       return false;
     }
-    if (selectedOptional.length >= effectiveOptionalBudget) return false;
+    if (Number.isFinite(effectiveOptionalBudget) && selectedOptional.length >= effectiveOptionalBudget) return false;
     selectedIds.add(key);
     selectedOptional.push(item);
     const reasons = selectedReasonsByEvidenceId.get(key) || new Set();
@@ -54190,22 +57001,15 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     addOptional(item, "baseline-retained");
     if (selectedOptional.length >= effectiveOptionalBudget) break;
   }
-  // Semantic-fill pass: when the description path disables the count ceiling,
-  // every remaining eligible positive optional row is admitted after the
-  // coverage reservations and baseline retention. The 16,000-token hard
-  // preflight remains the sole bound on actual serialized size; this pass
-  // only fills rows the reservations/baseline did not already select, in the
-  // deterministic upstream `comparator` order (never re-ranked by semantic
-  // score). The task-generation/chat path keeps `recordCeiling` as a maximum,
-  // never a fill target: optional rows there still enter only through
-  // task/scope reservations or explicit retained stable IDs.
-  if (descriptionCeilingDisabled) {
-    for (const item of optionalItems.slice().sort(comparator)) {
-     if (selectedIds.has(deliveryKey(item))) continue;
-      addOptional(item, "semantic-fill");
-    }
+  // Complete-set pass: reservation/baseline metadata may explain rows, but
+  // cannot decide membership. Preserve upstream order and admit every
+  // remaining positive row before the final serialized-envelope preflight.
+  for (const item of optionalItems.slice().sort(comparator)) {
+    if (selectedIds.has(deliveryKey(item))) continue;
+    addOptional(item, "semantic-fill");
   }
   const selectedEvidenceIds = new Set([...protectedItems, ...selectedOptional].map((item) => item.evidenceId));
+  const selectedDeliveryIds = uniqueValues([...protectedItems, ...selectedOptional].map((item) => deliveryKey(item)).filter(Boolean));
   // Preserve the upstream aggregate/fused order when serializing the selected
   // set; reservation order belongs only to selection/telemetry, not payload
   // ordering.
@@ -54315,10 +57119,10 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     selectedTaskCount: selectedTaskIds.size,
     selectedSourceCount: selectedSourceIds.size,
     selectedScopeCount: selectedScopeIds.size,
-    protectedOverflow: protectedItems.length > 0 && projectedItems.length > recordCeiling,
-    providerTotalOverflow: descriptionCeilingDisabled ? false : projectedItems.length > optionalBudget,
-    optionalSelectionCeiling: descriptionCeilingDisabled ? null : optionalBudget,
-    perTaskOptionalCeiling: recordCeiling,
+    protectedOverflow: false,
+    providerTotalOverflow: false,
+    optionalSelectionCeiling: null,
+    perTaskOptionalCeiling: null,
     recordCeiling,
     descriptionCeilingDisabled,
     elapsedMs: Math.round(elapsedMs),
@@ -54340,10 +57144,13 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   const providerEvidenceDirectory = canonicalProviderEvidenceDirectory(projectedItems);
   const providerFactIds = new Set();
   for (const fact of factsById.values()) {
-    const evidenceId = String(fact.evidenceId || fact.evidence_id || "");
-    if (selectedEvidenceIds.has(evidenceId)) providerFactIds.add(String(fact.factId || fact.fact_id || ""));
+    const factEvidenceIds = [fact.evidenceId, fact.evidence_id, fact.valueEvidenceId, fact.value_evidence_id]
+      .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
+      .map(String);
+    if (factEvidenceIds.some((evidenceId) => selectedEvidenceIds.has(evidenceId))) providerFactIds.add(String(fact.factId || fact.fact_id || ""));
   }
   telemetry.selectedEvidenceIds = projectedItems.map((item) => String(item.evidenceId || item.id || "")).filter(Boolean);
+  telemetry.selectedDeliveryIds = projectedItems.map((item) => deliveryKey(item)).filter(Boolean);
   telemetry.selectedFactIds = Array.from(providerFactIds).filter(Boolean);
   const projectionScopes = new Set();
   const protectedProjectionScopes = new Set();
@@ -54360,8 +57167,12 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     for (const fact of item.structuredFacts || []) addProjectionScope(fact.scopeId || fact.scope_id, protectedItems.includes(item));
   }
   for (const fact of factsById.values()) {
-    const evidenceId = String(fact.evidenceId || fact.evidence_id || "");
-    if (selectedEvidenceIds.has(evidenceId)) addProjectionScope(fact.scopeId || fact.scope_id, protectedEvidenceIds.has(evidenceId));
+    const factEvidenceIds = [fact.evidenceId, fact.evidence_id, fact.valueEvidenceId, fact.value_evidence_id]
+      .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
+      .map(String);
+    if (factEvidenceIds.some((evidenceId) => selectedEvidenceIds.has(evidenceId))) {
+      addProjectionScope(fact.scopeId || fact.scope_id, factEvidenceIds.some((evidenceId) => protectedEvidenceIds.has(evidenceId)));
+    }
   }
   for (const scope of sourceContract.scopes || []) {
     const scopeId = String(scope.scopeId || scope.scope_id || scope.id || "").trim();
@@ -54381,10 +57192,11 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   return {
     version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
     recordCeiling,
-    optionalSelectionCeiling: descriptionCeilingDisabled ? null : optionalBudget,
-    perTaskOptionalCeiling: recordCeiling,
+    optionalSelectionCeiling: null,
+    perTaskOptionalCeiling: null,
     descriptionCeilingDisabled,
     selectedEvidenceIds: projectedItems.map((item) => item.evidenceId),
+    selectedDeliveryIds,
     protectedEvidenceIds: protectedItems.map((item) => item.evidenceId),
     protectedFactIds: Array.from(protectedFactIds),
     providerFactIds: Array.from(providerFactIds).filter(Boolean),
@@ -54554,15 +57366,13 @@ function taskDescriptionMarkedActionSubjectDecision(item = {}, sourceContract = 
   if (verifiedAdjacentCriteria) {
     return { admitted: true, applied: true, item, reasonCode: "task-semantic-current-source-adjacent-criteria-verified" };
   }
-  const contractSubjectFacts = taskSemanticImmutableScopeSubjectFacts(task, sourceContract);
-  // A provider may legitimately shorten the task title. Keep the immutable
-  // same-scope requested action in the relevance subject so that this title
-  // compression cannot discard people, conditions, conflicts, or handoffs
-  // before description evidence is selected.
-  const subjectText = uniqueValues((contractSubjectFacts.length
-    ? contractSubjectFacts
-    : [task.semanticQuery, task.content, task.title, task.requiredRequestCoverage])
-    .map((value) => String(value || "").trim()).filter(Boolean)).join("\n");
+  // Structural-only description admission: the owning scope's already-selected
+  // complete positive union arrives preselected, so no new lexical, path,
+  // title, shortlist, materiality, quota, or global-fill comparison may run
+  // here. Exact task/scope/fact bindings are preserved and only structurally
+  // foreign rows are excluded, using the same contract as retrieval admission.
+  // The immutable indexed chunk and original provenance travel unchanged: the
+  // current generated task is never stamped onto cross-note candidates.
   const decision = taskSemanticMarkedActionSupportingCandidateDecision(
     item,
     { path: sourceContract.path || sourceContract.sourceId || sourceContract.source_id || "", type: sourceType },
@@ -54571,7 +57381,8 @@ function taskDescriptionMarkedActionSubjectDecision(item = {}, sourceContract = 
     {
       markedActionScope: true,
       activeSourcePath: sourceContract.path || sourceContract.sourceId || sourceContract.source_id || "",
-      subjectText,
+      scopeId,
+      taskId,
       settings: options.settings || DEFAULT_SETTINGS
     }
   );
@@ -55000,7 +57811,10 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
   // The source rows are already upstream-semantic admissions. Preserve that
   // order through the description closure; this boundary does not re-rank,
   // diversify, or fill an arbitrary row target.
-  const admitted = optionalCandidates.slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+  // The source rows already passed structural applicability and positive
+  // semantic admission. Preserve the complete set; provider preflight, not a
+  // supporting-row count, decides whether the final envelope can be sent.
+  const admitted = optionalCandidates;
   const admittedPool = [...protectedCandidates, ...admitted];
   const admittedIds = new Set(admittedPool.map((item) => String(item.evidenceId || item.id || "")));
   const selectedEvidenceIds = new Set();
@@ -55020,7 +57834,6 @@ function taskDescriptionSemanticShortlistForTask(sourceItems = [], sourceContrac
   }
   for (const item of items.filter((entry) => !entry._descriptionProtected)) {
     for (const fact of item._descriptionFacts || []) {
-      if (facts.length >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) break;
       if (!facts.some((row) => String(row.factId || row.fact_id || "") === String(fact.factId || fact.fact_id || ""))) facts.push(fact);
     }
   }
@@ -55332,7 +58145,7 @@ function taskLocalProviderProjectionForDescriptionTask(finalItems = [], sourceCo
     rich.candidateSupportingFactRefs = uniqueValues([
       ...shortlistFactIds.filter((factId) => !protectedShortlistFactIds.has(factId)),
       ...(rich.candidateSupportingFactRefs || rich.candidate_supporting_fact_refs || [])
-    ].filter((factId) => !protectedShortlistFactIds.has(String(factId)))).slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+    ].filter((factId) => !protectedShortlistFactIds.has(String(factId))));
     rich.factBindings = [
       ...(rich.factBindings || rich.fact_bindings || []),
       ...semanticShortlist.facts.map((fact) => ({
@@ -55474,7 +58287,6 @@ function taskLocalProviderProjectionForDescriptionTask(finalItems = [], sourceCo
     if (f && isTaskOnlyForDescription(f)) optionalFactIds.splice(i, 1);
   }
   for (const factId of optionalFactIds) {
-    if (optionalFactBackedEvidenceIds.size >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) break;
     if (explicitProtectedFactIds.has(factId)) continue;
     const fact = localFactsById[factId];
     const evidenceId = String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "");
@@ -58722,14 +61534,12 @@ function taskWorkflowContextBundle(options = {}) {
         || taskSemanticRequestScopedRelevanceEligible(item, taskId, scopeId, facts);
     };
     const exactById = new Map();
-    let selectedOptionalCount = 0;
     const addExactRow = (item, requireShortlistAcceptance = false) => {
       const evidenceId = String(item?.evidenceId || item?.evidence_id || item?.id || "");
       if (!evidenceId || exactById.has(evidenceId)) return;
       if (requireShortlistAcceptance && !taskSemanticTaskLocalRelevanceAccepted(item)) return;
       if (!strictTaskLocalRow(item)) return;
       const current = taskCurrentRow(item);
-      if (!current && selectedOptionalCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return;
       const materialized = current
         ? (finalItems.find((row) => String(row?.evidenceId || row?.id || "") === evidenceId) || item)
         : materializeSelectedTaskSemanticExcerptFact(item, taskId, scopeId, {
@@ -58738,7 +61548,6 @@ function taskWorkflowContextBundle(options = {}) {
         });
       if (!current && !(materialized?.structuredFacts || []).length) return;
       exactById.set(evidenceId, materialized);
-      if (!current) selectedOptionalCount += 1;
     };
     for (const evidenceId of syntheticHandoffIds) {
       const row = syntheticHandoffRowsById.get(evidenceId) || taskRows.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId);
@@ -59868,8 +62677,7 @@ function taskGenerationBatchProjection(options = {}) {
     const enriched = Object.assign({}, task);
     const taskId = String(enriched.taskId || enriched.id || "");
     const scopeId = String(enriched.scope_id || enriched.scopeId || "");
-    const materializedHistoryRows = materializedHistoryRowsForTask(enriched)
-      .slice(0, TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS);
+    const materializedHistoryRows = materializedHistoryRowsForTask(enriched);
     const materializedHistoryEvidenceIds = materializedHistoryRows.map((item) => String(item.evidenceId || item.id || "")).filter(Boolean);
     const candidateEvidenceIds = uniqueValues([
       ...(enriched.taskLocalSemanticEvidence?.evidenceIds || []),
@@ -59877,20 +62685,7 @@ function taskGenerationBatchProjection(options = {}) {
       ...(enriched.evidence_ids || []),
       ...materializedHistoryEvidenceIds
     ].map(String).filter(Boolean));
-    let optionalSelectedCount = 0;
-    const selectedEvidenceIds = candidateEvidenceIds.filter((evidenceId) => {
-      const row = evidenceCatalog.items.find((item) => String(item?.evidenceId || item?.id || "") === evidenceId) || {};
-      const sourceKind = String(row?.sourceKind || row?.source_kind || "").toLowerCase();
-      const protectedCurrent = evidenceId === String(scoped.contract.primaryEvidenceId || "")
-        || sourceKind === "current-source"
-        || row?.primarySource === true
-        || row?.current === true
-        || String(row?.temporalRelation || row?.temporal_relation || "").toLowerCase() === "current";
-      if (protectedCurrent) return true;
-      if (optionalSelectedCount >= TASK_DESCRIPTION_MAX_CANDIDATE_SUPPORTING_FACT_REFS) return false;
-      optionalSelectedCount += 1;
-      return true;
-    });
+    const selectedEvidenceIds = candidateEvidenceIds.slice();
     if (taskId && scopeId) {
       enriched.evidence_ids = selectedEvidenceIds.slice();
       enriched.evidenceIds = selectedEvidenceIds.slice();
@@ -60043,9 +62838,7 @@ function taskGenerationProviderRequiredCurrentContext(batch = {}, sourceContract
   };
   const admitted = [];
   const admittedText = new Set();
-  let admittedChars = 0;
   for (const fact of sourceContract.facts || []) {
-    if (admitted.length >= TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_ITEMS) break;
     const factId = String(fact?.factId || fact?.fact_id || "");
     const factScopeId = String(fact?.scopeId || fact?.scope_id || "");
     const evidenceId = String(fact?.evidenceId || fact?.evidence_id || "");
@@ -60075,12 +62868,9 @@ function taskGenerationProviderRequiredCurrentContext(batch = {}, sourceContract
       .find((value) => typeof value === "string" && value.length > 0);
     if (!rawText
       || taskGenerationProviderIdentifierFreeValue(rawText, scopeTokens) !== rawText
-      || rawText.length > TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_CHARS
-      || admittedChars + rawText.length > TASK_GENERATION_PROVIDER_CURRENT_CONTEXT_MAX_CHARS
       || admittedText.has(rawText)) continue;
     admitted.push(rawText);
     admittedText.add(rawText);
-    admittedChars += rawText.length;
   }
   return admitted;
 }
@@ -60290,16 +63080,51 @@ function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowCont
     || batch.contextBundle?.providerEvidenceProjection
     || {};
   const selectedEvidenceIds = uniqueValues((projection.selectedEvidenceIds || []).map(String).filter(Boolean));
+  const selectedDeliveryIds = uniqueValues((projection.selectedDeliveryIds || []).map(String).filter(Boolean));
+  const providerDirectory = projection.providerEvidenceDirectory
+    && Array.isArray(projection.providerEvidenceDirectory.records)
+    ? projection.providerEvidenceDirectory
+    : null;
+  const directoryBodiesByRef = new Map((providerDirectory?.bodies || [])
+    .filter((body) => body && typeof body === "object")
+    .map((body) => [String(body.bodyRef || ""), String(body.body || body.text || "")]));
+  const directoryRecords = (providerDirectory?.records || []).filter((record) => record && typeof record === "object");
   const batchEvidenceRows = [
     ...(batch.evidenceCatalog?.items || []),
     ...(batch.contextBundle?.evidenceCatalog?.items || []),
     ...(workflowContext.evidenceCatalog?.items || [])
   ];
   const batchEvidenceById = new Map();
+  const batchEvidenceByDeliveryId = new Map();
   for (const row of batchEvidenceRows) {
     const evidenceId = String(row?.evidenceId || row?.evidence_id || row?.id || "");
     if (evidenceId && !batchEvidenceById.has(evidenceId)) batchEvidenceById.set(evidenceId, row);
+    const deliveryId = String(row?.deliveryId || semanticEvidenceDeliveryIdentity(row) || evidenceId);
+    if (deliveryId && !batchEvidenceByDeliveryId.has(deliveryId)) batchEvidenceByDeliveryId.set(deliveryId, row);
   }
+  const selectedDirectoryRecords = directoryRecords.filter((record) => {
+    const evidenceId = String(record.originalEvidenceId || record.evidenceId || record.evidence_id || record.id || "");
+    const deliveryId = String(record.deliveryId || "");
+    return selectedDeliveryIds.length
+      ? selectedDeliveryIds.includes(deliveryId)
+      : selectedEvidenceIds.includes(evidenceId);
+  });
+  const compactRecordRow = (record = {}) => {
+    const evidenceId = String(record.originalEvidenceId || record.evidenceId || record.evidence_id || record.id || "");
+    const deliveryId = String(record.deliveryId || "");
+    const body = directoryBodiesByRef.get(String(record.bodyRef || "")) || "";
+    const source = batchEvidenceByDeliveryId.get(deliveryId) || batchEvidenceById.get(evidenceId) || {};
+    const row = Object.assign({}, source, record);
+    if (body) {
+      row.text = body;
+      row.body = body;
+      row.excerpt = body;
+    }
+    return row;
+  };
+  const selectedEvidenceRecords = selectedDirectoryRecords.length
+    ? selectedDirectoryRecords.map(compactRecordRow)
+    : selectedEvidenceIds.map((evidenceId) => batchEvidenceById.get(evidenceId) || {});
   const syntheticTask = batch.syntheticTask
     || (batch.contextBundle?.tasks || []).find((task) => String(task?.taskId || task?.id || "") === String(batch.syntheticTaskId || ""))
     || (workflowContext.tasks || []).find((task) => String(task?.taskId || task?.id || "") === String(batch.syntheticTaskId || ""));
@@ -60334,6 +63159,7 @@ function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowCont
   const selectedEvidenceSet = new Set(selectedEvidenceIds);
   const evidenceById = Object.assign({}, Object.fromEntries(batchEvidenceById), workflowContext.providerEvidenceById || {}, projection.providerEvidenceById || {});
   const factById = new Map();
+  const providerFactIdSet = new Set((projection.providerFactIds || []).map(String).filter(Boolean));
   const syntheticBoundFactPairs = new Set(syntheticTaskFactBindings.map((binding) => [
     String(binding?.factId || binding?.fact_id || ""),
     String(binding?.evidenceId || binding?.evidence_id || "")
@@ -60344,18 +63170,23 @@ function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowCont
     if (!factId || !evidenceId || !selectedEvidenceSet.has(evidenceId) || factById.has(factId)) return;
     const exactSyntheticFact = boundBatchEvidenceIds.includes(evidenceId)
       && syntheticBoundFactPairs.has(`${factId}\u0000${evidenceId}`);
-    if (projection.providerFactIds?.length
-      && !projection.providerFactIds.map(String).includes(factId)
+    if (providerFactIdSet.size
+      && !providerFactIdSet.has(factId)
       && !exactSyntheticFact) return;
     factById.set(factId, fact);
   };
   for (const fact of Object.values(workflowContext.factsById || {})) registerFact(fact);
   for (const fact of Object.values(batch.contextBundle?.factsById || {})) registerFact(fact);
   for (const row of Object.values(evidenceById)) for (const fact of row?.structuredFacts || []) registerFact(fact);
-  const compactEvidence = selectedEvidenceIds.map((evidenceId) => {
-    const row = evidenceById[evidenceId] || {};
+  for (const row of selectedEvidenceRecords) for (const fact of row?.structuredFacts || []) registerFact(fact);
+  const compactEvidence = selectedEvidenceRecords.map((row) => {
+    const evidenceId = String(row.originalEvidenceId || row.evidenceId || row.evidence_id || row.id || "");
+    const deliveryId = String(row.deliveryId || semanticEvidenceDeliveryIdentity(row) || evidenceId);
     return {
       evidenceId,
+      originalEvidenceId: String(row.originalEvidenceId || evidenceId),
+      deliveryId,
+      bodyRef: String(row.bodyRef || ""),
       sourceId: String(row.sourceId || row.provenance?.sourceId || ""),
       sourceKind: String(row.sourceKind || row.provenance?.sourceKind || ""),
       title: singleLine(row.title || row.provenance?.title || ""),
@@ -60366,7 +63197,9 @@ function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowCont
       temporalRelation: String(row.temporalRelation || ""),
       conflictState: String(row.conflictState || "none"),
       materialityState: String(row.materialityState || row.materiality_state || ""),
-      materialityReason: String(row.materialityReason || row.materiality_reason || "")
+      materialityReason: String(row.materialityReason || row.materiality_reason || ""),
+      scopeIds: uniqueValues([...(row.scopeIds || []), row.scopeId].map(String).filter(Boolean)),
+      taskScopeAssociations: uniqueTaskScopeAssociations(row.taskScopeAssociations || [])
     };
   });
   const compactFacts = Array.from(factById.values()).map((fact) => ({
@@ -60403,22 +63236,25 @@ function taskGenerationProviderClosedEvidenceProjection(batch = {}, workflowCont
       ...(rich.evidenceIds || rich.evidence_ids || []),
       ...(task?.providerEligibleEvidenceIds || [])
     ].map(String).filter(Boolean));
-    const evidenceIds = selectedEvidenceIds.filter((evidenceId) => {
+    const evidenceRows = selectedEvidenceRecords.filter((row) => {
+      const evidenceId = String(row.originalEvidenceId || row.evidenceId || row.evidence_id || row.id || "");
       if (taskReferenceIds.has(evidenceId)) return true;
-      const row = evidenceById[evidenceId] || {};
       const associations = uniqueTaskScopeAssociations(row.taskScopeAssociations || []);
       return associations.some((association) => String(association?.taskId || association?.task_id || "") === taskId
         && String(association?.scopeId || association?.scope_id || "") === scopeId);
     });
+    const evidenceIds = uniqueValues(evidenceRows.map((row) => String(row.originalEvidenceId || row.evidenceId || row.evidence_id || row.id || "")).filter(Boolean));
+    const deliveryIds = uniqueValues(evidenceRows.map((row) => String(row.deliveryId || semanticEvidenceDeliveryIdentity(row) || "")).filter(Boolean));
     const evidenceSet = new Set(evidenceIds);
     const factIds = uniqueValues(Array.from(factById.values())
       .filter((fact) => evidenceSet.has(String(fact?.evidenceId || fact?.evidence_id || fact?.valueEvidenceId || fact?.value_evidence_id || "")))
       .map((fact) => String(fact?.factId || fact?.fact_id || "")).filter(Boolean));
-    return { evidenceIds, factIds };
+    return { evidenceIds, deliveryIds, factIds };
   });
   return {
     version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
     evidenceIds: selectedEvidenceIds,
+    deliveryIds: uniqueValues(compactEvidence.map((row) => row.deliveryId).filter(Boolean)),
     evidence: compactEvidence,
     factIds: compactFacts.map((fact) => fact.factId),
     facts: compactFacts,
@@ -61746,6 +64582,74 @@ function taskGenerationMicroBatchProviderEnvelope(options = {}) {
   return Object.freeze(admittedResult);
 }
 
+function taskGenerationPreparedBatchRecordProjection(batchRecord = {}) {
+  const source = batchRecord && typeof batchRecord === "object" && !Array.isArray(batchRecord)
+    ? batchRecord
+    : {};
+  const projection = {};
+  const boundedKeys = [
+    "batchId",
+    "ordinal",
+    "scopeIds",
+    "taskIds",
+    "taskLimit",
+    "workflowSourceContractId",
+    "workflow_source_contract_id",
+    "workflowEvidenceCatalogHash",
+    "batchEvidenceIds",
+    "batchEvidenceHash",
+    "localRequestCacheIdentityHash",
+    "syntheticTaskId",
+    "synthetic_task_id",
+    "localWorkflowSourceContract",
+    "sourceContract",
+    "safe_fields",
+    "safeFields"
+  ];
+  for (const key of boundedKeys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) projection[key] = source[key];
+  }
+  if (source.syntheticTask && typeof source.syntheticTask === "object" && !Array.isArray(source.syntheticTask)) {
+    const task = {};
+    const taskKeys = [
+      "id",
+      "taskId",
+      "task_id",
+      "scopeId",
+      "scope_id",
+      "content",
+      "evidenceIds",
+      "evidence_ids",
+      "providerEligibleEvidenceIds",
+      "factBindings",
+      "fact_bindings"
+    ];
+    for (const key of taskKeys) {
+      if (Object.prototype.hasOwnProperty.call(source.syntheticTask, key)) task[key] = source.syntheticTask[key];
+    }
+    for (const key of ["taskLocalEvidence", "taskLocalSemanticEvidence"]) {
+      const container = source.syntheticTask[key];
+      if (!container || typeof container !== "object" || Array.isArray(container)) continue;
+      const compact = {};
+      for (const nestedKey of [
+        "taskId",
+        "task_id",
+        "scopeId",
+        "scope_id",
+        "evidenceIds",
+        "evidence_ids",
+        "factBindings",
+        "fact_bindings"
+      ]) {
+        if (Object.prototype.hasOwnProperty.call(container, nestedKey)) compact[nestedKey] = container[nestedKey];
+      }
+      task[key] = compact;
+    }
+    projection.syntheticTask = task;
+  }
+  return projection;
+}
+
 function taskGenerationMicroBatchPreparedPlan(options = {}) {
   function deepFreezeValueLocal(value, seen) {
     if (value === null || typeof value !== "object" || (seen && seen.has(value))) return value;
@@ -61782,7 +64686,10 @@ function taskGenerationMicroBatchPreparedPlan(options = {}) {
   for (let i = 0; i < rawSingletons.length; i += 1) {
     const s = rawSingletons[i];
     let cloned;
-    try { cloned = JSON.parse(JSON.stringify(s)); } catch (e) { cloned = s && typeof s === "object" ? Object.assign({}, s) : {}; }
+    const singletonForClone = s && typeof s === "object"
+      ? Object.assign({}, s, { batchRecord: taskGenerationPreparedBatchRecordProjection(s.batchRecord) })
+      : s;
+    try { cloned = JSON.parse(JSON.stringify(singletonForClone)); } catch (e) { cloned = s && typeof s === "object" ? Object.assign({}, s, { batchRecord: taskGenerationPreparedBatchRecordProjection(s.batchRecord) }) : {}; }
     if (cloned && typeof cloned === "object") {
       if (!cloned.providerBoundary || typeof cloned.providerBoundary !== "object") cloned.providerBoundary = {};
       if (!cloned.preflight || typeof cloned.preflight !== "object") cloned.preflight = { overflow: false, estimatedInputTokens: 0 };
@@ -61911,7 +64818,7 @@ function taskGenerationMicroBatchPreparedPlan(options = {}) {
     const scopeIds = freezer(Object.freeze([String(origSingleton.scopeId)]));
     const taskIds = freezer(Object.freeze([String(origSingleton.taskId || "")]));
     let batchRecordCopy;
-    try { batchRecordCopy = origSingleton.batchRecord && typeof origSingleton.batchRecord === "object" ? JSON.parse(JSON.stringify(origSingleton.batchRecord)) : {}; } catch(e){ batchRecordCopy = {}; }
+    try { batchRecordCopy = JSON.parse(JSON.stringify(taskGenerationPreparedBatchRecordProjection(origSingleton.batchRecord))); } catch(e){ batchRecordCopy = {}; }
     const batchRecords = freezer(Object.freeze([freezer(batchRecordCopy)]));
     let preflightCopy;
     try { preflightCopy = JSON.parse(JSON.stringify(origSingleton.preflight)); } catch(e){ preflightCopy = { overflow: false, estimatedInputTokens: Number(origSingleton.preflight && origSingleton.preflight.estimatedInputTokens) || 0 }; }
@@ -62016,7 +64923,7 @@ function taskGenerationMicroBatchPreparedPlan(options = {}) {
       freezer(membersCopy);
       const scopeIds = freezer(Object.freeze(membersCopy.map(function(m){ return String(m.scopeId); })));
       const taskIds = freezer(Object.freeze(membersCopy.map(function(m){ return String(m.taskId); })));
-      const batchRecords = freezer(Object.freeze(slice.map(function(o){ let br; try { br = o.batchRecord && typeof o.batchRecord === "object" ? JSON.parse(JSON.stringify(o.batchRecord)) : {}; } catch(e){ br = {}; } return freezer(br); })));
+       const batchRecords = freezer(Object.freeze(slice.map(function(o){ let br; try { br = JSON.parse(JSON.stringify(taskGenerationPreparedBatchRecordProjection(o.batchRecord))); } catch(e){ br = {}; } return freezer(br); })));
       let preflightCopy;
       try { preflightCopy = JSON.parse(JSON.stringify(bestPreflight)); } catch(e){ preflightCopy = { overflow: Boolean(bestPreflight.overflow), estimatedInputTokens: Number(bestPreflight.estimatedInputTokens), adjustedEstimatedInputTokens: Number(bestPreflight.adjustedEstimatedInputTokens), inputTokenLimitTokens: Number(bestPreflight.inputTokenLimitTokens) }; }
       freezer(preflightCopy);
@@ -64072,31 +66979,150 @@ function semanticIndexShardBodies(indexFile, meta, chunks, maxBytes = SEMANTIC_I
   return shards;
 }
 
-async function semanticIndexShardBodiesAsync(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES, generation = "") {
+function shortHashFeed(hash, text) {
+  // Lane D1 incremental FNV-1a feed: continues the shortHash stream over one
+  // exact JSON fragment so large payloads hash without building one giant
+  // intermediate string. Feeding the exact concatenation equals shortHash of
+  // the whole (UTF-16 code units are hashed independently, in order).
+  const value = String(text);
+  let next = hash;
+  for (let i = 0; i < value.length; i += 1) {
+    next ^= value.charCodeAt(i);
+    next = Math.imul(next, 16777619);
+  }
+  return next;
+}
+
+function semanticIndexGenerationSeedHash(seedMeta, chunks) {
+  // Lane D1 incremental generation-seed hash over the exact JSON
+  // representation of `{ meta: seedMeta, chunks }`, equal to
+  // `shortHash(JSON.stringify({ meta: seedMeta, chunks }))` for empty,
+  // ordinary, Unicode, and boundary inputs. Array elements that stringify to
+  // undefined (holes, undefined/functions/symbols) feed as "null", matching
+  // JSON array semantics.
+  let hash = 2166136261;
+  hash = shortHashFeed(hash, '{"meta":');
+  hash = shortHashFeed(hash, JSON.stringify(seedMeta));
+  hash = shortHashFeed(hash, ',"chunks":[');
+  const list = chunks || [];
+  for (let index = 0; index < list.length; index += 1) {
+    if (index) hash = shortHashFeed(hash, ",");
+    const body = JSON.stringify(list[index]);
+    hash = shortHashFeed(hash, body === undefined ? "null" : body);
+  }
+  hash = shortHashFeed(hash, "]}");
+  return (hash >>> 0).toString(36);
+}
+
+async function semanticIndexShardBodiesAsync(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES, generation = "", onShardOrOptions = null) {
+  // Lane D1 bounded producer: shard boundaries, file names, metadata, JSON
+  // bytes, chunk order, Unicode encoding, and per-shard hashes are exactly
+  // equivalent to the synchronous reference path. Without a consumer the
+  // result contract is unchanged (descriptors with bodies). With an explicit
+  // consumer (function or { onShard|consumer, signal?, isCurrent?, slice?,
+  // progress?, budgetMs? }), each complete shard body is emitted once in
+  // original order and awaited before release; the producer then drops the
+  // body so at most the current shard body and its chunk strings are live.
+  // Returned streaming descriptors carry file/bytes/chunkCount/hash only.
+  // Consumer errors and slice cancellation propagate without later emissions.
+  // Cooperative checkpoints use lane A's accepted slice primitive at the C1
+  // stride — no worker pool, scheduler, or fixed sleep.
+  let consumer = null;
+  let opts = {};
+  let effectiveGeneration = generation;
+  let effectiveMaxBytes = maxBytes;
+  if (typeof effectiveGeneration === "function" || (effectiveGeneration && typeof effectiveGeneration === "object")) {
+    onShardOrOptions = effectiveGeneration;
+    effectiveGeneration = "";
+  }
+  if (typeof effectiveMaxBytes === "function" || (effectiveMaxBytes && typeof effectiveMaxBytes === "object" && !Array.isArray(effectiveMaxBytes))) {
+    onShardOrOptions = effectiveMaxBytes;
+    effectiveMaxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES;
+  }
+  if (typeof onShardOrOptions === "function") consumer = onShardOrOptions;
+  else if (onShardOrOptions && typeof onShardOrOptions === "object") {
+    opts = onShardOrOptions;
+    if (typeof opts.onShard === "function") consumer = opts.onShard;
+    else if (typeof opts.consumer === "function") consumer = opts.consumer;
+  }
+  const limit = effectiveMaxBytes === undefined ? SEMANTIC_INDEX_SHARD_MAX_BYTES : effectiveMaxBytes;
+  const generationToken = effectiveGeneration;
+  const { slice, ownsSlice } = semanticPreparedSliceFor(opts, "shard-bodies");
   const shards = [];
   let currentBodies = [];
   let currentBytes = 0;
+  let shardIndex = 0;
   const flush = async () => {
     if (!currentBodies.length) return;
-    const shard = semanticIndexShardFromBodies(indexFile, meta, shards.length, currentBodies, currentBytes, generation);
-    shards.push(shard);
+    const bodies = currentBodies;
+    const bytes = currentBytes;
     currentBodies = [];
     currentBytes = 0;
-    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+    await slice.checkpoint();
+    const shard = semanticIndexShardFromBodies(indexFile, meta, shardIndex, bodies, bytes, generationToken);
+    bodies.length = 0;
+    if (consumer) {
+      const hash = shortHash(shard.body);
+      await consumer({ file: shard.file, body: shard.body, bytes: shard.bytes, chunkCount: shard.chunkCount, hash, index: shardIndex });
+      shards.push({ file: shard.file, bytes: shard.bytes, chunkCount: shard.chunkCount, hash });
+      shard.body = null;
+    } else {
+      shards.push(shard);
+    }
+    shardIndex += 1;
   };
-  for (let index = 0; index < (chunks || []).length; index += 1) {
-    const chunk = chunks[index];
-    const chunkBody = JSON.stringify(chunk);
-    const chunkBytes = utf8ByteLength(chunkBody);
-    const nextBytes = currentBytes + chunkBytes;
-    const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shards.length, currentBodies.length + 1, nextBytes, generation);
-    if (currentBodies.length && projectedBytes > maxBytes) await flush();
-    currentBodies.push(chunkBody);
-    currentBytes += chunkBytes;
-    if (index && index % 50 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+  try {
+    const source = chunks || [];
+    for (let index = 0; index < source.length; index += 1) {
+      const chunk = source[index];
+      const chunkBody = JSON.stringify(chunk);
+      const chunkBytes = utf8ByteLength(chunkBody);
+      const nextBytes = currentBytes + chunkBytes;
+      const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shardIndex, currentBodies.length + 1, nextBytes, generationToken);
+      if (currentBodies.length && projectedBytes > limit) await flush();
+      currentBodies.push(chunkBody);
+      currentBytes += chunkBytes;
+      if ((index + 1) % SEMANTIC_PREPARED_GENERATION_STRIDE === 0) await slice.checkpoint();
+    }
+    await flush();
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    return shards;
+  } catch (error) {
+    semanticPreparedRecordProgress(opts, ownsSlice, slice);
+    currentBodies = [];
+    currentBytes = 0;
+    throw error;
   }
-  await flush();
-  return shards;
+}
+
+if (typeof module !== "undefined" && module.exports && !module.exports.__semanticIndexStreamingCodec) {
+  // Lane D1 production-interface seam for the bounded serialization kernels
+  // (shard/routing codec + incremental seed hash). Additive only; the shared
+  // __semanticRetrieval export list owned by other lanes is untouched.
+  module.exports.__semanticIndexStreamingCodec = Object.freeze({
+    semanticIndexShardBodies,
+    semanticIndexShardBodiesAsync,
+    semanticIndexShardMeta,
+    semanticIndexShardHeader,
+    semanticIndexShardProjectedBytes,
+    semanticIndexShardFromBodies,
+    semanticIndexShardFileName,
+    productionSemanticRoutingBytesToBase64,
+    productionSemanticRoutingBytesToBase64Async,
+    productionSemanticRoutingBase64ToBytes,
+    serializeProductionSemanticRoutingArtifact,
+    serializeProductionSemanticRoutingArtifactAsync,
+    deserializeProductionSemanticRoutingArtifact,
+    productionSemanticRoutingArtifactIntegrity,
+    shortHash,
+    shortHashFeed,
+    semanticIndexGenerationSeedHash,
+    utf8ByteLength,
+    createSemanticWorkSlice,
+    semanticHostYield,
+    SEMANTIC_INDEX_SHARD_MAX_BYTES,
+    SEMANTIC_PREPARED_GENERATION_STRIDE
+  });
 }
 
 function semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount, generation = "") {
@@ -64575,12 +67601,16 @@ function isEmailLogPath(path, settings = DEFAULT_SETTINGS) {
 }
 function sectionKey(name) { return singleLine(name).toLowerCase(); }
 
-async function appendMarkdownBlock(app, file, markdown, assertActive = null) {
+async function appendMarkdownBlock(app, file, markdown, assertActive = null, hostIO = null) {
   if (!(file instanceof TFile)) throw new Error("Active note was not found.");
+  // Lane J: an optional host-I/O executor (e.g. a bound _admittedHostIO) routes
+  // the Vault read/write through the admitted renderer turn one call at a
+  // time; without it the calls run directly as before.
+  const io = typeof hostIO === "function" ? hostIO : (call) => call();
   assertActive?.();
-  const current = await app.vault.read(file);
+  const current = await io(() => app.vault.read(file));
   assertActive?.();
-  await app.vault.modify(file, markdownWithSingleBlankLineBeforeAppend(current, markdown));
+  await io(() => app.vault.modify(file, markdownWithSingleBlankLineBeforeAppend(current, markdown)));
 }
 
 function markdownWithSingleBlankLineBeforeAppend(current, markdown) {
@@ -64589,14 +67619,17 @@ function markdownWithSingleBlankLineBeforeAppend(current, markdown) {
   return before ? `${before}\n\n${block}\n` : `${block}\n`;
 }
 
-async function ensureVaultFolder(app, folderPath) {
+async function ensureVaultFolder(app, folderPath, hostIO = null) {
+  // Lane J: optional host-I/O executor routes folder creation through the
+  // admitted renderer turn; sync lookups stay read-free and direct.
+  const io = typeof hostIO === "function" ? hostIO : (call) => call();
   const parts = trimSlashes(folderPath).split("/").filter(Boolean);
   let current = "";
   for (const part of parts) {
     current = current ? `${current}/${part}` : part;
     if (!app.vault.getAbstractFileByPath(current)) {
       try {
-        await app.vault.createFolder(current);
+        await io(() => app.vault.createFolder(current));
       } catch (error) {
         if (!/exist/i.test(error.message || String(error))) throw error;
       }
@@ -66264,6 +69297,138 @@ function idlePause(timeoutMs = 50) {
   const requested = Number(timeoutMs);
   const ms = Number.isFinite(requested) && requested >= 0 ? requested : 0;
   return delay(ms);
+}
+
+// --- Lane A cooperative work slices (adjacent to idlePause) ---
+// One shared host-yield channel only; never a scheduler per operation. The
+// channel is module-shared across coordinators and standalone slices and is
+// intentionally not torn down on coordinator close: closing it could strand
+// concurrent yielders from other owners, and no per-entry timer/channel is
+// ever held (close settles entries, which hold no yield resources).
+
+const SEMANTIC_WORK_SLICE_DEFAULT_BUDGET_MS = 8;
+
+let semanticHostYieldChannel = null;
+
+function semanticSliceNowMs() {
+  try {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") return performance.now();
+  } catch (error) { /* fall through to Date.now */ }
+  return Date.now();
+}
+
+function semanticHostYield() {
+  // A real macrotask/host yield, never a promise-only yield: scheduler.yield()
+  // when available, otherwise one shared MessageChannel, else setTimeout(0).
+  // Global lookups go through globalThis so no host object is patched.
+  const scope = typeof globalThis !== "undefined" ? globalThis : null;
+  try {
+    const hostScheduler = (scope && scope.scheduler) || null;
+    if (hostScheduler && typeof hostScheduler.yield === "function") return hostScheduler.yield();
+  } catch (error) { /* fall through */ }
+  try {
+    const Channel = (scope && scope.MessageChannel) || ((typeof MessageChannel !== "undefined") ? MessageChannel : null);
+    if (typeof Channel === "function") {
+      let active = semanticHostYieldChannel;
+      if (!active) {
+        const fresh = new Channel();
+        if (fresh && fresh.port1 && typeof fresh.port1.addEventListener === "function" && fresh.port2 && typeof fresh.port2.postMessage === "function") {
+          semanticHostYieldChannel = fresh;
+          active = fresh;
+        } else if (fresh && fresh.port1 && fresh.port2) {
+          // Legacy port without addEventListener: single-use ephemeral yield
+          // that closes itself so no channel/timer resource leaks.
+          return new Promise((resolve) => {
+            fresh.port1.onmessage = () => {
+              fresh.port1.onmessage = null;
+              try { fresh.port1.close(); } catch (error) { /* ignore */ }
+              try { fresh.port2.close(); } catch (error) { /* ignore */ }
+              resolve();
+            };
+            fresh.port2.postMessage(0);
+          });
+        }
+      }
+      if (active) {
+        return new Promise((resolve) => {
+          active.port1.addEventListener("message", () => resolve(), { once: true });
+          active.port2.postMessage(0);
+        });
+      }
+    }
+  } catch (error) { /* fall through */ }
+  return new Promise((resolve) => {
+    try {
+      const scope = typeof globalThis !== "undefined" ? globalThis : null;
+      const timer = (typeof setTimeout === "function" ? setTimeout : null) || (scope && typeof scope.setTimeout === "function" ? scope.setTimeout : null);
+      if (timer) {
+        // Preserve `this` for host timer implementations that require it.
+        if (scope && timer === scope.setTimeout) timer.call(scope, resolve, 0);
+        else timer(resolve, 0);
+        return;
+      }
+    } catch (error) { /* fall through */ }
+    resolve();
+  });
+}
+
+function createSemanticWorkSlice(options = {}) {
+  const requested = Number(options && options.budgetMs);
+  const budgetMs = Number.isFinite(requested) && requested >= 0 ? requested : SEMANTIC_WORK_SLICE_DEFAULT_BUDGET_MS;
+  const signal = (options && (options.signal || options.abortSignal)) || null;
+  const isCurrent = options && typeof options.isCurrent === "function" ? options.isCurrent : null;
+  const phase = String((options && options.phase) || "").slice(0, 80);
+  const startMs = semanticSliceNowMs();
+  let sliceStartMs = startMs;
+  let yieldWaitMs = 0;
+  let yieldCount = 0;
+  let maxSliceMs = 0;
+  const cancelled = () => {
+    try {
+      if (signal && signal.aborted) return true;
+    } catch (error) { /* treat unreadable signal as live */ }
+    try {
+      if (isCurrent && !isCurrent()) return true;
+    } catch (error) {
+      return true;
+    }
+    return false;
+  };
+  const cancelError = () => {
+    const error = new Error(`Semantic work slice was cancelled${phase ? ` during ${phase}` : ""}.`);
+    error.code = "semantic-work-cancelled";
+    return error;
+  };
+  return {
+    phase,
+    budgetMs,
+    cancelled,
+    async checkpoint() {
+      if (cancelled()) throw cancelError();
+      const before = semanticSliceNowMs();
+      const sliceMs = before - sliceStartMs;
+      if (sliceMs > maxSliceMs) maxSliceMs = sliceMs;
+      await semanticHostYield();
+      const after = semanticSliceNowMs();
+      yieldWaitMs += Math.max(0, after - before);
+      if (cancelled()) throw cancelError();
+      yieldCount += 1;
+      sliceStartMs = after;
+    },
+    finish() {
+      const endMs = semanticSliceNowMs();
+      const elapsedMs = Math.max(0, endMs - startMs);
+      // Fold the final tail slice (work since the last checkpoint) into the
+      // max so short trailing work is never silently dropped.
+      const tailMs = Math.max(0, endMs - sliceStartMs);
+      return {
+        workMs: Math.max(0, elapsedMs - yieldWaitMs),
+        elapsedMs,
+        yieldCount,
+        maxSliceMs: Math.max(maxSliceMs, tailMs)
+      };
+    }
+  };
 }
 const STS_MULTI_PROVIDER = (() => {
   // Keep OpenWebUI safety normalization inside the extracted provider module
@@ -77562,12 +80727,23 @@ class AIModelGateway {
           };
           let providerWorkPromise;
           if (this.runtime?.runtimeWorkCoordinator) {
+            // Owned maintenance only: admission requires the presented token
+            // to BE the exact active owned token while the run holds gateway
+            // admission. Unrelated/copied/absent tokens fall through to the
+            // ordinary workflow admission below; provider lanes are untouched.
+            const presentedIndexToken = request?.indexToken || operationRequest?.indexToken;
+            const ownedIndexToken = this.runtime?._semanticIndexActiveToken;
             providerWorkPromise = this.runtime.runtimeWorkCoordinator.runProviderWork({
               provider: reference.provider,
               model: reference.model,
               operation: plan.operation,
               workflowToken: request.workflowToken || null,
-              allowActiveIndex: Boolean(this.runtime.semanticIndexOperationActive),
+              allowActiveIndex: Boolean(
+                presentedIndexToken
+                && ownedIndexToken
+                && presentedIndexToken === ownedIndexToken
+                && this.runtime?._semanticIndexGatewayAllowActive
+              ),
               execute: runAttempt
             });
           } else {
@@ -78286,8 +81462,145 @@ function semanticEfficiencyObservation(input = {}) {
     .map(([key, value]) => [key, Math.max(0, Number(value) || 0)]));
   const lineageStages = ["indexed", "routed", "exactScored", "positiveUnion", "deduplicated", "taskBound", "providerDelivered", "citedOrUsed"];
   const suppliedLineageStages = new Set(Object.keys(input.lineage || {}));
-  const lineage = Object.fromEntries(lineageStages.map(key => [key, [...new Set((input.lineage?.[key] || []).map(String))].sort()]));
-  lineage.firstMissing = lineage.indexed.filter(id => lineageStages.slice(1).some(key => suppliedLineageStages.has(key) && !lineage[key].includes(id)));
+  const hashValue = (value) => localSemanticRoutingStableHash(String(value || ""));
+  const lineageEntry = (value) => {
+    if (!value || typeof value !== "object") {
+      const label = String(value || "");
+      return {
+        key: JSON.stringify([label, "", ""]),
+        label,
+        originalId: label,
+        originalIdHash: hashValue(label),
+        deliveryId: label,
+        deliveryIdHash: hashValue(label),
+        bodyHash: "",
+        scopeAssociationHash: "",
+        scopeAssociationCount: 0
+      };
+    }
+    const originalId = String(value.originalEvidenceId || value.evidenceId || value.evidence_id || value.id || "").trim();
+    const body = semanticEvidenceRecordBody(value);
+    const bodyHash = body ? hashValue(body) : "";
+    const deliveryId = String(value.deliveryId || semanticEvidenceDeliveryIdentity(value) || originalId).trim();
+    const associations = [];
+    for (const scopeId of [
+      value.scopeId,
+      value.scope_id,
+      ...(value.scopeIds || []),
+      ...(value.scope_ids || [])
+    ]) {
+      const normalizedScopeId = String(scopeId || "").trim();
+      if (normalizedScopeId) associations.push({ taskId: "", scopeId: normalizedScopeId });
+    }
+    for (const association of [
+      ...(value.taskScopeAssociations || []),
+      ...(value.task_scope_associations || [])
+    ]) {
+      const taskId = String(association?.taskId || association?.task_id || "").trim();
+      const scopeId = String(association?.scopeId || association?.scope_id || "").trim();
+      if (taskId || scopeId) associations.push({ taskId, scopeId });
+    }
+    const uniqueAssociations = Array.from(new Map(
+      associations.map((association) => [JSON.stringify(association), association])
+    ).values()).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const scopeAssociationHash = uniqueAssociations.length ? hashValue(JSON.stringify(uniqueAssociations)) : "";
+    return {
+      key: JSON.stringify([deliveryId || originalId, bodyHash, scopeAssociationHash]),
+      label: deliveryId || originalId,
+      originalId,
+      originalIdHash: hashValue(originalId),
+      deliveryId,
+      deliveryIdHash: hashValue(deliveryId),
+      bodyHash,
+      scopeAssociationHash,
+      scopeAssociationCount: uniqueAssociations.length
+    };
+  };
+  const internalIdentityRecords = {};
+  const identityRecords = {};
+  const lineage = Object.fromEntries(lineageStages.map((stage) => {
+    const recordsByKey = new Map();
+    for (const value of input.lineage?.[stage] || []) {
+      const record = lineageEntry(value);
+      if (record.key && !recordsByKey.has(record.key)) recordsByKey.set(record.key, record);
+    }
+    const records = Array.from(recordsByKey.values()).sort((left, right) => left.label.localeCompare(right.label));
+    internalIdentityRecords[stage] = records;
+    identityRecords[stage] = records.map((record) => Object.freeze({
+      identityHash: hashValue(record.key),
+      originalIdHash: record.originalIdHash,
+      deliveryIdHash: record.deliveryIdHash,
+      bodyHash: record.bodyHash,
+      scopeAssociationHash: record.scopeAssociationHash,
+      scopeAssociationCount: record.scopeAssociationCount
+    }));
+    return [stage, records.map((record) => record.label)];
+  }));
+  const suppliedStagesAfterRoot = lineageStages.slice(1).filter((stage) => suppliedLineageStages.has(stage));
+  const rootRecords = Array.from(new Map(
+    (internalIdentityRecords.indexed || []).map((record, index) => [
+      record.key,
+      { ...record, index }
+    ])
+  ).values());
+  const stageRecordMaps = Object.fromEntries(lineageStages.map((stage) => [
+    stage,
+    new Map((internalIdentityRecords[stage] || []).map((record) => [
+      record.key,
+      record
+    ]))
+  ]));
+  const firstMissingRecords = rootRecords.filter((root) => suppliedStagesAfterRoot.some((stage) => {
+    return !stageRecordMaps[stage].has(root.key);
+  }));
+  const recordsByOriginal = (stage) => {
+    const result = new Map();
+    for (const record of internalIdentityRecords[stage] || []) {
+      const rows = result.get(record.originalIdHash) || [];
+      rows.push(record);
+      result.set(record.originalIdHash, rows);
+    }
+    return result;
+  };
+  let bodyMismatchCount = 0;
+  let scopeMismatchCount = 0;
+  let identityMismatchCount = 0;
+  const rootOriginalRecords = recordsByOriginal("indexed");
+  for (const stage of suppliedStagesAfterRoot) {
+    const stageByOriginal = recordsByOriginal(stage);
+    for (const [originalIdHash, roots] of rootOriginalRecords.entries()) {
+      const observed = stageByOriginal.get(originalIdHash) || [];
+      for (const root of roots) {
+        if (!observed.length) continue;
+        if (!observed.some((record) => record.bodyHash === root.bodyHash)) bodyMismatchCount += 1;
+        if (!observed.some((record) => record.scopeAssociationHash === root.scopeAssociationHash)) scopeMismatchCount += 1;
+        if (!observed.some((record) => record.deliveryIdHash === root.deliveryIdHash)) identityMismatchCount += 1;
+      }
+    }
+  }
+  const providerRecords = internalIdentityRecords.providerDelivered || [];
+  const citedRecords = stageRecordMaps.citedOrUsed || new Map();
+  const deliveredButUnusedCount = providerRecords.filter((record) => !citedRecords.has(record.key)).length;
+  const reconciliation = Object.freeze({
+    suppliedStageCount: suppliedLineageStages.size,
+    rootCount: rootRecords.length,
+    stageCounts: Object.freeze(Object.fromEntries(lineageStages.map((stage) => [stage, (identityRecords[stage] || []).length]))),
+    matchedCounts: Object.freeze(Object.fromEntries(lineageStages.map((stage) => [
+      stage,
+      stage === "indexed" ? rootRecords.length : rootRecords.filter((root) => stageRecordMaps[stage].has(
+        root.key
+      )).length
+    ]))),
+    firstMissingCount: firstMissingRecords.length,
+    bodyMismatchCount,
+    scopeMismatchCount,
+    identityMismatchCount,
+    deliveredButUnusedCount
+  });
+  lineage.firstMissing = firstMissingRecords.map((record) => record.label);
+  lineage.firstMissingIdentityHashes = firstMissingRecords.map((record) => record.identityHash);
+  lineage.identityRecords = Object.freeze(identityRecords);
+  lineage.reconciliation = reconciliation;
   return Object.freeze({
     schemaVersion: 1,
     operation: String(input.operation || ""),
@@ -78313,8 +81626,14 @@ if (typeof module !== "undefined" && module.exports) {
     semanticPreparedViewIdentity,
     SEMANTIC_CORPUS_PREPARATION_POLICY_VERSION,
     prepareProductionSemanticRoutingState,
+    prepareProductionSemanticRoutingStateAsync,
     buildLocalSemanticTextSeedIndex,
+    buildLocalSemanticTextSeedIndexAsync,
     buildLocalSemanticRoutingIndex,
+    buildLocalSemanticRoutingIndexAsync,
+    measurePreparedMetadata,
+    buildSemanticIndexPreparedView,
+    buildSemanticIndexPreparedViewAsync,
     localSemanticTextSeedTerms,
     resolveIndexedLocalTextSeedQueryHandles,
     resolveIndexedLocalTextSeedQueryHandlesLegacy,
@@ -78322,6 +81641,7 @@ if (typeof module !== "undefined" && module.exports) {
     semanticRoutingStableHandleKey,
     routeLocalSemanticEvidence,
     localSemanticRoutingIndexIntegrity,
+    localSemanticRoutingIndexIntegrityAsync,
     localSemanticRoutingStableHash,
     uniqueSemanticEvidenceChunks,
     semanticEvidenceDeliveryIdentity,
@@ -78427,7 +81747,11 @@ if (typeof module !== "undefined" && module.exports) {
     taskReservedSemanticEvidenceLineRange,
     taskSemanticScopeLineRanges,
     taskDescriptionProviderConcurrency,
-    taskGenerationRunInitialBatchWorkers
+    taskGenerationRunInitialBatchWorkers,
+    RuntimeWorkCoordinator,
+    createSemanticWorkSlice,
+    SEMANTIC_WORK_SLICE_DEFAULT_BUDGET_MS,
+    semanticHostYield
   });
   module.exports.__taskGenerationValidation = Object.freeze({
     taskGenerationMicroBatchSettleMembers,
@@ -78460,6 +81784,9 @@ if (typeof module !== "undefined" && module.exports) {
     taskDescriptionRequiredSemanticContextRepair,
     validateTaskDescriptionSentences,
     taskDescriptionAcceptedCitationLedger,
+    taskDescriptionProviderEnvelopeFit,
+    taskDescriptionOptionalPrunedContractView,
+    taskDescriptionProviderEvidenceGroups,
     taskWorkflowEvidenceSourceList,
     deduplicateGeneratedTaskBatch,
     taskGenerationBatchClosureState
@@ -78802,6 +82129,11 @@ if (typeof module !== "undefined" && module.exports?.prototype) {
 }
 
 function stsCreateRuntimeAiModelGateway(plugin) {
+  // Lane J transport-factory seam: constructs the AIModelGateway transport
+  // (requestUrl adapters) without acquiring a renderer turn or issuing host
+  // data-I/O. Provider waits release renderer ownership via the
+  // RuntimeWorkCoordinator.runProviderWork bridge; local result adoption
+  // re-enters through RuntimeWorkCoordinator.runRendererPhase.
   const transport = typeof requestUrl === "function" ? requestUrl : null;
   const adapterOptions = { requestUrl: transport };
   return new AIModelGateway(plugin, {

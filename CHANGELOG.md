@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.40
+
+### Semantic index reliability
+- Improved prepared-index startup coordination and readiness reporting.
+- Added complete settled-storage accounting with safe cleanup of validated
+  inactive derived partitions and obsolete current-generation routing copies.
+
+### Grounded task and description generation
+- Preserved complete positive evidence closure through task-generation and
+  description-provider preparation while protecting required source context.
+- Added bounded context fitting for oversized description requests without
+  changing provider or retry policy.
+- Strengthened task-reference alignment and content-free diagnostics.
+
 ## 0.8.39
 
 ### Provider choice and compatibility

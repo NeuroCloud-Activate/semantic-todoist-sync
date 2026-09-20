@@ -18,6 +18,19 @@ const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
 const SEMANTIC_INDEX_PATH_META_FILE = "semantic-index-path-meta.json";
+const SUPPORTED_AI_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai"]);
+const AI_OPERATION_KEYS = Object.freeze([
+  "chat-query", "prompt-response", "task-generation", "task-description",
+  "section-title", "scheduler", "policy", "deduplication"
+]);
+const DEFAULT_GENERATION_PRIMARY = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-luna", reasoningEffort: "medium" });
+const DEFAULT_GENERATION_FALLBACK = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-terra", reasoningEffort: "medium" });
+const DEFAULT_EMBEDDING_REFERENCE = Object.freeze({ provider: "customopenai", model: "qwen3-embedding-0.6b-8k:latest" });
+const STABLE_INDEX_CLEANUP_PATTERNS = Object.freeze([
+  /^semantic-index\.(?:openai|gemini|openrouter|openwebui|customopenai)\.g[a-z0-9-]+\.\d{3}\.json$/i,
+  /^semantic-index-path-meta\.[a-z0-9-]+\.json$/i,
+  /^semantic-index-routing\.[a-z0-9-]+\.json$/i
+]);
 const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
 const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
 const SCHEDULER_MEMORY_FILE = "scheduler-memory.json";
@@ -1404,23 +1417,276 @@ function deserializeProductionSemanticRoutingArtifact(artifact = {}) {
   return index;
 }
 
+function stableSupportedProvider(value, fallback = DEFAULT_GENERATION_PRIMARY.provider) {
+  const aliases = {
+    google: "gemini",
+    "open-ai": "openai",
+    "open-webui": "openwebui",
+    "open-web-ui": "openwebui",
+    "custom-openai": "customopenai",
+    "openai-compatible": "customopenai",
+    openaicompatible: "customopenai"
+  };
+  const candidate = aliases[String(value || "").trim().toLowerCase()] || String(value || "").trim().toLowerCase();
+  if (SUPPORTED_AI_PROVIDERS.includes(candidate)) return candidate;
+  const fallbackCandidate = aliases[String(fallback || "").trim().toLowerCase()] || String(fallback || "").trim().toLowerCase();
+  return SUPPORTED_AI_PROVIDERS.includes(fallbackCandidate) ? fallbackCandidate : DEFAULT_GENERATION_PRIMARY.provider;
+}
+
+function stableReasoningEffort(value, fallback = "medium") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return REASONING_EFFORT_VALUES.includes(normalized) ? normalized : fallback;
+}
+
+function stableReference(value, fallback = DEFAULT_GENERATION_PRIMARY) {
+  const source = value && typeof value === "object" ? value : { model: value };
+  const fallbackReference = fallback && typeof fallback === "object" ? fallback : DEFAULT_GENERATION_PRIMARY;
+  const provider = stableSupportedProvider(source.provider, fallbackReference.provider);
+  const model = String(source.model || fallbackReference.model || "").trim();
+  return {
+    provider,
+    model: model || String(fallbackReference.model || "").trim(),
+    reasoningEffort: stableReasoningEffort(source.reasoningEffort, stableReasoningEffort(fallbackReference.reasoningEffort, "medium"))
+  };
+}
+
+function createStableOperationModels(primary = DEFAULT_GENERATION_PRIMARY, fallback = DEFAULT_GENERATION_FALLBACK) {
+  const result = {};
+  for (const operation of AI_OPERATION_KEYS) {
+    result[operation] = {
+      primary: stableReference(primary, DEFAULT_GENERATION_PRIMARY),
+      fallback: stableReference(fallback, DEFAULT_GENERATION_FALLBACK)
+    };
+  }
+  return result;
+}
+
+function cloneStableValue(value) {
+  if (Array.isArray(value)) return value.map(cloneStableValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneStableValue(item)]));
+}
+
+function stableOperationSource(settings, operation, role) {
+  const operationMap = settings?.aiOperationModels && typeof settings.aiOperationModels === "object" ? settings.aiOperationModels : {};
+  const row = operationMap[operation] && typeof operationMap[operation] === "object" ? operationMap[operation] : {};
+  const value = row[role];
+  return value && typeof value === "object" && String(value.model || "").trim() ? value : null;
+}
+
+function normalizeStableOperationModels(source = {}, sharedPrimary = DEFAULT_GENERATION_PRIMARY, sharedFallback = DEFAULT_GENERATION_FALLBACK) {
+  const existing = source && typeof source === "object" ? source : {};
+  const result = cloneStableValue(existing);
+  for (const operation of AI_OPERATION_KEYS) {
+    const row = existing[operation] && typeof existing[operation] === "object" ? existing[operation] : {};
+    result[operation] = Object.assign({}, row, {
+      primary: stableReference(row.primary, sharedPrimary),
+      fallback: stableReference(row.fallback, sharedFallback)
+    });
+  }
+  return result;
+}
+
+function normalizeStableSettings(input = {}) {
+  const source = input && typeof input === "object" ? input : {};
+  const result = Object.assign({}, cloneStableValue(DEFAULT_SETTINGS), cloneStableValue(source));
+  const primaryProvider = stableSupportedProvider(source.aiModelProvider, DEFAULT_GENERATION_PRIMARY.provider);
+  const fallbackProvider = stableSupportedProvider(source.fallbackAiModelProvider, primaryProvider);
+  result.aiModelProvider = primaryProvider;
+  result.fallbackAiModelProvider = fallbackProvider;
+  result.embeddingProvider = stableSupportedProvider(source.embeddingProvider, DEFAULT_EMBEDDING_REFERENCE.provider);
+  result.embeddingModel = String(source.embeddingModel || DEFAULT_EMBEDDING_REFERENCE.model).trim();
+  result.embeddingModelReference = stableReference(source.embeddingModelReference || {
+    provider: result.embeddingProvider,
+    model: result.embeddingModel
+  }, DEFAULT_EMBEDDING_REFERENCE);
+  result.embeddingProvider = result.embeddingModelReference.provider;
+  result.embeddingModel = result.embeddingModelReference.model;
+  const legacyPrimary = source.sharedGenerationPrimary || {
+    provider: primaryProvider,
+    model: source.chatModel || DEFAULT_GENERATION_PRIMARY.model,
+    reasoningEffort: source.chatReasoningEffort
+  };
+  const legacyFallback = source.sharedGenerationFallback || {
+    provider: fallbackProvider,
+    model: source.chatFallbackModel || DEFAULT_GENERATION_FALLBACK.model,
+    reasoningEffort: source.chatFallbackReasoningEffort
+  };
+  result.sharedGenerationPrimary = stableReference(legacyPrimary, DEFAULT_GENERATION_PRIMARY);
+  result.sharedGenerationFallback = stableReference(legacyFallback, DEFAULT_GENERATION_FALLBACK);
+  result.chatModel = result.sharedGenerationPrimary.model;
+  result.chatFallbackModel = result.sharedGenerationFallback.model;
+  result.chatReasoningEffort = result.sharedGenerationPrimary.reasoningEffort;
+  result.chatFallbackReasoningEffort = result.sharedGenerationFallback.reasoningEffort;
+  result.aiOperationModels = normalizeStableOperationModels(source.aiOperationModels, result.sharedGenerationPrimary, result.sharedGenerationFallback);
+  if (!source.aiOperationModels || typeof source.aiOperationModels !== "object") {
+    result.aiOperationModels = normalizeStableOperationModels({}, result.sharedGenerationPrimary, result.sharedGenerationFallback);
+  }
+  const generationCatalogs = source.providerGenerationModels && typeof source.providerGenerationModels === "object" ? source.providerGenerationModels : {};
+  const embeddingCatalogs = source.providerEmbeddingModels && typeof source.providerEmbeddingModels === "object" ? source.providerEmbeddingModels : {};
+  result.providerGenerationModels = Object.assign({}, cloneStableValue(generationCatalogs));
+  result.providerEmbeddingModels = Object.assign({}, cloneStableValue(embeddingCatalogs));
+  for (const provider of SUPPORTED_AI_PROVIDERS) {
+    result.providerGenerationModels[provider] = Array.isArray(generationCatalogs[provider]) ? generationCatalogs[provider].slice() : [];
+    result.providerEmbeddingModels[provider] = Array.isArray(embeddingCatalogs[provider]) ? embeddingCatalogs[provider].slice() : [];
+  }
+  result.enableMultiProviderOperationModels = source.enableMultiProviderOperationModels === true;
+  return result;
+}
+
+function stableReferenceKey(reference = {}) {
+  return `${stableSupportedProvider(reference.provider)}:${String(reference.model || "").trim().toLowerCase()}`;
+}
+
+function resolveOperationReference(settings = DEFAULT_SETTINGS, operation = "chat-query", role = "primary") {
+  const normalized = normalizeStableSettings(settings);
+  const operationKey = AI_OPERATION_KEYS.includes(operation) ? operation : "chat-query";
+  const selectedRole = role === "fallback" ? "fallback" : "primary";
+  const shared = selectedRole === "fallback" ? normalized.sharedGenerationFallback : normalized.sharedGenerationPrimary;
+  const candidate = normalized.enableMultiProviderOperationModels ? stableOperationSource(normalized, operationKey, selectedRole) : null;
+  const reference = candidate ? stableReference(candidate, shared) : stableReference(shared, shared);
+  const primary = selectedRole === "fallback"
+    ? (normalized.enableMultiProviderOperationModels && stableOperationSource(normalized, operationKey, "primary")
+      ? stableReference(stableOperationSource(normalized, operationKey, "primary"), normalized.sharedGenerationPrimary)
+      : normalized.sharedGenerationPrimary)
+    : reference;
+  if (selectedRole === "fallback" && stableReferenceKey(primary) === stableReferenceKey(reference)) {
+    const error = new Error("same-model-fallback");
+    error.code = "same-model-fallback";
+    throw error;
+  }
+  return Object.freeze({
+    provider: stableSupportedProvider(reference.provider, shared.provider),
+    model: String(reference.model || shared.model).trim(),
+    reasoningEffort: stableReasoningEffort(reference.reasoningEffort, shared.reasoningEffort)
+  });
+}
+
+function stableEndpointIdentity(settings = {}, provider = "") {
+  const normalizedProvider = stableSupportedProvider(provider, "");
+  const configured = normalizedProvider === "customopenai"
+    ? settings.customOpenAIBaseUrl
+    : normalizedProvider === "openwebui"
+      ? settings.openwebuiBaseUrl
+      : settings.providerEndpoints?.[normalizedProvider];
+  const raw = String(configured || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return `${parsed.origin.toLowerCase()}${parsed.pathname.replace(/\/+$/, "") || "/"}`;
+  } catch {
+    return raw.replace(/[?#].*$/, "").replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function providerIndexIdentity(settings = DEFAULT_SETTINGS, provider = "", model = "") {
+  const normalized = normalizeStableSettings(settings);
+  const normalizedProvider = stableSupportedProvider(provider, normalized.embeddingProvider);
+  const exactModel = String(model || normalized.embeddingModel || DEFAULT_EMBEDDING_REFERENCE.model).trim();
+  const overrideKey = `${normalizedProvider}:${exactModel}`;
+  const dimensionCandidates = [
+    normalized.embeddingDimensionOverrides?.[overrideKey],
+    normalized.embeddingDimensions?.[overrideKey],
+    normalized.embeddingDimension,
+    normalized.semanticIndexMeta?.dimension,
+    normalized.openAiEmbeddingDimensions
+  ];
+  const dimension = dimensionCandidates.map((value) => Number(value)).find((value) => Number.isInteger(value) && value > 0) || 0;
+  const endpoint = stableEndpointIdentity(normalized, normalizedProvider);
+  const endpointIdentityHash = endpoint ? shortHash(endpoint) : "";
+  return Object.freeze({
+    provider: normalizedProvider,
+    model: exactModel,
+    dimension,
+    endpointIdentityHash,
+    identityKey: [normalizedProvider, exactModel, dimension, endpointIdentityHash].join("|")
+  });
+}
+
+function semanticIndexCompatibilityStatus(settings = DEFAULT_SETTINGS, manifest = {}) {
+  const expected = providerIndexIdentity(settings, settings.embeddingProvider, settings.embeddingModel);
+  const actual = manifest?.identity || manifest?.meta || null;
+  if (!actual || typeof actual !== "object") return { compatible: false, rebuildRequired: true, reasonCode: "manifest-missing", expected, actual: null };
+  const actualIdentityFields = {
+    provider: typeof actual.provider === "string" ? actual.provider.trim().toLowerCase() : "",
+    model: typeof actual.model === "string" ? actual.model.trim() : "",
+    dimension: Number(actual.dimension),
+    endpointIdentityHash: typeof actual.endpointIdentityHash === "string" ? actual.endpointIdentityHash : ""
+  };
+  const manifestComplete = SUPPORTED_AI_PROVIDERS.includes(actualIdentityFields.provider)
+    && Boolean(actualIdentityFields.model)
+    && Number.isInteger(actualIdentityFields.dimension)
+    && actualIdentityFields.dimension > 0
+    && Object.prototype.hasOwnProperty.call(actual, "endpointIdentityHash");
+  if (!manifestComplete) {
+    return {
+      compatible: false,
+      rebuildRequired: true,
+      reasonCode: actualIdentityFields.provider && !SUPPORTED_AI_PROVIDERS.includes(actualIdentityFields.provider) ? "provider-mismatch" : "manifest-incomplete",
+      expected,
+      actual: actualIdentityFields
+    };
+  }
+  const actualIdentity = providerIndexIdentity({
+    ...settings,
+    embeddingProvider: actualIdentityFields.provider,
+    embeddingModel: actualIdentityFields.model,
+    embeddingDimension: actualIdentityFields.dimension,
+    embeddingDimensionOverrides: { [`${actualIdentityFields.provider}:${actualIdentityFields.model}`]: actualIdentityFields.dimension },
+    customOpenAIBaseUrl: actualIdentityFields.endpointIdentityHash ? settings.customOpenAIBaseUrl : "",
+    openwebuiBaseUrl: actualIdentityFields.endpointIdentityHash ? settings.openwebuiBaseUrl : ""
+  }, actualIdentityFields.provider, actualIdentityFields.model);
+  const reasons = [];
+  if (actualIdentity.provider !== expected.provider) reasons.push("provider-mismatch");
+  if (actualIdentity.model !== expected.model) reasons.push("model-mismatch");
+  if (actualIdentity.dimension !== expected.dimension) reasons.push("dimension-mismatch");
+  if (actualIdentityFields.endpointIdentityHash !== expected.endpointIdentityHash) reasons.push("endpoint-mismatch");
+  return {
+    compatible: reasons.length === 0,
+    rebuildRequired: reasons.length > 0,
+    reasonCode: reasons[0] || "compatible",
+    expected,
+    actual: actualIdentityFields
+  };
+}
+
+function semanticIndexCleanupPlan(files = [], state = {}) {
+  const eligible = state.replacementCommitted === true && state.integrityVerified === true && state.pointerPromoted === true;
+  const active = new Set(Array.isArray(state.activeFiles) ? state.activeFiles : []);
+  const allowlisted = (name) => STABLE_INDEX_CLEANUP_PATTERNS.some((pattern) => pattern.test(String(name || "")));
+  const candidates = Array.from(new Set((Array.isArray(files) ? files : []).map((name) => String(name || ""))))
+    .filter((name) => allowlisted(name) && !active.has(name));
+  return { eligible, files: eligible ? candidates : [] };
+}
+
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
   googleApiKey: "",
   todoistToken: "",
   workerUrl: "",
   workerToken: "",
-  aiModelProvider: "openai",
-  chatModel: "gpt-5.6-terra",
+  aiModelProvider: "openrouter",
+  fallbackAiModelProvider: "openrouter",
+  sharedGenerationPrimary: DEFAULT_GENERATION_PRIMARY,
+  sharedGenerationFallback: DEFAULT_GENERATION_FALLBACK,
+  aiOperationModels: createStableOperationModels(),
+  enableMultiProviderOperationModels: false,
+  providerGenerationModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
+  providerEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
+  chatModel: "openai/gpt-5.6-luna",
   chatReasoningEffort: "medium",
-  chatFallbackModel: "gpt-5.6-luna",
+  chatFallbackModel: "openai/gpt-5.6-terra",
   chatFallbackReasoningEffort: "medium",
   optimizeStructuredAiUsage: true,
   enableOpenAiPromptCaching: true,
   enableAiModelFallback: true,
   showAiFallbackNotice: true,
   chatMode: "Vault QA",
-  embeddingModel: "text-embedding-3-large",
+  embeddingProvider: "customopenai",
+  embeddingModelReference: DEFAULT_EMBEDDING_REFERENCE,
+  embeddingModel: "qwen3-embedding-0.6b-8k:latest",
+  embeddingDimension: 0,
+  embeddingDimensionOverrides: {},
   openAiEmbeddingDimensions: 1024,
   availableChatModels: ["gpt-5.6-terra", "gpt-5.6-luna"],
   availableEmbeddingModels: ["text-embedding-3-large"],
@@ -2520,6 +2786,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async migrateSettings() {
+    const stableBeforeMigration = normalizeStableSettings(this.settings);
+    Object.assign(this.settings, stableBeforeMigration);
     let changed = false;
     const normalizedTaskSectionTitleMode = normalizeTaskSectionTitleMode(this.settings.taskSectionTitleMode);
     if (this.settings.taskSectionTitleMode !== normalizedTaskSectionTitleMode) {
@@ -2796,6 +3064,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (JSON.stringify(normalizedDescriptions) !== JSON.stringify(this.settings.pendingTaskDescriptions)) changed = true;
       this.settings.pendingTaskDescriptions = normalizedDescriptions;
     }
+    const stableAfterMigration = normalizeStableSettings(this.settings);
+    if (JSON.stringify(stableAfterMigration) !== JSON.stringify(this.settings)) changed = true;
+    Object.assign(this.settings, stableAfterMigration);
     if (changed || this.taskReferenceSnapshotDirty) this.markTaskReferenceStateDirty();
     if (changed) await this.saveSettings();
   }
@@ -33920,13 +34191,17 @@ function shortHash(value) {
   return (hash >>> 0).toString(36);
 }
 function normalizeAiProvider(value, fallback = "openai") {
-  const provider = String(value || "").toLowerCase();
-  if (provider === "gemini" || provider === "google") return "gemini";
-  if (provider === "openai" || provider === "open-ai") return "openai";
-  return fallback === "gemini" ? "gemini" : "openai";
+  return stableSupportedProvider(value, fallback);
 }
 function providerDisplayName(provider) {
-  return normalizeAiProvider(provider) === "gemini" ? "Gemini" : "OpenAI";
+  const normalized = normalizeAiProvider(provider);
+  return {
+    openai: "OpenAI",
+    gemini: "Gemini",
+    openrouter: "OpenRouter",
+    openwebui: "Open WebUI",
+    customopenai: "Custom OpenAI-compatible"
+  }[normalized] || "OpenAI";
 }
 function normalizeOpenAIModelId(value) {
   return String(value || "").replace(/^openai[/:]/i, "").trim();
@@ -36153,5 +36428,18 @@ function idlePause(timeoutMs = 50) {
       return;
     }
     window.setTimeout(resolve, timeoutMs);
+  });
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  Object.assign(module.exports, {
+    SUPPORTED_AI_PROVIDERS,
+    AI_OPERATION_KEYS,
+    DEFAULT_SETTINGS,
+    normalizeStableSettings,
+    resolveOperationReference,
+    providerIndexIdentity,
+    semanticIndexCompatibilityStatus,
+    semanticIndexCleanupPlan
   });
 }

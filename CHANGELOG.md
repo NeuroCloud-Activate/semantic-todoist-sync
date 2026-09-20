@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.41
+
+### Web research
+- Added opt-in Internet Search and Deep Research modes for chat.
+- Added provider-native web search for OpenAI, Gemini, and OpenRouter with
+  canonical source validation, citations, and local fallback behavior.
+- Added sanitized Research-note saving for validated web evidence.
+
 ## 0.8.40
 
 ### Semantic index reliability

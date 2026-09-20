@@ -156,6 +156,17 @@ const CONTEXT_QUERY_SCOPE_STOP_WORDS = new Set([
 const STRONG_MODEL_ESCALATION_THRESHOLD = 95;
 const STRONG_MODEL_HARD_ESCALATION_THRESHOLD = 99;
 const CHAT_RESPONSE_MAX_CLAIMS = 24;
+const WEB_SEARCH_PROVIDER_VALUES = Object.freeze(["openai", "gemini", "openrouter"]);
+const WEB_SEARCH_MODE_VALUES = Object.freeze(["off", "concise", "deep"]);
+const WEB_SEARCH_PROVIDER_DEFAULT_MODELS = Object.freeze({
+  openai: "gpt-5.6",
+  gemini: "gemini-3.5-flash-lite",
+  openrouter: "openrouter/free"
+});
+const WEB_SEARCH_MODE_PROFILES = Object.freeze({
+  concise: Object.freeze({ maxOutputTokens: 8000, maxResults: 10, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 3, openrouter: Object.freeze({ max_results: 6, max_total_results: 12, max_uses: 3, max_characters: 4000 }) }),
+  deep: Object.freeze({ maxOutputTokens: 8000, maxResults: 12, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 4, openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 }) })
+});
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
     filename: "Generate Todoist task list.md",
@@ -1532,6 +1543,12 @@ function normalizeStableSettings(input = {}) {
     result.providerEmbeddingModels[provider] = Array.isArray(embeddingCatalogs[provider]) ? embeddingCatalogs[provider].slice() : [];
   }
   result.enableMultiProviderOperationModels = source.enableMultiProviderOperationModels === true;
+  result.chatWebSearchProvider = normalizeWebSearchProvider(source.chatWebSearchProvider);
+  result.chatWebSearchModel = normalizeWebSearchModel(source.chatWebSearchModel, result.chatWebSearchProvider);
+  result.chatWebSearchMode = normalizeWebSearchMode(source.chatWebSearchMode);
+  result.chatWebSaveResearch = typeof source.chatWebSaveResearch === "string"
+    ? source.chatWebSaveResearch.trim().toLowerCase() !== "false"
+    : source.chatWebSaveResearch !== false;
   return result;
 }
 
@@ -1675,6 +1692,10 @@ const DEFAULT_SETTINGS = {
   providerGenerationModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
   providerEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
   chatModel: "openai/gpt-5.6-luna",
+  chatWebSearchProvider: "gemini",
+  chatWebSearchModel: "gemini-3.5-flash-lite",
+  chatWebSearchMode: "off",
+  chatWebSaveResearch: true,
   chatReasoningEffort: "medium",
   chatFallbackModel: "openai/gpt-5.6-terra",
   chatFallbackReasoningEffort: "medium",
@@ -7901,7 +7922,117 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return [];
   }
 
-  async chat(prompt, activeOverride = null, history = []) {
+  async runWebSearch(request = {}, options = {}) {
+    const provider = normalizeWebSearchProvider(request.provider || this.settings.chatWebSearchProvider);
+    const configuredModel = request.model !== undefined ? request.model : this.settings.chatWebSearchModel;
+    const model = String(configuredModel || "").trim();
+    const mode = normalizeWebSearchMode(request.mode);
+    const profile = webSearchModeProfile(mode);
+    const apiKey = String({ openai: this.settings.openaiApiKey, gemini: this.settings.googleApiKey, openrouter: this.settings.openrouterApiKey }[provider] || "").trim();
+    if (!apiKey) throw providerAdapterError(provider, "web-search-missing-credential", `Internet Search needs the ${stableProviderLabel(provider)} API key.`);
+    if (!model) throw providerAdapterError(provider, "web-search-missing-model", "Choose a search model before running Internet Search.");
+    const query = truncateAtWord(redactWebContext(request.query || request.prompt || ""), profile.maxRequestChars);
+    if (!query) throw providerAdapterError(provider, "web-search-query-empty", "Internet Search needs a non-empty query.");
+    const body = provider === "gemini"
+      ? {
+        contents: [{ role: "user", parts: [{ text: query }] }],
+        tools: [{ google_search: {} }],
+        generationConfig: { maxOutputTokens: profile.maxOutputTokens, thinkingConfig: { thinkingLevel: profile.thinkingEffort } }
+      }
+      : provider === "openai"
+        ? {
+          model,
+          reasoning: { effort: profile.thinkingEffort },
+          max_output_tokens: profile.maxOutputTokens,
+          tools: [{ type: "web_search", search_context_size: profile.searchContextSize }],
+          input: query
+        }
+        : {
+          model,
+          messages: [{ role: "user", content: query }],
+          max_tokens: profile.maxOutputTokens,
+           tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", ...profile.openrouter, search_context_size: profile.searchContextSize } }]
+        };
+    const transport = provider === "gemini"
+      ? { url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, headers: { "x-goog-api-key": apiKey, "content-type": "application/json" } }
+      : provider === "openai"
+        ? { url: "https://api.openai.com/v1/responses", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" } }
+        : { url: "https://openrouter.ai/api/v1/chat/completions", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "HTTP-Referer": "https://obsidian.md" } };
+    const requestFn = options.requestUrl || requestUrl;
+    let response;
+    try {
+      response = await requestFn({ url: transport.url, method: "POST", headers: transport.headers, body: JSON.stringify(body), throw: false });
+    } catch {
+      return webSearchFailureResult(provider, model, "transport-error", mode);
+    }
+    if (!response || Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
+      const status = Number(response?.status || 0);
+      return webSearchFailureResult(provider, model, status ? `http-${status}` : "transport-error", mode);
+    }
+    const payload = providerResponseJson(response);
+    const extracted = provider === "gemini"
+      ? extractGeminiWebEvidence(payload)
+      : provider === "openai"
+        ? extractOpenAIWebEvidence(payload)
+        : extractOpenRouterWebEvidence(payload);
+    const candidates = extracted.candidates;
+    const normalized = normalizeWebEvidenceRows(provider, model, candidates, this.settings, { mode });
+    const tokenUsage = normalizeWebSearchUsage(provider, payload, extracted.queryCount);
+    return {
+      status: normalized.rows.length ? "searched" : "no-evidence",
+      provider,
+      model,
+      mode,
+      queryCount: Math.max(1, tokenUsage.searchRequests || extracted.queryCount || 1),
+      resultCount: normalized.rows.length,
+      tokenUsage,
+      evidence: normalized.rows,
+      reasons: normalized.reasons
+    };
+  }
+
+  async saveChatWebResearch({ prompt = "", active = null, answer = "", subject = "", mode = "concise", webSearchResult = {}, citationTelemetry = {} } = {}) {
+    if (this.settings.chatWebSaveResearch !== true) return { status: "disabled", reason: "setting-disabled" };
+    const citedEvidenceIds = uniqueValues((Array.isArray(citationTelemetry.usedEvidenceIds) ? citationTelemetry.usedEvidenceIds : []).map((id) => String(id || "").trim()).filter(Boolean));
+    const admittedIds = new Set((Array.isArray(webSearchResult.evidence) ? webSearchResult.evidence : []).map((row) => String(row?.evidenceId || "").trim()).filter(Boolean));
+    const citedWebEvidenceIds = citedEvidenceIds.filter((id) => admittedIds.has(id));
+    const invalidCitation = Number(citationTelemetry.schemaInvalidCount || 0) > 0
+      || Number(citationTelemetry.citedWebEvidenceCount || 0) < 1
+      || !citedWebEvidenceIds.length;
+    if (String(webSearchResult.status || "") !== "searched" || !String(answer || "").trim() || invalidCitation) {
+      return { status: "not-eligible", reason: Number(citationTelemetry.schemaInvalidCount || 0) > 0 ? "citation-validation-failed" : "no-cited-web-evidence" };
+    }
+    if (!this.app?.vault?.create || !this.app?.vault?.getAbstractFileByPath) return { status: "failed", reason: "vault-unavailable" };
+    const folder = `${PLUGIN_DATA_FOLDER}/Research`;
+    const normalizedSubject = normalizeResearchSubject(subject, prompt);
+    const title = `${deviceDateString(new Date())} - ${safeMarkdownFileName(normalizedSubject.value, 110) || "Research"}`;
+    try {
+      await ensureVaultFolder(this.app, folder);
+      const path = uniqueMarkdownPath(this.app, folder, title);
+      await this.app.vault.create(path, buildChatResearchMarkdown({
+        prompt,
+        subject: normalizedSubject.value,
+         mode,
+         answer,
+         active,
+         provider: webSearchResult.provider,
+         model: webSearchResult.model,
+         queryCount: webSearchResult.queryCount,
+         resultCount: webSearchResult.resultCount,
+         evidence: webSearchResult.evidence,
+         citedEvidenceIds: citedWebEvidenceIds,
+         citedWebEvidenceCount: citationTelemetry.citedWebEvidenceCount
+       }));
+      return { status: "saved", path, subject: normalizedSubject.value };
+    } catch {
+      return { status: "failed", reason: "vault-create-failed" };
+    }
+  }
+
+  async chat(prompt, activeOverride = null, history = [], modelOperation = "chat-query", options = {}) {
+    const requestedWebSearchMode = normalizeWebSearchMode(options?.webSearchMode || (options?.webSearchEnabled === true ? "concise" : "off"));
+    let webSearchMode = String(modelOperation || "chat-query").trim().toLowerCase() === "chat-query" ? requestedWebSearchMode : "off";
+    let webSearchUnavailable = false;
     const schedulerMemoryUpdate = await this.tryUpdateSchedulerMemoryFromChat(prompt);
     if (schedulerMemoryUpdate) return { answer: schedulerMemoryUpdate, context: [] };
     const dedupePolicyUpdate = await this.tryUpdateTaskDeduplicationPolicyFromChat(prompt);
@@ -8004,10 +8135,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       dedupedContext.semanticRetrieval = rawContext.semanticRetrieval || null;
       context = dedupedContext;
     }
-    const sourceLedger = chatSourceLedger(active, context, this.settings, sourceContract);
+    let sourceLedger = chatSourceLedger(active, context, this.settings, sourceContract);
+    let webSearchResult = null;
+    if (webSearchMode !== "off") {
+      const webProvider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
+      const webModel = normalizeWebSearchModel(this.settings.chatWebSearchModel, webProvider);
+      this.setSidebarStatus(webSearchMode === "deep" ? "Researching the web" : "Searching the web");
+      webSearchResult = await this.runWebSearch(buildWebSearchRequest({ provider: webProvider, model: webModel, mode: webSearchMode, prompt, active, context }));
+      if (webSearchResult.status !== "searched" || !webSearchResult.evidence?.length) {
+        webSearchUnavailable = true;
+        webSearchMode = "off";
+      }
+      sourceLedger = sourceLedger.concat(webEvidenceLedgerEntries(webSearchResult.evidence));
+    }
     const sources = sourceLedger.map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || ""} title=${entry.title || ""} link=${entry.markdown}`).join("\n");
     const promptSources = reservedTaskEvidence
-      ? sourceLedger.filter((entry) => entry.role === "Active note").map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || "note"} title=${entry.title || ""} link=${entry.markdown}`).join("\n")
+      ? sourceLedger.filter((entry) => entry.role === "Active note" || entry.sourceKind === "web-search").map((entry) => `- evidence_id=${entry.evidenceId || ""} source_id=${entry.sourceId || ""} source_kind=${entry.sourceKind || "note"} title=${entry.title || ""} link=${entry.markdown}`).join("\n")
       : sources;
     const taskContext = reservedTaskEvidence ? "" : await this.buildTaskContext(active, context, prompt);
     const adaptivePack = this.buildAdaptiveContextPack({
@@ -8025,8 +8168,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     let response = await this.withAiActivity("Answering question", () => this.openaiResponse({
       operation: "chat",
       model: modelChoice.model,
-      jsonSchema: chatResponseSchema(),
+      jsonSchema: webSearchMode === "off" ? chatResponseSchema() : webResearchResponseSchema(webSearchMode),
       system: [
+        ...(webSearchMode === "off" ? [] : [
+          webSearchMode === "deep" ? "Deep Research is enabled. Return two or three concise paragraphs as claims in the research schema." : "Internet Search is enabled. Return one concise useful paragraph as one claim in the research schema.",
+          "Use only admitted web evidence IDs for external claims. Never invent, repeat, or return provider URLs directly."
+        ]),
         "You are a concise Obsidian sidebar assistant.",
         "Return only JSON matching the supplied chat evidence schema. Each claim must be one short factual sentence.",
         "Answer in plain language, usually in 3-6 short claims.",
@@ -8088,12 +8235,46 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       appendFallbackNotice: false,
       background: false
     }));
+    if (webSearchMode !== "off") {
+      const renderedResearch = renderWebResearchAnswer(response, sourceLedger, webSearchMode);
+      if (!renderedResearch.valid) {
+        const error = new Error(`Research response validation failed: ${(renderedResearch.telemetry.schemaInvalidReasons || ["invalid-response"]).join(", ")}`);
+        error.code = "web-research-response-invalid";
+        throw error;
+      }
+      const researchSave = await this.saveChatWebResearch({
+        prompt,
+        active,
+        answer: renderedResearch.answer,
+        subject: renderedResearch.subject,
+        mode: webSearchMode,
+        webSearchResult,
+        citationTelemetry: renderedResearch.telemetry
+      });
+      this.lastChatCitationTelemetry = renderedResearch.telemetry;
+      return {
+        answer: renderedResearch.answer,
+        context,
+        citationValidation: renderedResearch.telemetry,
+        citationTelemetry: renderedResearch.telemetry,
+        webSearchStatus: webSearchResult?.status || "failed",
+        webSearchResult,
+        researchSave,
+        taskContextHydration: this.lastTaskContextHydrationTelemetry || null,
+        sourceContractId: adaptivePack.sourceContractId || sourceContract?.id || "",
+        contextBundleHash: adaptivePack.contextBundleHash || "",
+        contextBundleId: adaptivePack.contextBundleHash || "",
+        promptBundleId: adaptivePack.promptBundleId || adaptivePack.contextBundleHash || "",
+        validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || "",
+        contextBundle: chatContextBundle || reservedTaskEvidence || null
+      };
+    }
     const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
       retrievalTelemetry: context.semanticRetrieval?.telemetry
     });
     response = citationResult.answer;
     this.lastChatCitationTelemetry = citationResult.telemetry;
-    return {
+    const localChatResult = {
       answer: response,
       context,
       citationValidation: citationResult.telemetry,
@@ -8106,6 +8287,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       validatorBundleId: adaptivePack.validatorBundleId || adaptivePack.contextBundleHash || "",
       contextBundle: chatContextBundle || reservedTaskEvidence || null
     };
+    if (requestedWebSearchMode !== "off" && webSearchResult) Object.assign(localChatResult, {
+      webSearchStatus: webSearchResult.status || "failed",
+      webSearchResult,
+      webSearchDegraded: webSearchUnavailable
+    });
+    return localChatResult;
   }
 
   async tryUpdateSchedulerMemoryFromChat(prompt) {
@@ -13239,6 +13426,7 @@ class SemanticTodoistView extends ItemView {
     this.includeActiveNote = plugin.settings.searchIncludeActiveNote !== false;
     this.statusDisplayEntries = new Map();
     this.statusRefreshTimer = null;
+    this.webSearchMode = "off";
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -13350,6 +13538,14 @@ class SemanticTodoistView extends ItemView {
       this.ask();
     });
     const actionRow = container.createDiv({ cls: "semantic-todoist-action-row" });
+    const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
+    this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
+    setIcon(this.webSearchToggleEl, "globe-2");
+    this.webSearchToggleEl.onclick = () => {
+      this.webSearchMode = this.webSearchMode === "off" ? "concise" : this.webSearchMode === "concise" ? "deep" : "off";
+      this.updateWebSearchToggleState();
+    };
+    this.updateWebSearchToggleState();
     actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Run:" });
     this.actionSelectEl = actionRow.createEl("select", { cls: "semantic-todoist-action-select", attr: { "aria-label": "Action prompt to run", title: "Choose a scheduler action or prompt template" } });
     this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
@@ -13382,15 +13578,29 @@ class SemanticTodoistView extends ItemView {
       this.addMessage("assistant", "Thinking...");
       const active = await this.getSelectedActiveContext();
       if (this.promptEl) this.promptEl.value = "";
-      const result = await this.plugin.chat(prompt, active, history);
+      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode });
       this.renderRelevantNotes(result.context);
       this.replaceLastAssistantMessage(result.answer);
-      this.setStatus("Ready");
+      this.setStatus(webSearchStatusLabel(result));
     } catch (error) {
       console.error(error);
       this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
       this.setStatus(`Chat failed: ${error.message || error}`);
     }
+  }
+
+  updateWebSearchToggleState() {
+    if (!this.webSearchToggleEl) return;
+    const mode = normalizeWebSearchMode(this.webSearchMode);
+    this.webSearchMode = mode;
+    this.webSearchToggleEl.classList?.toggle("is-enabled", mode !== "off");
+    this.webSearchToggleEl.classList?.toggle("is-concise", mode === "concise");
+    this.webSearchToggleEl.classList?.toggle("is-deep", mode === "deep");
+    this.webSearchToggleEl.setAttribute("aria-pressed", mode === "off" ? "false" : "true");
+    this.webSearchToggleEl.setAttribute("data-web-search-mode", mode);
+    const label = webSearchModeLabel(mode);
+    this.webSearchToggleEl.setAttribute("aria-label", label);
+    this.webSearchToggleEl.setAttribute("title", `${label}; click to cycle`);
   }
 
   async runDefaultTaskPrompt() {
@@ -15329,7 +15539,7 @@ function embeddingCapabilitySummary(settings, provider, model) {
 
 function webResearchSettings(containerEl, plugin) {
   const providers = ["openai", "gemini", "openrouter"];
-  const provider = stableSupportedProvider(plugin.settings.chatWebSearchProvider, "openrouter");
+  const provider = normalizeWebSearchProvider(plugin.settings.chatWebSearchProvider);
   const models = providerCatalogModels(plugin.settings, provider).concat(plugin.settings.chatWebSearchModel || "");
   dropdownSettingWithDesc(containerEl, "Search provider", "Native search is limited to OpenAI, Gemini, and OpenRouter.", plugin, "chatWebSearchProvider", providers);
   new Setting(containerEl).setName("Search model").setDesc("Provider-scoped model used only by an explicit search mode.").addDropdown((dropdown) => {
@@ -16660,6 +16870,429 @@ function formatBytes(bytes) {
   if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${value} B`;
+}
+
+function normalizeWebSearchProvider(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return WEB_SEARCH_PROVIDER_VALUES.includes(normalized) ? normalized : "gemini";
+}
+
+function normalizeWebSearchMode(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_-]+/g, "-");
+  if (normalized === "internet-search" || normalized === "search" || normalized === "concise") return "concise";
+  if (normalized === "deep-research" || normalized === "research" || normalized === "deep") return "deep";
+  return "off";
+}
+
+function webSearchModeProfile(value) {
+  return WEB_SEARCH_MODE_PROFILES[normalizeWebSearchMode(value) === "deep" ? "deep" : "concise"];
+}
+
+function normalizeWebSearchModel(value, provider) {
+  return String(value || "").trim() || WEB_SEARCH_PROVIDER_DEFAULT_MODELS[normalizeWebSearchProvider(provider)];
+}
+
+function webSearchModeLabel(value) {
+  const mode = normalizeWebSearchMode(value);
+  return mode === "deep" ? "Deep Research ON" : mode === "concise" ? "Internet Search ON" : "Internet Search OFF";
+}
+
+function webSearchStatusLabel(result = {}) {
+  const webResult = result?.webSearchResult;
+  if (!webResult || result.webSearchStatus === "off") return "Ready";
+  const status = String(webResult.status || result.webSearchStatus || "failed");
+  let label = status === "searched"
+    ? `Answer ready · ${Math.max(0, Number(webResult.resultCount || webResult.evidence?.length || 0))} web source(s)`
+    : status === "no-evidence"
+      ? "Answer ready · No web sources found"
+      : "Answer ready · Web search unavailable";
+  if (result.researchSave?.status === "saved") label += " · Research saved";
+  else if (result.researchSave?.status === "failed") label += " · Research save failed";
+  return label;
+}
+
+function redactWebContext(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => redactSecrets(String(line || "").trim())
+      .replace(/\b(?:api[_ -]?key|access[_ -]?token|authorization|password|passcode|secret|token)\b\s*(?::|=|is)\s*[^.;|\n]+/gi, (match) => match.replace(/(?::|=|is)\s*[^.;|\n]+$/i, ": [redacted]")))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function canonicalWebSearchUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) return "";
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/(?:api[_-]?key|access[_-]?token|authorization|password|passwd|secret|session|token)/i.test(key)) return "";
+    }
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.toLowerCase();
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function webSearchDomain(value) {
+  const canonical = canonicalWebSearchUrl(value);
+  if (!canonical) return "";
+  try { return new URL(canonical).hostname.toLowerCase(); } catch { return ""; }
+}
+
+function boundedWebExcerpt(value, maxChars = webSearchModeProfile("concise").maxEvidenceChars) {
+  return truncateAtWord(redactWebContext(value).replace(/\s+/g, " ").trim(), maxChars);
+}
+
+function extractWebSearchCandidates(value, candidates = [], depth = 0) {
+  if (depth > 7 || value == null) return candidates;
+  if (Array.isArray(value)) {
+    value.forEach((item) => extractWebSearchCandidates(item, candidates, depth + 1));
+    return candidates;
+  }
+  if (typeof value !== "object") return candidates;
+  const url = value.url || value.uri || value.link || value.href || value.web?.url || value.web?.uri;
+  const title = value.title || value.name || value.web?.title || value.publisher?.name || "";
+  const excerpt = value.excerpt || value.snippet || value.description || value.content || value.text || "";
+  if (url && (title || excerpt)) candidates.push({ url, title, excerpt });
+  for (const key of ["annotations", "citations", "groundingChunks", "grounding_chunks", "web_search_results", "search_results", "results", "sources", "web", "output", "content", "choices", "message", "candidates"]) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) extractWebSearchCandidates(value[key], candidates, depth + 1);
+  }
+  return candidates;
+}
+
+function citationExcerpt(text, citation, maxChars = webSearchModeProfile("deep").maxEvidenceChars) {
+  const supplied = [citation?.content, citation?.excerpt, citation?.text]
+    .find((value) => typeof value === "string" && value.trim());
+  if (supplied) return boundedWebExcerpt(supplied, maxChars);
+  const source = String(text || "").replace(/\s+/g, " ").trim();
+  const start = Math.max(0, Number(citation?.start_index ?? citation?.startIndex ?? 0) || 0);
+  const end = Math.max(start, Number(citation?.end_index ?? citation?.endIndex ?? source.length) || source.length);
+  return boundedWebExcerpt(source.slice(start, end) || source, maxChars);
+}
+
+function extractGeminiWebEvidence(response = {}) {
+  const metadata = response?.candidates?.[0]?.groundingMetadata || response?.candidates?.[0]?.grounding_metadata || {};
+  const chunks = Array.isArray(metadata.groundingChunks || metadata.grounding_chunks) ? (metadata.groundingChunks || metadata.grounding_chunks) : [];
+  const supports = Array.isArray(metadata.groundingSupports || metadata.grounding_supports) ? (metadata.groundingSupports || metadata.grounding_supports) : [];
+  const candidates = [];
+  for (const support of supports) {
+    const segment = support?.segment || {};
+    const excerpt = String(segment.text || "").trim();
+    const indices = Array.isArray(support?.groundingChunkIndices || support?.grounding_chunk_indices) ? (support.groundingChunkIndices || support.grounding_chunk_indices) : [];
+    for (const index of indices) {
+      const web = chunks[Number(index)]?.web;
+      if (web?.uri) candidates.push({ url: web.uri, title: web.title, excerpt });
+    }
+  }
+  if (!candidates.length) {
+    for (const chunk of chunks) if (chunk?.web?.uri) candidates.push({ url: chunk.web.uri, title: chunk.web.title, excerpt: "" });
+  }
+  return {
+    candidates,
+    queryCount: Array.isArray(metadata.webSearchQueries || metadata.web_search_queries)
+      ? (metadata.webSearchQueries || metadata.web_search_queries).length
+      : 0
+  };
+}
+
+function extractOpenAIWebEvidence(response = {}) {
+  const candidates = [];
+  const output = Array.isArray(response?.output) ? response.output : [];
+  for (const item of output) for (const content of Array.isArray(item?.content) ? item.content : []) {
+    const text = String(content?.text || "");
+    for (const annotation of Array.isArray(content?.annotations) ? content.annotations : []) {
+      const citation = annotation?.url_citation || annotation;
+      if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
+      candidates.push({ url: citation?.url, title: citation?.title, excerpt: citationExcerpt(text, citation) });
+    }
+  }
+  return {
+    candidates,
+    queryCount: output.filter((item) => String(item?.type || "").toLowerCase() === "web_search_call").length
+  };
+}
+
+function extractOpenRouterWebEvidence(response = {}) {
+  const message = response?.choices?.[0]?.message || {};
+  const text = String(message?.content || "");
+  const candidates = [];
+  for (const annotation of Array.isArray(message?.annotations) ? message.annotations : []) {
+    const citation = annotation?.url_citation || annotation;
+    if (String(annotation?.type || "").toLowerCase() !== "url_citation" && !citation?.url) continue;
+    candidates.push({ url: citation?.url, title: citation?.title, excerpt: citationExcerpt(text, citation) });
+  }
+  return {
+    candidates,
+    queryCount: Number(response?.usage?.server_tool_use?.web_search_requests || 0)
+  };
+}
+
+function normalizeWebEvidenceRows(provider, model, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
+  const profile = webSearchModeProfile(options.mode);
+  const rows = [];
+  const safeCandidates = [];
+  const reasons = {};
+  const seen = new Set();
+  const reject = (reason) => { reasons[reason] = Number(reasons[reason] || 0) + 1; };
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const url = canonicalWebSearchUrl(candidate?.url || candidate?.uri || candidate?.link);
+    if (!url) { reject("invalid-url"); continue; }
+    if (isExcludedUrl(url, settings)) { reject("excluded-domain"); continue; }
+    if (seen.has(url)) { reject("duplicate-url"); continue; }
+    const title = boundedWebExcerpt(candidate?.title || webSearchDomain(url), 180);
+    const excerpt = boundedWebExcerpt(candidate?.excerpt || candidate?.snippet || candidate?.content || candidate?.text || "", profile.maxEvidenceChars);
+    if (!excerpt) { reject("missing-grounding-support"); continue; }
+    seen.add(url);
+    safeCandidates.push({ url, title, excerpt, sourceFamily: webSearchDomain(url) });
+  }
+  const distinct = [];
+  const repeated = [];
+  const admittedFamilies = new Set();
+  for (const candidate of safeCandidates) {
+    if (admittedFamilies.has(candidate.sourceFamily)) repeated.push(candidate);
+    else {
+      admittedFamilies.add(candidate.sourceFamily);
+      distinct.push(candidate);
+    }
+  }
+  for (const candidate of [...distinct, ...repeated]) {
+    const evidenceId = `web-${shortHash(`${normalizeWebSearchProvider(provider)}:${normalizeWebSearchModel(model, provider)}:${candidate.url}`)}`;
+    rows.push({
+      evidenceId,
+      sourceId: evidenceId,
+      sourceKind: "web-search",
+      role: "Admitted web source",
+      title: candidate.title || candidate.sourceFamily,
+      url: candidate.url,
+      domain: candidate.sourceFamily,
+      sourceFamily: candidate.sourceFamily,
+      excerpt: candidate.excerpt,
+      text: candidate.excerpt,
+      epistemicStatus: "external",
+      provider: normalizeWebSearchProvider(provider),
+      model: normalizeWebSearchModel(model, provider)
+    });
+    if (rows.length >= profile.maxResults) break;
+  }
+  if (safeCandidates.length > rows.length) reject("max-results");
+  return { rows, reasons, distinctSourceFamilyCount: new Set(rows.map((row) => row.sourceFamily).filter(Boolean)).size, repeatedSourceFamilyCount: Math.max(0, rows.length - new Set(rows.map((row) => row.sourceFamily).filter(Boolean)).size) };
+}
+
+function normalizeWebSearchUsage(provider, payload = {}) {
+  const usage = payload?.usage || payload?.usageMetadata || {};
+  const outputItems = Array.isArray(payload?.output) ? payload.output : [];
+  const groundingMetadata = payload?.candidates?.[0]?.groundingMetadata || payload?.candidates?.[0]?.grounding_metadata || {};
+  const queryCount = Number(
+    usage?.server_tool_use?.web_search_requests
+      ?? usage?.web_search_requests
+      ?? usage?.webSearchRequests
+      ?? (Array.isArray(groundingMetadata.webSearchQueries || groundingMetadata.web_search_queries)
+        ? (groundingMetadata.webSearchQueries || groundingMetadata.web_search_queries).length
+        : 0)
+      ?? 0
+  );
+  const inputTokens = Math.max(0, Number(usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount ?? 0) || 0);
+  const outputTokens = Math.max(0, Number(usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount ?? 0) || 0);
+  const totalTokens = Math.max(0, Number(usage.total_tokens ?? usage.totalTokenCount ?? (inputTokens + outputTokens)) || 0);
+  return {
+    provider: normalizeWebSearchProvider(provider),
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    searchRequests: Math.max(0, Math.round(Math.max(
+      outputItems.filter((item) => String(item?.type || "").toLowerCase() === "web_search_call").length,
+      Number.isFinite(queryCount) ? queryCount : 0
+    )))
+  };
+}
+
+function providerResponseJson(response = {}) {
+  if (response.json && typeof response.json === "object") return response.json;
+  try { return JSON.parse(String(response.text || "{}")); } catch { return {}; }
+}
+
+function buildWebSearchRequest(options = {}) {
+  const provider = normalizeWebSearchProvider(options.provider);
+  const model = normalizeWebSearchModel(options.model, provider);
+  const mode = normalizeWebSearchMode(options.mode);
+  const profile = webSearchModeProfile(mode);
+  const prompt = truncateAtWord(redactWebContext(options.prompt || options.query || ""), profile.maxQueryChars);
+  const active = options.active && typeof options.active === "object" ? options.active : {};
+  const localEvidence = (Array.isArray(options.context) ? options.context : []).slice(0, profile.maxLocalEvidenceRows).map((row) => ({
+    title: boundedWebExcerpt(row?.title || row?.path || "", 160),
+    excerpt: boundedWebExcerpt(row?.text || row?.excerpt || row?.content || "", profile.maxEvidenceChars)
+  })).filter((row) => row.title || row.excerpt);
+  const query = [
+    mode === "deep" ? "Use Deep Research mode." : "Use Internet Search mode.",
+    "Search exactly once through the provider-native search tool and return only useful, canonical source citations.",
+    "Answer the bounded request using admitted evidence, not model memory alone.",
+    `User request: ${prompt}`,
+    active.text || active.selection ? `Active note context: ${boundedWebExcerpt(active.selection || active.text, profile.maxActiveChars)}` : "",
+    localEvidence.length ? `Local evidence for disambiguation:\n${localEvidence.map((row) => `- ${row.title}: ${row.excerpt}`).join("\n")}` : ""
+  ].filter(Boolean).join("\n\n");
+  return { provider, model, mode, query: truncateAtWord(query, profile.maxRequestChars), prompt, active, context: localEvidence };
+}
+
+function webSearchFailureResult(provider, model, code, mode = "off") {
+  return {
+    status: "failed",
+    provider: normalizeWebSearchProvider(provider),
+    model: normalizeWebSearchModel(model, provider),
+    mode: normalizeWebSearchMode(mode),
+    queryCount: 0,
+    resultCount: 0,
+    tokenUsage: { provider: normalizeWebSearchProvider(provider), inputTokens: 0, outputTokens: 0, totalTokens: 0, searchRequests: 0 },
+    evidence: [],
+    reasons: { [String(code || "search-failed")]: 1 }
+  };
+}
+
+function webEvidenceLedgerEntries(rows = []) {
+  return (Array.isArray(rows) ? rows : []).map((row) => ({
+    key: row.evidenceId,
+    sourceId: row.evidenceId,
+    evidenceId: row.evidenceId,
+    sourceKind: "web-search",
+    title: row.title,
+    evidenceText: row.excerpt || row.text || "",
+    url: row.url,
+    markdown: `[${markdownLinkText(row.title)}](${row.url})`
+  }));
+}
+
+function webResearchResponseSchema(mode = "concise") {
+  const normalizedMode = normalizeWebSearchMode(mode);
+  const maxClaims = normalizedMode === "deep" ? 3 : 1;
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      research_subject: { type: "string", minLength: 1, maxLength: 80 },
+      claims: {
+        type: "array",
+        minItems: normalizedMode === "deep" ? 2 : 1,
+        maxItems: maxClaims,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            text: { type: "string", minLength: 1, maxLength: 1200 },
+            established: { type: "boolean" },
+            evidence_ids: { type: "array", items: { type: "string" }, maxItems: 8 },
+            category: { type: "string", enum: ["fact", "current-state", "history", "criteria", "next-step", "unsupported"] }
+          },
+          required: ["text", "established", "evidence_ids", "category"]
+        }
+      }
+    },
+    required: ["research_subject", "claims"]
+  };
+}
+
+function parseWebResearchResponse(value = "") {
+  try {
+    const parsed = JSON.parse(extractJsonPayload(value));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderWebResearchAnswer(value, evidence = [], mode = "concise") {
+  const normalizedMode = normalizeWebSearchMode(mode);
+  const parsed = parseWebResearchResponse(value);
+  const rows = (Array.isArray(evidence) ? evidence : []).filter((row) => row && row.evidenceId && row.url);
+  const byId = new Map(rows.map((row) => [String(row.evidenceId || ""), row]).filter(([id]) => id));
+  const invalid = (reason) => ({ valid: false, answer: "", subject: "", telemetry: { citedWebEvidenceCount: 0, schemaInvalidCount: 1, schemaInvalidReasons: [reason], usedEvidenceIds: [], deliveredEvidenceIds: rows.map((row) => row.evidenceId).filter(Boolean) } });
+  if (!parsed || typeof parsed.research_subject !== "string" || !parsed.research_subject.trim() || !Array.isArray(parsed.claims)) return invalid("response-shape-invalid");
+  const minimum = normalizedMode === "deep" ? 2 : 1;
+  if (parsed.claims.length < minimum || parsed.claims.length > (normalizedMode === "deep" ? 3 : 1)) return invalid("claim-count-invalid");
+  const usedIds = [];
+  const paragraphs = [];
+  for (const claim of parsed.claims) {
+    if (!claim || typeof claim.text !== "string" || !claim.text.trim() || typeof claim.established !== "boolean") return invalid("claim-shape-invalid");
+    const ids = Array.isArray(claim.evidence_ids) ? uniqueValues(claim.evidence_ids.map((id) => String(id || "").trim()).filter(Boolean)) : [];
+    if (claim.established !== true) {
+      if (claim.category !== "unsupported" || ids.length) return invalid("unsupported-claim-invalid");
+      paragraphs.push(chatClaimBody(claim.text));
+      continue;
+    }
+    if (!ids.length || ids.some((id) => !byId.has(id))) return invalid("foreign-citation-id");
+    usedIds.push(...ids);
+    paragraphs.push(`${chatClaimBody(claim.text)} (${ids.map((id) => rows.findIndex((row) => row.evidenceId === id) + 1).join(", ")})`);
+  }
+  const citedIds = uniqueValues(usedIds);
+  const references = citedIds.map((id) => byId.get(id)).filter(Boolean).map((row) => `${rows.findIndex((item) => item.evidenceId === row.evidenceId) + 1}. [${markdownLinkText(row.title)}](${row.url})`);
+  const citedWebIds = citedIds.filter((id) => String(byId.get(id)?.sourceKind || "") === "web-search");
+  return {
+    valid: true,
+    answer: `${paragraphs.join("\n\n")}\n\nReferences:\n${references.join("\n")}`,
+    subject: singleLine(parsed.research_subject).slice(0, 80),
+    telemetry: {
+      citedWebEvidenceCount: citedWebIds.length,
+      schemaInvalidCount: 0,
+      schemaInvalidReasons: [],
+      usedEvidenceIds: citedIds,
+      deliveredEvidenceIds: rows.map((row) => row.evidenceId).filter(Boolean),
+      sourceIds: rows.map((row) => row.sourceId || row.evidenceId).filter(Boolean)
+    }
+  };
+}
+
+function normalizeResearchSubject(value, fallback = "Research") {
+  const normalized = redactWebContext(value).replace(/[\r\n]+/g, " ").trim();
+  const fallbackText = redactWebContext(fallback).replace(/[\r\n]+/g, " ").trim();
+  return { value: (normalized || fallbackText || "Research").slice(0, 120), fallback: !normalized };
+}
+
+function buildChatResearchMarkdown(options = {}) {
+  const subject = safeMarkdownFileName(options.subject || "Research", 120) || "Research";
+  const answer = String(options.answer || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line ? redactWebContext(line) : "")
+    .join("\n")
+    .slice(0, 16000)
+    .trim();
+  const citedIds = new Set((Array.isArray(options.citedEvidenceIds) ? options.citedEvidenceIds : []).map((id) => String(id || "").trim()).filter(Boolean));
+  const references = (Array.isArray(options.evidence) ? options.evidence : [])
+    .filter((row) => row?.url && (!citedIds.size || citedIds.has(String(row.evidenceId || ""))))
+    .map((row, index) => `${index + 1}. [${markdownLinkText(row.title || webSearchDomain(row.url))}](${canonicalWebSearchUrl(row.url)})`);
+  const referenceBlock = /(?:^|\n)References:\s*(?:\n|$)/i.test(answer)
+    ? ""
+    : `\n\nReferences:\n${references.join("\n")}`;
+  const createdAt = deviceTimestamp();
+  const created = deviceDateString(new Date());
+  const activePath = vaultRelativePath(options.active?.path || "");
+  const yaml = (value) => JSON.stringify(singleLine(redactWebContext(value || "")));
+  return [
+    "---",
+    `type: ${yaml("semantic-todoist-sync-research")}`,
+    `created: ${yaml(created)}`,
+    `created_at: ${yaml(createdAt)}`,
+    `topic: ${yaml(subject)}`,
+    `research_mode: ${yaml(normalizeWebSearchMode(options.mode))}`,
+    `search_provider: ${yaml(options.provider || "unknown")}`,
+    `search_model: ${yaml(options.model || "unknown")}`,
+    `search_queries: ${Math.max(0, Math.round(Number(options.queryCount) || 0))}`,
+    `admitted_sources: ${Math.max(0, Math.round(Number(options.resultCount) || 0))}`,
+    `cited_web_sources: ${Math.max(0, Math.round(Number(options.citedWebEvidenceCount) || citedIds.size))}`,
+    ...(activePath && !activePath.startsWith("@todoist/") ? [`active_note: ${yaml(activePath)}`] : []),
+    "---",
+    "",
+    `# ${subject}`,
+    `Question: ${redactWebContext(options.prompt || "").slice(0, 2000)}${activePath && !activePath.startsWith("@todoist/") ? `\nActive note: [[${activePath}|${safeMarkdownFileName(activePath.split("/").pop() || "Active note", 120)}]]` : ""}`,
+    "",
+    answer,
+    "",
+    `Search sources admitted: ${Math.max(0, Number(options.resultCount || 0))}${referenceBlock}`
+  ].join("\n").trim() + "\n";
 }
 
 function chatResponseSchema(maxClaims = CHAT_RESPONSE_MAX_CLAIMS) {
@@ -36951,6 +37584,10 @@ if (typeof module !== "undefined" && module.exports) {
     providerIndexIdentity,
     semanticIndexCompatibilityStatus,
     semanticIndexCleanupPlan,
+    normalizeWebSearchProvider,
+    normalizeWebSearchMode,
+    canonicalWebSearchUrl,
+    normalizeWebEvidenceRows,
     SemanticTodoistSettingTab
   });
 }

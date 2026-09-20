@@ -450,8 +450,41 @@
   align-items: center;
   display: grid;
   gap: 6px;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto auto minmax(0, 1fr);
   min-width: 0;
+}
+
+.semantic-todoist-web-search-modifier {
+  display: inline-flex;
+  align-items: center;
+}
+
+.semantic-todoist-web-search-toggle {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  display: inline-flex;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0;
+}
+
+.semantic-todoist-web-search-toggle.is-concise {
+  border-color: var(--text-accent);
+  color: var(--text-accent);
+}
+
+.semantic-todoist-web-search-toggle.is-deep {
+  border-color: #7567e8;
+  color: #7567e8;
+}
+
+.semantic-todoist-web-search-toggle:focus-visible {
+  box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
+  outline: none;
 }
 
 .semantic-todoist-action-label {
@@ -1255,6 +1288,7 @@
 
   .semantic-todoist-action-row {
     gap: 4px;
+    grid-template-columns: auto auto minmax(0, 1fr);
   }
 
   .semantic-todoist-action-row select {

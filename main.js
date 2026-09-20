@@ -26,6 +26,7 @@ const AI_OPERATION_KEYS = Object.freeze([
 const DEFAULT_GENERATION_PRIMARY = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-luna", reasoningEffort: "medium" });
 const DEFAULT_GENERATION_FALLBACK = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-terra", reasoningEffort: "medium" });
 const DEFAULT_EMBEDDING_REFERENCE = Object.freeze({ provider: "customopenai", model: "qwen3-embedding-0.6b-8k:latest" });
+const PROVIDER_REQUEST_TIMEOUT_MS = 120000;
 const STABLE_INDEX_CLEANUP_PATTERNS = Object.freeze([
   /^semantic-index\.(?:openai|gemini|openrouter|openwebui|customopenai)\.g[a-z0-9-]+\.\d{3}\.json$/i,
   /^semantic-index-path-meta\.[a-z0-9-]+\.json$/i,
@@ -4620,10 +4621,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   requireAiAccess() {
     const missing = [];
-    if (usesOpenAIChatModel(this.settings.chatModel) && !this.settings.openaiApiKey) missing.push("OpenAI API key");
-    if (usesGeminiChatModel(this.settings.chatModel) && !this.settings.googleApiKey) missing.push("Google API key");
-    if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && !this.settings.openaiApiKey) missing.push("OpenAI API key");
-    if (usesGeminiEmbeddingModel(this.settings.embeddingModel) && !this.settings.googleApiKey) missing.push("Google API key");
+    const required = new Set([
+      stableSupportedProvider(this.settings.sharedGenerationPrimary?.provider || this.settings.aiModelProvider, "openrouter"),
+      stableSupportedProvider(this.settings.embeddingModelReference?.provider || this.settings.embeddingProvider, "customopenai")
+    ]);
+    for (const provider of required) {
+      if (provider === "openai" && !this.settings.openaiApiKey) missing.push("OpenAI API key");
+      if (provider === "gemini" && !this.settings.googleApiKey) missing.push("Google Gemini API key");
+      if (provider === "openrouter" && !this.settings.openrouterApiKey) missing.push("OpenRouter API key");
+      if (provider === "openwebui" && (!this.settings.openwebuiBaseUrl || (!this.settings.openwebuiApiKey && !this.settings.openwebuiJwt && !(this.settings.openwebuiAuthMode === "login" && this.openwebuiLoginPassword)))) missing.push("OpenWebUI base URL and authentication");
+      if (provider === "customopenai" && !this.settings.customOpenAIBaseUrl) missing.push("Custom OpenAI-compatible base URL");
+    }
     if (missing.length) throw new Error(`Add ${missing.join(", ")} in Semantic Todoist Sync settings.`);
   }
 
@@ -5802,13 +5810,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async embedTexts(texts, role = "document") {
     const normalized = texts.map((text) => clamp(String(text || ""), 8000));
-    if (usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
+    const provider = stableSupportedProvider(this.settings.embeddingProvider, usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai");
+    if (provider === "gemini") {
       return this.geminiEmbedTexts(normalized, role);
     }
+    if (provider !== "openai") return this.openAiCompatibleEmbeddings(provider, normalized, role);
     const dimensions = semanticEmbeddingRequestDimension(this.settings, role, this.settings.semanticIndexMeta || {});
     const body = { model: this.settings.embeddingModel, input: normalized };
     if (dimensions > 0) body.dimensions = dimensions;
-    const response = await requestUrl({
+    const response = await requestProviderUrl("openai", {
       url: "https://api.openai.com/v1/embeddings",
       method: "POST",
       headers: {
@@ -5821,11 +5831,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`OpenAI embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
     }
-    const embeddings = response.json.data.map((item) => item.embedding);
-    if (dimensions > 0 && embeddings.some((embedding) => !Array.isArray(embedding) || embedding.length !== dimensions)) {
-      throw new Error(`OpenAI embeddings returned an unexpected dimension; expected ${dimensions}.`);
-    }
-    return embeddings;
+    return normalizeProviderEmbeddingRows(response.json?.data, normalized.length, dimensions, "openai");
   }
 
   async geminiEmbedTexts(texts, role = "document") {
@@ -5838,9 +5844,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`Gemini embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
       }
-      embeddings[index] = response.json?.embedding?.values || [];
+      embeddings[index] = { index, values: response.json?.embedding?.values || [] };
     });
-    return embeddings;
+    return normalizeProviderEmbeddingRows(embeddings, texts.length, 0, "gemini");
   }
 
   geminiEmbeddingRequestBody(model, text, role = "document") {
@@ -5854,7 +5860,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async geminiEmbeddingRequest(model, body) {
     let response = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      response = await requestUrl({
+      response = await requestProviderUrl("gemini", {
         url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:embedContent`,
         method: "POST",
         headers: {
@@ -5868,6 +5874,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await delay(750 * (attempt + 1));
     }
     return response;
+  }
+
+  async openAiCompatibleEmbeddings(provider, texts, role = "document") {
+    if (!texts.length) return [];
+    const normalizedProvider = stableSupportedProvider(provider, "openrouter");
+    const model = String(this.settings.embeddingModel || DEFAULT_EMBEDDING_REFERENCE.model).trim();
+    const overrideKey = `${normalizedProvider}:${model}`;
+    const dimension = Number(this.settings.embeddingDimensionOverrides?.[overrideKey] || this.settings.embeddingDimension || 0);
+    const body = { model, input: texts };
+    if (dimension > 0) body.dimensions = dimension;
+    const response = await this.openAiCompatibleRequest(normalizedProvider, "/embeddings", body);
+    if (response.status < 200 || response.status >= 300) {
+      const detail = response.json?.error?.message || response.json?.error?.code || "provider embedding request rejected";
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(response.status)));
+    }
+    return normalizeProviderEmbeddingRows(response.json?.data, texts.length, dimension, normalizedProvider);
   }
 
   async retrieveSemanticContext(query, limit, queryPlan = null) {
@@ -8301,9 +8323,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ? normalizeReasoningEffort(reasoningEffort)
           : aiOperationReasoningEffort(configuredEffort, operation, this.settings.optimizeStructuredAiUsage !== false);
         const reasoningConfig = modelReasoningConfig(candidateModel, effectiveEffort);
-        const response = usesGeminiChatModel(candidateModel)
+        const provider = this.generationProviderForModel(candidateModel);
+        const response = provider === "gemini"
           ? await this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, operation, promptCachePrefix })
-          : await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey });
+          : provider === "openai"
+            ? await this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig, background, operation, promptCachePrefix, promptCacheKey })
+            : await this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, jsonSchema, reasoningConfig, operation, promptCachePrefix, promptCacheKey });
         this.lastAiResponseModel = candidateModel;
         if (index > 0 && appendFallbackNotice && !jsonSchema) {
           return `${String(response || "").trimEnd()}\n\nAI fallback model used: ${modelDisplayName(candidateModel)}`;
@@ -8322,9 +8347,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     throw lastError;
   }
 
+  generationProviderForModel(model) {
+    if (usesGeminiChatModel(model)) return "gemini";
+    return stableSupportedProvider(this.settings.aiModelProvider, "openrouter");
+  }
+
   sameProviderFallbackModels(primaryModel) {
     if (!this.settings.enableAiModelFallback) return [];
-    if (usesGeminiChatModel(primaryModel)) {
+    const provider = this.generationProviderForModel(primaryModel);
+    if (provider !== "openai" && provider !== "gemini") {
+      const primary = String(primaryModel || "").trim().toLowerCase();
+      const sharedFallback = this.settings.sharedGenerationFallback;
+      const preferred = sharedFallback?.provider === provider ? String(sharedFallback.model || "").trim() : "";
+      const models = providerCatalogModels(this.settings, provider, false);
+      return uniqueValues([preferred].concat(models)).filter((model) => String(model || "").trim().toLowerCase() !== primary).slice(0, 1);
+    }
+    if (provider === "gemini") {
       const primary = normalizeGeminiModelId(primaryModel);
       const models = this.settings.availableGeminiModels?.length ? this.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
       const preferred = this.settings.chatFallbackModel && usesGeminiChatModel(this.settings.chatFallbackModel)
@@ -8341,6 +8379,79 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return uniqueValues([preferred].concat((this.settings.availableChatModels || [])
       .map((model) => normalizeOpenAIModelId(model))))
       .filter((model) => model && model !== primary).slice(0, 1);
+  }
+
+  async openAiCompatibleResponse({ provider, model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "" }) {
+    const normalizedProvider = stableSupportedProvider(provider, "openrouter");
+    const body = {
+      model: String(model || "").trim(),
+      messages: [
+        { role: "system", content: [promptCachePrefix, system].filter(Boolean).join("\n\n") },
+        { role: "user", content: String(user || "") }
+      ]
+    };
+    if (reasoningConfig.openai?.effort) body.reasoning_effort = reasoningConfig.openai.effort;
+    if (promptCacheKey) body.user = String(promptCacheKey).slice(0, 128);
+    if (jsonSchema) {
+      body.response_format = {
+        type: "json_schema",
+        json_schema: { name: "semantic_todoist_tasks", strict: true, schema: jsonSchema }
+      };
+    }
+    const response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body);
+    if (response.status < 200 || response.status >= 300) {
+      const detail = response.json?.error?.message || response.json?.error?.code || "provider response rejected";
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(response.status)));
+    }
+    const text = providerAdapterText(response.json);
+    if (!text) throw providerAdapterError(normalizedProvider, "invalid-response", "The provider returned no text.", response.status);
+    this.recordAiTokenUsage(operation, model, response.json?.usage || {});
+    return jsonSchema ? extractJsonPayload(text) : text;
+  }
+
+  async openAiCompatibleRequest(provider, path, body, options = {}) {
+    const normalizedProvider = stableSupportedProvider(provider, "openrouter");
+    let token = normalizedProvider === "openrouter"
+      ? String(this.settings.openrouterApiKey || "")
+      : normalizedProvider === "openwebui"
+        ? String(this.settings.openwebuiApiKey || this.settings.openwebuiJwt || this.openwebuiSessionToken || "")
+        : String(this.settings.customOpenAIApiKey || "");
+    if (normalizedProvider === "openwebui" && this.settings.openwebuiAuthMode === "login" && !token) token = await this.openWebUILogin();
+    const base = providerAdapterBaseUrl(this.settings, normalizedProvider);
+    const headers = { "content-type": "application/json" };
+    if (token) headers.authorization = `Bearer ${token}`;
+    if (normalizedProvider === "openrouter") headers["HTTP-Referer"] = "https://obsidian.md";
+    if (normalizedProvider === "openwebui" && this.settings.openwebuiCustomHeader) headers["x-openwebui-custom-header"] = String(this.settings.openwebuiCustomHeader).slice(0, 200);
+    return requestProviderUrl(normalizedProvider, {
+      url: `${base}${path}`,
+      method: body === undefined ? "GET" : "POST",
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: options.signal || undefined,
+      throw: false
+    });
+  }
+
+  async openWebUILogin() {
+    const password = String(this.openwebuiLoginPassword || "");
+    if (!password) throw providerAdapterError("openwebui", "login-password-missing", "Enter a login password only for the explicit provider test.");
+    try {
+      const base = providerAdapterBaseUrl(this.settings, "openwebui");
+      const response = await requestProviderUrl("openwebui", {
+        url: `${base}/auths/signin`,
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: String(this.settings.openwebuiEmail || ""), password }),
+        throw: false
+      });
+      if (response.status < 200 || response.status >= 300) throw providerAdapterError("openwebui", `http-${response.status}`, "OpenWebUI login was rejected.", response.status, response.status === 429 || response.status >= 500);
+      const token = String(response.json?.token || response.json?.access_token || response.json?.jwt || "").trim();
+      if (!token) throw providerAdapterError("openwebui", "login-token-missing", "OpenWebUI login did not return a token.");
+      this.openwebuiSessionToken = token;
+      return token;
+    } finally {
+      this.openwebuiLoginPassword = "";
+    }
   }
 
   async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "" }) {
@@ -8418,7 +8529,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       generationConfig.responseMimeType = "application/json";
       generationConfig.responseSchema = geminiCompatibleSchema(jsonSchema);
     }
-    let response = await requestUrl({
+    let response = await requestProviderUrl("gemini", {
       url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent`,
       method: "POST",
       headers: {
@@ -8437,7 +8548,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         system || "",
         "Return syntactically valid JSON only. Do not wrap it in markdown. Match the requested schema exactly."
       ].filter(Boolean).join(" ");
-      response = await requestUrl({
+      response = await requestProviderUrl("gemini", {
         url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent`,
         method: "POST",
         headers: {
@@ -8467,7 +8578,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async openaiResponsesRequest(method, path, body) {
-    return requestUrl({
+    return requestProviderUrl("openai", {
       url: `https://api.openai.com/v1${path}`,
       method,
       headers: {
@@ -8509,10 +8620,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async refreshOpenAIModels(showNotice = true) {
+    const activeProvider = stableSupportedProvider(this.settings.aiModelProvider, "openrouter");
+    if (["openrouter", "openwebui", "customopenai"].includes(activeProvider)) {
+      const discovered = await this.discoverOpenAiCompatibleModels(activeProvider);
+      this.settings.providerGenerationModels = Object.assign({}, this.settings.providerGenerationModels || {}, { [activeProvider]: discovered.generation });
+      this.settings.providerEmbeddingModels = Object.assign({}, this.settings.providerEmbeddingModels || {}, { [activeProvider]: discovered.embedding });
+      this.settings.providerGenerationModels[activeProvider] = discovered.generation;
+      this.settings.providerEmbeddingModels[activeProvider] = discovered.embedding;
+      this.settings.modelsFetchedAt = deviceTimestamp();
+      await this.saveSettings();
+      this.queryEmbeddingCache?.clear?.();
+      if (showNotice) new Notice(`Loaded ${discovered.generation.length} ${stableProviderLabel(activeProvider)} generation models and ${discovered.embedding.length} embedding models.`);
+      return discovered;
+    }
     let loadedOpenAI = 0;
     let loadedGemini = 0;
     if (this.settings.openaiApiKey) {
-      const modelsResponse = await requestUrl({
+      const modelsResponse = await requestProviderUrl("openai", {
         url: "https://api.openai.com/v1/models",
         method: "GET",
         headers: { authorization: `Bearer ${this.settings.openaiApiKey}` },
@@ -8554,8 +8678,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (showNotice) new Notice(`Loaded ${loadedOpenAI} OpenAI models and ${loadedGemini} Gemini models.`);
   }
 
+  async discoverOpenAiCompatibleModels(provider) {
+    const normalizedProvider = stableSupportedProvider(provider, "openrouter");
+    const response = await this.openAiCompatibleRequest(normalizedProvider, "/models", undefined);
+    if (response.status < 200 || response.status >= 300) {
+      const detail = response.json?.error?.message || response.json?.error?.code || "model discovery failed";
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, response.status === 429 || response.status >= 500);
+    }
+    const rows = Array.isArray(response.json?.data) ? response.json.data : [];
+    const ids = rows.map((row) => String(row?.id || row?.name || "").replace(/^models\//i, "").trim()).filter(Boolean);
+    return {
+      generation: uniqueValues(ids.filter((id) => !/embedding|whisper|tts|transcrib|moderation|image|rerank/i.test(id))),
+      embedding: uniqueValues(ids.filter((id) => /embedding/i.test(id)))
+    };
+  }
+
   async fetchGeminiModels() {
-    const response = await requestUrl({
+    const response = await requestProviderUrl("gemini", {
       url: "https://generativelanguage.googleapis.com/v1beta/models",
       method: "GET",
       headers: { "x-goog-api-key": this.settings.googleApiKey },
@@ -13657,60 +13796,46 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 
   renderAiSearch(containerEl) {
-    settingsHeading(containerEl, "Provider and access", "Choose one preferred provider. Keys are stored locally and sent only to the provider operations you run.");
-    aiProviderSetting(containerEl, this.plugin, () => this.display());
-    secretSetting(containerEl, "OpenAI API key", this.plugin, "openaiApiKey");
-    secretSetting(containerEl, "Google Gemini API key", this.plugin, "googleApiKey");
-    settingsHeading(containerEl, "Chat and fallback models", "Choose the primary model, one same-provider fallback, and their reasoning levels.");
-    new Setting(containerEl).setName("Configured models").setDesc(configuredAiModelSummary(this.plugin));
-    modelDropdownSetting(containerEl, "Primary chat model", "Used for chat, task generation, descriptions, prompts, and scheduler estimates.", this.plugin, "chatModel", "availableChatModels", () => this.display());
-    reasoningEffortSetting(containerEl, "Primary reasoning", "Controls the primary model's reasoning level.", this.plugin, "chatReasoningEffort", this.plugin.settings.chatModel);
-    toggleSetting(containerEl, "Use same-provider fallback", "Retry temporary model failures with a compatible model from the same provider.", this.plugin, "enableAiModelFallback");
-    aiFallbackModelSetting(containerEl, this.plugin, () => this.display());
-    const fallbackModel = this.plugin.settings.chatFallbackModel || this.plugin.sameProviderFallbackModels(this.plugin.settings.chatModel)[0] || this.plugin.settings.chatModel;
-    reasoningEffortSetting(containerEl, "Fallback reasoning", "Controls the fallback model's reasoning level.", this.plugin, "chatFallbackReasoningEffort", fallbackModel);
-    toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", this.plugin, "showAiFallbackNotice");
-    toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls; keep your selected level for chat, tasks, and descriptions.", this.plugin, "optimizeStructuredAiUsage");
-    toggleSetting(containerEl, "Use OpenAI prompt caching", "Cache stable instructions for supported OpenAI models. Note, email, and vault content stays outside the cached portion.", this.plugin, "enableOpenAiPromptCaching");
-    new Setting(containerEl).setName("Refresh model lists").setDesc(modelSummary(this.plugin.settings)).addButton((button) => button.setButtonText("Refresh").onClick(async () => {
-      try { await this.plugin.refreshOpenAIModels(true); this.display(); } catch (error) { new Notice(`Could not load AI models: ${error.message || error}`); }
-    }));
-    new Setting(containerEl).setName("Validate AI access").setDesc("Loads the available models with the saved provider key.").addButton((button) => button.setButtonText("Test AI").setCta().onClick(async () => {
-      try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${error.message || error}`); }
-    }));
+    const routing = settingsDisclosure(containerEl, "AI & Search routing", "Shared routing is the default. Advanced operation overrides are opt-in and remain local until you save them.", true);
+    renderSharedAiRoutingSettings(routing, this.plugin, () => this.display());
+    aiProviderSetting(routing, this.plugin, () => this.display(), this);
+    renderProviderConnectionSettings(routing, this.plugin, this);
+    renderAdvancedOperationSettings(routing, this.plugin, () => this.display());
 
-    settingsHeading(containerEl, "Embeddings and semantic search", "The local semantic index uses the selected embedding model and configured vault scope. Rebuild after changing the model or dimension.");
-    modelDropdownSetting(containerEl, "Embedding model", "Used to build and search the local semantic index.", this.plugin, "embeddingModel", "availableEmbeddingModels");
-    openAiEmbeddingDimensionSetting(containerEl, this.plugin);
-    textSetting(containerEl, "Indexed folders", "Comma-separated folders. Leave blank to index the whole vault.", this.plugin, "indexedFolders");
-    folderListSetting(containerEl, "Excluded folders", "Folders ignored by semantic search and indexing.", this.plugin, "excludedFolders");
-    textSetting(containerEl, "Excluded link domains", "Comma-separated web domains omitted from prompts and descriptions.", this.plugin, "excludedLinkDomains");
-    numberSetting(containerEl, "Embedding batch size", this.plugin, "embeddingBatchSize");
-    numberSetting(containerEl, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
-    numberSetting(containerEl, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
-    numberSetting(containerEl, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
-    toggleSetting(containerEl, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
-    toggleSetting(containerEl, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
-    numberSetting(containerEl, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
-    new Setting(containerEl).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true))).addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
+    const embeddings = settingsDisclosure(containerEl, "Embeddings and semantic index", "Provider, model, capability, and dimension are kept together so indexes are never mixed across identities.", true);
+    providerEmbeddingSettings(embeddings, this.plugin, () => this.display());
+    textSetting(embeddings, "Indexed folders", "Comma-separated folders. Leave blank to index the whole vault.", this.plugin, "indexedFolders");
+    folderListSetting(embeddings, "Excluded folders", "Folders ignored by semantic search and indexing.", this.plugin, "excludedFolders");
+    textSetting(embeddings, "Excluded link domains", "Comma-separated web domains omitted from prompts and descriptions.", this.plugin, "excludedLinkDomains");
+    numberSetting(embeddings, "Embedding batch size", this.plugin, "embeddingBatchSize");
+    numberSetting(embeddings, "Index chunk size", this.plugin, "semanticIndexMaxChunkChars");
+    numberSetting(embeddings, "Maximum chunks per note", this.plugin, "semanticIndexMaxChunksPerNote");
+    numberSetting(embeddings, "Embedding precision", this.plugin, "semanticIndexEmbeddingPrecision");
+    toggleSetting(embeddings, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
+    toggleSetting(embeddings, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
+    numberSetting(embeddings, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
+    new Setting(embeddings).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true))).addButton((button) => button.setButtonText("Purge current").onClick(() => this.plugin.purgeSemanticIndex(true)));
 
-    settingsHeading(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.");
-    dropdownSettingWithDesc(containerEl, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
-    dropdownSetting(containerEl, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
-    numberSetting(containerEl, "Chat font size", this.plugin, "chatFontSizePx");
-    toggleSetting(containerEl, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
-    toggleSetting(containerEl, "Include active note in search", "Include the active note alongside semantic search by default.", this.plugin, "searchIncludeActiveNote");
-    numberSetting(containerEl, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
-    numberSetting(containerEl, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
-    textSetting(containerEl, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
-    taskGenerationPromptTemplateSetting(containerEl, this.plugin);
-    new Setting(containerEl).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
-    new Setting(containerEl).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
+    const search = settingsDisclosure(containerEl, "Internet Search", "Search is off by default. Selecting a mode only changes saved search preferences; execution belongs to the chat action.", false);
+    webResearchSettings(search, this.plugin);
 
-    settingsHeading(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.");
-    toggleSetting(containerEl, "Publish MCP bridge manifest", "Point an external read-only bridge at existing plugin databases without copying them.", this.plugin, "externalMcpExportEnabled");
-    textSetting(containerEl, "MCP bridge folder", "Vault folder for the discoverable bridge manifest.", this.plugin, "externalMcpExportFolder");
-    setupStatusSetting(containerEl, "MCP bridge status", externalMcpExportSummary(this.plugin), [["Refresh bridge", async () => { try { await this.plugin.writeExternalMcpExport(true); this.display(); } catch (error) { new Notice(`Could not refresh external MCP bridge: ${error.message || error}`); } }]]);
+    const sidebar = settingsDisclosure(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.", false);
+    dropdownSettingWithDesc(sidebar, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
+    dropdownSetting(sidebar, "Open plugin in", this.plugin, "defaultOpenArea", ["view", "left", "right"]);
+    numberSetting(sidebar, "Chat font size", this.plugin, "chatFontSizePx");
+    toggleSetting(sidebar, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
+    toggleSetting(sidebar, "Include active note in search", "Include the active note alongside semantic search by default.", this.plugin, "searchIncludeActiveNote");
+    numberSetting(sidebar, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
+    numberSetting(sidebar, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
+    textSetting(sidebar, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
+    taskGenerationPromptTemplateSetting(sidebar, this.plugin);
+    new Setting(sidebar).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
+    new Setting(sidebar).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
+
+    const mcp = settingsDisclosure(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.", false);
+    toggleSetting(mcp, "Publish MCP bridge manifest", "Point an external read-only bridge at existing plugin databases without copying them.", this.plugin, "externalMcpExportEnabled");
+    textSetting(mcp, "MCP bridge folder", "Vault folder for the discoverable bridge manifest.", this.plugin, "externalMcpExportFolder");
+    setupStatusSetting(mcp, "MCP bridge status", externalMcpExportSummary(this.plugin), [["Refresh bridge", async () => { try { await this.plugin.writeExternalMcpExport(true); this.display(); } catch (error) { new Notice(`Could not refresh external MCP bridge: ${error.message || error}`); } }]]);
   }
 
   renderTaskWorkflows(containerEl) {
@@ -14844,19 +14969,380 @@ function textSetting(containerEl, name, desc, plugin, key) {
   }));
 }
 
-function aiProviderSetting(containerEl, plugin, refreshDisplay) {
-  const current = normalizeAiProvider(plugin.settings.aiModelProvider, aiProviderForModel(plugin.settings.chatModel));
+const STABLE_PROVIDER_LABELS = Object.freeze({
+  openai: "OpenAI",
+  gemini: "Google Gemini",
+  openrouter: "OpenRouter",
+  openwebui: "Self-Hosted OpenWebUI",
+  customopenai: "Custom OpenAI-compatible"
+});
+
+const STABLE_OPERATION_LABELS = Object.freeze({
+  "chat-query": "Chat queries",
+  "prompt-response": "Saved prompts",
+  "task-generation": "Task generation",
+  "task-description": "Task descriptions",
+  "section-title": "Section titles",
+  scheduler: "Scheduler estimates",
+  policy: "Policy updates",
+  deduplication: "Duplicate review"
+});
+
+function providerAdapterError(provider, code, message, status = 0, retryable = false) {
+  const statusText = Number(status || 0) > 0 ? ` ${Number(status)}` : "";
+  const error = new Error(`${String(provider || "provider")} request failed${statusText}: ${redactProviderAdapterDetail(message || code || "provider-error")}`);
+  error.provider = stableSupportedProvider(provider, "openrouter");
+  error.providerError = {
+    provider: error.provider,
+    code: String(code || "provider-error").slice(0, 80),
+    status: Number(status || 0),
+    retryable: Boolean(retryable)
+  };
+  error.code = error.providerError.code;
+  error.status = error.providerError.status;
+  return error;
+}
+
+function redactProviderAdapterDetail(value) {
+  return redactSecrets(value)
+    .replace(/https?:\/\/[^\s"'<>]+/gi, "[redacted-endpoint]")
+    .replace(/\b(?:sk-or-v1|sk-ant)-[0-9A-Za-z_-]+/gi, "[redacted-provider-key]")
+    .replace(/\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*["']?[^\s,"'}]+/gi, "$1=[redacted]");
+}
+
+function requestProviderUrl(provider, request, timeoutMs = PROVIDER_REQUEST_TIMEOUT_MS) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const requestOptions = Object.assign({}, request);
+  let removeUpstreamAbort = null;
+  if (controller) {
+    requestOptions.signal = controller.signal;
+    if (request.signal?.aborted) controller.abort();
+    else if (request.signal?.addEventListener) {
+      const abortUpstream = () => controller.abort();
+      request.signal.addEventListener("abort", abortUpstream, { once: true });
+      removeUpstreamAbort = () => request.signal.removeEventListener?.("abort", abortUpstream);
+    }
+  }
+  let timer = null;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      controller?.abort();
+      reject(providerAdapterError(provider, "timeout", "The provider request timed out.", 0, true));
+    }, Math.max(1, Number(timeoutMs) || PROVIDER_REQUEST_TIMEOUT_MS));
+  });
+  return Promise.race([Promise.resolve().then(() => requestUrl(requestOptions)), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+    if (removeUpstreamAbort) removeUpstreamAbort();
+  });
+}
+
+function providerAdapterBaseUrl(settings = {}, provider = "") {
+  const normalized = stableSupportedProvider(provider, "openrouter");
+  if (normalized === "openrouter") return "https://openrouter.ai/api/v1";
+  const configured = normalized === "openwebui" ? settings.openwebuiBaseUrl : settings.customOpenAIBaseUrl;
+  const raw = String(configured || "").trim();
+  if (!raw) throw providerAdapterError(normalized, "provider-endpoint-missing", "Configure the provider base URL before testing it.");
+  let normalizedUrl = normalizeHttpsUrl(raw).replace(/\/+$/, "");
+  try {
+    const parsed = new URL(normalizedUrl);
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error("unsupported-protocol");
+    normalizedUrl = parsed.toString().replace(/\/+$/, "");
+  } catch {
+    throw providerAdapterError(normalized, "provider-endpoint-invalid", "The saved provider base URL is invalid.");
+  }
+  return /\/v1$/i.test(normalizedUrl) ? normalizedUrl : `${normalizedUrl}/v1`;
+}
+
+function providerAdapterText(response = {}) {
+  const choice = response?.choices?.[0] || {};
+  const content = choice.message?.content ?? choice.text ?? "";
+  if (Array.isArray(content)) return content.map((item) => item?.text || item?.content || "").join("");
+  if (content && typeof content === "object") return String(content.text ?? content.content ?? "").trim();
+  return String(content || "").trim();
+}
+
+function normalizeProviderEmbeddingRows(rows, expectedCount, expectedDimension = 0, provider = "provider") {
+  if (!Array.isArray(rows) || rows.length !== expectedCount) throw providerAdapterError(provider, "embedding-count-mismatch", "The provider returned an unexpected embedding count.");
+  const result = new Array(expectedCount);
+  const seen = new Set();
+  let dimension = 0;
+  rows.forEach((row, position) => {
+    const rawIndex = row && Object.prototype.hasOwnProperty.call(row, "index") ? Number(row.index) : position;
+    if (!Number.isInteger(rawIndex) || rawIndex < 0 || rawIndex >= expectedCount || seen.has(rawIndex)) throw providerAdapterError(provider, "embedding-index-invalid", "The provider returned invalid or duplicate embedding indexes.");
+    seen.add(rawIndex);
+    const vector = Array.isArray(row?.embedding) ? row.embedding : Array.isArray(row?.values) ? row.values : null;
+    if (!vector?.length || vector.some((value) => !Number.isFinite(Number(value)))) throw providerAdapterError(provider, "embedding-vector-invalid", "The provider returned a non-finite embedding vector.");
+    if (!dimension) dimension = vector.length;
+    if (vector.length !== dimension || (expectedDimension > 0 && vector.length !== expectedDimension)) throw providerAdapterError(provider, "embedding-dimension-mismatch", "The provider returned inconsistent embedding dimensions.");
+    result[rawIndex] = vector.map(Number);
+  });
+  if (result.some((vector) => !vector)) throw providerAdapterError(provider, "embedding-index-missing", "The provider omitted an embedding index.");
+  return result;
+}
+
+function settingsDisclosure(containerEl, title, description = "", open = false, extraClass = "") {
+  const classes = ["semantic-todoist-settings-disclosure", extraClass].filter(Boolean).join(" ");
+  const disclosure = containerEl.createEl("details", { cls: classes });
+  disclosure.open = Boolean(open);
+  disclosure.createEl("summary", { text: title });
+  if (description) disclosure.createDiv({ cls: "semantic-todoist-settings-disclosure-description", text: description });
+  return disclosure.createDiv({ cls: "semantic-todoist-settings-disclosure-body" });
+}
+
+function stableProviderLabel(provider) {
+  return STABLE_PROVIDER_LABELS[stableSupportedProvider(provider)] || "OpenRouter";
+}
+
+function providerCatalogModels(settings, provider, embedding = false) {
+  const normalized = stableSupportedProvider(provider);
+  const catalogs = embedding ? settings.providerEmbeddingModels : settings.providerGenerationModels;
+  const catalog = Array.isArray(catalogs?.[normalized]) ? catalogs[normalized] : [];
+  const legacy = embedding
+    ? {
+      openai: settings.availableEmbeddingModels,
+      gemini: settings.availableGeminiEmbeddingModels,
+      openrouter: settings.availableOpenRouterEmbeddingModels,
+      openwebui: settings.availableOpenWebUIEmbeddingModels,
+      customopenai: settings.availableCustomOpenAIEmbeddingModels
+    }[normalized]
+    : {
+      openai: settings.availableChatModels,
+      gemini: settings.availableGeminiModels,
+      openrouter: settings.availableOpenRouterModels,
+      openwebui: settings.availableOpenWebUIModels,
+      customopenai: settings.availableCustomOpenAIModels
+    }[normalized];
+  return uniqueValues((catalog || []).concat(legacy || []).map((value) => String(value || "").trim()).filter(Boolean));
+}
+
+function providerDropdownOptions(provider, embedding = false) {
+  return (embedding ? ["openai", "gemini", "openrouter", "openwebui", "customopenai"] : SUPPORTED_AI_PROVIDERS)
+    .map((value) => ({ value, label: stableProviderLabel(value) }));
+}
+
+function providerTextSetting(containerEl, name, desc, plugin, key, options = {}) {
+  new Setting(containerEl).setName(name).setDesc(desc || "").addText((text) => {
+    text.setValue(String(plugin.settings[key] || "")).onChange(async (value) => {
+      plugin.settings[key] = options.url ? normalizeHttpsUrl(value) : value;
+      await plugin.saveSettings();
+    });
+  });
+}
+
+function ephemeralSecretSetting(containerEl, name, desc, plugin, property) {
+  new Setting(containerEl).setName(name).setDesc(desc || "").addText((text) => {
+    text.inputEl.type = "password";
+    text.setValue(String(plugin[property] || "")).onChange((value) => {
+      plugin[property] = String(value || "");
+    });
+  });
+}
+
+function aiProviderSetting(containerEl, plugin, refreshDisplay, tab = null) {
+  const current = normalizeAiProvider(tab?.providerViewProvider || plugin.settings.aiModelProvider, "openrouter");
   new Setting(containerEl)
-    .setName("Preferred AI provider")
-    .setDesc(settingDescription("Preferred AI provider", "aiModelProvider"))
+    .setName("Provider connection to show")
+    .setDesc("Display-only selection. It does not change routing, embeddings, or saved settings.")
     .addDropdown((dropdown) => {
-      dropdown.addOption("openai", "OpenAI");
-      dropdown.addOption("gemini", "Google Gemini");
-      dropdown.setValue(current).onChange(async (value) => {
-        await plugin.setAiModelProvider(value);
+      for (const option of providerDropdownOptions()) dropdown.addOption(option.value, option.label);
+      dropdown.setValue(current).onChange((value) => {
+        if (tab) tab.providerViewProvider = stableSupportedProvider(value, current);
         if (refreshDisplay) refreshDisplay();
       });
     });
+}
+
+function providerConnectionDisclosure(containerEl, plugin, provider) {
+  const normalized = stableSupportedProvider(provider, "openrouter");
+  const body = settingsDisclosure(containerEl, `${stableProviderLabel(normalized)} connection`, "Only the selected connection is shown. Refresh and test actions are explicit.", true, "semantic-todoist-provider-connection");
+  if (normalized === "openai") {
+    secretSetting(body, "OpenAI API key", plugin, "openaiApiKey");
+  } else if (normalized === "gemini") {
+    secretSetting(body, "Google Gemini API key", plugin, "googleApiKey");
+  } else if (normalized === "openrouter") {
+    secretSetting(body, "OpenRouter API key", plugin, "openrouterApiKey");
+    providerTextSetting(body, "OpenRouter default model", "Optional saved model used when the provider catalog is empty.", plugin, "openrouterDefaultModel");
+  } else if (normalized === "openwebui") {
+    providerTextSetting(body, "OpenWebUI base URL", "Saved HTTPS API root. No endpoint is inferred from a model name.", plugin, "openwebuiBaseUrl", { url: true });
+    secretSetting(body, "OpenWebUI API key or token", plugin, "openwebuiApiKey");
+    dropdownSettingWithDesc(body, "Authentication mode", "Use a saved token, or enter an ephemeral login password only for an explicit provider test.", plugin, "openwebuiAuthMode", ["api-key", "login"]);
+    ephemeralSecretSetting(body, "Login password (not saved)", "Held only in memory until the explicit provider test completes.", plugin, "openwebuiLoginPassword");
+  } else {
+    providerTextSetting(body, "Custom OpenAI-compatible base URL", "Saved HTTPS API root. No endpoint is inferred from a model name.", plugin, "customOpenAIBaseUrl", { url: true });
+    secretSetting(body, "Custom OpenAI-compatible API key", plugin, "customOpenAIApiKey");
+    providerTextSetting(body, "Custom default model", "Optional model ID used when the provider catalog is empty.", plugin, "customOpenAIModel");
+  }
+  return body;
+}
+
+function renderProviderConnectionSettings(containerEl, plugin, tab = null) {
+  const provider = tab?.providerViewProvider || plugin.settings.aiModelProvider || "openrouter";
+  providerConnectionDisclosure(containerEl, plugin, provider);
+}
+
+function stableSharedReference(settings, role) {
+  const normalized = normalizeStableSettings(settings);
+  return role === "fallback" ? normalized.sharedGenerationFallback : normalized.sharedGenerationPrimary;
+}
+
+function stableUiOperationReference(settings, operation, role) {
+  const normalized = normalizeStableSettings(settings);
+  return normalized.aiOperationModels?.[operation]?.[role] || (role === "fallback" ? normalized.sharedGenerationFallback : normalized.sharedGenerationPrimary);
+}
+
+async function saveSharedReferenceField(plugin, role, field, value) {
+  const current = stableSharedReference(plugin.settings, role);
+  const next = stableReference(Object.assign({}, current, { [field]: value }), current);
+  if (role === "fallback") {
+    plugin.settings.sharedGenerationFallback = next;
+    plugin.settings.fallbackAiModelProvider = next.provider;
+    plugin.settings.chatFallbackModel = next.model;
+    plugin.settings.chatFallbackReasoningEffort = next.reasoningEffort;
+  } else {
+    plugin.settings.sharedGenerationPrimary = next;
+    plugin.settings.aiModelProvider = next.provider;
+    plugin.settings.chatModel = next.model;
+    plugin.settings.chatReasoningEffort = next.reasoningEffort;
+  }
+  await plugin.saveSettings();
+}
+
+async function saveOperationReferenceField(plugin, operation, role, field, value) {
+  const current = stableUiOperationReference(plugin.settings, operation, role);
+  const operations = cloneStableValue(plugin.settings.aiOperationModels || {});
+  const row = Object.assign({}, operations[operation] || {});
+  row[role] = stableReference(Object.assign({}, current, { [field]: value }), current);
+  operations[operation] = row;
+  plugin.settings.aiOperationModels = operations;
+  await plugin.saveSettings();
+}
+
+function referenceDropdownSetting(containerEl, name, desc, plugin, options = {}) {
+  const { operation = "", role = "primary", field = "provider", shared = false, refreshDisplay = null } = options;
+  const current = shared ? stableSharedReference(plugin.settings, role) : stableUiOperationReference(plugin.settings, operation, role);
+  const values = field === "provider"
+    ? providerDropdownOptions().map((option) => ({ value: option.value, label: option.label }))
+    : field === "reasoningEffort"
+      ? reasoningEffortOptionsForModel(current.model, current.reasoningEffort)
+      : providerCatalogModels(plugin.settings, current.provider).map((value) => ({ value, label: modelDisplayName(value) }));
+  const setting = new Setting(containerEl).setName(name).setDesc(desc || "");
+  setting.addDropdown((dropdown) => {
+    if (!values.some((option) => option.value === current[field]) && current[field]) dropdown.addOption(current[field], String(current[field]));
+    for (const option of values) dropdown.addOption(option.value, option.label);
+    dropdown.setValue(current[field]).onChange(async (value) => {
+      if (shared) await saveSharedReferenceField(plugin, role, field, value);
+      else await saveOperationReferenceField(plugin, operation, role, field, value);
+      if (refreshDisplay) refreshDisplay();
+    });
+  });
+  return setting;
+}
+
+function renderSharedReferenceControls(containerEl, plugin, role, refreshDisplay) {
+  const title = role === "fallback" ? "Shared fallback" : "Shared primary";
+  const reference = stableSharedReference(plugin.settings, role);
+  settingsHeading(containerEl, title, role === "fallback" ? "Used after an eligible primary failure." : "Used by every operation unless advanced routing is enabled.");
+  referenceDropdownSetting(containerEl, `${title} provider`, "Provider is stored with the model; bare model IDs are never guessed.", plugin, { role, field: "provider", shared: true, refreshDisplay });
+  referenceDropdownSetting(containerEl, `${title} model`, "Provider-scoped model catalog; saved selections remain available when a catalog is empty.", plugin, { role, field: "model", shared: true, refreshDisplay });
+  referenceDropdownSetting(containerEl, `${title} reasoning`, "Reasoning level for this saved reference.", plugin, { role, field: "reasoningEffort", shared: true, refreshDisplay });
+  if (role === "primary") new Setting(containerEl).setName("Configured models").setDesc(`${configuredAiModelSummary(plugin)} Active: ${stableProviderLabel(reference.provider)} / ${modelDisplayName(reference.model)}.`);
+}
+
+function renderSharedAiRoutingSettings(containerEl, plugin, refreshDisplay) {
+  renderSharedReferenceControls(containerEl, plugin, "primary", refreshDisplay);
+  toggleSetting(containerEl, "Enable AI fallback", "Allow one configured fallback attempt after an eligible primary failure.", plugin, "enableAiModelFallback");
+  renderSharedReferenceControls(containerEl, plugin, "fallback", refreshDisplay);
+  toggleSetting(containerEl, "Show fallback notice", "Add a short local note when a chat answer used the fallback model.", plugin, "showAiFallbackNotice");
+  toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls.", plugin, "optimizeStructuredAiUsage");
+  toggleSetting(containerEl, "Use provider prompt caching", "Cache stable instructions only when the selected provider supports it.", plugin, "enableOpenAiPromptCaching");
+  new Setting(containerEl).setName("Refresh Models").setDesc("Explicitly load provider model catalogs; typing and display-only selection never refreshes.").addButton((button) => button.setButtonText("Refresh Models").onClick(async () => {
+    try { await plugin.refreshOpenAIModels(true); if (refreshDisplay) refreshDisplay(); } catch (error) { new Notice(`Could not refresh models: ${error.message || error}`); }
+  }));
+  new Setting(containerEl).setName("Test Provider").setDesc("Explicitly validate the selected provider connection.").addButton((button) => button.setButtonText("Test Provider").setCta().onClick(async () => {
+    try { await plugin.validateAiSetup(true); if (refreshDisplay) refreshDisplay(); } catch (error) { new Notice(`Provider test failed: ${error.message || error}`); }
+  }));
+}
+
+function renderAdvancedOperationSettings(containerEl, plugin, refreshDisplay) {
+  const advanced = settingsDisclosure(containerEl, "Advanced operation routing", "Optional per-operation overrides. When disabled, all eight operations inherit the shared references.", Boolean(plugin.settings.enableMultiProviderOperationModels), "semantic-todoist-operation-disclosure");
+  toggleSetting(advanced, "Enable per-operation overrides", "Opt in before changing an operation-specific primary or fallback.", plugin, "enableMultiProviderOperationModels");
+  if (plugin.settings.enableMultiProviderOperationModels !== true) return;
+  for (const operation of AI_OPERATION_KEYS) {
+    const operationBody = settingsDisclosure(advanced, STABLE_OPERATION_LABELS[operation] || operation, "Primary and fallback are resolved from the shared references until explicitly overridden.", false, "semantic-todoist-operation-disclosure");
+    renderOperationReferenceControls(operationBody, plugin, operation, "primary", refreshDisplay);
+    renderOperationReferenceControls(operationBody, plugin, operation, "fallback", refreshDisplay);
+  }
+}
+
+function renderOperationReferenceControls(containerEl, plugin, operation, role, refreshDisplay) {
+  const label = role === "fallback" ? "Fallback" : "Primary";
+  referenceDropdownSetting(containerEl, `${label} provider`, `${label} provider for ${STABLE_OPERATION_LABELS[operation] || operation}.`, plugin, { operation, role, field: "provider", refreshDisplay });
+  referenceDropdownSetting(containerEl, `${label} model`, "Provider-scoped model selection.", plugin, { operation, role, field: "model", refreshDisplay });
+  referenceDropdownSetting(containerEl, `${label} reasoning`, "Saved reasoning level.", plugin, { operation, role, field: "reasoningEffort", refreshDisplay });
+}
+
+function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
+  const normalized = normalizeStableSettings(plugin.settings);
+  let reference = normalized.embeddingModelReference;
+  new Setting(containerEl).setName("Embedding provider").setDesc("Indexes are provider/model/dimension specific and are never mixed.").addDropdown((dropdown) => {
+    for (const option of providerDropdownOptions(null, true)) dropdown.addOption(option.value, option.label);
+    dropdown.setValue(reference.provider).onChange(async (value) => {
+      reference = stableReference({ provider: value, model: reference.model }, reference);
+      plugin.settings.embeddingModelReference = reference;
+      plugin.settings.embeddingProvider = reference.provider;
+      plugin.settings.embeddingModel = reference.model;
+      await plugin.saveSettings();
+      if (refreshDisplay) refreshDisplay();
+    });
+  });
+  new Setting(containerEl).setName("Embedding model").setDesc("Provider-scoped catalog; changing this control saves state but does not make a network request.").addDropdown((dropdown) => {
+    const models = providerCatalogModels(plugin.settings, reference.provider, true);
+    if (!models.includes(reference.model)) dropdown.addOption(reference.model, reference.model);
+    for (const model of models) dropdown.addOption(model, modelDisplayName(model));
+    dropdown.setValue(reference.model).onChange(async (value) => {
+      reference = stableReference({ provider: reference.provider, model: value }, reference);
+      plugin.settings.embeddingModelReference = reference;
+      plugin.settings.embeddingProvider = reference.provider;
+      plugin.settings.embeddingModel = reference.model;
+      await plugin.saveSettings();
+      if (refreshDisplay) refreshDisplay();
+    });
+  });
+  new Setting(containerEl).setName("Embedding capability").setDesc(embeddingCapabilitySummary(plugin.settings, reference.provider, reference.model));
+  new Setting(containerEl).setName("Embedding dimension").setDesc("Use the provider's native dimension when blank; a saved positive value becomes part of index identity.").addText((text) => {
+    text.inputEl.type = "number";
+    text.inputEl.min = "0";
+    text.setValue(String(plugin.settings.embeddingDimension || "")).onChange(async (value) => {
+      const parsed = Number.parseInt(value, 10);
+      plugin.settings.embeddingDimension = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+      await plugin.saveSettings();
+    });
+  });
+}
+
+function embeddingCapabilitySummary(settings, provider, model) {
+  const catalog = settings.providerEmbeddingModels?.[stableSupportedProvider(provider)] || [];
+  const listed = Array.isArray(catalog) && catalog.some((value) => String(value) === String(model));
+  return listed ? "Provider catalog reports this model as embedding-capable." : "Capability is not reported locally; the explicit provider test is required before rebuilding.";
+}
+
+function webResearchSettings(containerEl, plugin) {
+  const providers = ["openai", "gemini", "openrouter"];
+  const provider = stableSupportedProvider(plugin.settings.chatWebSearchProvider, "openrouter");
+  const models = providerCatalogModels(plugin.settings, provider).concat(plugin.settings.chatWebSearchModel || "");
+  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is limited to OpenAI, Gemini, and OpenRouter.", plugin, "chatWebSearchProvider", providers);
+  new Setting(containerEl).setName("Search model").setDesc("Provider-scoped model used only by an explicit search mode.").addDropdown((dropdown) => {
+    const values = uniqueValues(models.filter(Boolean));
+    if (!values.length) values.push("");
+    if (!values.includes(plugin.settings.chatWebSearchModel || "")) dropdown.addOption(plugin.settings.chatWebSearchModel || "", plugin.settings.chatWebSearchModel || "Provider default");
+    for (const model of values) dropdown.addOption(model, model || "Provider default");
+    dropdown.setValue(plugin.settings.chatWebSearchModel || "").onChange(async (value) => {
+      plugin.settings.chatWebSearchModel = value;
+      await plugin.saveSettings();
+    });
+  });
+  dropdownSettingWithDesc(containerEl, "Search mode", "Off makes no search request. Concise and Deep are explicit per-view modes.", plugin, "chatWebSearchMode", ["off", "concise", "deep"]);
+  toggleSetting(containerEl, "Save Research notes", "Save a sanitized Research note only after citation validation succeeds.", plugin, "chatWebSaveResearch");
 }
 
 function modelDropdownSetting(containerEl, name, desc, plugin, key, listKey, refreshDisplay = null) {
@@ -15360,15 +15846,34 @@ function yesNo(value) {
 }
 
 function aiSetupSummary(settings) {
-  const provider = normalizeAiProvider(settings.aiModelProvider, aiProviderForModel(settings.chatModel));
-  const keyReady = provider === "gemini" ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
-  const embeddingReady = usesGeminiEmbeddingModel(settings.embeddingModel) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
-  return `${providerDisplayName(provider)} is preferred. Chat key: ${keyReady ? "set" : "missing"}. Embedding key: ${embeddingReady ? "set" : "missing"}. Model list: ${settings.modelsFetchedAt || settings.geminiModelsFetchedAt ? "loaded" : "not loaded"}.`;
+  const provider = stableSupportedProvider(settings.sharedGenerationPrimary?.provider || settings.aiModelProvider, "openrouter");
+  const embeddingProvider = stableSupportedProvider(settings.embeddingModelReference?.provider || settings.embeddingProvider, "customopenai");
+  const connectionReady = provider === "openai" ? Boolean(settings.openaiApiKey)
+    : provider === "gemini" ? Boolean(settings.googleApiKey)
+      : provider === "openrouter" ? Boolean(settings.openrouterApiKey)
+        : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+          : Boolean(settings.customOpenAIBaseUrl);
+  const embeddingReady = embeddingProvider === "openai" ? Boolean(settings.openaiApiKey)
+    : embeddingProvider === "gemini" ? Boolean(settings.googleApiKey)
+      : embeddingProvider === "openrouter" ? Boolean(settings.openrouterApiKey)
+        : embeddingProvider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+          : Boolean(settings.customOpenAIBaseUrl);
+  return `${stableProviderLabel(provider)} is preferred. Chat connection: ${connectionReady ? "set" : "missing"}. Embedding connection (${stableProviderLabel(embeddingProvider)}): ${embeddingReady ? "set" : "missing"}. Model list: ${settings.modelsFetchedAt || settings.geminiModelsFetchedAt ? "loaded" : "not loaded"}.`;
 }
 
 function aiAccessConfigured(settings) {
-  const chatReady = usesGeminiChatModel(settings.chatModel) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
-  const embeddingReady = usesGeminiEmbeddingModel(settings.embeddingModel) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
+  const provider = stableSupportedProvider(settings.sharedGenerationPrimary?.provider || settings.aiModelProvider, "openrouter");
+  const embeddingProvider = stableSupportedProvider(settings.embeddingModelReference?.provider || settings.embeddingProvider, "customopenai");
+  const chatReady = provider === "openai" ? Boolean(settings.openaiApiKey)
+    : provider === "gemini" ? Boolean(settings.googleApiKey)
+      : provider === "openrouter" ? Boolean(settings.openrouterApiKey)
+        : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+          : Boolean(settings.customOpenAIBaseUrl);
+  const embeddingReady = embeddingProvider === "openai" ? Boolean(settings.openaiApiKey)
+    : embeddingProvider === "gemini" ? Boolean(settings.googleApiKey)
+      : embeddingProvider === "openrouter" ? Boolean(settings.openrouterApiKey)
+        : embeddingProvider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+          : Boolean(settings.customOpenAIBaseUrl);
   return chatReady && embeddingReady;
 }
 
@@ -36440,6 +36945,7 @@ if (typeof module !== "undefined" && module.exports) {
     resolveOperationReference,
     providerIndexIdentity,
     semanticIndexCompatibilityStatus,
-    semanticIndexCleanupPlan
+    semanticIndexCleanupPlan,
+    SemanticTodoistSettingTab
   });
 }

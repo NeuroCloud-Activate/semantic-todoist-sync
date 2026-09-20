@@ -1594,3 +1594,77 @@
 .is-mobile .semantic-todoist-view .clickable-icon {
   min-height: 44px;
 }
+
+/* Provider settings disclose one connection and one operation lane at a time. */
+.semantic-todoist-settings-disclosure {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  margin: 0 0 12px;
+  padding: 0 12px;
+  overflow: hidden;
+}
+
+.semantic-todoist-settings-disclosure > summary {
+  cursor: pointer;
+  font-weight: 600;
+  list-style-position: outside;
+  padding: 12px 0;
+}
+
+.semantic-todoist-settings-disclosure-description {
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin: -2px 0 8px;
+  max-width: 72ch;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-settings-disclosure-body {
+  min-width: 0;
+  padding-bottom: 4px;
+}
+
+.semantic-todoist-provider-connection {
+  background: var(--background-secondary-alt);
+  margin-inline: 0;
+}
+
+.semantic-todoist-operation-disclosure {
+  border-color: var(--background-modifier-border-hover);
+  margin-inline: 0;
+}
+
+.semantic-todoist-settings-disclosure .setting-item {
+  min-width: 0;
+}
+
+.semantic-todoist-settings-disclosure .setting-item-control {
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 100%;
+}
+
+@media (max-width: 700px) {
+  .semantic-todoist-settings-disclosure {
+    padding-inline: 10px;
+  }
+
+  .semantic-todoist-settings-disclosure .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .semantic-todoist-settings-disclosure .setting-item-info,
+  .semantic-todoist-settings-disclosure .setting-item-control {
+    margin-inline-start: 0;
+    width: 100%;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .semantic-todoist-settings-disclosure > summary {
+    min-height: 44px;
+    padding-block: 12px;
+  }
+}

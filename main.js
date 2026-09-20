@@ -32328,8 +32328,10 @@ function taskDescriptionContextAvailability(contract = {}, options = {}) {
   const evidenceById = safe.evidenceById || safe.evidence_by_id || {};
   const executionCandidatesByFactId = safe.executionCandidatesByFactId || safe.execution_candidates_by_fact_id || {};
 
-  const refList = (camel, snake) => uniqueValues(
-    [...(camel || []), ...(snake || [])].map((value) => String(value)).filter((value) => value !== undefined && value !== null && value !== "")
+  const refList = (...lists) => uniqueValues(
+    lists.flatMap((list) => Array.isArray(list) ? list : [])
+      .filter((value) => value !== undefined && value !== null && String(value).trim() !== "")
+      .map((value) => String(value))
   );
 
   const allowedFactIds = refList(safe.allowedFactIds, safe.allowed_fact_ids);
@@ -32354,7 +32356,6 @@ function taskDescriptionContextAvailability(contract = {}, options = {}) {
 
   const usableSourceFacts = (fact) => {
     if (!fact) return false;
-    if (fact.current !== true) return false;
     const authorityState = String(fact?.authorityState || fact?.authority_state || "authoritative").trim().toLowerCase();
     if (authorityState !== "authoritative") return false;
     const conflictState = String(fact?.conflictState || fact?.conflict_state || "none").trim().toLowerCase();
@@ -32366,7 +32367,8 @@ function taskDescriptionContextAvailability(contract = {}, options = {}) {
     return true;
   };
 
-  const candidateDetailRefs = uniqueValues([...materialDescriptionFactRefs, ...executionDetailFactRefs, ...candidateSupportingFactRefs]);
+  const supportingFactRefs = uniqueValues([...availableDescriptionFactRefs, ...candidateSupportingFactRefs]);
+  const candidateDetailRefs = uniqueValues([...materialDescriptionFactRefs, ...executionDetailFactRefs, ...supportingFactRefs]);
   const usableDetailIds = uniqueValues(
     candidateDetailRefs.filter((factId) => {
       if (allowedFactIds.length > 0 && !allowedFactIds.includes(factId)) return false;
@@ -32382,7 +32384,7 @@ function taskDescriptionContextAvailability(contract = {}, options = {}) {
     materialFactCount: materialDescriptionFactRefs.length,
     executionDetailFactCount: executionDetailFactRefs.length,
     currentFactCount: requiredCurrentFactIds.length,
-    supportingFactCount: candidateSupportingFactRefs.length,
+    supportingFactCount: supportingFactRefs.length,
     optionalEvidenceOmittedCount: Number(options?.omittedOptionalEvidenceIds?.length || 0),
     missingDetailAnomaly: missingDetailAnomaly
   };
@@ -48258,6 +48260,10 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
     executionCandidatesByFactId[factId] = row;
   }
   const executionCandidateLocalizationBytes = utf8ByteLength(JSON.stringify(executionCandidatesByFactId));
+  const contextAvailability = taskDescriptionContextAvailability(dispatchContract || singletonContract, {
+    omittedOptionalEvidenceIds: options.omittedOptionalEvidenceIds || []
+  });
+  ledger.contextAvailability = contextAvailability;
   // `ledger` remains the full local validator contract. The provider receives
   // task-local bodies only via the closed envelope suffix; the ledger delta is
   // strictly bounded to the task-local execution shortlist, never the complete
@@ -48266,6 +48272,7 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
     version: ledger.version,
     task: ledger.task,
     closure: ledger.closure,
+    contextAvailability: ledger.contextAvailability,
     ...(Object.keys(executionCandidatesByFactId).length ? { executionCandidatesByFactId } : {}),
     bindingsByFactId: ledger.bindingsByFactId,
     citationsByEvidenceId: ledger.citationsByEvidenceId
@@ -48293,6 +48300,7 @@ function taskDescriptionCanonicalRequestLedger(promptTask = {}, sharedPayload = 
     executionCandidateOmittedForItemBoundCount,
     executionCandidateOmittedForRowByteBoundCount,
     executionCandidateOmittedForTotalByteBoundCount,
+    contextAvailability,
     legacyBytes: Math.max(0, utf8ByteLength(String(options.legacyPromptContextSuffix || "")) + utf8ByteLength(String(options.legacyUser || ""))),
     compactBytes: utf8ByteLength(user)
   });

@@ -8444,7 +8444,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         body: JSON.stringify({ email: String(this.settings.openwebuiEmail || ""), password }),
         throw: false
       });
-      if (response.status < 200 || response.status >= 300) throw providerAdapterError("openwebui", `http-${response.status}`, "OpenWebUI login was rejected.", response.status, response.status === 429 || response.status >= 500);
+      if (response.status < 200 || response.status >= 300) throw providerAdapterError("openwebui", `http-${response.status}`, "OpenWebUI login was rejected.", response.status, isRetryableProviderStatus(response.status));
       const token = String(response.json?.token || response.json?.access_token || response.json?.jwt || "").trim();
       if (!token) throw providerAdapterError("openwebui", "login-token-missing", "OpenWebUI login did not return a token.");
       this.openwebuiSessionToken = token;
@@ -8680,7 +8680,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const response = await this.openAiCompatibleRequest(normalizedProvider, "/models", undefined);
     if (response.status < 200 || response.status >= 300) {
       const detail = response.json?.error?.message || response.json?.error?.code || "model discovery failed";
-      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, response.status === 429 || response.status >= 500);
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
     }
     const rows = Array.isArray(response.json?.data) ? response.json.data : [];
     const ids = rows.map((row) => String(row?.id || row?.name || "").replace(/^models\//i, "").trim()).filter(Boolean);

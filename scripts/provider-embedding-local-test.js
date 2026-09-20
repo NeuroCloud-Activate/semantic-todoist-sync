@@ -54,6 +54,12 @@ const makePlugin = (settings) => {
 
   scriptedResponses = [{ status: 200, json: { data: [{ index: 0, embedding: [1, 0, 0] }, { index: 0, embedding: [0, 1, 0] }] }, text: 'FICTIONAL_DUPLICATE_INDEX' }];
   await assert.rejects(() => openrouter.embedTexts(['FICTIONAL_A', 'FICTIONAL_B'], 'query'), (error) => error.code === 'embedding-index-invalid');
+  scriptedResponses = [{ status: 200, json: { data: [{ index: 0, embedding: [1, 0, 0] }] }, text: 'FICTIONAL_COUNT_MISMATCH' }];
+  await assert.rejects(() => openrouter.embedTexts(['FICTIONAL_A', 'FICTIONAL_B'], 'query'), (error) => error.code === 'embedding-count-mismatch');
+  scriptedResponses = [{ status: 200, json: { data: [{ index: 0, embedding: [1, 0, 0] }, { index: 1, embedding: [0, 1] }] }, text: 'FICTIONAL_DIMENSION_MISMATCH' }];
+  await assert.rejects(() => openrouter.embedTexts(['FICTIONAL_A', 'FICTIONAL_B'], 'query'), (error) => error.code === 'embedding-dimension-mismatch');
+  scriptedResponses = [{ status: 200, json: { data: [{ index: 0, embedding: [NaN, 0, 0] }, { index: 1, embedding: [0, 1, 0] }] }, text: 'FICTIONAL_NONFINITE_VECTOR' }];
+  await assert.rejects(() => openrouter.embedTexts(['FICTIONAL_A', 'FICTIONAL_B'], 'query'), (error) => error.code === 'embedding-vector-invalid');
   scriptedResponses = [];
 
   calls.length = 0;

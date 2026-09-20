@@ -16,6 +16,7 @@ const path = require('path');
 
 const originalLoad = Module._load;
 const renderedSettings = [];
+let networkCount = 0;
 class FakeElement {
   constructor(tagName = 'div', options = {}) {
     this.tagName = tagName;
@@ -78,7 +79,7 @@ Module._load = function (request, parent, isMain) {
   return {
     ItemView: Empty, MarkdownRenderer: {}, MarkdownView: Empty, Modal: Empty,
     Notice: Empty, Plugin: Empty, PluginSettingTab: Empty, Setting: FakeSetting,
-    TFile: Empty, setIcon() {}, requestUrl() { throw new Error('network disabled'); }
+    TFile: Empty, setIcon() {}, requestUrl() { networkCount += 1; throw new Error('network disabled'); }
   };
 };
 global.window = { setTimeout, clearTimeout, requestIdleCallback: null };
@@ -145,7 +146,7 @@ const mouse = Plugin.resolveOperationReference({
 assert.deepStrictEqual(keyboard, mouse, 'keyboard and mouse selection resolve identically');
 
 // 7. Explicit Refresh/Test actions exist (selection must not auto-run on blur).
-assert.ok(/setButtonText\(\s*"Refresh"\s*\)/.test(source), 'explicit Refresh action present');
+assert.ok(/setButtonText\(\s*"Refresh Models"\s*\)/.test(source), 'explicit Refresh Models action present');
 assert.ok(/setButtonText\(\s*"Test Provider"\s*\)/.test(source), 'explicit Test Provider action present');
 
 // 8. Provider connection keys are explicit and never include the removed
@@ -169,7 +170,16 @@ assert.ok(/for\s*\(const operation of AI_OPERATION_KEYS\)/.test(source), 'advanc
 assert.ok(/sharedGenerationPrimary/.test(source) && /sharedGenerationFallback/.test(source), 'shared references are presented before advanced overrides');
 assert.ok(/chatWebSearchProvider/.test(source) && /chatWebSaveResearch/.test(source), 'search provider/model/mode/save settings are present');
 assert.ok(/semantic-todoist-settings-disclosure/.test(styles) && /max-width:\s*700px/.test(styles), 'responsive disclosure styles exist');
+assert.ok(/min-height:\s*44px/.test(styles) && /flex-direction:\s*column/.test(styles), 'coarse targets and narrow stacking styles exist');
 assert.ok(!/:has\(/.test(styles), 'settings styles do not depend on :has');
+
+const inherited = Plugin.resolveOperationReference({
+  ...defaults,
+  enableMultiProviderOperationModels: false,
+  sharedGenerationPrimary: { provider: 'customopenai', model: 'fictional-shared-model' },
+  aiOperationModels: { 'chat-query': { primary: { provider: 'gemini', model: 'fictional-operation-model' } } }
+}, 'chat-query', 'primary');
+assert.deepStrictEqual(inherited, { provider: 'customopenai', model: 'fictional-shared-model', reasoningEffort: 'medium' }, 'disabled operation overrides inherit shared primary');
 
 // 10. Render the owned settings method with a no-network fake DOM. This
 // exercises the actual disclosures rather than only checking source labels.
@@ -179,9 +189,13 @@ const plugin = Object.assign(Object.create(Plugin.prototype), {
   app: { vault: { getAllLoadedFiles: () => [] } },
   semanticIndex: [],
   saveCount: 0,
+  refreshCount: 0,
+  testCount: 0,
   saveSettings: async function () { this.saveCount += 1; },
   getPromptTemplates: async () => [],
-  openwebuiLoginPassword: ''
+  openwebuiLoginPassword: '',
+  refreshOpenAIModels: async function () { this.refreshCount += 1; },
+  validateAiSetup: async function () { this.testCount += 1; }
 });
 plugin.sameProviderFallbackModels = Plugin.prototype.sameProviderFallbackModels.bind(plugin);
 plugin.displayName = 'test';
@@ -201,4 +215,22 @@ providerSelector.control.change('gemini');
 assert.strictEqual(plugin.saveCount, 0, 'provider-view selection performs no save/network action');
 assert.strictEqual(tab.providerViewProvider, 'gemini', 'provider-view selection remains in-memory only');
 
-console.log('provider-settings-local-test: PASS');
+const typedSetting = renderedSettings.find((setting) => setting.name === 'OpenRouter default model');
+assert.ok(typedSetting?.control?.change, 'provider model input is rendered');
+(async () => {
+  await typedSetting.control.change('fictional-typed-model');
+  assert.strictEqual(networkCount, 0, 'typing a provider model performs no network request');
+  assert.strictEqual(plugin.settings.openrouterDefaultModel, 'fictional-typed-model', 'typing a provider model only saves its setting');
+  const refreshSetting = renderedSettings.find((setting) => setting.name === 'Refresh Models');
+  const testSetting = renderedSettings.find((setting) => setting.name === 'Test Provider');
+  assert.ok(refreshSetting?.control?.click && testSetting?.control?.click, 'explicit Refresh/Test actions are rendered');
+  await refreshSetting.control.click();
+  await testSetting.control.click();
+  assert.strictEqual(plugin.refreshCount, 1, 'Refresh Models only runs when explicitly clicked');
+  assert.strictEqual(plugin.testCount, 1, 'Test Provider only runs when explicitly clicked');
+  assert.strictEqual(networkCount, 0, 'explicit action stubs remain the only transport entry points');
+  console.log('provider-settings-local-test: PASS');
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

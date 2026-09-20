@@ -5829,7 +5829,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       throw: false
     });
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`OpenAI embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
+      throw providerAdapterError("openai", `http-${response.status}`, response.text || "OpenAI embeddings request failed.", response.status, isRetryableProviderStatus(response.status));
     }
     return normalizeProviderEmbeddingRows(response.json?.data, normalized.length, dimensions, "openai");
   }
@@ -5842,7 +5842,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const body = this.geminiEmbeddingRequestBody(model, text, role);
       const response = await this.geminiEmbeddingRequest(model, body);
       if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Gemini embeddings returned ${response.status}: ${redactSecrets(response.text)}`);
+        throw providerAdapterError("gemini", `http-${response.status}`, response.text || "Gemini embeddings request failed.", response.status, isRetryableProviderStatus(response.status));
       }
       embeddings[index] = { index, values: response.json?.embedding?.values || [] };
     });
@@ -5887,7 +5887,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const response = await this.openAiCompatibleRequest(normalizedProvider, "/embeddings", body);
     if (response.status < 200 || response.status >= 300) {
       const detail = response.json?.error?.message || response.json?.error?.code || "provider embedding request rejected";
-      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(response.status)));
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
     }
     return normalizeProviderEmbeddingRows(response.json?.data, texts.length, dimension, normalizedProvider);
   }
@@ -8336,7 +8336,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         return response;
       } catch (error) {
         lastError = error;
-        if (!this.settings.enableAiModelFallback || index >= candidates.length - 1 || !isTransientAiModelError(error)) throw error;
+        if (!this.settings.enableAiModelFallback || index >= candidates.length - 1 || !isRetryableAiModelError(error)) throw error;
         this.logLocal("AI model fallback triggered", {
           from: modelDisplayName(candidateModel),
           to: modelDisplayName(candidates[index + 1]),
@@ -8401,7 +8401,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body);
     if (response.status < 200 || response.status >= 300) {
       const detail = response.json?.error?.message || response.json?.error?.code || "provider response rejected";
-      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(response.status)));
+      throw providerAdapterError(normalizedProvider, response.json?.error?.code || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
     }
     const text = providerAdapterText(response.json);
     if (!text) throw providerAdapterError(normalizedProvider, "invalid-response", "The provider returned no text.", response.status);
@@ -8429,7 +8429,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: options.signal || undefined,
       throw: false
-    });
+    }, options.timeoutMs || PROVIDER_REQUEST_TIMEOUT_MS);
   }
 
   async openWebUILogin() {
@@ -8497,8 +8497,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     if (response.status < 200 || response.status >= 300) {
       const diagnostic = openAiHttpResponseDiagnostic(response, "response create");
-      const error = new Error(`OpenAI returned ${response.status}: ${JSON.stringify(diagnostic)}`);
-      error.code = diagnostic.code;
+      const error = providerAdapterError("openai", diagnostic.code || `http-${response.status}`, diagnostic.message || JSON.stringify(diagnostic), response.status, isRetryableProviderStatus(response.status));
       error.providerDiagnostic = diagnostic;
       throw error;
     }
@@ -8569,11 +8568,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
     }
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Gemini returned ${response.status}: ${redactSecrets(response.text)}`);
+      throw providerAdapterError("gemini", `http-${response.status}`, response.text || "Gemini generation request failed.", response.status, isRetryableProviderStatus(response.status));
     }
     this.recordAiTokenUsage(operation, model, response.json?.usageMetadata || {});
     const text = extractGeminiText(response.json);
-    if (!text) throw new Error(`Gemini returned no text: ${redactSecrets(response.text)}`);
+    if (!text) throw providerAdapterError("gemini", "invalid-response", "The provider returned no text.", response.status);
     return jsonSchema ? extractJsonPayload(text) : text;
   }
 
@@ -8599,19 +8598,17 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (status === "completed") return current;
       if (["failed", "cancelled", "canceled", "incomplete"].includes(status)) {
         const diagnostic = openAiTerminalResponseDiagnostic(current);
-        const error = new Error(`OpenAI response ${status}: ${JSON.stringify(diagnostic)}`);
-        error.code = diagnostic.code || `response-${status}`;
+        const error = providerAdapterError("openai", diagnostic.code || `response-${status}`, diagnostic.message || `OpenAI response ${status}.`, 0, false);
         error.providerDiagnostic = diagnostic;
         throw error;
       }
-      if (!current.id) throw new Error(`OpenAI response did not return an id: ${JSON.stringify(current)}`);
-      if (Date.now() - startedAt > maxWaitMs) throw new Error("OpenAI response did not complete within 4 minutes.");
+      if (!current.id) throw providerAdapterError("openai", "response-id-missing", "OpenAI response did not return an id.");
+      if (Date.now() - startedAt > maxWaitMs) throw providerAdapterError("openai", "timeout", "OpenAI response did not complete within 4 minutes.", 0, true);
       await delay(2500);
       const poll = await this.openaiResponsesRequest("GET", `/responses/${encodeURIComponent(current.id)}`);
       if (poll.status < 200 || poll.status >= 300) {
         const diagnostic = openAiHttpResponseDiagnostic(poll, "response poll");
-        const error = new Error(`OpenAI poll returned ${poll.status}: ${JSON.stringify(diagnostic)}`);
-        error.code = diagnostic.code;
+        const error = providerAdapterError("openai", diagnostic.code || `http-${poll.status}`, diagnostic.message || `OpenAI poll returned ${poll.status}.`, poll.status, isRetryableProviderStatus(poll.status));
         error.providerDiagnostic = diagnostic;
         throw error;
       }
@@ -15001,6 +14998,10 @@ function providerAdapterError(provider, code, message, status = 0, retryable = f
   error.code = error.providerError.code;
   error.status = error.providerError.status;
   return error;
+}
+
+function isRetryableProviderStatus(status) {
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(status));
 }
 
 function redactProviderAdapterDetail(value) {
@@ -35413,8 +35414,12 @@ function modelDisplayName(value) {
 }
 function isTransientAiModelError(error) {
   const message = String(error?.message || error || "");
-  return /\b(404|429|500|502|503|504)\b/.test(message) ||
-    /overload|too much demand|temporarily unavailable|unavailable|not found|no longer available|rate limit|rate-limit|capacity|try again|deadline exceeded/i.test(message);
+  return /\b(408|409|425|429|500|502|503|504)\b/.test(message) ||
+    /overload|too much demand|temporarily unavailable|unavailable|rate limit|rate-limit|capacity|try again|deadline exceeded|timed out|timeout/i.test(message);
+}
+function isRetryableAiModelError(error) {
+  if (error?.providerError && typeof error.providerError.retryable === "boolean") return error.providerError.retryable;
+  return isTransientAiModelError(error);
 }
 function geminiEmbeddingInput(text, role = "document", model = "") {
   const value = String(text || "").trim();

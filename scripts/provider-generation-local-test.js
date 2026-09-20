@@ -5,6 +5,7 @@ const Module = require('module');
 const path = require('path');
 const calls = [];
 let scriptedResponses = [];
+let blockRequests = false;
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request !== 'obsidian') return originalLoad.call(this, request, parent, isMain);
@@ -15,6 +16,7 @@ Module._load = function (request, parent, isMain) {
     TFile: Empty, setIcon() {},
     requestUrl: async (options) => {
       calls.push(options);
+      if (blockRequests) return new Promise(() => {});
       if (scriptedResponses.length) return scriptedResponses.shift();
       const body = options.url.includes('/auths/signin')
         ? { token: 'FICTIONAL_LOGIN_TOKEN' }
@@ -36,7 +38,8 @@ const makePlugin = (settings) => {
   plugin.settings = Plugin.normalizeStableSettings(settings);
   plugin.setSidebarStatus = () => {};
   plugin.logLocal = () => {};
-  plugin.recordAiTokenUsage = () => {};
+  plugin.tokenUsage = [];
+  plugin.recordAiTokenUsage = (...args) => { plugin.tokenUsage.push(args); };
   plugin.saveSettings = async () => {};
   plugin.lastAiResponseModel = '';
   return plugin;
@@ -54,7 +57,10 @@ const makePlugin = (settings) => {
   assert.strictEqual(calls.length, 1, 'primary generation uses one request');
   assert.strictEqual(calls[0].url, 'https://openrouter.ai/api/v1/chat/completions');
   assert.strictEqual(calls[0].headers.authorization, 'Bearer FICTIONAL_OPENROUTER_KEY');
-  assert.strictEqual(JSON.parse(calls[0].body).model, 'openai/gpt-5.6-luna');
+  const openrouterBody = JSON.parse(calls[0].body);
+  assert.strictEqual(openrouterBody.model, 'openai/gpt-5.6-luna');
+  assert.strictEqual(openrouterBody.reasoning_effort, 'medium', 'supported reasoning is forwarded');
+  assert.strictEqual(openrouter.tokenUsage[0][2].total_tokens, 5, 'provider usage is normalized to the recorder');
 
   calls.length = 0;
   const openai = makePlugin({ aiModelProvider: 'openai', chatModel: 'gpt-5.6-luna', openaiApiKey: 'FICTIONAL_OPENAI_KEY' });
@@ -77,7 +83,15 @@ const makePlugin = (settings) => {
   assert.strictEqual(await custom.openaiResponse({ model: 'fictional-custom-model', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER', jsonSchema: { type: 'object', properties: {} } }), '{"ok":true}', 'structured compatible output is normalized to JSON');
   assert.strictEqual(calls[0].url, 'https://sentinel.invalid/v1/chat/completions');
   assert.ok(JSON.parse(calls[0].body).response_format, 'structured output stays in the provider request');
+  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(calls[0].body), 'reasoning_effort'), 'unsupported reasoning is omitted');
   scriptedResponses = [];
+
+  calls.length = 0;
+  const timeoutPlugin = makePlugin({ aiModelProvider: 'openrouter', openrouterApiKey: 'FICTIONAL_OPENROUTER_KEY' });
+  blockRequests = true;
+  await assert.rejects(() => timeoutPlugin.openAiCompatibleRequest('openrouter', '/models', undefined, { timeoutMs: 5 }), (error) => error.code === 'timeout');
+  blockRequests = false;
+  assert.strictEqual(calls[calls.length - 1].signal.aborted, true, 'provider timeout aborts the underlying request');
 
   calls.length = 0;
   const webui = makePlugin({
@@ -110,6 +124,20 @@ const makePlugin = (settings) => {
   scriptedResponses = [];
 
   calls.length = 0;
+  scriptedResponses = [
+    { status: 408, json: { error: { code: 'request-timeout', message: 'FICTIONAL transient timeout' } }, text: 'FICTIONAL transient timeout' },
+    { status: 200, json: { choices: [{ message: { content: 'FICTIONAL 408 FALLBACK_RESPONSE' } }] }, text: 'FICTIONAL 408 FALLBACK_RESPONSE' }
+  ];
+  assert.strictEqual(await fallback.openaiResponse({ model: 'fictional-primary', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' }), 'FICTIONAL 408 FALLBACK_RESPONSE');
+  assert.strictEqual(calls.length, 2, 'normalized retryable 408 permits one fallback');
+
+  calls.length = 0;
+  scriptedResponses = [{ status: 404, json: { error: { code: 'not-found', message: 'FICTIONAL missing model' } }, text: 'FICTIONAL missing model' }];
+  await assert.rejects(() => fallback.openaiResponse({ model: 'fictional-primary', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' }), /404/);
+  assert.strictEqual(calls.length, 1, 'normalized non-retryable 404 does not trigger a fallback');
+  scriptedResponses = [];
+
+  calls.length = 0;
   scriptedResponses = [{ status: 200, json: { data: [{ id: 'fictional-chat-model' }, { id: 'fictional-embedding-model' }] }, text: 'FICTIONAL_MODEL_CATALOG' }];
   const discovered = makePlugin({ aiModelProvider: 'openrouter', openrouterApiKey: 'FICTIONAL_OPENROUTER_KEY' });
   const catalog = await discovered.refreshOpenAIModels(false);
@@ -136,7 +164,9 @@ const makePlugin = (settings) => {
   scriptedResponses = [{ status: 401, json: { error: { message: 'FICTIONAL login rejected' } }, text: 'FICTIONAL login rejected' }];
   const failedLogin = makePlugin({ aiModelProvider: 'openwebui', chatModel: 'fictional-webui-model', openwebuiBaseUrl: 'https://sentinel.invalid/api', openwebuiAuthMode: 'login', openwebuiEmail: 'fictional@example.invalid' });
   failedLogin.openwebuiLoginPassword = 'FICTIONAL_LOGIN_PASSWORD';
-  await assert.rejects(() => failedLogin.openaiResponse({ model: 'fictional-webui-model', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' }), /401/);
+  await assert.rejects(() => failedLogin.openaiResponse({ model: 'fictional-webui-model', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' }), (error) => /401/.test(error.message)
+    && !error.message.includes('FICTIONAL_LOGIN_PASSWORD')
+    && !error.message.includes('https://sentinel.invalid'));
   assert.strictEqual(failedLogin.openwebuiLoginPassword, '', 'failed login also clears the password');
   scriptedResponses = [];
 

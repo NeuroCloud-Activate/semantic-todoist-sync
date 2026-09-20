@@ -10,6 +10,8 @@
  *   - Establishes a RED baseline against a corrupted/changed core (fails on the
  *     authoritative SHA-256 gates), then verifies a restored 0.7.19 core is
  *     byte-identical to the canonical published release and statically healthy.
+ *   - Statically characterizes the required stable public surface of the
+ *     bundle (no execution) so a tampered/mis-merged core is caught.
  *
  * Design constraints (per task):
  *   - Deterministic: no network, no external deps, no randomness/timing.
@@ -19,6 +21,16 @@
  *     compilation (vm.Script), which parses without running.
  *   - Run from the repo root:
  *         node scripts/stable-core-characterization-local-test.js
+ *     Optional (test only): pass a path to a main.js replacement as argv[2] to
+ *     exercise the surface gates against an arbitrary file, e.g. a stripped
+ *     copy, so absence of a marker is observed as RED before confirming the
+ *     real release passes as GREEN. The default path is always the repo
+ *     main.js; argv override does not change committed acceptance behavior.
+ *
+ * Commit note: this harness is intentionally force-added and committed
+ * (git add -f) even though a broad local *.ignore rule would normally exclude
+ * scripts/**. It is a required, tracked artifact of Task 1, not build output;
+ * keep it tracked.
  *
  * Exit code: 0 when ALL checks pass (known-good stable 0.7.19 core), 1 on any
  * failure. Output is plain-text PASS/FAIL per check (no TDD framework needed).
@@ -36,11 +48,39 @@ const TARGETS = {
   'styles.css': '8afc25ecac104c8b627a61034d663f38345f9d777e5c9b95b6e4649fd2b9c279',
 };
 
-// Stable-surface markers a genuine 0.7.19 Obsidian plugin bundle must contain.
-// (Used as a corruption/identity sanity gate, NOT the primary discriminator.)
+// Stable public surface markers a genuine 0.7.19 Obsidian plugin bundle must
+// contain. This is the required, statically-characterized stable surface:
+// presence of each is a hard gate (a marker absent -> RED). These are checked
+// statically via substring containment on the bundle text; the bundle is never
+// executed. Coverage mirrors the shipped settings labels, tab/view classes,
+// persisted state keys, tag constants, scheduler entry, prompt-templates hook,
+// save path, and a safety action.
 const STABLE_SURFACE_MARKERS = [
-  'obsidian', // runtime import specifier present in every plugin bundle
-  'semantic-todoist-sync', // plugin id embedded in the bundle
+  // settings-group labels
+  'Setup',
+  'AI & Search',
+  'Task Workflows',
+  'Daily Scheduler',
+  'Task Integrity',
+  'Activity',
+  // class/entrypoint identifiers
+  'SemanticTodoistSettingTab',
+  'SemanticTodoistView',
+  // persisted state / on-disk artifacts
+  'semantic-index.json',
+  'scheduler-memory.json',
+  // sync tag constants
+  '#STsync',
+  '#STSubSync',
+  // source-of-sync tag constants
+  'Notes-To-Todoist',
+  'Email-To-Todoist',
+  // scheduler UI action label
+  "Schedule Today's Tasks",
+  // hook/property + save path + safety action
+  'promptTemplatesFolder',
+  'saveSettings',
+  'Undo',
 ];
 
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -50,7 +90,7 @@ function sha256(buf) {
 }
 
 function readBuffer(rel) {
-  const abs = path.join(REPO_ROOT, rel);
+  const abs = path.isAbsolute(rel) ? path.resolve(rel) : path.join(REPO_ROOT, rel);
   const stat = fs.statSync(abs); // throws if missing -> surfaced as a failed check
   return { abs, buf: fs.readFileSync(abs), size: stat.size };
 }
@@ -101,8 +141,15 @@ function main() {
   }
 
   // main.js: static health / stable-surface characterization (no execution).
+  // The path defaults to the repo main.js; an optional argv[2] override lets a
+  // test point at an arbitrary file (e.g. a stripped copy) to observe RED when
+  // a marker is absent. The authoritative acceptance path is unchanged.
   try {
-    const { buf } = readBuffer('main.js');
+    // Resolve argv[2] to an absolute path; default stays inside the repo root.
+    const mainJsPath = process.argv[2]
+      ? path.resolve(process.argv[2])
+      : path.join(REPO_ROOT, 'main.js');
+    const { buf } = readBuffer(mainJsPath);
     push('syntax:main.js', mainSyntaxValid(buf), buf.length > 0 ? `compiled ${buf.length}B` : 'empty');
 
     const text = Buffer.from(buf, 'utf8').toString('utf8');
@@ -111,7 +158,7 @@ function main() {
     push(
       'surface:main.js',
       missing.length === 0,
-      present.length ? `markers=${present.join(',')}` : `missing=${missing.join(',')}`,
+      present.length ? `markers=${present.length}/${STABLE_SURFACE_MARKERS.length}` : `missing=${missing.join(',')}`,
     );
   } catch (_e) {
     // readBuffer failure already recorded under hash:main.js

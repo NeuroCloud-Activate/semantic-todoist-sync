@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.42
+
+### Task-reference and semantic-index integrity
+- Added authoritative active-and-completed Todoist task-reference inventory
+  reconciliation while preserving pending payloads and same-identity
+  multi-location records.
+- Added metadata-only integrity repair with fail-closed validation, bounded
+  automatic retry, and content-free repair telemetry.
+- Improved semantic-index readiness, repair coordination, and empty-account
+  reconciliation behavior.
+
+### Provider settings and model choice
+- Reorganized provider connection and operation controls into a dedicated AI
+  Models settings section without implicit network requests.
+- Added searchable model controls, custom connection labels, and clearer
+  provider endpoint guidance.
+
 ## 0.8.41
 
 ### Web research

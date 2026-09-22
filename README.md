@@ -27,14 +27,14 @@ The plugin supports Obsidian 1.5.0 and later on desktop, iPhone, and iPad.
 
 ## Providers and model choice
 
-The plugin supports OpenAI, Google Gemini, OpenRouter, self-hosted Open
-WebUI connected to Ollama, Custom OpenAI-compatible (`customopenai`), and
-OpenCode Go. OpenCode Go is generation-only; embeddings remain independently
-selected and provider-scoped. Each workflow has a searchable provider/model
-picker and can use an optional fallback. Embedding indexes remain partitioned
-by their selected provider and model, so incompatible data is not mixed.
+The plugin supports OpenAI, Google Gemini, OpenRouter, self-hosted Open WebUI
+connected to Ollama, and Custom OpenAI-compatible (`customopenai`). Embeddings
+remain independently selected and provider-scoped. Each workflow has a
+searchable provider/model picker and can use an optional fallback. Embedding
+indexes remain partitioned by their selected provider and model, so incompatible
+data is not mixed.
 
-The `AI provider settings` dropdown is presentation-only: it reveals one
+The `AI provider settings` dropdown in **AI Models** is presentation-only: it reveals one
 provider's connection controls at a time without changing routing, embeddings,
 credentials, or saved settings. Changing the provider-settings or model
 selection makes no network request. An explicit refresh, or committing a
@@ -49,10 +49,11 @@ user-configured OpenAI-compatible API root with standard `GET /models`,
 non-streaming `POST /chat/completions`, and `POST /embeddings` behavior
 beneath that root.
 
-Enter the complete versioned API root, such as
-`http://127.0.0.1:11434/v1` for direct Ollama. The plugin never appends
-`/v1` automatically; if discovery reports a missing route, verify the
-complete API root including `/v1` where required.
+Enter the complete API root, such as `https://provider.example/v1`. The plugin
+never appends `/v1` automatically; if discovery reports a missing route, verify
+the complete API root including `/v1` where required. For a trusted local
+endpoint that uses plain HTTP, explicitly enable the provider's insecure-HTTP
+option before saving the root.
 
 The Bearer API key is optional and masked. An empty key is valid for
 unauthenticated local endpoints; a non-empty key is sent only as
@@ -114,27 +115,27 @@ provider.
 - **Accounts:** The plugin does not create or require its own hosted account. A
   Todoist account and token are required for Todoist workflows. A provider
   account and API credential are required when you select OpenAI, Google
-  Gemini, OpenRouter, or OpenCode Go. A self-hosted Open WebUI, Ollama, or
-  Custom OpenAI-compatible endpoint may be configured without an account when
-  that endpoint permits it.
+  Gemini, or OpenRouter. A self-hosted Open WebUI, Ollama, or Custom
+  OpenAI-compatible endpoint may be configured without an account when that
+  endpoint permits it.
 - **Costs:** The plugin is free and does not accept payments or donations.
   Selected third-party AI providers may charge for their services according to
   their own plans. Self-hosted providers can be used instead.
 - **Network use:** Todoist task workflows connect to `api.todoist.com`. AI and
   embedding workflows connect only to the selected OpenAI, Google Gemini,
-  OpenRouter, OpenCode Go, Open WebUI/Ollama, or Custom OpenAI-compatible
-  service. Internet Search and Deep Research are opt-in and use the selected
-  provider's supported search or research service. Email processing connects
-  only to the optional worker URL configured by the user. These connections
-  send the request content needed to perform the selected workflow.
+  OpenRouter, Open WebUI/Ollama, or Custom OpenAI-compatible service. Internet
+  Search and Deep Research are opt-in and use the selected provider's
+  supported search or research service. Email processing connects only to the
+  optional worker URL configured by the user. These connections send the
+  request content needed to perform the selected workflow.
 - **Credentials:** Provider keys, Todoist tokens, endpoint credentials, and
   worker tokens are stored in the plugin's local Obsidian settings and sent
   only to their corresponding configured services.
 
 ## Quick setup
 
-1. Open `Settings > Semantic Todoist Sync`, choose routing/models under `AI
-   routing`, then use the `AI provider settings` dropdown to reveal one
+1. Open `Settings > Semantic Todoist Sync`, choose routing and models under
+   `AI Models`, then use the `AI provider settings` dropdown to reveal one
    provider's connection controls.
 2. Add that provider's credential or configure the displayed Open WebUI endpoint
    and sign-in details.
@@ -155,6 +156,12 @@ action markers are mandatory coverage anchors, but they are not an exclusive
 source filter: clearly actionable unmarked content in the selected whole note
 is also examined. Normal note capture has no note-wide task cap; an explicitly
 selected single-task mode is the intentional exception.
+
+Optional note auto-sync reports `Sync queued` only while a pending debounce is
+waiting and `Syncing` while a sync is active; it removes the status when no
+sync work remains. If a configured non-empty semantic index is degraded, task
+generation, task descriptions, and note/Todoist writes wait for a compatible
+index instead of silently claiming semantic enrichment.
 
 Schedule Today's Tasks always opens a preview first. Todoist changes occur only
 after you select `Apply`, and the last applied schedule can be undone.

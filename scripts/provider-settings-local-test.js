@@ -1,8 +1,8 @@
 'use strict';
 
-// Local (no-network) test for Task 4 — AI & Search disclosure contract.
+// Local (no-network) test for Task 3/4 — AI settings disclosure contract.
 // Verifies the parts of the contract that are deterministically testable from a
-// CommonJS import with an `obsidian` stub: six-group order, the no-OpenCode Go
+// CommonJS import with an `obsidian` stub: seven-group order, the no-OpenCode Go
 // invariant, the five provider connections and their stable order, the eight
 // operation keys and their resolution, and the explicit Refresh/Test actions.
 // DOM rendering (connection/operation disclosures, embeddings capability
@@ -88,6 +88,32 @@ global.fetch = async () => { throw new Error('network disabled'); };
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
 const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 const styles = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+const requestCounter = { get count() { return networkCount; } };
+
+// Task 1 RED contract: the title is optional presentation-only state. This is
+// intentionally before the existing Task 4 assertions so the unchanged build
+// fails at the missing title default/helper, without touching production code.
+assert.strictEqual(Plugin.DEFAULT_SETTINGS.customOpenAIConnectionTitle, '');
+assert.strictEqual(Plugin.customOpenAIConnectionDisplayName({}), 'Custom OpenAI-compatible');
+assert.strictEqual(
+  Plugin.customOpenAIConnectionDisplayName({ customOpenAIConnectionTitle: '  Local Gateway  ' }),
+  'Local Gateway'
+);
+const identityBeforeTitle = Plugin.providerIndexIdentity({
+  embeddingProvider: 'customopenai',
+  embeddingModel: 'fictional-embed',
+  customOpenAIBaseUrl: 'https://synthetic.invalid'
+}, 'customopenai', 'fictional-embed');
+const identityAfterTitle = Plugin.providerIndexIdentity({
+  embeddingProvider: 'customopenai',
+  embeddingModel: 'fictional-embed',
+  customOpenAIBaseUrl: 'https://synthetic.invalid',
+  customOpenAIConnectionTitle: 'Local Gateway'
+}, 'customopenai', 'fictional-embed');
+assert.deepStrictEqual(identityAfterTitle, identityBeforeTitle, 'title must not alter provider/model/dimension/endpoint identity');
+const legacyTitle = Plugin.normalizeStableSettings({ customOpenAIBaseUrl: 'https://synthetic.invalid', customOpenAIConnectionTitle: undefined });
+assert.strictEqual(legacyTitle.customOpenAIConnectionTitle, '', 'legacy settings receive the empty title default');
+assert.strictEqual(requestCounter.count, 0, 'title normalization makes no network request');
 
 function collect(element, predicate, result = []) {
   if (predicate(element)) result.push(element);
@@ -95,10 +121,34 @@ function collect(element, predicate, result = []) {
   return result;
 }
 
-// 1. Six groups, in the required order: Setup, AI & Search, Task Workflows,
-//    Daily Scheduler, Task Integrity, Activity.
-const GROUP_ORDER = 'const tabNames = ["Setup", "AI & Search", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"]';
-assert.ok(source.includes(GROUP_ORDER), 'six setting groups exist in the required order');
+// 1. Seven groups, in the required order: Setup, AI & Search, AI Models,
+//    Task Workflows, Daily Scheduler, Task Integrity, Activity.
+const GROUP_ORDER = 'const tabNames = ["Setup", "AI & Search", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"]';
+assert.ok(source.includes(GROUP_ORDER), 'seven setting groups exist in the required order');
+assert.ok(source.includes('renderAiModels(containerEl)'), 'AI Models renderer exists');
+
+function classMethodBody(name, nextName) {
+  const start = source.indexOf(`  ${name}(`);
+  const end = source.indexOf(`  ${nextName}(`, start + 1);
+  assert.ok(start >= 0 && end > start, `settings method boundary exists for ${name}`);
+  return source.slice(start, end);
+}
+
+const aiSearchSource = classMethodBody('renderAiSearch', 'renderAiModels');
+const aiModelsSource = classMethodBody('renderAiModels', 'renderTaskWorkflows');
+for (const movedRenderer of [
+  'renderSharedAiRoutingSettings',
+  'aiProviderSetting',
+  'renderProviderConnectionSettings',
+  'renderAdvancedOperationSettings',
+  'providerEmbeddingSettings'
+]) {
+  assert.strictEqual((aiModelsSource.match(new RegExp(movedRenderer, 'g')) || []).length, 1, `${movedRenderer} is owned by AI Models exactly once`);
+  assert.strictEqual((aiSearchSource.match(new RegExp(movedRenderer, 'g')) || []).length, 0, `${movedRenderer} is not duplicated in AI & Search`);
+}
+assert.ok(/webResearchSettings/.test(aiSearchSource), 'AI & Search retains Internet Search');
+assert.ok(/Sidebar and prompts/.test(aiSearchSource), 'AI & Search retains sidebar and prompt controls');
+assert.ok(/Semantic vault index/.test(aiSearchSource), 'AI & Search retains semantic-index maintenance');
 
 // 2. No OpenCode Go connection anywhere (Task 4 invariant).
 assert.ok(!/opencodego|opencode-go|OpenCode Go/i.test(source), 'no OpenCode Go text anywhere in main.js');
@@ -181,7 +231,7 @@ const inherited = Plugin.resolveOperationReference({
 }, 'chat-query', 'primary');
 assert.deepStrictEqual(inherited, { provider: 'customopenai', model: 'fictional-shared-model', reasoningEffort: 'medium' }, 'disabled operation overrides inherit shared primary');
 
-// 10. Render the owned settings method with a no-network fake DOM. This
+// 10. Render both owned settings methods with a no-network fake DOM. This
 // exercises the actual disclosures rather than only checking source labels.
 assert.strictEqual(typeof Plugin.SemanticTodoistSettingTab, 'function', 'settings tab is testable without Obsidian');
 const plugin = Object.assign(Object.create(Plugin.prototype), {
@@ -203,12 +253,22 @@ const tab = Object.create(Plugin.SemanticTodoistSettingTab.prototype);
 tab.plugin = plugin;
 tab.display = () => { tab.displayCount = (tab.displayCount || 0) + 1; };
 const root = new FakeElement('section');
-tab.renderAiSearch(root);
+tab.renderAiModels(root);
 const connectionDisclosures = collect(root, (element) => element.className.includes('semantic-todoist-provider-connection'));
 const operationDisclosures = collect(root, (element) => element.className.includes('semantic-todoist-operation-disclosure'));
 assert.strictEqual(connectionDisclosures.length, 1, 'exactly one provider connection disclosure renders');
 assert.strictEqual(operationDisclosures.length, 9, 'advanced routing renders one group plus eight operation disclosures');
 assert.strictEqual(plugin.saveCount, 0, 'rendering performs no implicit save or network action');
+const searchRoot = new FakeElement('section');
+const searchSettingsStart = renderedSettings.length;
+tab.renderAiSearch(searchRoot);
+assert.strictEqual(collect(searchRoot, (element) => element.className.includes('semantic-todoist-provider-connection')).length, 0, 'AI & Search does not duplicate provider connections');
+assert.strictEqual(collect(searchRoot, (element) => element.className.includes('semantic-todoist-operation-disclosure')).length, 0, 'AI & Search does not duplicate operation disclosures');
+assert.ok(collect(searchRoot, (element) => element.textContent === 'Internet Search').length >= 1, 'AI & Search renders search controls');
+assert.ok(collect(searchRoot, (element) => element.textContent === 'Sidebar and prompts').length >= 1, 'AI & Search renders sidebar/prompt controls');
+const searchSettings = renderedSettings.slice(searchSettingsStart);
+assert.ok(searchSettings.some((setting) => setting.name === 'Semantic vault index'), 'AI & Search renders semantic-index controls');
+assert.ok(!renderedSettings.slice(0, searchSettingsStart).some((setting) => setting.name === 'Semantic vault index'), 'AI Models does not duplicate semantic-index controls');
 const providerSelector = renderedSettings.find((setting) => setting.name === 'Provider connection to show');
 assert.ok(providerSelector?.control?.change, 'provider-view selector is rendered');
 providerSelector.control.change('gemini');
@@ -229,6 +289,21 @@ assert.ok(typedSetting?.control?.change, 'provider model input is rendered');
   assert.strictEqual(plugin.refreshCount, 1, 'Refresh Models only runs when explicitly clicked');
   assert.strictEqual(plugin.testCount, 1, 'Test Provider only runs when explicitly clicked');
   assert.strictEqual(networkCount, 0, 'explicit action stubs remain the only transport entry points');
+  tab.providerViewProvider = 'customopenai';
+  renderedSettings.length = 0;
+  const customRoot = new FakeElement('section');
+  tab.renderAiModels(customRoot);
+  const titleSetting = renderedSettings.find((setting) => setting.name === 'Custom connection title');
+  assert.ok(titleSetting?.control?.change, 'Custom connection title input is rendered only for the custom connection');
+  const saveCountBeforeTitle = plugin.saveCount;
+  await titleSetting.control.change('  Local Gateway  ');
+  assert.strictEqual(plugin.settings.customOpenAIConnectionTitle, '  Local Gateway  ', 'title input saves only its setting');
+  assert.strictEqual(plugin.saveCount, saveCountBeforeTitle + 1, 'title input performs one settings save');
+  assert.strictEqual(networkCount, 0, 'title input performs no provider/discovery request');
+  renderedSettings.length = 0;
+  const renamedRoot = new FakeElement('section');
+  tab.renderAiModels(renamedRoot);
+  assert.ok(collect(renamedRoot, (element) => element.textContent === 'Local Gateway connection').length === 1, 'trimmed title replaces the custom disclosure label');
   console.log('provider-settings-local-test: PASS');
 })().catch((error) => {
   console.error(error);

@@ -83,6 +83,69 @@
   max-width: 100%;
 }
 
+.semantic-todoist-model-combobox-setting .setting-item-control {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.semantic-todoist-model-combobox-input {
+  width: 100%;
+  min-height: 36px;
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-model-combobox-results {
+  position: absolute;
+  z-index: 1000;
+  left: 0;
+  right: 0;
+  top: 100%;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  padding: 4px;
+}
+
+.semantic-todoist-model-combobox-group {
+  padding: 6px 8px 2px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.semantic-todoist-model-combobox-option {
+  min-height: 36px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  cursor: pointer;
+}
+
+.semantic-todoist-model-combobox-option[aria-selected="true"] {
+  background-color: var(--background-modifier-hover);
+}
+
+.semantic-todoist-model-combobox-empty {
+  padding: 8px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+@media (pointer: coarse) {
+  .semantic-todoist-model-combobox-input {
+    min-height: 44px;
+  }
+
+  .semantic-todoist-model-combobox-option {
+    min-height: 44px;
+  }
+}
+
 .semantic-todoist-setting .setting-item-name {
   font-size: var(--font-ui-small);
   color: var(--text-muted);

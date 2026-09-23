@@ -1353,7 +1353,7 @@ function productionSemanticRoutingArtifactCompatibility(artifact = {}, chunks = 
   if (options.model && modelIdentity(artifact.model || "") !== modelIdentity(options.model)) reasonCodes.push("artifact-model-mismatch");
   if (options.dimension && Number(artifact.dimension) !== Number(options.dimension)) reasonCodes.push("artifact-dimension-mismatch");
   if (options.contentVersion && Number(artifact.contentVersion) !== Number(options.contentVersion)) reasonCodes.push("artifact-content-version-mismatch");
-  if (Object.prototype.hasOwnProperty.call(options, "revision") && Number(artifact.indexRevision) !== Number(options.revision)) reasonCodes.push("artifact-index-revision-mismatch");
+  // indexRevision is transient (incremented on cache invalidation) and must not gate persisted artifact compatibility.
   if (Object.prototype.hasOwnProperty.call(options, "storageFingerprint") && String(artifact.storageFingerprint || "") !== String(options.storageFingerprint || "")) reasonCodes.push("artifact-storage-fingerprint-mismatch");
   if (Number(artifact.count) !== sourceChunks.length) reasonCodes.push("artifact-count-mismatch");
   if (!artifactShardRefs.length && sourceChunks.length) reasonCodes.push("artifact-shard-layout-missing");
@@ -2156,6 +2156,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceIndexRevision = -1;
     this.taskReferenceSnapshotFingerprint = "";
     this.taskReferenceSnapshotDirty = true;
+    this.taskReferenceSnapshotReady = false;
     this.taskReferenceIntegrity = null;
     this.taskReferenceRepairTimer = null;
     this.taskReferenceRepairInProgress = false;
@@ -2178,6 +2179,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.schedulerMemorySaveTimer = null;
     this.aiActivity = "";
     this.pendingIndexPaths = new Set();
+    this.semanticIndexIncrementalFailure = "";
     this.semanticIndexOperationPromise = Promise.resolve();
     this.semanticIndexOperationActive = false;
     this.semanticIndexOperationOwner = "";
@@ -2230,7 +2232,6 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (oldPath && oldPath !== file.path) Promise.resolve().then(() => this.removePathFromSemanticIndex(oldPath)).catch((error) => this.logLocal("Semantic index move cleanup deferred", { path: oldPath, error: error.message || String(error) }));
       this.queueSemanticIndexUpdate(file.path, "move");
     }));
-    await this.migrateSettings();
     let startupPhaseConcurrent = 0;
     let startupPhaseMaxConcurrent = 0;
     const runStartupPhase = async (name, fn) => {
@@ -2254,6 +2255,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
     await runStartupPhase("schedulerMemory", () => this.loadSchedulerMemory());
     await runStartupPhase("taskReferenceSnapshot", () => this.loadTaskReferenceSnapshot());
+    await this.migrateSettings();
     await runStartupPhase("semanticIndexPathMetaSnapshot", () => this.loadSemanticIndexPathMetaSnapshot());
     if (this.taskReferenceIndexRevision !== this.taskReferenceStateRevision) this.refreshTaskReferenceIndex();
     const bufferedStartupEvents = Array.from(this.semanticIndexStartupEventBuffer.values());
@@ -2312,6 +2314,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.noteSyncTimer = null;
     this.noteSyncPath = "";
     this.noteSyncToken = null;
+    this.noteSyncGeneration = (Number(this.noteSyncGeneration) || 0) + 1;
     await this.flushQueuedSettingsSave().catch((error) => console.error("Queued settings flush failed", error));
     window.clearTimeout(this.semanticIndexLoadTimer);
     this.semanticIndexLoadTimer = null;
@@ -2533,7 +2536,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const pointer = await readJsonFile(TASK_REFERENCE_MANIFEST_FILE);
     let parsedIndex = null;
     let snapshot = null;
-    if (pointer && Number(pointer.version || 0) === TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION && pointer.generation && pointer.fingerprint) {
+    let taskReferenceManifestExists = false;
+    let taskReferenceManifestAbsenceProven = false;
+    try {
+      if (this.app?.vault?.adapter && typeof this.app.vault.adapter.exists === "function") {
+        const taskReferenceManifestExistsResult = await this.app.vault.adapter.exists(`${this.manifest.dir}/${TASK_REFERENCE_MANIFEST_FILE}`);
+        if (taskReferenceManifestExistsResult === true) taskReferenceManifestExists = true;
+        else if (taskReferenceManifestExistsResult === false) taskReferenceManifestAbsenceProven = true;
+      }
+    } catch {
+      taskReferenceManifestExists = false;
+      taskReferenceManifestAbsenceProven = false;
+    }
+    const taskReferencePointerValid = pointer && Number(pointer.version || 0) === TASK_REFERENCE_PERSISTENCE_SCHEMA_VERSION && pointer.generation && pointer.fingerprint;
+    if (taskReferenceManifestExists && !taskReferencePointerValid) {
+      this.lastTaskReferencePersistenceError = { phase: "load", message: "Task-reference manifest is invalid." };
+      this.taskReferenceSnapshotFingerprint = "";
+      this.taskReferenceSnapshotDirty = true;
+      return false;
+    }
+    if (!taskReferencePointerValid && !taskReferenceManifestAbsenceProven) {
+      this.lastTaskReferencePersistenceError = { phase: "load", message: "Task-reference manifest state is unknown." };
+      this.taskReferenceSnapshotFingerprint = "";
+      this.taskReferenceSnapshotDirty = true;
+      return false;
+    }
+    if (taskReferencePointerValid) {
       try {
         const generation = normalizedPluginBasename(pointer.generation, "task-reference generation");
         const snapshotFile = taskReferenceGenerationFile("task-reference-snapshot", generation);
@@ -2584,6 +2612,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       this.taskReferenceSnapshotFingerprint = snapshot.meta?.fingerprint || compactIndex?.fingerprint || taskReferencePayloadFingerprint(this.settings);
       this.taskReferenceSnapshotDirty = false;
+      this.taskReferenceSnapshotReady = true;
       return;
     }
     if (persistedIndex) {
@@ -2592,6 +2621,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     this.taskReferenceSnapshotFingerprint = taskReferencePayloadFingerprint(this.settings);
     this.taskReferenceSnapshotDirty = Object.keys(this.settings.taskCache || {}).length > 0 || Object.keys(this.settings.pendingTaskReferences || {}).length > 0;
+    this.taskReferenceSnapshotReady = true;
   }
 
   refreshTaskReferenceIndex() {
@@ -2933,6 +2963,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async flushTaskReferenceSnapshotIfDirty() {
+    if (!this.taskReferenceSnapshotReady) return false;
     if (!this.taskReferenceSnapshotDirty && this.taskReferenceIndexRevision === this.taskReferenceStateRevision && this.taskReferenceSnapshotFingerprint) return false;
     this.refreshTaskReferenceIndex();
     const fingerprint = this.taskReferenceIndex.fingerprint || taskReferencePayloadFingerprint(this.settings);
@@ -3101,6 +3132,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // normalization applies the current default and hides absent/legacy state.
     const savedProviderApiRootContractVersion = this.settings ? this.settings.providerApiRootContractVersion : undefined;
     const needsProviderApiRootMigration = savedProviderApiRootContractVersion !== PROVIDER_API_ROOT_CONTRACT_VERSION;
+    const taskReferencePayloadBeforeMigration = taskReferencePayloadFingerprint(this.settings);
+    const taskReferenceSnapshotDirtyBeforeMigration = this.taskReferenceSnapshotDirty;
     const stableBeforeMigration = normalizeStableSettings(this.settings);
     Object.assign(this.settings, stableBeforeMigration);
     let changed = false;
@@ -3239,7 +3272,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if ((preferredProvider === "gemini" && !usesGeminiChatModel(this.settings.chatModel)) || (preferredProvider === "openai" && !usesOpenAIChatModel(this.settings.chatModel))) {
       this.settings.chatModel = preferredChatModelForProvider(this.settings, preferredProvider);
       this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, preferredProvider, this.settings.chatModel);
-      this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, preferredProvider);
+      // Embedding identity is explicit and independent of the generation model
+      // (requirements.md): never rewrite it during chat-provider correction.
       changed = true;
     }
     const fallbackProviderMatches = (preferredProvider === "gemini" && usesGeminiChatModel(this.settings.chatFallbackModel)) || (preferredProvider === "openai" && usesOpenAIChatModel(this.settings.chatFallbackModel));
@@ -3251,14 +3285,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.taskDeduplicationAiModel = "";
       changed = true;
     }
-    if (usesGeminiChatModel(this.settings.chatModel) && !usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
-      this.settings.embeddingModel = "gemini/gemini-embedding-2";
-      changed = true;
-    }
-    if (usesOpenAIChatModel(this.settings.chatModel) && !usesOpenAIEmbeddingModel(this.settings.embeddingModel)) {
-      this.settings.embeddingModel = DEFAULT_SETTINGS.embeddingModel;
-      changed = true;
-    }
+    // Legacy chat-model-driven embedding inference removed: embedding identity is
+    // explicit (embeddingModelReference, normalized at the start of migration) and
+    // model inference is a legacy fallback only. A generation-model change must never
+    // rewrite the configured embedding model or unload a compatible index.
     if (this.settings.syncTag === "#tdsync" || this.settings.syncTag === "tdsync") {
       this.settings.syncTag = "#STsync";
       changed = true;
@@ -3415,7 +3445,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const stableAfterMigration = normalizeStableSettings(this.settings);
     if (JSON.stringify(stableAfterMigration) !== JSON.stringify(this.settings)) changed = true;
     Object.assign(this.settings, stableAfterMigration);
-    if (changed || this.taskReferenceSnapshotDirty) this.markTaskReferenceStateDirty();
+    const taskReferencePayloadAfterMigration = taskReferencePayloadFingerprint(this.settings);
+    if (taskReferencePayloadAfterMigration !== taskReferencePayloadBeforeMigration || taskReferenceSnapshotDirtyBeforeMigration) this.markTaskReferenceStateDirty();
     if (changed) await this.saveSettings();
   }
 
@@ -3682,7 +3713,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       } catch (error) {
         if (error?.code === "semantic-index-read-failed") throw error;
         rememberCompatibilityRefresh(error);
-        if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
+        // Legacy semantic-index.json fallback is OpenAI-only: legacy model inference
+        // (usesOpenAIEmbeddingModel) is true for custom OpenAI-compatible models, so gate
+        // on the explicit embedding provider and never load an OpenAI legacy file for a
+        // customopenai identity.
+        const legacyIndexExplicitProvider = stableSupportedProvider(this.settings.embeddingModelReference?.provider || this.settings.embeddingProvider, aiProviderForModel(this.settings.embeddingModel));
+        if (legacyIndexExplicitProvider === "openai" && usesOpenAIEmbeddingModel(this.settings.embeddingModel) && indexFile !== SEMANTIC_INDEX_FILE) {
           try {
             const loaded = await this.readSemanticIndexFile(SEMANTIC_INDEX_FILE);
             await applyLoaded(loaded, SEMANTIC_INDEX_FILE, { legacy: true });
@@ -3693,7 +3729,22 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             rememberCompatibilityRefresh(legacyError);
           }
         }
-        if (!compatibilityRefreshCandidate && !this.semanticIndex.length && Array.isArray(this.settings.semanticIndex) && this.settings.semanticIndex.length) {
+        // Legacy settings-array fallback: migrate only when the stored vectors are
+        // compatible with the explicit identity. Stored payloads predate per-chunk
+        // provider metadata and are OpenAI-era, so without trustworthy chunk metadata
+        // they migrate under explicit openai only — never under a custom identity.
+        // Skipped payloads are left stored (not deleted) and simply not migrated.
+        const legacyStoredChunks = Array.isArray(this.settings.semanticIndex) ? this.settings.semanticIndex : [];
+        const legacyExplicitProvider = stableSupportedProvider(this.settings.embeddingModelReference?.provider || this.settings.embeddingProvider, aiProviderForModel(this.settings.embeddingModel));
+        const legacyChunkConflicts = (chunk) => {
+          const chunkProvider = chunk?.embeddingProvider || chunk?.indexMetadata?.provider;
+          if (chunkProvider && stableSupportedProvider(chunkProvider, legacyExplicitProvider) !== legacyExplicitProvider) return true;
+          const chunkModel = chunk?.embeddingModel || chunk?.indexMetadata?.model;
+          if (chunkModel && normalizeOpenAIModelId(chunkModel).toLowerCase() !== normalizeOpenAIModelId(this.settings.embeddingModel).toLowerCase()) return true;
+          return false;
+        };
+        const legacyFallbackCompatible = legacyExplicitProvider === "openai" && legacyStoredChunks.length > 0 && !legacyStoredChunks.some(legacyChunkConflicts);
+        if (!compatibilityRefreshCandidate && !(this.semanticIndex || []).length && legacyFallbackCompatible) {
           this.semanticIndex = normalizeSemanticIndexPaths(this.settings.semanticIndex, this.app, this.semanticIndexRevision);
           this.invalidateSemanticRetrievalCache();
           delete this.settings.semanticIndex;
@@ -4862,27 +4913,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async ensureCompatibleEmbeddingForChatModel(options = {}) {
-    const loadIndex = options.loadIndex !== false;
-    const before = this.settings.embeddingModel;
-    if (usesGeminiChatModel(this.settings.chatModel) && !usesGeminiEmbeddingModel(this.settings.embeddingModel)) {
-      this.settings.embeddingModel = "gemini/gemini-embedding-2";
-    }
-    if (usesOpenAIChatModel(this.settings.chatModel) && !usesOpenAIEmbeddingModel(this.settings.embeddingModel)) {
-      const openaiModels = this.settings.availableEmbeddingModels || [];
-      this.settings.embeddingModel = openaiModels.includes("text-embedding-3-large") ? "text-embedding-3-large" : DEFAULT_SETTINGS.embeddingModel;
-    }
-    if (this.settings.embeddingModel !== before) {
-      this.queryEmbeddingCache?.clear?.();
-      this.semanticIndexLoaded = false;
-      this.semanticIndex = [];
-      this.invalidateSemanticRetrievalCache();
-      this.semanticIndexPathMeta?.clear?.();
-      this.semanticIndexPathMetaSnapshotFingerprint = "";
-      if (loadIndex) await this.loadSemanticIndex();
-      else this.queueSemanticIndexLoad();
-      await this.saveSettings();
-      return loadIndex;
-    }
+    // Embedding identity is explicit and independent of the generation model
+    // (requirements.md lines 79-87): changing the chat model or provider must never
+    // overwrite the configured embedding provider/model/dimension or unload a
+    // compatible index. Explicit embedding changes go through setEmbeddingModel and
+    // the provider-scoped embedding settings controls. Kept as a no-op so existing
+    // callers observe "no embedding change, index stays".
+    void options;
     return false;
   }
 
@@ -4896,22 +4933,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async setAiModelProvider(value) {
     const provider = normalizeAiProvider(value, this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel));
-    const beforeEmbedding = this.settings.embeddingModel;
+    // Embedding identity is explicit and independent of the generation provider:
+    // a generation-provider change must not rewrite it or unload the index.
     this.settings.aiModelProvider = provider;
     this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
     this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
-    this.settings.embeddingModel = preferredEmbeddingModelForProvider(this.settings, provider);
     if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== provider) {
       this.settings.taskDeduplicationAiModel = "";
-    }
-    if (this.settings.embeddingModel !== beforeEmbedding) {
-      this.queryEmbeddingCache?.clear?.();
-      this.semanticIndexLoaded = false;
-      this.semanticIndex = [];
-      this.invalidateSemanticRetrievalCache();
-      this.semanticIndexPathMeta?.clear?.();
-      this.semanticIndexPathMetaSnapshotFingerprint = "";
-      await this.loadSemanticIndex();
     }
     await this.saveSettings();
   }
@@ -4924,16 +4952,75 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
   }
 
-  async setEmbeddingModel(value) {
-    this.settings.embeddingModel = value;
-    if (supportsOpenAiEmbeddingDimensions(value)) {
-      this.settings.openAiEmbeddingDimensions = normalizeOpenAiEmbeddingDimensions(this.settings.openAiEmbeddingDimensions, value);
+  // Canonical explicit embedding-identity change path: keeps the reference triple
+  // in sync, clears stale embedding caches, and loads the compatible index for the
+  // new identity from disk (no network indexing).
+  async setEmbeddingReference(provider, model) {
+    // Await any in-flight load first: it was started under the previous identity
+    // and must not race the reset and reload below. The load records its own
+    // failure state, so a rejection here is swallowed after the wait.
+    if (this.semanticIndexLoadPromise) {
+      try { await this.semanticIndexLoadPromise; } catch { /* load records its own failure state */ }
     }
+    const currentEmbeddingReference = normalizeStableSettings(this.settings).embeddingModelReference;
+    const nextEmbeddingReference = stableReference({
+      provider: stableSupportedProvider(provider, currentEmbeddingReference.provider),
+      model: String(model || "").trim() || currentEmbeddingReference.model
+    }, currentEmbeddingReference);
+    this.settings.embeddingModelReference = nextEmbeddingReference;
+    this.settings.embeddingProvider = nextEmbeddingReference.provider;
+    this.settings.embeddingModel = nextEmbeddingReference.model;
+    if (supportsOpenAiEmbeddingDimensions(this.settings.embeddingModel)) {
+      this.settings.openAiEmbeddingDimensions = normalizeOpenAiEmbeddingDimensions(this.settings.openAiEmbeddingDimensions, this.settings.embeddingModel);
+    }
+    // Drop stale in-memory index state before loading: loadSemanticIndexInternal
+    // snapshots entry state as its restore point, so old chunks left in memory would
+    // be restored as usable under the new identity when no target index file exists
+    // yet. Disk files are preserved; only memory, meta, and caches reset to an empty
+    // non-ready state. No index write, rebuild, or network request happens here.
+    const nextIndexFile = this.semanticIndexFileName();
+    this.semanticIndex = [];
+    this.semanticIndexLoaded = false;
+    this.semanticIndexStats = { bytes: 0, path: nextIndexFile };
+    this.semanticIndexKnownShardFiles = [];
+    this.semanticIndexStorageFingerprint = "";
+    this.semanticIndexPathMeta?.clear?.();
+    this.semanticIndexPathMetaSnapshotFingerprint = "";
+    this.semanticChunkTermCache?.clear?.();
+    this.settings.semanticIndexMeta = {
+      model: this.settings.embeddingModel,
+      provider: semanticEmbeddingProvider(this.settings),
+      dimension: semanticEmbeddingTargetDimension(this.settings),
+      targetDimension: semanticEmbeddingTargetDimension(this.settings),
+      embeddingMigrationRequired: false,
+      file: nextIndexFile,
+      chunks: 0
+    };
     this.queryEmbeddingCache?.clear?.();
     this.taskDeduplicationEmbeddingCache?.clear?.();
     this.invalidateSemanticRetrievalCache();
-    await this.loadSemanticIndex();
+    const embeddingReloadResult = await this.loadSemanticIndex();
+    // The loader's finally block can mark a failed load complete. Keep the new
+    // identity non-ready until a compatible index is actually available.
+    if (embeddingReloadResult?.ok === false) {
+      this.semanticIndexLoaded = false;
+    }
     await this.saveSettings();
+  }
+
+  async setEmbeddingModel(value) {
+    const rawEmbeddingModel = String(value || "").trim();
+    const currentEmbeddingReference = normalizeStableSettings(this.settings).embeddingModelReference;
+    let nextEmbeddingProvider = currentEmbeddingReference.provider;
+    let nextEmbeddingModel = rawEmbeddingModel || currentEmbeddingReference.model;
+    const prefixedEmbedding = rawEmbeddingModel.match(/^(gemini|openai|openrouter|openwebui|customopenai)\s*[/:]\s*(.+)$/i);
+    if (prefixedEmbedding) {
+      nextEmbeddingProvider = stableSupportedProvider(prefixedEmbedding[1].toLowerCase(), currentEmbeddingReference.provider);
+      nextEmbeddingModel = prefixedEmbedding[2].trim() || currentEmbeddingReference.model;
+    } else if (/^gemini-embedding/i.test(rawEmbeddingModel)) {
+      nextEmbeddingProvider = "gemini";
+    }
+    return this.setEmbeddingReference(nextEmbeddingProvider, nextEmbeddingModel);
   }
 
   async setOpenAiEmbeddingDimensions(value) {
@@ -5176,11 +5263,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }).open();
   }
 
-  queueNoteSync(path) {
+  queueNoteSync(path, busyRetries = 0) {
     if (!this.isSyncableTaskPath(path)) return;
     window.clearTimeout(this.noteSyncTimer);
     this.noteSyncGeneration = (Number(this.noteSyncGeneration) || 0) + 1;
-    const token = { handle: null, generation: this.noteSyncGeneration, path };
+    const token = { handle: null, generation: this.noteSyncGeneration, path, busyRetries: Number(busyRetries) || 0 };
     token.handle = window.setTimeout(() => {
       if (this.isUnloading) return;
       if (this.noteSyncToken !== token) return;
@@ -5188,7 +5275,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.noteSyncTimer = null;
       this.noteSyncPath = "";
       if (this.fileSyncInProgress?.has(path)) {
-        this.queueNoteSync(path);
+        if ((token.busyRetries || 0) >= 3) {
+          this.logLocal("Note sync busy, giving up requeue", { path });
+          this.refreshSidebarStatus();
+          return;
+        }
+        this.queueNoteSync(path, (token.busyRetries || 0) + 1);
         return;
       }
       const pending = this.syncFileNotes(path, false);
@@ -5268,6 +5360,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!this.settings.autoUpdateSemanticIndex || !this.isIndexablePath(normalizedPath)) return semanticOperationResult({ ok: true, reasonCode: "path-excluded" });
     if (!aiAccessConfigured(this.settings)) return semanticOperationResult({ ok: false, reasonCode: "embedding-access-unavailable" });
     if (!this.shouldQueueSemanticIndexUpdate(normalizedPath, reason)) return semanticOperationResult({ ok: true, reasonCode: "unchanged-or-startup-suppressed" });
+    this.semanticIndexIncrementalFailure = "";
     this.pendingIndexPaths.add(normalizedPath);
     window.clearTimeout(this.semanticIndexTimer);
     this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(5, this.settings.semanticIndexDelaySeconds) * 1000);
@@ -5566,6 +5659,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return this.withSemanticIndexOperation("incremental-flush", async () => {
       if (!this.pendingIndexPaths.size) {
         this.semanticIndexTimer = null;
+        this.semanticIndexIncrementalFailure = "";
         this.refreshSidebarStatus();
         return semanticOperationResult({ ok: true, reasonCode: "nothing-pending" });
       }
@@ -5589,9 +5683,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.pendingIndexPaths.clear();
         return semanticOperationResult({ ok: true, changed: true, reasonCode: "rebuilt-materiality-anchors" });
       }
-      const paths = Array.from(this.pendingIndexPaths);
-      this.pendingIndexPaths.clear();
-      this.semanticIndexTimer = null;
+        const paths = Array.from(this.pendingIndexPaths);
+        this.pendingIndexPaths.clear();
+        this.semanticIndexTimer = null;
+        this.semanticIndexIncrementalFailure = "";
       const previousIndex = this.semanticIndex;
       const previousMeta = Object.assign({}, this.settings.semanticIndexMeta || {});
       const previousIntegrity = this.taskReferenceIntegrity;
@@ -5643,12 +5738,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         this.settings.semanticIndexMeta = previousMeta;
         this.taskReferenceIntegrity = previousIntegrity;
         for (const path of paths) this.pendingIndexPaths.add(path);
-        window.clearTimeout(this.semanticIndexTimer);
-        this.semanticIndexTimer = window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
         result.ok = false;
         result.reasonCode = String(error?.message || "semantic-index-update-failed").split("\n")[0].slice(0, 120);
+        const deterministicIntegrityFailure = result.reasonCode === "incremental-integrity";
+        window.clearTimeout(this.semanticIndexTimer);
+        this.semanticIndexTimer = deterministicIntegrityFailure ? null : window.setTimeout(() => this.flushSemanticIndexUpdates(), Math.max(1000, Number(this.settings.semanticIndexDelaySeconds || 1) * 1000));
+        this.semanticIndexIncrementalFailure = deterministicIntegrityFailure ? result.reasonCode : "";
         result.repairQueued = Boolean(this.scheduleSemanticTaskReferenceRepair?.("incremental-integrity"));
-        this.logLocal("Semantic index update failed", { error: error.message || String(error), queued: paths.length });
+        this.logLocal("Semantic index update failed", deterministicIntegrityFailure
+          ? { code: result.reasonCode, queued: paths.length, repairQueued: result.repairQueued }
+          : { error: error.message || String(error), queued: paths.length });
         return result;
       } finally {
         this.semanticIndexInProgress = false;
@@ -5700,6 +5799,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           { settings: this.settings, isIndexablePath: (candidatePath) => this.isIndexablePath(candidatePath), requireChunks: true }
         );
         if (!candidateIntegrity.ok) {
+          this.logLocal("Semantic index candidate integrity failed", {
+            reasonCodes: candidateIntegrity.reasonCodes,
+            duplicateIdentityCount: candidateIntegrity.graph?.duplicateIdentityCount || 0,
+            missingSnapshotRows: candidateIntegrity.telemetry?.missingSnapshotRows || 0,
+            missingSnapshotChunks: candidateIntegrity.telemetry?.missingSnapshotChunks || 0,
+            privacyLeakCount: candidateIntegrity.privacy?.leakCount || 0
+          });
           this.taskReferenceIntegrity = candidateIntegrity;
           this.pendingIndexPaths?.add?.(path);
           const repairQueued = Boolean(this.scheduleSemanticTaskReferenceRepair("incremental-integrity"));
@@ -6324,7 +6430,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async embedTexts(texts, role = "document") {
     const normalized = texts.map((text) => clamp(String(text || ""), 8000));
-    const provider = stableSupportedProvider(this.settings.embeddingProvider, usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai");
+    // Canonical explicit identity (reference provider with legacy-model fallback),
+    // matching the provider/model/dimension the index filename and metadata use.
+    const provider = semanticEmbeddingProvider(this.settings);
     if (provider === "gemini") {
       return this.geminiEmbedTexts(normalized, role);
     }
@@ -9380,9 +9488,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.modelsFetchedAt = deviceTimestamp();
       loadedOpenAI = chat.length + embeddings.length;
       if (usesOpenAIChatModel(this.settings.chatModel) && !chat.includes(normalizeOpenAIModelId(this.settings.chatModel)) && chat.length) this.settings.chatModel = preferredChatModelForProvider(this.settings, "openai");
-      if (usesOpenAIEmbeddingModel(this.settings.embeddingModel) && !embeddings.includes(normalizeOpenAIModelId(this.settings.embeddingModel))) {
-        this.settings.embeddingModel = embeddings.includes("text-embedding-3-large") ? "text-embedding-3-large" : embeddings[0] || this.settings.embeddingModel;
-      }
+      // Model-list refresh never rewrites explicit embedding identity: the configured
+      // provider/model/dimension persist even when the model is absent from the refreshed
+      // OpenAI catalog (migration already guarantees a valid explicit default). If the
+      // model is genuinely gone, embedding calls fail visibly and the user picks a
+      // replacement explicitly via setEmbeddingModel, which keeps the reference triple
+      // in sync. A string-only fallback here would be reverted by stable normalization
+      // (embeddingModelReference wins) and would only create split-brain state.
     }
     if (this.settings.googleApiKey) {
       const geminiModels = await this.fetchGeminiModels();
@@ -11357,6 +11469,48 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (showNotice) new Notice("AI provider connected and model list refreshed.");
   }
 
+  async validateEmbeddingProvider(showNotice = true) {
+    if (this.embeddingValidationRunning) {
+      if (showNotice) new Notice("Embedding validation is already running.");
+      return { ok: false, busy: true };
+    }
+    const provider = stableSupportedProvider(this.settings.embeddingProvider, usesGeminiEmbeddingModel(this.settings.embeddingModel) ? "gemini" : "openai");
+    const model = String(this.settings.embeddingModel || "").trim();
+    const label = stableProviderLabel(provider);
+    const where = model ? `${label} / ${model}` : label;
+    this.embeddingValidationRunning = true;
+    try {
+      const vectors = await this.embedTexts(["Semantic Todoist Sync embedding check."], "document");
+      const dimension = Array.isArray(vectors) && Array.isArray(vectors[0]) ? vectors[0].length : 0;
+      if (!Number.isInteger(dimension) || dimension <= 0) throw providerAdapterError(provider, "embedding-vector-invalid", "The provider returned an invalid embedding vector.");
+      const configured = Number(this.settings.embeddingDimension || 0);
+      if (Number.isInteger(configured) && configured > 0 && configured !== dimension) {
+        if (showNotice) new Notice(`Embedding dimension mismatch: saved ${configured}d but provider returned ${dimension}d.`);
+        return { ok: false, provider, model, dimension, configuredDimension: configured, code: "embedding-dimension-mismatch" };
+      }
+      if (showNotice) new Notice(`Embedding OK: ${where} (${dimension}d).`);
+      return { ok: true, provider, model, dimension };
+    } catch (error) {
+      const status = Number(error?.status ?? error?.providerError?.status ?? 0);
+      const rawCode = String(error?.code || error?.providerError?.code || "embedding-validation-failed");
+      const code = /^[a-z0-9][a-z0-9-]{0,79}$/i.test(rawCode) ? rawCode.slice(0, 80) : "embedding-validation-failed";
+      const attachedDimension = error && typeof error.embeddingDimension === "object" ? error.embeddingDimension : null;
+      const attachedExpected = Number(attachedDimension?.expected);
+      const attachedActual = Number(attachedDimension?.actual);
+      if (code === "embedding-dimension-mismatch" && Number.isInteger(attachedExpected) && attachedExpected > 0 && Number.isInteger(attachedActual) && attachedActual > 0) {
+        if (showNotice) new Notice(`Embedding dimension mismatch: saved ${attachedExpected}d but provider returned ${attachedActual}d.`);
+        return { ok: false, provider, model, dimension: attachedActual, configuredDimension: attachedExpected, code };
+      }
+      if (showNotice) {
+        if (Number.isInteger(status) && status > 0) new Notice(`Embedding validation failed: ${code} (HTTP ${status}).`);
+        else new Notice(`Embedding validation failed: ${code}.`);
+      }
+      return { ok: false, provider, model, code, status: Number.isInteger(status) && status > 0 ? status : 0 };
+    } finally {
+      this.embeddingValidationRunning = false;
+    }
+  }
+
   async validateTodoistSetup(showNotice = true) {
     this.requireTodoistAccess();
     await this.refreshTodoistProjects(false);
@@ -12130,6 +12284,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const priorMeta = this.settings.taskReferenceSnapshotMeta;
     const priorFingerprint = this.taskReferenceSnapshotFingerprint;
     const priorDirty = this.taskReferenceSnapshotDirty;
+    const priorReady = this.taskReferenceSnapshotReady;
     const priorRevision = this.taskReferenceStateRevision;
     const priorIndex = this.taskReferenceIndex;
     const priorIndexRevision = this.taskReferenceIndexRevision;
@@ -12150,6 +12305,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.logLocal("Todoist reference candidate rejected", { reason });
       return { ok: false, reason, reasonCodes: integrity.reasonCodes };
     }
+    // Deliberate validated full rebuild may publish even when startup hydration failed.
+    this.taskReferenceSnapshotReady = true;
     this.settings.taskCache = nextCache;
     this.taskReferenceInventoryScope = {
       populationScope: "complete-todoist-inventory",
@@ -12168,6 +12325,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.taskReferenceSnapshotMeta = priorMeta;
       this.taskReferenceSnapshotFingerprint = priorFingerprint;
       this.taskReferenceSnapshotDirty = priorDirty;
+      this.taskReferenceSnapshotReady = priorReady;
       this.taskReferenceStateRevision = priorRevision;
       this.taskReferenceIndex = priorIndex;
       this.taskReferenceIndexRevision = priorIndexRevision;
@@ -12317,6 +12475,41 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return Boolean(this.todoistSnapshotCache?.key === key && elapsedMs(this.todoistSnapshotCache.fetchedAt) < ttlMs);
   }
 
+  checkNoteOidAmbiguity(lines, settings, path = "") {
+    const source = Array.isArray(lines) ? lines : [];
+    const cache = settings?.taskCache && typeof settings.taskCache === "object" ? settings.taskCache : {};
+    const cachedIdsByOid = new Map();
+    for (const [cachedId, cached] of Object.entries(cache)) {
+      const cachedOid = String(cached?.oid || "").trim().toUpperCase();
+      if (!cachedOid || !cachedId) continue;
+      const list = cachedIdsByOid.get(cachedOid) || [];
+      if (!list.includes(String(cachedId))) list.push(String(cachedId));
+      cachedIdsByOid.set(cachedOid, list);
+    }
+    const lineCounts = new Map();
+    const verifiedIdsByOid = new Map();
+    for (let i = 0; i < source.length; i += 1) {
+      const parsed = parseTaskLine(source[i], i, path, source, settings);
+      if (!parsed || !parsed.isSyncTask) continue;
+      const oid = String(parsed.oid || "").trim().toUpperCase();
+      if (!oid) continue;
+      lineCounts.set(oid, (lineCounts.get(oid) || 0) + 1);
+      let verified = verifiedIdsByOid.get(oid);
+      if (!verified) { verified = new Set(); verifiedIdsByOid.set(oid, verified); }
+      const explicitId = String(parsed.id || "").trim();
+      if (explicitId) verified.add(explicitId);
+      for (const cachedId of cachedIdsByOid.get(oid) || []) verified.add(cachedId);
+    }
+    let repeatedGroups = 0;
+    for (const count of lineCounts.values()) if (count > 1) repeatedGroups += 1;
+    for (const [oid, count] of lineCounts.entries()) {
+      const verified = verifiedIdsByOid.get(oid) || new Set();
+      if (verified.size > 1) return { ok: false, reasonCode: "oid-identity-ambiguous", repeatedGroups, oidGroups: lineCounts.size };
+      if (count > 1 && verified.size !== 1) return { ok: false, reasonCode: "oid-identity-ambiguous", repeatedGroups, oidGroups: lineCounts.size };
+    }
+    return { ok: true, reasonCode: "oid-identity-clear", repeatedGroups, oidGroups: lineCounts.size };
+  }
+
   async syncFileNotes(path, showNotice = true) {
     this.fileSyncInProgress = this.fileSyncInProgress || new Set();
     if (this.fileSyncInProgress.has(path)) return emptySyncStats();
@@ -12327,6 +12520,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!(file instanceof TFile)) return stats;
     const original = await this.app.vault.read(file);
     const lines = original.split("\n");
+    const oidAmbiguity = this.checkNoteOidAmbiguity(lines, this.settings, path);
+    if (!oidAmbiguity.ok) throw new Error("Sync aborted: ambiguous local task identity in this note.");
     const creations = [];
     const existingUpdates = [];
     const lineToTemp = new Map();
@@ -12495,6 +12690,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return stats;
     } finally {
       this.fileSyncInProgress.delete(path);
+      this.refreshSidebarStatus();
     }
   }
 
@@ -14606,6 +14802,17 @@ class SemanticTodoistView extends ItemView {
   }
 }
 
+function semanticSettingsScroller(containerEl) {
+  let node = containerEl || null;
+  while (node) {
+    try {
+      if (typeof node.scrollTop === "number" && node.scrollHeight > node.clientHeight + 2) return node;
+    } catch (error) { /* label-only */ }
+    node = node.parentElement;
+  }
+  return null;
+}
+
 class SemanticTodoistSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -14615,16 +14822,25 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   goTo(tab) {
     this.activeTab = tab;
+    this.resetSettingsScroll = true;
     this.display();
   }
 
   display() {
     const { containerEl } = this;
+    const settingsScroller = semanticSettingsScroller(containerEl);
+    const preservedScrollTop = settingsScroller ? settingsScroller.scrollTop : 0;
+    const existingTabs = containerEl.querySelector ? containerEl.querySelector(".semantic-todoist-tabs") : null;
+    if (existingTabs) this.tabScrollLeft = existingTabs.scrollLeft;
+    const resetSettingsScroll = this.resetSettingsScroll === true;
+    this.resetSettingsScroll = false;
+    const settingsScrollSeq = (Number(this.settingsScrollSeq) || 0) + 1;
+    this.settingsScrollSeq = settingsScrollSeq;
     containerEl.empty();
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
-    const tabNames = ["Setup", "AI & Search", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"];
+    const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"];
     let activeButton = null;
     for (const tab of tabNames) {
       const button = tabs.createEl("button", { text: tab, attr: { type: "button", "aria-label": `Open ${tab} settings` } });
@@ -14636,12 +14852,14 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       button.onclick = () => {
         this.tabScrollLeft = tabs.scrollLeft;
         this.activeTab = tab;
+        this.resetSettingsScroll = true;
         this.display();
       };
     }
     const renderers = {
       Setup: "renderSetup",
       "AI & Search": "renderAiSearch",
+      "AI Providers": "renderAiProviders",
       "AI Models": "renderAiModels",
       "Task Workflows": "renderTaskWorkflows",
       "Daily Scheduler": "renderScheduleToday",
@@ -14651,16 +14869,38 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     this[renderers[this.activeTab] || "renderSetup"](containerEl);
     tabs.scrollLeft = Number(this.tabScrollLeft || 0);
     if (activeButton) {
-      const alignActiveTab = () => activeButton.scrollIntoView({ block: "nearest", inline: "center" });
+      const alignActiveTab = () => {
+        try {
+          const stripRect = tabs.getBoundingClientRect();
+          const buttonRect = activeButton.getBoundingClientRect();
+          if (buttonRect.left < stripRect.left) tabs.scrollLeft -= (stripRect.left - buttonRect.left + 8);
+          else if (buttonRect.right > stripRect.right) tabs.scrollLeft += (buttonRect.right - stripRect.right + 8);
+        } catch (error) { /* label-only */ }
+      };
       if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(alignActiveTab);
       else alignActiveTab();
+    }
+    if (settingsScroller) {
+      if (resetSettingsScroll) settingsScroller.scrollTop = 0;
+      else settingsScroller.scrollTop = Math.min(preservedScrollTop, Math.max(0, settingsScroller.scrollHeight - settingsScroller.clientHeight));
+    }
+    if (settingsScroller && !resetSettingsScroll) {
+      const deferredScrollTarget = Math.min(preservedScrollTop, Math.max(0, settingsScroller.scrollHeight - settingsScroller.clientHeight));
+      const restoreSettingsScroll = () => {
+        try {
+          if (this.settingsScrollSeq !== settingsScrollSeq) return;
+          const clamped = Math.min(deferredScrollTarget, Math.max(0, settingsScroller.scrollHeight - settingsScroller.clientHeight));
+          if (settingsScroller.scrollTop < clamped - 2) settingsScroller.scrollTop = clamped;
+        } catch (error) { /* label-only */ }
+      };
+      if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(restoreSettingsScroll);
     }
   }
 
   renderSetup(containerEl) {
     settingsHeading(containerEl, "Setup", "Check your connections here, then use the buttons to open the one place where each setting lives.");
     setupStatusSetting(containerEl, "AI provider", aiSetupSummary(this.plugin.settings), [
-      ["Configure AI Models", () => this.goTo("AI Models")],
+      ["Configure AI Providers", () => this.goTo("AI Providers")],
       ["Validate AI", async () => { try { await this.plugin.validateAiSetup(true); this.display(); } catch (error) { new Notice(`AI setup check failed: ${error.message || error}`); } }]
     ]);
     setupStatusSetting(containerEl, "Todoist", todoistSetupSummary(this.plugin.settings), [
@@ -14678,7 +14918,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     setupStatusSetting(containerEl, "Overall setup", "Run a bounded check for services that have credentials saved. No note content is sent by this check.", [
       ["Check setup", async () => { await this.plugin.validateConfiguredSetup(true); this.display(); }]
     ]);
-    settingsHeading(containerEl, "Next steps", "AI Models holds provider keys and models. AI & Search holds search, the semantic index, and sidebar behavior. Task Workflows holds Todoist, note, and email settings. Daily Scheduler and Task Integrity hold their own workflow controls.");
+    settingsHeading(containerEl, "Next steps", "AI Providers holds provider keys and endpoints. AI Models holds routing and models. AI & Search holds search, the semantic index, and sidebar behavior. Task Workflows holds Todoist, note, and email settings. Daily Scheduler and Task Integrity hold their own workflow controls.");
   }
 
   renderAiSearch(containerEl) {
@@ -14717,11 +14957,15 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     setupStatusSetting(mcp, "MCP bridge status", externalMcpExportSummary(this.plugin), [["Refresh bridge", async () => { try { await this.plugin.writeExternalMcpExport(true); this.display(); } catch (error) { new Notice(`Could not refresh external MCP bridge: ${error.message || error}`); } }]]);
   }
 
+  renderAiProviders(containerEl) {
+    const providers = settingsDisclosure(containerEl, "Provider connections", "Choose which provider connection to show. The selection only changes the display; it never saves routing or contacts a provider.", true);
+    aiProviderSetting(providers, this.plugin, () => this.display(), this);
+    renderProviderConnectionSettings(providers, this.plugin, this);
+  }
+
   renderAiModels(containerEl) {
     const routing = settingsDisclosure(containerEl, "AI Models routing", "Shared routing is the default. Advanced operation overrides are opt-in and remain local until you save them.", true);
     renderSharedAiRoutingSettings(routing, this.plugin, () => this.display());
-    aiProviderSetting(routing, this.plugin, () => this.display(), this);
-    renderProviderConnectionSettings(routing, this.plugin, this);
     renderAdvancedOperationSettings(routing, this.plugin, () => this.display());
 
     const embeddings = settingsDisclosure(containerEl, "Embeddings", "Provider, model, capability, and dimension are kept together so indexes are never mixed across identities.", true);
@@ -15715,7 +15959,7 @@ const SETTING_DESCRIPTIONS = {
   enableOpenAiPromptCaching: "Enabled by default. Uses explicit prompt caching on GPT 5.6 and newer OpenAI models for stable structured-output schemas and system instructions only. Dynamic user, note, email, vault, and Todoist context remains after the cache breakpoint. Turning this off disables reads and billable writes instead of reverting to implicit caching.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   showAiFallbackNotice: "Appends a short note to sidebar chat answers when the fallback model answered the question.",
-  embeddingModel: "Used to build and search the local semantic index. It follows the selected provider by default.",
+  embeddingModel: "Used to build and search the local semantic index. Select its provider and model separately from the generation models.",
   openAiEmbeddingDimensions: "Stored and queried dimensions for OpenAI text-embedding-3 indexes. The mobile-safe default is 1024. Changing this value requires a semantic-index rebuild; unsupported embedding models keep their native dimensions.",
   todoistToken: "Required for Todoist project loading, task creation, and two-way sync.",
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
@@ -15993,7 +16237,11 @@ function normalizeProviderEmbeddingRows(rows, expectedCount, expectedDimension =
     const vector = Array.isArray(row?.embedding) ? row.embedding : Array.isArray(row?.values) ? row.values : null;
     if (!vector?.length || vector.some((value) => !Number.isFinite(Number(value)))) throw providerAdapterError(provider, "embedding-vector-invalid", "The provider returned a non-finite embedding vector.");
     if (!dimension) dimension = vector.length;
-    if (vector.length !== dimension || (expectedDimension > 0 && vector.length !== expectedDimension)) throw providerAdapterError(provider, "embedding-dimension-mismatch", "The provider returned inconsistent embedding dimensions.");
+    if (vector.length !== dimension || (expectedDimension > 0 && vector.length !== expectedDimension)) {
+      const dimensionError = providerAdapterError(provider, "embedding-dimension-mismatch", "The provider returned inconsistent embedding dimensions.");
+      dimensionError.embeddingDimension = { expected: Number(expectedDimension) || 0, actual: vector.length };
+      throw dimensionError;
+    }
     result[rawIndex] = vector.map(Number);
   });
   if (result.some((vector) => !vector)) throw providerAdapterError(provider, "embedding-index-missing", "The provider omitted an embedding index.");
@@ -16316,6 +16564,8 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
   const comboboxId = `semantic-todoist-model-combobox-${(modelComboboxSequence += 1)}`;
   const setting = new Setting(containerEl).setName(name).setDesc(desc || "");
   setting.settingEl.addClass("semantic-todoist-model-combobox-setting");
+  let comboboxInput = null;
+  let comboboxBrowse = null;
   let committed = String(config.inputValue || "");
   let popup = null;
   let highlightIndex = -1;
@@ -16325,6 +16575,20 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
 
   setting.addText((text) => {
     const input = text.inputEl;
+    comboboxInput = input;
+    function pickerDocument() {
+      try {
+        if (input && input.ownerDocument) return input.ownerDocument;
+      } catch (error) { /* label-only */ }
+      return typeof document !== "undefined" ? document : null;
+    }
+    function pickerWindow() {
+      const pickerDoc = pickerDocument();
+      try {
+        if (pickerDoc && pickerDoc.defaultView) return pickerDoc.defaultView;
+      } catch (error) { /* label-only */ }
+      return typeof window !== "undefined" ? window : null;
+    }
     addComboboxClass(input, "semantic-todoist-model-combobox-input");
     setComboboxAttribute(input, "role", "combobox");
     setComboboxAttribute(input, "aria-label", config.ariaLabel || name);
@@ -16344,8 +16608,9 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
     }
 
     function closePopup() {
-      if (documentHandler && typeof document !== "undefined" && document && typeof document.removeEventListener === "function") {
-        try { document.removeEventListener("mousedown", documentHandler); } catch (error) { /* label-only */ }
+      const closeDocument = pickerDocument();
+      if (documentHandler && closeDocument && typeof closeDocument.removeEventListener === "function") {
+        try { closeDocument.removeEventListener("mousedown", documentHandler); } catch (error) { /* label-only */ }
       }
       documentHandler = null;
       if (popup && typeof popup.remove === "function") {
@@ -16356,6 +16621,7 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
       visibleEntries = [];
       manualEntry = null;
       setComboboxAttribute(input, "aria-expanded", "false");
+      if (comboboxBrowse) setComboboxAttribute(comboboxBrowse, "aria-expanded", "false");
       removeComboboxAttribute(input, "aria-activedescendant");
     }
 
@@ -16367,6 +16633,8 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
 
     function renderPopup() {
       if (!popup) return;
+      const renderDocument = pickerDocument();
+      if (!renderDocument) return;
       while (popup.children && popup.children.length) {
         try { popup.removeChild(popup.children[0]); } catch (error) { break; }
       }
@@ -16384,7 +16652,7 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
           return describeSelection(group.provider, model).toLowerCase().includes(needle);
         });
         if (!matches.length) continue;
-        const header = document.createElement("div");
+        const header = renderDocument.createElement("div");
         header.className = "semantic-todoist-model-combobox-group";
         setComboboxAttribute(header, "role", "presentation");
         header.textContent = group.label;
@@ -16402,7 +16670,7 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
         entries.push(manualEntry);
       }
       if (!entries.length) {
-        const empty = document.createElement("div");
+        const empty = renderDocument.createElement("div");
         empty.className = "semantic-todoist-model-combobox-empty";
         setComboboxAttribute(empty, "role", "presentation");
         empty.textContent = "No matching models. Type provider:model for a manual selection.";
@@ -16413,7 +16681,7 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
       removeComboboxAttribute(input, "aria-activedescendant");
       entries.forEach((entry, index) => {
         entry.id = `${comboboxId}-option-${index}`;
-        const option = document.createElement("div");
+        const option = renderDocument.createElement("div");
         option.className = "semantic-todoist-model-combobox-option";
         setComboboxAttribute(option, "role", "option");
         setComboboxAttribute(option, "id", entry.id);
@@ -16425,9 +16693,12 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
       });
     }
 
-    function setPopupGeometry(top, maxHeight) {
+    function setPopupGeometry(top, maxHeight, left, width) {
       try {
-        popup.style.position = "absolute";
+        popup.style.position = "fixed";
+        popup.style.left = `${Math.max(0, Math.round(left || 0))}px`;
+        popup.style.width = `${Math.max(0, Math.round(width || 0))}px`;
+        popup.style.right = "auto";
         popup.style.top = `${Math.max(0, Math.round(top))}px`;
         popup.style.maxHeight = `${Math.max(44, Math.round(maxHeight))}px`;
         popup.style.zIndex = "1000";
@@ -16436,14 +16707,19 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
 
     function positionPopup() {
       if (!popup) return;
-      const viewportHeight = typeof window !== "undefined" && window && window.innerHeight ? Number(window.innerHeight) : 600;
+      const pickerView = pickerWindow();
+      const viewportHeight = pickerView && pickerView.innerHeight ? Number(pickerView.innerHeight) : 600;
       let inputTop = 0;
       let inputBottom = 0;
+      let inputLeft = 0;
+      let inputWidth = 0;
       try {
         const rect = input && typeof input.getBoundingClientRect === "function" ? input.getBoundingClientRect() : null;
         if (rect) {
           if (typeof rect.top === "number") inputTop = rect.top;
           if (typeof rect.bottom === "number") inputBottom = rect.bottom;
+          if (typeof rect.left === "number") inputLeft = rect.left;
+          if (typeof rect.width === "number") inputWidth = rect.width;
         }
       } catch (error) { /* label-only */ }
       const naturalBelow = inputBottom + 4;
@@ -16453,15 +16729,16 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
       // room above, so the popup never overflows the settings viewport.
       if (spaceBelow < 96 && spaceAbove > spaceBelow) {
         const maxAbove = Math.max(44, Math.min(260, spaceAbove - 4));
-        setPopupGeometry(Math.max(0, inputTop - 4 - maxAbove), maxAbove);
+        setPopupGeometry(Math.max(0, inputTop - 4 - maxAbove), maxAbove, inputLeft, inputWidth);
         return;
       }
       const top = Math.max(0, Math.min(naturalBelow, viewportHeight - 52));
-      setPopupGeometry(top, Math.max(44, Math.min(260, viewportHeight - top - 8)));
+      setPopupGeometry(top, Math.max(44, Math.min(260, viewportHeight - top - 8)), inputLeft, inputWidth);
     }
 
     function attachDocumentHandler() {
-      if (documentHandler || typeof document === "undefined" || !document || typeof document.addEventListener !== "function") return;
+      const handlerDocument = pickerDocument();
+      if (documentHandler || !handlerDocument || typeof handlerDocument.addEventListener !== "function") return;
       documentHandler = (event) => {
         if (!popup) return;
         const target = event ? event.target : null;
@@ -16471,20 +16748,22 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
         } catch (error) { /* label-only */ }
         cancelPopup();
       };
-      try { document.addEventListener("mousedown", documentHandler); } catch (error) { /* label-only */ }
+      try { handlerDocument.addEventListener("mousedown", documentHandler); } catch (error) { /* label-only */ }
     }
 
     function openPopup() {
-      if (typeof document === "undefined" || !document || typeof document.createElement !== "function" || !document.body) return;
+      const openDocument = pickerDocument();
+      if (!openDocument || typeof openDocument.createElement !== "function" || !openDocument.body) return;
       if (!popup) {
-        popup = document.createElement("div");
+        popup = openDocument.createElement("div");
         popup.className = "semantic-todoist-model-combobox-results";
         setComboboxAttribute(popup, "role", "listbox");
         setComboboxAttribute(popup, "id", `${comboboxId}-listbox`);
         setComboboxAttribute(popup, "aria-label", `${name} results`);
         onComboboxEvent(popup, "mousedown", (event) => { if (event && event.preventDefault) event.preventDefault(); });
-        document.body.appendChild(popup);
+        openDocument.body.appendChild(popup);
         setComboboxAttribute(input, "aria-expanded", "true");
+        if (comboboxBrowse) setComboboxAttribute(comboboxBrowse, "aria-expanded", "true");
         attachDocumentHandler();
       }
       renderPopup();
@@ -16578,7 +16857,8 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
     onComboboxEvent(input, "blur", () => {
       setTimeout(() => {
         if (!popup) return;
-        const active = typeof document !== "undefined" && document ? document.activeElement : null;
+        const blurDocument = pickerDocument();
+        const active = blurDocument ? blurDocument.activeElement : null;
         if (active && (active === input)) return;
         try {
           if (active && popup.contains(active)) return;
@@ -16604,6 +16884,20 @@ function modelComboboxSetting(containerEl, name, desc, plugin, config = {}) {
         moveHighlight(-1);
       }
     });
+  });
+  setting.addButton((button) => {
+    button.setButtonText("Browse").onClick(() => {
+      try {
+        if (comboboxInput && typeof comboboxInput.focus === "function") comboboxInput.focus();
+      } catch (error) { /* label-only */ }
+    });
+    const browseEl = button && button.buttonEl ? button.buttonEl : null;
+    if (browseEl) {
+      addComboboxClass(browseEl, "semantic-todoist-model-combobox-browse");
+      setComboboxAttribute(browseEl, "aria-label", "Browse " + name + " models");
+      setComboboxAttribute(browseEl, "aria-expanded", "false");
+      comboboxBrowse = browseEl;
+    }
   });
   return setting;
 }
@@ -16691,11 +16985,11 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
   new Setting(containerEl).setName("Embedding provider").setDesc("Indexes are provider/model/dimension specific and are never mixed.").addDropdown((dropdown) => {
     for (const option of providerDropdownOptions(null, true)) dropdown.addOption(option.value, option.label);
     dropdown.setValue(reference.provider).onChange(async (value) => {
-      reference = stableReference({ provider: value, model: reference.model }, reference);
-      plugin.settings.embeddingModelReference = reference;
-      plugin.settings.embeddingProvider = reference.provider;
-      plugin.settings.embeddingModel = reference.model;
-      await plugin.saveSettings();
+      // Route through the canonical identity-change path so cached query/dedup
+      // embeddings are cleared and the index for the new identity is loaded from
+      // disk (no network indexing); the old in-memory index must not stay usable.
+      await plugin.setEmbeddingReference(value, plugin.settings.embeddingModel);
+      reference = normalizeStableSettings(plugin.settings).embeddingModelReference;
       if (refreshDisplay) refreshDisplay();
     });
   });
@@ -16705,11 +16999,10 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
     allowedProviders: MODEL_COMBOBOX_PROVIDER_ORDER.slice(),
     current: { provider: reference.provider, model: reference.model },
     onSelect: async (provider, model) => {
-      reference = stableReference({ provider, model }, reference);
-      plugin.settings.embeddingModelReference = reference;
-      plugin.settings.embeddingProvider = reference.provider;
-      plugin.settings.embeddingModel = reference.model;
-      await plugin.saveSettings();
+      // Same canonical path as above: clear stale caches, load the new identity.
+      await plugin.setEmbeddingReference(provider, model);
+      reference = normalizeStableSettings(plugin.settings).embeddingModelReference;
+      if (refreshDisplay) refreshDisplay();
     },
     refreshDisplay
   });
@@ -16721,6 +17014,11 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
       const parsed = Number.parseInt(value, 10);
       plugin.settings.embeddingDimension = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
       await plugin.saveSettings();
+    });
+  });
+  new Setting(containerEl).setName("Validate embedding provider").setDesc("Runs one small embedding request with the saved provider and model. It never changes settings, refreshes catalogs, or touches the index.").addButton((button) => {
+    button.setButtonText("Validate embedding provider").setCta().onClick(async () => {
+      try { await plugin.validateEmbeddingProvider(true); } catch (error) { /* label-only: validateEmbeddingProvider already reports safely */ }
     });
   });
 }
@@ -20524,6 +20822,7 @@ function allActiveWorkflowStatusItems(plugin) {
   else if (plugin.semanticIndexOptimizeInProgress) items.push({ label: "Index", value: "Optimizing" });
   else if (plugin.semanticIndexInProgress) items.push({ label: "Index", value: "Indexing vault" });
   else if (plugin.semanticIndexWarmupInProgress) items.push({ label: "Index", value: "Preparing" });
+  else if (plugin.semanticIndexIncrementalFailure) items.push({ label: "Index", value: `Integrity failed (${indexCount} pending)` });
   else if (indexCount) items.push({ label: "Index", value: `Queued (${indexCount})` });
   else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "Queued" });
   if (plugin.referenceRebuildInProgress) items.push({ label: "References", value: "Rebuilding" });
@@ -34970,6 +35269,17 @@ function attachTaskLocalSemanticFacts(task = {}, evidenceIds = [], evidenceCatal
   if (!localScopeId) return task;
   const selectedIds = new Set((evidenceIds || []).map(String).filter(Boolean));
   const replaceExisting = options.replaceExisting === true;
+  const incomingFactRefs = new Set((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
+  const incomingBindingsByFact = new Map();
+  for (const incomingBinding of (Array.isArray(task.fact_bindings || task.factBindings) ? (task.fact_bindings || task.factBindings) : [])) {
+    if (!incomingBinding || typeof incomingBinding !== "object") continue;
+    const incomingFactId = String(incomingBinding.factId || incomingBinding.fact_id || "");
+    if (!incomingFactId || incomingBindingsByFact.has(incomingFactId)) continue;
+    incomingBindingsByFact.set(incomingFactId, {
+      evidenceId: String(incomingBinding.evidenceId || incomingBinding.evidence_id || ""),
+      scopeId: String(incomingBinding.scopeId || incomingBinding.scope_id || "")
+    });
+  }
   const factRefs = replaceExisting ? [] : uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
   const bindings = replaceExisting ? [] : (Array.isArray(task.fact_bindings || task.factBindings)
     ? (task.fact_bindings || task.factBindings).slice()
@@ -34982,7 +35292,15 @@ function attachTaskLocalSemanticFacts(task = {}, evidenceIds = [], evidenceCatal
       const factEvidenceId = String(fact.evidenceId || fact.evidence_id || evidenceId);
       const factScopeId = String(fact.scopeId || fact.scope_id || item.scopeId || item.scope_id || "");
       if (!factId || factEvidenceId !== evidenceId || factScopeId !== localScopeId) continue;
-      if ((fact.mandatoryFor || []).length) continue;
+      const mandatoryTargets = Array.isArray(fact.mandatoryFor || fact.mandatory_for) ? (fact.mandatoryFor || fact.mandatory_for) : [];
+      if (mandatoryTargets.length) {
+        const priorBinding = incomingBindingsByFact.get(factId);
+        if (!incomingFactRefs.has(factId) || !priorBinding) continue;
+        if (priorBinding.evidenceId !== evidenceId || priorBinding.scopeId !== localScopeId) continue;
+        if (fact.current !== true) continue;
+        if (String(fact.authorityState || "").toLowerCase() !== "authoritative") continue;
+        if (String(fact.conflictState || "").toLowerCase() !== "none") continue;
+      }
       if (["rejected", "conflict"].includes(String(fact.authorityState || "").toLowerCase()) || ["conflict", "conflicted"].includes(String(fact.conflictState || "").toLowerCase())) continue;
       if (!factRefs.includes(factId)) factRefs.push(factId);
       if (!bindings.some((binding) => String(binding?.factId || binding?.fact_id || "") === factId)) {

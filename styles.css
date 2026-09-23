@@ -11,9 +11,7 @@
 }
 
 .semantic-todoist-tabs {
-  position: sticky;
-  top: 0;
-  z-index: 10;
+  position: static;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -95,6 +93,35 @@
   overflow-wrap: anywhere;
 }
 
+.semantic-todoist-settings .semantic-todoist-model-combobox-setting {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-combobox-setting .setting-item-info {
+  width: 100%;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-combobox-setting .setting-item-control {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  margin-left: 0;
+}
+
+.semantic-todoist-model-combobox-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.semantic-todoist-settings .setting-item-control button.semantic-todoist-model-combobox-browse {
+  flex: 0 0 auto;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
 .semantic-todoist-model-combobox-results {
   position: absolute;
   z-index: 1000;
@@ -138,6 +165,10 @@
 
 @media (pointer: coarse) {
   .semantic-todoist-model-combobox-input {
+    min-height: 44px;
+  }
+
+  .semantic-todoist-model-combobox-browse {
     min-height: 44px;
   }
 

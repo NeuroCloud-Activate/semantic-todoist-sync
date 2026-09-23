@@ -34,12 +34,11 @@ searchable provider/model picker and can use an optional fallback. Embedding
 indexes remain partitioned by their selected provider and model, so incompatible
 data is not mixed.
 
-The `AI provider settings` dropdown in **AI Models** is presentation-only: it reveals one
-provider's connection controls at a time without changing routing, embeddings,
-credentials, or saved settings. Changing the provider-settings or model
-selection makes no network request. An explicit refresh, or committing a
-changed complete custom endpoint or non-empty key, is what contacts the custom
-endpoint.
+**AI Providers** has a presentation-only dropdown that reveals one provider's
+connection controls at a time without changing routing or embeddings. **AI
+Models** holds the primary and fallback model choices, searchable model pickers,
+and a separate embedding-provider validation button. Browsing models does not
+make a network request; refresh and validation are explicit actions.
 
 ### Custom OpenAI-compatible provider
 
@@ -55,13 +54,15 @@ the complete API root including `/v1` where required. For a trusted local
 endpoint that uses plain HTTP, explicitly enable the provider's insecure-HTTP
 option before saving the root.
 
+The optional custom connection title changes only its display label. The
+`Allow insecure HTTP` switch is off by default and permits an explicit plain
+HTTP root for this connection when enabled.
+
 The Bearer API key is optional and masked. An empty key is valid for
 unauthenticated local endpoints; a non-empty key is sent only as
 `Authorization: Bearer <key>` to the configured endpoint.
 
-Plain HTTP is disabled by default. Enable it only through the explicit
-`Allow insecure custom-provider HTTP` option, which warns that credentials
-and content can be observed on trusted local networks.
+Plain HTTP can expose credentials and content on a network you do not trust.
 
 Discovered custom models form one role-neutral list shown in both the
 generation and embedding selectors with capability `Not reported`. The
@@ -81,9 +82,9 @@ or provider-specific compatibility machinery. Existing providers and behavior
 remain unchanged.
 
 Embedding models remain user-selected and provider-scoped. The shipped default
-remains OpenAI `text-embedding-3-large`; choosing an OpenRouter embedding model
-such as `openai/text-embedding-3-small` creates a separate index identity rather
-than silently replacing an index built by another provider or model.
+is Custom OpenAI-compatible `qwen3-embedding-0.6b-8k:latest`. Choosing an
+OpenRouter embedding model such as `openai/text-embedding-3-small` creates a
+separate index identity rather than replacing another provider's index.
 
 Provider defaults are conservative and adaptable rather than implicit model
 assumptions. OpenRouter starts with prompt-grounded JSON unless fresh capability
@@ -134,9 +135,9 @@ provider.
 
 ## Quick setup
 
-1. Open `Settings > Semantic Todoist Sync`, choose routing and models under
-   `AI Models`, then use the `AI provider settings` dropdown to reveal one
-   provider's connection controls.
+1. Open `Settings > Semantic Todoist Sync`. Configure connections under `AI
+   Providers`, then choose the primary, fallback, and embedding models under
+   `AI Models`.
 2. Add that provider's credential or configure the displayed Open WebUI endpoint
    and sign-in details.
 3. Add a Todoist token and run the connection check.

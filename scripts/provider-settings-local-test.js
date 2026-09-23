@@ -121,11 +121,15 @@ function collect(element, predicate, result = []) {
   return result;
 }
 
-// 1. Seven groups, in the required order: Setup, AI & Search, AI Models,
-//    Task Workflows, Daily Scheduler, Task Integrity, Activity.
-const GROUP_ORDER = 'const tabNames = ["Setup", "AI & Search", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"]';
-assert.ok(source.includes(GROUP_ORDER), 'seven setting groups exist in the required order');
+// 1. Eight groups: the seven-tab layout is retired by the Task 2 contract.
+assert.ok(!source.includes('const tabNames = ["Setup", "AI & Search", "AI Models",'), 'seven-tab layout is retired');
 assert.ok(source.includes('renderAiModels(containerEl)'), 'AI Models renderer exists');
+// Task 2 RED: eight canonical groups with AI Providers owning the
+// presentation-only provider dropdown and single connection disclosure.
+const EIGHT_TABS = 'const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"]';
+assert.ok(source.includes(EIGHT_TABS), 'eight setting groups exist in the required order');
+assert.ok(source.includes('renderAiProviders(containerEl)'), 'AI Providers renderer exists');
+assert.ok(source.includes('this.goTo("AI Providers")'), 'Setup navigates to AI Providers');
 
 function classMethodBody(name, nextName) {
   const start = source.indexOf(`  ${name}(`);
@@ -134,17 +138,24 @@ function classMethodBody(name, nextName) {
   return source.slice(start, end);
 }
 
-const aiSearchSource = classMethodBody('renderAiSearch', 'renderAiModels');
+const aiSearchSource = classMethodBody('renderAiSearch', 'renderAiProviders');
 const aiModelsSource = classMethodBody('renderAiModels', 'renderTaskWorkflows');
+const aiProvidersSource = classMethodBody('renderAiProviders', 'renderAiModels');
 for (const movedRenderer of [
   'renderSharedAiRoutingSettings',
-  'aiProviderSetting',
-  'renderProviderConnectionSettings',
   'renderAdvancedOperationSettings',
   'providerEmbeddingSettings'
 ]) {
   assert.strictEqual((aiModelsSource.match(new RegExp(movedRenderer, 'g')) || []).length, 1, `${movedRenderer} is owned by AI Models exactly once`);
   assert.strictEqual((aiSearchSource.match(new RegExp(movedRenderer, 'g')) || []).length, 0, `${movedRenderer} is not duplicated in AI & Search`);
+}
+for (const ownedRenderer of [
+  'aiProviderSetting',
+  'renderProviderConnectionSettings'
+]) {
+  assert.strictEqual((aiProvidersSource.match(new RegExp(ownedRenderer, 'g')) || []).length, 1, `${ownedRenderer} is owned by AI Providers exactly once`);
+  assert.strictEqual((aiModelsSource.match(new RegExp(ownedRenderer, 'g')) || []).length, 0, `${ownedRenderer} is not duplicated in AI Models`);
+  assert.strictEqual((aiSearchSource.match(new RegExp(ownedRenderer, 'g')) || []).length, 0, `${ownedRenderer} is not duplicated in AI & Search`);
 }
 assert.ok(/webResearchSettings/.test(aiSearchSource), 'AI & Search retains Internet Search');
 assert.ok(/Sidebar and prompts/.test(aiSearchSource), 'AI & Search retains sidebar and prompt controls');
@@ -252,11 +263,14 @@ plugin.displayName = 'test';
 const tab = Object.create(Plugin.SemanticTodoistSettingTab.prototype);
 tab.plugin = plugin;
 tab.display = () => { tab.displayCount = (tab.displayCount || 0) + 1; };
-const root = new FakeElement('section');
-tab.renderAiModels(root);
-const connectionDisclosures = collect(root, (element) => element.className.includes('semantic-todoist-provider-connection'));
-const operationDisclosures = collect(root, (element) => element.className.includes('semantic-todoist-operation-disclosure'));
-assert.strictEqual(connectionDisclosures.length, 1, 'exactly one provider connection disclosure renders');
+const providersRoot = new FakeElement('section');
+tab.renderAiProviders(providersRoot);
+const connectionDisclosures = collect(providersRoot, (element) => element.className.includes('semantic-todoist-provider-connection'));
+assert.strictEqual(connectionDisclosures.length, 1, 'exactly one provider connection disclosure renders in AI Providers');
+const modelsRoot = new FakeElement('section');
+tab.renderAiModels(modelsRoot);
+assert.strictEqual(collect(modelsRoot, (element) => element.className.includes('semantic-todoist-provider-connection')).length, 0, 'AI Models does not duplicate provider connections');
+const operationDisclosures = collect(modelsRoot, (element) => element.className.includes('semantic-todoist-operation-disclosure'));
 assert.strictEqual(operationDisclosures.length, 9, 'advanced routing renders one group plus eight operation disclosures');
 assert.strictEqual(plugin.saveCount, 0, 'rendering performs no implicit save or network action');
 const searchRoot = new FakeElement('section');
@@ -292,7 +306,7 @@ assert.ok(typedSetting?.control?.change, 'provider model input is rendered');
   tab.providerViewProvider = 'customopenai';
   renderedSettings.length = 0;
   const customRoot = new FakeElement('section');
-  tab.renderAiModels(customRoot);
+  tab.renderAiProviders(customRoot);
   const titleSetting = renderedSettings.find((setting) => setting.name === 'Custom connection title');
   assert.ok(titleSetting?.control?.change, 'Custom connection title input is rendered only for the custom connection');
   const saveCountBeforeTitle = plugin.saveCount;
@@ -302,7 +316,7 @@ assert.ok(typedSetting?.control?.change, 'provider model input is rendered');
   assert.strictEqual(networkCount, 0, 'title input performs no provider/discovery request');
   renderedSettings.length = 0;
   const renamedRoot = new FakeElement('section');
-  tab.renderAiModels(renamedRoot);
+  tab.renderAiProviders(renamedRoot);
   assert.ok(collect(renamedRoot, (element) => element.textContent === 'Local Gateway connection').length === 1, 'trimmed title replaces the custom disclosure label');
   console.log('provider-settings-local-test: PASS');
 })().catch((error) => {

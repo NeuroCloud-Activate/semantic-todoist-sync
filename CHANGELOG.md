@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.8.43
+
+### Settings
+- Split provider connections into a dedicated **AI Providers** tab, separate
+  from the primary, fallback, and embedding model choices in **AI Models**.
+- Added an explicit **Validate embedding provider** button that runs one small
+  request against the saved embedding provider and model without changing
+  settings, refreshing catalogs, or touching the index.
+- Preserved the settings scroll position when changing dropdown values, and
+  stopped the settings tab strip from overlaying controls while scrolling.
+
+### Semantic index and embeddings
+- Changing the AI model or provider no longer rewrites the configured embedding
+  model or unloads its index; embedding identity changes only through an
+  explicit embedding-model selection.
+- Refreshing a provider's model list no longer silently replaces the configured
+  embedding model when it is absent from the refreshed catalog.
+- Legacy semantic-index data is adopted only when its stored chunks match the
+  configured embedding identity.
+- A deterministic index-integrity failure now reports
+  `Integrity failed (N pending)` instead of retrying indefinitely.
+
+### Note sync
+- The sidebar **Notes** status now refreshes when a queued note sync finishes.
+- A note whose sync is already running no longer requeues without limit.
+- A pending queued note sync is cleared when the plugin unloads.
+- Note sync aborts with a clear message when a note's local task identities are
+  ambiguous, instead of creating duplicate Todoist tasks.
+
+### Task references
+- The local Todoist reference snapshot is no longer written before startup
+  hydration completes, so an interrupted startup cannot replace a good
+  generation with an empty one.
+
 ## 0.8.42
 
 ### Task-reference and semantic-index integrity

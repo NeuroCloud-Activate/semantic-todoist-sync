@@ -2283,7 +2283,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     else this.queueSemanticIndexWarmup();
     const activeMarkdown = this.app.workspace.getActiveViewOfType(MarkdownView);
     this.lastActiveMarkdownLeaf = activeMarkdown?.leaf || null;
-    this.addSettingTab(new SemanticTodoistSettingTab(this.app, this));
+    this.settingsTab = new SemanticTodoistSettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
     this.registerView(VIEW_TYPE, (leaf) => new SemanticTodoistView(leaf, this));
 
     this.addRibbonIcon("list-checks", "Semantic Todoist Sync", () => this.openSidebar());
@@ -5186,6 +5187,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const entry = { at: deviceTimestamp(), message, data: sanitizeLogData(data) };
     this.settings.localLog = [entry, ...(this.settings.localLog || [])].slice(0, 100);
     this.queueSettingsSave();
+    if (this.settingsTab?.activeTab === "Activity") this.settingsTab.queueActivityLogRefresh();
   }
 
   requireApiAccess(requireWorker = false) {
@@ -12719,6 +12721,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         args: todoistArgsFromParsedTask(task, projectId, parent, sectionRefs.get(task.section), this.settings)
       });
     }
+    const batchTempIds = new Set(tasks.map((task) => String(task.tempId || "")));
+    const knownRemoteIds = new Set(Object.keys(this.settings?.taskCache || {}));
+    const tempIdShape = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    for (const [index, task] of tasks.entries()) {
+      const parent = findParentForTask(task, lineToTemp, this.settings);
+      if (!parent) continue;
+      if (batchTempIds.has(parent)) continue;
+      if (knownRemoteIds.has(parent)) continue;
+      if (!tempIdShape.test(parent)) continue;
+      this.logLocal("Todoist subtask parent missing from batch", { index, line: task.lineNumber });
+      throw new Error("Todoist subtask parent is not in this batch (task index " + index + ", line " + task.lineNumber + ").");
+    }
     this.logLocal("Todoist task create prepared", {
       tasks: tasks.length,
       rootTasks: tasks.filter((task) => !task.isSubtask).length,
@@ -12757,6 +12771,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       task.section = match.section || task.section || "";
       task.projectId = match.projectId || task.projectId || "";
       task.projectName = match.projectName || task.projectName || "";
+      const ownLine = Number(task.lineNumber);
+      if (lineToTemp instanceof Map && Number.isFinite(ownLine) && ownLine >= 0) {
+        lineToTemp.set(ownLine, match.id);
+      }
       relinked.push(task);
       creations.splice(i, 1);
     }
@@ -14828,6 +14846,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
   display() {
     const { containerEl } = this;
+    this.activityLogEl = null;
     const settingsScroller = semanticSettingsScroller(containerEl);
     const preservedScrollTop = settingsScroller ? settingsScroller.scrollTop : 0;
     const existingTabs = containerEl.querySelector ? containerEl.querySelector(".semantic-todoist-tabs") : null;
@@ -14895,6 +14914,22 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       };
       if (typeof window !== "undefined" && window.requestAnimationFrame) window.requestAnimationFrame(restoreSettingsScroll);
     }
+  }
+
+  queueActivityLogRefresh() {
+    if (this.activeTab !== "Activity") return;
+    const log = this.activityLogEl;
+    const container = this.containerEl;
+    if (!log || !container || typeof container.contains !== "function" || !container.contains(log)) return;
+    if (this.activityLogRefreshTimer != null) return;
+    this.activityLogRefreshTimer = setTimeout(() => {
+      this.activityLogRefreshTimer = null;
+      if (this.activeTab !== "Activity") return;
+      const currentLog = this.activityLogEl;
+      const currentContainer = this.containerEl;
+      if (!currentLog || !currentContainer || typeof currentContainer.contains !== "function" || !currentContainer.contains(currentLog)) return;
+      currentLog.setText((this.plugin.settings.localLog || []).length ? (this.plugin.settings.localLog || []).map((entry) => `${formatDeviceDateTime(entry.at) || "Unknown time"}  ${entry.message}  ${activityLogDataText(entry.data || {})}`).join("\n") : "No local activity logged yet.");
+    }, 250);
   }
 
   renderSetup(containerEl) {
@@ -15123,6 +15158,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Refresh").addButton((button) => button.setButtonText("Refresh").onClick(() => this.display()));
     settingsHeading(containerEl, "Activity log", "Local workflow events. Secrets and raw provider payloads are not shown.");
     const log = containerEl.createEl("pre", { cls: "semantic-todoist-activity-log" });
+    this.activityLogEl = log;
     log.setAttribute("tabindex", "0");
     log.setAttribute("aria-label", "Semantic Todoist Sync activity log");
     log.setText((this.plugin.settings.localLog || []).length ? (this.plugin.settings.localLog || []).map((entry) => `${formatDeviceDateTime(entry.at) || "Unknown time"}  ${entry.message}  ${activityLogDataText(entry.data || {})}`).join("\n") : "No local activity logged yet.");

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.44
+
+### Note sync
+- Fixed note-to-Todoist sync failing outright when one of a note's tasks
+  already existed in Todoist. A relinked parent task kept its temporary batch
+  id, so Todoist rejected the whole creation batch with `PARENT_NOT_FOUND` and
+  no tasks were created. Subtasks now reference the parent's real Todoist id.
+- Note sync now stops with a clear message when a subtask's parent resolves to
+  neither the current batch nor an existing Todoist task, instead of sending an
+  invalid batch to Todoist.
+
+### Settings
+- The Activity log now updates live while the Activity tab is open, instead of
+  waiting for a manual refresh.
+
 ## 0.8.43
 
 ### Settings

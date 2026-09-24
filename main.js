@@ -1892,7 +1892,7 @@ const DEFAULT_SETTINGS = {
   dateInstructions: "Determine a task completion deadline and a due date for each main task based on urgency, priority, and complexity. Do not add due dates to subtasks. Avoid weekends and the holidays that apply to the user's locale.",
   tagInstructions: "Only create Todoist labels that are explicitly named in these instructions. Add labels only when the source content clearly matches a configured rule.",
   priorityInstructions: "Assign priority 1 to 4 to each task and subtask, where 4 is highest priority and 1 is no priority.",
-  descriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded information to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. Use direct execution guidance. Treat the source note or email as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the source note, source subject, email, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE,
+  descriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded information to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. State every materially relevant supplied fact needed to understand and action the task; do not compress away specific names, objects, amounts, dates, decisions, or criteria that the supplied evidence provides. The plugin attaches citations automatically from the returned evidence IDs; do not write numeric markers. Use direct execution guidance. Treat the source note or email as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the source note, source subject, email, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE,
   emailMainTaskInstructions: "Assume every email forwarded into Email-To-Todoist is intended to create at least one Todoist task. Review the email chain together with relevant ranked vault context and identify the most useful action, follow-up, review, decision, or completion task for the user. Requests for thoughts, feedback, review, comments, tracked changes, verification of accuracy, confirmation of gaps, or document/draft review are actionable even when phrased politely, marked non-urgent, or sent to multiple recipients. Exclude signatures, disclaimers, logos, and work clearly owned by someone else unless the user needs to follow up. Create detailed Todoist tasks that preserve enough email and vault context to act without rereading the full thread.",
   emailSubtaskInstructions: "Create email subtasks only for concrete steps required to complete the parent task and supported by the email or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   emailSectionTitleInstructions: "Create one Todoist section for all tasks from the same email using Email_YY_MM_DD_Subject based on the email received date and subject.",
@@ -1906,7 +1906,7 @@ const DEFAULT_SETTINGS = {
   noteDateInstructions: "Determine due dates and deadlines from the note's timing, urgency, complexity, and any explicit dates. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
   noteTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   notePriorityInstructions: "Assign priority 1 to 4 to each note-derived task and subtask, where 4 is highest priority and 1 is no priority.",
-  noteDescriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded note and semantic-index detail to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. Use direct execution guidance. Treat the active/source note as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the active note, source note title, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE
+  noteDescriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded note and semantic-index detail to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. State every materially relevant supplied fact needed to understand and action the task; do not compress away specific names, objects, amounts, dates, decisions, or criteria that the supplied evidence provides. The plugin attaches citations automatically from the returned evidence IDs; do not write numeric markers. Use direct execution guidance. Treat the active/source note as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the active note, source note title, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE
 };
 
 function migrateRetrievalDefaultSettings(settings = {}, defaults = DEFAULT_SETTINGS) {
@@ -4926,7 +4926,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async setChatModel(value) {
     this.settings.chatModel = value;
-    this.settings.aiModelProvider = aiProviderForModel(value);
+    this.settings.aiModelProvider = generationProviderForSelectedModel(this.settings, value, this.settings.aiModelProvider);
+    this.settings.sharedGenerationPrimary = stableReference(Object.assign({}, this.settings.sharedGenerationPrimary, {
+      provider: this.settings.aiModelProvider,
+      model: value
+    }), DEFAULT_GENERATION_PRIMARY);
     this.ensureSameProviderFallbackModel();
     await this.ensureCompatibleEmbeddingForChatModel();
     await this.saveSettings();
@@ -4934,10 +4938,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
 
   async setAiModelProvider(value) {
     const provider = normalizeAiProvider(value, this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel));
+    const currentModelProvider = generationProviderForSelectedModel(
+      this.settings,
+      this.settings.chatModel,
+      this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel)
+    );
     // Embedding identity is explicit and independent of the generation provider:
     // a generation-provider change must not rewrite it or unload the index.
     this.settings.aiModelProvider = provider;
-    this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
+    if (currentModelProvider !== provider) {
+      this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
+    }
+    this.settings.sharedGenerationPrimary = stableReference(Object.assign({}, this.settings.sharedGenerationPrimary, {
+      provider,
+      model: this.settings.chatModel
+    }), DEFAULT_GENERATION_PRIMARY);
     this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
     if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== provider) {
       this.settings.taskDeduplicationAiModel = "";
@@ -10360,6 +10375,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
     const initialProviderProjection = options.contextBundle?.providerEvidenceProjection || null;
     const descriptionEvidenceItems = options.contextBundle?.evidenceCatalog?.items;
+    const descriptionTaskCount = mainTasks.length;
+    const descriptionRecordCeiling = taskDescriptionEvidenceRecordCeiling(this.settings, descriptionTaskCount);
     const descriptionProviderProjection = structuredEvidence && Array.isArray(descriptionEvidenceItems)
       ? taskWorkflowProviderEvidenceProjection(descriptionEvidenceItems, {
         settings: this.settings,
@@ -10367,10 +10384,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         tasks: mainTasks,
         taskEvidenceRefs: options.contextBundle?.taskEvidenceRefs || {},
         scopeSemanticEvidence: options.contextBundle?.scopeSemanticEvidence || {},
-        recordCeiling: initialProviderProjection?.recordCeiling
-          ?? initialProviderProjection?.telemetry?.recordCeiling
-          ?? this.settings.maxTaskContextChunks
-          ?? 48,
+        recordCeiling: descriptionRecordCeiling,
+        descriptionTaskCount,
         baselineSelectedEvidenceIds: initialProviderProjection?.selectedEvidenceIds || [],
         candidateCount: descriptionEvidenceItems.length,
         contextBundle: options.contextBundle
@@ -10435,14 +10450,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           "Description contract: write a standalone, detailed, task-specific execution brief that preserves the current artifact or state, intent when non-obvious, audience/reviewer/recipient needs, required details, decisions, dependencies, timing, constraints, substantive review criteria, and supported links or citations when available.",
           "Write a natural narrative execution brief, not a structured field display. Do not prefix lines with labels such as Goal:, Intent:, Person involved:, Source:, Where this came from:, Context:, Evidence:, Action:, Outcome:, Deliverable:, Criteria:, Dependencies:, or Next step:; integrate those facts into complete sentences instead.",
           "Structured payload rules: treat action/title and existingSubtasks as the task scope; preserve mandatoryRequestFacts and resolve taskLocalEvidence.factRefs, priorityFactRefs, materialDescriptionFactRefs, executionDetailFactRefs, and candidateSupportingFactRefs through shared factsById. Use citationLedgerByTask[index] and evidenceById for task-local evidence; never borrow another task's IDs or facts.",
-          "Fact semantics: requested-action facts are mandatory current-source requirements. Same-scope primary-context summary facts are optional adjacency context; use them only when they materially clarify intent, state, timing, recipient, or criteria. Keep distinct timing statements attached to their own source facts and never merge or reassign them.",
+          "Fact semantics: requested-action facts are mandatory current-source requirements. State every materially relevant supplied task-local fact directly and accurately in the prose and bind it to its exact task-local fact and evidence. Same-scope primary-context facts are required when they materially clarify intent, current state, timing, recipient, or criteria; they are not optional adjacency context. Keep distinct timing statements attached to their own source facts and never merge or reassign them.",
           "Rich task-local evidence payload: taskLocalEvidence contains the closed task-local IDs and structured task details. Resolve taskLocalEvidence facts through shared factsById and citationLedgerByTask through evidenceById; use only this task-local payload and never borrow a neighboring task's facts.",
           "Priority fact rule: every taskLocalEvidence.priorityFacts row is required unless it is marked conflicting or rejected. This includes every materialDescriptionFactRefs ID. Resolve each priority ID through shared factsById, state its exact content accurately in a natural execution sentence, carry that row's exact factId in fact_refs and evidenceId in evidence_ids, and include the exact matching fact_binding on the containing description object. Never bind or cite without stating the supported content; use separate sentences when priority facts add distinct current-state, history, criteria, or dependency dimensions, label a fact as history only when its temporal relation is historical rather than merely old, and preserve current direction. Ordinary remaining taskLocalEvidence.factRefs are optional.",
           TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
           "Execution-detail fact rule: executionDetailFactRefs is an ordered, ID-only closed set of exact-task-scope non-action facts. When this set contains usable members, every successful description must state and bind at least one of them, with its exact factId, evidenceId, and fact_binding; an action-only or title-only description fails when usable execution detail is supplied. Resolve the IDs once through shared factsById, preserve their exact scope and source binding, and never invent or substitute a neighboring fact. When the normalized set is empty, no execution-detail contract is present and an exact, grounded action-only description may pass.",
-          "Candidate supporting-fact rule: candidateSupportingFactRefs is an optional ID-only shortlist for semantic evidence navigation, not a mandatory narrative set. Resolve each optional ID through shared factsById and select a candidate only when removing it would change execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff; if selected, state it directly and return its exact evidence ID, fact ID, and binding. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. PriorityFacts, including materialDescriptionFactRefs, remain mandatory; when executionDetailFactRefs has usable members, at least one of those members must be selected and stated.",
+          "Candidate supporting-fact rule: candidateSupportingFactRefs is an ID-only shortlist for task-local semantic evidence. For each supplied candidate fact that materially changes execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff, state it directly and return its exact evidence ID, fact ID, and binding; it must be stated and bound, not merely considered. Resolve each ID through shared factsById. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. PriorityFacts, including materialDescriptionFactRefs, remain mandatory; when executionDetailFactRefs has usable members, at least one of those members must be selected and stated.",
           TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE,
-          "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local evidence ID and one bound fact ref; the plugin validates those IDs, maps evidence IDs to the task-local ledger, appends the accurate numbered (n) citations at each sentence end, and renders the final narrative plus Sources/Context lists. The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
+          "Citation contract: in current strict workflows return description_sentences, each with {text,evidence_ids,fact_refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry at least one task-local semantic evidence ID and one bound fact ref; the plugin validates those IDs against the full task-local ledger, then mechanically assigns sequential citation numbers per description and appends the matching Sources/Context list. For note workflows, the primary source is (1), followed by retained context sources from (2). The primary current source is authoritative; supporting/history/task-snapshot records belong in Context.",
+          normalizeDescriptionWorkflowSourceType(options.sourceContract?.sourceType || options.sourceContract?.source_type || "", options.sourceContract) === "email" ? "" : "Context-note cap: cite at most six distinct context notes per task. The primary note is always source (1) and does not count against this cap. When more than six context notes are materially relevant, select the six most material; the plugin assigns context citation numbers consecutively from (2) for each description.",
           structuredEvidence ? "Immutable evidence rules: return scope_id, evidence_ids, fact_refs, and fact_bindings on each description object. Each fact_binding must be {factId,type,role,evidenceId,scopeId}, copied from the task-local factsById/evidenceById contract only; all IDs and bindings must be subsets of that closed contract, include the current-source evidence/fact and task action binding, and remain unique. The validator ignores any unrecognized ID." : "",
           "Task-local evidence rule: use concrete wording from existingSubtasks, workingContext, and mandatoryRequestFacts when it adds supported intent, object, dependency, recipient, or criteria for this task; currentDescription and labels are scope hints, not permission to invent source facts.",
           "Description focus: write direct execution sentences in description_sentences. A natural action sentence may overlap the task title once, but a title-only or slight-restatement description is invalid; incorporate every supplied task-local fact that materially changes how the work should be understood or performed, including applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, useful history or handoff, remaining action, and links. Keep descriptions complete. When the task-local evidence bundle supports multiple execution dimensions, use multiple complete natural sentences; use one sentence only when the entire bundle truly supports no additional material execution detail beyond the action. Do not invent or pad details.",
@@ -10573,7 +10589,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             executionDetailFactRefs: mainTasks[item.index]?.taskLocalEvidence?.executionDetailFactRefs || []
           }),
           options.sourceContract,
-          mainTasks[item.index]?.taskLocalEvidence?.citationLedger || []
+          mainTasks[item.index]?.taskLocalEvidence?.citationLedger || [],
+          vaultBasePath(this.app)
         );
         if (!sentenceValidation.valid) {
           failures.push({ taskIndex: item.index, reason: sentenceValidation.errors.join("; "), stage: "sentences" });
@@ -10608,9 +10625,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         fact_refs: structuredRefs.factRefs,
         fact_bindings: structuredRefs.factBindings,
         bundle: structuredRefs.bundle,
-        citationLedger: mainTasks[item.index]?.taskLocalEvidence?.citationLedger || [],
+        citationLedger: sentenceValidation?.citationLedger || mainTasks[item.index]?.taskLocalEvidence?.citationLedger || [],
+        descriptionSentences: sentenceValidation?.sentences || [],
         descriptionCitedEvidenceIds: sentenceValidation
-          ? uniqueValues(sentenceValidation.sentences.flatMap((sentence) => sentence.evidence_ids || []).map(String).filter(Boolean))
+          ? sentenceValidation.descriptionCitedEvidenceIds
           : undefined
       } : summary);
       }
@@ -10810,6 +10828,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         tasks[item.index].descriptionFactRefs = validated.fact_refs.slice();
         tasks[item.index].descriptionFactBindings = (validated.fact_bindings || []).slice();
         tasks[item.index].descriptionCitationLedger = (validated.citationLedger || []).slice();
+        tasks[item.index].descriptionSentences = (validated.descriptionSentences || []).slice();
         if (Array.isArray(validated.descriptionCitedEvidenceIds)) tasks[item.index].descriptionCitedEvidenceIds = validated.descriptionCitedEvidenceIds.slice();
       }
     }
@@ -28720,6 +28739,9 @@ const TASK_DESCRIPTION_HISTORY_MATERIALITY_REASONS = new Set([
   "task-semantic-history-ordinary-material-selected"
 ]);
 const TASK_DESCRIPTION_MAX_MATERIAL_FACT_REFS = 8;
+// Scale the shared optional pool with task count so each task has usable context coverage.
+const TASK_DESCRIPTION_EVIDENCE_PER_TASK_FLOOR = 8;
+const TASK_DESCRIPTION_EVIDENCE_HARD_MAX = 160;
 
 function taskDescriptionFactIsNonAction(fact = {}) {
   const normalizeMetadata = (value) => String(value || "").trim().toLowerCase().replaceAll("_", "-").replaceAll(" ", "-");
@@ -29289,9 +29311,25 @@ function taskDescriptionSentenceText(value = "") {
     .trim();
 }
 
-function renderTaskDescriptionSentences(sentences = [], citationLedger = []) {
+function insertTaskDescriptionCitationMarker(text = "", markers = "") {
+  const value = String(text || "").trim();
+  const citationText = String(markers || "").trim();
+  const terminal = value.match(/^(.*?)([.!?]+)([ \t"'”’»›)\]}]*)$/);
+  if (terminal) {
+    const body = terminal[1].trimEnd();
+    return `${body}${body ? " " : ""}${citationText}${terminal[2]}${terminal[3]}`;
+  }
+  const closing = value.match(/["'”’»›)\]}]+$/);
+  const splitIndex = closing ? closing.index : value.length;
+  const body = value.slice(0, splitIndex).trimEnd();
+  const closingText = value.slice(splitIndex);
+  return `${body}${body ? " " : ""}${citationText}.${closingText}`;
+}
+
+function renderTaskDescriptionSentences(sentences = [], citationLedger = [], retainedEvidenceIds = null) {
+  const retainedIds = retainedEvidenceIds == null ? null : new Set(Array.from(retainedEvidenceIds, String));
   const numbersByEvidenceId = new Map((citationLedger || [])
-    .filter((entry) => entry?.evidenceId && Number.isFinite(Number(entry.number)) && Number(entry.number) > 0)
+    .filter((entry) => entry?.evidenceId && Number.isFinite(Number(entry.number)) && Number(entry.number) > 0 && (!retainedIds || retainedIds.has(String(entry.evidenceId))))
     .map((entry) => [String(entry.evidenceId), Number(entry.number)]));
   return (sentences || []).map((sentence) => {
     const text = taskDescriptionSentenceText(sentence?.text || "");
@@ -29299,12 +29337,12 @@ function renderTaskDescriptionSentences(sentences = [], citationLedger = []) {
       .map((evidenceId) => numbersByEvidenceId.get(evidenceId))
       .filter((number) => Number.isFinite(number) && number > 0)
       .filter((number, index, values) => values.indexOf(number) === index);
-    const narrative = /[.!?]$/.test(text) ? text : `${text}.`;
-    return `${narrative}${citations.length ? ` ${citations.map((number) => `(${number})`).join(" ")}` : ""}`;
+    if (!citations.length) return /[.!?]$/.test(text) ? text : `${text}.`;
+    return insertTaskDescriptionCitationMarker(text, citations.map((number) => `(${number})`).join(" "));
   }).join(" ").trim();
 }
 
-function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs = {}, sourceContract = null, citationLedger = []) {
+function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs = {}, sourceContract = null, citationLedger = [], basePath = "") {
   const errors = [];
   const rawSentences = Array.isArray(item.description_sentences) ? item.description_sentences : [];
   if (!rawSentences.length) return { valid: false, errors: ["description-sentence-missing"], sentences: [], rendered: "" };
@@ -29391,11 +29429,33 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
     }
   }
   const uniqueErrors = uniqueValues(errors);
+  const citedEvidenceIds = uniqueValues(sentences.flatMap((sentence) => sentence.evidence_ids || []).map(String).filter(Boolean));
+  const workflowSourceType = normalizeDescriptionWorkflowSourceType(
+    sourceContract?.sourceType || sourceContract?.source_type || sourceContract?.type || "",
+    sourceContract
+  );
+  const displayableCitedLedger = workflowSourceType === "email"
+    ? citationLedger
+    : (citationLedger || [])
+      .filter((entry) => entry && Number.isInteger(Number(entry.number)) && Number(entry.number) > 0 && entry.evidenceId)
+      .filter((entry) => citedEvidenceIds.includes(String(entry.evidenceId)))
+      .filter((entry) => entry.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
+      .filter((entry) => entry.path || entry.taskId || entry.sourceId || entry.title);
+  const displaySelection = workflowSourceType === "email"
+    ? { ledger: citationLedger, retainedEvidenceIds: null }
+    : capTaskDescriptionCitationLedger(displayableCitedLedger, 6, basePath);
+  const renderedCitationLedger = workflowSourceType === "email" ? citationLedger : displaySelection.ledger;
+  const renderedCitedEvidenceIds = workflowSourceType === "email"
+    ? citedEvidenceIds
+    : citedEvidenceIds.filter((evidenceId) => displaySelection.retainedEvidenceIds.has(evidenceId));
   return {
     valid: uniqueErrors.length === 0,
     errors: uniqueErrors,
     sentences,
-    rendered: uniqueErrors.length ? "" : renderTaskDescriptionSentences(sentences, citationLedger)
+    rendered: uniqueErrors.length ? "" : renderTaskDescriptionSentences(sentences, renderedCitationLedger, displaySelection.retainedEvidenceIds),
+    citationLedger: renderedCitationLedger,
+    descriptionCitedEvidenceIds: renderedCitedEvidenceIds,
+    retainedEvidenceIds: displaySelection.retainedEvidenceIds
   };
 }
 
@@ -30876,6 +30936,61 @@ function descriptionSpecificEntities(value = "") {
   }).filter((entity) => entity && !/^(January|February|March|April|May|June|July|August|September|October|November|December)$/i.test(entity))).slice(0, 12);
 }
 
+function taskDescriptionSourceIdentity(entry = {}, basePath = "") {
+  return {
+    path: vaultRelativePath(entry.path || "", basePath),
+    sourceId: singleLine(entry.sourceId || ""),
+    title: singleLine(entry.title || "").replace(/\s+/g, " ").toLowerCase()
+  };
+}
+
+function sameTaskDescriptionSourceIdentity(left = {}, right = {}) {
+  if (left.path && right.path) return left.path === right.path;
+  if (left.sourceId || right.sourceId) return Boolean(left.sourceId && right.sourceId && left.sourceId === right.sourceId);
+  if (left.path || right.path) return false;
+  return Boolean(left.title && right.title && left.title === right.title);
+}
+
+function capTaskDescriptionCitationLedger(ledger = [], maxContextNotes = 6, basePath = "") {
+  const entries = Array.isArray(ledger) ? ledger : [];
+  const parsedLimit = Number(maxContextNotes);
+  const contextLimit = Number.isFinite(parsedLimit) ? Math.max(0, Math.floor(parsedLimit)) : 6;
+  const groups = [];
+  const groupByEntry = new Map();
+  for (const entry of entries) {
+    const identity = taskDescriptionSourceIdentity(entry, basePath);
+    let group = groups.find((candidate) => sameTaskDescriptionSourceIdentity(candidate.identity, identity));
+    if (!group) {
+      group = { identity, entries: [], lowestNumber: Number(entry.number), isCurrentSource: false, isNumberOne: false };
+      groups.push(group);
+    }
+    group.entries.push(entry);
+    group.lowestNumber = Math.min(group.lowestNumber, Number(entry.number));
+    group.isCurrentSource ||= entry.sourceKind === "current-source";
+    group.isNumberOne ||= Number(entry.number) === 1;
+    groupByEntry.set(entry, group);
+  }
+  const primaryGroup = groups.find((group) => group.isCurrentSource)
+    || groups.find((group) => group.isNumberOne);
+  const retainedGroups = new Set(primaryGroup ? [primaryGroup] : []);
+  const rankedContextGroups = groups
+    .filter((group) => group !== primaryGroup)
+    .sort((left, right) => right.entries.length - left.entries.length || left.lowestNumber - right.lowestNumber);
+  const orderedRetainedGroups = primaryGroup ? [primaryGroup] : [];
+  for (const group of rankedContextGroups.slice(0, contextLimit)) {
+    retainedGroups.add(group);
+    orderedRetainedGroups.push(group);
+  }
+  const numberByGroup = new Map(orderedRetainedGroups.map((group, index) => [group, index + 1]));
+  const retainedLedger = entries
+    .filter((entry) => retainedGroups.has(groupByEntry.get(entry)))
+    .map((entry) => Object.assign({}, entry, { number: numberByGroup.get(groupByEntry.get(entry)) }));
+  return {
+    ledger: retainedLedger,
+    retainedEvidenceIds: new Set(retainedLedger.map((entry) => String(entry.evidenceId || "")).filter(Boolean))
+  };
+}
+
 function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", includeSourceList = true, sourceType = "") {
   if (!includeSourceList) return "";
   const bundle = task.descriptionEvidenceBundle || task.evidenceBundle || task.taskEvidenceBundle;
@@ -30897,11 +31012,14 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
   const acceptedEvidenceIds = new Set((bundle.acceptedEvidenceIds || bundle.evidenceIds || bundle.evidence_ids || []).map(String));
   const hasTrackedCitedEvidenceIds = Array.isArray(task.descriptionCitedEvidenceIds);
   const trackedCitedEvidenceIds = new Set((task.descriptionCitedEvidenceIds || []).map(String).filter(Boolean));
-  const ledger = (task.descriptionCitationLedger || task.taskLocalEvidence?.citationLedger || [])
+  const citedLedger = (task.descriptionCitationLedger || task.taskLocalEvidence?.citationLedger || [])
     .filter((entry) => entry && Number.isInteger(Number(entry.number)) && entry.evidenceId)
     .filter((entry) => !hasTrackedCitedEvidenceIds || trackedCitedEvidenceIds.has(String(entry.evidenceId)))
     .filter((entry) => entry.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
     .filter((entry) => entry.path || entry.taskId || entry.sourceId || entry.title);
+  const ledger = workflowSourceType === "email"
+    ? citedLedger
+    : capTaskDescriptionCitationLedger(citedLedger, 6, basePath).ledger;
   if (ledger.length || hasTrackedCitedEvidenceIds) {
     const renderedCitation = (entry) => {
       const path = singleLine(entry.path || "");
@@ -30918,24 +31036,13 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     const sourceEntries = workflowSourceType === "email"
       ? ledger.filter((entry) => Number(entry.number) > 0 && entry.sourceKind !== "current-source" && !entry.taskId && !taskDescriptionTaskReferenceSourceKind(entry.sourceKind) && !/^@todoist\//i.test(String(entry.path || "")))
       : ledger.filter((entry) => Number(entry.number) > 0);
-    const sourceIdentity = (entry) => ({
-      path: vaultRelativePath(entry.path || "", basePath),
-      sourceId: singleLine(entry.sourceId || ""),
-      title: singleLine(entry.title || "").replace(/\s+/g, " ").toLowerCase()
-    });
-    const sameSourceIdentity = (left, right) => {
-      if (left.path && right.path) return left.path === right.path;
-      if (left.sourceId || right.sourceId) return Boolean(left.sourceId && right.sourceId && left.sourceId === right.sourceId);
-      if (left.path || right.path) return false;
-      return Boolean(left.title && right.title && left.title === right.title);
-    };
     const canonicalSourceEntries = new Map();
     for (const entry of sourceEntries) {
       const number = Number(entry.number);
       const existing = canonicalSourceEntries.get(number);
-      if (existing && !sameSourceIdentity(sourceIdentity(existing), sourceIdentity(entry))) return "";
+      if (existing && !sameTaskDescriptionSourceIdentity(taskDescriptionSourceIdentity(existing, basePath), taskDescriptionSourceIdentity(entry, basePath))) return "";
       for (const [existingNumber, existingEntry] of canonicalSourceEntries.entries()) {
-        if (existingNumber !== number && sameSourceIdentity(sourceIdentity(existingEntry), sourceIdentity(entry))) return "";
+        if (existingNumber !== number && sameTaskDescriptionSourceIdentity(taskDescriptionSourceIdentity(existingEntry, basePath), taskDescriptionSourceIdentity(entry, basePath))) return "";
       }
       const rank = entry.path ? 3 : entry.sourceId ? 2 : entry.title ? 1 : 0;
       const existingRank = existing ? (existing.path ? 3 : existing.sourceId ? 2 : existing.title ? 1 : 0) : -1;
@@ -30972,7 +31079,11 @@ function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFA
   const summaryInput = renderedSourceHeading
     ? descriptionText.slice(0, renderedSourceHeading.index).trim()
     : descriptionText.trim();
-  const summary = normalizeDescriptionLinks(cleanGeneratedDescriptionSummary(summaryInput, settings), linkContext, settings);
+  const hasValidatedDescriptionSentences = Array.isArray(task.descriptionSentences) && task.descriptionSentences.length > 0;
+  const cleanedSummary = hasValidatedDescriptionSentences
+    ? summaryInput
+    : cleanGeneratedDescriptionSummary(summaryInput, settings);
+  const summary = normalizeDescriptionLinks(cleanedSummary, linkContext, settings);
   if (!summary) return "";
   const sourceList = taskWorkflowEvidenceSourceList(task, active, basePath, includeSourceList, sourceType);
   const parts = [summary, sourceList].filter(Boolean);
@@ -31464,9 +31575,7 @@ function bestContextCitationNumber(text, taskTitle = "", notes = []) {
 }
 
 function appendContextCitation(text, number) {
-  const punctuation = /[.!?]$/.test(text) ? text.slice(-1) : "";
-  const body = punctuation ? text.slice(0, -1).trim() : text;
-  return `${body} (${number})${punctuation}`;
+  return insertTaskDescriptionCitationMarker(text, `(${number})`);
 }
 
 function splitCitationSentences(text) {
@@ -35782,6 +35891,12 @@ function taskWorkflowRequiredPromptBlock(sourceContract = {}, evidenceCatalog = 
   return { block: roundTrip || block, serialized, chars: serialized.length, error, hardCeiling: null, contextBudget: null };
 }
 
+function taskDescriptionEvidenceRecordCeiling(settings = DEFAULT_SETTINGS, mainTaskCount = 0) {
+  const configuredCeiling = Math.max(1, Number(settings.maxTaskContextChunks ?? 48) || 48);
+  const perTaskFloor = Math.max(0, Math.floor(Number(mainTaskCount) || 0)) * TASK_DESCRIPTION_EVIDENCE_PER_TASK_FLOOR;
+  return Math.min(TASK_DESCRIPTION_EVIDENCE_HARD_MAX, Math.max(configuredCeiling, perTaskFloor));
+}
+
 function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
   const startedAt = typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
   const settings = options.settings || DEFAULT_SETTINGS;
@@ -35797,7 +35912,10 @@ function taskWorkflowProviderEvidenceProjection(finalItems = [], options = {}) {
     itemById.set(evidenceId, normalized);
     items.push(normalized);
   }
-  const recordCeiling = Math.max(1, Number(options.recordCeiling ?? settings.maxTaskContextChunks ?? 48) || 48);
+  const configuredRecordCeiling = Math.max(1, Number(options.recordCeiling ?? settings.maxTaskContextChunks ?? 48) || 48);
+  const recordCeiling = options.descriptionTaskCount == null
+    ? configuredRecordCeiling
+    : taskDescriptionEvidenceRecordCeiling(settings, options.descriptionTaskCount);
   const factsById = new Map();
   const addFact = (fact = {}) => {
     const factId = String(fact.factId || fact.fact_id || "").trim();
@@ -37218,6 +37336,15 @@ function usesOpenAIEmbeddingModel(value) {
 }
 function aiProviderForModel(value) {
   return usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value) ? "gemini" : "openai";
+}
+function generationProviderForSelectedModel(settings = DEFAULT_SETTINGS, model = "", currentProvider = "") {
+  const selectedModel = String(model || "").trim();
+  if (usesGeminiChatModel(selectedModel)) return "gemini";
+  if (providerCatalogModels(settings, "openrouter").includes(selectedModel)) return "openrouter";
+  const normalizedOpenAIModel = normalizeOpenAIModelId(selectedModel);
+  if (providerCatalogModels(settings, "openai").some((candidate) => normalizeOpenAIModelId(candidate) === normalizedOpenAIModel)) return "openai";
+  const fallbackProvider = String(currentProvider || "").trim();
+  return fallbackProvider ? stableSupportedProvider(fallbackProvider, "openai") : "openai";
 }
 
 // Embedding identity is explicit when settings provide it.  aiProviderForModel
@@ -39607,6 +39734,13 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeWebEvidenceRows,
     providerAdapterBaseUrl,
     SemanticTodoistSettingTab,
+    // Test-only seam for the description context-cap local harness.
+    __descriptionContextCoverage: {
+      capTaskDescriptionCitationLedger,
+      renderTaskDescriptionSentences,
+      renderStructuredTaskDescription,
+      validateTaskDescriptionSentences
+    },
     // Test-only seam for the Task 7 focused harness (Node require path only;
     // not runtime/plugin API).
     allActiveWorkflowStatusItems,
@@ -39624,5 +39758,9 @@ if (typeof module !== "undefined" && module.exports) {
     semanticTaskReferenceRecords,
     semanticTaskReferenceExpectedSnapshotIds,
     semanticTaskReferenceCorpusIntegrity
+  });
+  Object.assign(module.exports, {
+    // Test-only seam for the description evidence budget local harness.
+    __descriptionEvidenceBudget: { taskWorkflowProviderEvidenceProjection }
   });
 }

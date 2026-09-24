@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.45
+
+### Task descriptions
+- Descriptions now state the materially relevant facts supplied by a task's
+  evidence bundle instead of compressing them away, so a task can be understood
+  and actioned without reopening the notes.
+- Context notes that supply a stated fact are cited in the prose and listed in
+  the appended source list. The primary note is `(1)` and at most six cited
+  context notes follow from `(2)`.
+- Citation markers are placed inside the sentence they support, before the
+  terminal punctuation, and numbering is sequential per description.
+- The description-phase evidence budget now scales with the number of generated
+  tasks, eight rows per task up to a hard maximum of 160, instead of sharing one
+  fixed budget across the whole batch. Each task now receives a usable slice of
+  its supporting evidence.
+
+### Model selection
+- Fixed the generation provider being forced to OpenAI whenever a model without
+  a Gemini-style prefix was selected. That made OpenRouter models such as
+  `deepseek/deepseek-v4.1-flash` unroutable and reverted on reload. Provider
+  selection is now catalog aware, and the primary model and provider survive a
+  settings reload.
+
 ## 0.8.44
 
 ### Note sync

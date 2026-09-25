@@ -2061,7 +2061,7 @@ function taskWorkflowSystemInstruction() {
     "For descriptions, return one continuous natural narrative paragraph containing one or more complete sentences. State evidence-backed facts directly; never refer to provided, supplied, input, or source context, never say supporting context, current context, historical context, context notes, or the notes say, and never describe the model-input container.",
     "Do not use the word context to introduce a fact in description prose, including historical execution context; state Earlier, On <date>, or the fact directly only when chronology matters.",
     "Use only the retained workflow context and the phase-specific task data supplied after it.",
-    "Never invent people, documents, links, dates, dependencies, ownership, status, decisions, or outcomes.",
+    "Never invent factual people, documents, links, source dates, dependencies, ownership, status, decisions, or outcomes. Metadata fields may be assigned as configured classifications or planning judgments, not as new source facts, only when the saved rules and this task's own evidence support them.",
     "Keep each task scope isolated from neighboring topics and preserve explicit source action facts.",
     "Treat action/requested-action facts as mandatory current-source requirements. Primary-context facts are optional same-scope summaries from adjacent source structure; use them only when they materially clarify intent, state, timing, recipient, or criteria. Keep distinct timing statements attached to their own source facts; never merge or reassign them.",
     "Use clear professional task titles: expand informal shorthand or abbreviations and correct obvious capitalization, spelling, and grammar (for example, write vacation instead of Vaca) while preserving the source's exact action, people, object, conditions, and temporal attachment. Do not add or remove scope.",
@@ -2071,7 +2071,7 @@ function taskWorkflowSystemInstruction() {
     TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
     "For every task and subtask, use only supplied scope_id, evidence_ids, fact_refs, and fact_bindings from the current source contract and bounded evidence catalog. Each fact_binding is {factId,type,role,evidenceId,scopeId} and must exactly match the immutable catalog fact metadata. Main tasks must include current-source evidence and at least one current-source fact; subtasks inherit only their parent scope when the supplied contract permits it.",
     "Enforce phase shapes exactly: task-structure phases return section_name:\"\" and descriptions:[]; description phases return section_name:\"\" and tasks:[]; only section-title phases may populate section_name and must keep tasks and descriptions empty.",
-    "Resolve relative source terms such as today or tomorrow only from authoritative source note/date metadata in the workflow context when that source date is established. If no authoritative source date is established, preserve the source phrase; never resolve it from the execution date or invent a date.",
+    "Resolve relative source terms such as today or tomorrow only from authoritative source note/date metadata in the workflow context when that source date is established. If no authoritative source date is established, preserve the source phrase; never resolve source-relative terms from the current local planning date or execution date, and never invent a source date.",
     "Copy every supplied scope_id, evidence_id, fact_ref, and fact_binding exactly from the current task-local contract; never reuse IDs or bindings from another task, note, or request.",
     "In description phases, every taskLocalEvidence.priorityFacts row is required unless it is marked conflicting or rejected. This includes every materialDescriptionFactRefs ID. Resolve each priority ID through shared factsById, state its exact content accurately in a natural execution sentence, and carry that row's exact factId in fact_refs and evidenceId in evidence_ids; the containing description object must include the exact matching fact_binding. Never bind or cite without stating the supported content. Use separate sentences when priority facts add distinct current-state, history, criteria, or dependency dimensions; label a fact as history only when its temporal relation is historical, not merely because its timestamp is old, and preserve current direction.",
     "candidateSupportingFactRefs is an optional ID-only shortlist for semantic evidence navigation, not a mandatory narrative set. Resolve each optional ID through shared factsById and select a candidate only when removing it would change execution, current state, decision criteria, reviewer or recipient, dependency, timing, or handoff; if selected, state it directly and return its exact evidence ID, fact ID, and binding. Omit stale availability, expired scheduling, merely related facts, and evidence-container narration. PriorityFacts, including materialDescriptionFactRefs, remain the only mandatory narrative facts.",
@@ -9963,6 +9963,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           ? "Create task structure only for the exact failed source-action scopes in the closed recovery contract below. Do not create, repeat, or reference sibling scopes."
           : "Create Todoist task structure from the shared workflow context.",
         recoveryClosure?.instructions || instructions,
+        `Current local planning date (device local): ${today()}. Use it only as an anchor for a saved due-date planning rule that permits inference; never use it as a source date or to resolve relative terms found in source text.`,
         `Prompt profile guidance: ${promptProfile.taskGuidance}`,
         TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE,
         `Fallback section name if the Section title instructions cannot be applied: ${recoveryClosure ? "" : source.sectionName || ""}`,
@@ -10333,7 +10334,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     parsed.taskWorkflowContextBundle = workflowContext;
     parsed.contextBundle = workflowContext;
     parsed.adaptiveContextDepth = adaptivePack.depth;
-    parsed.allowedLabels = Array.from(allowedLabels);
+    parsed.allowedLabels = allowedLabels == null ? null : Array.from(allowedLabels);
     parsed.requestedActionSignals = requestedActionSignals;
     parsed.sourceContract = sourceContract;
     parsed.sourceContractId = sourceContract.id;
@@ -11888,7 +11889,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       taskCount: generationMainTaskLimit(this.settings) + generationSubtaskLimit(this.settings),
       validationRepair: true
     });
-    const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+    const allowedLabels = plan.allowedLabels == null
+      ? null
+      : new Set(plan.allowedLabels.map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
     let repairSeedTasks = tasks;
     let currentCoverage = coverage;
     let currentHierarchyIssues = hierarchyIssues;
@@ -27569,13 +27572,18 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "- Hierarchy: when one outcome requires several steps, use a clear parent title that names the overall deliverable or completion outcome. Put review criteria, checks, recipients, dependencies, and handoffs in subtasks instead of listing the full checklist in the parent title.",
     "- Relevance: do not turn background discussion, quoted history, another person's completed work, or loosely related vault context into a task.",
     "- Separation: create distinct main tasks only when they have different immediate actions or independently completable outcomes; do not split one requested outcome into paraphrased task records.",
+    "Metadata requirements:",
+    "- For every task and subtask, independently evaluate labels, priority, due_date, and deadline_date under the saved instructions. Use only that task's own evidence. Empty labels, priority 1, and null dates are valid when no different value is supported; do not force nonempty or changed fields.",
+    "- Apply a saved rule to task-owned meaning when it permits semantic inference. Do not require literal hashtags, priority markers, or ISO date tokens unless the saved instruction explicitly requires them.",
+    "- Metadata choices are classifications or planning judgments, not permission to add unsupported facts to task titles or descriptions. Preserve configured label names and priority rules.",
     `- Section title: Return one section_name for the full generated task group. Follow this setting exactly: ${taskInstructions.sectionTitle || "Create one Todoist section for tasks from the same source."}`,
     `- Labels: ${taskInstructions.tags || "Do not add labels unless explicitly instructed."}`,
     `- Priority: ${taskInstructions.priorities || "Assign priority 1 to 4."}`,
     "Dates and deadlines:",
     `- Follow this setting exactly: ${taskInstructions.dates || "Use YYYY-MM-DD dates only when supported by the source."}`,
     "- due_date and deadline_date are independent. Do not copy due_date into deadline_date or deadline_date into due_date unless the setting explicitly says to mirror them.",
-    "- Use null for any due_date or deadline_date that is not supported by the source and the setting. If the setting says deadlines require explicit source language, deadline_date must be null unless the source explicitly indicates a deadline.",
+    "- A saved due-date planning rule may use this task's own timing, urgency, or complexity evidence and the supplied current local planning date when that rule permits inference; do not force a due date when the rule and evidence do not support one.",
+    "- When the saved date instructions require an explicit deadline, set deadline_date only when this task's own evidence explicitly states one. Otherwise, follow the saved planning rule using task-owned timing, urgency, complexity, and the supplied current local planning date only when that rule permits it. Never create a deadline merely by copying a due date.",
     "- Descriptions: leave description empty in this JSON step; descriptions are generated separately.",
     "",
     "Subtask requirements:",
@@ -30933,7 +30941,9 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     requestSignals,
     sourceType: options.source || "note"
   });
-  const allowedLabels = new Set((plan.allowedLabels || []).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
+  const allowedLabels = plan.allowedLabels == null
+    ? null
+    : new Set(plan.allowedLabels.map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
   const seenTitles = new Set();
   let subtaskCount = 0;
   let labelCount = 0;
@@ -30970,7 +30980,7 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
     const taskLabels = (task.labels || []).map(cleanLabel).filter(Boolean);
     labelCount += taskLabels.length;
     if (new Set(taskLabels.map((label) => label.toLowerCase())).size !== taskLabels.length) addIssue("duplicate-label", index);
-    if (!task.id && taskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("label-not-allowed", index);
+    if (!task.id && allowedLabels && taskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("label-not-allowed", index);
     const seenSubtasks = new Set();
     for (const [subtaskIndex, subtask] of (task.subtasks || []).entries()) {
       subtaskCount += 1;
@@ -30987,7 +30997,7 @@ function generatedTaskWorkflowQualityReport(tasks = [], plan = {}, options = {},
       }
       const subtaskLabels = (subtask.labels || []).map(cleanLabel).filter(Boolean);
       labelCount += subtaskLabels.length;
-      if (!subtask.id && subtaskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("subtask-label-not-allowed", index);
+      if (!subtask.id && allowedLabels && subtaskLabels.some((label) => !allowedLabels.has(label.toLowerCase()))) addIssue("subtask-label-not-allowed", index);
       if (subtask.due_date && !validDate(subtask.due_date)) addIssue("invalid-subtask-due-date", index);
       if (subtask.deadline_date && !validDate(subtask.deadline_date)) addIssue("invalid-subtask-deadline-date", index);
     }

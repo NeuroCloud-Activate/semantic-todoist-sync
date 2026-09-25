@@ -54,6 +54,8 @@ Use `#STsync` on main tasks and `#STSubSync` on subtasks. Required-action hashta
 
 Task workflow instructions control labels, priorities, and dates. Named `#tags` in the label instructions form an allowlist; without named tags, the model can choose labels supported by the task. Use only `do not add labels` to disable labels. Explicit task markers use `!!1`–`!!4` for Todoist API priority (4 is highest), `📅 YYYY-MM-DD` for a due date, and `{{YYYY-MM-DD}}` for a deadline. Descriptions use relevant note evidence to explain the action and its purpose, with citations before the sentence punctuation and a source list below.
 
+You don't need to add metadata markers to every note. The model applies your label and priority rules to the task's meaning. If your date instructions allow estimates, it can plan due dates and deadlines from today's date, urgency, and workload. These are planning decisions, not dates claimed by the note. Your explicit-only rules and subtask restrictions remain in the request; fields without support can stay empty.
+
 Schedule Today's Tasks always shows a preview before you apply changes. You can undo the last applied schedule.
 
 ## Output quality and privacy

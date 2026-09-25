@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.46
+
+### Task generation and sync
+- Preserve the primary note's validated action evidence when refreshing semantic
+  context. This prevents valid tasks, including their labels, priorities, due
+  dates, and deadlines, from being replaced with empty-field fallback tasks.
+- Keep model-selected labels when no label allowlist is configured, while
+  honoring named allowlists and the explicit option to disable labels.
+- Fill missing main-task fields from their own explicit priority, due-date,
+  deadline, and permitted-label evidence without overwriting generated values.
+- Recognize unchecked checkboxes as action scopes, keep inline dates with their
+  owning action, and preserve section names containing `&` during note sync.
+- Ask descriptions to explain the task's purpose when the supplied evidence
+  supports it.
+- Preserve citation-bearing descriptions through sync and local caching, so
+  useful sentences and their source references remain together.
+- Exclude empty headings and tag-only metadata from supporting task evidence.
+
+### Semantic scoring
+- Run exact semantic scoring as local background work, keeping the same scores and evidence selection.
+- Let Obsidian process UI events between batches of index metadata preparation during search and task generation, preserving evidence IDs and task relationships.
+- Fall back to the existing local scoring path when background workers are unavailable, with no new settings or provider changes.
+
 ## 0.8.45
 
 ### Task descriptions

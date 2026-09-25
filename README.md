@@ -11,7 +11,7 @@ Requires Obsidian 1.5.0 or later. Desktop, iPhone, and iPad are supported.
 
 ## What it does
 
-- **Search and chat:** Ask questions about relevant vault notes and follow links to the source. Internet Search and Deep Research are optional and off by default.
+- **Search and chat:** Ask questions about relevant vault notes and follow links to the source. Semantic scoring runs as local background work on your device. Internet Search and Deep Research are optional and off by default.
 - **Notes to Todoist:** Turn a note, selection, email, or prompt template into tasks, subtasks, and task descriptions.
 - **Sync and deduplication:** Keep note tasks and Todoist state aligned while preserving local references and distinct work.
 - **Schedule Today's Tasks:** Preview a plan for the day, adjust it, then apply or undo its Todoist changes.
@@ -51,6 +51,8 @@ Custom OpenAI-compatible supports model discovery, chat completions, and embeddi
 Use **Ask**, **Tasks**, **Index**, and **Run** from the sidebar. The command palette also has note sync, email processing, scheduling, and undo.
 
 Use `#STsync` on main tasks and `#STSubSync` on subtasks. Required-action hashtags are configurable; `#todo` is the shipped default. These markers are required coverage anchors, but they are not an exclusive filter: clearly actionable, unmarked content in the selected note can still be considered.
+
+Task workflow instructions control labels, priorities, and dates. Named `#tags` in the label instructions form an allowlist; without named tags, the model can choose labels supported by the task. Use only `do not add labels` to disable labels. Explicit task markers use `!!1`–`!!4` for Todoist API priority (4 is highest), `📅 YYYY-MM-DD` for a due date, and `{{YYYY-MM-DD}}` for a deadline. Descriptions use relevant note evidence to explain the action and its purpose, with citations before the sentence punctuation and a source list below.
 
 Schedule Today's Tasks always shows a preview before you apply changes. You can undo the last applied schedule.
 

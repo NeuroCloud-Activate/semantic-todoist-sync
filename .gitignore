@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 /Testing/
+/AI_SESSION_HANDOFF.md
 /public-share/
 node_modules/
 *.log

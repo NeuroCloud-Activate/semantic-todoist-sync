@@ -38,7 +38,7 @@ try {
   testModule._compile(
     `${mainSource}\nmodule.exports.__testTaskSelectedNoteMateriality = {\n` +
       "  buildTaskSourceContract, taskSemanticCurrentSourceCandidateDecision, buildTaskEvidenceCatalog,\n" +
-      "  attachTaskWorkflowSemanticEvidence, taskWorkflowContextBundle, attachTaskWorkflowEvidenceBundles,\n" +
+      "  attachTaskWorkflowSemanticEvidence, taskWorkflowContextBundle, resolveTaskWorkflowReferences,\n" +
       "  taskDescriptionRichLocalPayload, validateTaskDescriptionSentences\n" +
       "};\n",
     mainPath
@@ -55,7 +55,7 @@ const {
   buildTaskEvidenceCatalog,
   attachTaskWorkflowSemanticEvidence,
   taskWorkflowContextBundle,
-  attachTaskWorkflowEvidenceBundles,
+  resolveTaskWorkflowReferences,
   taskDescriptionRichLocalPayload,
   validateTaskDescriptionSentences
 } = pluginApi.__testTaskSelectedNoteMateriality;
@@ -224,7 +224,7 @@ check(failures, "the exact current-note chunk survives provider projection", () 
   assert.ok(contextBundle.contextBundleValidation.dispatchAllowed);
 });
 
-const attached = attachTaskWorkflowEvidenceBundles(
+const attached = resolveTaskWorkflowReferences(
   [initialTask],
   sourceContract,
   contextBundle.providerEvidenceCatalog,
@@ -263,9 +263,9 @@ const validation = validateTaskDescriptionSentences(omittedNarrative, task, {
   executionDetailFactRefs: [],
   bundle: task.evidenceBundle
 }, sourceContract, local.citationLedger, source.path);
-check(failures, "sentence validation rejects prose that omits the admitted material current-note fact", () => {
-  assert.equal(validation.valid, false);
-  assert.ok(validation.errors.includes(`description-sentence-material-fact-omitted:${positive.fact.factId}`), validation.errors.join("; "));
+check(failures, "sentence validation does not reject prose that omits the advisory material current-note fact", () => {
+  assert.ok(!validation.errors.some((error) => String(error).startsWith("description-sentence-material-fact-omitted")), validation.errors.join("; "));
+  assert.equal(validation.valid, true, validation.errors.join("; "));
 });
 
 if (task?.evidenceBundle) {

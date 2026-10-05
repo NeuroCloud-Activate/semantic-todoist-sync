@@ -232,18 +232,19 @@ captureRegression("sibling, ambiguous, non-current, or mismatched facts cannot f
   }
 });
 
-captureRegression("configured label rules apply only when title or task evidence matches", () => {
+captureRegression("field completion preserves model labels without interpreting configured prose", () => {
   assert.strictEqual(typeof seams.completeEmptyGeneratedTaskFields, "function", "task-field completion seam must be available");
   const matching = sourceTask("Review Example Research audit");
   const nonMatching = sourceTask("Prepare annual vacation request");
+  nonMatching.labels = ["Planning"];
   const instructions = "Add #Compliance for tasks involving Example Research.";
   seams.completeEmptyGeneratedTaskFields([matching, nonMatching], {
     sourceEvidence: "- Review Example Research audit\n- Prepare annual vacation request",
     labelInstructions: instructions,
     settings: Plugin.DEFAULT_SETTINGS
   });
-  assert.deepStrictEqual(matching.labels, ["Compliance"], "a matching rule must add its configured label");
-  assert.deepStrictEqual(nonMatching.labels, [], "a non-matching rule must not add a label");
+  assert.deepStrictEqual(matching.labels, [], "word overlap must not invent a model-omitted label");
+  assert.deepStrictEqual(nonMatching.labels, ["Planning"], "field completion must not reinterpret model labels");
 });
 
 if (failures.length) throw new Error(`task field completion regressions failed:\n${failures.join("\n")}`);

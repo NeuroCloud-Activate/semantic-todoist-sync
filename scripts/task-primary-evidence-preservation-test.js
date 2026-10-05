@@ -52,7 +52,7 @@ const {
   buildTaskEvidenceCatalog,
   buildTaskSourceContract,
   attachTaskWorkflowSemanticEvidence,
-  attachTaskWorkflowEvidenceBundles,
+  resolveTaskWorkflowReferences,
   structuredMarkedActionFactCoverage,
   supplementMissingStructuredMarkedActionTasks,
   taskWorkflowOwnershipKey
@@ -62,7 +62,7 @@ for (const name of [
   "buildTaskEvidenceCatalog",
   "buildTaskSourceContract",
   "attachTaskWorkflowSemanticEvidence",
-  "attachTaskWorkflowEvidenceBundles",
+  "resolveTaskWorkflowReferences",
   "structuredMarkedActionFactCoverage",
   "supplementMissingStructuredMarkedActionTasks",
   "taskWorkflowOwnershipKey"
@@ -140,7 +140,7 @@ function runReadySecondaryHandoff(providerTask, {
   postContext = [{ id: SECONDARY_EVIDENCE_ID, evidenceId: SECONDARY_EVIDENCE_ID }],
   preStructureEvidenceIds = []
 } = {}) {
-  const seed = attachTaskWorkflowEvidenceBundles([providerTask], contract, catalog, {});
+  const seed = resolveTaskWorkflowReferences([providerTask], contract, catalog, {});
   if (requireValidSeed) {
     assert.equal(seed.rejected.length, 0,
       `initial provider task must pass bundle validation: ${JSON.stringify(seed.rejected.map((entry) => entry.errors))}`);
@@ -165,7 +165,7 @@ function runReadySecondaryHandoff(providerTask, {
       [scopeId]: { scopeId, evidenceIds: preStructureEvidenceIds, context: preStructureContext }
     } : {}
   }, retrieval);
-  const final = attachTaskWorkflowEvidenceBundles([task], contract, catalog, {});
+  const final = resolveTaskWorkflowReferences([task], contract, catalog, {});
   const coverage = structuredMarkedActionFactCoverage(final.tasks, contract);
   const supplementation = coverage.passed
     ? { tasks: final.tasks, addedFactIds: [], unresolvedFactIds: [] }
@@ -216,9 +216,9 @@ function runReadySecondaryHandoff(providerTask, {
   assert.equal(result.final.tasks[0].deadline_date, "2026-10-20");
 }
 
-// A malformed primary binding must not become valid through primary-ID
-// preservation. This task skips the initial-validity precondition so it
-// specifically guards the safety boundary of the candidate fix.
+// A malformed primary binding must not launder the sibling-scope input: under
+// Task 2 existence-only resolution the node is kept, provided bindings are
+// discarded, and bindings are re-derived from the real local fact directory.
 {
   const malformed = buildProviderTask({
     fact_bindings: bindingsForScope().map((binding) => binding.factId === actionFact.factId
@@ -226,10 +226,12 @@ function runReadySecondaryHandoff(providerTask, {
       : binding)
   });
   const result = runReadySecondaryHandoff(malformed, { requireValidSeed: false });
-  assert.equal(result.final.tasks.length, 0, "foreign sibling-scope action binding must remain rejected");
-  assert.equal(result.final.rejected.length, 1, "invalid binding must continue through the documented rejection path");
-  assert.ok(!result.task.fact_bindings.some((binding) => binding.factId === actionFact.factId && binding.scopeId === scopeId),
-    "preservation must not synthesize a valid local binding for a sibling-scope input");
+  assert.equal(result.final.tasks.length, 1, "existence-only resolution must keep the node");
+  assert.equal(result.final.rejected.length, 0, "existence-only resolution never rejects");
+  assert.ok(result.final.tasks[0].fact_bindings.some((binding) => binding.factId === actionFact.factId && binding.scopeId === scopeId),
+    "derived binding must come from the local fact directory");
+  assert.ok(!result.final.tasks[0].fact_bindings.some((binding) => binding.scopeId === "scope-foreign-sibling"),
+    "sibling-scope input binding must not survive resolution");
 }
 
 console.log(`Task primary evidence preservation: passed (${sourcePath === mainPath ? "repository source" : "source override"}).`);

@@ -47,7 +47,7 @@ class FakeSetting {
   setDesc(value) { this.description = value; return this; }
   setHeading() { return this; }
   addDropdown(callback) {
-    const control = { options: [], value: '', addOption: (value, label) => control.options.push({ value, label }), setValue: (value) => { control.value = value; return control; }, onChange: (handler) => { control.change = handler; return control; } };
+    const control = { options: [], value: '', disabled: false, addOption: (value, label) => control.options.push({ value, label }), setValue: (value) => { control.value = value; return control; }, setDisabled: (value) => { control.disabled = Boolean(value); return control; }, onChange: (handler) => { control.change = handler; return control; } };
     control.selectEl = new FakeElement('select');
     callback(control);
     this.control = control;
@@ -67,7 +67,7 @@ class FakeSetting {
     return this;
   }
   addButton(callback) {
-    const control = { setButtonText: (value) => { control.label = value; return control; }, setCta: () => control, onClick: (handler) => { control.click = handler; return control; } };
+    const control = { label: '', disabled: false, setButtonText: (value) => { control.label = value; return control; }, setCta: () => { control.isCta = true; return control; }, setWarning: () => { control.isWarning = true; return control; }, setDisabled: (value) => { control.disabled = Boolean(value); return control; }, onClick: (handler) => { control.click = handler; return control; } };
     callback(control);
     this.control = control;
     return this;
@@ -249,6 +249,8 @@ const plugin = Object.assign(Object.create(Plugin.prototype), {
   settings: Plugin.normalizeStableSettings({ enableMultiProviderOperationModels: true, providerGenerationModels: { openrouter: ['openai/gpt-5.6-luna'] }, providerEmbeddingModels: { customopenai: ['qwen3-embedding-0.6b-8k:latest'] } }),
   app: { vault: { getAllLoadedFiles: () => [] } },
   semanticIndex: [],
+  savedData: null,
+  saveDataCalls: 0,
   saveCount: 0,
   refreshCount: 0,
   testCount: 0,
@@ -256,7 +258,12 @@ const plugin = Object.assign(Object.create(Plugin.prototype), {
   getPromptTemplates: async () => [],
   openwebuiLoginPassword: '',
   refreshOpenAIModels: async function () { this.refreshCount += 1; },
-  validateAiSetup: async function () { this.testCount += 1; }
+  validateAiSetup: async function () { this.testCount += 1; },
+  // Faithful in-memory persistence: the production plugin persists the
+  // task-reference-table-stripped settings snapshot via saveData; here we
+  // capture that exact snapshot in memory (no disk) so the queued-save drain
+  // can be asserted deterministically.
+  saveData: async function (data) { this.savedData = data; this.saveDataCalls += 1; return data; }
 });
 plugin.sameProviderFallbackModels = Plugin.prototype.sameProviderFallbackModels.bind(plugin);
 plugin.displayName = 'test';
@@ -318,6 +325,20 @@ assert.ok(typedSetting?.control?.change, 'provider model input is rendered');
   const renamedRoot = new FakeElement('section');
   tab.renderAiProviders(renamedRoot);
   assert.ok(collect(renamedRoot, (element) => element.textContent === 'Local Gateway connection').length === 1, 'trimmed title replaces the custom disclosure label');
+  // The render flow above (renderInactiveSemanticIndexPurge inventory failure ->
+  // plugin.logLocal -> production queueSettingsSave()) schedules a 4000ms timer
+  // that would fire flushQueuedSettingsSave -> saveData after the assertions.
+  // Drain it deterministically here rather than sleeping: flushQueuedSettingsSave
+  // clears the timer and runs the queued save exactly once (same as the real
+  // unload path), so no delayed save error can print after the process ends.
+  const queuedBeforeDrain = plugin.settingsSaveQueued;
+  const flushedQueue = await plugin.flushQueuedSettingsSave();
+  assert.strictEqual(queuedBeforeDrain, true, 'render flow scheduled a queued settings save');
+  assert.strictEqual(flushedQueue, true, 'queued settings save drains to a single save');
+  assert.strictEqual(plugin.settingsSaveQueued, false, 'no queued settings save remains pending');
+  assert.strictEqual(plugin.settingsSaveTimer, null, 'scheduled timer drained, no delayed save');
+  assert.strictEqual(plugin.saveDataCalls, 1, 'queued save persisted exactly once on drain');
+  assert.strictEqual(plugin.savedData.customOpenAIConnectionTitle, '  Local Gateway  ', 'queued save persisted current in-memory settings');
   console.log('provider-settings-local-test: PASS');
 })().catch((error) => {
   console.error(error);

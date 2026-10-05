@@ -35,7 +35,6 @@ function makePlugin(settings = {}) {
     chatModel: 'fictional-generation-model',
     chatWebSearchProvider: 'openrouter',
     chatWebSearchModel: 'fictional-search-model',
-    chatWebSearchMode: 'off',
     chatWebSaveResearch: false,
     autoAddActiveContentToContext: false,
     openrouterApiKey: 'FICTIONAL_OPENROUTER_KEY',

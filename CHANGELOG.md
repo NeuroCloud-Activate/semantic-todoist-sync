@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.1 - 2026-10-05
+
+### Added
+- Live status for every AI step with a running timer (for example "Writing descriptions: 4 of 10 · 1:12"), ending with a result line, including Ask. Status messages never include note names.
+- New "Parallel description requests" setting (default 4, range 1-8; Open WebUI stays at 1) so task descriptions are written in parallel.
+- The task deduplication toggle now also controls linking new tasks to existing Todoist tasks by exact title. When off, existing Todoist tasks are never touched.
+- Optional cleanup of unused inactive semantic indexes to free space; only the indexes you confirm are removed.
+- Reasoning control for every provider: the reasoning setting now works for OpenRouter, LiteLLM-style gateways, Open WebUI, and custom endpoints. The plugin discovers what each model supports from the endpoint's model list and from the model's own replies (no extra requests), and a new "Check model capabilities" button runs a quick one-time test. OpenRouter now receives its documented reasoning field.
+- New "Automatic" reasoning setting (the new default): uses the model's recommended level. DeepSeek V4.1 Flash is set to Low automatically (in testing, a full 10-task run went from about 25 minutes to about 4 minutes with about 57% fewer tokens and the same task quality); every other model sends nothing extra, exactly as before. Your explicit choice always wins.
+- If an endpoint rejects a reasoning setting, the plugin finishes the request without it, switches that model's row to Provider default with a short note, and keeps it there until you pick a value again.
+
+### Changed
+- The "Sync note tasks with Todoist" command now has an internal id without the plugin name in it, to follow Obsidian's submission rules. Its name in the command palette is unchanged; if you assigned a hotkey to it, set it again in Settings > Hotkeys.
+- The reasoning setting's shipped default is now "Automatic". A previously stored "Provider default" is moved to "Automatic" once (a one-time migration); anyone who wants nothing sent can choose "Provider default" again. Other stored values are untouched.
+- Task descriptions keep valid output with a warning instead of being blocked by description-quality warnings.
+- Failed email runs pause just that email instead of retrying forever; use Resume in settings to try again.
+- Clearer ownership when one marked action splits into steps, plus richer task planning (priorities and dates) when your rules allow it.
+- Removed the 2-minute provider request limit; requests now run until the provider answers or you cancel.
+- Debug logging stays off by default and needs a small collector on your own computer to view.
+
+### Fixed
+- Open WebUI works again as a provider, including connection address handling, streamed replies, sign-in, and clearer messages when embeddings are misconfigured.
+- Ask, Internet Search, and Deep Research answers now actually use the web pages found; long redirect links no longer clutter requests, and web text is treated as untrusted source material.
+- Retrieved evidence was checked against an independent reference and matches; references that cannot be resolved are skipped quietly instead of failing a run.
+- Readable source references, stale index and status messages fixed, and the sidebar status area stays visible in short sidebars.
+
+### Performance
+- Much faster task generation: the plugin's own work on a typical real note dropped from about 12 minutes to about 1.5 minutes (about 8x), and a real end-to-end run of 10 tasks with descriptions finished in about 3.6 minutes. Waiting on your model provider is now the main cost.
+- Much lighter on memory: peak use down about a third in the heaviest test, and temporary memory now frees itself when idle (caches observed empty about 2 minutes after finishing) instead of being held.
+- Compared five models head to head on a real note; see the README.
+
+### Known limits
+- Google search results can still show Google redirect links in References.
+- In-app speed depends on your model provider.
+- Model comparison covers one real note, one run per model, scored by AI reviewers: treat the ranking in the README as a rough guide; GLM 5.3 Flash did not complete.
+
 ## 0.8.46
 
 ### Task generation and sync

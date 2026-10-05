@@ -68,11 +68,15 @@
   min-width: 0;
 }
 
-.semantic-todoist-settings .setting-item-control select {
-  flex: 0 1 min(100%, 360px);
+.semantic-todoist-settings .setting-item-control select,
+.semantic-todoist-settings .setting-item-control input[type="text"],
+.semantic-todoist-settings .setting-item-control input[type="password"],
+.semantic-todoist-settings .setting-item-control input[type="number"],
+.semantic-todoist-settings .setting-item-control input[type="time"] {
+  flex: 0 1 360px;
   max-width: 100%;
-  min-width: min(220px, 100%);
-  width: 100%;
+  min-width: 0;
+  width: 360px;
 }
 
 .semantic-todoist-settings input,
@@ -318,6 +322,18 @@
   padding: 12px;
 }
 
+.semantic-todoist-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
 .semantic-todoist-header {
   display: flex;
   gap: 8px;
@@ -328,19 +344,26 @@
   flex: 1 1 auto;
   margin: 0;
   min-width: 0;
+  font-size: var(--font-ui-medium, 1em);
+  line-height: 1.2;
 }
 
 .semantic-todoist-header button {
   border-radius: 6px;
   flex: 0 0 auto;
+  height: 26px;
+  min-height: 26px;
 }
 
 .semantic-todoist-header-icon {
   align-items: center;
   display: inline-flex;
   justify-content: center;
-  min-width: 34px;
-  padding-inline: 6px;
+  height: 26px;
+  min-height: 26px;
+  min-width: 26px;
+  padding-inline: 4px;
+  width: 26px;
 }
 
 .semantic-todoist-note-row {
@@ -533,8 +556,9 @@
   align-items: center;
   display: inline-flex;
   justify-content: center;
+  height: 26px;
   line-height: 1;
-  min-height: 34px;
+  min-height: 26px;
   padding-block: 0;
   text-align: center;
   white-space: nowrap;
@@ -561,8 +585,9 @@
   color: var(--text-muted);
   display: inline-flex;
   justify-content: center;
-  min-height: 44px;
-  min-width: 44px;
+  height: 26px;
+  min-height: 26px;
+  min-width: 26px;
   padding: 0;
 }
 
@@ -590,7 +615,8 @@
 
 .semantic-todoist-action-row select {
   border-radius: 6px;
-  min-height: 34px;
+  height: 26px;
+  min-height: 26px;
   width: 100%;
 }
 
@@ -601,7 +627,7 @@
   overflow: auto;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 280px;
+  min-height: 0;
   background: var(--background-primary);
   user-select: text;
   -webkit-user-select: text;
@@ -706,9 +732,9 @@
 
 .semantic-todoist-status {
   flex: 0 0 auto;
-  min-height: calc(2 * 1.25em + 8px);
-  max-height: calc(2 * 1.25em + 8px);
-  overflow: hidden;
+  max-height: 30vh;
+  overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   padding: 4px 7px;
@@ -716,12 +742,14 @@
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.25;
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-overflow-scrolling: touch;
 }
 
 .semantic-todoist-status-line {
   display: block;
   white-space: normal;
-  overflow: hidden;
   overflow-wrap: anywhere;
 }
 
@@ -913,6 +941,13 @@
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   text-align: right;
+}
+
+/* Narrow panes: the fixed value column cannot fit beside the slider. */
+@media (max-width: 420px) {
+  .semantic-todoist-weight-control {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .semantic-todoist-schedule-modal {
@@ -1262,6 +1297,15 @@
     width: 100%;
   }
 
+  .semantic-todoist-settings .setting-item-control input[type="text"],
+  .semantic-todoist-settings .setting-item-control input[type="password"],
+  .semantic-todoist-settings .setting-item-control input[type="number"],
+  .semantic-todoist-settings .setting-item-control input[type="time"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+  }
+
   .semantic-todoist-settings .setting-item-control button {
     min-height: 40px;
     margin-inline-start: 0;
@@ -1292,6 +1336,7 @@
 
   .semantic-todoist-header h3 {
     font-size: 1.05em;
+    line-height: 1.2;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1301,6 +1346,7 @@
   .semantic-todoist-header button,
   .semantic-todoist-toolbar button {
     font-size: var(--font-ui-small);
+    height: 30px;
     min-height: 30px;
   }
 
@@ -1360,7 +1406,7 @@
   }
 
   .semantic-todoist-conversation {
-    min-height: 160px;
+    min-height: 0;
     flex-basis: 0;
     padding: 6px;
   }
@@ -1387,6 +1433,7 @@
 
   .semantic-todoist-action-row select {
     font-size: var(--font-ui-small);
+    height: 30px;
     min-height: 30px;
   }
 
@@ -1395,9 +1442,8 @@
     max-height: 15vh;
   }
 
-  .semantic-todoist-status {
-    min-height: calc(2 * 1.25em + 10px);
-    max-height: calc(2 * 1.25em + 10px);
+  .semantic-todoist-main {
+    gap: 4px;
   }
 
   .semantic-todoist-reference-table-wrap {
@@ -1494,6 +1540,26 @@
     touch-action: manipulation;
   }
 
+  .semantic-todoist-toolbar button,
+  .semantic-todoist-header button {
+    height: 44px;
+  }
+
+  .semantic-todoist-web-search-toggle {
+    height: 44px;
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .semantic-todoist-header-icon {
+    min-width: 34px;
+  }
+
+  .semantic-todoist-action-row select {
+    height: 34px;
+    min-height: 34px;
+  }
+
   .semantic-todoist-schedule-block-controls button {
     min-height: 28px;
   }
@@ -1527,8 +1593,24 @@
 
 .is-mobile .semantic-todoist-header button,
 .is-mobile .semantic-todoist-toolbar button {
+  height: 34px;
   min-height: 34px;
   padding-block: 4px;
+}
+
+.is-mobile .semantic-todoist-web-search-toggle {
+  height: 44px;
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.is-mobile .semantic-todoist-header-icon {
+  min-width: 34px;
+}
+
+.is-mobile .semantic-todoist-action-row select {
+  height: 34px;
+  min-height: 34px;
 }
 
 .is-mobile .semantic-todoist-note-picker input {
@@ -1621,23 +1703,35 @@
   overflow-wrap: anywhere;
 }
 
+/* Obsidian pads the settings-tab h3 itself (`.vertical-tab-content h3`:
+   padding: 0 var(--size-4-4)), so the title and the .setting-item rows share
+   that inset while the heading description would sit one inset to the left.
+   Match the same inset on the description so title, description and rows
+   share one left edge and the description wraps inside the 72ch column. */
+.semantic-todoist-settings .semantic-todoist-settings-heading > div {
+  padding-inline: var(--size-4-4, 16px);
+}
+
 .semantic-todoist-settings .setting-item {
   min-width: 0;
   max-width: 100%;
 }
 
-.semantic-todoist-settings .setting-item-info,
-.semantic-todoist-settings .setting-item-control {
+.semantic-todoist-settings .setting-item-info {
+  flex: 1 1 0;
   min-width: 0;
   max-width: 100%;
 }
 
 .semantic-todoist-settings .setting-item-control {
   display: flex;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-start;
+  justify-content: flex-end;
+  margin-inline-start: auto;
   max-width: 100%;
+  min-width: 0;
 }
 
 .semantic-todoist-settings .setting-item-control input,
@@ -1657,6 +1751,19 @@
   padding: 8px 12px;
   text-align: center;
   white-space: normal;
+}
+
+/* Preserved variants: setup-step actions stay left-aligned under their
+   description, and the model combobox input still fills its stacked row. */
+.semantic-todoist-settings .semantic-todoist-setup-step .setting-item-control {
+  justify-content: flex-start;
+  margin-inline-start: 0;
+}
+
+.semantic-todoist-settings .semantic-todoist-model-combobox-setting .setting-item-control .semantic-todoist-model-combobox-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
 }
 
 @media (max-width: 700px) {
@@ -1795,4 +1902,22 @@
     min-height: 44px;
     padding-block: 12px;
   }
+}
+
+/* Narrow panes: keep nested disclosure padding from squeezing setting text
+   into per-character columns (360 px emulated settings window). */
+@media (max-width: 420px) {
+  .semantic-todoist-settings-disclosure {
+    padding-inline: 6px;
+  }
+
+  .semantic-todoist-settings .setting-item {
+    padding-inline: 8px;
+  }
+}
+
+/* Obsidian's hidden dropdown option-measuring clones are absolutely positioned
+   and otherwise extend the settings pane's horizontal scroll range. */
+.semantic-todoist-settings select.dropdown.is-measuring {
+  position: fixed;
 }

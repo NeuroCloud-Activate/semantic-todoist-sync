@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.2 - 2026-10-05
+
+### Fixed
+- Creating tasks from a note works again when the note is not in the semantic index yet (for example a note made before an update, or a vault that has not been indexed), instead of reporting that no actionable tasks were found.
+- Notes added or changed while the plugin was not running are picked up for indexing at startup.
+- The shared primary and fallback model lists, and per-task model lists, now show only the models of the provider chosen above them.
+- Task descriptions stay focused on the task: related notes are used only when they help, and every cited source is one the description actually uses.
+- Answers that cannot confirm something now also say what your notes do show about the topic.
+- The status area shows Ready when the plugin is idle, without repeated background task-reference messages.
+
 ## 0.9.1 - 2026-10-05
 
 ### Added

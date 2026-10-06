@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.4 - 2026-10-06
+
+### Fixed
+- Task descriptions are matched to the task they were requested for, so a reply that leaves out or mislabels the task number no longer fails with "omitted-index" and leaves tasks without descriptions.
+
 ## 0.9.3 - 2026-10-06
 
 ### Fixed

@@ -14000,9 +14000,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         initialParseFailures.push({ taskIndex: slot.indexes[0], reason: slot.parseError ? "description response JSON could not be parsed" : "description response shape was invalid", stage: "response" });
         continue;
       }
-      for (const item of slot.parsed.descriptions || []) {
-        if (Number.isInteger(item?.index) && item.index === slot.indexes[0]) parsedByIndex.set(item.index, item);
-      }
+      // A singleton request carries exactly one task, so its single returned
+      // description belongs to that task whatever index the model echoed.
+      const [only] = slot.parsed.descriptions;
+      if (only && typeof only === "object") parsedByIndex.set(slot.indexes[0], Object.assign({}, only, { index: slot.indexes[0] }));
       if (!parsedByIndex.has(slot.indexes[0])) {
         initialParseFailures.push({ taskIndex: slot.indexes[0], reason: "description response omitted the task index", stage: "response" });
       }
@@ -14319,9 +14320,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
               retryShapeFailures.push({ taskIndex: slot.indexes[0], reason: slot.parseError ? "description recovery response JSON could not be parsed" : "description recovery response shape was invalid", stage: "response" });
               continue;
             }
-            for (const item of slot.parsed.descriptions || []) {
-              if (Number.isInteger(item?.index) && item.index === slot.indexes[0]) retryByIndex.set(item.index, item);
-            }
+            const [only] = slot.parsed.descriptions;
+            if (only && typeof only === "object") retryByIndex.set(slot.indexes[0], Object.assign({}, only, { index: slot.indexes[0] }));
             if (!retryByIndex.has(slot.indexes[0])) {
               retryShapeFailures.push({ taskIndex: slot.indexes[0], reason: "description recovery omitted a valid task result", stage: "response" });
             }

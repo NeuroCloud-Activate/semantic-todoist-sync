@@ -43,6 +43,12 @@ const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
 const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
 const SCHEDULER_RELATED_GROUPING_POLICY_ID = "related-task-grouping";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
+// Obsidian Sync Standard silently skips files over 5 MB; a 10 MB shard size
+// makes index files larger than that limit so Sync Standard ignores them.
+// Any value other than 10 falls back to 4.5 MB (the Sync-Standard-safe size).
+function semanticIndexShardMaxBytes(settings) {
+  return Number(settings?.semanticIndexShardMegabytes) === 10 ? 10 * 1024 * 1024 : SEMANTIC_INDEX_SHARD_MAX_BYTES;
+}
 const SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION = 2;
 const SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION = 2;
 const SEMANTIC_INDEX_PATH_META_SCHEMA_VERSION = 2;
@@ -2246,12 +2252,29 @@ async function semanticIndexPurgeInventory(options = {}) {
     dataset.fingerprint = semanticIndexPurgeDatasetFingerprint(dataset);
   }
 
+  // Read-only display classification for the settings list: protected shared
+  // artifacts, files owned by the active or an inactive dataset, and
+  // semantic-index-named files that no valid dataset owns.
+  const fileStatuses = [];
+  for (const name of files) {
+    const owner = datasets.find((dataset) => dataset.files.includes(name));
+    const status = protectedSet.has(name) ? "protected" : owner ? (owner.active ? "active" : "inactive") : (/^semantic-index\b/i.test(semanticIndexPurgeBasename(name)) ? "orphaned" : "");
+    if (!status) continue;
+    let size = null;
+    try {
+      const stat = statFile ? await statFile(name) : null;
+      size = stat && Number.isFinite(Number(stat.size)) ? Number(stat.size) : null;
+    } catch { size = null; }
+    fileStatuses.push({ file: name, status, bytes: size });
+  }
+  fileStatuses.sort((a, b) => a.file.localeCompare(b.file));
   datasets.sort((a, b) => a.key.localeCompare(b.key));
   const inventory = {
     datasets,
     protectedFiles,
     malformedManifests,
     unclaimedFiles,
+    fileStatuses,
     incompleteFiles,
     ambiguousPresent,
     incompletePresent,
@@ -2287,6 +2310,37 @@ function semanticIndexPurgeSelection(options = {}) {
     bytesKnown: dataset.bytesKnown,
     fingerprint: semanticIndexPurgeDatasetFingerprint(dataset)
   };
+}
+
+// Orphan selection: only semantic-index-named files that no valid dataset owns
+// and that are not shared/protected. Fails closed unless exactly one active
+// dataset is identified and its manifest is readable.
+function semanticIndexPurgeOrphanSelection(inventory = {}) {
+  const fail = (reasonCode) => ({ ok: false, reasonCode, files: [], bytes: null, bytesKnown: false, fingerprint: "" });
+  const datasets = Array.isArray(inventory.datasets) ? inventory.datasets : [];
+  if (inventory.incompletePresent) return fail("inventory-incomplete");
+  const actives = datasets.filter((dataset) => dataset.active === true);
+  if (actives.length !== 1) return fail("active-index-not-loaded");
+  const activeBase = semanticIndexPurgeBasename(inventory.activeManifestFile || "");
+  const activeUnreadable = (Array.isArray(inventory.malformedManifests) ? inventory.malformedManifests : []).some((entry) =>
+    (inventory.activeManifestFile && entry.file === inventory.activeManifestFile) ||
+    (activeBase && semanticIndexPurgeBasename(entry.file) === activeBase));
+  if (activeUnreadable) return fail("active-index-ambiguous");
+  const statuses = Array.isArray(inventory.fileStatuses) ? inventory.fileStatuses : [];
+  const bytesByFile = new Map(statuses.map((entry) => [entry.file, entry.bytes]));
+  const owned = new Set();
+  for (const dataset of datasets) for (const file of dataset.files) owned.add(file);
+  const files = (Array.isArray(inventory.unclaimedFiles) ? inventory.unclaimedFiles : [])
+    .filter((name) => !owned.has(name) && /^semantic-index\b/i.test(semanticIndexPurgeBasename(name)) && !semanticIndexPurgeProtectedName(name));
+  if (!files.length) return Object.assign(fail("no-orphaned-files"), { bytes: 0, bytesKnown: true });
+  let bytes = 0;
+  let bytesKnown = true;
+  for (const name of files) {
+    const size = bytesByFile.get(name);
+    if (size === null || size === undefined) { bytesKnown = false; continue; }
+    bytes += Number(size) || 0;
+  }
+  return { ok: true, reasonCode: "deletable", files, bytes: bytesKnown ? bytes : null, bytesKnown, fingerprint: String(inventory.fingerprint || "") };
 }
 
 
@@ -2357,6 +2411,7 @@ const DEFAULT_SETTINGS = {
   semanticIndexMeta: {},
   autoUpdateSemanticIndex: true,
   semanticIndexDelaySeconds: 30,
+  semanticIndexShardMegabytes: 4.5,
   todoistInboxProjectId: "",
   todoistTaskProjectId: "",
   todoistTaskProjectName: "Inbox",
@@ -3151,6 +3206,9 @@ function openAiHttpResponseDiagnostic(response = {}, phase = "request") {
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // Settings write gate baseline: adopt the loaded content so the first idle
+    // save after load is skipped when nothing changed.
+    this._lastSettingsSerialized = this.settingsPersistenceSnapshot().serialized;
     this.queryEmbeddingCache = new Map();
     this.taskDeduplicationEmbeddingCache = new Map();
     this.semanticRetrievalCache = new Map();
@@ -3406,12 +3464,30 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
+  settingsPersistenceSnapshot() {
+    const payload = settingsWithoutTaskReferenceTables(this.settings);
+    // lastNoteAutoSyncAt is volatile scheduling bookkeeping: excluding it keeps
+    // a timestamp-only change from triggering a rewrite, and the current value
+    // rides along with the next real save.
+    const serialized = JSON.stringify(payload, (key, value) => (key === "lastNoteAutoSyncAt" ? "" : value));
+    return { payload, serialized };
+  }
+
+  async persistSettingsIfChanged() {
+    const { payload, serialized } = this.settingsPersistenceSnapshot();
+    if (this._lastSettingsSerialized === undefined) this._lastSettingsSerialized = serialized;
+    if (this._lastSettingsSerialized === serialized) return false;
+    await this.saveData(payload);
+    this._lastSettingsSerialized = serialized;
+    return true;
+  }
+
   async saveSettings(options = {}) {
     window.clearTimeout(this.settingsSaveTimer);
     this.settingsSaveTimer = null;
     this.settingsSaveQueued = false;
     if (!options.skipTaskReferenceSnapshot) await this.flushTaskReferenceSnapshotIfDirty();
-    await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
+    await this.persistSettingsIfChanged();
   }
 
   queueSettingsSave(delayMs = 4000) {
@@ -3428,7 +3504,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.settingsSaveTimer);
     this.settingsSaveTimer = null;
     this.settingsSaveQueued = false;
-    await this.saveData(settingsWithoutTaskReferenceTables(this.settings));
+    await this.persistSettingsIfChanged();
     return true;
   }
 
@@ -4888,9 +4964,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (parsed.meta?.generation) this.semanticIndexManifestPublishedGeneration = String(parsed.meta.generation);
         if (!shallowObjectEqual(nextMeta, this.settings.semanticIndexMeta || {})) settingsChanged = true;
         this.settings.semanticIndexMeta = nextMeta;
+        const configuredShardMaxBytes = semanticIndexShardMaxBytes(this.settings);
         const loadedShardMaxBytes = Number(parsed.meta?.shardMaxBytes || 0);
-        const oversizedLegacyShards = loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES && (!loadedShardMaxBytes || loadedShardMaxBytes > SEMANTIC_INDEX_SHARD_MAX_BYTES);
-        shouldRewriteShardedIndex = this.semanticIndex.length && ((!loaded.stats.shards && loaded.stats.bytes > SEMANTIC_INDEX_SHARD_MAX_BYTES) || oversizedLegacyShards);
+        const oversizedLegacyShards = loaded.stats.shards && loaded.stats.bytes > configuredShardMaxBytes && (!loadedShardMaxBytes || loadedShardMaxBytes > configuredShardMaxBytes);
+        shouldRewriteShardedIndex = this.semanticIndex.length && ((!loaded.stats.shards && loaded.stats.bytes > configuredShardMaxBytes) || oversizedLegacyShards);
       };
       try {
         const loaded = await this.readSemanticIndexFile(indexFile);
@@ -5516,7 +5593,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       embeddingMigrationRequired: false,
       file: indexFile,
       sharded: true,
-      shardMaxBytes: SEMANTIC_INDEX_SHARD_MAX_BYTES
+      shardMaxBytes: semanticIndexShardMaxBytes(this.settings)
     });
     if (candidateChunks.length) {
       const anchorCompatibility = semanticMaterialityAnchorCompatibility(this.settings, meta);
@@ -5543,7 +5620,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const generation = semanticIndexGenerationToken(seed, 0);
     const generationMeta = Object.assign({}, meta, { generation, chunks: candidateChunks.length });
     this._markSemanticIndexPersistencePhase(tracker, "shard-build", "running", "shard-build");
-    const shards = await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, SEMANTIC_INDEX_SHARD_MAX_BYTES, generation);
+    const shards = await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, semanticIndexShardMaxBytes(this.settings), generation);
     if (tracker && typeof tracker === "object") tracker.shardCount = shards.length;
     const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
     const stagePathMetaFile = semanticIndexPathMetaGenerationFile(generation);
@@ -6267,6 +6344,70 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return result;
   });
 }
+
+  // Deletes only files the inventory classifies as unclaimed: semantic-index
+  // naming, not protected, and not owned by the active or any valid inactive
+  // dataset. Fails closed unless exactly one active dataset is identified.
+  async purgeOrphanedSemanticIndexFiles(options = {}) {
+    const showNotice = options.showNotice !== false;
+    const expectedFingerprint = String(options.fingerprint || "");
+    const busyResult = () => semanticOperationResult({ ok: false, changed: false, reasonCode: "semantic-index-busy", repairQueued: true });
+    return this.withSemanticIndexOperation("purge-orphaned", async () => {
+      if (this.semanticIndexInProgress) return busyResult();
+      let inventory;
+      try { inventory = await this._semanticIndexPurgeInventoryUnsafe(); }
+      catch (error) {
+        if (showNotice) new Notice(`Could not inventory semantic-index files: ${error.message || error}`);
+        return Object.assign(semanticOperationResult({ ok: false, reasonCode: "inventory-failed" }), { error: String(error?.message || error).slice(0, 200) });
+      }
+      const selection = semanticIndexPurgeOrphanSelection(inventory);
+      if (expectedFingerprint && selection.ok && selection.fingerprint !== expectedFingerprint) {
+        if (showNotice) new Notice("The semantic-index file set changed; reopen the purge control and try again.");
+        return semanticOperationResult({ ok: false, changed: false, reasonCode: "inventory-changed" });
+      }
+      if (!selection.ok) {
+        return semanticOperationResult({ ok: false, changed: false, reasonCode: selection.reasonCode });
+      }
+      // Re-check the busy guard immediately before any deletion.
+      if (this.semanticIndexInProgress) return busyResult();
+      const removed = [];
+      const failed = [];
+      for (const name of selection.files) {
+        try {
+          await this.app.vault.adapter.remove(`${this.manifest.dir}/${name}`);
+          removed.push(name);
+        } catch (error) {
+          failed.push({ file: name, message: String(error?.message || error).slice(0, 160) });
+        }
+      }
+      let refreshed = null;
+      try { refreshed = await this._semanticIndexPurgeInventoryUnsafe(); } catch { refreshed = null; }
+      const result = Object.assign(semanticOperationResult({
+        ok: failed.length === 0,
+        changed: removed.length > 0,
+        completed: removed.length,
+        reasonCode: failed.length ? "purge-partial-failure" : "purged"
+      }), {
+        removedFiles: removed,
+        failedFiles: failed,
+        removedCount: removed.length,
+        failedCount: failed.length,
+        bytes: selection.bytes,
+        bytesKnown: selection.bytesKnown,
+        inventoryFresh: Boolean(refreshed)
+      });
+      this.lastSemanticIndexPurgeResult = Object.assign(result, { errors: failed.length });
+      this.logLocal(failed.length ? "Orphaned semantic-index file purge incomplete" : "Orphaned semantic-index files purged", {
+        removed: removed.length, failed: failed.length
+      });
+      if (showNotice) {
+        new Notice(failed.length
+          ? `Removed ${removed.length} orphaned file(s); ${failed.length} could not be removed and remain on disk.`
+          : `Deleted ${removed.length} orphaned semantic-index file(s).`);
+      }
+      return result;
+    });
+  }
 
   async removeSemanticIndexShardFiles(indexFile, keepFiles = [], candidateFiles = null) {
     const keep = new Set(keepFiles || []);
@@ -7107,7 +7248,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const file = this.app.vault.getAbstractFileByPath(path);
     const fileModifiedAt = file instanceof TFile ? Number(file.stat?.mtime || 0) : 0;
     if (fileModifiedAt && indexed.modifiedAt && fileModifiedAt <= indexed.modifiedAt + 1000) {
-      this.logLocal("Skipped unchanged semantic index event", { path, reason });
+      // Burst guard: at most one entry per 30 s so repeated events cannot keep
+      // resetting the settings save debounce.
+      if (now - (this._lastSkippedUnchangedIndexLogAt || 0) >= 30000) {
+        this._lastSkippedUnchangedIndexLogAt = now;
+        this.logLocal("Skipped unchanged semantic index event", { path, reason });
+      }
       return false;
     }
     return true;
@@ -15955,8 +16101,6 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     this.beginWorkflowActivity("notes", "Syncing note tasks...");
     this.setSidebarStatus("Syncing note tasks...");
     try {
-      this.logLocal("Note sync started", { fullScan });
-      this.settings.lastNoteAutoSyncAt = deviceTimestamp();
       this.requireTodoistAccess();
       this.setSidebarStatus("Syncing Todoist changes...");
       await this.pullTodoistUpdates();
@@ -15975,7 +16119,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       });
       totals.workers = workerCount;
       this.setSidebarStatus("Confirming Todoist sync...");
-      this.logLocal("Note sync complete", totals);
+      const didWork = (fullScan && totals.files > 0) || ["created", "updated", "relinked", "deleted", "completedForgotten", "normalized", "conflicts", "staleReferences"].some((key) => totals[key] > 0);
+      if (didWork) {
+        // Idle syncs stay out of the activity log and off disk; log the pair
+        // only when something actually changed (reverse order keeps the
+        // prepended entries reading started -> complete).
+        this.logLocal("Note sync complete", totals);
+        this.logLocal("Note sync started", { fullScan });
+      }
+      if (didWork || elapsedMs(this.settings.lastNoteAutoSyncAt) >= 60 * 60 * 1000) this.settings.lastNoteAutoSyncAt = deviceTimestamp();
       if (showNotice) new Notice("Semantic Todoist note sync complete.");
       return totals;
     } catch (error) {
@@ -18933,6 +19085,17 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(embeddings, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
     toggleSetting(embeddings, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
     numberSetting(embeddings, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
+    new Setting(embeddings)
+      .setName("Index shard size")
+      .setDesc("4.5 MB keeps every index file under the Obsidian Sync Standard 5 MB limit so Sync copies them. 10 MB makes index files larger than that limit so Sync Standard skips them (use this if you exclude index files from Sync; Sync Plus has a 200 MB limit and will still sync 10 MB files). Changing this applies the next time the index is saved; existing index files are not rewritten until then.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("4.5", "4.5 MB");
+        dropdown.addOption("10", "10 MB");
+        dropdown.setValue(semanticIndexShardMaxBytes(this.plugin.settings) === 10 * 1024 * 1024 ? "10" : "4.5").onChange(async (value) => {
+          this.plugin.settings.semanticIndexShardMegabytes = Number(value) === 10 ? 10 : 4.5;
+          await this.plugin.saveSettings();
+        });
+      });
     new Setting(embeddings).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)));
     renderInactiveSemanticIndexPurge(embeddings, this.plugin, () => this.display());
 
@@ -19947,6 +20110,25 @@ function renderInactiveSemanticIndexPurge(containerEl, plugin, refresh) {
       }).open();
     });
   });
+  const filesEl = containerEl.createDiv({ cls: "semantic-todoist-index-files" });
+  let orphanButton = null;
+  const orphanSetting = new Setting(containerEl)
+    .setName("Delete orphaned index files")
+    .setDesc("Removes only semantic-index files that no active or retained partition owns: orphaned shard generations, stale path-metadata generations, and staged leftovers. The active partition and protected routing, task-reference, and settings files are never touched.");
+  orphanSetting.addButton((b) => {
+    orphanButton = b;
+    b.setButtonText("Delete orphaned index files").setWarning();
+    b.setDisabled(true); // inventory not loaded yet
+    b.onClick(() => {
+      const selection = semanticIndexPurgeOrphanSelection(inventory);
+      if (!selection.ok) { new Notice(`Cannot delete orphaned index files: ${selection.reasonCode}`); return; }
+      new OrphanedIndexPurgeConfirmModal(plugin.app, selection, async (confirmed) => {
+        const result = await plugin.purgeOrphanedSemanticIndexFiles({ showNotice: true, fingerprint: confirmed.fingerprint });
+        if (!result.ok) new Notice(`Delete not completed: ${result.reasonCode}`);
+        if (typeof refresh === "function") refresh();
+      }).open();
+    });
+  });
   (async () => {
     try { inventory = await plugin.buildSemanticIndexPurgeInventory(); }
     catch (error) {
@@ -19954,6 +20136,8 @@ function renderInactiveSemanticIndexPurge(containerEl, plugin, refresh) {
       plugin.logLocal?.("Semantic-index purge inventory failed", { error: String(error?.message || error).slice(0, 160) });
     }
     if (!dropdown) return;
+    renderSemanticIndexFileList(filesEl, inventory);
+    if (orphanButton) orphanButton.setDisabled(!semanticIndexPurgeOrphanSelection(inventory).ok);
     if (typeof dropdown.selectEl?.empty === "function") dropdown.selectEl.empty();
     selectedKey = ""; // reset to none on every refresh
     dropdown.addOption("", "Select an inactive index...");
@@ -19970,6 +20154,58 @@ function renderInactiveSemanticIndexPurge(containerEl, plugin, refresh) {
     if (button) button.setDisabled(true);
     if (inventory.ambiguousPresent) new Notice("An unreadable or unclaimed semantic-index file is present, so inactive partitions are protected from deletion until it is resolved.");
   })();
+}
+
+function renderSemanticIndexFileList(containerEl, inventory = {}) {
+  if (!containerEl || typeof containerEl.empty !== "function") return;
+  containerEl.empty();
+  settingsHeading(containerEl, "Semantic index files", "Read-only list of semantic-index files in the plugin folder: active, inactive datasets, protected shared artifacts, and unclaimed or orphaned files.");
+  if (!Array.isArray(inventory.fileStatuses)) {
+    containerEl.createDiv({ text: "The file list is unavailable until the inventory can be read." });
+    return;
+  }
+  if (!inventory.fileStatuses.length) {
+    containerEl.createDiv({ text: "No semantic-index files were found in the plugin folder." });
+    return;
+  }
+  const labels = { active: "active", inactive: "inactive dataset", protected: "protected", orphaned: "unclaimed / orphaned" };
+  const list = containerEl.createEl("ul", { cls: "semantic-todoist-index-file-list" });
+  for (const entry of inventory.fileStatuses) {
+    const size = entry.bytes === null || entry.bytes === undefined ? "size unknown" : formatBytes(Number(entry.bytes) || 0);
+    list.createEl("li", { text: `${entry.file} | ${size} | ${labels[entry.status] || entry.status}` });
+  }
+}
+
+class OrphanedIndexPurgeConfirmModal extends Modal {
+  constructor(app, selection, onConfirm) {
+    super(app);
+    this.selection = selection;
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-purge-modal");
+    contentEl.addClass("semantic-todoist-modal-content");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Delete orphaned index files" });
+    const sizeText = this.selection.bytesKnown ? formatBytes(this.selection.bytes || 0) : "size unknown";
+    contentEl.createEl("p", { text: `These files are not owned by the active partition or any retained partition. Total ${sizeText}.` });
+    const list = contentEl.createEl("ul");
+    for (const file of this.selection.files) list.createEl("li", { text: file });
+    contentEl.createEl("p", { text: "Only these unclaimed files are removed. The active partition and protected routing, task-reference, and settings files are preserved." });
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) => b.setButtonText("Delete").setWarning().onClick(async () => {
+        this.close();
+        await this.onConfirm(this.selection);
+      }));
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 class InactiveIndexPurgeConfirmModal extends Modal {
@@ -22034,6 +22270,33 @@ function renderSharedAiRoutingSettings(containerEl, plugin, refreshDisplay) {
   renderSharedReferenceControls(containerEl, plugin, "primary", refreshDisplay);
   toggleSetting(containerEl, "Enable AI fallback", "Allow one configured fallback attempt after an eligible primary failure.", plugin, "enableAiModelFallback");
   renderSharedReferenceControls(containerEl, plugin, "fallback", refreshDisplay);
+  // Slice B: explicit reasoning capability probe. Never automatic; one tiny
+  // fixed request pair per configured generation model (no vault content).
+  new Setting(containerEl).setName("Check model capabilities").setDesc("Sends one tiny fixed question (\"What is 17*23?\") to the configured generation models to classify reasoning support. No vault content is sent, it never runs automatically, and your reasoning settings are left unchanged.").addButton((button) => {
+    button.setButtonText("Check model capabilities").onClick(async () => {
+      button.setDisabled(true);
+      try {
+        const targets = [stableSharedReference(plugin.settings, "primary")];
+        if (plugin.settings.enableAiModelFallback) targets.push(stableSharedReference(plugin.settings, "fallback"));
+        const seen = new Set();
+        const messages = [];
+        for (const reference of targets) {
+          const model = String(reference.model || "").trim();
+          const key = `${reference.provider}:${model.toLowerCase()}`;
+          if (!model || seen.has(key)) continue;
+          seen.add(key);
+          const result = await plugin.probeModelReasoningCapability(model);
+          if (result?.message) messages.push(result.message);
+        }
+        new Notice(messages.length ? messages.join(" ") : "No generation model is configured.");
+        if (refreshDisplay) refreshDisplay();
+      } catch (error) {
+        new Notice(`Capability check failed: ${error.message || error}`);
+      } finally {
+        button.setDisabled(false);
+      }
+    });
+  });
   toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls.", plugin, "optimizeStructuredAiUsage");
   toggleSetting(containerEl, "Use provider prompt caching", "Cache stable instructions only when the selected provider supports it.", plugin, "enableOpenAiPromptCaching");
   new Setting(containerEl).setName("Refresh Models").setDesc("Explicitly load provider model catalogs; typing and display-only selection never refreshes.").addButton((button) => button.setButtonText("Refresh Models").onClick(async () => {
@@ -22102,33 +22365,6 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
   new Setting(containerEl).setName("Validate embedding provider").setDesc("Runs one small embedding request with the saved provider and model. It never changes settings, refreshes catalogs, or touches the index.").addButton((button) => {
     button.setButtonText("Validate embedding provider").setCta().onClick(async () => {
       try { await plugin.validateEmbeddingProvider(true); } catch (error) { /* label-only: validateEmbeddingProvider already reports safely */ }
-    });
-  });
-  // Slice B: explicit reasoning capability probe. Never automatic; one tiny
-  // fixed request pair per configured generation model (no vault content).
-  new Setting(containerEl).setName("Check model capabilities").setDesc("Sends one tiny fixed question (\"What is 17*23?\") to the configured generation models to classify reasoning support. No vault content is sent, it never runs automatically, and your reasoning settings are left unchanged.").addButton((button) => {
-    button.setButtonText("Check model capabilities").onClick(async () => {
-      button.setDisabled(true);
-      try {
-        const targets = [stableSharedReference(plugin.settings, "primary")];
-        if (plugin.settings.enableAiModelFallback) targets.push(stableSharedReference(plugin.settings, "fallback"));
-        const seen = new Set();
-        const messages = [];
-        for (const reference of targets) {
-          const model = String(reference.model || "").trim();
-          const key = `${reference.provider}:${model.toLowerCase()}`;
-          if (!model || seen.has(key)) continue;
-          seen.add(key);
-          const result = await plugin.probeModelReasoningCapability(model);
-          if (result?.message) messages.push(result.message);
-        }
-        new Notice(messages.length ? messages.join(" ") : "No generation model is configured.");
-        if (refreshDisplay) refreshDisplay();
-      } catch (error) {
-        new Notice(`Capability check failed: ${error.message || error}`);
-      } finally {
-        button.setDisabled(false);
-      }
     });
   });
   new Setting(containerEl).setName("Warm embedding server on startup").setDesc(settingDescription("Warm embedding server on startup", "warmEmbeddingServerOnStartup")).addToggle((toggle) => {

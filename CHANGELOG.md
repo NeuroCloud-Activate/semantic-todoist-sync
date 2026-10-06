@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.9 - 2026-10-06
+
+### Fixed
+- The plugin no longer rewrites its settings file when nothing changed. While idle, the background note sync used to rewrite it about twice a minute, and each rewrite became a new version in Obsidian Sync history. Idle syncs now write nothing, and a sync that finds no changes no longer logs or time-stamps.
+- The "skipped unchanged" index log line is rate limited so a burst of events cannot keep resetting the settings save timer.
+
+### Added
+- New "Index shard size" setting (4.5 MB default, or 10 MB). 4.5 MB keeps every index file under the Obsidian Sync Standard 5 MB limit. 10 MB makes index files larger than that limit, so Sync Standard skips them (Sync Plus still syncs them). The change applies the next time the index is saved.
+- Settings now list every semantic index file with its size and status, and a "Delete orphaned index files" button removes leftover files that no index uses, after a confirmation that lists them. The active index is never touched.
+
+### Changed
+- The "Check model capabilities" button moved from the Embeddings section to the AI model section, next to the primary and fallback model controls.
+
 ## 0.9.8 - 2026-10-06
 
 ### Changed

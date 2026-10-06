@@ -34,6 +34,9 @@ const STABLE_INDEX_CLEANUP_PATTERNS = Object.freeze([
 const TASK_REFERENCE_SNAPSHOT_FILE = "task-reference-snapshot.json";
 const TASK_REFERENCE_INDEX_FILE = "task-reference-index.json";
 const SCHEDULER_MEMORY_FILE = "scheduler-memory.json";
+const ACTIVITY_LOG_FILE = "activity-log.json";
+const MODEL_CACHE_FILE = "model-cache.json";
+const ACTIVITY_LOG_SAVE_DELAY_MS = 60000;
 const SCHEDULER_MEMORY_MAX_ENTRIES = 500;
 const SCHEDULER_MEMORY_MAX_CONTEXT_PATHS = 12;
 const SCHEDULE_PREVIEW_SUGGESTION_LIMIT = 10;
@@ -3205,7 +3208,13 @@ function openAiHttpResponseDiagnostic(response = {}, phase = "request") {
 
 module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loadedData = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+    // Split persistence: the activity log and the regenerable provider model
+    // caches live in their own plugin-folder files. Legacy copies inside
+    // data.json are dropped by the next settings write.
+    this._settingsSplitMigrationPending = settingsRequireSplitMigration(loadedData);
+    await this.loadSplitPersistenceFiles();
     // Settings write gate baseline: adopt the loaded content so the first idle
     // save after load is skipped when nothing changed.
     this._lastSettingsSerialized = this.settingsPersistenceSnapshot().serialized;
@@ -3451,6 +3460,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.taskReferenceIntegrityScanFollowUp = false;
     window.clearTimeout(this.schedulerMemorySaveTimer);
     this.schedulerMemorySaveTimer = null;
+    clearTimeout(this.activityLogSaveTimer);
+    this.activityLogSaveTimer = null;
     window.clearInterval(this._semanticCacheCleanupInterval);
     this._semanticCacheCleanupInterval = null;
     window.clearTimeout(this._semanticCacheSweepTimer);
@@ -3461,11 +3472,42 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.workflowActivities = {};
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
     await this.flushSchedulerMemoryIfDirty().catch((error) => console.error("Scheduler memory flush failed", error));
+    await this.flushActivityLogIfDirty().catch((error) => console.error("Activity log flush failed", error));
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
-  settingsPersistenceSnapshot() {
-    const payload = settingsWithoutTaskReferenceTables(this.settings);
+  async readPluginJsonFile(fileName) {
+    try {
+      const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${fileName}`);
+      return JSON.parse(raw);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async loadSplitPersistenceFiles() {
+    const activityLog = await this.readPluginJsonFile(ACTIVITY_LOG_FILE);
+    if (Array.isArray(activityLog)) {
+      this.settings.localLog = activityLog;
+      this._lastActivityLogSerialized = JSON.stringify(activityLog);
+    } else if ((this.settings.localLog || []).length) {
+      // The legacy log still lives inside data.json: migrate it on the next
+      // scheduled window instead of waiting for a new entry.
+      this.markActivityLogDirty();
+    }
+    const modelCache = await this.readPluginJsonFile(MODEL_CACHE_FILE);
+    if (modelCache && typeof modelCache === "object" && !Array.isArray(modelCache)) {
+      for (const key of MODEL_CACHE_SETTINGS_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(modelCache, key)) this.settings[key] = modelCache[key];
+      }
+      // The file wins over any legacy copy still inside data.json; adopting its
+      // exact serialization keeps the next save from rewriting unchanged data.
+      this._lastModelCacheSerialized = JSON.stringify(modelCache);
+    }
+  }
+
+  settingsPersistenceSnapshot(options = {}) {
+    const payload = settingsWithoutTaskReferenceTables(this.settings, options);
     // lastNoteAutoSyncAt is volatile scheduling bookkeeping: excluding it keeps
     // a timestamp-only change from triggering a rewrite, and the current value
     // rides along with the next real save.
@@ -3473,12 +3515,39 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     return { payload, serialized };
   }
 
+  modelCachePersistenceSnapshot() {
+    const payload = {};
+    for (const key of MODEL_CACHE_SETTINGS_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(this.settings, key)) payload[key] = this.settings[key];
+    }
+    return { payload, serialized: JSON.stringify(payload) };
+  }
+
+  async persistModelCacheIfChanged() {
+    const { serialized } = this.modelCachePersistenceSnapshot();
+    if (this._lastModelCacheSerialized === serialized) return "unchanged";
+    try {
+      await this.app.vault.adapter.write(`${this.manifest.dir}/${MODEL_CACHE_FILE}`, serialized);
+      this._lastModelCacheSerialized = serialized;
+      return "written";
+    } catch (error) {
+      // Console only: a failed cache write must never break callers or recurse
+      // into the activity log.
+      console.error("Model cache save failed", error);
+      return "failed";
+    }
+  }
+
   async persistSettingsIfChanged() {
-    const { payload, serialized } = this.settingsPersistenceSnapshot();
+    // The cache file is written first: data.json stops carrying those keys
+    // below, so the cache must be durable before the settings copy goes away.
+    const modelCacheStatus = await this.persistModelCacheIfChanged();
+    const { payload, serialized } = this.settingsPersistenceSnapshot({ includeModelCache: modelCacheStatus === "failed" });
     if (this._lastSettingsSerialized === undefined) this._lastSettingsSerialized = serialized;
-    if (this._lastSettingsSerialized === serialized) return false;
+    if (this._lastSettingsSerialized === serialized && !this._settingsSplitMigrationPending) return false;
     await this.saveData(payload);
     this._lastSettingsSerialized = serialized;
+    this._settingsSplitMigrationPending = false;
     return true;
   }
 
@@ -3544,6 +3613,38 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.schedulerMemory = compact;
     this.schedulerMemoryDirty = false;
     return true;
+  }
+
+  markActivityLogDirty() {
+    this.activityLogDirty = true;
+    // At most one scheduled write per window: a pending flush absorbs further
+    // entries instead of being pushed back.
+    if (this.activityLogSaveTimer) return;
+    this.activityLogSaveTimer = setTimeout(() => {
+      this.activityLogSaveTimer = null;
+      this.flushActivityLogIfDirty().catch((error) => console.error("Activity log save failed", error));
+    }, ACTIVITY_LOG_SAVE_DELAY_MS);
+  }
+
+  async flushActivityLogIfDirty() {
+    if (!this.activityLogDirty) return false;
+    clearTimeout(this.activityLogSaveTimer);
+    this.activityLogSaveTimer = null;
+    const serialized = JSON.stringify(this.settings.localLog || []);
+    if (serialized === this._lastActivityLogSerialized) {
+      this.activityLogDirty = false;
+      return false;
+    }
+    try {
+      await this.app.vault.adapter.write(`${this.manifest.dir}/${ACTIVITY_LOG_FILE}`, serialized);
+      this._lastActivityLogSerialized = serialized;
+      this.activityLogDirty = false;
+      return true;
+    } catch (error) {
+      // Console only; the dirty flag stays set so the next window or unload retries.
+      console.error("Activity log save failed", error);
+      return false;
+    }
   }
 
   applySchedulerMemoryToCandidates(candidates) {
@@ -4844,15 +4945,23 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           return semanticOperationResult({ ok: false, reasonCode });
         });
     };
-    if (typeof window?.setTimeout === "function") {
-      window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
-      this.semanticIndexCompatibilityRefreshTimer = window.setTimeout(() => {
-        this.semanticIndexCompatibilityRefreshTimer = null;
-        start();
-      }, SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS);
-    } else {
-      Promise.resolve().then(start);
-    }
+    const schedule = () => {
+      if (typeof window?.setTimeout === "function") {
+        window.clearTimeout(this.semanticIndexCompatibilityRefreshTimer);
+        this.semanticIndexCompatibilityRefreshTimer = window.setTimeout(() => {
+          this.semanticIndexCompatibilityRefreshTimer = null;
+          start();
+        }, SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS);
+      } else {
+        Promise.resolve().then(start);
+      }
+    };
+    // At startup the vault's note list can still be empty, which made this rebuild
+    // fail at once with "No indexable Markdown notes were found" and then stay
+    // suppressed for the session. Wait for the workspace before the first attempt.
+    const workspace = this.app?.workspace;
+    if (workspace && workspace.layoutReady === false && typeof workspace.onLayoutReady === "function") workspace.onLayoutReady(schedule);
+    else schedule();
     return true;
   }
 
@@ -7054,7 +7163,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   logLocal(message, data = {}) {
     const entry = { at: deviceTimestamp(), message, data: sanitizeLogData(data) };
     this.settings.localLog = [entry, ...(this.settings.localLog || [])].slice(0, 100);
-    this.queueSettingsSave();
+    this.markActivityLogDirty();
     if (this.settingsTab?.activeTab === "Activity") this.settingsTab.queueActivityLogRefresh();
   }
 
@@ -7421,6 +7530,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         this.logLocal("Semantic index rebuilt but settings persistence failed after manifest commit", { error: settingsError?.message || String(settingsError), generation: this.semanticIndexManifestPublishedGeneration || "" });
         if (showNotice) new Notice("Semantic index rebuilt, but settings persistence failed; the committed index remains active.");
         return semanticOperationResult({ ok: true, changed: true, changedCount: indexed.length, reasonCode: "rebuilt-settings-persist-failed", repairQueued: this.taskReferenceRepairFollowUp });
+      }
+      if (this.semanticIndexCompatibilityRefresh?.state === "failed") {
+        this.updateSemanticIndexCompatibilityRefresh({ state: "complete", reasonCode: "rebuilt", reason: "", error: "", completedAt: deviceTimestamp() });
       }
       this.logLocal("Semantic index rebuilt", { files: files.length, chunks: indexed.length, embedded: embedded.embedded, providerInputs: embedded.providerInputs, deduplicatedInputs: embedded.deduplicatedInputs, reused: embedded.reused, materialityAnchorInputs: materialityAnchors.telemetry.inputCount, ms: Date.now() - startedAt });
       if (showNotice) new Notice(`Semantic index rebuilt: ${indexed.length} chunks from ${files.length} notes.`);
@@ -12782,7 +12894,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       semanticContext: initialSemanticContext,
       scopeSemanticEvidence: preStructureScopes.byScope,
       scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry,
-      taskRelevanceRankings: preStructureScopes.taskRelevanceRankings || null,
+      // A non-note source (an email) with no ranked evidence rows at all has nothing to
+      // select from: pass no rankings so the bundle skips corpus-coverage instead of
+      // failing with "ranked corpus is empty". Notes keep their existing handling.
+      taskRelevanceRankings: (retrievalIsNote || Object.values(preStructureScopes.taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length)) ? (preStructureScopes.taskRelevanceRankings || null) : null,
       // Task 2 first slice: the exact single computed selection for note
       // sources, plus the ranked rows for the bundle's independent selected-ID
       // body/provenance recheck and the preserved retrieval bindings the
@@ -13464,7 +13579,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       semanticContext: [...(initialSemanticContext || []), ...taskSemanticChunks],
       scopeSemanticEvidence: preStructureScopes.byScope,
       scopeSemanticRetrievalTelemetry: preStructureScopes.telemetry,
-      taskRelevanceRankings,
+      // A non-note source (an email) with no ranked evidence rows at all has nothing to
+      // select from: pass no rankings so the bundle skips corpus-coverage instead of
+      // failing with "ranked corpus is empty". Notes keep their existing handling.
+      taskRelevanceRankings: (poststructureIsNote || Object.values(taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length)) ? taskRelevanceRankings : null,
       // Task 2 first slice: the exact single computed selection for note
       // sources, plus the ranked rows for the bundle's independent selected-ID
       // body/provenance recheck and the preserved retrieval bindings the
@@ -23254,11 +23372,47 @@ function availableModelSummary(settings) {
   return `${gemini} ${openai}`;
 }
 
-function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS) {
+// Provider model catalogs and reasoning-capability metadata: pure regenerable
+// caches that live in model-cache.json instead of data.json. Credentials,
+// user-authored settings, providerGenerationModels/providerEmbeddingModels and
+// the semantic-index/task tables deliberately stay in data.json.
+const MODEL_CACHE_SETTINGS_KEYS = Object.freeze([
+  "availableChatModels",
+  "availableEmbeddingModels",
+  "availableGeminiModels",
+  "availableGeminiEmbeddingModels",
+  "availableOpenRouterModels",
+  "availableOpenRouterEmbeddingModels",
+  "availableOpenWebUIModels",
+  "availableOpenWebUIEmbeddingModels",
+  "availableCustomOpenAIModels",
+  "availableCustomOpenAIEmbeddingModels",
+  "providerModelCapabilities",
+  "openrouterModelMetadata",
+  "openaiModelMetadata",
+  "openwebuiModelMetadata",
+  "geminiModelMetadata",
+  "openrouterEmbeddingModelMetadata",
+  "customOpenAIModelMetadata",
+  "openrouterMetadataFingerprint",
+  "openrouterMetadataRevision"
+]);
+
+function settingsRequireSplitMigration(loadedData = {}) {
+  if (!loadedData || typeof loadedData !== "object") return false;
+  if (Object.prototype.hasOwnProperty.call(loadedData, "localLog")) return true;
+  return MODEL_CACHE_SETTINGS_KEYS.some((key) => Object.prototype.hasOwnProperty.call(loadedData, key));
+}
+
+function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS, options = {}) {
   const data = Object.assign({}, settings);
   delete data.taskCache;
   delete data.pendingTaskReferences;
   delete data.pendingTaskDescriptions;
+  delete data.localLog;
+  if (options.includeModelCache !== true) {
+    for (const key of MODEL_CACHE_SETTINGS_KEYS) delete data[key];
+  }
   return data;
 }
 
@@ -26369,11 +26523,11 @@ function emailPreparationFailureDetail(plan = {}, error = null) {
   return { stage, codes: Array.from(codes).slice(0, EMAIL_FAILURE_HOLD_MAX_CODES) };
 }
 
-function allActiveWorkflowStatusItems(plugin) {
+function allActiveWorkflowStatusItems(plugin, aiValueOptions = {}) {
   const fileSyncCount = plugin.fileSyncInProgress?.size || 0;
   const indexCount = plugin.pendingIndexPaths?.size || 0;
   const items = [];
-  if (plugin.aiActivity) items.push({ label: "AI", value: aiActivityStatusValue(plugin) });
+  if (plugin.aiActivity) items.push({ label: "AI", value: aiActivityStatusValue(plugin, Date.now(), aiValueOptions) });
   if (plugin.schedulerInProgress) items.push({ label: "Scheduler", value: workflowActivityValue(plugin, "scheduler", "Planning") });
   if (plugin.emailProcessingInProgress) items.push({ label: "Email", value: workflowActivityValue(plugin, "email", "Processing") });
   const notesLive = workflowActivityValue(plugin, "notes", "");
@@ -26406,15 +26560,27 @@ function activeWorkflowStatusItems(plugin, currentStatus = "Ready") {
   const explicit = /^ready$/i.test(status) ? "" : status;
   const items = [];
   const liveItems = allActiveWorkflowStatusItems(plugin);
-  // Concise composition: while a live activity item exists, an explicit
-  // free-text message that only restates the same in-progress step is dropped
-  // so the sidebar shows one line instead of two saying the same thing.
-  // Outcome/error lines carry new information and are always kept.
-  if (explicit && (!liveItems.length || isStatusOutcomeMessage(explicit) ||
-      !statusMessageDuplicatesLiveActivity(explicit, liveWorkflowActivityLabels(plugin)))) {
-    items.push({ label: "Status", value: explicit });
+  // The Status item is always present while work is live: an explicit message
+  // is kept verbatim, and a Ready/empty status shows the live activity name
+  // instead, so the label never reads "Ready" during activity.
+  let statusValue = explicit;
+  // When no AI activity names the work and the only live items are labelled
+  // non-AI items (for example a persistent "Index: Compatibility rebuild
+  // failed"), those items already carry their own label: they are shown as is
+  // and never copied into a second, identical Status text.
+  if (!statusValue && liveItems.length) {
+    statusValue = topLiveAiActivityLabel(plugin).slice(0, 80);
   }
-  items.push(...liveItems);
+  // Concise composition: the repeated wording is removed from the live AI
+  // item (its activity label and any counter the Status text already shows),
+  // never by hiding the Status item.
+  const duplicates = Boolean(statusValue) && statusWordingDuplicatesLiveActivity(statusValue, liveAiActivityLabels(plugin));
+  const aiOptions = duplicates
+    ? { omitLabel: true, omitCounter: duplicatedStatusCounter(statusValue, topAiActivityProgress(plugin)) }
+    : {};
+  const finalLiveItems = aiOptions.omitLabel ? allActiveWorkflowStatusItems(plugin, aiOptions) : liveItems;
+  if (statusValue) items.push({ label: "Status", value: statusValue });
+  items.push(...finalLiveItems);
   return items.length ? items : [{ label: "Status", value: "Ready" }];
 }
 
@@ -26496,6 +26662,61 @@ function statusMessageDuplicatesLiveActivity(status, liveLabels = []) {
   return isStatusInProgressMessage(status);
 }
 
+// Wording-only duplicate check for the AI item: true when the Status text
+// restates one of the live AI activity labels ("Writing descriptions 3 of
+// 10..." vs "Writing descriptions"). A phase-shaped status that names a
+// different activity ("Syncing Todoist tasks...") must not shorten the AI
+// item, so the in-progress fallback of statusMessageDuplicatesLiveActivity is
+// deliberately not used here.
+function statusWordingDuplicatesLiveActivity(status, labels = []) {
+  const normalized = normalizeStatusComparisonText(status);
+  if (!normalized || normalized.length < 4) return false;
+  for (const raw of labels || []) {
+    const label = normalizeStatusComparisonText(raw);
+    if (!label || label.length < 4) continue;
+    if (normalized.includes(label) || label.includes(normalized)) return true;
+  }
+  return false;
+}
+
+// Labels of every live AI activity (stacked tokens plus the current one).
+function liveAiActivityLabels(plugin) {
+  const labels = [];
+  const stacked = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
+  for (const entry of stacked) {
+    const label = singleLine((entry && entry.label) || "");
+    if (label) labels.push(label);
+  }
+  const current = singleLine(plugin?.aiActivity || "");
+  if (current) labels.push(current);
+  return labels;
+}
+
+// The "N of M" counter the Status item already shows, when the live AI
+// progress carries the same counter; the AI value drops it so the rendered
+// line never repeats one counter.
+function duplicatedStatusCounter(status, progress) {
+  const counters = singleLine(status || "").match(/\b\d+\s+of\s+\d+\b/g) || [];
+  const text = singleLine(progress || "");
+  for (const counter of counters) {
+    if (text.includes(counter)) return counter;
+  }
+  return "";
+}
+
+// Removes the duplicated counter wording from the live AI progress:
+// "step 3 of 4 · 3 of 10 complete" with counter "3 of 10" becomes
+// "step 3 of 4"; a leading "step 3 of 10: ..." loses the whole step prefix.
+function stripDuplicatedCounter(progress, counter) {
+  const escaped = String(counter || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escaped) return progress;
+  return singleLine(progress
+    .replace(new RegExp(`^step\\s+${escaped}\\s*:?\\s*`, "i"), "")
+    .replace(new RegExp(`(?:·\\s*)?${escaped}(?:\\s+complete)?\\s*`, "g"), " ")
+    .replace(/\s*·\s*$/, "")
+    .replace(/\s+/g, " "));
+}
+
 function isReadyWorkflowStatusItems(items) {
   return (items || []).length === 1 && /^status$/i.test(items[0]?.label || "") && /^ready$/i.test(items[0]?.value || "");
 }
@@ -26508,17 +26729,30 @@ function formatAiActivityDuration(elapsedMs) {
   return `${Math.floor(totalMinutes / 60)}h ${String(totalMinutes % 60).padStart(2, "0")}m`;
 }
 
-function aiActivityStatusValue(plugin, now = Date.now()) {
+// The live AI item's activity label (top of the stack) and the first live
+// progress string, shared by the status composer and the AI value builder.
+function topLiveAiActivityLabel(plugin) {
   const active = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
   const top = active.length ? active[active.length - 1] : null;
-  const label = singleLine((top && top.label) || plugin?.aiActivity || "");
+  return singleLine((top && top.label) || plugin?.aiActivity || "");
+}
+
+function topAiActivityProgress(plugin) {
+  const active = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
+  const withProgress = active.find((entry) => entry && singleLine(entry.progress || ""));
+  return withProgress ? singleLine(withProgress.progress).slice(0, 48) : "";
+}
+
+function aiActivityStatusValue(plugin, now = Date.now(), options = {}) {
+  const active = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
+  const label = topLiveAiActivityLabel(plugin);
   if (!label) return "";
   // Per-activity start: the oldest live token, so elapsed never resets
   // backwards while nested provider tokens start and settle above it.
   const starts = active.map((entry) => Number(entry?.startedAt || 0)).filter((value) => value > 0);
   const startedAt = starts.length ? Math.min(...starts) : Number(plugin?.aiActivityStartedAt || 0);
-  const withProgress = active.find((entry) => entry && singleLine(entry.progress || ""));
-  const progress = withProgress ? singleLine(withProgress.progress).slice(0, 48) : "";
+  let progress = topAiActivityProgress(plugin);
+  if (progress && options.omitCounter) progress = stripDuplicatedCounter(progress, options.omitCounter);
   const extra = active.length > 1 ? ` (+${active.length - 1} more)` : "";
   const duration = startedAt ? ` · ${formatAiActivityDuration(now - startedAt)}` : "";
   const suffix = `${duration}${extra}`;
@@ -26527,14 +26761,16 @@ function aiActivityStatusValue(plugin, now = Date.now()) {
   const progressForms = progress
     ? [progress, progress.replace(/ complete$/, ""), progress.replace(/^step \d+ of \d+:? ?/, "").replace(/^· /, "").replace(/ complete$/, "")].filter(Boolean)
     : [];
-  let core = label;
+  let core = options.omitLabel ? "" : label;
   for (const form of progressForms) {
-    core = `${label} · ${form}`;
+    core = core ? `${core} · ${form}` : form;
     if ((core + suffix).length <= 80) break;
   }
   let value = core + suffix;
   if (value.length > 80 && extra) value = core + duration;
-  return value.length > 80 ? value.slice(0, 80) : value;
+  value = value.replace(/^\s*·\s*/, "").trim();
+  if (value.length > 80) value = value.slice(0, 80);
+  return value || label;
 }
 
 // Bounded progress text builder shared by setAiActivityProgress and
@@ -44193,7 +44429,10 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
     const scopeForAction = (sourceContract.scopes || []).find((scope) => String(scope?.scopeId || scope?.id || "") === scopeId);
     const sourcePath = String(sourceContract.path || sourceContract.sourcePath || "");
     const markerMatches = self ? explicitNoteActionMarkers(self.text, options.settings || DEFAULT_SETTINGS)
-      .filter((marker) => marker.action === actionText
+      // A list-group chunk stores a marker line together with the next list item, so its
+        // action text can run on past the note's own action: accept that only at a word
+        // boundary, and the single-match rule below still applies.
+        .filter((marker) => (marker.action === actionText || (marker.action.startsWith(actionText) && /^\s/.test(marker.action.slice(actionText.length))))
         && Array.isArray(scopeForAction?.lines)
         && scopeForAction.lines.some((line) => Number(line) >= self.lineStart && Number(line) <= self.lineEnd)) : [];
     if (!self || !sourcePath || self.path !== sourcePath || !scopeForAction

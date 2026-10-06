@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.10 - 2026-10-06
+
+### Fixed
+- Email-to-Todoist no longer stalls before or after generating when an email has no related indexed notes: it now works from the email itself.
+- The status line always shows its "Status:" label while the plugin works, and no longer duplicates another row's text under it.
+- A successful index rebuild now clears a stale "compatibility rebuild failed" status, and the automatic rebuild after an index version change now waits for the vault to finish loading before it runs, so it no longer fails with "No indexable Markdown notes".  
+
+### Changed
+- The activity log and the cached provider model lists now live in their own files (activity-log.json, model-cache.json). data.json shrinks from about 570 KB to about 100 KB, so sync no longer stores a new full-size version with every step of a run.
+- Settings rows put the name (bold) and the description (muted, after a dash) on one line, with the control below in a second row next to its action button. Toggles sit on the right of the text line.
+
 ## 0.9.9 - 2026-10-06
 
 ### Fixed

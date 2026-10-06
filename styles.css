@@ -1921,3 +1921,266 @@
 .semantic-todoist-settings select.dropdown.is-measuring {
   position: fixed;
 }
+
+
+/* Settings rows (0.9.10): every plain row puts the name (bold) and the description (muted, smaller)
+   on one wrapping line, then lays the controls out in a two-column
+   grid: the main control in column one and an action button in column two.
+   Rows that own their layout keep it untouched: Obsidian heading rows, the
+   model combobox, the project select, setup steps, reference actions, and the
+   folder chips. In narrow panes (<= 480px container or viewport) the control
+   grid drops to one column so a button sits below the control instead of
+   squeezing it. */
+.semantic-todoist-settings {
+  container-type: inline-size;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) {
+  align-items: start;
+  display: grid;
+  gap: 6px 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-info {
+  display: block;
+  margin-right: 0;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* Name and description share one line (wrapping at word boundaries when long):
+   the name is bold and normal-colored, the description is lighter, smaller and
+   muted after an em dash, so the two stay clearly separate without costing a row. */
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-info .setting-item-name {
+  color: var(--text-normal);
+  display: inline;
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold, 600);
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-info .setting-item-description {
+  color: var(--text-muted);
+  display: inline;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-normal, 400);
+  margin-inline-start: 0.35em;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-info .setting-item-description:not(:empty)::before {
+  color: var(--text-faint);
+  content: "\2014\00a0";
+}
+
+/* Long names and descriptions wrap at word boundaries, never per character. */
+.semantic-todoist-settings .setting-item .setting-item-info .setting-item-name,
+.semantic-todoist-settings .setting-item .setting-item-info .setting-item-description {
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.semantic-todoist-settings .setting-item .setting-item-info .setting-item-description:empty {
+  display: none;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-inline-start: 0;
+  max-width: 100%;
+  min-width: 0;
+  width: 100%;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control:empty {
+  display: none;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > input,
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > select,
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > textarea {
+  width: 100%;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > textarea {
+  grid-column: 1 / -1;
+}
+
+/* A lone button (or toggle) sits in the first column, left-aligned. */
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > button,
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > .checkbox-container,
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))) .setting-item-control > .semantic-todoist-weight-control {
+  justify-self: start;
+}
+
+/* A row whose only control is a toggle keeps the classic single line: name and
+   description on the left, the toggle on the right. */
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))):has(> .setting-item-control > .checkbox-container:only-child) {
+  align-items: center;
+  column-gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.semantic-todoist-settings .setting-item:where(:not(:is(
+  .setting-item-heading,
+  .semantic-todoist-model-combobox-setting,
+  .semantic-todoist-project-setting,
+  .semantic-todoist-setup-step,
+  .semantic-todoist-reference-action-setting,
+  .semantic-todoist-folder-list .setting-item
+))):has(> .setting-item-control > .checkbox-container:only-child) > .setting-item-control {
+  display: flex;
+  justify-content: flex-end;
+  width: auto;
+}
+
+@container (max-width: 480px) {
+  .semantic-todoist-settings .setting-item:where(:not(:is(
+    .setting-item-heading,
+    .semantic-todoist-model-combobox-setting,
+    .semantic-todoist-project-setting,
+    .semantic-todoist-setup-step,
+    .semantic-todoist-reference-action-setting,
+    .semantic-todoist-folder-list .setting-item
+  ))) .setting-item-control {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .semantic-todoist-settings .setting-item:where(:not(:is(
+    .setting-item-heading,
+    .semantic-todoist-model-combobox-setting,
+    .semantic-todoist-project-setting,
+    .semantic-todoist-setup-step,
+    .semantic-todoist-reference-action-setting,
+    .semantic-todoist-folder-list .setting-item
+  ))) .setting-item-control {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Long index file names stay inside the pane. */
+.semantic-todoist-settings .semantic-todoist-index-file-list li {
+  overflow-wrap: anywhere;
+}

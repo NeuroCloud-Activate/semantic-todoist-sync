@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.5 - 2026-10-06
+
+### Changed
+- Task descriptions are shorter and more focused: a few sentences on what to do now, without recounting the full history.
+- Descriptions no longer name the source note, repeat the task title, or build a history from the same note's own lines.
+- Content taken from an older or other note is asked to carry that note's citation.
+
 ## 0.9.4 - 2026-10-06
 
 ### Fixed

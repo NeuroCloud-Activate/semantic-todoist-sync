@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.3 - 2026-10-06
+
+### Fixed
+- Creating tasks from a note no longer stops with "No actionable tasks found" when an indexed note contributes only front matter or tags. Those entries are now skipped automatically.
+- If task creation is blocked before the AI step, the message now says why instead of reporting that no tasks were found.
+
 ## 0.9.2 - 2026-10-05
 
 ### Fixed

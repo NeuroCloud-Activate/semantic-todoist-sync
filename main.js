@@ -15475,6 +15475,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         maxChars: this.settings.maxNoteChars,
         templateInstructions: template.prompt
       }, { captureContext });
+      if (plan.workflowContextFailure) {
+        const code = String(plan.workflowContextFailure.code || "workflow-context-failure");
+        const reason = [].concat(plan.workflowContextFailure.reason || []).slice(0, 3).join(", ");
+        throw new Error(`Task creation blocked before the AI step: ${code}${reason ? ` (${reason})` : ""}.`);
+      }
       let sectionName = plan.sectionName || fallbackSectionName;
       const tasks = plan.tasks || [];
       if (!tasks.length) return { tasks: [], markdown: "" };
@@ -43857,6 +43862,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
   const selectedUnion = new Set();
   const rankedCorpus = new Set();
   const rankedIdsByTask = new Map();
+  const metadataOnlyRankedIds = new Set();
   const perTaskOrder = Object.keys(perTaskRankings || {});
   for (const taskKey of perTaskOrder) {
     const ranking = perTaskRankings[taskKey] || {};
@@ -43900,6 +43906,9 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
         continue;
       }
       ranked.push({ evidenceId, score, text, path, lineStart, lineEnd });
+      // The evidence catalog drops metadata-only rows (frontmatter / tags-only),
+      // so they stay ranked for corpus coverage but are never selected.
+      if (semanticMetadataOnlyUnit(row.sourceChunk || row)) metadataOnlyRankedIds.add(evidenceId);
       if (checkpoint && checkpoint()) yield TASK_WORKFLOW_HASH_YIELD;
     }
     ranked.sort((left, right) => (right.score - left.score)
@@ -43960,6 +43969,9 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       redundancy: { evidenceIds: dedupedSelection.evidenceIds.slice() },
       protection: { evidenceIds: protectionSelection.evidenceIds.slice() }
     };
+    }
+    for (let index = candidateIds.length - 1; index >= 0; index -= 1) {
+      if (metadataOnlyRankedIds.has(candidateIds[index]) && candidateIds[index] !== queryHandleEvidenceId) candidateIds.splice(index, 1);
     }
     const candidateSet = new Set(candidateIds);
     // Single-step mandatory closure: query-handle evidence plus mandatory-fact
@@ -44932,9 +44944,23 @@ function* taskWorkflowContextBundleSteps(options = {}) {
     ? new Set(taskRelevanceSelection.selectedEvidenceIds.map(String))
     : null;
   const availableCatalogIds = new Set(mergedFinalItems.map((item) => String(item.evidenceId || item.id || "")));
-  const selectedCatalogMissing = selectedEvidenceIdSet
-    ? [...selectedEvidenceIdSet].filter((id) => !availableCatalogIds.has(id))
-    : [];
+  // Self-repair: a selected optional row the catalog dropped (for example a
+  // frontmatter/tags-only first chunk) is removed from the selection instead of
+  // aborting the run. Only protected rows (primary source, per-task closure) stay
+  // fatal when missing.
+  const selectedCatalogMissing = [];
+  if (selectedEvidenceIdSet) {
+    const protectedSelectedIds = new Set([String(sourceContract.primaryEvidenceId || "").trim()]);
+    for (const entry of Object.values(taskRelevanceSelection.perTask || {})) {
+      if (entry?.queryHandleEvidenceId) protectedSelectedIds.add(String(entry.queryHandleEvidenceId));
+      for (const evidenceId of entry?.closureAdded || []) protectedSelectedIds.add(String(evidenceId));
+    }
+    for (const id of [...selectedEvidenceIdSet]) {
+      if (availableCatalogIds.has(id)) continue;
+      if (protectedSelectedIds.has(id)) selectedCatalogMissing.push(id);
+      else selectedEvidenceIdSet.delete(id);
+    }
+  }
   // Bounded closure keep (round 1/5 review): the only rows that may survive
   // outside the selected union are current-source/primary rows whose evidence
   // is in the calibrated per-task closure (query-handle or mandatory closure

@@ -13551,7 +13551,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   // Owned local activity scope for task description refinement: the token
   // starts before local preparation and ends in finally after post-response
   // validation/retry processing settles. Each provider call keeps its own
-  // nested "Writing task description N of M" activity.
+  // nested "Writing task description" activity (one identical label for every
+  // parallel call; the phase progress carries the K of N counter once).
   async refineTaskDescriptionsWithLocalActivity(tasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}) {
     const activity = this.beginAiActivity("Preparing task descriptions");
     try {
@@ -13832,9 +13833,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       try {
         const dispatchGate = await this.semanticTaskContextDispatchGate("description");
         if (dispatchGate) throw Object.assign(new Error("Semantic index is degraded."), { code: dispatchGate.code, semanticDispatchGate: dispatchGate });
-        const position = mainTasks.findIndex((entry) => entry.index === targetTask.index) + 1;
         slotEntry.transportAttempted = true;
-        const json = await this.withAiActivity(`Writing task description ${position} of ${mainTasks.length}`, () => this.openaiResponse({
+        // Identical per-call label: the phase progress ("step 3 of 4:
+        // descriptions · K of N complete") already renders the counter, so a
+        // per-position label here would show the same counter twice.
+        const json = await this.withAiActivity("Writing task description", () => this.openaiResponse({
         operation: "description",
         model: modelChoice.model,
         // t19: keep the override flag so fallback stays suppressed; per-call identity.
@@ -26184,6 +26187,11 @@ function normalizeStatusComparisonText(text) {
   value = value.replace(/;.*$/, "");
   value = value.replace(/\b\d+\s+of\s+\d+\b/g, "").replace(/\b\d+\s*\/\s*\d+\b/g, "").replace(/\(\s*\d+[^)]*\)/g, "");
   value = value.replace(/·\s*\d+[hms](?:\s*\d+[ms])?/g, " ");
+  // Plural/singular and the "task" qualifier must not defeat the dedupe
+  // compare: "Writing task description 3 of 10" and "Writing descriptions
+  // 3 of 10..." both normalize to "writing description".
+  value = value.replace(/\btasks?\b/g, " ");
+  value = value.replace(/\b([a-z]+)([^su])s\b/g, "$1$2");
   return value.replace(/\s+/g, " ").trim();
 }
 
@@ -43933,7 +43941,15 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
         && scopeForAction.lines.some((line) => Number(line) >= self.lineStart && Number(line) <= self.lineEnd)) : [];
     if (!self || !sourcePath || self.path !== sourcePath || !scopeForAction
       || String(scopeForAction.action || "").trim() !== actionText || markerMatches.length !== 1) {
-      scoreMissingErrors.push(`action-source-mismatch:${taskKey}:${queryHandleEvidenceId}`);
+      // Say which sub-check failed (counts and flags only, never note text).
+      const why = [];
+      if (!self) why.push("self-missing");
+      if (!sourcePath) why.push("no-source-path");
+      else if (self && self.path !== sourcePath) why.push("path-differs");
+      if (!scopeForAction) why.push("scope-missing");
+      else if (String(scopeForAction.action || "").trim() !== actionText) why.push("action-differs");
+      if (markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
+      scoreMissingErrors.push(`action-source-mismatch:${taskKey}:${queryHandleEvidenceId}:why=${why.join("+")}`);
     }
     // Protection first, then the score module; a stable union is
     // conservatively deduplicated against this task's original raw rows

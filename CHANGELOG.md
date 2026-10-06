@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.6 - 2026-10-06
+
+### Fixed
+- The status area no longer shows the description counter twice while descriptions are written in parallel, and the status text no longer disappears during that step.
+
+### Changed
+- When task creation is blocked because an action line could not be matched to the note, the message now says which check failed (counts and flags only, never note text), so the cause can be diagnosed.
+
 ## 0.9.5 - 2026-10-06
 
 ### Changed

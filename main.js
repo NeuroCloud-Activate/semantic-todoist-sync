@@ -3066,6 +3066,8 @@ function taskDescriptionUserInstructionLines({
     "Task materiality: use a same-scope line only when it adds a concrete execution detail for this task. Include prior reviewer edits or comments, known concerns, existing artifact state, unresolved decisions or conflicts, reviewer expectations, and earlier handoffs only when they identify what to inspect, preserve, verify, or resolve now. Omit stale availability, expired scheduling, unrelated lines, and unrelated task evidence.",
     "Do not name or quote the source note, its title or filename, and do not repeat the task title or the same fact twice. Treat the source note as the current state: do not narrate a history or timeline made up of lines from that same note; give history only when it comes from a different, older note and changes what must be done now. Do not mention prompt fields, evidence bundles, source notes, task numbers, another/previous/next/separate tasks, task order, batching, separation, or workflow mechanics. Do not use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is....",
     TASK_DESCRIPTION_ANTI_FILLER_RULE,
+    "Formatting: write each sentence's text in Todoist-compatible Markdown so the key points stand out. Put **bold** on the one to three most important items (the action, a deadline or date, a named person or owner, a key amount or decision) and *italic* for a condition or caveat. Use only **bold**, *italic* and `inline code`; do not use headings, tables, bullet lists, quotes or code blocks. Keep emphasis sparing, never bold a whole sentence, and never put emphasis markers around a citation or inside a link.",
+    "Length limit (overrides every completeness, every-must-ref, separate-sentence and detail rule above, and any saved description instructions): write at most 1000 characters per task (a hard maximum, usually 3 to 5 short sentences). Fold must refs and supporting facts into those sentences by citing several refs in one sentence instead of adding sentences. Keep only what is needed to act now: the action, who, when, and the key decision or caveat. Leave out background that does not change what must be done.",
     "",
     "Context-note citation rule:",
     contextCitationInstructions(citeContextNotes, structuredEvidence),
@@ -13605,7 +13607,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       evidenceBundleHash: task.evidenceBundle?.hash || task.taskEvidenceBundle?.hash || ""
     }));
     if (!mainTasks.length) return emptyTaskDescriptionFailureReport();
-    this.setAiActivityProgress(activity, { step: 3, steps: 4, label: "descriptions", done: 0, total: mainTasks.length });
+    this.setAiActivityProgress(activity, { step: 3, steps: 4, done: 0, total: mainTasks.length });
     for (const task of tasks || []) clearTaskDescriptionGenerationFailure(task);
     const recoveryTelemetry = {
       callCount: 0,
@@ -13837,7 +13839,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // Identical per-call label: the phase progress ("step 3 of 4:
         // descriptions · K of N complete") already renders the counter, so a
         // per-position label here would show the same counter twice.
-        const json = await this.withAiActivity("Writing task description", () => this.openaiResponse({
+        const json = await this.withAiActivity("Writing descriptions", () => this.openaiResponse({
         operation: "description",
         model: modelChoice.model,
         // t19: keep the override flag so fallback stays suppressed; per-call identity.
@@ -13939,7 +13941,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // parse) is caught into that singleton's own slot, so a setup throw on
       // one worker can never reject Promise.all before the other workers
       // settle. No sibling cancellation, no retry of successes.
+      // Progress is per phase: the counter and its total always come from this
+      // phase's own targets, and a retry says so, so "K of N" never mixes lists.
       let descriptionSettledCount = 0;
+      const progressLabel = phase === "retry" ? "retrying" : "";
+      this.setAiActivityProgress(activity, { step: 3, steps: 4, label: progressLabel, done: 0, total: targets.length });
       await asyncPool(targets, taskDescriptionConcurrencyFor(this.settings), async (task) => {
         const slot = byIndex.get(task.index);
         try {
@@ -13955,7 +13961,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           return;
         }
         descriptionSettledCount += 1;
-        if (this.setAiActivityProgress(activity, { step: 3, steps: 4, label: "descriptions", done: descriptionSettledCount, total: targets.length })) this.setSidebarStatus(`Writing descriptions ${descriptionSettledCount} of ${targets.length}...`);
+        if (this.setAiActivityProgress(activity, { step: 3, steps: 4, label: progressLabel, done: descriptionSettledCount, total: targets.length })) this.setSidebarStatus(`${phase === "retry" ? "Retrying" : "Writing"} descriptions ${descriptionSettledCount} of ${targets.length}...`);
         slot.raw = outcome.json;
         try {
           slot.parsed = JSON.parse(outcome.json);
@@ -26280,10 +26286,15 @@ function aiActivityStatusValue(plugin, now = Date.now()) {
   const extra = active.length > 1 ? ` (+${active.length - 1} more)` : "";
   const duration = startedAt ? ` · ${formatAiActivityDuration(now - startedAt)}` : "";
   const suffix = `${duration}${extra}`;
-  let core = progress ? `${label} · ${progress}` : label;
-  if ((core + suffix).length > 80 && progress) {
-    const budget = Math.max(0, 80 - (label + suffix).length - 3);
-    core = `${label} · ${progress.slice(0, budget)}`;
+  // The line is capped at 80 characters. Shorten the progress by dropping words, never by
+  // cutting digits: full text, then without "complete", then the counter alone.
+  const progressForms = progress
+    ? [progress, progress.replace(/ complete$/, ""), progress.replace(/^step \d+ of \d+:? ?/, "").replace(/^· /, "").replace(/ complete$/, "")].filter(Boolean)
+    : [];
+  let core = label;
+  for (const form of progressForms) {
+    core = `${label} · ${form}`;
+    if ((core + suffix).length <= 80) break;
   }
   let value = core + suffix;
   if (value.length > 80 && extra) value = core + duration;

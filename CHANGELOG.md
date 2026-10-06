@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.8 - 2026-10-06
+
+### Changed
+- Task descriptions now use Todoist-compatible formatting: bold for the few key items (the action, a date, a person, a key decision), italics for conditions, and inline code. Headings, tables, lists and code blocks are not used.
+- Task descriptions have a firm length target of 1000 characters or fewer, folding supporting facts into fewer sentences instead of recounting everything.
+
+### Fixed
+- The status line while descriptions are written now reads once, for example "Writing descriptions - step 3 of 4 - 9 of 9 complete", instead of repeating the word "description" and showing a mismatched counter. A retry pass shows its own counter.
+
 ## 0.9.7 - 2026-10-06
 
 ### Fixed

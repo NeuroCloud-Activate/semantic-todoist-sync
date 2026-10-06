@@ -37100,7 +37100,17 @@ function stripGeneratedActionItemsSection(text) {
   let skipping = false;
   const headingLevel = /^(\s*#{1,6})\s*(?:Semantic Todoist Sync\s*-\s*)?(?:[^\w#]+[-\s]*)?(?:Actionable\s+Items(?:\s+from\s+Note)?|Action\s+Items|Tasks?\s*&\s*Projects?|Tasks?|Projects?)\b/i;
   let skipLevel = 0;
-  for (const line of lines) {
+  // Properties (YAML front matter) are never headings: an alias such as
+  // "- Project: #Name" must not start a skipped section and shift line numbers.
+  let body = lines;
+  if (lines[0]?.trim() === "---") {
+    const close = lines.findIndex((line, index) => index > 0 && /^(?:---|\.\.\.)\s*$/.test(line.trim()));
+    if (close > 0) {
+      output.push(...lines.slice(0, close + 1));
+      body = lines.slice(close + 1);
+    }
+  }
+  for (const line of body) {
     const start = headingLevel.exec(line);
     if (start || isStandaloneActionItemsHeading(line)) {
       skipping = true;

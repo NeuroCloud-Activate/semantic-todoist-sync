@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.7 - 2026-10-06
+
+### Fixed
+- Creating tasks from a note no longer stops with a protected evidence error when the note has a properties block whose values look like a Tasks or Projects heading (for example an alias such as "Project: #Name"). Properties are now left out when finding generated task sections, so action lines match the indexed note.
+
 ## 0.9.6 - 2026-10-06
 
 ### Fixed

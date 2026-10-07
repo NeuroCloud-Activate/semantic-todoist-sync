@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.11 - 2026-10-06
+
+### Fixed
+- An email's own source text is now accepted as evidence for every scope of that email when the workflow checks references after generating tasks, so email processing no longer stops with a protected-evidence error after generation. All other foreign-reference checks are unchanged.
+
 ## 0.9.10 - 2026-10-06
 
 ### Fixed

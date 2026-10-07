@@ -45695,6 +45695,10 @@ function* taskWorkflowContextBundleSteps(options = {}) {
     if (!scopeId) return;
     for (const evidenceId of refs || []) {
       const evidence = sharedEvidenceById[String(evidenceId)];
+      // Same current-source-primary exception the ownership loop below uses: the
+      // source's own primary evidence is valid for every scope of that source.
+      if (taskWorkflowIsCurrentSourcePrimaryEvidence(evidence,
+        taskWorkflowCurrentSourcePrimaryIdentity(sourceContract))) continue;
       const scopeIds = uniqueValues([...(evidence?.scopeIds || []), evidence?.scopeId].map(String).filter(Boolean));
       if (evidence && scopeIds.length && !scopeIds.includes(scopeId)) foreignReferenceErrors.push(`task:${taskId}:scope:${evidenceId}`);
     }

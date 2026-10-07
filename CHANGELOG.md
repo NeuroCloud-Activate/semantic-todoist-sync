@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.12 - 2026-10-07
+
+### Fixed
+- Email-to-Todoist now writes task descriptions: when the model labels an email task with the wrong scope, the task is resolved to the email's single scope, so its source evidence is no longer dropped and the description is no longer empty.
+- Sidebar chat about the active note no longer marks correct answers as unsupported: every retrieved chunk of a note is now citable.
+
+### Changed
+- Chat answers no longer show a "Not established from supplied evidence" label. Every claim shows as written, with links only for citations that match the retrieved evidence; unstructured replies show as plain text.
+
 ## 0.9.11 - 2026-10-06
 
 ### Fixed

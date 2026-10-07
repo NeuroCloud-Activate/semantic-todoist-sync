@@ -13123,6 +13123,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     const allowedLabels = labelsAllowedByInstructions(taskInstructions.tags);
     const rawTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    // A single-scope contract (an email, or a note with no marked actions)
+    // leaves the model no real scope choice; when it returns the source title,
+    // an evidence handle, or another invented scope_id, resolve the tree to the
+    // contract's single scope BEFORE handle/fact resolution so the scope-keyed
+    // fact directory derives the task's fact refs/bindings exactly as it does
+    // for a matching note scope, and every downstream scope gate (bundle,
+    // description ledger, ownership) sees the real scope. Multi-scope contracts
+    // (note marker scopes) keep failing closed on a foreign scope.
+    for (const task of rawTasks) normalizeGeneratedTaskTreeScopes(task, sourceContract);
     // Option A (spec §5A item 4): resolve refs once at the generation parse
     // boundary, before validators and cleanTask. Scope-allowed IDs are the
     // bundle's per-scope delivered sets (promptScopeAssignment); the bundled
@@ -28439,7 +28448,10 @@ function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTING
     if (kind === "vault-note" && !path) return;
     const evidenceId = String(entry.evidenceId || entry.evidence_id || "");
     const sourceId = String(entry.sourceId || entry.provenance?.sourceId || "");
-    const key = sourceId || evidenceId || (kind === "todoist-task" ? `todoist:${taskId}` : `note:${path}`);
+    // One ledger row per evidence identity: the prompt lists every retrieved
+    // row's evidence_id, so distinct evidence ids of one source must each stay
+    // citable. The source id only dedupes rows that carry no evidence id.
+    const key = evidenceId || sourceId || (kind === "todoist-task" ? `todoist:${taskId}` : `note:${path}`);
     if (entries.some((item) => item.key === key)) return;
     const title = singleLine(entry.title || task.content || task.title || path || taskId);
     const url = kind === "todoist-task"
@@ -28593,80 +28605,39 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const byEvidenceId = new Map(entries.map((entry) => [String(entry.evidenceId), entry]));
   const reasonCodes = [];
   const renderedClaims = [];
-  let invalidClaimCount = 0;
-  let unsupportedClaimCount = 0;
+  // Every claim renders verbatim as the model wrote it. established/category
+  // flags never downgrade visible text; evidence_ids that do not resolve in
+  // the ledger are silently ignored (telemetry only).
+  let unresolvedClaimCount = 0;
+  let claimWithEvidenceCount = 0;
   let usedSourceCount = 0;
   const sourceUrlsUsed = new Set();
   if (!parsed) {
-    return {
-      answer: "Not established from supplied evidence: the assistant did not return a structured evidence response.",
-      telemetry: {
-        schemaVersion: 2,
-        responseSchema: "chat-evidence-v1",
-        allowedSourceCount: entries.length,
-        allowedEvidenceCount: entries.length,
-        usedSourceCount: 0,
-        missingSourceCount: entries.length,
-        removedInventedLinkCount: 0,
-        removedLinkCount: 0,
-        claimCount: 0,
-        supportedClaimCount: 0,
-        unsupportedClaimCount: 1,
-        invalidEvidenceClaimCount: 0,
-        missingSentenceCitationCount: 1,
-        unsupportedSentenceCount: 1,
-        reasonCodes: ["structured-response-invalid"],
-        repairCallCount: 0,
-        degraded: Boolean(options.degraded || options.retrievalTelemetry?.degraded),
-        degradedReason: options.retrievalTelemetry?.degradedReason || "",
-        sourceOnly: Boolean(options.degraded || options.retrievalTelemetry?.degraded),
-        selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
-        sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
-      }
-    };
+    return validateChatEvidenceCitations(value, ledger, options);
   }
   for (const claim of parsed.claims) {
     const sentences = chatClaimSentences(claim?.text);
     if (!sentences.length) continue;
     const evidenceIds = uniqueValues((Array.isArray(claim?.evidence_ids) ? claim.evidence_ids : []).map(String).filter(Boolean));
     const validEntries = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
-    const allEvidenceValid = evidenceIds.length > 0 && validEntries.length === evidenceIds.length;
-    const category = String(claim?.category || "");
-    const categoryShapeValid = claim?.established === true
-      ? category !== "unsupported"
-      : category === "unsupported" && evidenceIds.length === 0;
-    const established = claim?.established === true && categoryShapeValid && allEvidenceValid;
-    if (!categoryShapeValid) reasonCodes.push("claim-category-shape-invalid");
-    if (claim?.established === true && !established) {
-      invalidClaimCount += 1;
-      if (!evidenceIds.length) reasonCodes.push("established-claim-missing-evidence");
-      else if (!allEvidenceValid) reasonCodes.push("invalid-evidence-id");
+    const unresolvedIds = evidenceIds.filter((id) => !byEvidenceId.has(id));
+    if (unresolvedIds.length) {
+      unresolvedClaimCount += 1;
+      reasonCodes.push("unresolved-evidence-id-ignored");
     }
-    if (claim?.established !== true && !categoryShapeValid) invalidClaimCount += 1;
-    if (!established) unsupportedClaimCount += 1;
-    if (established) {
-      const links = validEntries.map((entry) => entry.markdown).filter(Boolean);
-      links.forEach((link) => {
-        const url = String(link).match(/\]\(([^)]+)\)$/)?.[1] || "";
-        if (url) sourceUrlsUsed.add(url);
-      });
-      for (const sentence of sentences) {
-        const clean = finalizeStructuredChatSentence(sentence);
-        if (!clean) continue;
-        renderedClaims.push(`- ${clean} ${links.join(" ")}`.trim());
-      }
-    } else {
-      for (const sentence of sentences) {
-        const clean = finalizeStructuredChatSentence(sentence);
-        if (!clean) continue;
-        const prefix = /^(?:not established|not supported|unknown|unavailable)\b/i.test(clean) ? "" : "Not established from supplied evidence: ";
-        renderedClaims.push(`- ${prefix}${clean}`.trim());
-      }
+    if (validEntries.length) claimWithEvidenceCount += 1;
+    const links = validEntries.map((entry) => entry.markdown).filter(Boolean);
+    links.forEach((link) => {
+      const url = String(link).match(/\]\(([^)]+)\)$/)?.[1] || "";
+      if (url) sourceUrlsUsed.add(url);
+    });
+    for (const sentence of sentences) {
+      const clean = finalizeStructuredChatSentence(sentence);
+      if (!clean) continue;
+      renderedClaims.push(`- ${clean}${links.length ? ` ${links.join(" ")}` : ""}`.trim());
     }
   }
   if (!renderedClaims.length) {
-    renderedClaims.push("- Not established from supplied evidence: no supported claims were returned.");
-    unsupportedClaimCount += 1;
     reasonCodes.push("structured-response-empty");
   }
   usedSourceCount = sourceUrlsUsed.size;
@@ -28684,11 +28655,11 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     removedInventedLinkCount: 0,
     removedLinkCount: 0,
     claimCount: parsed.claims.length,
-    supportedClaimCount: parsed.claims.filter((claim) => claim?.established === true && Array.isArray(claim?.evidence_ids) && claim.evidence_ids.length > 0).length - invalidClaimCount,
-    unsupportedClaimCount,
-    invalidEvidenceClaimCount: invalidClaimCount,
-    missingSentenceCitationCount: unsupportedClaimCount,
-    unsupportedSentenceCount: unsupportedClaimCount,
+    supportedClaimCount: claimWithEvidenceCount,
+    unsupportedClaimCount: parsed.claims.length - claimWithEvidenceCount,
+    invalidEvidenceClaimCount: unresolvedClaimCount,
+    missingSentenceCitationCount: 0,
+    unsupportedSentenceCount: 0,
     reasonCodes: uniqueValues(reasonCodes),
     repairCallCount: 0,
     degraded,
@@ -42857,6 +42828,32 @@ function resolveTaskWorkflowReferences(tasks = [], sourceContract = null, eviden
   return drainTaskWorkflowHashRequestsSync(resolveTaskWorkflowReferencesSteps(null, tasks, sourceContract, evidenceCatalog, options));
 }
 
+// A contract with exactly one scope (an email, or a note with no marked
+// actions) leaves the model no real choice of scope id, yet it may return the
+// source title, an evidence handle, or another invented value. Resolve such a
+// requested scope to the contract's single/default scope: the scope-keyed
+// evidence filter, fact directory and every downstream scope gate then see the
+// real scope instead of dropping the task's refs. Multi-scope contracts (note
+// marker scopes) keep failing closed on a foreign scope id.
+function taskWorkflowEffectiveTaskScopeId(requestedScopeId = "", sourceContract = null, fallbackScopeId = "") {
+  const normalized = String(requestedScopeId || "");
+  if (!normalized) return normalized;
+  const contract = sourceContract || {};
+  const contractScopeIds = new Set((contract.scopeIds || (contract.scopes || []).map((scope) => scope?.scopeId || scope?.id) || []).map(String).filter(Boolean));
+  if (contractScopeIds.size !== 1 || contractScopeIds.has(normalized)) return normalized;
+  return String(fallbackScopeId || contract.defaultScopeId || contract.scopeId || contract.scope_id || normalized);
+}
+
+// Normalize a generated task tree's scope ids before handle/fact resolution:
+// an empty subtask scope inherits the (already normalized) parent scope.
+function normalizeGeneratedTaskTreeScopes(task, sourceContract = null, parentScopeId = "") {
+  if (!task || typeof task !== "object") return task;
+  const scopeId = taskWorkflowEffectiveTaskScopeId(String(task.scope_id || task.scopeId || parentScopeId || ""), sourceContract);
+  if (scopeId) task.scope_id = scopeId;
+  for (const subtask of task.subtasks || []) normalizeGeneratedTaskTreeScopes(subtask, sourceContract, scopeId);
+  return task;
+}
+
 // Cooperative twin: same resolver body driven with an ~8 ms checkpoint; the
 // per-task resolve loop and the fact-directory scan yield, and the ledger hash
 // resolves through the shared cooperative traversal. Byte parity is a test
@@ -42887,8 +42884,11 @@ function* resolveTaskWorkflowReferencesSteps(checkpoint, tasks = [], sourceContr
   let droppedRefCount = 0;
   const resolveNode = (task, index, parentScopeId = "") => {
     if (!task) return null;
-    // Subtasks inherit the parent's scope when they carry none.
-    const scopeId = String(task.scope_id || task.scopeId || parentScopeId || fallbackScopeId || "");
+    // Subtasks inherit the parent's scope when they carry none. A requested
+    // scope the single-scope contract cannot mean (the source title, an
+    // evidence handle, an invented value) resolves to that one scope instead
+    // of filtering every ref out; multi-scope contracts keep failing closed.
+    const scopeId = taskWorkflowEffectiveTaskScopeId(String(task.scope_id || task.scopeId || parentScopeId || fallbackScopeId || ""), contract, fallbackScopeId);
     const taskId = String(task.taskId || task.id || task.oid || `task-${index}`);
     const requestedEvidenceIds = uniqueValues((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean));
     const requestedFactRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));

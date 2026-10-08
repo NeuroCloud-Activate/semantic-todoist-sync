@@ -2,6 +2,11 @@
 
 Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day. Local-first, and you pick the AI service for each job.
 
+## What's new in 0.9.14
+
+- New: **Prompt caching for Claude models** (on by default) lets Anthropic cache the repeated part of each task description request, so the later requests of a note are cheaper and faster. Other models are not affected, and an endpoint that rejects it is handled with one retry and a sidebar note.
+- Fixed a repeating warning in settings ('An unreadable or unclaimed semantic-index file is present...') that appeared after updating to 0.9.13. The plugin now recognises both files of each index shard, keeps your active index from ever being offered for deletion, and shows the notice at most once per session.
+
 ## What's new in 0.9.13
 
 - Smaller requests: the per-note series and superseded labels are gone (about 15 percent less input, and they did not improve answers in our tests), and descriptions explain each task in the model's own words.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.14 - 2026-10-08
+
+### Added
+- **Prompt caching for Claude models** (Settings, AI models; on by default). Requests to any model whose name contains "claude" or starts with "anthropic/" now mark the repeated part of each task description request, so Anthropic can cache it and the later requests of a note cost less and start faster. It works for Claude models reached through OpenRouter, a custom OpenAI-compatible endpoint or Open WebUI, and other models are not changed. The first description request of a note is now sent on its own so the cache is warm for the rest, which adds about one request time at the start. If an endpoint rejects the setting, the plugin retries once without it, remembers that model for the session and shows "Prompt cache: Prompt caching was rejected by <model>..." in the sidebar so you can turn the option off for a model that was misidentified as Claude.
+
+### Fixed
+- The sidebar status line no longer goes quiet while a task is being worked on. When background index preparation was also showing, it could take the place of the live activity item, so the running seconds disappeared and the line sat unchanged for 10 seconds or more. The live activity now stays visible ahead of background index and reference items.
+- Settings no longer shows 'An unreadable or unclaimed semantic-index file is present' over and over. Version 0.9.13 stores each index shard as two files, and the check that protects inactive indexes from deletion did not recognise the second file, so it treated every index file as unclaimed on each redraw. Both files are now recognised as belonging to their index, the active index can never be offered for deletion, and deleting an inactive index removes both files. A file the plugin cannot account for still blocks deletion, and the notice now appears once per session instead of on every redraw.
+
 ## 0.9.13 - 2026-10-08
 
 ### Added

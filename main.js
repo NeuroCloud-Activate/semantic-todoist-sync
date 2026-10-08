@@ -3016,6 +3016,13 @@ function semanticIndexPurgeRoutingGenerationPattern() {
   return new RegExp(`^${base}\\.[a-z0-9-]+\\.json$`, "i");
 }
 
+// Staging shards of a resumable rebuild (`semantic-index-rebuild.NNN.json`);
+// claimed by the persisted rebuild progress while that rebuild is live.
+function semanticIndexPurgeRebuildStagingPattern() {
+  const base = escapeRegExp(SEMANTIC_INDEX_REBUILD_STAGING_PREFIX);
+  return new RegExp(`^${base}\\.[a-z0-9-]+\\.json$`, "i");
+}
+
 function semanticIndexPurgeSafeRelative(rel) {
   const value = String(rel || "");
   if (!value) return false;
@@ -3066,6 +3073,11 @@ function semanticIndexPurgeManifestCandidate(name) {
   if (/\.g[a-z0-9-]+\.\d{3}\.json$/i.test(value)) return false;
   if (/\.\d{3}\.json$/i.test(value)) return false;
   if (isSemanticIndexPathMetaGenerationFile(value)) return false;
+  // Save-protocol staging name (`<indexFile>.<generation>.manifest.json`):
+  // a leftover from an interrupted save, never a dataset manifest. Falling
+  // through to the unclaimed list keeps it visible, fail-closed, and
+  // resolvable with the orphan-file purge.
+  if (/\.manifest\.json$/i.test(value)) return false;
   return true;
 }
 
@@ -3093,6 +3105,17 @@ function semanticIndexPurgeValidateManifest(manifestName, parsed) {
   const settings = semanticIndexPurgeSettingsForManifest(parsed.meta);
   const validated = semanticIndexManifestValidation(parsed, indexFile, settings);
   const meta = parsed.meta;
+  // Binary shards keep their payload in a sibling `.bin` file linked by the
+  // manifest's own `shard.bin` field (the same link the sidecar records as
+  // `vectors.file`). Ownership must include it, or the payload is misread as
+  // an unclaimed file. A declared name that fails the real naming rule is
+  // ignored (never guessed): it then stays unclaimed and keeps deletion
+  // fail-closed.
+  const shardBinFiles = [];
+  for (const shard of parsed.shards) {
+    const bin = String(shard?.bin || "");
+    if (bin && isSemanticIndexShardBinaryFile(indexFile, bin)) shardBinFiles.push(bin);
+  }
   return {
     identity: {
       provider: String(meta.provider || "").toLowerCase(),
@@ -3101,6 +3124,7 @@ function semanticIndexPurgeValidateManifest(manifestName, parsed) {
       generation: String(meta.generation || "")
     },
     shardFiles: validated.shardFiles.slice(),
+    shardBinFiles,
     pathMetaFile: validated.pathMetaFile || "",
     versioned: validated.versioned === true
   };
@@ -3121,6 +3145,7 @@ function semanticIndexPurgeOwnedFiles(manifestName, validated = {}) {
   const join = (name) => (dir ? `${dir}/${String(name || "")}` : String(name || ""));
   const owned = new Set([String(manifestName || "")].filter(Boolean));
   for (const shard of (validated.shardFiles || [])) owned.add(join(shard));
+  for (const shardBin of (validated.shardBinFiles || [])) owned.add(join(shardBin));
   if (validated.pathMetaFile) owned.add(join(validated.pathMetaFile));
   return Array.from(owned).filter(Boolean);
 }
@@ -3132,6 +3157,19 @@ function semanticIndexPurgeDatasetFingerprint(dataset = {}) {
     deletable: dataset.deletable === true,
     files: (Array.isArray(dataset.files) ? dataset.files.slice() : []).sort()
   }));
+}
+
+// Session-scoped key for the ambiguous-file notice: the sorted set of file
+// names the notice is about. The settings surface keeps it in memory on the
+// plugin instance (no persistence, no data.json field) so a redraw re-raises
+// the notice only when the ambiguous set actually changed; the inline file
+// list stays the persistent display of unclaimed files.
+function semanticIndexPurgeAmbiguousNoticeKey(inventory = {}) {
+  const names = [
+    ...(Array.isArray(inventory.malformedManifests) ? inventory.malformedManifests.map((entry) => String(entry?.file || "")) : []),
+    ...(Array.isArray(inventory.unclaimedFiles) ? inventory.unclaimedFiles : [])
+  ].filter(Boolean).sort();
+  return shortHash(JSON.stringify(names));
 }
 
 // Inventory every retained partition from actual listings plus manifests that
@@ -3148,6 +3186,17 @@ async function semanticIndexPurgeInventory(options = {}) {
   // so a possible co-owner is never silently omitted.
   const incompleteFiles = Array.from(new Set((Array.isArray(options.incomplete) ? options.incomplete : [])
     .map((reason) => String(reason || "")).filter(Boolean))).sort();
+  // Staging files of a live rebuild (claimed by the persisted, version-valid
+  // rebuild progress) are transient: they belong to the in-flight rebuild,
+  // not to any dataset. They must neither block deletion nor be offered for
+  // deletion. Stale `semantic-index-rebuild.*` leftovers without a live
+  // progress stay unclaimed, so they remain fail-closed and deletable with
+  // the orphan-file purge.
+  const transientFiles = Array.from(new Set((Array.isArray(options.transientFiles) ? options.transientFiles : [])
+    .map((name) => String(name || "")).filter(Boolean)))
+    .filter((name) => semanticIndexPurgeRebuildStagingPattern().test(semanticIndexPurgeBasename(name)))
+    .sort();
+  const transientSet = new Set(transientFiles);
 
   const protectedFiles = files.filter((name) => semanticIndexPurgeProtectedName(name)).sort();
   const malformedManifests = [];
@@ -3199,6 +3248,7 @@ async function semanticIndexPurgeInventory(options = {}) {
   const unclaimedFiles = files.filter((name) =>
     /^semantic-index\b/i.test(semanticIndexPurgeBasename(name)) &&
     !protectedSet.has(name) &&
+    !transientSet.has(name) &&
     !ownedFiles.has(name)
   ).sort();
   const ambiguousPresent = malformedManifests.length > 0 || unclaimedFiles.length > 0;
@@ -3247,7 +3297,7 @@ async function semanticIndexPurgeInventory(options = {}) {
   const fileStatuses = [];
   for (const name of files) {
     const owner = datasets.find((dataset) => dataset.files.includes(name));
-    const status = protectedSet.has(name) ? "protected" : owner ? (owner.active ? "active" : "inactive") : (/^semantic-index\b/i.test(semanticIndexPurgeBasename(name)) ? "orphaned" : "");
+    const status = protectedSet.has(name) || transientSet.has(name) ? "protected" : owner ? (owner.active ? "active" : "inactive") : (/^semantic-index\b/i.test(semanticIndexPurgeBasename(name)) ? "orphaned" : "");
     if (!status) continue;
     let size = null;
     try {
@@ -3261,6 +3311,7 @@ async function semanticIndexPurgeInventory(options = {}) {
   const inventory = {
     datasets,
     protectedFiles,
+    transientFiles,
     malformedManifests,
     unclaimedFiles,
     fileStatuses,
@@ -3359,6 +3410,7 @@ const DEFAULT_SETTINGS = {
   chatFallbackReasoningEffort: "auto",
   optimizeStructuredAiUsage: true,
   enableOpenAiPromptCaching: true,
+  promptCacheHints: true,
   enableAiModelFallback: true,
   chatMode: "Vault QA",
   embeddingProvider: "customopenai",
@@ -4184,6 +4236,7 @@ function taskDescriptionUserInstruction({
   sharedTaskEvidence = null,
   promptMainTasks = [],
   sharedInstructionLines = null,
+  splitStableChars = false,
   ...instructionContext
 } = {}) {
   const rows = (promptMainTasks || []).filter(Boolean).map((row) => JSON.stringify(row));
@@ -4206,12 +4259,14 @@ function taskDescriptionUserInstruction({
   if (sharedLines && instructionContext.phase !== "retry" && instructionContext.phase !== "initial") {
     throw new Error("sharedInstructionLines require an explicit initial/retry phase");
   }
-  return [
-    ...(sharedLines || taskDescriptionUserInstructionLines(instructionContext)),
-    ...subsetLines,
-    "Tasks (one JSON row per task):",
-    ...rows
-  ].join("\n");
+  // Prompt-cache hints: the joined prompt is exactly stableLines + "\n" +
+  // tailLines, so the stable/tail boundary is a character count, never a text
+  // search. splitStableChars exposes it for the provider adapter.
+  const stableLines = sharedLines || taskDescriptionUserInstructionLines(instructionContext);
+  const tailLines = [...subsetLines, "Tasks (one JSON row per task):", ...rows];
+  const user = [...stableLines, ...tailLines].join("\n");
+  if (!splitStableChars) return user;
+  return { user, stableChars: stableLines.length ? stableLines.join("\n").length + 1 : 0 };
 }
 
 function openAiTerminalResponseDiagnostic(response = {}) {
@@ -7738,13 +7793,26 @@ _semanticIndexPurgeInventoryUnsafe() {
       generation: String(meta.generation || this.semanticIndexManifestPublishedGeneration || "")
     });
     const activeManifestFile = String(meta.file || this.semanticIndexFileName() || "");
+    // Rebuild staging files claimed by the persisted progress of a live,
+    // version-valid rebuild are transient (never deselected, never deleted).
+    // Any other semantic-index-rebuild leftover stays unclaimed: fail-closed
+    // and deletable with the orphan-file purge.
+    const rebuildProgress = getSemanticIndexRebuildProgress(this.settings);
+    const transientFiles = [];
+    if (isRebuildProgressValid(rebuildProgress, SEMANTIC_EMBEDDING_CONTENT_VERSION)) {
+      for (const file of (rebuildProgress.stagingFiles || [])) {
+        const base = semanticIndexPurgeBasename(String(file || ""));
+        if (base) transientFiles.push(base);
+      }
+    }
     return semanticIndexPurgeInventory({
       files,
       readManifest,
       statFile,
       activeDatasetKey,
       activeManifestFile,
-      incomplete: Array.from(incomplete)
+      incomplete: Array.from(incomplete),
+      transientFiles
     });
   })();
 }
@@ -13723,7 +13791,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     };
   }
 
-  async openaiResponse({ model, modelOverride = "", onResponseIdentity = null, system, user, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", captureContext = null }) {
+  async openaiResponse({ model, modelOverride = "", onResponseIdentity = null, system, user, userStableChars = 0, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", captureContext = null }) {
     // A standalone call (no explicit context) begins its own workflow root; a
     // parent-workflow descendant must inherit the root passed by its caller.
     // t19: optional per-call modelOverride wins over model/settings; when set,
@@ -13777,7 +13845,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           ? this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, onResponseIdentity }, activeCapture)
           : provider === "openai"
             ? this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, background, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture)
-            : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture);
+            : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture);
         let response;
         try {
           response = await sendRequest(reasoningConfig);
@@ -13840,14 +13908,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openAiCompatibleResponse({ provider, model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
+  async openAiCompatibleResponse({ provider, model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
     const normalizedProvider = stableSupportedProvider(provider, "openrouter");
     const body = {
       model: String(model || "").trim(),
-      messages: [
-        { role: "system", content: [promptCachePrefix, system].filter(Boolean).join("\n\n") },
-        { role: "user", content: String(user || "") }
-      ]
+      // Prompt-cache hints: plugin.__promptTuning is read here, at call time,
+      // so the primary can A/B live without a rebuild. When the hint applies,
+      // the description user message becomes two text blocks with ONE
+      // cache_control marker at the end of the stable block; otherwise this
+      // shape is byte-identical to today.
+      messages: openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this })
     };
     // OpenWebUI can answer with SSE even when `stream` is omitted (a model's
     // Stream Chat Response setting, or a pipe/function model that streams).
@@ -13876,8 +13946,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         json_schema: { name: "semantic_todoist_tasks", strict: true, schema: jsonSchema }
       };
     }
-    const response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body, { captureContext });
-    const payload = openAiCompatibleChatPayload(response, normalizedProvider);
+    const hintApplied = Array.isArray(body.messages?.[1]?.content);
+    let response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body, { captureContext });
+    let payload = openAiCompatibleChatPayload(response, normalizedProvider);
+    if ((response.status < 200 || response.status >= 300 || payload?.error) && hintApplied) {
+      const rejectedDetail = payload?.error?.message || payload?.error?.code || response.text || "";
+      if (promptCacheHintRejected(response.status, rejectedDetail)) {
+        notePromptCacheHintRejected(this, normalizedProvider, model, response.status);
+        // Retry once with the plain user message; every other body field is
+        // identical because only `messages` is rebuilt (the rejection Map is
+        // already set, so the shaper returns the plain string form).
+        body.messages = openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this });
+        response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body, { captureContext });
+        payload = openAiCompatibleChatPayload(response, normalizedProvider);
+      }
+    }
     if (response.status < 200 || response.status >= 300 || payload?.error) {
       const detail = payload?.error?.message || payload?.error?.code || "provider response rejected";
       throw providerAdapterError(normalizedProvider, payload?.error?.code || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
@@ -16499,6 +16582,24 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // Identical per-call label: the phase progress ("step 3 of 4:
         // descriptions · K of N complete") already renders the counter, so a
         // per-position label here would show the same counter twice.
+        // Prompt-cache hints: build the user prompt once with its structural
+        // stable/tail split; the adapter marks the stable block only when the
+        // call's provider+model qualify.
+        const descriptionUserParts = taskDescriptionUserInstruction({
+          phase,
+          // t19: effective settings carry the override model for profile selection.
+          settings: descriptionSettings,
+          sourceTitle,
+          descriptionInstructions,
+          sourceType: options.sourceContract?.sourceType || options.sourceContract?.source_type || "",
+          sourceContract: options.sourceContract,
+          citeContextNotes,
+          structuredEvidence,
+          sharedInstructionLines,
+          sharedTaskEvidence: singletonShared,
+          promptMainTasks: [promptRow].filter(Boolean),
+          splitStableChars: true
+        });
         const json = await this.withAiActivity("Writing descriptions", () => this.openaiResponse({
         operation: "description",
         model: modelChoice.model,
@@ -16512,20 +16613,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         promptCachePrefix: "",
         promptCacheKey: TASK_WORKFLOW_PROMPT_CACHE_KEY,
         captureContext: callCapture,
-        user: taskDescriptionUserInstruction({
-          phase,
-          // t19: effective settings carry the override model for profile selection.
-          settings: descriptionSettings,
-          sourceTitle,
-          descriptionInstructions,
-          sourceType: options.sourceContract?.sourceType || options.sourceContract?.source_type || "",
-          sourceContract: options.sourceContract,
-          citeContextNotes,
-          structuredEvidence,
-          sharedInstructionLines,
-          sharedTaskEvidence: singletonShared,
-          promptMainTasks: [promptRow].filter(Boolean)
-        })
+        user: descriptionUserParts.user,
+        userStableChars: descriptionUserParts.stableChars
         }));
         const holderSummary = callCapture?.usageState?.summary || null;
         slotEntry.elapsedMs = Math.max(0, Date.now() - startedAt);
@@ -16606,7 +16695,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       let descriptionSettledCount = 0;
       const progressLabel = phase === "retry" ? "retrying" : "";
       this.setAiActivityProgress(activity, { step: 3, steps: 4, label: progressLabel, done: 0, total: targets.length });
-      await asyncPool(targets, taskDescriptionConcurrencyFor(this.settings), async (task) => {
+      const descriptionWorker = async (task) => {
         const slot = byIndex.get(task.index);
         try {
         if (phaseSharedInstructionError) {
@@ -16632,7 +16721,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           slot.rawError = error;
           slot.failed = true;
         }
-      });
+      };
+      // Prompt-cache hints: with warm-first the first description request is
+      // sent alone so it can warm the provider cache before the pool fans out.
+      const warmFirst = descriptionWarmFirstEnabled(this, this.generationProviderForModel(modelChoice.model), modelChoice.model);
+      await descriptionPhaseDispatch(targets, taskDescriptionConcurrencyFor(this.settings), descriptionWorker, warmFirst);
       return slots;
     };
     const providerFailureFor = (error) => error?.providerDiagnostic || {
@@ -21368,7 +21461,17 @@ class SemanticTodoistView extends ItemView {
       nextDelay = nextDelay ? Math.min(nextDelay, tick) : tick;
     }
     const items = visible
-      .sort((a, b) => a.order - b.order)
+      .sort((a, b) => {
+        const aLabel = String(a.item?.label || "").toLowerCase();
+        const bLabel = String(b.item?.label || "").toLowerCase();
+        const aIsAi = aLabel === "ai";
+        const bIsAi = bLabel === "ai";
+        // While a live AI activity runs, keep the AI item ahead of purely
+        // background items (Index: Preparing, Queued, etc.) so it never lands
+        // in the overflow behind an older first-seen background entry.
+        if (aIsAi !== bIsAi) return aIsAi ? -1 : 1;
+        return a.order - b.order;
+      })
       .map((entry) => entry.item);
     // The explicit Status message (errors, outcomes) is never collapsed into
     // the "(+N more)" overflow: pin it to the front before capping.
@@ -22771,7 +22874,13 @@ function renderInactiveSemanticIndexPurge(containerEl, plugin, refresh) {
     dropdown.setValue("");
     dropdown.setDisabled(false);
     if (button) button.setDisabled(true);
-    if (inventory.ambiguousPresent) new Notice("An unreadable or unclaimed semantic-index file is present, so inactive partitions are protected from deletion until it is resolved.");
+    if (inventory.ambiguousPresent) {
+      const noticeKey = semanticIndexPurgeAmbiguousNoticeKey(inventory);
+      if (!plugin || plugin.semanticIndexPurgeAmbiguousNoticeKey !== noticeKey) {
+        if (plugin) plugin.semanticIndexPurgeAmbiguousNoticeKey = noticeKey;
+        new Notice("An unreadable or unclaimed semantic-index file is present, so inactive partitions are protected from deletion until it is resolved.");
+      }
+    }
   })();
 }
 
@@ -22979,6 +23088,7 @@ const SETTING_DESCRIPTIONS = {
   chatFallbackReasoningEffort: "Controls the fallback model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   optimizeStructuredAiUsage: "Reduces reasoning-token usage for simple scheduler and policy calls while preserving the selected reasoning effort for chat, task extraction, and descriptions. AI duplicate checks use their own reasoning setting.",
   enableOpenAiPromptCaching: "Enabled by default. Uses explicit prompt caching on GPT 5.6 and newer OpenAI models for stable structured-output schemas and system instructions only. Dynamic user, note, email, vault, and Todoist context remains after the cache breakpoint. Turning this off disables reads and billable writes instead of reverting to implicit caching.",
+  promptCacheHints: "When on, requests to models whose name contains \"claude\" mark the repeated part of each task description request so the provider can cache it, which lowers cost and time for the later requests of a note. Turn this off if a model is misidentified as Claude or its endpoint rejects the setting.",
   enableAiModelFallback: "Retries transient same-provider model failures, such as temporary overload, 429, 503, and other 5xx capacity errors, with another available chat model from that provider.",
   warmEmbeddingServerOnStartup: "Send one small embedding request to your embedding server after the plugin loads so the first chat question isn't delayed while the server loads its model. Off by default. Uses your configured embedding provider and may incur cost on paid providers.",
   embeddingModel: "Used to build and search the local semantic index. Select its provider and model separately from the generation models.",
@@ -25172,6 +25282,7 @@ function renderSharedAiRoutingSettings(containerEl, plugin, refreshDisplay) {
   });
   toggleSetting(containerEl, "Optimize structured AI use", "Use lower reasoning only for simple scheduler and policy calls.", plugin, "optimizeStructuredAiUsage");
   toggleSetting(containerEl, "Use provider prompt caching", "Cache stable instructions only when the selected provider supports it.", plugin, "enableOpenAiPromptCaching");
+  toggleSetting(containerEl, "Prompt caching for Claude models", "When on, requests to models whose name contains \"claude\" mark the repeated part of each task description request so the provider can cache it, which lowers cost and time for the later requests of a note. Turn this off if a model is misidentified as Claude or its endpoint rejects the setting.", plugin, "promptCacheHints", () => clearPromptCacheHintRejection(plugin));
   new Setting(containerEl).setName("Refresh Models").setDesc("Explicitly load provider model catalogs; typing and display-only selection never refreshes.").addButton((button) => button.setButtonText("Refresh Models").onClick(async () => {
     try { await plugin.refreshOpenAIModels(true); if (refreshDisplay) refreshDisplay(); } catch (error) { new Notice(`Could not refresh models: ${error.message || error}`); }
   }));
@@ -25521,9 +25632,10 @@ function taskSectionTitleModeSetting(containerEl, plugin) {
     });
 }
 
-function toggleSetting(containerEl, name, desc, plugin, key) {
+function toggleSetting(containerEl, name, desc, plugin, key, onChanged = null) {
   new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc)).addToggle((toggle) => toggle.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
     plugin.settings[key] = value;
+    if (typeof onChanged === "function") onChanged(value);
     await plugin.saveSettings();
   }));
 }
@@ -29237,6 +29349,130 @@ function taskDescriptionConcurrencyFor(settings = DEFAULT_SETTINGS) {
   return provider === "openwebui" ? 1 : concurrency;
 }
 
+// --- Description prompt-cache hints (kg-cache-hints) -------------------------
+// Claude models behind customopenai/openrouter do not auto-cache through the
+// LiteLLM gateway; an explicit cache_control marker on a content block is
+// passed through and reported via usage.cached_tokens. The description user
+// prompt is a stable instruction block followed by per-request evidence/task
+// rows; the stable block is byte-identical across the description requests of
+// one note. ONE marker is placed at the END of the stable user block: the
+// provider cache prefix is everything up to the marker, so the system message
+// and the stable user block cache together and no second marker is needed
+// (gateways accept one marker per message; one total is the safe shape).
+const PROMPT_CACHE_HINT_MIN_STABLE_CHARS = 4096; // Anthropic minimum cacheable length varies by model; 4096 chars is a safe floor.
+
+function promptCacheTuning(plugin) {
+  const tuning = plugin && plugin.__promptTuning;
+  return tuning && typeof tuning === "object" ? tuning : {};
+}
+
+// Switchable at call time: plugin.__promptTuning = { cacheHints: false }
+// disables; undefined keeps the default (on for Claude-named models). The
+// user setting promptCacheHints (default on) gates the same path; turning it
+// off covers a model misidentified as Claude or an endpoint that rejects the
+// setting. No provider restriction: the OpenAI-compatible adapter already
+// excludes native openai and gemini, and openwebui/openrouter/customopenai
+// are all included.
+function descriptionCacheHintEligible(plugin, provider, model) {
+  const tuning = promptCacheTuning(plugin);
+  const cacheHints = typeof tuning.cacheHints === "boolean"
+    ? tuning.cacheHints
+    : !(plugin && plugin.settings && plugin.settings.promptCacheHints === false);
+  if (!cacheHints) return false;
+  if (promptCacheHintRejectionRemembered(plugin, provider, model)) return false;
+  const id = String(model || "");
+  return /claude/i.test(id) || /^anthropic\//i.test(id);
+}
+
+function descriptionCacheHintsEnabled(plugin, provider, model, stableChars) {
+  if (!descriptionCacheHintEligible(plugin, provider, model)) return false;
+  return stableChars >= PROMPT_CACHE_HINT_MIN_STABLE_CHARS;
+}
+
+// Warm-first default: on when cache hints are active for the call's
+// provider+model, off otherwise; plugin.__promptTuning.warmFirst wins either way.
+function descriptionWarmFirstEnabled(plugin, provider, model) {
+  const tuning = promptCacheTuning(plugin);
+  if (typeof tuning.warmFirst === "boolean") return tuning.warmFirst;
+  if (promptCacheHintRejectionRemembered(plugin, provider, model)) return false;
+  return descriptionCacheHintEligible(plugin, provider, model);
+}
+
+// In-memory per-session memory of hint rejections: provider|model pairs that
+// already failed with a cache-hint rejection are built plain from then on.
+function promptCacheHintRejectionRemembered(plugin, provider, model) {
+  const rejected = plugin && plugin.promptCacheHintRejected;
+  return Boolean(rejected && typeof rejected.has === "function" && rejected.has(`${provider}|${model}`));
+}
+
+// 400 and 422 always count (an endpoint that rejects the shape usually says so
+// in a generic 400/422); any other 4xx only when the error text points at the
+// marker or at a content-shape mismatch. 401/403/429 never retry; 5xx and
+// network/timeout errors never retry and never set memory.
+function promptCacheHintRejected(status, detailText) {
+  const code = Number(status) || 0;
+  if (code === 401 || code === 403 || code === 429) return false;
+  if (code < 400 || code >= 500) return false;
+  if (code === 400 || code === 422) return true;
+  return /cache_control|cache control|content.*array|unsupported (parameter|content)|invalid.*content|extra inputs/i.test(String(detailText || ""));
+}
+
+function notePromptCacheHintRejected(plugin, provider, model, status) {
+  if (!plugin.promptCacheHintRejected) plugin.promptCacheHintRejected = new Map();
+  plugin.promptCacheHintRejected.set(`${provider}|${model}`, true);
+  plugin.promptCacheHintRejectedMessage = `Prompt caching was rejected by ${model}. If this model is not a Claude model, turn off "Prompt caching for Claude models" in settings.`;
+  if (typeof plugin.logLocal === "function") plugin.logLocal("Prompt cache hint rejected", { provider, model, status });
+  if (typeof plugin.refreshSidebarStatus === "function") plugin.refreshSidebarStatus();
+}
+
+// Clears the session memory and the persistent sidebar item together; called
+// when the user changes the promptCacheHints setting.
+function clearPromptCacheHintRejection(plugin) {
+  if (!plugin) return;
+  const had = Boolean(plugin.promptCacheHintRejectedMessage)
+    || Boolean(plugin.promptCacheHintRejected && plugin.promptCacheHintRejected.size);
+  if (plugin.promptCacheHintRejected && typeof plugin.promptCacheHintRejected.clear === "function") plugin.promptCacheHintRejected.clear();
+  plugin.promptCacheHintRejectedMessage = "";
+  if (had && typeof plugin.refreshSidebarStatus === "function") plugin.refreshSidebarStatus();
+}
+
+// Chat-completions message shaping for the OpenAI-compatible adapters.
+// userStableChars = 0 (every caller except the description workflow) returns
+// today's exact message shape.
+function openAiCompatibleChatMessages({ provider, model, system, user, userStableChars = 0, promptCachePrefix = "", plugin = null }) {
+  const systemContent = [promptCachePrefix, system].filter(Boolean).join("\n\n");
+  const userText = String(user || "");
+  const stableChars = Math.max(0, Math.min(userText.length, parseInt(userStableChars, 10) || 0));
+  if (stableChars <= 0 || stableChars >= userText.length || !descriptionCacheHintsEnabled(plugin, provider, model, stableChars)) {
+    return [
+      { role: "system", content: systemContent },
+      { role: "user", content: userText }
+    ];
+  }
+  return [
+    { role: "system", content: systemContent },
+    { role: "user", content: [
+      { type: "text", text: userText.slice(0, stableChars), cache_control: { type: "ephemeral" } },
+      { type: "text", text: userText.slice(stableChars) }
+    ] }
+  ];
+}
+
+// Warm-first dispatch for the description pool: caching only hits after the
+// first description request of the note has been processed, so with warm-first
+// target 1 is sent alone and the rest start only after it settles. Latency
+// cost: one extra serial request time (~15-25 s on the live runs) before the
+// pool fans out; without warm-first the pool behaviour is unchanged.
+async function descriptionPhaseDispatch(targets, workerCount, worker, warmFirst = false) {
+  const list = Array.from(targets || []);
+  if (!warmFirst || list.length <= 1) {
+    await asyncPool(list, workerCount, worker);
+    return;
+  }
+  await asyncPool(list.slice(0, 1), 1, worker);
+  await asyncPool(list.slice(1), workerCount, worker);
+}
+
 function emailAutoPollIntervalSeconds(settings = DEFAULT_SETTINGS) {
   return Math.max(MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS, parseInt(settings.emailPollIntervalSeconds, 10) || DEFAULT_SETTINGS.emailPollIntervalSeconds);
 }
@@ -29383,6 +29619,9 @@ function allActiveWorkflowStatusItems(plugin, aiValueOptions = {}) {
   else if (indexCount) items.push({ label: "Index", value: `Queued (${indexCount})` });
   else if (plugin.semanticIndexTimer) items.push({ label: "Index", value: "Queued" });
   if (plugin.referenceRebuildInProgress) items.push({ label: "References", value: workflowActivityValue(plugin, "references", "Rebuilding") });
+  // Persistent session condition, same approach as semanticIndexLoadFailure:
+  // it stays while the message is set and clears with the rejection Map.
+  if (plugin.promptCacheHintRejectedMessage) items.push({ label: "Prompt cache", value: plugin.promptCacheHintRejectedMessage });
   return items;
 }
 

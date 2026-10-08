@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.13 - 2026-10-08
+
+### Added
+- Optional **System One decision model** (Settings, off by default). Point it at your own server and "Check connection" tests it and calibrates it on your vault automatically, showing live steps in the status bar. When on, it puts the most relevant evidence first for each task. Task text and short note excerpts are sent to that server only.
+- **Max efficiency** (under the System One section, off by default). Sends the 8 most relevant passages in full and a one-line pointer for the next 16, which trims about 2 to 4 percent of input tokens in our tests. It did not change speed.
+- **Require model due dates** (on by default): the AI proposes a due date for each new task from its own judgment of urgency, even when the note gives none. Turn it off to use only dates the note states.
+- **Semantic search mode** (Exact by default). "Routed" scores only the part of a large index that is likely to matter; in tests it found the same notes while scanning about 30 percent of the index. Exact stays available.
+- Reasoning levels now follow what your endpoint reports: "xhigh" and "max" appear when a gateway says the model supports them, and the level you pick is the one that is sent. Haiku 5.5 now defaults to medium under Automatic, because high and max can run past a gateway's request time limit.
+
+### Changed
+- Smaller, faster requests: the note descriptions now explain each task in the model's own words and no longer carry per-note series or superseded labels. In our tests the labels added about 15 percent to the input and did not improve the answers, so they were removed (and the series graph file the plugin used to keep for them is deleted on first load).
+- Notes are embedded with their title, date and heading path, so related notes are found more reliably. This is a one-time change: on first start the plugin queues a background rebuild of the semantic index, resumes it if Obsidian closes, and keeps working while it runs. Local embedding models cost nothing; a paid embedding provider is charged once for the re-embed.
+- Much less freezing on large vaults: opening and rebuilding the index is now done in small slices, so Obsidian stays responsive (the longest pause we measured in live runs was about 0.3 seconds).
+- Lower memory: the index is held once in compact form instead of three times, and per-run caches are released after each task.
+- The settings file now holds only what you chose. Polling times, rebuild markers and snapshot bookkeeping moved to device-local storage and a small runtime-state.json file, and the plugin only writes a settings file when one of your settings actually changed. In our test vault it settled at about 35 KB, and an idle or note-processing session wrote it zero times, which keeps Obsidian Sync history clean.
+
+### Fixed
+- If the description for the first task of a note fails, it is now retried like the others instead of being skipped.
+
 ## 0.9.12 - 2026-10-07
 
 ### Fixed

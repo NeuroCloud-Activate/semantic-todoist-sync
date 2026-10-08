@@ -46,6 +46,21 @@ const SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES = ["people-followup-max-30"];
 const SCHEDULER_DEFAULT_FOCUS_POLICY_ID = "default-focused-work-duration";
 const SCHEDULER_RELATED_GROUPING_POLICY_ID = "related-task-grouping";
 const SEMANTIC_INDEX_SHARD_MAX_BYTES = 4.5 * 1024 * 1024;
+// Task 9: binary shard payload format. Float64 little-endian keeps every parsed
+// JSON double bit-identical (Task 4 decision); the routing artifact keeps its
+// int8 quantization. The routing artifact is split into parts of at most
+// the configured shard size (semanticIndexShardMaxBytes: 4.5 MB default, or
+// 10 MB per setting) so every synced file stays in bounds for Sync.
+const SEMANTIC_INDEX_SHARD_BINARY_FORMAT = "f64le";
+const SEMANTIC_ROUTED_SHARD_TOP = 3;
+// Router v2: routing cells are fixed-row-count partitions of the loaded index,
+// independent of shard file size. A query probes the top cells by centroid
+// similarity up to a row-fraction budget, plus the active-note/recent/required
+// cells; only those rows are exact-scored. ~12 cells for a 4.3k-row index.
+const SEMANTIC_ROUTED_CELL_TARGET_ROWS = 384;
+const SEMANTIC_ROUTED_CELL_SCAN_FRACTION = 0.25;
+const SEMANTIC_ROUTED_CELL_MIN_PROBES = 3;
+const LOCAL_SEMANTIC_ROUTING_PARTS_PREFIX = "semantic-index-routing.part-";
 // Obsidian Sync Standard silently skips files over 5 MB; a 10 MB shard size
 // makes index files larger than that limit so Sync Standard ignores them.
 // Any value other than 10 falls back to 4.5 MB (the Sync-Standard-safe size).
@@ -65,7 +80,14 @@ const SEMANTIC_INDEX_WARMUP_PAUSE_MS = 100;
 const SEMANTIC_INDEX_FILE_YIELD_INTERVAL = 4;
 const SEMANTIC_INDEX_FILE_PAUSE_MS = 25;
 const SEMANTIC_INDEX_EMBED_PAUSE_MS = 25;
-const SEMANTIC_EMBEDDING_CONTENT_VERSION = 3;
+const SEMANTIC_EMBEDDING_CONTENT_VERSION = 4;
+// Resumable re-embed staging: finished shards are written beside the index as
+// they complete, so an interrupted rebuild (app suspension/kill) resumes
+// without re-embedding finished shards. Bounded per shard like every other
+// index file; a staging shard is flushed at the smaller of the byte cap or
+// the minimum chunk count so small vaults still checkpoint.
+const SEMANTIC_INDEX_REBUILD_STAGING_PREFIX = "semantic-index-rebuild";
+const SEMANTIC_INDEX_REBUILD_STAGING_MIN_CHUNKS = 32;
 const SEMANTIC_MATERIALITY_ANCHOR_VERSION = 1;
 const SEMANTIC_MATERIALITY_ANCHOR_TEXTS = Object.freeze({
   positive: "An unresolved review comment, edit, decision, approval, dependency, handoff, or durable cross-program requirement changes the remaining work or acceptance criteria.",
@@ -83,6 +105,14 @@ const SEMANTIC_RETRIEVAL_SCHEMA_VERSION = 1;
 const TASK_SEMANTIC_CONTEXT_CACHE_MAX_ENTRIES = 3;
 const SEMANTIC_RETRIEVAL_CACHE_MAX_ENTRIES_CHAT = 3;
 const SEMANTIC_EXACT_SCORE_CACHE_MAX_ENTRIES = 5000;
+// Task 3(a): in-run bound for the exact-score cache. The between-run sweep
+// trims to SEMANTIC_EXACT_SCORE_CACHE_MAX_ENTRIES when idle; during a run the
+// map previously grew unbounded (~105k entries / ~29 MB on the test vault,
+// scaling with index size on larger vaults). Measured on the Sep 21 run:
+// cap 5000 thrashes (map hit-rate 0.400 -> 0.061, +29% recomputes); 25000
+// recovers most reuse (0.270) while cutting the working set ~4x; 50000 gives
+// 0.359 with a smaller saving. 25000 chosen (see kg-task3-report.md).
+const SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES = 25000;
 const SEMANTIC_EXACT_SCORE_CACHE_TTL_SLICE_ENTRIES = 5000;
 const SEMANTIC_EXACT_SCORE_CACHE_TTL_SLICE_THRESHOLD_ENTRIES = 20000;
 const TASK_DEDUPLICATION_EMBEDDING_CACHE_MAX_ENTRIES = 500;
@@ -213,7 +243,7 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
 const DEFAULT_REASONING_EFFORT = "default";
 const REASONING_EFFORT_VALUES = ["auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Keep descriptions complete: incorporate a listed ref only when it adds a concrete execution detail for this task. When the row supports multiple useful content areas, integrate them into multiple complete natural sentences covering applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, history or handoff, and remaining action. Permit one sentence only when the task row truly supports no additional useful detail beyond the action. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions. When cited lines support it, state why the task matters and what the reader is expected to achieve; convey the task's intent or purpose rather than merely restating lines. Do not invent intent the evidence does not support.";
+const TASK_DESCRIPTION_ANTI_FILLER_RULE = "Keep descriptions complete: incorporate a listed ref only when it adds a concrete execution detail for this task. When the row supports multiple useful content areas, integrate them into multiple complete natural sentences covering applicable current state or artifact, intent, recipient or reviewer, criteria, dependencies or timing, history or handoff, and remaining action. Permit one sentence only when the task row truly supports no additional useful detail beyond the action. Never pad sparse evidence with obvious task mechanics or tautological sequencing. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions. When cited lines support it, state why the task matters and what the reader is expected to achieve; convey the task's intent or purpose rather than merely restating lines. Do not invent intent the evidence does not support. Explain what this task is for, why it matters now and what is needed to act, in your own words, as a knowledgeable colleague would; state criteria, people, dates and dependencies plainly; do not quote or closely copy source sentences; combine related evidence into one clear explanation; if evidence conflicts, the newer and the current note win.";
 const LEGACY_TASK_DESCRIPTION_ANTI_FILLER_RULE = "Never pad sparse evidence with obvious task mechanics or tautological sequencing; prefer a grounded execution brief. Do not explain that an artifact must be completed before it is sent, delivered, or handed off, and do not restate a handoff already represented by the task tree. Preserve non-obvious external approval or dependency conditions.";
 const TASK_DESCRIPTION_SEMANTIC_CONTEXT_RULE = "Evidence interpretation: current authoritative source facts win every conflict. State supported facts directly in natural prose without mentioning selection signals, scores, meanings, or containers.";
 
@@ -620,7 +650,7 @@ function resolveIndexedSemanticQueryHandles(index = [], request = {}) {
   const metadata = (chunk) => Object.assign({}, chunk?.indexMetadata || {}, {
     provider: knownMetadata(chunk?.embeddingProvider, chunk?.indexMetadata?.provider, request.indexProvider, requestedProvider),
     model: knownMetadata(chunk?.embeddingModel, chunk?.indexMetadata?.model, request.indexModel, requestedModel),
-    dimension: chunk?.embeddingDimension || chunk?.indexMetadata?.dimension || (Array.isArray(chunk?.embedding) ? chunk.embedding.length : 0),
+    dimension: chunk?.embeddingDimension || chunk?.indexMetadata?.dimension || (isEmbeddingVector(chunk?.embedding) ? chunk.embedding.length : 0),
     contentVersion: chunk?.embeddingContentVersion || chunk?.indexMetadata?.contentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION,
     indexRevision: chunk?.indexRevision || chunk?.indexMetadata?.indexRevision || requestedRevision
   });
@@ -719,7 +749,7 @@ function resolveIndexedSemanticQueryHandles(index = [], request = {}) {
     const model = String(meta.model || "");
     const dimension = Number(meta.dimension || 0);
     const revision = Number(meta.indexRevision || 0);
-    const compatible = Array.isArray(values) && values.length > 0
+    const compatible = isEmbeddingVector(values) && values.length > 0
       && (!requestedProvider || !provider || provider === requestedProvider)
       && (!requestedModel || !model || modelIdentity(model) === modelIdentity(requestedModel))
       && (!requestedDimension || dimension === requestedDimension)
@@ -843,6 +873,126 @@ function localSemanticRoutingIndexIntegrity(index) {
     hash = fnv1aStep(hash, `|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
   }
   for (let indexValue = 0; indexValue < values.length; indexValue += 1) {
+    const value = values[indexValue];
+    const slot = value >= -128 && value <= 127 && (value | 0) === value ? value + 128 : -1;
+    if (slot < 0) {
+      hash = fnv1aStep(hash, `|${value}`);
+      continue;
+    }
+    const offset = slot * LOCAL_SEMANTIC_ROUTING_INT8_CODE_WIDTH;
+    const length = valueLengths[slot];
+    for (let codeIndex = 0; codeIndex < length; codeIndex += 1) {
+      hash ^= valueCodes[offset + codeIndex];
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+  return fnv1aFinish16(hash);
+}
+// Cooperative variant of the same fold (byte-identical output): metadata rows
+// and the Int8 value stream are hashed in ~8 ms slices; the clock is probed
+// per batch, never per value.
+async function localSemanticRoutingIndexIntegrityCooperative(index, gate = null) {
+  const descriptor = index.encoder || {};
+  const values = index.vectorStore?.values || [];
+  const valueCodes = LOCAL_SEMANTIC_ROUTING_INT8_CODES.codes;
+  const valueLengths = LOCAL_SEMANTIC_ROUTING_INT8_CODES.lengths;
+  let hash = fnv1aStep(2166136261, [index.schemaVersion, index.generation, descriptor.id, descriptor.version, descriptor.dimension, descriptor.normalization, descriptor.quantization?.type, descriptor.quantization?.scale].join("|"));
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let row = 0; row < index.evidenceIds.length; row += 1) {
+    hash = fnv1aStep(hash, `|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  const batchMask = (1 << 16) - 1;
+  for (let indexValue = 0; indexValue < values.length; indexValue += 1) {
+    const value = values[indexValue];
+    const slot = value >= -128 && value <= 127 && (value | 0) === value ? value + 128 : -1;
+    if (slot < 0) {
+      hash = fnv1aStep(hash, `|${value}`);
+    } else {
+      const offset = slot * LOCAL_SEMANTIC_ROUTING_INT8_CODE_WIDTH;
+      const length = valueLengths[slot];
+      for (let codeIndex = 0; codeIndex < length; codeIndex += 1) {
+        hash ^= valueCodes[offset + codeIndex];
+        hash = Math.imul(hash, 16777619);
+      }
+    }
+    if ((indexValue & batchMask) === batchMask && localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  return fnv1aFinish16(hash);
+}
+
+// Cooperative slicing for the production routing rebuild: ~8 ms of synchronous
+// work per macrotask, the same pattern as decorateSemanticIndexChunksCooperative.
+// The slicer also carries the rebuild's abort predicate: when the index
+// generation/revision/fingerprint changes mid-rebuild the build is abandoned
+// cleanly (code routing-state-build-aborted) and the caller fails closed.
+const PRODUCTION_SEMANTIC_ROUTING_REBUILD_SLICE_MS = 8;
+const PRODUCTION_SEMANTIC_ROUTING_REBUILD_ABORT_CODE = "routing-state-build-aborted";
+const PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_WAIT_MS = 4000;
+const PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_POLL_MS = 100;
+
+function productionSemanticRoutingCooperativeSlicer(shouldAbort = null) {
+  let lastYieldAt = localSemanticRoutingNow();
+  const checkAbort = () => {
+    if (typeof shouldAbort === "function" && shouldAbort()) {
+      throw localSemanticRoutingError(PRODUCTION_SEMANTIC_ROUTING_REBUILD_ABORT_CODE, "Production routing rebuild was abandoned: the semantic index changed mid-rebuild.");
+    }
+  };
+  return async function slice(force = false) {
+    checkAbort();
+    if (!force && localSemanticRoutingNow() - lastYieldAt < PRODUCTION_SEMANTIC_ROUTING_REBUILD_SLICE_MS) return;
+    await idlePause(0);
+    lastYieldAt = localSemanticRoutingNow();
+    checkAbort();
+  };
+}
+
+// Streaming fold over the same character stream as fnv1aStep(seed, text), in
+// bounded slices so a multi-MB integrity pass never blocks the renderer.
+async function productionSemanticRoutingFoldCooperative(seed, text, slice) {
+  let hash = seed >>> 0;
+  const step = 262144;
+  for (let offset = 0; offset < text.length; offset += step) {
+    hash = fnv1aStep(hash, text.slice(offset, offset + step));
+    if (offset + step < text.length) await slice();
+  }
+  return hash;
+}
+
+// Byte-identical JSON text of an array (JSON.stringify semantics: undefined
+// elements become null), serialized element by element so large metadata
+// arrays never produce one long synchronous stringify.
+async function productionSemanticRoutingJsonArrayCooperative(values, slice) {
+  const list = Array.isArray(values) ? values : [];
+  const parts = new Array(list.length);
+  for (let index = 0; index < list.length; index += 1) {
+    const json = JSON.stringify(list[index]);
+    parts[index] = json === undefined ? "null" : json;
+    await slice();
+  }
+  return `[${parts.join(",")}]`;
+}
+
+// Cooperative mirror of localSemanticRoutingIndexIntegrity: identical
+// character stream, sliced at row / value-group boundaries.
+async function localSemanticRoutingIndexIntegrityCooperative(index, slice) {
+  const descriptor = index.encoder || {};
+  const values = index.vectorStore?.values || [];
+  const valueCodes = LOCAL_SEMANTIC_ROUTING_INT8_CODES.codes;
+  const valueLengths = LOCAL_SEMANTIC_ROUTING_INT8_CODES.lengths;
+  let hash = fnv1aStep(2166136261, [index.schemaVersion, index.generation, descriptor.id, descriptor.version, descriptor.dimension, descriptor.normalization, descriptor.quantization?.type, descriptor.quantization?.scale].join("|"));
+  for (let row = 0; row < index.evidenceIds.length; row += 1) {
+    hash = fnv1aStep(hash, `|${index.evidenceIds[row]}|${index.sourceIds[row]}|${index.shardRefs[row]}|${JSON.stringify(index.scopeRefs[row])}|${JSON.stringify(index.taskRefs[row])}|${JSON.stringify(index.temporalMetadata[row])}|${JSON.stringify(index.routingMetadata?.[row])}`);
+    await slice();
+  }
+  for (let indexValue = 0; indexValue < values.length; indexValue += 1) {
+    if ((indexValue & 1023) === 0 && indexValue > 0) await slice();
     const value = values[indexValue];
     const slot = value >= -128 && value <= 127 && (value | 0) === value ? value + 128 : -1;
     if (slot < 0) {
@@ -1142,6 +1292,241 @@ async function routeLocalSemanticEvidenceBatch(index, queryHandles = [], options
   });
 }
 
+// --- Task 9: resident shard router -------------------------------------------
+// One centroid per shard (int8 routing rows averaged and L2-normalized) plus
+// the row->shard map. ~150 KB on a ten-shard vault; routeQuery selects the top
+// 2-4 shards by centroid similarity plus the most recent shard (MoE/IVF-style
+// routing with a recency prior, per the memory-architecture research).
+function buildSemanticShardRouter(routingIndex = {}, options = {}) {
+  const view = localSemanticRoutingIndexView(routingIndex);
+  const { encoder, count, vectorStore } = view;
+  const dimension = Number(encoder.dimension);
+  const shardRefs = routingIndex.shardRefs || [];
+  const shardIds = [];
+  const shardIndexByRef = new Map();
+  const rowShard = new Int32Array(count);
+  for (let row = 0; row < count; row += 1) {
+    const ref = String(shardRefs[row] || "");
+    let shardId = shardIndexByRef.get(ref);
+    if (shardId === undefined) {
+      shardId = shardIds.length;
+      shardIds.push(ref);
+      shardIndexByRef.set(ref, shardId);
+    }
+    rowShard[row] = shardId;
+  }
+  const shardCount = shardIds.length;
+  const shardRows = Array.from({ length: shardCount }, () => []);
+  for (let row = 0; row < count; row += 1) shardRows[rowShard[row]].push(row);
+  const centroids = new Float64Array(shardCount * dimension);
+  const scale = Number(encoder.quantization.scale) || 1;
+  const values = vectorStore.values;
+  for (let shard = 0; shard < shardCount; shard += 1) {
+    const rows = shardRows[shard];
+    const base = shard * dimension;
+    for (const row of rows) {
+      const offset = row * dimension;
+      for (let index = 0; index < dimension; index += 1) centroids[base + index] += values[offset + index] / scale;
+    }
+    let norm = 0;
+    for (let index = 0; index < dimension; index += 1) norm += centroids[base + index] * centroids[base + index];
+    norm = Math.sqrt(norm) || 1;
+    for (let index = 0; index < dimension; index += 1) centroids[base + index] /= norm;
+  }
+  // The most recent shard comes from the newest temporal value in the routing
+  // metadata; when the artifact carries no dates, the corpus-order tail (the
+  // newest generation segment) is the fallback.
+  let mostRecentShard = shardCount - 1;
+  let newest = Number.NEGATIVE_INFINITY;
+  const temporalValue = (value) => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (value && typeof value === "object") {
+      for (const key of ["createdAt", "modifiedAt", "timestamp", "date", "time"]) {
+        const candidate = Number(value[key]);
+        if (Number.isFinite(candidate) && candidate > 0) return candidate;
+      }
+    }
+    return Number.NaN;
+  };
+  for (let row = 0; row < count; row += 1) {
+    const value = temporalValue(routingIndex.temporalMetadata?.[row]);
+    if (Number.isFinite(value) && value > newest) {
+      newest = value;
+      mostRecentShard = rowShard[row];
+    }
+  }
+  if (mostRecentShard < 0) mostRecentShard = 0;
+  const route = (queryVector, routeOptions = {}) => {
+    const topShards = Math.max(1, Math.min(shardCount, Number(routeOptions.topShards || options.topShards || SEMANTIC_ROUTED_SHARD_TOP)));
+    const query = localSemanticRoutingVector(queryVector, dimension, "Query", 0, encoder.normalization);
+    const ranked = [];
+    for (let shard = 0; shard < shardCount; shard += 1) {
+      const base = shard * dimension;
+      let score = 0;
+      for (let index = 0; index < dimension; index += 1) score += query[index] * centroids[base + index];
+      ranked.push({ shard, score });
+    }
+    ranked.sort((left, right) => right.score - left.score || left.shard - right.shard);
+    const selected = ranked.slice(0, topShards).map((entry) => entry.shard);
+    if (mostRecentShard >= 0 && !selected.includes(mostRecentShard)) selected.push(mostRecentShard);
+    return selected;
+  };
+  return { dimension, count, shardCount, shardIds, rowShard, shardRows, centroids, mostRecentShard, route };
+}
+
+// --- Router v2: fixed-size routing cells -------------------------------------
+// Cells partition the loaded index into fixed-row-count groups, independent of
+// shard file sizes, so routing granularity does not change when the release
+// session switches the shard size (4.5 MB vs 10 MB). Strategies:
+//   "chunk" — consecutive rows in index order;
+//   "note"  — rows grouped by source identity (every chunk of one note/series
+//             stays together), packed greedily into cells of ~target rows.
+// The resident router is tiny: cellCount * dimension Float64 centroid values
+// plus a row->cell Int32Array. route() selects the top cells by centroid
+// similarity up to a row-fraction budget (floor on probes) plus the most
+// recent cell and any forced rows (active note / query-handle rows); only the
+// selected rows are exact-scored.
+const SEMANTIC_ROUTED_CELL_STRATEGY = "chunk";
+
+function buildSemanticCellRouter(routingIndex = {}, options = {}) {
+  const view = localSemanticRoutingIndexView(routingIndex);
+  const { encoder, count, vectorStore } = view;
+  const dimension = Number(encoder.dimension);
+  const strategy = String(options.strategy || options.cellStrategy || SEMANTIC_ROUTED_CELL_STRATEGY) === "chunk" ? "chunk" : "note";
+  const requestedTarget = Math.floor(Number(options.targetRows || options.cellTargetRows || SEMANTIC_ROUTED_CELL_TARGET_ROWS));
+  const targetRows = Math.max(1, Number.isFinite(requestedTarget) ? requestedTarget : SEMANTIC_ROUTED_CELL_TARGET_ROWS);
+  const cellRows = [];
+  const rowCell = new Int32Array(count);
+  rowCell.fill(-1);
+  if (count > 0) {
+    if (strategy === "chunk") {
+      for (let start = 0; start < count; start += targetRows) {
+        const rows = [];
+        const end = Math.min(count, start + targetRows);
+        for (let row = start; row < end; row += 1) rows.push(row);
+        cellRows.push(rows);
+      }
+    } else {
+      const groups = new Map();
+      const order = [];
+      const sourceIds = routingIndex.sourceIds || [];
+      for (let row = 0; row < count; row += 1) {
+        const key = String(sourceIds[row] || "");
+        let rows = groups.get(key);
+        if (!rows) {
+          rows = [];
+          groups.set(key, rows);
+          order.push(key);
+        }
+        rows.push(row);
+      }
+      let current = [];
+      for (const key of order) {
+        const rows = groups.get(key);
+        // An oversized source keeps its rows together in one cell.
+        if (rows.length > targetRows) {
+          if (current.length) { cellRows.push(current); current = []; }
+          cellRows.push(rows);
+          continue;
+        }
+        if (current.length + rows.length > targetRows) { cellRows.push(current); current = []; }
+        current = current.concat(rows);
+        if (current.length >= targetRows) { cellRows.push(current); current = []; }
+      }
+      if (current.length) cellRows.push(current);
+    }
+    for (let cell = 0; cell < cellRows.length; cell += 1) {
+      for (const row of cellRows[cell]) rowCell[row] = cell;
+    }
+  }
+  const cellCount = cellRows.length;
+  const centroids = new Float64Array(cellCount * dimension);
+  const scale = Number(encoder.quantization.scale) || 1;
+  const values = vectorStore.values;
+  for (let cell = 0; cell < cellCount; cell += 1) {
+    const rows = cellRows[cell];
+    const base = cell * dimension;
+    for (const row of rows) {
+      const offset = row * dimension;
+      for (let index = 0; index < dimension; index += 1) centroids[base + index] += values[offset + index] / scale;
+    }
+    let norm = 0;
+    for (let index = 0; index < dimension; index += 1) norm += centroids[base + index] * centroids[base + index];
+    norm = Math.sqrt(norm) || 1;
+    for (let index = 0; index < dimension; index += 1) centroids[base + index] /= norm;
+  }
+  // The most recent cell comes from the newest temporal value in the routing
+  // metadata; when the artifact carries no dates, the corpus-order tail (the
+  // newest generation segment) is the fallback.
+  const temporalValue = (value) => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (value && typeof value === "object") {
+      for (const key of ["createdAt", "modifiedAt", "timestamp", "date", "time"]) {
+        const candidate = Number(value[key]);
+        if (Number.isFinite(candidate) && candidate > 0) return candidate;
+      }
+    }
+    return Number.NaN;
+  };
+  let mostRecentCell = cellCount - 1;
+  let newest = Number.NEGATIVE_INFINITY;
+  for (let row = 0; row < count; row += 1) {
+    const value = temporalValue(routingIndex.temporalMetadata?.[row]);
+    if (Number.isFinite(value) && value > newest) {
+      newest = value;
+      mostRecentCell = rowCell[row];
+    }
+  }
+  if (mostRecentCell < 0) mostRecentCell = 0;
+  const route = (queryVector, routeOptions = {}) => {
+    if (cellCount === 0) return [];
+    const query = localSemanticRoutingVector(queryVector, dimension, "Query", 0, encoder.normalization);
+    const requestedFraction = Number(routeOptions.scanFraction ?? routeOptions.cellScanFraction ?? options.scanFraction ?? SEMANTIC_ROUTED_CELL_SCAN_FRACTION);
+    const fraction = Number.isFinite(requestedFraction) ? Math.min(1, Math.max(0, requestedFraction)) : SEMANTIC_ROUTED_CELL_SCAN_FRACTION;
+    const requestedProbes = Math.floor(Number(routeOptions.minProbes ?? routeOptions.cellMinProbes ?? options.minProbes ?? SEMANTIC_ROUTED_CELL_MIN_PROBES));
+    const minProbes = Math.max(1, Number.isFinite(requestedProbes) ? requestedProbes : SEMANTIC_ROUTED_CELL_MIN_PROBES);
+    const budgetRows = Math.max(1, Math.ceil(fraction * count));
+    const ranked = [];
+    for (let cell = 0; cell < cellCount; cell += 1) {
+      const base = cell * dimension;
+      let score = 0;
+      for (let index = 0; index < dimension; index += 1) score += query[index] * centroids[base + index];
+      ranked.push({ cell, score });
+    }
+    ranked.sort((left, right) => right.score - left.score || left.cell - right.cell);
+    const selected = [];
+    const selectedSet = new Set();
+    // Mandatory cells first: forced rows (active note / query-handle rows) and
+    // the most recent cell always probe, and count toward the row budget so the
+    // scan stays at or below the requested fraction; routing only decides which
+    // rows get exact-scored.
+    const forcedRows = Array.isArray(routeOptions.forcedRows) ? routeOptions.forcedRows : [];
+    for (const row of forcedRows) {
+      const cell = rowCell[row];
+      if (cell >= 0 && !selectedSet.has(cell)) {
+        selectedSet.add(cell);
+        selected.push(cell);
+      }
+    }
+    if (routeOptions.includeRecent !== false && mostRecentCell >= 0 && !selectedSet.has(mostRecentCell)) {
+      selectedSet.add(mostRecentCell);
+      selected.push(mostRecentCell);
+    }
+    let rowsBudget = 0;
+    for (const cell of selected) rowsBudget += cellRows[cell].length;
+    for (const entry of ranked) {
+      if (selected.length >= minProbes && rowsBudget >= budgetRows) break;
+      if (selectedSet.has(entry.cell)) continue;
+      selected.push(entry.cell);
+      selectedSet.add(entry.cell);
+      rowsBudget += cellRows[entry.cell].length;
+    }
+    selected.sort((left, right) => left - right);
+    return selected;
+  };
+  return { dimension, count, strategy, targetRows, cellCount, cellRows, rowCell, centroids, mostRecentCell, route };
+}
+
 function productionSemanticRoutingNormalize(value) {
   if (value && typeof value === "object") return String(value.id ?? value.ref ?? value.path ?? "").trim();
   return String(value ?? "").trim();
@@ -1196,6 +1581,30 @@ function productionSemanticRoutingHandleLookup(chunks = [], routingIndex = {}) {
           ? [routingIndex.sourceIds[row], ...productionSemanticRoutingLookupValues(chunk, kind)]
           : productionSemanticRoutingLookupValues(chunk, kind);
       for (const value of values) productionSemanticRoutingAddLookup(lookup[kind], value, row);
+    }
+  }
+  return lookup;
+}
+// Cooperative load-path variant (identical maps): rows are folded in ~8 ms
+// slices. The sync version above stays for synchronous callers (rebuild path,
+// routing-hot-paths probe).
+async function productionSemanticRoutingHandleLookupCooperative(chunks = [], routingIndex = {}, gate = null) {
+  const lookup = { evidence: new Map(), source: new Map(), path: new Map(), scope: new Map(), task: new Map(), fact: new Map() };
+  const kinds = ["evidence", "source", "path", "scope", "task", "fact"];
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let row = 0; row < chunks.length; row += 1) {
+    const chunk = chunks[row] || {};
+    for (const kind of kinds) {
+      const values = kind === "evidence" && routingIndex.evidenceIds?.[row]
+        ? [routingIndex.evidenceIds[row], ...productionSemanticRoutingLookupValues(chunk, kind)]
+        : kind === "source" && routingIndex.sourceIds?.[row]
+          ? [routingIndex.sourceIds[row], ...productionSemanticRoutingLookupValues(chunk, kind)]
+          : productionSemanticRoutingLookupValues(chunk, kind);
+      for (const value of values) productionSemanticRoutingAddLookup(lookup[kind], value, row);
+    }
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
     }
   }
   return lookup;
@@ -1386,7 +1795,7 @@ function productionSemanticRoutingDescriptor(chunks = [], settings = {}, options
 function productionSemanticRoutingQueryAdapter(handle = {}, routingState = {}, settings = {}) {
   const encoder = routingState?.routingIndex?.encoder;
   if (!encoder || typeof encoder !== "object") throw localSemanticRoutingError("routing-state-missing", "Production routing encoder is unavailable.");
-  if (!handle || typeof handle !== "object" || !Array.isArray(handle.vector)) throw localSemanticRoutingError("query-malformed", "Semantic query handle is malformed.");
+  if (!handle || typeof handle !== "object" || !isEmbeddingVector(handle.vector)) throw localSemanticRoutingError("query-malformed", "Semantic query handle is malformed.");
   const provider = productionSemanticRoutingNormalize(handle.provider || "").toLowerCase();
   const model = productionSemanticRoutingNormalize(handle.model || "");
   const expectedProvider = productionSemanticRoutingNormalize(semanticEmbeddingProvider(settings)).toLowerCase();
@@ -1414,14 +1823,29 @@ function productionSemanticRoutingQueryAdapter(handle = {}, routingState = {}, s
   });
 }
 
-function productionSemanticRoutingChunkCompatibility(chunk = {}, descriptor = {}, settings = {}) {
+// The expected provider/model identity is derived from the settings object and
+// is identical for every chunk of one build. semanticEmbeddingProvider clones
+// the whole settings object (cloneStableValue) on every call, so recomputing it
+// per chunk turned the rebuild into a 6+ s synchronous stretch (4,374 clones).
+// Computing it once per build removes that recompute; the identity itself is
+// unchanged.
+function productionSemanticRoutingExpectedIdentity(settings = {}) {
+  settings = settings && typeof settings === "object" ? settings : {};
+  return Object.freeze({
+    provider: productionSemanticRoutingNormalize(semanticEmbeddingProvider(settings)).toLowerCase(),
+    model: productionSemanticRoutingNormalize(settings.embeddingModel || "")
+  });
+}
+
+function productionSemanticRoutingChunkCompatibility(chunk = {}, descriptor = {}, settings = {}, expectedIdentity = null) {
   settings = settings && typeof settings === "object" ? settings : {};
   if (!chunk.embedding || typeof chunk.embedding.length !== "number" || chunk.embedding.length !== descriptor.dimension) return false;
   const metadata = Object.assign({}, chunk.indexMetadata || {});
   const provider = productionSemanticRoutingNormalize(chunk.embeddingProvider || metadata.provider || "").toLowerCase();
   const model = productionSemanticRoutingNormalize(chunk.embeddingModel || metadata.model || "");
-  const expectedProvider = productionSemanticRoutingNormalize(semanticEmbeddingProvider(settings)).toLowerCase();
-  const expectedModel = productionSemanticRoutingNormalize(settings.embeddingModel || "");
+  const expected = expectedIdentity && typeof expectedIdentity === "object" ? expectedIdentity : productionSemanticRoutingExpectedIdentity(settings);
+  const expectedProvider = expected.provider;
+  const expectedModel = expected.model;
   if (provider && expectedProvider && provider !== expectedProvider) return false;
   if (model && expectedModel && modelIdentity(model) !== modelIdentity(expectedModel)) return false;
   const contentVersion = Number(chunk.embeddingContentVersion || metadata.contentVersion || SEMANTIC_EMBEDDING_CONTENT_VERSION);
@@ -1435,8 +1859,9 @@ function prepareProductionSemanticRoutingState(chunks = [], settings = {}, revis
   if (!Array.isArray(chunks)) throw localSemanticRoutingError("routing-state-chunks-malformed", "Production routing chunks must be an array.");
   const descriptor = productionSemanticRoutingDescriptor(chunks, settings, options);
   const sourceChunks = chunks.filter((chunk) => chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true);
+  const compatibilityIdentity = productionSemanticRoutingExpectedIdentity(settings);
   for (let row = 0; row < sourceChunks.length; row += 1) {
-    if (!productionSemanticRoutingChunkCompatibility(sourceChunks[row], descriptor, settings)) throw localSemanticRoutingError("routing-state-incompatible", "Persisted embedding is incompatible with the production routing descriptor.", { row, dimension: descriptor.dimension });
+    if (!productionSemanticRoutingChunkCompatibility(sourceChunks[row], descriptor, settings, compatibilityIdentity)) throw localSemanticRoutingError("routing-state-incompatible", "Persisted embedding is incompatible with the production routing descriptor.", { row, dimension: descriptor.dimension });
   }
   const generation = String(options.generation || localSemanticRoutingStableHash(`${descriptor.id}|${descriptor.version}|${revision}|${storageFingerprint}|${sourceChunks.map((chunk) => chunk.evidenceId || chunk.id || "").join("|")}`));
   const expectedShardCount = Number(options.shardCount || settings.semanticIndexMeta?.shardCount || 0);
@@ -1474,6 +1899,153 @@ function prepareProductionSemanticRoutingState(chunks = [], settings = {}, revis
   return Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, telemetry });
 }
 
+// Cooperative mirror of buildLocalSemanticRoutingIndex: identical outputs
+// (same primitives, same order), sliced at row / hash boundaries.
+async function buildLocalSemanticRoutingIndexCooperative(chunks = [], descriptor = {}, options = {}) {
+  if (!Array.isArray(chunks)) throw localSemanticRoutingError("count-malformed", "Routing chunks must be an array.");
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw localSemanticRoutingError("options-malformed", "Routing build options must be an object.");
+  const slice = typeof options.slice === "function" ? options.slice : productionSemanticRoutingCooperativeSlicer();
+  const encoder = localSemanticRoutingDescriptor(descriptor);
+  const count = chunks.length;
+  const shardSize = Number.isInteger(options.shardSize) && options.shardSize > 0 ? options.shardSize : 256;
+  const evidenceIds = [];
+  const sourceIds = [];
+  const shardRefs = [];
+  const scopeRefs = [];
+  const taskRefs = [];
+  const temporalMetadata = [];
+  const routingMetadata = [];
+  const quantized = new Int8Array(count * encoder.dimension);
+  const seenEvidence = new Set();
+  const seenSource = new Set();
+  for (let row = 0; row < count; row += 1) {
+    const chunk = chunks[row];
+    if (!chunk || typeof chunk !== "object") throw localSemanticRoutingError("count-malformed", "Routing chunk is malformed.", { row });
+    const evidenceId = localSemanticRoutingIdentity(chunk.evidenceId ?? chunk.id, "evidence", row);
+    if (seenEvidence.has(evidenceId)) throw localSemanticRoutingError("identity-duplicate", `Duplicate evidence identity: ${evidenceId}.`, { row, evidenceId });
+    seenEvidence.add(evidenceId);
+    const sourceId = localSemanticRoutingIdentity(chunk.sourceId ?? chunk.source?.id ?? chunk.path ?? chunk.file, "source", row);
+    if (seenSource.has(`${evidenceId}\u0000${sourceId}`)) throw localSemanticRoutingError("identity-duplicate", `Duplicate evidence/source identity: ${evidenceId}.`, { row, evidenceId, sourceId });
+    seenSource.add(`${evidenceId}\u0000${sourceId}`);
+    const adaptedVector = typeof options.vectorAdapter === "function"
+      ? options.vectorAdapter(chunk, row, encoder)
+      : localSemanticRoutingVectorFromChunk(chunk, row);
+    const vector = localSemanticRoutingVector(adaptedVector, encoder.dimension, "Document", row, encoder.normalization);
+    const offset = row * encoder.dimension;
+    for (let dimension = 0; dimension < encoder.dimension; dimension += 1) {
+      const value = vector[dimension];
+      if (Math.abs(value) > 1 + 1e-9) throw localSemanticRoutingError("vector-invalid", "Document vector exceeds the normalized quantization range.", { row, dimension, value });
+      quantized[offset + dimension] = Math.max(-128, Math.min(127, Math.round(value * encoder.quantization.scale)));
+    }
+    evidenceIds.push(evidenceId);
+    sourceIds.push(sourceId);
+    shardRefs.push(localSemanticRoutingIdentity(chunk.shardRef ?? chunk.shard ?? `shard-${Math.floor(row / shardSize)}`, "shard", row));
+    const rowMetadata = localSemanticRoutingCanonicalMetadata(chunk, evidenceId, sourceId);
+    scopeRefs.push(rowMetadata.scope.ids);
+    taskRefs.push(rowMetadata.task.ids);
+    temporalMetadata.push(rowMetadata.temporal);
+    routingMetadata.push(rowMetadata);
+    await slice();
+  }
+  const generation = localSemanticRoutingIdentity(options.generation ?? localSemanticRoutingStableHash(`${encoder.id}|${encoder.version}|${count}|${evidenceIds.join("|")}`), "generation", 0);
+  const vectorStore = Object.freeze({ format: encoder.quantization.type, scale: encoder.quantization.scale, dimension: encoder.dimension, count, values: quantized });
+  const index = {
+    schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
+    generation,
+    encoder,
+    evidenceIds: Object.freeze(evidenceIds),
+    sourceIds: Object.freeze(sourceIds),
+    shardRefs: Object.freeze(shardRefs),
+    scopeRefs: Object.freeze(scopeRefs),
+    taskRefs: Object.freeze(taskRefs),
+    temporalMetadata: Object.freeze(temporalMetadata),
+    routingMetadata: Object.freeze(routingMetadata),
+    vectorStore,
+    integrityHash: "",
+    count
+  };
+  index.integrityHash = await localSemanticRoutingIndexIntegrityCooperative(index, slice);
+  Object.freeze(index);
+  return index;
+}
+
+// Cooperative mirror of productionSemanticRoutingHandleLookup: identical maps,
+// sliced per row.
+async function productionSemanticRoutingHandleLookupCooperative(chunks = [], routingIndex = {}, slice) {
+  const lookup = { evidence: new Map(), source: new Map(), path: new Map(), scope: new Map(), task: new Map(), fact: new Map() };
+  const kinds = ["evidence", "source", "path", "scope", "task", "fact"];
+  for (let row = 0; row < chunks.length; row += 1) {
+    const chunk = chunks[row] || {};
+    for (const kind of kinds) {
+      const values = kind === "evidence" && routingIndex.evidenceIds?.[row]
+        ? [routingIndex.evidenceIds[row], ...productionSemanticRoutingLookupValues(chunk, kind)]
+        : kind === "source" && routingIndex.sourceIds?.[row]
+          ? [routingIndex.sourceIds[row], ...productionSemanticRoutingLookupValues(chunk, kind)]
+          : productionSemanticRoutingLookupValues(chunk, kind);
+      for (const value of values) productionSemanticRoutingAddLookup(lookup[kind], value, row);
+    }
+    await slice();
+  }
+  return lookup;
+}
+
+// Cooperative mirror of prepareProductionSemanticRoutingState: identical state
+// (same descriptor, generation, Int8 matrix, hashes and maps), sliced into
+// ~8 ms macrotasks and abandonable when options.shouldAbort() turns true.
+async function prepareProductionSemanticRoutingStateCooperative(chunks = [], settings = {}, revision = 0, storageFingerprint = "", options = {}) {
+  const startedAt = localSemanticRoutingNow();
+  settings = settings && typeof settings === "object" ? settings : {};
+  options = options && typeof options === "object" ? options : {};
+  if (!Array.isArray(chunks)) throw localSemanticRoutingError("routing-state-chunks-malformed", "Production routing chunks must be an array.");
+  const slice = productionSemanticRoutingCooperativeSlicer(options.shouldAbort);
+  const descriptor = productionSemanticRoutingDescriptor(chunks, settings, options);
+  const sourceChunks = chunks.filter((chunk) => chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true);
+  const compatibilityIdentity = productionSemanticRoutingExpectedIdentity(settings);
+  for (let row = 0; row < sourceChunks.length; row += 1) {
+    if (!productionSemanticRoutingChunkCompatibility(sourceChunks[row], descriptor, settings, compatibilityIdentity)) throw localSemanticRoutingError("routing-state-incompatible", "Persisted embedding is incompatible with the production routing descriptor.", { row, dimension: descriptor.dimension });
+    await slice();
+  }
+  const generation = String(options.generation || localSemanticRoutingStableHash(`${descriptor.id}|${descriptor.version}|${revision}|${storageFingerprint}|${sourceChunks.map((chunk) => chunk.evidenceId || chunk.id || "").join("|")}`));
+  const expectedShardCount = Number(options.shardCount || settings.semanticIndexMeta?.shardCount || 0);
+  const explicitShardRefs = sourceChunks.map((chunk) => String(chunk?.shardRef ?? chunk?.shard ?? ""));
+  const explicitShardLayoutUsable = explicitShardRefs.length > 0 && explicitShardRefs.every(Boolean)
+    && (!expectedShardCount || new Set(explicitShardRefs).size === expectedShardCount);
+  const shardSize = Number.isInteger(options.shardSize) && options.shardSize > 0
+    ? options.shardSize
+    : expectedShardCount > 0 && sourceChunks.length > 0
+      ? Math.max(1, Math.ceil(sourceChunks.length / expectedShardCount))
+      : undefined;
+  const routingChunks = !explicitShardLayoutUsable && expectedShardCount > 0 && sourceChunks.length > 0
+    ? sourceChunks.map((chunk, row) => Object.assign({}, chunk, { shardRef: `shard-${Math.floor(row / shardSize)}` }))
+    : sourceChunks;
+  await slice();
+  const routingIndex = await buildLocalSemanticRoutingIndexCooperative(routingChunks, descriptor, {
+    generation,
+    shardSize,
+    slice,
+    vectorAdapter: (chunk, row, encoder) => localSemanticRoutingVector(chunk.embedding, encoder.dimension, "Provider document", row, encoder.normalization)
+  });
+  const chunkByEvidenceId = new Map();
+  for (let row = 0; row < sourceChunks.length; row += 1) {
+    chunkByEvidenceId.set(routingIndex.evidenceIds[row], sourceChunks[row]);
+    await slice();
+  }
+  const handleLookup = await productionSemanticRoutingHandleLookupCooperative(sourceChunks, routingIndex, slice);
+  const telemetry = {
+    state: "ready",
+    coldBuild: true,
+    loadHit: false,
+    providerCalls: 0,
+    networkCalls: 0,
+    revision: Number(revision || 0),
+    storageFingerprint: String(storageFingerprint || ""),
+    count: routingIndex.count,
+    dimension: routingIndex.encoder.dimension,
+    buildElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt)
+  };
+  return Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, telemetry });
+}
+
 function productionSemanticRoutingBytesToBase64(values) {
   const bytes = values instanceof Uint8Array ? values : new Uint8Array(values?.buffer || values || []);
   if (typeof btoa === "function") {
@@ -1494,6 +2066,37 @@ function productionSemanticRoutingBytesToBase64(values) {
     output += offset + 2 < bytes.length ? alphabet[c & 63] : "=";
   }
   return output;
+}
+
+// Cooperative mirror of productionSemanticRoutingBytesToBase64: standard
+// base64, identical output, encoded in 3-byte-aligned chunks (btoa per chunk
+// when available) so the multi-MB encode yields between ~32 KB chunks.
+async function productionSemanticRoutingBytesToBase64Cooperative(values, slice) {
+  const bytes = values instanceof Uint8Array ? values : new Uint8Array(values?.buffer || values || []);
+  const step = 0x8000 - (0x8000 % 3);
+  const pieces = [];
+  const hasBtoa = typeof btoa === "function";
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let offset = 0; offset < bytes.length; offset += step) {
+    const end = Math.min(bytes.length, offset + step);
+    if (hasBtoa) {
+      pieces.push(btoa(String.fromCharCode(...bytes.subarray(offset, end))));
+    } else {
+      let piece = "";
+      for (let index = offset; index < end; index += 3) {
+        const a = bytes[index];
+        const b = index + 1 < end ? bytes[index + 1] : 0;
+        const c = index + 2 < end ? bytes[index + 2] : 0;
+        piece += alphabet[a >> 2];
+        piece += alphabet[((a & 3) << 4) | (b >> 4)];
+        piece += index + 1 < end ? alphabet[((b & 15) << 2) | (c >> 6)] : "=";
+        piece += index + 2 < end ? alphabet[c & 63] : "=";
+      }
+      pieces.push(piece);
+    }
+    await slice();
+  }
+  return pieces.join("");
 }
 
 function productionSemanticRoutingBase64ToBytes(value) {
@@ -1517,6 +2120,26 @@ function productionSemanticRoutingBase64ToBytes(value) {
     if (encoded[index + 3] !== "=") bytes.push(((c & 3) << 6) | d);
   }
   return new Uint8Array(bytes);
+}
+// Cooperative base64 decode: the single atob call (~8 ms on the 6 M-char
+// payload) stays one isolated unit; the char->byte pass runs in ~1 M-char
+// slices. Platforms without atob fall back to the sync decoder.
+async function productionSemanticRoutingBase64ToBytesCooperative(value, gate = null) {
+  const encoded = String(value || "");
+  if (typeof atob !== "function") return productionSemanticRoutingBase64ToBytes(encoded);
+  const text = atob(encoded);
+  const bytes = new Uint8Array(text.length);
+  const step = 1 << 20;
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let offset = 0; offset < text.length; offset += step) {
+    const end = Math.min(text.length, offset + step);
+    for (let index = offset; index < end; index += 1) bytes[index] = text.charCodeAt(index);
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  return bytes;
 }
 
 // Characters JSON.stringify would escape (or must escape conservatively, like
@@ -1607,14 +2230,102 @@ function productionSemanticRoutingArtifactIntegrity(artifact = {}) {
   hash = fnv1aStep(hash, "}}");
   return fnv1aFinish16(hash);
 }
+// Cooperative variant of the same fold (byte-identical output): fields keep
+// their order, and the multi-MB base64 `data` string is folded in ~1 M-char
+// slices. The escape fallback (invalid payload) still serializes once.
+async function productionSemanticRoutingArtifactIntegrityCooperative(artifact = {}, gate = null) {
+  const store = artifact.vectorStore || {};
+  let hash = 2166136261;
+  let first = true;
+  const field = (key, value) => {
+    const json = JSON.stringify(value);
+    if (json === undefined) return;
+    if (!first) hash = fnv1aStep(hash, ",");
+    first = false;
+    hash = fnv1aStep(hash, `"${key}":`);
+    hash = fnv1aStep(hash, json);
+  };
+  hash = fnv1aStep(hash, "{");
+  field("schemaVersion", artifact.schemaVersion);
+  field("persistenceSchemaVersion", artifact.persistenceSchemaVersion);
+  field("provider", artifact.provider);
+  field("model", artifact.model);
+  field("dimension", artifact.dimension);
+  field("contentVersion", artifact.contentVersion);
+  field("indexRevision", artifact.indexRevision);
+  field("storageFingerprint", artifact.storageFingerprint);
+  field("generation", artifact.generation);
+  field("count", artifact.count);
+  field("evidenceIds", artifact.evidenceIds);
+  field("sourceIds", artifact.sourceIds);
+  field("shardRefs", artifact.shardRefs);
+  field("scopeRefs", artifact.scopeRefs);
+  field("taskRefs", artifact.taskRefs);
+  field("temporalMetadata", artifact.temporalMetadata);
+  field("routingMetadata", artifact.routingMetadata);
+  // Break the macrotask before the vectorStore section so the array
+  // serializations above never share a stretch with the data fold below.
+  await semanticIndexLoadSlicePause(gate);
+  if (!first) hash = fnv1aStep(hash, ",");
+  first = true;
+  hash = fnv1aStep(hash, `"vectorStore":{`);
+  field("format", store.format);
+  field("scale", store.scale);
+  field("dimension", store.dimension);
+  field("count", store.count);
+  field("encoding", store.encoding);
+  const data = store.data;
+  if (data !== undefined) {
+    const dataIsString = typeof data === "string";
+    const dataJson = dataIsString ? null : JSON.stringify(data);
+    if (dataIsString || dataJson !== undefined) {
+      if (!first) hash = fnv1aStep(hash, ",");
+      first = false;
+      hash = fnv1aStep(hash, `"data":`);
+      if (dataIsString) {
+        // Same escape-aware raw-character fold as the sync version, sliced by
+        // ~1 M chars (~3 ms); on the first escapable character, restart from
+        // the saved state with the fully serialized string.
+        const dataState = hash;
+        let escaped = false;
+        let dataHash = fnv1aStep(hash, `"`);
+        const step = 1 << 20;
+        let lastYieldAt = localSemanticRoutingNow();
+        for (let offset = 0; offset < data.length; offset += step) {
+          const end = Math.min(data.length, offset + step);
+          for (let index = offset; index < end; index += 1) {
+            const code = data.charCodeAt(index);
+            if (LOCAL_SEMANTIC_ROUTING_JSON_ESCAPE_CODES[code] === 1) {
+              escaped = true;
+              break;
+            }
+            dataHash ^= code;
+            dataHash = Math.imul(dataHash, 16777619);
+          }
+          if (escaped) break;
+          if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+            await semanticIndexLoadSlicePause(gate);
+            lastYieldAt = localSemanticRoutingNow();
+          }
+        }
+        if (escaped) hash = fnv1aStep(dataState, JSON.stringify(data));
+        else hash = fnv1aStep(dataHash, `"`);
+      } else {
+        hash = fnv1aStep(hash, dataJson);
+      }
+    }
+  }
+  hash = fnv1aStep(hash, "}}");
+  return fnv1aFinish16(hash);
+}
 
-function productionSemanticRoutingArtifactCompatibility(artifact = {}, chunks = [], settings = {}, options = {}) {
+async function productionSemanticRoutingArtifactCompatibility(artifact = {}, chunks = [], settings = {}, options = {}, gate = null) {
   const sourceChunks = (chunks || []).filter((chunk) => chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true);
   const meta = settings?.semanticIndexMeta && typeof settings.semanticIndexMeta === "object" ? settings.semanticIndexMeta : {};
   const expectedGeneration = String(options.generation || meta.generation || "");
   const expectedShardCount = Number(options.shardCount || meta.shardCount || 0);
-  const artifactShardRefs = Array.isArray(artifact.shardRefs) ? artifact.shardRefs.map((value) => String(value || "")) : [];
-  const explicitShardRefs = sourceChunks.map((chunk) => String(chunk?.shardRef ?? chunk?.shard ?? ""));
+  const artifactShardRefs = await cooperativeArrayFrom(artifact.shardRefs, (value) => String(value || ""), gate);
+  const explicitShardRefs = await cooperativeArrayFrom(sourceChunks, (chunk) => String(chunk?.shardRef ?? chunk?.shard ?? ""), gate);
   const reasonCodes = [];
   if (expectedGeneration && String(artifact.generation || "") !== expectedGeneration) reasonCodes.push("artifact-generation-mismatch");
   if (options.provider && String(artifact.provider || "").toLowerCase() !== String(options.provider).toLowerCase()) reasonCodes.push("artifact-provider-mismatch");
@@ -1634,7 +2345,7 @@ function productionSemanticRoutingArtifactCompatibility(artifact = {}, chunks = 
   }
   if (expectedShardCount > 0 && sourceChunks.length > 0 && !explicitLayoutUsable) {
     const shardSize = Math.max(1, Math.ceil(sourceChunks.length / expectedShardCount));
-    const expectedGeneratedRefs = sourceChunks.map((_, row) => `shard-${Math.floor(row / shardSize)}`);
+    const expectedGeneratedRefs = await cooperativeArrayFrom(sourceChunks, (_, row) => `shard-${Math.floor(row / shardSize)}`, gate);
     if (artifactShardRefs.length !== expectedGeneratedRefs.length
         || artifactShardRefs.some((value, row) => value !== expectedGeneratedRefs[row])) {
       reasonCodes.push("artifact-shard-layout-mismatch");
@@ -1687,6 +2398,233 @@ function serializeProductionSemanticRoutingArtifact(state = {}, options = {}) {
   return artifact;
 }
 
+// --- Task 9: routing artifact parts ------------------------------------------
+// The single routing artifact (~12.9 MB) exceeds the 4.5 MB sync cap, so it is
+// persisted as JSON string-slice parts plus a small pointer file under the
+// stable name. Reassembly verifies the declared length and the artifact
+// integrity hash before the artifact is trusted; the legacy single file stays
+// readable until the pointer replaces it (never before the parts verify).
+function productionSemanticRoutingPartFileName(index, generation = "") {
+  const token = String(generation || "").replace(/[^a-z0-9-]/gi, "").toLowerCase();
+  return `${LOCAL_SEMANTIC_ROUTING_PARTS_PREFIX}${token ? `${token}-` : ""}${String(index + 1).padStart(3, "0")}.json`;
+}
+
+function isProductionSemanticRoutingPartFile(name = "") {
+  return new RegExp(`^${escapeRegExp(LOCAL_SEMANTIC_ROUTING_PARTS_PREFIX)}[a-z0-9-]*\\d{3}\\.json$`, "i").test(String(name || ""));
+}
+
+// Routing parts are deliberately kept above the Sync Standard skip threshold
+// (5 MB) so a routing rebuild never uploads the artifact (the old single
+// 13.5 MB file was Sync-skipped; 14 sub-5 MB parts were not). One part while
+// the artifact fits a single file (<= 16 MB); otherwise ceil(total / 16 MB)
+// even parts, each ~8-16 MB and always > 5.2 MB. maxBytes (the configured
+// index-shard cap) stays as the floor. The artifact is a rebuildable cache;
+// keeping it Sync-skipped is intentional and revises the earlier
+// "every file <= 4.5 MB" mobile rule, which was designed for Sync.
+const ROUTING_PART_SYNC_SKIP_BYTES = Math.ceil(5.2 * 1024 * 1024);
+const ROUTING_PART_SINGLE_MAX_BYTES = 16 * 1024 * 1024;
+function productionSemanticRoutingPartBytes(totalLength, maxBytes = 0) {
+  const floor = Math.max(1, Number(maxBytes) || 0);
+  if (totalLength <= ROUTING_PART_SYNC_SKIP_BYTES) return Math.max(totalLength, 1);
+  if (totalLength <= ROUTING_PART_SINGLE_MAX_BYTES) return totalLength;
+  const parts = Math.ceil(totalLength / ROUTING_PART_SINGLE_MAX_BYTES);
+  return Math.max(Math.ceil(totalLength / parts), floor);
+}
+
+function serializeProductionSemanticRoutingArtifactParts(artifact = {}, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES) {
+  const json = JSON.stringify(artifact);
+  const partBytes = productionSemanticRoutingPartBytes(json.length, maxBytes);
+  const header = {
+    schemaVersion: Number(artifact.schemaVersion || 0),
+    persistenceSchemaVersion: Number(artifact.persistenceSchemaVersion || 0),
+    generation: String(artifact.generation || ""),
+    integrityHash: String(artifact.integrityHash || ""),
+    length: json.length
+  };
+  // Raw string slices: the serialized part body carries the chunk as a JSON
+  // string, so escaping (\" for every quote) makes the body file run ~8%
+  // larger than the raw budget. The sizing rule above is stated on the raw
+  // artifact and parts are never uploaded, so no cap check belongs here.
+  const chunks = [];
+  for (let cursor = 0; cursor < json.length; cursor += partBytes) {
+    chunks.push(json.slice(cursor, cursor + partBytes));
+  }
+  const parts = chunks.map((chunk, index) => ({
+    file: productionSemanticRoutingPartFileName(index, header.generation),
+    body: JSON.stringify(Object.assign({}, header, { part: index + 1, parts: chunks.length, chunk }))
+  }));
+  const pointer = {
+    schemaVersion: header.schemaVersion,
+    persistenceSchemaVersion: header.persistenceSchemaVersion,
+    generation: header.generation,
+    integrityHash: header.integrityHash,
+    length: json.length,
+    parts: parts.length,
+    files: parts.map((part) => part.file)
+  };
+  return { parts, pointer: { file: LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE, body: JSON.stringify(pointer) } };
+}
+
+// Cooperative mirror of serializeProductionSemanticRoutingArtifact + parts: the
+// same artifact bytes (base64 data, field JSON, integrity hash, split parts and
+// pointer), assembled in ~8 ms slices. The artifact JSON text is assembled from
+// the same per-field JSON.stringify texts the integrity hash folds, so the
+// persisted bytes are identical to the synchronous path.
+async function serializeProductionSemanticRoutingArtifactCooperative(state = {}, options = {}, slice) {
+  const index = state.routingIndex;
+  if (!index || typeof index !== "object") throw localSemanticRoutingError("artifact-state-missing", "Production routing state is missing.");
+  const vectorStore = index.vectorStore || {};
+  const data = await productionSemanticRoutingBytesToBase64Cooperative(new Uint8Array(vectorStore.values.buffer, vectorStore.values.byteOffset, vectorStore.values.byteLength), slice);
+  const artifact = {
+    schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
+    persistenceSchemaVersion: LOCAL_SEMANTIC_ROUTING_PERSISTENCE_SCHEMA_VERSION,
+    provider: String(options.provider || String(index.encoder?.id || "").split(":")[1] || ""),
+    model: String(options.model || String(index.encoder?.id || "").split(":").slice(2).join(":") || ""),
+    dimension: Number(index.encoder?.dimension || vectorStore.dimension || 0),
+    contentVersion: index.encoder?.version,
+    indexRevision: Number(options.revision || state.telemetry?.revision || 0),
+    storageFingerprint: String(options.storageFingerprint || state.telemetry?.storageFingerprint || ""),
+    generation: String(index.generation || ""),
+    count: Number(index.count || 0),
+    evidenceIds: Array.from(index.evidenceIds || []),
+    sourceIds: Array.from(index.sourceIds || []),
+    shardRefs: Array.from(index.shardRefs || []),
+    scopeRefs: Array.from(index.scopeRefs || [], (value) => Array.from(value || [])),
+    taskRefs: Array.from(index.taskRefs || [], (value) => Array.from(value || [])),
+    temporalMetadata: Array.from(index.temporalMetadata || []),
+    routingMetadata: Array.from(index.routingMetadata || []),
+    vectorStore: {
+      format: vectorStore.format,
+      scale: Number(vectorStore.scale),
+      dimension: Number(vectorStore.dimension),
+      count: Number(vectorStore.count),
+      encoding: "base64",
+      data
+    }
+  };
+  const arrayTexts = {};
+  for (const key of ["evidenceIds", "sourceIds", "shardRefs", "scopeRefs", "taskRefs", "temporalMetadata", "routingMetadata"]) {
+    arrayTexts[key] = await productionSemanticRoutingJsonArrayCooperative(artifact[key], slice);
+  }
+  const vectorStoreText = `{${[
+    ["format", artifact.vectorStore.format],
+    ["scale", artifact.vectorStore.scale],
+    ["dimension", artifact.vectorStore.dimension],
+    ["count", artifact.vectorStore.count],
+    ["encoding", artifact.vectorStore.encoding]
+  ].filter(([, value]) => value !== undefined).map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`).join(",")},"data":${JSON.stringify(data)}}`;
+  const scalar = (value) => JSON.stringify(value);
+  const fieldEntries = [
+    ["schemaVersion", scalar(artifact.schemaVersion)],
+    ["persistenceSchemaVersion", scalar(artifact.persistenceSchemaVersion)],
+    ["provider", scalar(artifact.provider)],
+    ["model", scalar(artifact.model)],
+    ["dimension", scalar(artifact.dimension)],
+    ["contentVersion", scalar(artifact.contentVersion)],
+    ["indexRevision", scalar(artifact.indexRevision)],
+    ["storageFingerprint", scalar(artifact.storageFingerprint)],
+    ["generation", scalar(artifact.generation)],
+    ["count", scalar(artifact.count)],
+    ["evidenceIds", arrayTexts.evidenceIds],
+    ["sourceIds", arrayTexts.sourceIds],
+    ["shardRefs", arrayTexts.shardRefs],
+    ["scopeRefs", arrayTexts.scopeRefs],
+    ["taskRefs", arrayTexts.taskRefs],
+    ["temporalMetadata", arrayTexts.temporalMetadata],
+    ["routingMetadata", arrayTexts.routingMetadata],
+    ["vectorStore", vectorStoreText]
+  ].filter(([, text]) => text !== undefined);
+  const jsonWithoutIntegrityHash = `{${fieldEntries.map(([key, text]) => `${JSON.stringify(key)}:${text}`).join(",")}}`;
+  const integrityHash = fnv1aFinish16(await productionSemanticRoutingFoldCooperative(2166136261, jsonWithoutIntegrityHash, slice));
+  artifact.integrityHash = integrityHash;
+  const json = `${jsonWithoutIntegrityHash.slice(0, -1)},"integrityHash":${JSON.stringify(integrityHash)}}`;
+  return { artifact, json };
+}
+
+// Cooperative mirror of serializeProductionSemanticRoutingArtifactParts with
+// the artifact JSON supplied by the caller (already assembled cooperatively).
+async function serializeProductionSemanticRoutingArtifactPartsCooperative(artifact = {}, json = "", maxBytes, slice) {
+  const partBytes = productionSemanticRoutingPartBytes(json.length, maxBytes);
+  const header = {
+    schemaVersion: Number(artifact.schemaVersion || 0),
+    persistenceSchemaVersion: Number(artifact.persistenceSchemaVersion || 0),
+    generation: String(artifact.generation || ""),
+    integrityHash: String(artifact.integrityHash || ""),
+    length: json.length
+  };
+  const chunks = [];
+  for (let cursor = 0; cursor < json.length; cursor += partBytes) {
+    chunks.push(json.slice(cursor, cursor + partBytes));
+    await slice();
+  }
+  const parts = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    parts.push({
+      file: productionSemanticRoutingPartFileName(index, header.generation),
+      body: JSON.stringify(Object.assign({}, header, { part: index + 1, parts: chunks.length, chunk: chunks[index] }))
+    });
+    await slice();
+  }
+  const pointer = {
+    schemaVersion: header.schemaVersion,
+    persistenceSchemaVersion: header.persistenceSchemaVersion,
+    generation: header.generation,
+    integrityHash: header.integrityHash,
+    length: json.length,
+    parts: parts.length,
+    files: parts.map((part) => part.file)
+  };
+  return { parts, pointer: { file: LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE, body: JSON.stringify(pointer) } };
+}
+
+function parseProductionSemanticRoutingArtifactParts(pointer = {}, partBodies = []) {
+  const partCount = Number(pointer?.parts);
+  if (!pointer || !Number.isInteger(partCount) || partCount < 1) throw localSemanticRoutingError("artifact-pointer-invalid", "Production routing artifact pointer is malformed.");
+  const bodies = Array.isArray(partBodies) ? partBodies : [];
+  if (bodies.length !== partCount) throw localSemanticRoutingError("artifact-parts-missing", "Production routing artifact parts are incomplete.");
+  let json = "";
+  for (let index = 0; index < bodies.length; index += 1) {
+    const parsed = typeof bodies[index] === "string" ? JSON.parse(bodies[index]) : bodies[index];
+    if (!parsed || Number(parsed.part) !== index + 1 || Number(parsed.parts) !== partCount || typeof parsed.chunk !== "string") {
+      throw localSemanticRoutingError("artifact-part-invalid", "Production routing artifact part is malformed.");
+    }
+    json += parsed.chunk;
+  }
+  if (Number(pointer.length) !== json.length) throw localSemanticRoutingError("artifact-length-mismatch", "Production routing artifact length check failed.");
+  const artifact = JSON.parse(json);
+  if (String(pointer.integrityHash || "") !== String(artifact.integrityHash || "")) throw localSemanticRoutingError("artifact-integrity-failed", "Production routing artifact pointer integrity check failed.");
+  return artifact;
+}
+// Cooperative load-path variant: parts are parsed one per slice, the
+// reassembled parse stays one isolated ~25 ms unit (under the 50 ms desktop
+// budget) and the gate is consulted between slices. Byte-identical result to
+// the sync version above (the load path uses this one; the sync one stays for
+// callers that need it synchronously).
+async function parseProductionSemanticRoutingArtifactPartsCooperative(pointer = {}, partBodies = [], gate = null) {
+  const partCount = Number(pointer?.parts);
+  if (!pointer || !Number.isInteger(partCount) || partCount < 1) throw localSemanticRoutingError("artifact-pointer-invalid", "Production routing artifact pointer is malformed.");
+  const bodies = Array.isArray(partBodies) ? partBodies : [];
+  if (bodies.length !== partCount) throw localSemanticRoutingError("artifact-parts-missing", "Production routing artifact parts are incomplete.");
+  const chunks = new Array(bodies.length);
+  let totalLength = 0;
+  for (let index = 0; index < bodies.length; index += 1) {
+    const parsed = typeof bodies[index] === "string" ? JSON.parse(bodies[index]) : bodies[index];
+    if (!parsed || Number(parsed.part) !== index + 1 || Number(parsed.parts) !== partCount || typeof parsed.chunk !== "string") {
+      throw localSemanticRoutingError("artifact-part-invalid", "Production routing artifact part is malformed.");
+    }
+    chunks[index] = parsed.chunk;
+    totalLength += parsed.chunk.length;
+    await semanticIndexLoadSlicePause(gate);
+  }
+  if (Number(pointer.length) !== totalLength) throw localSemanticRoutingError("artifact-length-mismatch", "Production routing artifact length check failed.");
+  const artifact = JSON.parse(chunks.join(""));
+  // Isolate the reassembled parse: nothing else shares its macrotask, so the
+  // ~25 ms parse is the whole stretch (under the 50 ms desktop budget).
+  await semanticIndexLoadSlicePause(gate);
+  if (String(pointer.integrityHash || "") !== String(artifact.integrityHash || "")) throw localSemanticRoutingError("artifact-integrity-failed", "Production routing artifact pointer integrity check failed.");
+  return artifact;
+}
+
 function deserializeProductionSemanticRoutingArtifact(artifact = {}) {
   if (!artifact || Number(artifact.schemaVersion) !== LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION || Number(artifact.persistenceSchemaVersion) !== LOCAL_SEMANTIC_ROUTING_PERSISTENCE_SCHEMA_VERSION) throw localSemanticRoutingError("artifact-schema-mismatch", "Production routing artifact schema is unsupported.");
   if (!artifact.vectorStore || artifact.vectorStore.encoding !== "base64") throw localSemanticRoutingError("artifact-encoding-invalid", "Production routing artifact encoding is unsupported.");
@@ -1714,6 +2652,54 @@ function deserializeProductionSemanticRoutingArtifact(artifact = {}) {
   if (!index.routingMetadata.length) index.routingMetadata = Object.freeze(Array.from({ length: count }, () => Object.freeze({})));
   if (index.routingMetadata.length !== count) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact routing metadata count is invalid.");
   index.integrityHash = localSemanticRoutingIndexIntegrity(index);
+  Object.freeze(index);
+  return index;
+}
+// Cooperative load-path variant (byte-identical index): the artifact
+// integrity fold, the base64 decode, every metadata array build and the final
+// index integrity fold run in ~8 ms slices under the load gate. The sync
+// version above stays for synchronous callers; this one is the load path.
+async function cooperativeArrayFrom(source, mapper, gate = null) {
+  const list = Array.isArray(source) ? source : [];
+  const output = new Array(list.length);
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let index = 0; index < list.length; index += 1) {
+    output[index] = mapper(list[index], index);
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  return output;
+}
+async function deserializeProductionSemanticRoutingArtifactCooperative(artifact = {}, gate = null) {
+  if (!artifact || Number(artifact.schemaVersion) !== LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION || Number(artifact.persistenceSchemaVersion) !== LOCAL_SEMANTIC_ROUTING_PERSISTENCE_SCHEMA_VERSION) throw localSemanticRoutingError("artifact-schema-mismatch", "Production routing artifact schema is unsupported.");
+  if (!artifact.vectorStore || artifact.vectorStore.encoding !== "base64") throw localSemanticRoutingError("artifact-encoding-invalid", "Production routing artifact encoding is unsupported.");
+  await semanticIndexLoadSlicePause(gate);
+  if (String(artifact.integrityHash || "") !== (await productionSemanticRoutingArtifactIntegrityCooperative(artifact, gate))) throw localSemanticRoutingError("artifact-integrity-failed", "Production routing artifact integrity check failed.");
+  const count = Number(artifact.count);
+  const dimension = Number(artifact.dimension);
+  const valuesBytes = await productionSemanticRoutingBase64ToBytesCooperative(artifact.vectorStore.data, gate);
+  if (!Number.isInteger(count) || count < 0 || !Number.isInteger(dimension) || dimension < 1 || valuesBytes.length !== count * dimension) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact vector count is invalid.");
+  const index = {
+    schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
+    generation: String(artifact.generation || ""),
+    encoder: localSemanticRoutingDescriptor({ id: `indexed-routing:${String(artifact.provider || "")}:${String(artifact.model || "")}`, version: artifact.contentVersion, dimension, normalization: "l2", quantization: { type: artifact.vectorStore.format, scale: Number(artifact.vectorStore.scale) } }),
+    evidenceIds: Object.freeze(await cooperativeArrayFrom(artifact.evidenceIds, (value) => String(value), gate)),
+    sourceIds: Object.freeze(await cooperativeArrayFrom(artifact.sourceIds, (value) => String(value), gate)),
+    shardRefs: Object.freeze(await cooperativeArrayFrom(artifact.shardRefs, (value) => String(value), gate)),
+    scopeRefs: Object.freeze(await cooperativeArrayFrom(artifact.scopeRefs, (value) => Object.freeze(Array.from(value || [], String)), gate)),
+    taskRefs: Object.freeze(await cooperativeArrayFrom(artifact.taskRefs, (value) => Object.freeze(Array.from(value || [], String)), gate)),
+    temporalMetadata: Object.freeze(await cooperativeArrayFrom(artifact.temporalMetadata, (value) => localSemanticRoutingMetadata(value), gate)),
+    routingMetadata: Object.freeze(await cooperativeArrayFrom(artifact.routingMetadata, (value) => localSemanticRoutingCompactMetadata(value), gate)),
+    vectorStore: Object.freeze({ format: artifact.vectorStore.format, scale: Number(artifact.vectorStore.scale), dimension, count, values: new Int8Array(valuesBytes.buffer, valuesBytes.byteOffset, valuesBytes.byteLength) }),
+    integrityHash: "",
+    count
+  };
+  if (index.evidenceIds.length !== count || index.sourceIds.length !== count || index.shardRefs.length !== count || index.scopeRefs.length !== count || index.taskRefs.length !== count || index.temporalMetadata.length !== count) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact metadata count is invalid.");
+  if (!index.routingMetadata.length) index.routingMetadata = Object.freeze(Array.from({ length: count }, () => Object.freeze({})));
+  if (index.routingMetadata.length !== count) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact routing metadata count is invalid.");
+  index.integrityHash = await localSemanticRoutingIndexIntegrityCooperative(index, gate);
   Object.freeze(index);
   return index;
 }
@@ -2412,9 +3398,33 @@ const DEFAULT_SETTINGS = {
   indexedFolders: "",
   excludedFolders: PLUGIN_DATA_FOLDER,
   semanticIndexMeta: {},
+  semanticIndexRebuildProgress: null,
+  // Task 9: "exact" (default until Task 10 decides from measurements) keeps
+  // today's full exact scan; "routed" scores only the shards the resident
+  // router selects plus the most recent shard, then rescoring the shortlist.
+  semanticSearchMode: "exact",
   autoUpdateSemanticIndex: true,
   semanticIndexDelaySeconds: 30,
   semanticIndexShardMegabytes: 4.5,
+  // Optional System One decision model: after retrieval finalises a task's
+  // admitted rows, order the optional rows with the user's own decision-model
+  // server before the description request is built. Off by default: when
+  // disabled there are zero network calls and byte-identical behaviour.
+  // Sends task text and short note excerpts to this server; use a server on
+  // your own network. Endpoint: <url>/v1/systemone. evidenceRerankCalibration
+  // (the last Check connection / calibration summary) is persisted through the
+  // model-cache mechanism, never in data.json.
+  evidenceRerankEnabled: false,
+  evidenceRerankUrl: "",
+  evidenceRerankApiKey: "",
+  evidenceRerankMaxCandidates: 32,
+  evidenceRerankTimeoutMs: 12000,
+  evidenceRerankShowBands: true,
+  // Max efficiency (background tier): when on with the decision model, keep
+  // the 8 most relevant optional rows in full, render the next 16 as one-line
+  // background pointers, and drop the rest. Off by default (user-chosen).
+  evidenceRerankTier: false,
+  evidenceRerankCalibration: null,
   todoistInboxProjectId: "",
   todoistTaskProjectId: "",
   todoistTaskProjectName: "Inbox",
@@ -2497,7 +3507,9 @@ const DEFAULT_SETTINGS = {
   maxGeneratedMainTasks: 10,
   maxGeneratedSubtasksPerMainTask: 4,
   todoistDescriptionMaxChars: 8000,
-  taskDescriptionConcurrency: 4,
+  // Task 7 (L3): 10 tasks at 4 = 3 provider waves; at 8 = 2. Clamp 1..8 and the
+  // OpenWebUI serial carve-out (taskDescriptionConcurrencyFor) are unchanged.
+  taskDescriptionConcurrency: 8,
   emailIncludeSourceListInDescriptions: true,
   noteIncludeSourceListInDescriptions: true,
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
@@ -2551,6 +3563,7 @@ const DEFAULT_SETTINGS = {
   noteSubtaskInstructions: "Create note subtasks only for concrete steps required to complete the parent task and supported by the note or relevant ranked vault context. Do not create subtasks for background details, simple reminders, or loosely related information.",
   noteSectionTitleInstructions: "Create one Todoist section for all tasks from the same note using Notes_YY_MM_DD_Subject based on the note date and note subject.",
   noteDateInstructions: "Determine due dates and deadlines from the note's timing, urgency, complexity, workload, and any explicit dates relative to the current local planning date. Treat these estimates as planning judgments, not source facts. Avoid weekends and the holidays that apply to the user's locale. Do not add due dates to subtasks.",
+  requireModelDueDates: true,
   noteTagInstructions: "Only create Todoist labels explicitly named here. Suggested starter rule: create tasks for follow-up items and add #FollowUp. Add more label rules in plain language for your own people, teams, or projects.",
   notePriorityInstructions: "Assign priority 1 to 4 to each note-derived task and subtask from its own content, urgency, importance, and complexity, where 4 is highest priority and 1 is no priority.",
   noteDescriptionInstructions: "Write a standalone, task-specific execution brief with enough current, source-grounded note and semantic-index detail to perform the named task without reopening notes. Include intent or purpose when non-obvious, the current artifact or state, audience/reviewer/recipient needs, required sections or details, decisions, dependencies, timing, constraints, substantive review or quality criteria, and supported links/citations when available. State every materially relevant supplied fact needed to understand and action the task; do not compress away specific names, objects, amounts, dates, decisions, or criteria that the supplied evidence provides. The plugin attaches citations automatically from the returned evidence IDs; do not write numeric markers. Use direct execution guidance. Treat the active/source note as authoritative for current direction and use directly relevant current semantic-index context to enrich the brief when it materially adds useful execution detail; exclude stale, unrelated, or neighboring-task context. Never mention another, previous, next, separate, or numbered task, task order, batching, separation, or workflow mechanics. Never use sentence-leading completion/result/outcome status narration such as Completion is..., Complete when..., Done when..., Expected outcome is..., The result is..., or The immediate result is.... Do not open by naming the active note, source note title, or filename. " + TASK_DESCRIPTION_ANTI_FILLER_RULE
@@ -2584,7 +3597,10 @@ function normalizeReasoningEffort(value, fallback = DEFAULT_REASONING_EFFORT) {
 // id and `openrouter/deepseek/deepseek-v4.1-flash` all match. `-nothink`
 // variants disable reasoning and are never recommended.
 const MODEL_RECOMMENDED_REASONING_EFFORTS = Object.freeze({
-  "deepseek-v4.1-flash": "low"
+  "deepseek-v4.1-flash": "low",
+  // Live 3-note comparison: medium matched high on grounding with ~2.5x fewer reasoning
+  // tokens; max exceeded the gateway's 300 s request timeout (408) on large prompts.
+  "claude-haiku-5-5": "medium"
 });
 
 function reasoningModelLookupId(model) {
@@ -2727,9 +3743,30 @@ function liteLLMReasoningCapabilityFromRow(row) {
       .map((value) => String(value || "").trim().toLowerCase())
       .filter((value) => REASONING_CAPABILITY_EFFORT_ORDER.includes(value)))
     : [];
-  // This gateway reports no levels array; a capable model without a reported
-  // list gets the safe ladder (live-verified: low accepted on all models).
-  const efforts = levels.length ? levels.slice(0, REASONING_CAPABILITY_MAX_EFFORTS) : ["low", "medium", "high"];
+  let efforts;
+  if (levels.length) {
+    // Reported levels win; use them exactly (plus default if not present).
+    efforts = levels.slice(0, REASONING_CAPABILITY_MAX_EFFORTS);
+  } else {
+    // No reported levels: derive from explicit gateway support flags.
+    // Start with the safe ladder, then add higher levels only when the
+    // endpoint explicitly reports support. Respect explicitly-false flags
+    // for none/minimal/low by omitting those specific levels.
+    const baseLadder = ["low", "medium", "high"];
+    // If supports_low_reasoning_effort is explicitly false, remove "low".
+    // medium/high have no dedicated flags and remain in the ladder.
+    if (info.supports_low_reasoning_effort === false) {
+      const idx = baseLadder.indexOf("low");
+      if (idx >= 0) baseLadder.splice(idx, 1);
+    }
+    // Add higher levels only when explicitly true.
+    if (info.supports_xhigh_reasoning_effort === true) baseLadder.push("xhigh");
+    if (info.supports_max_reasoning_effort === true) baseLadder.push("max");
+    // Note: supports_none_reasoning_effort and supports_minimal_reasoning_effort
+    // are not in the base ladder; they would only be added if explicitly true
+    // and the model uses them, which is not the case for LiteLLM Claude models.
+    efforts = baseLadder.slice(0, REASONING_CAPABILITY_MAX_EFFORTS);
+  }
   const defaultEffort = String(info.default_reasoning_effort || "").trim().toLowerCase();
   if (defaultEffort && REASONING_CAPABILITY_EFFORT_ORDER.includes(defaultEffort) && !efforts.includes(defaultEffort)) {
     efforts.push(defaultEffort);
@@ -2888,6 +3925,10 @@ function modelReasoningConfig(model, configuredEffort, provider = "", capabiliti
   if (effort === DEFAULT_REASONING_EFFORT || !supportedReasoningEffortsForModel(model, provider, capabilities).includes(effort)) return {};
   if (usesOpenAIChatModel(model)) return { openai: { effort } };
   if (isGemini3ReasoningModel(model)) return { gemini: { thinkingLevel: effort } };
+  // Models without a static rule (for example Claude behind an OpenAI-compatible gateway): send the
+  // standard flat effort ONLY when the endpoint's own capability record lists this effort. The
+  // options shown and the value sent come from the same resolver; no record means nothing is sent.
+  if (stableSupportedProvider(provider, "") === "customopenai" && modelReasoningCapabilityEfforts(provider, model, capabilities)?.includes(effort)) return { openai: { effort } };
   return {};
 }
 
@@ -2988,7 +4029,7 @@ const TASK_GENERATION_PROMPT_PROFILE_NAMES = Object.freeze({
   "gpt-5.6-terra": "GPT 5.6 Terra"
 });
 const TASK_GENERATION_SHARED_TASK_GUIDANCE = "Task titles must be clear, standalone, and specific. Include the named artifact, program, or purpose when exact-scope evidence supports it. Use a listed ref only when it supports the task as titled; never cite a ref for content it does not contain; using fewer refs is fine.";
-const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = "Descriptions must be complete and bounded by the task row refs. Do not open by repeating or paraphrasing the title. State every must ref. Other listed refs are candidates, not obligations: they are listed most relevant first; use one only when it helps the reader perform the task as titled; ignore refs about other activities, general process or background that only share a topic keyword, and skip refs that are superseded or stale. Cite a ref if and only if a sentence uses it; never cite to cover; using fewer refs is fine.";
+const TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE = "Descriptions must be complete and bounded by the task row refs. Do not open by repeating or paraphrasing the title. State every must ref. Other listed refs are candidates, not obligations: they are listed most relevant first; use one only when it helps the reader perform the task as titled; ignore refs about other activities, general process or background that only share a topic keyword, and skip refs that are superseded or stale. Cite a ref if and only if a sentence uses it; never cite to cover; using fewer refs is fine. Explain what this task is for, why it matters now and what is needed to act, in your own words, as a knowledgeable colleague would; state criteria, people, dates and dependencies plainly; do not quote or closely copy source sentences; combine related evidence into one clear explanation; if evidence conflicts, the newer and the current note win.";
 const TASK_GENERATION_PROMPT_PROFILE_GUIDANCE = Object.freeze({
   "default": Object.freeze({ taskGuidance: TASK_GENERATION_SHARED_TASK_GUIDANCE, descriptionGuidance: TASK_GENERATION_SHARED_DESCRIPTION_GUIDANCE }),
   "gpt-5.6-luna": Object.freeze({
@@ -3050,7 +4091,7 @@ function taskWorkflowSystemInstruction() {
     "Resolve relative source terms such as today or tomorrow only from authoritative source note/date metadata in the workflow context when that source date is established. If no authoritative source date is established, preserve the source phrase; never resolve source-relative terms from the current local planning date or execution date, and never invent a source date.",
     "Copy every supplied scope_id exactly and cite only refs from the task's own row; never reuse refs from another task, note, or request.",
     "In description phases, state every must ref in a natural execution sentence, using separate sentences when must refs add distinct current-state, history, criteria, or dependency content. Label a line as history only when its time is history, not merely because its timestamp is old, and preserve current direction. Never cite a ref without stating its supported content. Description_sentences[].text is prose-only and must not contain numeric citation markers; each sentence carries refs for the lines it states, and the plugin renders citations locally.",
-    "Use another listed ref only when it helps perform the task as titled: organization, expectations, history, people, decisions, dates. Cite it in that sentence's refs; using fewer refs is fine. Ignore refs about other activities or background that only share a topic keyword, and skip refs that are unrelated, superseded or stale.",
+    "Use another listed ref only when it helps perform the task as titled: organization, expectations, history, people, decisions, dates. Cite it in that sentence's refs; using fewer refs is fine. Ignore refs about other activities or background that only share a topic keyword, and skip refs that are unrelated, superseded or stale. Explain what this task is for, why it matters now and what is needed to act, in your own words, as a knowledgeable colleague would; state criteria, people, dates and dependencies plainly; do not quote or closely copy source sentences; combine related evidence into one clear explanation; if evidence conflicts, the newer and the current note win.",
     TASK_DESCRIPTION_SEMANTIC_DISAMBIGUATION_RULE
   ].join(" ");
 }
@@ -3213,8 +4254,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // Split persistence: the activity log and the regenerable provider model
     // caches live in their own plugin-folder files. Legacy copies inside
     // data.json are dropped by the next settings write.
-    this._settingsSplitMigrationPending = settingsRequireSplitMigration(loadedData);
+    this._settingsSplitMigrationPending = settingsRequireSplitMigration(loadedData) || settingsRequireDeviceStateMigration(loadedData);
     await this.loadSplitPersistenceFiles();
+    // Per-device stores: legacy copies inside data.json are read once here and
+    // stripped by the next settings write (the migration flag above).
+    await this.loadDeviceStatePersistence();
+    this.runtimeStateSaveTimer = null;
+    this._runtimeStateDirty = false;
+    this._deviceStateFileDirty = false;
     // Settings write gate baseline: adopt the loaded content so the first idle
     // save after load is skipped when nothing changed.
     this._lastSettingsSerialized = this.settingsPersistenceSnapshot().serialized;
@@ -3224,10 +4271,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.semanticRoutingRouteCache = new Map();
     this.semanticExactScoreCache = new Map();
     this._semanticExactScoreCacheTimestamps = new Map();
+    // Task 3(b): per-task description-phase intermediates (shared evidence
+    // payloads) released via releaseTaskIntermediates once the task's
+    // description request is dispatched and its recovery data is unneeded.
+    this._taskIntermediateByKey = new Map();
     this.taskDeduplicationEmbeddingCache = new Map();
     this._taskDeduplicationEmbeddingCacheTimestamps = new Map();
     this.semanticIndexRevision = 0;
     this.lastSemanticRetrievalTelemetry = null;
+    this.evidenceRerankTelemetry = { used: false, reason: "disabled" };
+    this._evidenceRerankHealth = new Map();
     this.semanticChunkTermCache = new Map();
     this.semanticIndexPathMeta = new Map();
     this.semanticIndexKnownShardFiles = [];
@@ -3472,6 +4525,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.workflowActivities = {};
     await this.flushTaskReferenceSnapshotIfDirty().catch((error) => console.error("Task reference snapshot flush failed", error));
     await this.flushSchedulerMemoryIfDirty().catch((error) => console.error("Scheduler memory flush failed", error));
+    await this.flushRuntimeStateIfDirty().catch((error) => console.error("Runtime state flush failed", error));
     await this.flushActivityLogIfDirty().catch((error) => console.error("Activity log flush failed", error));
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
@@ -3506,12 +4560,140 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  deviceStateStorageAvailable() {
+    return typeof this.app?.saveLocalStorage === "function" && typeof this.app?.loadLocalStorage === "function";
+  }
+
+  deviceStateValues(keys) {
+    const data = { schemaVersion: DEVICE_STATE_SCHEMA_VERSION };
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(this.settings, key)) data[key] = this.settings[key];
+    }
+    return data;
+  }
+
+  // Fixed key order keeps compare-before-write meaningful across sessions.
+  deviceStatePersistenceSnapshot() {
+    return {
+      small: JSON.stringify(this.deviceStateValues(DEVICE_STATE_SETTINGS_KEYS)),
+      runtime: JSON.stringify(this.deviceStateValues(RUNTIME_STATE_SETTINGS_KEYS))
+    };
+  }
+
+  // Restore the per-device stores into the in-memory settings object. A missing
+  // store is a first run for those keys: they keep whatever data.json carried
+  // (legacy migration) or the defaults, and the next persist creates the store.
+  async loadDeviceStatePersistence() {
+    let small = null;
+    if (this.deviceStateStorageAvailable()) {
+      try {
+        const raw = this.app.loadLocalStorage(DEVICE_STATE_STORAGE_KEY);
+        if (typeof raw === "string" && raw) small = JSON.parse(raw);
+      } catch { small = null; }
+    }
+    if (!small || typeof small !== "object" || Array.isArray(small)) {
+      const fallback = await this.readPluginJsonFile(DEVICE_STATE_FILE);
+      small = fallback && typeof fallback === "object" && !Array.isArray(fallback) ? fallback : null;
+    }
+    const runtime = await this.readPluginJsonFile(RUNTIME_STATE_FILE);
+    if (small) {
+      for (const key of DEVICE_STATE_SETTINGS_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(small, key)) this.settings[key] = small[key];
+      }
+      this._lastDeviceStateSerialized = JSON.stringify(this.deviceStateValues(DEVICE_STATE_SETTINGS_KEYS));
+    }
+    if (runtime && typeof runtime === "object" && !Array.isArray(runtime)) {
+      for (const key of RUNTIME_STATE_SETTINGS_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(runtime, key)) this.settings[key] = runtime[key];
+      }
+      this._lastRuntimeStateSerialized = JSON.stringify(this.deviceStateValues(RUNTIME_STATE_SETTINGS_KEYS));
+    }
+  }
+
+  // Compare-before-write. The small store lands in vault-scoped local storage
+  // (sync, tiny, never synced) when available, else through the debounced file
+  // path below. The larger store always debounces (>= 30 s trailing) and is
+  // flushed on unload.
+  async persistDeviceStateIfChanged() {
+    const { small, runtime } = this.deviceStatePersistenceSnapshot();
+    let changed = false;
+    if (this._lastDeviceStateSerialized !== small) {
+      changed = true;
+      let persisted = false;
+      if (this.deviceStateStorageAvailable()) {
+        try {
+          this.app.saveLocalStorage(DEVICE_STATE_STORAGE_KEY, small);
+          this._lastDeviceStateSerialized = small;
+          persisted = true;
+        } catch (error) {
+          console.error("Device state local storage save failed; falling back to file", error);
+        }
+      }
+      if (!persisted) {
+        // Durable immediately: fail-closed callers (email failure holds) rely
+        // on a throw here when the store cannot be persisted.
+        await this.app.vault.adapter.write(`${this.manifest.dir}/${DEVICE_STATE_FILE}`, small);
+        this._lastDeviceStateSerialized = small;
+      }
+    }
+    if (this._lastRuntimeStateSerialized !== runtime) {
+      changed = true;
+      this._runtimeStateDirty = true;
+    }
+    if ((this._deviceStateFileDirty || this._runtimeStateDirty) && !this.runtimeStateSaveTimer) {
+      this.runtimeStateSaveTimer = window.setTimeout(() => {
+        this.runtimeStateSaveTimer = null;
+        this.flushRuntimeStateIfDirty().catch((error) => console.error("Runtime state save failed", error));
+      }, RUNTIME_STATE_SAVE_DELAY_MS);
+    }
+    return changed;
+  }
+
+  async flushRuntimeStateIfDirty() {
+    window.clearTimeout(this.runtimeStateSaveTimer);
+    this.runtimeStateSaveTimer = null;
+    const adapter = this.app?.vault?.adapter;
+    if (!adapter?.write) return false;
+    const { small, runtime } = this.deviceStatePersistenceSnapshot();
+    let wrote = false;
+    if (this._deviceStateFileDirty && this._lastDeviceStateSerialized !== small) {
+      await adapter.write(`${this.manifest.dir}/${DEVICE_STATE_FILE}`, small);
+      this._lastDeviceStateSerialized = small;
+      wrote = true;
+    }
+    this._deviceStateFileDirty = false;
+    if (this._runtimeStateDirty && this._lastRuntimeStateSerialized !== runtime) {
+      const path = `${this.manifest.dir}/${RUNTIME_STATE_FILE}`;
+      await adapter.write(path, runtime);
+      if (typeof adapter.read === "function") {
+        const readBack = await adapter.read(path);
+        if (shortHash(readBack) !== shortHash(runtime)) throw new Error("Runtime state verification failed.");
+      }
+      this._lastRuntimeStateSerialized = runtime;
+      wrote = true;
+    }
+    this._runtimeStateDirty = false;
+    return wrote;
+  }
+
   settingsPersistenceSnapshot(options = {}) {
     const payload = settingsWithoutTaskReferenceTables(this.settings, options);
-    // lastNoteAutoSyncAt is volatile scheduling bookkeeping: excluding it keeps
-    // a timestamp-only change from triggering a rewrite, and the current value
-    // rides along with the next real save.
-    const serialized = JSON.stringify(payload, (key, value) => (key === "lastNoteAutoSyncAt" ? "" : value));
+    // Volatile scheduling bookkeeping: excluding it keeps a timestamp/status
+    // change from triggering a rewrite, and the current value rides along with
+    // the next real save. `lastReferenceRebuildFingerprint` stays compared: it
+    // is the coarse state a restart needs to suppress an unchanged rebuild.
+    const volatileBookkeepingKeys = ["lastNoteAutoSyncAt", "lastEmailPollAt", "lastReferenceRebuildAt", "lastReferenceRebuildAttemptAt", "lastReferenceRebuildState", "lastReferenceRebuildReason", "lastReferenceRebuildCandidateCount"];
+    // The snapshot meta timestamp is flush bookkeeping too: the generation
+    // manifest carries its own publishedAt, so a new updatedAt must not make
+    // the payload look changed. The real value still rides along with the next
+    // genuine save.
+    let comparisonPayload = payload;
+    if (payload.taskReferenceSnapshotMeta && typeof payload.taskReferenceSnapshotMeta === "object") {
+      const comparisonMeta = Object.assign({}, payload.taskReferenceSnapshotMeta);
+      delete comparisonMeta.updatedAt;
+      comparisonPayload = Object.assign({}, payload, { taskReferenceSnapshotMeta: comparisonMeta });
+    }
+    const serialized = JSON.stringify(comparisonPayload, (key, value) => (volatileBookkeepingKeys.includes(key) ? "" : value));
     return { payload, serialized };
   }
 
@@ -3542,6 +4724,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     // The cache file is written first: data.json stops carrying those keys
     // below, so the cache must be durable before the settings copy goes away.
     const modelCacheStatus = await this.persistModelCacheIfChanged();
+    // Per-device state syncs on every persist attempt, independent of the
+    // data.json byte comparison: its changes never rewrite the synced file.
+    // Failures propagate (fail-closed): email failure holds rely on the throw.
+    await this.persistDeviceStateIfChanged();
     const { payload, serialized } = this.settingsPersistenceSnapshot({ includeModelCache: modelCacheStatus === "failed" });
     if (this._lastSettingsSerialized === undefined) this._lastSettingsSerialized = serialized;
     if (this._lastSettingsSerialized === serialized && !this._settingsSplitMigrationPending) return false;
@@ -3583,6 +4769,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       const parsed = JSON.parse(raw || "{}");
       this.schedulerMemory = normalizeSchedulerMemory(parsed);
       this.schedulerMemoryDirty = false;
+      // Seed the compare-before-write baseline from the loaded content so an
+      // unchanged flush (a marked-dirty no-op) never rewrites the file.
+      const comparable = Object.assign({}, compactSchedulerMemory(this.schedulerMemory));
+      delete comparable.updatedAt;
+      this._lastSchedulerMemorySerialized = JSON.stringify(comparable);
       const policies = Array.isArray(parsed?.durationPolicies) ? parsed.durationPolicies : [];
       const hasCanonicalPolicy = policies.some((policy) => policy?.id === SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ID);
       const hasLegacyPolicy = policies.some((policy) => SCHEDULER_PEOPLE_FOLLOWUP_POLICY_ALIASES.includes(policy?.id));
@@ -3608,8 +4799,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     window.clearTimeout(this.schedulerMemorySaveTimer);
     this.schedulerMemorySaveTimer = null;
     const compact = compactSchedulerMemory(this.schedulerMemory);
+    // Compare before write: a flush carrying no change beyond the derived
+    // timestamp must not rewrite the synced scheduler memory file.
+    const comparable = Object.assign({}, compact);
+    delete comparable.updatedAt;
+    const serialized = JSON.stringify(comparable);
+    if (this._lastSchedulerMemorySerialized === serialized) {
+      this.schedulerMemory = compact;
+      this.schedulerMemoryDirty = false;
+      return false;
+    }
     compact.updatedAt = deviceTimestamp();
     await this.app.vault.adapter.write(`${this.manifest.dir}/${SCHEDULER_MEMORY_FILE}`, JSON.stringify(compact));
+    this._lastSchedulerMemorySerialized = serialized;
     this.schedulerMemory = compact;
     this.schedulerMemoryDirty = false;
     return true;
@@ -4243,6 +5445,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (this.taskReferenceSnapshotFlushPromise === flushSequence) this.taskReferenceSnapshotFlushPromise = null;
       this.taskReferenceSnapshotFlushAgain = false;
       if (error) throw error;
+      // A flushed pass rewrote taskReferenceSnapshotMeta (per-device): keep the
+      // device store current even when no saveSettings follows the flush.
+      if (result) await this.persistDeviceStateIfChanged().catch((error) => console.error("Device state save failed", error));
       return result;
     })();
     this.taskReferenceSnapshotFlushPromise = flushSequence;
@@ -4995,6 +6200,16 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }
   }
 
+  // Load-path cooperative slices ask this gate before continuing. A deferred
+  // (background) load pauses while the app is busy so user work never queues
+  // behind the load; a forced load (a caller is already awaiting it) must
+  // never wait on the gate or the caller and the load would deadlock.
+  semanticIndexLoadCooperativeGate() {
+    if (!this.semanticIndexLoadInProgress) return true;
+    if (this.semanticIndexPendingLoadMode === "forced") return true;
+    return this.canStartBackgroundWork();
+  }
+
   async loadSemanticIndexInternal() {
     this.semanticIndexLoadInProgress = true;
     this.refreshSidebarStatus();
@@ -5052,16 +6267,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const parsed = loaded.parsed || {};
         this.setSidebarStatus("Preparing semantic index...");
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-        this.semanticIndex = normalizeSemanticIndexPaths(loaded.chunks || [], this.app, this.semanticIndexRevision)
-          .map((chunk) => {
-            const pathMissing = chunk?.path && semanticChunkSourceKind(chunk) === "note" && !(this.app.vault.getAbstractFileByPath?.(chunk.path) instanceof TFile);
-            if (isLegacyGroupedTaskReferenceChunk(chunk) || pathMissing) {
-              return Object.assign({}, chunk, { stale: true, indexMetadata: Object.assign({}, chunk.indexMetadata || {}, { stale: true, quarantineReason: pathMissing ? "stale-note-path" : "legacy-grouped-task-reference" }) });
-            }
-            return chunk;
-          });
+        const loadGate = () => this.semanticIndexLoadCooperativeGate();
+        this.semanticIndex = await normalizeSemanticIndexPathsCooperative(loaded.chunks || [], this.app, this.semanticIndexRevision, loadGate);
+        this.semanticIndex = await markStaleSemanticIndexChunksCooperative(this.semanticIndex, this.app, loadGate);
         this.invalidateSemanticRetrievalCache();
-        const loadedDimension = Number(parsed.meta?.dimension || this.semanticIndex.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
+        const loadedDimension = Number(parsed.meta?.dimension || this.semanticIndex.find((chunk) => isEmbeddingVector(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
         const compatibility = semanticEmbeddingIndexCompatibility(this.settings, Object.assign({}, parsed.meta || {}, { dimension: loadedDimension }));
         const nextMeta = Object.assign({}, parsed.meta || {}, extraMeta, {
           chunks: this.semanticIndex.length,
@@ -5428,6 +6638,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   }
 
   async loadSemanticIndexPathMetaSnapshot() {
+    // The KG-TASK5 series-graph sidecar is no longer read or written; delete a
+    // stale semantic-index-graph.json if present so it does not linger in the
+    // vault or Sync. Best-effort only.
+    try {
+      const adapter = this.app.vault.adapter;
+      const staleGraphPath = `${this.manifest.dir}/semantic-index-graph.json`;
+      const canRemove = adapter && typeof adapter.exists === "function" && typeof adapter.remove === "function";
+      if (canRemove && await adapter.exists(staleGraphPath)) await adapter.remove(staleGraphPath);
+    } catch {}
     this.updateSemanticIndexLoadTelemetry({
       pathMetaAttempted: true,
       pathMetaReads: Number(this.semanticIndexLoadTelemetry?.pathMetaReads || 0) + 1
@@ -5491,6 +6710,28 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     if (this.semanticIndexPathMetaSnapshotFingerprint === metaFingerprint) return;
     const adapter = this.app.vault.adapter;
+    // Compare-before-write: when the fingerprint was never established (a load
+    // that rejected the on-disk copy) but the on-disk body already equals what
+    // would be written, adopt the fingerprint and skip the rewrite (and the
+    // graph). savedAt is flush bookkeeping, like updatedAt in the stores.
+    if (typeof adapter.read === "function") {
+      try {
+        const onDiskRaw = await adapter.read(`${this.manifest.dir}/${SEMANTIC_INDEX_PATH_META_FILE}`);
+        if (onDiskRaw) {
+          const comparableBody = (raw) => {
+            const parsedBody = JSON.parse(raw);
+            if (!parsedBody || typeof parsedBody !== "object") return "";
+            const copy = Object.assign({}, parsedBody);
+            delete copy.savedAt;
+            return JSON.stringify(copy);
+          };
+          if (comparableBody(onDiskRaw) === comparableBody(body)) {
+            this.semanticIndexPathMetaSnapshotFingerprint = metaFingerprint;
+            return;
+          }
+        }
+      } catch {}
+    }
     const committedPathMetaFile = semanticMeta.generation
       ? semanticIndexPathMetaGenerationFile(semanticMeta.generation)
       : "";
@@ -5563,6 +6804,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         largestBytes
       });
       const shardReads = [];
+      const shardBinFiles = [];
       for (let index = 0; index < shardFiles.length; index += 1) {
         const shardFile = shardFiles[index];
         this.setSidebarStatus(`Loading semantic index shard ${index + 1}/${shardFiles.length}...`);
@@ -5575,15 +6817,43 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (Number(shardMeta?.bytes || 0) > 0 && Number(shardMeta.bytes) !== shardBytes) throw new Error(`Semantic-index shard byte count mismatch: ${shardFile}`);
         const shardParsed = JSON.parse(shardRaw);
         semanticIndexShardValidation(shardParsed, manifestMeta, shardMeta);
-        shardReads[index] = { file: shardFile, hash: shortHash(shardRaw), bytes: shardBytes, parsed: shardParsed };
+        // Task 9: a sidecar with a `vectors` link streams its `.bin` payload
+        // through readBinary straight into typed arrays (one shard live);
+        // legacy JSON shards carry embeddings inline and stay readable until
+        // the next save/rebuild replaces them.
+        let shardBinBytes = 0;
+        let shardBinFile = "";
+        let shardHash = shortHash(shardRaw);
+        if (shardParsed?.vectors?.file) {
+          const binFile = String(shardParsed.vectors.file);
+          shardBinFile = binFile;
+          if (String(shardMeta?.bin || "") !== binFile) throw new Error(`Semantic-index shard binary link mismatch: ${shardFile}`);
+          if (typeof this.app.vault.adapter.readBinary !== "function") throw new Error(`Semantic-index binary shard requires readBinary support: ${binFile}`);
+          const binBuffer = await this.app.vault.adapter.readBinary(`${this.manifest.dir}/${binFile}`);
+          const binBytes = Number(binBuffer?.byteLength || 0);
+          if (Number(shardParsed.vectors.byteLength || 0) > 0 && Number(shardParsed.vectors.byteLength) !== binBytes) throw new Error(`Semantic-index binary shard byte count mismatch: ${binFile}`);
+          shardParsed.chunks = semanticIndexShardBinaryDecodeChunks(shardParsed, binBuffer);
+          shardBinBytes = binBytes;
+          shardHash = shortHash(`${shardHash}|${semanticIndexBinaryShortHash(new Uint8Array(binBuffer))}`);
+        }
+        // A recorded content hash (written by the incremental save) must match
+        // the bytes on disk; a mismatch means the referenced shard was altered
+        // after the manifest committed it.
+        if (String(shardMeta?.hash || "") && String(shardMeta.hash) !== shardHash) {
+          throw new Error(`Semantic-index shard hash mismatch: ${shardFile}`);
+        }
+        shardReads[index] = { file: shardFile, hash: shardHash, bytes: shardBytes + shardBinBytes, parsed: shardParsed };
+        shardBinFiles[index] = shardBinFile;
+        const shardTotalBytes = shardBytes + shardBinBytes;
         this.updateSemanticIndexLoadTelemetry({
           shardsLoaded: index + 1,
-          totalBytes: Number(this.semanticIndexLoadTelemetry?.totalBytes || 0) + shardBytes,
-          largestBytes: Math.max(Number(this.semanticIndexLoadTelemetry?.largestBytes || 0), shardBytes)
+          totalBytes: Number(this.semanticIndexLoadTelemetry?.totalBytes || 0) + shardTotalBytes,
+          largestBytes: Math.max(Number(this.semanticIndexLoadTelemetry?.largestBytes || 0), shardTotalBytes)
         });
         this.recordSemanticIndexLoadYield();
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       }
+      this.semanticIndexShardBinaryFiles = shardBinFiles.length && shardBinFiles.every(Boolean) ? shardBinFiles.slice() : null;
       for (const shard of shardReads) {
         const shardFile = shard.file || shard.path || "";
         if (!shardFile) continue;
@@ -5682,9 +6952,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this._markSemanticIndexPersistencePhase(tracker, "prepare", "deferred", "empty-index-deferred");
       return semanticOperationResult({ ok: false, reasonCode: "empty-index-deferred" });
     }
-    const activeDimension = Number(candidateChunks.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
+    const activeDimension = Number(candidateChunks.find((chunk) => isEmbeddingVector(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0);
     const targetDimension = semanticEmbeddingTargetDimension(this.settings);
-    if (candidateChunks.some((chunk) => !Array.isArray(chunk?.embedding) || !chunk.embedding.length)) {
+    if (candidateChunks.some((chunk) => !isEmbeddingVector(chunk?.embedding) || !chunk.embedding.length)) {
       throw new Error("Semantic-index save rejected empty embedding vectors.");
     }
     if (activeDimension && targetDimension && activeDimension !== targetDimension) {
@@ -5729,26 +6999,52 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const generation = semanticIndexGenerationToken(seed, 0);
     const generationMeta = Object.assign({}, meta, { generation, chunks: candidateChunks.length });
     this._markSemanticIndexPersistencePhase(tracker, "shard-build", "running", "shard-build");
-    const shards = await semanticIndexShardBodiesAsync(indexFile, generationMeta, candidateChunks, semanticIndexShardMaxBytes(this.settings), generation);
+    const adapter = this.app.vault.adapter;
+    const manifestPath = `${this.manifest.dir}/${indexFile}`;
+    let previousManifestBody = null;
+    if (typeof adapter.read === "function") {
+      try { previousManifestBody = await adapter.read(manifestPath); } catch {}
+    }
+    let previousManifest = null;
+    if (previousManifestBody) {
+      try { previousManifest = JSON.parse(previousManifestBody); } catch { previousManifest = null; }
+    }
+    const stablePlan = Array.isArray(options.previousIndex)
+      ? await semanticIndexStableShardPlanAsync(indexFile, generationMeta, options.previousIndex, candidateChunks, previousManifest, generation, semanticIndexShardMaxBytes(this.settings))
+      : null;
+    const shards = stablePlan
+      ? stablePlan.shards
+      : await semanticIndexShardBinaryBodiesAsync(indexFile, generationMeta, candidateChunks, semanticIndexShardMaxBytes(this.settings), generation);
     if (tracker && typeof tracker === "object") tracker.shardCount = shards.length;
     const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
+    const shardBinBytes = shards.reduce((sum, shard) => sum + shard.binBytes, 0);
     const stagePathMetaFile = semanticIndexPathMetaGenerationFile(generation);
     const manifest = {
       meta: Object.assign({}, generationMeta, {
         chunks: candidateChunks.length,
         shardCount: shards.length,
         shardBytes,
+        shardBinBytes,
+        shardFormat: SEMANTIC_INDEX_SHARD_BINARY_FORMAT,
         pathMetaFile: stagePathMetaFile,
         pathMetaGeneration: generation
       }),
       shards: shards.map((shard, index) => ({
         file: shard.file,
+        bin: shard.binFile,
         chunks: shard.chunkCount,
         bytes: shard.bytes,
-        index
+        binBytes: shard.binBytes,
+        index,
+        generation: shard.generation || generation,
+        hash: shard.hash,
+        binHash: shard.binHash,
+        payloadHash: shard.payloadHash
       }))
     };
     const shardFiles = shards.map((shard) => shard.file);
+    const shardBinFiles = shards.map((shard) => shard.binFile);
+    const publishedShardFiles = [...shardFiles, ...shardBinFiles];
     if (!this.semanticIndexPathMeta?.size && candidateChunks.some((chunk) => chunk?.path)) await this.refreshSemanticIndexPathMetaAsync();
     const pathEntries = Array.from(this.semanticIndexPathMeta || [])
       .filter(([path]) => path)
@@ -5757,14 +7053,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     const pathMetaFingerprint = semanticIndexPathMetaFingerprintForEntries(generationMeta, pathEntries, this.settings);
     manifest.meta.pathMetaFingerprint = pathMetaFingerprint;
     const manifestBody = JSON.stringify(manifest);
-    const storageFingerprint = semanticIndexStorageFingerprint(manifestBody, shards);
+    const storageFingerprint = semanticIndexStorageFingerprint(manifestBody, shards.map((shard) => ({
+      file: shard.file,
+      bytes: shard.bytes + shard.binBytes,
+      hash: shard.hash
+    })));
     const manifestBytes = utf8ByteLength(manifestBody);
-    const totalBytes = manifestBytes + shardBytes;
+    const totalBytes = manifestBytes + shardBytes + shardBinBytes;
     const stats = {
-      bytes: Math.max(manifestBytes, ...shards.map((shard) => shard.bytes)),
+      bytes: Math.max(manifestBytes, ...shards.map((shard) => Math.max(shard.bytes, shard.binBytes))),
       totalBytes,
       path: indexFile,
-      files: shards.length + 1,
+      files: shards.length * 2 + 1,
       shards: shards.length
     };
     const pathMetaBody = JSON.stringify({
@@ -5786,14 +7086,13 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     });
     if (storageFingerprint === this.semanticIndexStorageFingerprint && this.semanticIndexPathMetaSnapshotFingerprint === pathMetaFingerprint) {
       this.semanticIndexStats = stats;
-      this.semanticIndexKnownShardFiles = shardFiles;
+      this.semanticIndexKnownShardFiles = publishedShardFiles;
       this._markSemanticIndexPersistencePhase(tracker, "routing-publication", "running", "routing-publication");
       await this.ensureProductionSemanticRoutingState({ chunks: candidateChunks, revision: this.semanticIndexRevision || 0, storageFingerprint, allowLoad: true, persist: true });
       await this.writeExternalMcpExport(false);
       this._markSemanticIndexPersistencePhase(tracker, "routing-publication", "completed", "already-persisted");
       return;
     }
-    const adapter = this.app.vault.adapter;
     const stagedFiles = [];
     const stage = async (file, body) => {
       const path = `${this.manifest.dir}/${file}`;
@@ -5804,6 +7103,19 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         if (shortHash(readBack) !== shortHash(body)) throw new Error(`Semantic-index staged file verification failed: ${file}`);
       }
     };
+    const stageBinary = async (file, bytes) => {
+      if (typeof adapter.writeBinary !== "function" || typeof adapter.readBinary !== "function") {
+        throw new Error(`Semantic-index binary shard writes require writeBinary support: ${file}`);
+      }
+      const path = `${this.manifest.dir}/${file}`;
+      await adapter.writeBinary(path, bytes.buffer ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : bytes);
+      stagedFiles.push(path);
+      const readBack = await adapter.readBinary(path);
+      const readBytes = readBack instanceof Uint8Array ? readBack : new Uint8Array(readBack || 0);
+      if (readBytes.byteLength !== bytes.byteLength || semanticIndexBinaryShortHash(readBytes) !== semanticIndexBinaryShortHash(bytes)) {
+        throw new Error(`Semantic-index staged binary verification failed: ${file}`);
+      }
+    };
     const cleanupStaged = async () => {
       const errors = [];
       for (const path of stagedFiles) {
@@ -5812,15 +7124,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (errors.length) this.lastSemanticIndexPersistenceError = { phase: "staged-cleanup", count: errors.length };
     };
     const stageManifestFile = normalizedPluginBasename(`${indexFile}.${generation}.manifest.json`);
-    const manifestPath = `${this.manifest.dir}/${indexFile}`;
-    let previousManifestBody = null;
-    let hadPreviousManifest = false;
-    if (typeof adapter.read === "function") {
-      try {
-        previousManifestBody = await adapter.read(manifestPath);
-        hadPreviousManifest = true;
-      } catch {}
-    }
+    const hadPreviousManifest = Boolean(previousManifestBody);
     const restorePreviousManifest = async () => {
       if (hadPreviousManifest) await adapter.write(manifestPath, previousManifestBody);
       else {
@@ -5829,7 +7133,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     };
     try {
       this._markSemanticIndexPersistencePhase(tracker, "stage-shards", "running", "stage-shards");
-      await asyncPool(shards, 3, async (shard) => stage(shard.file, shard.body));
+      await asyncPool(shards.filter((shard) => !shard.reused), 3, async (shard) => {
+        await stage(shard.file, shard.body);
+        await stageBinary(shard.binFile, shard.binBody);
+      });
       this._markSemanticIndexPersistencePhase(tracker, "stage-path-meta", "running", "stage-path-meta");
       await stage(stagePathMetaFile, pathMetaBody);
       semanticIndexPathMetaArtifactValidation(JSON.parse(pathMetaBody), manifest.meta, indexFile, this.settings);
@@ -5873,7 +7180,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       throw error;
     }
     this.semanticIndexStats = stats;
-    this.semanticIndexKnownShardFiles = shardFiles;
+    this.semanticIndexKnownShardFiles = publishedShardFiles;
+    this.semanticIndexShardBinaryFiles = shardBinFiles.slice();
     this.semanticIndexStorageFingerprint = storageFingerprint;
     this.semanticIndexManifestPublishedGeneration = generation;
     this._markSemanticIndexPersistencePhase(tracker, "routing-publication", "running", "routing-publication");
@@ -5885,7 +7193,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       persist: true,
       forceBuild: true
     });
-    for (const shardFile of shardFiles) {
+    for (const shardFile of publishedShardFiles) {
       const stagedShardIndex = stagedFiles.indexOf(`${this.manifest.dir}/${shardFile}`);
       if (stagedShardIndex >= 0) stagedFiles.splice(stagedShardIndex, 1);
     }
@@ -5922,7 +7230,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.logLocal("Semantic index path metadata promotion failed", { error: error?.message || String(error) });
     }
     this._markSemanticIndexPersistencePhase(tracker, "cleanup", "running", "cleanup");
-    const cleanup = await this.removeSemanticIndexShardFiles(indexFile, shardFiles);
+    const cleanup = await this.removeSemanticIndexShardFiles(indexFile, publishedShardFiles);
     if (cleanup?.errors?.length) {
       this.lastSemanticIndexPersistenceError = { phase: "old-generation-cleanup", count: cleanup.errors.length };
       this.logLocal("Semantic index old-generation cleanup incomplete", { count: cleanup.errors.length });
@@ -6015,11 +7323,21 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (!adapter?.read) return null;
     try {
       const raw = await adapter.read(this.productionSemanticRoutingArtifactPath());
-      const artifact = JSON.parse(raw || "{}");
+      const pointer = JSON.parse(raw || "{}");
+      // Task 9: the pointer file lists <= 4.5 MB parts; a legacy single-file
+      // artifact (no `files` list) is read directly and stays readable.
+      let artifact = pointer;
+      if (Array.isArray(pointer?.files) && Number(pointer.parts) > 0) {
+        const partBodies = [];
+        for (const partFile of pointer.files) {
+          partBodies.push(await adapter.read(this.productionSemanticRoutingArtifactPath(String(partFile))));
+        }
+        artifact = await parseProductionSemanticRoutingArtifactPartsCooperative(pointer, partBodies, () => this.semanticIndexLoadCooperativeGate());
+      }
       const expectedProvider = String(options.provider || semanticEmbeddingProvider(settings)).toLowerCase();
       const expectedModel = String(options.model || settings.embeddingModel || "");
       const expectedDimension = Number(options.dimension || settings.semanticIndexMeta?.dimension || semanticEmbeddingTargetDimension(settings) || 0);
-      const compatibility = productionSemanticRoutingArtifactCompatibility(artifact, chunks, settings, {
+      const compatibility = await productionSemanticRoutingArtifactCompatibility(artifact, chunks, settings, {
         generation: options.generation || settings.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "",
         provider: expectedProvider,
         model: expectedModel,
@@ -6028,7 +7346,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         revision,
         storageFingerprint,
         shardCount: options.shardCount || settings.semanticIndexMeta?.shardCount || 0
-      });
+      }, () => this.semanticIndexLoadCooperativeGate());
       if (!compatibility.compatible) {
         throw localSemanticRoutingError(compatibility.reasonCode, "Production routing artifact is incompatible with the loaded semantic index.", {
           reasonCodes: compatibility.reasonCodes,
@@ -6037,12 +7355,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
           count: compatibility.count
         });
       }
-      const routingIndex = deserializeProductionSemanticRoutingArtifact(artifact);
+      const routingIndex = await deserializeProductionSemanticRoutingArtifactCooperative(artifact, () => this.semanticIndexLoadCooperativeGate());
       const sourceChunks = chunks.filter((chunk) => chunk && typeof chunk === "object" && chunk.stale !== true && chunk.tombstoned !== true && chunk.quarantined !== true);
       if (routingIndex.count !== sourceChunks.length || routingIndex.evidenceIds.some((id, row) => String(id) !== String(sourceChunks[row]?.evidenceId || sourceChunks[row]?.id || ""))) throw localSemanticRoutingError("artifact-order-mismatch", "Production routing artifact evidence ordering does not match the semantic index.");
       const chunkByEvidenceId = new Map();
       for (let row = 0; row < sourceChunks.length; row += 1) chunkByEvidenceId.set(routingIndex.evidenceIds[row], sourceChunks[row]);
-      const handleLookup = productionSemanticRoutingHandleLookup(sourceChunks, routingIndex);
+      const handleLookup = await productionSemanticRoutingHandleLookupCooperative(sourceChunks, routingIndex, () => this.semanticIndexLoadCooperativeGate());
       const telemetry = Object.freeze({ state: "ready", coldBuild: false, loadHit: true, artifactCompatibility: "aligned", providerCalls: 0, networkCalls: 0, revision, storageFingerprint, count: routingIndex.count, dimension: routingIndex.encoder.dimension, loadElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt) });
       const state = Object.freeze({ routingIndex, chunkByEvidenceId, handleLookup, telemetry });
       this.productionSemanticRoutingState = state;
@@ -6058,19 +7376,35 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
   async persistProductionSemanticRoutingArtifact(state, options = {}) {
     if (!state?.routingIndex || !this.app?.vault?.adapter?.write) return false;
     const adapter = this.app.vault.adapter;
-    const artifact = serializeProductionSemanticRoutingArtifact(state, {
+    const slice = productionSemanticRoutingCooperativeSlicer();
+    const serialized = await serializeProductionSemanticRoutingArtifactCooperative(state, {
       provider: options.provider || semanticEmbeddingProvider(this.settings),
       model: options.model || this.settings.embeddingModel || "",
       revision: options.revision ?? this.semanticIndexRevision ?? 0,
       storageFingerprint: options.storageFingerprint ?? this.semanticIndexStorageFingerprint ?? ""
-    });
-    const body = JSON.stringify(artifact);
+    }, slice);
+    const artifact = serialized.artifact;
+    const split = await serializeProductionSemanticRoutingArtifactPartsCooperative(artifact, serialized.json, semanticIndexShardMaxBytes(this.settings), slice);
+    const body = split.pointer.body;
     const stablePath = this.productionSemanticRoutingArtifactPath();
     const stagedName = `${LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE}.${artifact.generation}.staged.json`;
     const stagedPath = this.productionSemanticRoutingArtifactPath(stagedName);
     let previousBody = null;
     try { if (adapter.read) previousBody = await adapter.read(stablePath); } catch {}
+    const writtenParts = [];
     try {
+      // 1. Parts first, each verified by reading it back: the legacy single
+      // artifact (or the previous pointer) stays untouched until every new
+      // part is on disk and readable.
+      for (const part of split.parts) {
+        const partPath = this.productionSemanticRoutingArtifactPath(part.file);
+        let existed = false;
+        try { if (typeof adapter.exists === "function") existed = await adapter.exists(partPath); } catch {}
+        await adapter.write(partPath, part.body);
+        if (adapter.read && shortHash(await adapter.read(partPath)) !== shortHash(part.body)) throw localSemanticRoutingError("artifact-write-verification-failed", `Production routing artifact part ${part.file} verification failed.`);
+        writtenParts.push({ file: part.file, existed });
+      }
+      // 2. Pointer: staged, verified, promoted over the stable name.
       await adapter.write(stagedPath, body);
       if (adapter.read && shortHash(await adapter.read(stagedPath)) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact staged verification failed.");
       if (typeof adapter.rename === "function") {
@@ -6088,10 +7422,25 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         try { await adapter.remove(stagedPath); } catch {}
       }
       if (adapter.read && shortHash(await adapter.read(stablePath)) !== shortHash(body)) throw localSemanticRoutingError("artifact-write-verification-failed", "Production routing artifact promotion verification failed.");
+      // 3. Stale parts from earlier generations go only after the new pointer
+      // is verified; parts the new pointer references are never removed.
+      try {
+        const kept = new Set(split.parts.map((part) => part.file));
+        const listed = await adapter.list(this.manifest.dir);
+        for (const candidate of listed?.files || []) {
+          const name = String(candidate).split("/").pop() || "";
+          if (!isProductionSemanticRoutingPartFile(name) || kept.has(name)) continue;
+          try { await adapter.remove(this.productionSemanticRoutingArtifactPath(name)); } catch {}
+        }
+      } catch {}
       this.productionSemanticRoutingArtifactMeta = { schemaVersion: artifact.persistenceSchemaVersion, generation: artifact.generation, count: artifact.count, integrityHash: artifact.integrityHash, revision: artifact.indexRevision, storageFingerprint: artifact.storageFingerprint };
       this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, { persistenceWrites: 1, persistenceState: "committed" });
       return true;
     } catch (error) {
+      for (const part of writtenParts) {
+        if (part.existed) continue;
+        try { await adapter.remove(this.productionSemanticRoutingArtifactPath(part.file)); } catch {}
+      }
       try {
         if (previousBody !== null) await adapter.write(stablePath, previousBody);
         else await adapter.remove(stablePath);
@@ -6207,7 +7556,24 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       return null;
     }
     try {
-      const prepared = prepareProductionSemanticRoutingState(chunks, settings, revision, storageFingerprint, options);
+      // The rebuild starts only when the app is not already busy with another
+      // background job (canStartBackgroundWork). A workflow-owned request (an
+      // active AI activity is awaiting this state) must not wait for the
+      // workflow to end, so the bounded wait is skipped there and the
+      // cooperative slices keep the UI responsive instead.
+      if (typeof this.canStartBackgroundWork === "function" && !this.canStartBackgroundWork()
+          && !(Array.isArray(this.aiActivities) && this.aiActivities.length > 0)) {
+        const busyWaitStartedAt = localSemanticRoutingNow();
+        while (typeof this.canStartBackgroundWork === "function" && !this.canStartBackgroundWork()
+            && localSemanticRoutingNow() - busyWaitStartedAt < PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_WAIT_MS) {
+          await idlePause(PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_POLL_MS);
+        }
+      }
+      const buildInvalidationSerial = Number(this.productionSemanticRoutingInvalidationSerial || 0);
+      const buildAbortCheck = () => buildInvalidationSerial !== Number(this.productionSemanticRoutingInvalidationSerial || 0)
+        || Number(this.semanticIndexRevision ?? revision) !== revision
+        || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint;
+      const prepared = await prepareProductionSemanticRoutingStateCooperative(chunks, settings, revision, storageFingerprint, Object.assign({}, options, { shouldAbort: buildAbortCheck }));
       const telemetry = Object.freeze(Object.assign({}, prepared.telemetry, { cacheHit: false, coldBuild: true, loadHit: false, artifactCompatibility: "rebuilt-local", artifactCompatibilityReason: artifactCompatibilityReason || "forced-rebuild" }));
       const state = Object.freeze(Object.assign({}, prepared, { telemetry }));
       this.productionSemanticRoutingState = state;
@@ -6525,8 +7891,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (removeCandidates) {
       await asyncPool(removeCandidates, 4, async (candidate) => {
         let name = "";
-        try { name = semanticIndexShardName(indexFile, candidate, { allowLegacy: true }); } catch { return; }
-        if (!isSemanticIndexShardFile(indexFile, name) || keep.has(name)) return;
+        try { name = semanticIndexShardName(indexFile, candidate, { allowLegacy: true }); } catch { name = ""; }
+        if (!name && isSemanticIndexShardBinaryFile(indexFile, candidate)) name = String(candidate || "").split(/[\\/]/).pop() || "";
+        if (!name || !isSemanticIndexShardFile(indexFile, name) || keep.has(name)) return;
         try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${name}`); } catch (error) { errors.push(error); }
       });
       return { errors };
@@ -7129,8 +8496,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // tick or the settlement chain.
       const saveReferenceRepairStatus = () => {
         try {
-          if (typeof this.queueSettingsSave === "function") this.queueSettingsSave();
-        } catch {}
+          // Bookkeeping-only change: the attempt/state/reason keys live in the
+          // per-device store, so persist that store; the synced data.json must
+          // not be rewritten for a bookkeeping-only change.
+          const persist = this.persistDeviceStateIfChanged();
+          if (persist && typeof persist.catch === "function") {
+            persist.catch((error) => console.error("Device state save failed", error));
+          }
+        } catch (error) {
+          console.error("Device state save failed", error);
+        }
       };
       const referenceRebuildIntervalMs = Math.max(30, Number(this.settings.referenceRebuildIntervalMinutes || 360)) * 60 * 1000;
       if (elapsedMs(this.settings.lastReferenceRebuildAttemptAt) >= referenceRebuildIntervalMs) {
@@ -7418,8 +8793,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const previousPublishedGeneration = this.semanticIndexManifestPublishedGeneration || "";
     const startedAt = Date.now();
     this.setSidebarStatus("Indexing vault...");
+    
+    // Check for existing rebuild progress (resumable rebuild)
+    const existingProgress = getSemanticIndexRebuildProgress(this.settings);
+    const isResuming = isRebuildProgressValid(existingProgress, SEMANTIC_EMBEDDING_CONTENT_VERSION);
+    this.semanticIndexRebuildStagingPending = [];
+    this.semanticIndexRebuildStagingPendingBytes = 0;
+    let chunks = [];
+    let reuseMap = new Map();
+    
     try {
-      this.logLocal("Semantic index rebuild started", { existingChunks: (previousIndex || []).length });
+      this.logLocal("Semantic index rebuild started", { existingChunks: (previousIndex || []).length, resuming: isResuming });
       this.beginWorkflowActivity("index", "Indexing vault...");
       await this.ensureCompatibleEmbeddingForChatModel();
       if (!this.semanticIndexLoaded && Number(this.settings.semanticIndexMeta?.chunks || 0) > 0) {
@@ -7432,9 +8816,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.requireAiAccess();
       const files = this.orderSemanticIndexFiles(this.getIndexableFiles());
       if (!files.length) throw new Error("No indexable Markdown notes were found. Check Indexed folders and Excluded folders in settings.");
-      const chunks = [];
+      
       const taskReferenceLocationIndex = emptyTaskReferenceLocationIndex();
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+      
+      // Fresh rebuild: read all files and create chunks (resume never trusts a
+      // persisted chunk list; only finished staging shards supply vectors).
       for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
         const file = files[fileIndex];
         if (fileIndex % SEMANTIC_INDEX_FILE_YIELD_INTERVAL === 0) {
@@ -7453,6 +8840,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", metadataOnly: selectedFileChunks.semanticMetadataOnlyFlags?.[item.sourceIndex] === true, evidenceEligibility: selectedFileChunks.semanticEvidenceEligibilities?.[item.sourceIndex] || "evidence", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
         }
       }
+      
       this.setSidebarStatus("Preparing task reference chunks...");
       await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       await this.flushTaskReferenceSnapshotIfDirty();
@@ -7468,8 +8856,23 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (!taskReferenceIntegrity.ok) throw new Error(`Task-reference integrity failed: ${taskReferenceIntegrity.reasonCodes.join(",")}`);
       this.taskReferenceIntegrity = taskReferenceIntegrity;
 
-      const reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
-      const embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks");
+      // Build the reuse map from the previous complete index plus any finished
+      // staging shards. A staging record from another content version is
+      // discarded first, so mixed-version vectors never enter the new index.
+      if (existingProgress && !isResuming) await this.clearSemanticIndexRebuildStaging();
+      reuseMap = buildSemanticChunkReuseMap(previousIndex, this.settings, previousMeta);
+      if (isResuming) {
+        const stagedReuse = await this.loadSemanticIndexRebuildStagingReuse(existingProgress);
+        for (const [key, embedding] of stagedReuse) if (!reuseMap.has(key)) reuseMap.set(key, embedding);
+        this.logLocal("Resuming semantic index rebuild", { stagedVectors: stagedReuse.size, totalChunks: chunks.length });
+      } else {
+        await this.beginSemanticIndexRebuildStaging(chunks.length);
+      }
+      
+      const embedded = await this.embedSemanticChunks(chunks, reuseMap, "vault chunks", (progress) => this.recordSemanticIndexRebuildProgress(progress));
+      // Flush any remaining staged vectors so an interruption between the last
+      // batch and the index save still resumes without re-embedding.
+      await this.flushSemanticIndexRebuildStagingShard();
       const materialityAnchors = await this.embedSemanticMaterialityAnchors();
       const indexed = normalizeSemanticIndexPaths(embedded.indexed, this.app, this.semanticIndexRevision);
       const indexedTaskReferenceChunks = indexed.filter((chunk) => semanticTaskReferenceChunkSelected(chunk));
@@ -7491,7 +8894,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
        provider: semanticEmbeddingProvider(this.settings),
         rebuiltAt: deviceTimestamp(),
         chunks: indexed.length,
-        dimension: Number(indexed.find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
+        dimension: Number(indexed.find((chunk) => isEmbeddingVector(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
         targetDimension: semanticEmbeddingTargetDimension(this.settings),
         embeddingMigrationRequired: false,
         contentSchemaVersion: SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION,
@@ -7523,6 +8926,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
       await this.saveSemanticIndex();
       persistenceCommitted = true;
+      // Clear the staging record and files only after the new index is committed.
+      await this.clearSemanticIndexRebuildStaging();
       try {
         await this.saveSettings();
       } catch (settingsError) {
@@ -7538,6 +8943,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (showNotice) new Notice(`Semantic index rebuilt: ${indexed.length} chunks from ${files.length} notes.`);
       return semanticOperationResult({ ok: true, changed: true, changedCount: indexed.length, reasonCode: "rebuilt", repairQueued: this.taskReferenceRepairFollowUp });
     } catch (error) {
+      // On error, keep the staging record and files for the next resume.
+      this.semanticIndexRebuildStagingPending = [];
+      this.semanticIndexRebuildStagingPendingBytes = 0;
       const committedGeneration = this.semanticIndexManifestPublishedGeneration || "";
       if (persistenceCommitted || (committedGeneration && committedGeneration !== previousPublishedGeneration)) {
         this.lastSemanticIndexPersistenceError = { phase: "post-commit-rebuild", message: error?.message || String(error), generation: committedGeneration };
@@ -7604,7 +9012,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   hasUsableSemanticIndex() {
     const meta = this.settings.semanticIndexMeta || {};
     const compatibility = semanticEmbeddingIndexCompatibility(this.settings, meta);
-    return Boolean((this.semanticIndex || []).length && Number(meta.chunks || 0) > 0 && meta.rebuiltAt && compatibility.compatible);
+    if (!Boolean((this.semanticIndex || []).length && Number(meta.chunks || 0) > 0 && meta.rebuiltAt && compatibility.compatible)) return false;
+    // Mixed-version guard: when the persisted metadata claims the current
+    // embedding content version, no chunk may carry another version.
+    if (Number(meta.embeddingContentVersion || 0) === SEMANTIC_EMBEDDING_CONTENT_VERSION) {
+      for (const chunk of this.semanticIndex || []) {
+        const version = Number(chunk?.embeddingContentVersion || chunk?.indexMetadata?.contentVersion || 0);
+        if (version && version !== SEMANTIC_EMBEDDING_CONTENT_VERSION) return false;
+      }
+    }
+    return true;
   }
 
   getSyncableTaskFiles() {
@@ -7705,7 +9122,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           chunks: (this.semanticIndex || []).length,
           model: this.settings.embeddingModel,
            provider: semanticEmbeddingProvider(this.settings),
-          dimension: Number((this.semanticIndex || []).find((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
+          dimension: Number((this.semanticIndex || []).find((chunk) => isEmbeddingVector(chunk.embedding) && chunk.embedding.length)?.embedding?.length || 0),
           targetDimension: semanticEmbeddingTargetDimension(this.settings),
           embeddingMigrationRequired: false,
           contentSchemaVersion: SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION,
@@ -7715,7 +9132,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
           ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
         });
-        await this.saveSemanticIndex();
+        await this.saveSemanticIndex({ previousIndex });
         await this.saveSettings();
         result.changed = true;
         result.changedCount = changedFiles;
@@ -7818,7 +9235,100 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     });
   }
 
-  async embedSemanticChunks(chunks, reuseMap = new Map(), label = "semantic chunks") {
+  async beginSemanticIndexRebuildStaging(totalChunks) {
+    await this.clearSemanticIndexRebuildStaging();
+    const progress = {
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      chunksProcessed: 0,
+      totalChunks: Math.max(0, Number(totalChunks) || 0),
+      stagingFiles: [],
+      updatedAt: Date.now()
+    };
+    setSemanticIndexRebuildProgress(this.settings, progress);
+    if (typeof this.queueSettingsSave === "function") this.queueSettingsSave();
+    return progress;
+  }
+
+  async loadSemanticIndexRebuildStagingReuse(progress) {
+    if (!isRebuildProgressValid(progress, SEMANTIC_EMBEDDING_CONTENT_VERSION)) return new Map();
+    const stagedChunks = [];
+    for (const file of progress.stagingFiles || []) {
+      try {
+        const raw = await this.app.vault.adapter.read(`${this.manifest.dir}/${file}`);
+        const parsed = JSON.parse(raw);
+        if (Number(parsed?.contentVersion) !== SEMANTIC_EMBEDDING_CONTENT_VERSION) continue;
+        stagedChunks.push(...(parsed?.chunks || []));
+      } catch {}
+    }
+    return semanticStagingReuseMap(stagedChunks, this.settings);
+  }
+
+  async clearSemanticIndexRebuildStaging() {
+    const progress = getSemanticIndexRebuildProgress(this.settings);
+    const files = new Set(progress?.stagingFiles || []);
+    try {
+      const listing = await this.app.vault.adapter.list(this.manifest.dir);
+      for (const file of listing?.files || []) {
+        const base = String(file).split("/").pop() || "";
+        if (base.startsWith(`${SEMANTIC_INDEX_REBUILD_STAGING_PREFIX}.`)) files.add(base);
+      }
+    } catch {}
+    for (const file of files) {
+      try { await this.app.vault.adapter.remove(`${this.manifest.dir}/${file}`); } catch {}
+    }
+    clearSemanticIndexRebuildProgress(this.settings);
+    if (typeof this.queueSettingsSave === "function") this.queueSettingsSave();
+  }
+
+  async recordSemanticIndexRebuildProgress(progress) {
+    const record = getSemanticIndexRebuildProgress(this.settings) || {
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      chunksProcessed: 0,
+      totalChunks: Number(progress?.totalChunks) || 0,
+      stagingFiles: [],
+      updatedAt: Date.now()
+    };
+    const pending = Array.isArray(this.semanticIndexRebuildStagingPending) ? this.semanticIndexRebuildStagingPending : [];
+    if (Array.isArray(progress?.batchEmbedded)) pending.push(...progress.batchEmbedded);
+    this.semanticIndexRebuildStagingPending = pending;
+    let pendingBytes = Number(this.semanticIndexRebuildStagingPendingBytes || 0);
+    for (const chunk of progress?.batchEmbedded || []) {
+      try { pendingBytes += utf8ByteLength(JSON.stringify(serializableSemanticChunk(chunk))); } catch {}
+    }
+    this.semanticIndexRebuildStagingPendingBytes = pendingBytes;
+    const shouldFlush = pending.length >= SEMANTIC_INDEX_REBUILD_STAGING_MIN_CHUNKS || pendingBytes >= semanticIndexShardMaxBytes(this.settings);
+    if (shouldFlush) await this.flushSemanticIndexRebuildStagingShard();
+    record.chunksProcessed = Math.max(Number(record.chunksProcessed || 0), Number(progress?.chunksProcessed) || 0);
+    record.totalChunks = Number(progress?.totalChunks) || record.totalChunks;
+    record.updatedAt = Date.now();
+    setSemanticIndexRebuildProgress(this.settings, record);
+    if (typeof this.queueSettingsSave === "function") this.queueSettingsSave();
+  }
+
+  async flushSemanticIndexRebuildStagingShard() {
+    const pending = Array.isArray(this.semanticIndexRebuildStagingPending) ? this.semanticIndexRebuildStagingPending : [];
+    if (!pending.length) return;
+    const record = getSemanticIndexRebuildProgress(this.settings) || {
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      chunksProcessed: 0,
+      totalChunks: 0,
+      stagingFiles: [],
+      updatedAt: Date.now()
+    };
+    const file = semanticIndexRebuildStagingFileName(record.stagingFiles.length);
+    await this.app.vault.adapter.write(`${this.manifest.dir}/${file}`, JSON.stringify({
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      chunks: pending
+    }));
+    record.stagingFiles = (record.stagingFiles || []).concat(file);
+    record.updatedAt = Date.now();
+    setSemanticIndexRebuildProgress(this.settings, record);
+    if (typeof this.queueSettingsSave === "function") this.queueSettingsSave();
+    this.semanticIndexRebuildStagingPending = [];
+    this.semanticIndexRebuildStagingPendingBytes = 0;
+  }
+
+  async embedSemanticChunks(chunks, reuseMap = new Map(), label = "semantic chunks", onProgress = null) {
     const indexed = new Array(chunks.length);
     const pending = [];
     let reused = 0;
@@ -7848,6 +9358,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const batchSize = semanticEmbeddingBatchSize(this.settings);
     let embedded = 0;
     let providerInputs = 0;
+    let chunksProcessed = reused;
     // Nothing pending to embed: no visible status (idle stays "Ready").
     for (let i = 0; i < pendingGroups.length; i += batchSize) {
       const batch = pendingGroups.slice(i, i + batchSize);
@@ -7855,6 +9366,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const embeddings = await this.embedTexts(batch.map((group) => group.items.length > 1
         ? semanticChunkSharedEmbeddingInput(group.chunk)
         : semanticChunkEmbeddingInput(group.chunk)), "document");
+      const batchEmbedded = [];
       for (let j = 0; j < batch.length; j += 1) {
         const group = batch[j];
         const embedding = compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision);
@@ -7878,10 +9390,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
               ...(projectionVersion ? { taskReferenceEmbeddingProjectionVersion: projectionVersion } : {})
             }
           });
+          batchEmbedded.push(indexed[item.index]);
           embedded += 1;
+          chunksProcessed += 1;
         }
       }
       providerInputs += batch.length;
+      if (onProgress) {
+        await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded });
+      }
       await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
     }
     return {
@@ -8397,7 +9914,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
             chunks: this.semanticIndex.length,
             ...semanticIndexMetadata(this.semanticIndex || [], taskReferenceHealth)
           });
-          await this.saveSemanticIndex();
+          await this.saveSemanticIndex({ previousIndex });
           await this.saveSettings();
         }
         return semanticOperationResult({ ok: true, changed: true, changedCount: Math.max(0, before - candidateIndex.length), reasonCode: "removed" });
@@ -8950,6 +10467,58 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     this.queueSemanticRetrievalWarmup();
   }
 
+  // Task 3(b)/(c): release per-run intermediates once their last reader is
+  // done. Two namespaces:
+  //   - `cacheKey` (e.g. `description:2`) drops the per-task holder registered
+  //     in `_taskIntermediateByKey` (description-phase shared evidence);
+  //   - `retrieval` (a result object returned by retrieveTaskSemanticContexts)
+  //     drops the matching `taskSemanticContextCache` entry, so the routed
+  //     candidate stream (byTask contexts, per-task telemetry, score map,
+  //     coverage membership) is not retained until the between-run sweep.
+  // The result object itself is never mutated: the plan holds its own arrays
+  // and shares item references, and a warm cache hit recomputes identically
+  // instead of reading a half-released entry.
+  releaseTaskIntermediates(cacheKey = "", retrieval = null) {
+    let released = 0;
+    if (cacheKey && this._taskIntermediateByKey instanceof Map) {
+      if (this._taskIntermediateByKey.delete(cacheKey)) released += 1;
+    }
+    if (this.taskSemanticContextCache instanceof Map) {
+      if (cacheKey && this.taskSemanticContextCache.has(cacheKey)) {
+        this.taskSemanticContextCache.delete(cacheKey);
+        released += 1;
+      } else if (retrieval && typeof retrieval === "object") {
+        for (const [key, entry] of this.taskSemanticContextCache) {
+          // A fresh result is stored by reference; a warm cache hit returns a
+          // reconstruction that shares the stored byTask object, so match on
+          // either identity.
+          if (entry && (entry.result === retrieval || (retrieval.byTask && entry.result && entry.result.byTask === retrieval.byTask))) {
+            this.taskSemanticContextCache.delete(key);
+            released += 1;
+            break;
+          }
+        }
+      }
+    }
+    if (released > 0) this._taskIntermediatesReleasedCount = (Number(this._taskIntermediatesReleasedCount) || 0) + released;
+    return released > 0;
+  }
+
+  // Safety net for the description phase's early returns: drop every registered
+  // per-task holder (the local singleton evidence map dies with the call).
+  _releaseDescriptionIntermediates() {
+    if (!(this._taskIntermediateByKey instanceof Map)) return 0;
+    let released = 0;
+    for (const key of [...this._taskIntermediateByKey.keys()]) {
+      if (String(key).startsWith("description:")) {
+        this._taskIntermediateByKey.delete(key);
+        released += 1;
+      }
+    }
+    if (released > 0) this._taskIntermediatesReleasedCount = (Number(this._taskIntermediatesReleasedCount) || 0) + released;
+    return released;
+  }
+
   scheduleSemanticCacheSweep() {
     // Defer the sweep out of the activity's synchronous tail so the final
     // status render isn't blocked by cache eviction. At most one sweep is
@@ -9122,6 +10691,228 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     slice();
   }
 
+  // --- Task 9: routed retrieval ---------------------------------------------
+  semanticShardRouterFor(routingState) {
+    const key = `${String(routingState?.routingIndex?.generation || "")}|${Number(routingState?.telemetry?.revision ?? this.semanticIndexRevision ?? 0)}|${String(routingState?.telemetry?.storageFingerprint || "")}|${Number(routingState?.routingIndex?.count || 0)}`;
+    if (this._semanticShardRouter && this._semanticShardRouter.key === key) return this._semanticShardRouter.router;
+    const router = buildSemanticShardRouter(routingState?.routingIndex || {});
+    this._semanticShardRouter = { key, router };
+    return router;
+  }
+
+  // Router v2 cache: the resident cell router is rebuilt only when the index
+  // generation/revision/fingerprint/count or the cell definition changes.
+  semanticCellRouterFor(routingState, options = {}) {
+    const strategy = String(options.strategy || options.cellStrategy || SEMANTIC_ROUTED_CELL_STRATEGY) === "chunk" ? "chunk" : "note";
+    const requestedTarget = Math.floor(Number(options.targetRows || options.cellTargetRows || SEMANTIC_ROUTED_CELL_TARGET_ROWS));
+    const targetRows = Math.max(1, Number.isFinite(requestedTarget) ? requestedTarget : SEMANTIC_ROUTED_CELL_TARGET_ROWS);
+    const key = `${String(routingState?.routingIndex?.generation || "")}|${Number(routingState?.telemetry?.revision ?? this.semanticIndexRevision ?? 0)}|${String(routingState?.telemetry?.storageFingerprint || "")}|${Number(routingState?.routingIndex?.count || 0)}|${strategy}|${targetRows}`;
+    if (this._semanticCellRouter && this._semanticCellRouter.key === key) return this._semanticCellRouter.router;
+    const router = buildSemanticCellRouter(routingState?.routingIndex || {}, { strategy, targetRows });
+    this._semanticCellRouter = { key, router };
+    return router;
+  }
+
+  // One shard buffer live at a time: a legacy JSON index (or an adapter
+  // without readBinary) falls back to one shard-sized slice of the resident
+  // index; a binary index loads from the resident `.bin` buffer. The caller
+  // drops the returned view before the next shard loads.
+  // No extra I/O per query: shards stream views of the resident packed index
+  // (Task 4: one Float64Array, bit-identical cosine). One shard-sized slab is
+  // the only per-query resident cost; `bytesRead` reports the resident bytes
+  // streamed for the measurement table. With cell routing the slab covers only
+  // the selected rows of the shard (Task 10), so an unneeded shard is never
+  // materialized at all.
+  semanticRoutedShardVectorSource(shardId, router, selectedRows = null) {
+    const dimension = Number(router?.dimension || 0);
+    const rows = Array.isArray(selectedRows) ? selectedRows : (router?.shardRows?.[shardId] || []);
+    const values = new Float64Array(rows.length * dimension);
+    let vectors = 0;
+    for (let position = 0; position < rows.length; position += 1) {
+      const embedding = this.semanticIndex?.[rows[position]]?.embedding;
+      if (!isEmbeddingVector(embedding)) continue;
+      for (let index = 0; index < dimension; index += 1) values[position * dimension + index] = Number(embedding[index] || 0);
+      vectors += 1;
+    }
+    return { values: vectors ? values : null, bytesRead: vectors ? values.byteLength : 0, release() { values.fill(0); } };
+  }
+
+  // Routed retrieval: each request handle must carry the production query
+  // contract (encoderId, encoderVersion, dimension, normalization). The
+  // pipeline derives it through productionSemanticRoutingQueryAdapter before
+  // the sweep; the routed function receives the same adapted handles the exact
+  // sweep sees (no re-adaptation), so both modes score identical queries.
+  async routeRoutedSemanticEvidenceBatch(routingState, queryHandles = [], options = {}) {
+    if (!options || typeof options !== "object" || Array.isArray(options)) throw localSemanticRoutingError("options-malformed", "Routing options must be an object.");
+    const index = routingState?.routingIndex;
+    const view = localSemanticRoutingIndexView(index);
+    const { encoder, count, routingMetadata } = view;
+    if (!Array.isArray(queryHandles)) throw localSemanticRoutingError("query-malformed", "Query handles must be an array.");
+    const router = this.semanticShardRouterFor(routingState);
+    // Router v2: route at cell granularity (fixed row counts, independent of
+    // shard file sizes). `routing: "shards"` keeps the Task 9 whole-shard
+    // routing available for measurement and rollback.
+    const shardRouting = String(options.routing || options.routingMode || "") === "shards";
+    const cellRouter = shardRouting ? null : this.semanticCellRouterFor(routingState, { strategy: options.cellStrategy || options.strategy, targetRows: options.cellTargetRows });
+    const cellScanFraction = Number(options.cellScanFraction ?? options.scanFraction ?? SEMANTIC_ROUTED_CELL_SCAN_FRACTION);
+    const cellMinProbes = Number(options.cellMinProbes ?? options.minProbes ?? SEMANTIC_ROUTED_CELL_MIN_PROBES);
+    const perHandle = queryHandles.map((request) => {
+      const prepared = localSemanticRoutingQueryView(index, encoder, count, request?.handle, {
+        topK: request?.topK ?? options.topK ?? options.k ?? options.limit ?? 8
+      });
+      const entry = {
+        query: prepared.query,
+        topK: prepared.topK,
+        state: localSemanticRoutingHeapState(prepared.topK, prepared.query),
+        routedShardIds: null,
+        routedSet: null,
+        routedRows: null,
+        routedCellIds: [],
+        routedCellForcedRows: 0,
+        operationCount: 0,
+        rowsScanned: 0
+      };
+      if (shardRouting) {
+        entry.routedShardIds = router.route(prepared.query, { topShards: Number(options.topShards || SEMANTIC_ROUTED_SHARD_TOP) });
+        entry.routedSet = new Set(entry.routedShardIds);
+      } else {
+        // Forced rows: the active note / query-handle rows always probe their
+        // own cells, so a query never routes away from its source rows.
+        const forcedRows = [];
+        const sourceIds = Array.isArray(request?.sourceEvidenceIds) ? request.sourceEvidenceIds
+          : Array.isArray(request?.handle?.sourceEvidenceIds) ? request.handle.sourceEvidenceIds : [];
+        if (sourceIds.length && routingState?.handleLookup) {
+          for (const row of productionSemanticRoutingLookupRows(routingState.handleLookup, { evidenceIds: sourceIds })) forcedRows.push(row);
+        }
+        entry.routedCellIds = cellRouter.route(prepared.query, {
+          scanFraction: cellScanFraction,
+          minProbes: cellMinProbes,
+          forcedRows,
+          includeRecent: true
+        });
+        entry.routedCellForcedRows = forcedRows.length;
+        const rows = new Set();
+        for (const cell of entry.routedCellIds) for (const row of cellRouter.cellRows[cell]) rows.add(row);
+        entry.routedRows = rows;
+      }
+      return entry;
+    });
+    const startedAt = localSemanticRoutingNow();
+    this._semanticRoutedShardLive = 0;
+    this._semanticRoutedShardLivePeak = 0;
+    const unionRows = new Set();
+    for (const entry of perHandle) {
+      if (entry.routedRows) {
+        for (const row of entry.routedRows) unionRows.add(row);
+      } else {
+        for (const shardId of entry.routedShardIds) for (const row of router.shardRows[shardId]) unionRows.add(row);
+      }
+    }
+    const rowsByShard = new Map();
+    for (const row of unionRows) {
+      const shardId = router.rowShard[row];
+      let rows = rowsByShard.get(shardId);
+      if (!rows) {
+        rows = [];
+        rowsByShard.set(shardId, rows);
+      }
+      rows.push(row);
+    }
+    for (const rows of rowsByShard.values()) rows.sort((left, right) => left - right);
+    const onRowBatch = typeof options.onRowBatch === "function" ? options.onRowBatch : null;
+    const yieldEveryRows = Number.isInteger(options.yieldEveryRows) && options.yieldEveryRows > 0 ? options.yieldEveryRows : 256;
+    let bytesRead = 0;
+    for (const shardId of Array.from(rowsByShard.keys()).sort((a, b) => a - b)) {
+      const rows = rowsByShard.get(shardId);
+      const source = this.semanticRoutedShardVectorSource(shardId, router, rows);
+      this._semanticRoutedShardLive += 1;
+      this._semanticRoutedShardLivePeak = Math.max(Number(this._semanticRoutedShardLivePeak || 0), Number(this._semanticRoutedShardLive));
+      try {
+        bytesRead += Number(source.bytesRead || 0);
+        const values = source.values;
+        for (let position = 0; position < rows.length; position += 1) {
+          const row = rows[position];
+          for (let handleIndex = 0; handleIndex < perHandle.length; handleIndex += 1) {
+            const entry = perHandle[handleIndex];
+            const participates = entry.routedRows ? entry.routedRows.has(row) : entry.routedSet.has(shardId);
+            if (!participates) continue;
+            let score = 0;
+            if (values) {
+              const offset = position * router.dimension;
+              for (let index = 0; index < router.dimension; index += 1) score += values[offset + index] * entry.query[index];
+            }
+            entry.operationCount += router.dimension;
+            localSemanticRoutingHeapAdmit(index, entry.state, row, score);
+          }
+          for (const entry of perHandle) {
+            const participates = entry.routedRows ? entry.routedRows.has(row) : entry.routedSet.has(shardId);
+            if (participates) entry.rowsScanned += 1;
+          }
+          if (onRowBatch && ((position + 1) % yieldEveryRows === 0 || position + 1 === rows.length)) await onRowBatch(position + 1, rows.length);
+        }
+      } finally {
+        source.release?.();
+        this._semanticRoutedShardLive -= 1;
+      }
+      await idlePause(0);
+    }
+    return perHandle.map((entry) => {
+      if (!entry.routedShardIds) {
+        const shards = new Set();
+        for (const row of entry.routedRows) shards.add(router.rowShard[row]);
+        entry.routedShardIds = Array.from(shards).sort((left, right) => left - right);
+      }
+      const rows = localSemanticRoutingHeapRows(index, entry.state);
+      const candidates = localSemanticRoutingCandidates(index, routingMetadata, rows);
+      const telemetry = Object.freeze({
+        routeElapsedMs: Math.max(0, localSemanticRoutingNow() - startedAt),
+        candidateCount: entry.rowsScanned,
+        routingRowsScanned: entry.rowsScanned,
+        returnedCount: candidates.length,
+        topK: entry.topK,
+        dimension: encoder.dimension,
+        operationCount: entry.operationCount,
+        heapComparisons: entry.state.heapComparisons,
+        boundedCandidateAllocation: true,
+        networkCalls: 0,
+        encoderId: encoder.id,
+        encoderVersion: encoder.version,
+        generation: index.generation,
+        routedShardIds: Object.freeze(entry.routedShardIds.slice()),
+        routedShardCount: entry.routedShardIds.length,
+        routedShardBytesRead: bytesRead,
+        routedShardLivePeak: Number(this._semanticRoutedShardLivePeak || 0),
+        routedCellIds: Object.freeze(entry.routedCellIds.slice()),
+        routedCellCount: entry.routedCellIds.length,
+        routedCellStrategy: shardRouting ? "" : cellRouter.strategy,
+        routedCellTargetRows: shardRouting ? 0 : cellRouter.targetRows,
+        routedCellScanFraction: shardRouting ? 0 : (Number.isFinite(cellScanFraction) ? cellScanFraction : SEMANTIC_ROUTED_CELL_SCAN_FRACTION),
+        routedCellScannedRows: entry.routedRows ? entry.routedRows.size : entry.rowsScanned,
+        routedCellForcedRows: Number(entry.routedCellForcedRows || 0)
+      });
+      return Object.freeze({ candidates: Object.freeze(candidates), telemetry });
+    });
+  }
+
+  // One-time migration entry: the next save/rebuild writes every shard as
+  // `.bin` + sidecar under a fresh generation, verifies each file, publishes
+  // the manifest and only then removes the old JSON shards.
+  async migrateSemanticIndexShardsToBinary(options = {}) {
+    const chunks = Array.isArray(this.semanticIndex) ? this.semanticIndex : [];
+    if (!chunks.length) return semanticOperationResult({ ok: false, reasonCode: "empty-index-deferred" });
+    const adapter = this.app?.vault?.adapter;
+    if (!adapter?.write || typeof adapter.writeBinary !== "function" || typeof adapter.readBinary !== "function") {
+      return semanticOperationResult({ ok: false, reasonCode: "binary-write-unsupported" });
+    }
+    await this.saveSemanticIndex(Object.assign({ allowEmpty: false }, options || {}));
+    return semanticOperationResult({
+      ok: true,
+      reasonCode: "binary-shards-published",
+      chunkCount: chunks.length,
+      shardCount: Array.isArray(this.semanticIndexShardBinaryFiles) ? this.semanticIndexShardBinaryFiles.length : 0
+    });
+  }
+
   async routeProductionSemanticCandidateBatches(handleGroups = [], usableIndex = [], options = {}) {
     const startedAt = localSemanticRoutingNow();
     const scoreYieldBudgetMs = 8;
@@ -9147,7 +10938,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       groupIdCounts.set(baseGroupId, count);
       return {
       groupId: count === 1 ? baseGroupId : `${baseGroupId}#${count}`,
-      handles: (group?.handles || []).filter((handle) => Array.isArray(handle?.vector) && handle.vector.length),
+      handles: (group?.handles || []).filter((handle) => isEmbeddingVector(handle?.vector) && handle.vector.length),
       topK: Math.max(1, Number(group?.topK || options.topK || 40)),
       requiredEvidenceIds: uniqueValues((group?.requiredEvidenceIds || []).map((value) => String(value || "").trim()).filter(Boolean))
       };
@@ -9260,7 +11051,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // number by number over the vector.
     const stableHandleVectorHash = (vector) => {
       let hash = 2166136261;
-      const values = Array.isArray(vector) ? vector : [];
+      const values = isEmbeddingVector(vector) ? vector : [];
       for (let index = 0; index < values.length; index += 1) {
         const text = String(Number(values[index]));
         for (let cursor = 0; cursor < text.length; cursor += 1) {
@@ -9361,6 +11152,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const routingIndexCount = Number(routingState.routingIndex.count || 0);
         const batchRequests = pendingHandleRoutes.map((entry) => ({
           handle: productionSemanticRoutingQueryAdapter(entry.handle, routingState, this.settings),
+          // Router v2: the query handle's source rows always probe their own
+          // cells, so the active note is never routed away from itself.
+          sourceEvidenceIds: Array.isArray(entry.handle?.sourceEvidenceIds) ? entry.handle.sourceEvidenceIds : [],
           topK: completeEligibleStream
             ? routingIndexCount
             : Math.min(routingIndexCount, Math.max(entry.topK * 32, entry.topK + 128))
@@ -9368,7 +11162,18 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // Cooperative sweep: scale the checkpoint cadence by handle count so the
         // per-checkpoint handle work stays bounded; row/accumulation order
         // unchanged.
-        const routedBatch = await routeLocalSemanticEvidenceBatch(routingState.routingIndex, batchRequests, {
+        // Task 9: routed mode scores only the router-selected shards (one
+        // shard buffer at a time); exact mode keeps today's full sweep.
+        const routedSearchMode = semanticSearchModeOf(this.settings) === "routed";
+        const routedBatch = routedSearchMode
+          ? await this.routeRoutedSemanticEvidenceBatch(routingState, batchRequests, {
+              onRowBatch: async () => {
+                const sweepPause = scoreWorkCheckpoint();
+                if (sweepPause) await sweepPause;
+              },
+              yieldEveryRows: Math.max(1, Math.floor(256 / Math.max(1, batchRequests.length)))
+            })
+          : await routeLocalSemanticEvidenceBatch(routingState.routingIndex, batchRequests, {
           onRowBatch: async () => {
             const sweepPause = scoreWorkCheckpoint();
             if (sweepPause) await sweepPause;
@@ -9378,7 +11183,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // routingRowsScanned counts rows physically visited by routing sweeps: a
         // multi-handle sweep visits each row once for the whole batch, not once
         // per handle. Shared route-cache hits keep contributing zero.
-        routingRowsScanned += routingIndexCount;
+        routingRowsScanned += routedSearchMode
+          ? Math.max(0, ...routedBatch.map((routed) => Number(routed.telemetry?.routingRowsScanned || 0)))
+          : routingIndexCount;
         const sweepElapsedMs = Math.max(0, ...routedBatch.map((routed) => Number(routed.telemetry?.routeElapsedMs || 0)));
         routingElapsedMs += sweepElapsedMs;
         for (let index = 0; index < pendingHandleRoutes.length; index += 1) {
@@ -9470,7 +11277,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         nestedMap(requestScoresByHandle, handleKey, true).set(evidenceId, score);
         nestedMap(scoreOriginsByHandle, handleKey, true).set(evidenceId, "worker");
         exactScorePairCount += 1;
-        if (sharedScoreCacheIsCurrent()) { exactCache.set(exactKey, score); this._semanticExactScoreCacheTimestamps.set(exactKey, Date.now()); }
+        if (sharedScoreCacheIsCurrent()) {
+          exactCache.set(exactKey, score);
+          this._semanticExactScoreCacheTimestamps.set(exactKey, Date.now());
+          // Task 3(a): bound the exact-score cache DURING a run (oldest-first,
+          // insertion-ordered; the between-run sweep keeps its 5000 idle cap).
+          // A miss recomputes the identical exact score, so results are
+          // unchanged; the run cap is chosen from the measured working set
+          // (see SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES).
+          this._evictOldestBeyondCap(exactCache, SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES, this._semanticExactScoreCacheTimestamps);
+        }
         const resultAssemblyPause = scoreWorkCheckpoint();
         if (resultAssemblyPause) await resultAssemblyPause;
       }
@@ -10162,7 +11978,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // resolver reports no mismatch), so their retrieval stays byte-identical.
     if (localCurrentSourceRow && markedLineMismatchKeys.size) return degraded("marked-source-line-mismatch");
     const allLaneRoutingGroups = [];
+    // R9 fix A: in routed mode only the router-selected shards are scanned, so
+    // the task's protected rows - the lane query-handle evidence and the
+    // scope-listed mandatory facts - must be force-hydrated and exact-scored
+    // through the existing requiredEvidenceIds mechanism, or the routed
+    // "complete" stream is a shard subset that the downstream closure and
+    // supplement gates correctly refuse. Exact mode keeps its full sweep and
+    // passes no required ids (byte-identical), so only routed mode changes.
+    const routedSearchMode = semanticSearchModeOf(this.settings) === "routed";
     for (const laneData of laneDataByTask.values()) {
+      const routedScopeEntry = routedSearchMode
+        ? (sourceContract?.scopes || []).find((scope) => String(scope?.scopeId || scope?.id || "") === String(laneData.scopeId || "")) || {}
+        : null;
+      const routedMandatoryFactIds = new Set(routedScopeEntry
+        ? [...(routedScopeEntry.mandatoryFactIds || []), ...(routedScopeEntry.mandatoryTaskFactIds || [])].map((value) => String(value || "").trim()).filter(Boolean)
+        : []);
       for (const lane of laneData.lanes || []) {
         // History and handoff lanes get a larger local route pool so a
         // semantically strong source thread can be considered below the
@@ -10172,7 +12002,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const topK = sourceThreadLane
           ? Math.min(160, Math.max(limit * 12, 96))
           : Math.max(limit * 6, 40);
-        allLaneRoutingGroups.push({ groupId: lane.queryId, handles: Array.isArray(lane.queryHandles) ? lane.queryHandles : [], topK });
+        const requiredEvidenceIds = routedSearchMode ? uniqueValues([
+          ...(Array.isArray(lane.queryHandles) ? lane.queryHandles : [])
+            .flatMap((handle) => Array.isArray(handle?.sourceEvidenceIds) ? handle.sourceEvidenceIds : [])
+            .map((value) => String(value || "").trim()).filter(Boolean),
+          ...(sourceContract?.facts || []).flatMap((fact) => {
+            const factId = String(fact?.factId || fact?.fact_id || "").trim();
+            if (!factId || !routedMandatoryFactIds.has(factId)) return [];
+            const mandatoryFor = Array.isArray(fact?.mandatoryFor) ? fact.mandatoryFor.map(String) : [];
+            const mandatory = mandatoryFor.some((target) => ["task", "description", "identity"].includes(target))
+              || String(fact?.role || "").toLowerCase() === "requested-action";
+            if (!mandatory) return [];
+            return [fact.evidenceId, fact.evidence_id, fact.valueEvidenceId, fact.value_evidence_id]
+              .map((value) => String(value || "").trim()).filter(Boolean);
+          })
+        ]) : [];
+        allLaneRoutingGroups.push({ groupId: lane.queryId, handles: Array.isArray(lane.queryHandles) ? lane.queryHandles : [], topK, requiredEvidenceIds });
       }
     }
     const allLaneRoutingBatch = await this.routeProductionSemanticCandidateBatches(allLaneRoutingGroups, usableIndex, {
@@ -10229,10 +12074,27 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // orders/annotates this membership and may never remove a member.
     const acceptedStreamByTask = new Map();
     const acceptedExclusionsByTask = new Map();
+    // R9 fix B: the routed-scanned eligible sets the sweep actually covered.
+    // Per task: the union of its lanes' complete routed group candidates (the
+    // post-partition stream the accepted membership is built from). Carried
+    // into the coverage membership so the proof can state honestly which rows
+    // were scanned; exact mode keeps the full eligible partition.
+    const routedScannedByTask = routedSearchMode ? new Map() : null;
     for (const [indexValue, task] of flattened) {
       const key = taskKeyByIndex[String(indexValue)];
       const laneData = laneDataByTask.get(key);
       if (!laneData) continue;
+      if (routedSearchMode) {
+        const scanned = new Set();
+        for (const lane of laneData.lanes || []) {
+          const scannedGroup = allLaneRoutedById.get(lane.queryId);
+          for (const candidate of scannedGroup?.completeCandidates || scannedGroup?.candidates || []) {
+            const evidenceId = String(candidate?.routingEvidenceId || candidate?.chunk?.evidenceId || "").trim();
+            if (evidenceId) scanned.add(evidenceId);
+          }
+        }
+        routedScannedByTask.set(key, scanned);
+      }
       const laneStreams = (laneData.lanes || []).map((lane) => {
         const routedGroup = allLaneRoutedById.get(lane.queryId) || {};
         return { candidates: routedGroup.completeCandidates || routedGroup.candidates || [] };
@@ -10805,12 +12667,31 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         exclusions: Object.freeze(exclusions)
       });
     }
+    // R9 fix B: routed mode covered only the routed-scanned eligible sets.
+    // Carry them (gated on routed mode) so the proof and the reconcile gates
+    // can treat rows in unscanned shards as "not scanned in routed mode".
+    const routedScannedGlobal = routedSearchMode
+      ? uniqueValues(Array.from(routedScannedByTask.values()).flatMap((scanned) => Array.from(scanned)))
+      : [];
+    if (routedSearchMode) {
+      // The bundle coverage gate compares the proof's complete eligible
+      // membership against the live index counts. The routed batch's
+      // metadata-only count covers only the scanned shards, so the full-index
+      // eligible partition supplies the honest contract value; exact mode
+      // keeps the full-sweep routed batch count.
+      telemetry.metadataOnlyRejectedCandidateCount = Number(coverageEligiblePartition.telemetry.metadataOnlyRejectedCount || 0);
+    }
     const coverageMembership = {
       indexRevision: Number(revision || 0),
       sourceContractId: String(sourceContract?.id || ""),
       completeEligibleEvidenceIds: coverageCompleteEligibleEvidenceIds,
       completeEligibleFingerprint: taskWorkflowCoverageFingerprint(coverageCompleteEligibleEvidenceIds),
-      byTask: coverageByTask
+      byTask: coverageByTask,
+      ...(routedSearchMode ? {
+        semanticSearchMode: "routed",
+        routedScannedEvidenceIds: routedScannedGlobal,
+        routedScannedByTask: Object.fromEntries(Array.from(routedScannedByTask.entries()).map(([scannedKey, scanned]) => [scannedKey, Array.from(scanned)]))
+      } : {})
     };
     const result = {
       byTask, taskKeyByIndex, telemetry, taskRelevanceScoreByTaskAndEvidence,
@@ -11539,7 +13420,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         ]),
         "You are a concise Obsidian sidebar assistant.",
         "Return only JSON matching the supplied chat evidence schema. Each claim must be one short factual sentence.",
-        "Answer in plain language, usually in 3-6 short claims.",
+        "Answer in plain language, usually in 3-6 short claims, in your own words rather than quoting notes.",
         "Return exactly one category per claim. A claim with established=false must use category=unsupported, have no evidence_ids, and state only one missing or unestablished element; never combine a supported fact with unsupported details in one claim.",
         "When an answer states that an element is not established from the supplied evidence, also check the supplied evidence for established facts that are directly relevant to the asked topic: when such facts exist, state them as separate established claims with their exact evidence_ids, placed first or immediately after the not-established claim; a related established claim must state only what its cited evidence actually says about the asked topic, never the missing element, and must not upgrade any epistemic state; include related claims only when they are directly relevant to the asked topic; when no supplied evidence relates to the asked topic, briefly say so in the not-established claim instead of adding related claims.",
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
@@ -11865,6 +13746,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           ? resolveEffectiveReasoningEffort(normalizeReasoningEffort(reasoningEffort), candidateModel)
           : aiOperationReasoningEffort(resolveEffectiveReasoningEffort(configuredEffort, candidateModel), operation, this.settings.optimizeStructuredAiUsage !== false);
         const provider = this.generationProviderForModel(candidateModel);
+        // Auto-discovery: a customopenai model with no capability record yet
+        // triggers one bounded, non-blocking /model/info GET so the resolver
+        // gains the endpoint's own effort list. This request still resolves
+        // through cached records or static rules (never waits on discovery).
+        const discoveryInFlight = this.maybeAutoDiscoverReasoningCapability(provider, candidateModel);
+        if (discoveryInFlight && typeof discoveryInFlight.then === "function") {
+          // First request per provider+model per day: wait for the endpoint's capability record for at most 1.5 s so the
+          // first request already honors an explicitly chosen effort; a timeout or failure never blocks or fails the request.
+          await Promise.race([discoveryInFlight.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1500))]);
+        }
         // Slice B: capability records extend the control list and honor an
         // explicit user level. For a model whose static rule offers no control,
         // 'auto'/'default' keeps today's behavior (nothing sent — the
@@ -12570,6 +14461,65 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return result;
   }
 
+  // Auto-discovery: a customopenai (LiteLLM) model whose reasoning-effort
+  // record is still missing triggers ONE bounded GET /model/info, parsed by
+  // liteLLMReasoningCapabilityFromRow and stored through the existing
+  // capability cache path (model-cache.json). The existing capture only runs
+  // during a user-triggered catalog refresh, so a freshly configured model
+  // otherwise falls back to static rules and sends no reasoning field at all.
+  // Non-blocking: callers never await this, and the current request resolves
+  // through cached records or static rules. At most one attempt per
+  // provider+model per day, held in memory; a success persists a record so
+  // later sessions skip entirely, and a failure is retried at most on the next
+  // plugin load. ponytail: no persisted failure ledger (would need a new
+  // data.json key) — worst case is one GET per reload, never a retry storm.
+  maybeAutoDiscoverReasoningCapability(provider, model) {
+    try {
+      // Live-plugin only: offline reasoning-test harnesses build bare
+      // prototype instances that stub openAiCompatibleRequest and count exact
+      // requests; discovery must never add requests there.
+      if (!this.app) return;
+      if (stableSupportedProvider(provider, "") !== "customopenai") return;
+      const modelId = String(model || "").trim();
+      if (!modelId) return;
+      if (!this.reasoningCapabilityAutoDiscovery) this.reasoningCapabilityAutoDiscovery = { days: {}, inflight: {} };
+      const state = this.reasoningCapabilityAutoDiscovery;
+      const key = modelId.toLowerCase();
+      if (state.inflight[key]) return;
+      const day = new Date().toISOString().slice(0, 10);
+      if (state.days[key] === day) return;
+      const recordPresent = () => {
+        const entries = this.settings?.providerModelCapabilities?.customopenai;
+        return Boolean(entries && typeof entries === "object" && !Array.isArray(entries)
+          && Object.keys(entries).some((candidate) => candidate.toLowerCase() === key));
+      };
+      if (recordPresent()) return;
+      state.days[key] = day;
+      state.inflight[key] = true;
+      const timeoutSignal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(10000)
+        : undefined;
+      const discoveryPromise = this.openAiCompatibleRequest("customopenai", "/model/info", undefined, { signal: timeoutSignal })
+        .then((response) => {
+          const json = response.status >= 200 && response.status < 300 && response.json && typeof response.json === "object" ? response.json : null;
+          const rows = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : [];
+          if (!rows.length) return;
+          this.captureProviderModelCapabilities("customopenai", rows.map(liteLLMReasoningCapabilityFromRow).filter(Boolean));
+          if (recordPresent()) this.queueSettingsSave();
+        })
+        .catch(() => {
+          // Discovery is best-effort; cached records or static rules cover the
+          // request that triggered it.
+        })
+        .finally(() => { delete state.inflight[key]; });
+      // Hand the in-flight discovery back so the FIRST request of a session can wait for it briefly.
+      return discoveryPromise;
+    } catch (discoveryError) {
+      // Discovery must never change provider behavior.
+    }
+    return null;
+  }
+
   async fetchGeminiModels() {
     const response = await requestProviderUrl("gemini", {
       url: "https://generativelanguage.googleapis.com/v1beta/models",
@@ -12688,6 +14638,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // proof is honored only via the private registry keyed by this exact rankings
     // object, so a caller-supplied lookalike cannot authorize anything.
     attachTaskWorkflowCoverageProof(taskRelevanceRankings, retrieval.coverageMembership || null);
+    // Task 3(c): this call's last reader is the derived bundle above; the raw
+    // routed candidate stream (byTask contexts, score map, coverage membership)
+    // is dropped from the retrieval cache now so it is not retained until the
+    // between-run sweep. The derived byScope telemetry keeps its references; a
+    // warm cache hit recomputes identically.
+    this.releaseTaskIntermediates("", retrieval);
     return {
       scopes: scopeRecords,
       byScope,
@@ -13699,6 +15655,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // supplementation attach above; release them before the settlement scans
     // below and for the rest of the plan's lifetime.
     preStructureScopes = null;
+    // Task 3(c): the post-structure retrieval result's last readers were the
+    // bundle attach above and its telemetry reads; release the routed candidate
+    // stream from the retrieval cache now (nothing below reads it again). The
+    // plan keeps its own semanticContext arrays and item references.
+    this.releaseTaskIntermediates("", taskSemanticRetrieval);
     if (grounding.rejected.length) {
       this.logLocal("Rejected generated tasks without primary-source grounding", {
         source: source.type || "",
@@ -13863,6 +15824,393 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
+  // Task 7 (L1): per-task description evidence payload builder, factored so the
+  // dispatch pool assembles each task's payload on first use instead of for
+  // every task before the first request. Pure over its inputs: the same task,
+  // source contract, context bundle and provider projection produce the same
+  // payload the eager loop produced.
+  descriptionSingletonEvidencePayload(task, sourceContract, contextBundle, providerProjection) {
+    return taskDescriptionSharedEvidencePayload([task], sourceContract, {
+      contextBundle: contextBundle || null,
+      providerProjection
+    });
+  }
+
+  // Optional System One decision model: kick off one bounded decision-model
+  // run per task as soon as its admitted rows are final, so later tasks'
+  // local prep and provider waits overlap the HTTP work. Returns a
+  // Map<taskIndex, {promise, candidates}> or null when disabled/unavailable.
+  // Never throws and never blocks beyond the configured per-task timeout.
+  startEvidenceRerankForTasks(mainTasks = [], options = {}) {
+    const spec = evidenceRerankSettings(this.settings);
+    this.evidenceRerankTelemetry = { used: false, reason: spec.enabled ? (spec.endpoint ? "idle" : "url-invalid") : "disabled" };
+    if (!spec.enabled || !spec.endpoint) return null;
+    if (options.structuredEvidence !== true || !options.providerProjection) {
+      this.evidenceRerankTelemetry = { used: false, reason: "no-structured-evidence" };
+      return null;
+    }
+    const fetchFn = typeof globalThis !== "undefined" && typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+    if (!fetchFn) { this.evidenceRerankTelemetry = { used: false, reason: "fetch-unavailable" }; return null; }
+    const sourceTimestamp = Number(options.sourceContract?.sourceTimestamp || 0);
+    const noteDate = sourceTimestamp ? evidenceRerankDateText(new Date(sourceTimestamp).toISOString()) : "unknown";
+    const plan = new Map();
+    for (const task of mainTasks || []) {
+      const candidates = evidenceRerankCandidatesForTask(task, options.providerProjection).slice(0, spec.maxCandidates);
+      if (candidates.length < 2) continue;
+      const taskState = { action: task.action || task.title || "", noteTitle: options.sourceTitle || "", noteDate };
+      const promise = (async () => {
+        try {
+          // The scoring request itself is the liveness test: no per-task
+          // health probe (the single-slot server queues /health behind
+          // scoring, so a probe during other tasks' scoring measures the
+          // queue, not the server). While the baseUrl is marked down, fall
+          // back immediately without sending a request; the mark is set and
+          // cleared by evidenceRerankTaskOrder.
+          if (evidenceRerankServerDown(spec.baseUrl)) return { ok: false, reason: "server-unreachable" };
+          const outcome = await evidenceRerankTaskOrder(spec, taskState, candidates, fetchFn);
+          if (outcome?.model) this._evidenceRerankLastSeenModel = outcome.model;
+          return outcome;
+        } catch {
+          return { ok: false, reason: "internal-error" };
+        }
+      })();
+      plan.set(Number(task.index), { promise, candidates });
+    }
+    if (!plan.size) { this.evidenceRerankTelemetry = { used: false, reason: "no-optional-rows" }; return null; }
+    // Display-only ordering bookkeeping for the status line: ordinal per plan
+    // entry (task order) and a pending counter so the ordering label clears
+    // when the last task's ordering settles. In-memory only.
+    let ordinal = 0;
+    for (const entry of plan.values()) {
+      ordinal += 1;
+      entry.ordinal = ordinal;
+      entry.total = plan.size;
+    }
+    plan.pending = plan.size;
+    return plan;
+  }
+
+  // Same payload as descriptionSingletonEvidencePayload, but the awaited
+  // System One decision-model result reorders the task's optional refs first.
+  // Disabled runs return the byte-identical payload object (no copy, reorder).
+  async descriptionSingletonEvidencePayloadReranked(task, sourceContract, contextBundle, providerProjection, rerankPlan) {
+    const shared = this.descriptionSingletonEvidencePayload(task, sourceContract, contextBundle, providerProjection);
+    const entry = rerankPlan && rerankPlan.get(Number(task?.index));
+    if (!entry || !shared) return shared;
+    // Status line: name the ordering while this task's evidence is pending;
+    // the label clears when the plan's last task settles (display-only).
+    this.systemOneSetOrderingStatus(entry.ordinal, entry.total);
+    let result = null;
+    try { result = await entry.promise; } catch { result = null; }
+    this.systemOneFinishOrderingStatus(rerankPlan);
+    if (result?.ok && applyEvidenceRerankOrder(shared, result.order, Number(task?.index))) {
+      let tier = null;
+      try {
+        if (systemOneMaxEfficiencyEnabled(this.settings) && evidenceRerankSettings(this.settings).enabled) {
+          tier = applyEvidenceRerankTier(shared, task, providerProjection, result.order, Number(task?.index));
+        }
+      } catch { tier = null; }
+      if (tier) {
+        this.evidenceRerankTelemetry = { used: true, reason: "ok", tier };
+        try { this.logLocal("Evidence tier applied", { taskIndex: Number(task?.index), full: tier.full, pointers: tier.pointers, dropped: tier.dropped, bytesBefore: tier.bytesBefore, bytesAfter: tier.bytesAfter }); } catch {}
+      } else {
+        this.evidenceRerankTelemetry = { used: true, reason: "ok" };
+      }
+      this.systemOneAttachBands(shared, result);
+      return shared;
+    }
+    const reason = result?.reason || "internal-error";
+    this.evidenceRerankTelemetry = { used: this.evidenceRerankTelemetry?.used === true, reason };
+    if (reason !== "cancelled") this.systemOneShowFallbackNotice();
+    this.logLocal("Evidence re-rank kept semantic order", { taskIndex: Number(task?.index), reason });
+    return shared;
+  }
+
+  // Sample collection for the built-in calibration: chunks around marked-action
+  // lines from the user's own vault + semantic index (heading fallback), with
+  // negatives from other top-level folders that are far in time and in the
+  // bottom decile of index-vector similarity. Read-only; no network calls.
+  async systemOneCalibrationSamples(options = {}) {
+    return await systemOneCalibrationSampleChunks(this, options);
+  }
+
+  // True when the stored calibration no longer matches the current index
+  // generation or the model identity most recently reported by /health.
+  // Never makes a network call; only feeds the Recalibrate hint.
+  systemOneCalibrationStale() {
+    const summary = this.settings?.evidenceRerankCalibration;
+    if (!summary || typeof summary !== "object" || !summary.verdict || summary.verdict === "failed") return false;
+    const generation = systemOneIndexGeneration(this);
+    if (summary.indexGeneration && generation && String(summary.indexGeneration) !== generation) return true;
+    const lastSeen = this._evidenceRerankLastSeenModel;
+    if (summary.model && lastSeen && String(summary.model) !== String(lastSeen)) return true;
+    return false;
+  }
+
+  // Persist the calibration summary through the model-cache mechanism with a
+  // compare-before-write rule; an identical outcome keeps the stored
+  // timestamps and writes nothing.
+  async systemOneStoreCalibrationSummary(summary) {
+    const previous = this.settings?.evidenceRerankCalibration;
+    if (systemOneCalibrationSummaryUnchanged(previous, summary)) {
+      this.settings.evidenceRerankCalibration = previous;
+      return { state: "unchanged", summary: previous };
+    }
+    this.settings.evidenceRerankCalibration = summary;
+    const state = typeof this.persistModelCacheIfChanged === "function" ? await this.persistModelCacheIfChanged() : "skipped";
+    return { state, summary };
+  }
+
+  // Display-only mirror of the Check connection / calibration progress into
+  // the sidebar status line (the settings panel text is primary; the status
+  // line mirrors it so it is visible when the panel is closed). Coalesced to
+  // at most one render per second; the final outcome is forced. In-memory
+  // only: never persisted and never a network call.
+  systemOneMirrorStatus(text, force = false) {
+    try {
+      const value = singleLine(text || "");
+      if (!value) return false;
+      const now = Date.now();
+      this._systemOneMirrorText = value;
+      if (!force && now - (Number(this._systemOneMirrorAt) || 0) < 1000) return false;
+      this._systemOneMirrorAt = now;
+      this.setSidebarStatus(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Status-line ordering label (display-only, in-memory): set while a task's
+  // evidence is being ordered, cleared when the plan's last task settles.
+  // Renders coalesce to at most one per second (the stored value always tracks
+  // the latest); the existing status refresh tick picks up the rest. No new
+  // timers and never a data.json write.
+  systemOneSetOrderingStatus(ordinal, total) {
+    try {
+      const k = Number(ordinal);
+      const n = Number(total);
+      if (!Number.isInteger(k) || !Number.isInteger(n) || k < 1 || n < 1) return false;
+      this.systemOneOrderingText = `Ordering evidence with the System One decision model - task ${k} of ${n}`;
+      return this.systemOneNotifyStatusCoalesced();
+    } catch {
+      return false;
+    }
+  }
+
+  systemOneFinishOrderingStatus(plan) {
+    try {
+      if (plan && typeof plan === "object" && Number.isFinite(Number(plan.pending))) plan.pending = Math.max(0, Number(plan.pending) - 1);
+      if (plan && Number(plan.pending) > 0) return false;
+      return this.systemOneClearOrderingStatus();
+    } catch {
+      return false;
+    }
+  }
+
+  systemOneClearOrderingStatus() {
+    try {
+      if (!this.systemOneOrderingText) return false;
+      this.systemOneOrderingText = "";
+      return this.systemOneNotifyStatusCoalesced();
+    } catch {
+      return false;
+    }
+  }
+
+  // Brief fallback segment: the server could not be used for this run, so the
+  // semantic order is kept. Visible for about 3 s (lazy expiry against the
+  // existing status tick, no new timer), then the normal status returns.
+  systemOneShowFallbackNotice() {
+    try {
+      this.systemOneFallbackNotice = { text: "System One decision model unavailable - using the normal order", until: Date.now() + 3000 };
+      this.systemOneOrderingText = "";
+      return this.systemOneNotifyStatusCoalesced(true);
+    } catch {
+      return false;
+    }
+  }
+
+  // Display-only render gate: at most one status render per second; the stored
+  // value always tracks the latest change and the existing status tick
+  // re-reads it. force=true bypasses the gate for a new outcome.
+  systemOneNotifyStatusCoalesced(force = false) {
+    try {
+      const now = Date.now();
+      if (!force && now - (Number(this._systemOneStatusNotifyAt) || 0) < 1000) return false;
+      this._systemOneStatusNotifyAt = now;
+      this.notifyAiActivityChanged();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Settings "Check connection": bounded and cancellable. GET /health and
+  // GET /v1/models (either may be missing), ONE tiny POST /v1/systemone with a
+  // fixed generic example (never vault text) to verify the System One format,
+  // then the vault calibration. Never throws; returns { status, summary }.
+  async systemOneCheckConnection(options = {}) {
+    const settings = this.settings || DEFAULT_SETTINGS;
+    const spec = evidenceRerankSettings(settings);
+    const onStatus = typeof options.onStatus === "function" ? options.onStatus : () => {};
+    const reportStatus = (text) => { onStatus(text); this.systemOneMirrorStatus(text); };
+    const signal = options.signal || null;
+    const fetchFn = options.fetchFn || (typeof globalThis !== "undefined" && typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null);
+    const finish = async (partial) => {
+      const summary = Object.assign({
+        model: "",
+        checkedAt: new Date().toISOString(),
+        latencyMs: 0,
+        verdict: "failed",
+        reason: "",
+        auc: null,
+        cutoffHigh: null,
+        cutoffLow: null,
+        indexGeneration: systemOneIndexGeneration(this)
+      }, partial);
+      const stored = await this.systemOneStoreCalibrationSummary(summary);
+      const effective = stored?.summary || summary;
+      const status = systemOneStatusLineText(effective, false);
+      this.systemOneMirrorStatus(status, true);
+      return { status, summary: effective };
+    };
+    // Calibration start/end activity-log entries (counts only, never vault
+    // text) and the cancelled path: stop promptly, mirror "Check cancelled",
+    // and close the started entry with a counts-only record.
+    let calibrationStarted = false;
+    let scoredCount = 0;
+    const cancelled = () => {
+      if (calibrationStarted) this.logLocal("System One calibration finished", { checks: scoredCount, verdict: "cancelled" });
+      calibrationStarted = false;
+      this.systemOneMirrorStatus("Check cancelled", true);
+      return { status: "Check cancelled", cancelled: true, summary: null };
+    };
+    if (!spec.baseUrl) return await finish({ verdict: "failed", reason: "url-invalid" });
+    if (!fetchFn) return await finish({ verdict: "failed", reason: "unreachable" });
+    if (signal?.aborted) return cancelled();
+    const counter = { count: 0 };
+    const countingFetch = async (url, init) => { counter.count += 1; return await fetchFn(url, init); };
+    reportStatus("Checking connection... Contacting the server (step 1 of 5)...");
+    let healthJson = null;
+    let modelsJson = null;
+    try {
+      const result = await evidenceRerankRequestJson(countingFetch, `${spec.baseUrl}/health`, { method: "GET", headers: evidenceRerankHeaders(spec) }, EVIDENCE_RERANK_HEALTH_TIMEOUT_MS, signal);
+      if (result.status >= 200 && result.status < 300) healthJson = result.json;
+    } catch { healthJson = null; }
+    try {
+      const result = await evidenceRerankRequestJson(countingFetch, `${spec.baseUrl}/v1/models`, { method: "GET", headers: evidenceRerankHeaders(spec) }, EVIDENCE_RERANK_HEALTH_TIMEOUT_MS, signal);
+      if (result.status >= 200 && result.status < 300) modelsJson = result.json;
+    } catch { modelsJson = null; }
+    if (signal?.aborted) return cancelled();
+    if (healthJson === null && modelsJson === null) return await finish({ verdict: "failed", reason: "unreachable" });
+    const model = systemOneModelIdentity(healthJson, modelsJson);
+    reportStatus("Checking connection... Verifying the System One decision format (step 2 of 5)...");
+    const startedAt = Date.now();
+    let contract = null;
+    try {
+      contract = await evidenceRerankRequestJson(countingFetch, spec.endpoint, {
+        method: "POST",
+        headers: evidenceRerankHeaders(spec),
+        body: JSON.stringify({
+          state: SYSTEM_ONE_CHECK_EXAMPLE.state,
+          questions: { q0: { type: "choice", instructions: SYSTEM_ONE_CHECK_EXAMPLE.question, options: SYSTEM_ONE_CHECK_EXAMPLE.options } }
+        })
+      }, EVIDENCE_RERANK_REQUEST_TIMEOUT_MS, signal);
+    } catch { contract = null; }
+    const latencyMs = Date.now() - startedAt;
+    if (signal?.aborted) return cancelled();
+    const contractValue = contract && contract.status === 200 ? Number(contract.json?.answers?.q0?.probabilities?.essential) : NaN;
+    if (!contract || contract.status !== 200 || contract.json?.answers?.q0?.type !== "choice" || !Number.isFinite(contractValue)) {
+      return await finish({ model, latencyMs, verdict: "failed", reason: contract ? "format" : "unreachable" });
+    }
+    const samples = await this.systemOneCalibrationSamples({ signal });
+    const positives = [];
+    const negatives = [];
+    let scoringFailure = "";
+    const actionCount = (samples.positives || []).length;
+    calibrationStarted = true;
+    this.logLocal("System One calibration started", { checks: actionCount });
+    if (actionCount) reportStatus(`Checking connection... Testing the model on your notes (step 3 of 5, 0 of ${actionCount} checks)...`);
+    else reportStatus("Checking connection... Testing the model on your notes (step 3 of 5)...");
+    for (const sample of samples.positives || []) {
+      if (signal?.aborted) return cancelled();
+      if (counter.count >= EVIDENCE_RERANK_CALIBRATION_MAX_REQUESTS) { scoringFailure = scoringFailure || "budget"; break; }
+      const candidates = [{ evidenceId: sample.evidenceId, excerpt: sample.excerpt, date: sample.date }].concat(sample.negatives || []);
+      if (candidates.length < 2) continue;
+      scoredCount += 1;
+      const result = await evidenceRerankTaskOrder(spec, { action: sample.action, noteTitle: sample.noteTitle, noteDate: sample.date }, candidates, countingFetch, { signal, useCache: options.useCache !== false });
+      if (!result.ok) {
+        if (result.reason === "cancelled") return cancelled();
+        scoringFailure = scoringFailure || result.reason;
+        continue;
+      }
+      const positiveScore = Number(result.probabilities?.[sample.evidenceId]);
+      if (Number.isFinite(positiveScore)) positives.push(positiveScore);
+      for (const negative of sample.negatives || []) {
+        const value = Number(result.probabilities?.[negative.evidenceId]);
+        if (Number.isFinite(value)) negatives.push(value);
+      }
+      reportStatus(`Checking connection... Testing the model on your notes (step 3 of 5, ${scoredCount} of ${actionCount} checks)...`);
+    }
+    reportStatus("Checking connection... Deriving the relevance bands (step 4 of 5)...");
+    const metrics = evidenceRerankCalibrationMetrics(positives, negatives);
+    const verdict = positives.length && metrics.auc !== null && metrics.auc >= EVIDENCE_RERANK_CALIBRATION_AUC_MIN && positives.length >= EVIDENCE_RERANK_CALIBRATION_MIN_POSITIVES
+      ? "ok"
+      : positives.length ? "weak" : "untested";
+    calibrationStarted = false;
+    this.logLocal("System One calibration finished", { checks: scoredCount, verdict });
+    reportStatus("Checking connection... Saving the result (step 5 of 5)...");
+    const round4 = (value) => (value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Math.round(Number(value) * 10000) / 10000);
+    return await finish({
+      model,
+      latencyMs,
+      verdict,
+      reason: !positives.length && scoringFailure ? scoringFailure : "",
+      auc: round4(metrics.auc),
+      cutoffHigh: round4(metrics.cutoffHigh),
+      cutoffLow: round4(metrics.cutoffLow)
+    });
+  }
+
+  // Attach the coarse relevance bands (central/background) to the reordered
+  // task's envelope for the evidence table renderer. Only when a successful
+  // calibration exists and "Show relevance bands to the model" is on. This
+  // never changes the wire text: the renderer consumes shared.evidenceRerankBands.
+  systemOneAttachBands(shared, result) {
+    const settings = this.settings || DEFAULT_SETTINGS;
+    if (settings.evidenceRerankShowBands === false) return false;
+    const summary = settings.evidenceRerankCalibration;
+    if (!summary || typeof summary !== "object" || summary.verdict !== "ok") return false;
+    const probabilities = result?.probabilities;
+    if (!probabilities || typeof probabilities !== "object") return false;
+    const row = (shared?.providerTaskRows || [])[0];
+    const handleTable = shared?.handleTable || null;
+    const byHandleMap = handleTable?.byHandle instanceof Map
+      ? handleTable.byHandle
+      : (handleTable?.byHandle && typeof handleTable.byHandle === "object" ? handleTable.byHandle : null);
+    if (!row || !byHandleMap) return false;
+    const byEvidenceId = {};
+    for (const [evidenceId, probability] of Object.entries(probabilities)) {
+      const band = evidenceRerankBandForProbability(summary, probability);
+      if (band) byEvidenceId[evidenceId] = band;
+    }
+    if (!Object.keys(byEvidenceId).length) return false;
+    const byHandle = {};
+    for (const ref of Array.isArray(row.refs) ? row.refs : []) {
+      const evidenceId = String(byHandleMap instanceof Map ? (byHandleMap.get(String(ref)) || "") : (byHandleMap[String(ref)] || ""));
+      if (evidenceId && byEvidenceId[evidenceId]) byHandle[String(ref)] = byEvidenceId[evidenceId];
+    }
+    shared.evidenceRerankBands = {
+      verdict: "ok",
+      cutoffHigh: summary.cutoffHigh,
+      cutoffLow: summary.cutoffLow,
+      byEvidenceId,
+      byHandle
+    };
+    return true;
+  }
+
   async refineTaskDescriptions(tasks, sourceSummary, context, sourceTitle, descriptionInstructions, options = {}, activity = null) {
     const mainTasks = (tasks || []).map((task, index) => ({
       index,
@@ -13895,6 +16243,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     };
     const finalize = (failureEntries = [], generatedCount = 0) => {
       const failures = new Map();
+      // Task 3(b): every return path drops registered per-task holders (the
+      // local evidence map itself dies with this call).
+      this._releaseDescriptionIntermediates();
+      // Task 7 (L2): the description phase is the run's last local phase; drop
+      // the run's wall-time memo working data with the per-task intermediates.
+      releaseWalltimeMemos();
       for (const entry of failureEntries || []) {
         if (!Number.isInteger(entry?.taskIndex) || !tasks[entry.taskIndex]) continue;
         // Terminal classification is marker-independent and fail-closed: an
@@ -14037,6 +16391,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (sharedTaskEvidence.dispatchAllowed === false) {
       return failAll("description provider evidence closure was incomplete", "context-bundle");
     }
+    // Optional System One decision model (off by default): start one bounded
+    // decision-model run per task now that its admitted rows are final,
+    // overlapping the dispatch below. Results only reorder that task's refs.
+    const evidenceRerankPlan = this.startEvidenceRerankForTasks(mainTasks, {
+      structuredEvidence,
+      providerProjection: descriptionProviderProjection,
+      sourceTitle,
+      sourceContract: options.sourceContract
+    });
     const contextQuery = [sourceTitle, mainTasks.map((task) => task.title).join("\n")].filter(Boolean).join("\n");
     const modelChoice = this.aiModelForRequest("description", {
       prompt: contextQuery,
@@ -14052,14 +16415,38 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       : this.settings;
     this.setSidebarStatus(`Writing descriptions 0 of ${mainTasks.length}...`);
     const descriptionCaptureRoot = options.captureContext || this.beginProviderCapture("task-description");
+    // Task 7 (L1) per-task dispatch: each task's closed evidence payload is
+    // assembled lazily, on first use inside the dispatch pool, instead of
+    // eagerly for every task before the first request. The first description
+    // request starts as soon as the shared gates pass and ITS own payload is
+    // assembled, so the remaining tasks' local payload prep overlaps earlier
+    // provider waits. Values, slot order, telemetry order and retry/recovery
+    // reads are unchanged: the same pure builder produces the same payload, the
+    // map stays this call's owner for retry reads, and Task 3(b) registration
+    // happens at the same first-use moment. Leftovers from an aborted earlier
+    // run are swept first.
     const singletonSharedByIndex = new Map();
-    for (const task of mainTasks) {
-      const singletonShared = taskDescriptionSharedEvidencePayload([task], options.sourceContract, {
-        contextBundle: options.contextBundle || null,
-        providerProjection: descriptionProviderProjection
-      });
-      singletonSharedByIndex.set(task.index, singletonShared);
-    }
+    this._taskIntermediateByKey = this._taskIntermediateByKey instanceof Map ? this._taskIntermediateByKey : new Map();
+    this._releaseDescriptionIntermediates();
+    const ensureSingletonShared = async (task) => {
+      const existing = singletonSharedByIndex.get(task.index);
+      if (existing !== undefined) return existing;
+      // Optional decision model: await THIS task's System One result before its
+      // payload is built, so only this task's description request waits for it.
+      const shared = evidenceRerankPlan
+        ? await this.descriptionSingletonEvidencePayloadReranked(task, options.sourceContract, options.contextBundle || null, descriptionProviderProjection, evidenceRerankPlan)
+        : this.descriptionSingletonEvidencePayload(task, options.sourceContract, options.contextBundle || null, descriptionProviderProjection);
+      singletonSharedByIndex.set(task.index, shared);
+      if (shared) this._taskIntermediateByKey.set(`description:${task.index}`, { index: task.index, shared });
+      return shared;
+    };
+    const releaseDescriptionIntermediates = (indexes = null) => {
+      const list = Array.isArray(indexes) ? indexes : mainTasks.map((task) => task.index);
+      for (const index of list) {
+        singletonSharedByIndex.delete(index);
+        this.releaseTaskIntermediates(`description:${index}`);
+      }
+    };
     const requestDescriptionSingleton = async (targetTask, slotEntry, phase = "initial", sharedInstructionLines = null) => {
       slotEntry.transportAttempted = false;
       const failSetup = (error) => {
@@ -14073,7 +16460,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       let singletonShared = null;
       let promptRow = null;
       try {
-      singletonShared = singletonSharedByIndex.get(targetTask.index) || null;
+      singletonShared = (await ensureSingletonShared(targetTask)) || null;
       if (!singletonShared || singletonShared.dispatchAllowed === false) {
         const error = new Error("description provider evidence closure was incomplete");
         error.code = "closure-incomplete";
@@ -14432,8 +16819,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const initialValidation = validateDescriptionBatch(parsed, mainTasks);
     const validatedDescriptions = initialValidation.validatedDescriptions;
     let failures = [...initialParseFailures, ...initialValidation.failures];
-    recoveryTelemetry.initialFailedIndexes = uniqueValues(failures.map((failure) => failure.taskIndex))
+    recoveryTelemetry.initialFailedIndexes = uniqueIndexes(failures.map((failure) => failure.taskIndex))
       .sort((left, right) => left - right);
+    // Task 3(b): a validated description cannot be retried (retries cover
+    // failures only), so its intermediate payload is released here.
+    {
+      const initiallyFailedIndexes = new Set(failures.map((failure) => failure.taskIndex));
+      releaseDescriptionIntermediates(mainTasks.map((task) => task.index).filter((index) => !initiallyFailedIndexes.has(index)));
+    }
     const fullLocalEvidenceById = new Map(Object.entries(options.contextBundle?.evidenceById || {}));
     for (const evidence of options.evidenceCatalog?.items || []) {
       const evidenceId = String(evidence?.evidenceId || evidence?.id || "");
@@ -14527,7 +16920,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       && failures.length > 0
       && failures.every(retryableFailure);
     if (retryable) {
-      const retryIndexes = uniqueValues(failures.map((failure) => failure.taskIndex)).sort((left, right) => left - right);
+      const retryIndexes = uniqueIndexes(failures.map((failure) => failure.taskIndex)).sort((left, right) => left - right);
       const retryMainTasks = mainTasks.filter((task) => retryIndexes.includes(task.index));
       const inputPreflight = recoveryInputPreflight(retryMainTasks);
       if (!inputPreflight.valid) {
@@ -14628,6 +17021,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       }
       }
     }
+    // Task 3(b): the retry dispatch (if any) has settled; every remaining
+    // description-phase intermediate payload is now dead (the final loop reads
+    // only validated descriptions and task objects).
+    releaseDescriptionIntermediates();
     for (const item of mainTasks) {
       if (failures.some((failure) => failure.taskIndex === item.index)) continue;
       const validated = validatedDescriptions.get(item.index);
@@ -15967,6 +18364,89 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return { used: true, applied: false, coverage, hierarchyIssues, attempts: maxAttempts };
   }
 
+  // Setting requireModelDueDates (default on): every generated top-level task
+  // must end with a usable due date. One bounded recovery send may supply the
+  // missing dates (same single-retry pattern as description recovery); any
+  // date still missing or unusable is filled or corrected deterministically
+  // from the planning date and the task's priority, so the workflow never
+  // fails for a missing date and no main task stays dateless.
+  async ensureRequiredModelDueDates(tasks = [], options = {}) {
+    if (this.settings.requireModelDueDates !== true) return null;
+    const planningDate = options.planningDate || today();
+    const report = { used: false, attempts: 0, recovered: 0, fallbackCount: 0, correctedCount: 0 };
+    const sourceEvidence = [options.sourceTitle, options.sourceContext?.text, options.sourceSummary].filter(Boolean).join("\n");
+    const missingBefore = tasksMissingRequiredDueDate(tasks, planningDate);
+    if (missingBefore.length) {
+      report.used = true;
+      report.attempts = 1;
+      try {
+        const missingIndexes = new Set(missingBefore.map(({ index }) => index));
+        const recoveryPrompt = [
+          `Due-date recovery for ${missingBefore.length} main task${missingBefore.length === 1 ? "" : "s"}.`,
+          REQUIRED_DUE_DATE_INSTRUCTION,
+          `Current local planning date (device local): ${planningDate}.`,
+          "Return due_dates rows for exactly the listed main task indexes; do not rename, add, or reorder tasks.",
+          JSON.stringify(missingBefore.map(({ task, index }) => ({ index, title: singleLine(task.content || ""), priority: normalizePriority(task.priority) })))
+        ].join("\n");
+        const modelChoice = this.aiModelForRequest("task-generation", {
+          prompt: recoveryPrompt,
+          context: options.semanticContext || [],
+          taskCount: missingBefore.length
+        });
+        const json = await this.withAiActivity("Recovering missing due dates", () => this.openaiResponse({
+          operation: "task-generation",
+          model: modelChoice.model,
+          jsonSchema: requiredDueDateRecoverySchema(),
+          system: [
+            "You are filling in missing due dates for an already-approved task list.",
+            "Return only JSON matching the supplied strict structured-output schema.",
+            "Due dates are planning judgments, not source facts; never invent a source date and preserve explicit source dates."
+          ].join(" "),
+          user: [
+            recoveryPrompt,
+            "",
+            "Source:",
+            truncateAtWord(singleLine(sourceEvidence), 4000)
+          ].join("\n")
+        }));
+        const parsed = JSON.parse(json);
+        const rows = Array.isArray(parsed?.due_dates) ? parsed.due_dates : Array.isArray(parsed?.tasks) ? parsed.tasks : [];
+        for (let position = 0; position < rows.length; position += 1) {
+          const row = rows[position];
+          const index = Number.isInteger(row?.index) ? row.index : position;
+          if (!missingIndexes.has(index) || !tasks[index]) continue;
+          const value = requiredDueDateNormalized(row?.due_date, planningDate);
+          if (!value) continue;
+          tasks[index].due_date = value;
+          report.recovered += 1;
+        }
+      } catch (error) {
+        this.logLocal("Required due-date recovery skipped", { source: options.source || "", error: error.message || String(error) });
+      }
+    }
+    for (const { task } of tasksMissingRequiredDueDate(tasks, planningDate)) {
+      task.due_date = requiredDueDateFallbackForTask(task, planningDate);
+      report.fallbackCount += 1;
+    }
+    for (const task of tasks || []) {
+      if (!task || task.isSubtask || task.id || task.deduplication?.todoistId) continue;
+      const normalized = requiredDueDateNormalized(task.due_date, planningDate);
+      if (normalized && normalized !== task.due_date) {
+        task.due_date = normalized;
+        report.correctedCount += 1;
+      }
+    }
+    if (report.fallbackCount || report.correctedCount || report.recovered) {
+      this.logLocal("Applied required model due dates", {
+        source: options.source || "",
+        dueDateFallbackCount: report.fallbackCount,
+        dueDateCorrectedCount: report.correctedCount,
+        dueDateRecoveredCount: report.recovered
+      });
+    }
+    return report;
+  }
+
   async prepareGeneratedTasksForTodoistWorkflow(tasks, plan = {}, options = {}) {
     const todoistBound = options.prepareTodoistSection === true;
     const fallbackSectionName = options.sectionName || plan.sectionName || "";
@@ -15985,6 +18465,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (String(options.source || "").toLowerCase() === "note") {
       completeEmptyGeneratedTaskFields(tasks);
     }
+    const requiredDueDates = await this.ensureRequiredModelDueDates(tasks, {
+      source: options.source || "",
+      sourceTitle: options.sourceTitle || "",
+      sourceContext: options.sourceContext || null,
+      sourceSummary: plan.sourceSummary || "",
+      semanticContext: plan.semanticContext || []
+    });
+    if (requiredDueDates) plan.requiredDueDates = requiredDueDates;
     const workflowContext = plan.taskWorkflowContextBundle || plan.contextBundle;
     const sectionNamePromise = this.generateTaskSectionName(tasks, plan, {
       source: options.source || "",
@@ -17231,7 +19719,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const semanticRanks = semanticTaskReferenceCandidateRanks(options.semanticContext || []);
     const semanticChunks = (this.semanticIndex || []).filter((chunk) => {
       const sourceKind = semanticChunkSourceKind(chunk);
-      return (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record") && Array.isArray(chunk.embedding) && chunk.embedding.length > 0;
+      return (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record") && isEmbeddingVector(chunk.embedding) && chunk.embedding.length > 0;
     });
     const chunkByTaskId = new Map();
     for (const chunk of semanticChunks) {
@@ -17277,12 +19765,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // identity inclusion must address artifact rows directly.
     const routingIntegrity = semanticIndexIntegrity(routingRawChunks, routingRawChunks, this.settings);
     const routingChunks = routingIntegrity.validChunks;
-    const firstIndexedDimension = Number(routingChunks.find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || 0);
+    const firstIndexedDimension = Number(routingChunks.find((chunk) => isEmbeddingVector(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || 0);
     const activeDimension = Number(this.settings.semanticIndexMeta?.dimension || firstIndexedDimension || semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {}));
     const typedChunks = routingChunks.filter((chunk) => {
       const sourceKind = semanticChunkSourceKind(chunk);
       return (sourceKind === "todoist-snapshot-reference-row" || sourceKind === "subtask-task-tree-record")
-        && Array.isArray(chunk.embedding)
+        && isEmbeddingVector(chunk.embedding)
         && chunk.embedding.length > 0;
     });
     const telemetry = {
@@ -19212,6 +21700,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(embeddings, "Use note created time", "Use a note's created value when ranking current context; otherwise use file metadata.", this.plugin, "useNoteCreatedTimeForSemanticIndex");
     toggleSetting(embeddings, "Update the index automatically", "Re-index changed notes after a short delay.", this.plugin, "autoUpdateSemanticIndex");
     numberSetting(embeddings, "Index update delay seconds", this.plugin, "semanticIndexDelaySeconds");
+    dropdownSettingWithDesc(embeddings, "Semantic search mode", "Exact scores every indexed chunk; routed scores only the shards the router selects, which is faster on large vaults. Exact stays available.", this.plugin, "semanticSearchMode", ["exact", "routed"]);
+
     new Setting(embeddings)
       .setName("Index shard size")
       .setDesc("4.5 MB keeps every index file under the Obsidian Sync Standard 5 MB limit so Sync copies them. 10 MB makes index files larger than that limit so Sync Standard skips them (use this if you exclude index files from Sync; Sync Plus has a 200 MB limit and will still sync 10 MB files). Changing this applies the next time the index is saved; existing index files are not rewritten until then.")
@@ -19225,6 +21715,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       });
     new Setting(embeddings).setName("Semantic vault index").setDesc(indexSummary(this.plugin)).addButton((button) => button.setButtonText("Rebuild").onClick(() => this.plugin.rebuildSemanticIndex(true)));
     renderInactiveSemanticIndexPurge(embeddings, this.plugin, () => this.display());
+    systemOneDecisionModelSettings(embeddings, this.plugin);
 
     const search = settingsDisclosure(containerEl, "Internet Search", "Search is off by default. Selecting a mode only changes saved search preferences; execution belongs to the chat action.", false);
     webResearchSettings(search, this.plugin);
@@ -19275,6 +21766,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Maximum Todoist description characters", this.plugin, "todoistDescriptionMaxChars");
     numberSetting(containerEl, "Parallel description requests", this.plugin, "taskDescriptionConcurrency");
     subtaskCriteriaSettings(containerEl, this.plugin);
+    toggleSetting(containerEl, "Require model due dates", "When on, the AI always proposes a due date for each new task from its own judgment of urgency and timeline, even if the note gives none. Turn off to only use dates the note states.", this.plugin, "requireModelDueDates");
     toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// links when task references are shown in the sidebar.", this.plugin, "linksAppURI");
     numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
 
@@ -20504,6 +22996,15 @@ const SETTING_DESCRIPTIONS = {
   useNoteCreatedTimeForSemanticIndex: "Uses a note frontmatter created value, for example created: [\"2026-05-20 13:43\"], as the meeting/date signal in semantic ranking. When disabled, only file metadata is used.",
   autoUpdateSemanticIndex: "When enabled, edited notes are re-indexed after a delay while Obsidian is open.",
   semanticIndexDelaySeconds: "Wait time before re-indexing changed notes, so rapid edits collapse into one update.",
+  semanticSearchMode: "Exact scores every indexed chunk; routed scores only the shards the router selects, which is faster on large vaults. Exact stays available.",
+  evidenceRerankEnabled: "Optional. Uses a System One decision model on your own server to put the most relevant evidence first. Sends task text and short note excerpts to that server. Off by default.",
+  evidenceRerankUrl: "Address of the System One decision model server, for example http://192.0.2.10:8011; the endpoint <url>/v1/systemone is used. Task text and short note excerpts are sent to this address; use a server on your own network.",
+  evidenceRerankApiKey: "Optional. Sent as a Bearer token. Stored like the other plugin secrets and never logged.",
+  evidenceRerankMaxCandidates: "Maximum evidence rows scored per task (8 to 60; 32 by default).",
+  evidenceRerankTimeoutMs: "Total System One decision model budget per task in milliseconds (1000 to 60000; 12000 by default).",
+  evidenceRerankShowBands: "Show a coarse relevance band (central or background) on evidence rows to the model after a successful calibration. The raw probability is never shown.",
+  evidenceRerankTier: "Send fewer notes in full: the System One decision model picks the 8 most relevant passages to send in full and a one-line pointer for the next 16, so each request is shorter and cheaper. Needs the System One decision model to be on. Off by default.",
+  evidenceRerankCalibration: "Saved connection and calibration summary from the last Check connection run. Stored in model-cache.json, not data.json.",
   autoProcessEmails: "When enabled, Obsidian polls your Cloudflare Worker for forwarded emails while the app is open.",
   emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled. To protect the Cloudflare KV Free list limit, automatic polling is clamped to at least 420 seconds.",
   maxNoteChars: "Maximum characters read from a note as a task source. This is a note-ingestion bound, not a model-context display limit.",
@@ -20573,7 +23074,8 @@ const SETTING_DESCRIPTIONS = {
   noteDateInstructions: "Plain-language rules for choosing note task due dates and deadlines.",
   noteTagInstructions: "Plain-language rules for allowed Todoist labels from note tasks.",
   notePriorityInstructions: "Plain-language rules for note task priority 1 to 4.",
-  noteDescriptionInstructions: "Plain-language rules for note task descriptions."
+  noteDescriptionInstructions: "Plain-language rules for note task descriptions.",
+  requireModelDueDates: "When on, the AI always proposes a due date for each new task from its own judgment of urgency and timeline, even if the note gives none. Turn off to only use dates the note states."
 };
 
 function settingDescription(name, key, fallback = "") {
@@ -20632,6 +23134,250 @@ function textSetting(containerEl, name, desc, plugin, key) {
     plugin.settings[key] = key === "workerUrl" ? normalizeHttpsUrl(value) : value;
     await plugin.saveSettings();
   }));
+}
+
+// System One decision model settings (optional). One toggle; when it is on,
+// one Server address field, one Check connection button with a status line,
+// and a collapsed Advanced subsection. The row model below is pure (no DOM,
+// no network) so the local tests can assert the exact row set; rendering and
+// toggling never make network calls by themselves — only the button does.
+function systemOneCalibrationDetailsText(summary) {
+  if (!summary || typeof summary !== "object" || !summary.verdict) {
+    return "Calibration runs when you click Check connection. It checks that the System One decision model separates related from unrelated notes on this vault, using short excerpts of your own notes, and derives the display bands. It checks basic discrimination, not fine ranking quality.";
+  }
+  if (summary.verdict === "ok") {
+    return `Last calibration: ok. Separation (AUC) ${Number(summary.auc).toFixed(2)}; central band from p >= ${Number(summary.cutoffHigh).toFixed(2)}, background band at p <= ${Number(summary.cutoffLow).toFixed(2)}. Calibration checks basic discrimination on your vault, not fine ranking quality.`;
+  }
+  if (summary.verdict === "weak") {
+    const auc = Number.isFinite(Number(summary.auc)) ? Number(summary.auc).toFixed(2) : "n/a";
+    return `Last calibration: weak separation (AUC ${auc}). The System One decision model may still order rows, but no relevance bands are shown to the model. Calibration checks basic discrimination on your vault, not fine ranking quality.`;
+  }
+  if (summary.verdict === "untested") {
+    return "Last calibration: no usable vault samples were found, so the System One decision model only orders rows and no relevance bands are shown. Calibration checks basic discrimination on your vault, not fine ranking quality.";
+  }
+  return "Last check failed; the System One decision model is not used for bands. Calibration checks basic discrimination on your vault, not fine ranking quality.";
+}
+
+function systemOneStatusLineText(summary, stale = false) {
+  if (!summary || typeof summary !== "object" || !summary.verdict) return "Not checked yet.";
+  let line = "";
+  if (summary.verdict === "failed") {
+    line = summary.reason === "unreachable" ? "Can't reach the server" : "Server answered but not in System One format";
+  } else {
+    const model = String(summary.model || "System One decision model");
+    const latency = Number.isFinite(Number(summary.latencyMs)) ? Number(summary.latencyMs) : 0;
+    if (summary.verdict === "ok") line = `Connected: ${model} - ${latency} ms - calibration OK`;
+    else if (summary.verdict === "weak") line = `Connected: ${model} - ${latency} ms - Calibration found weak separation: using the normal order`;
+    else line = `Connected: ${model} - ${latency} ms - calibration untested: using the normal order`;
+  }
+  return stale ? `${line} - Recalibrate` : line;
+}
+
+// Calibration transparency (user ruling): one plain sentence shown before the
+// run, the exact stale notice, and the plain-language result view for the
+// settings panel. All pure (no DOM, no network) so the local tests can assert
+// the exact strings.
+const SYSTEM_ONE_STALE_NOTICE = "Calibration is out of date for this model/index. Click Check connection to recalibrate.";
+
+// Synchronous estimate of the number of calibration checks (scoring calls)
+// the vault/index will produce: one check per sampled marked-action note
+// (heading fallback), capped by the calibration positive limit. No network,
+// no vault reads; feeds the "about N checks" up-front sentence.
+function systemOnePlannedCheckCount(plugin) {
+  try {
+    const settings = plugin?.settings || DEFAULT_SETTINGS;
+    const chunks = Array.isArray(plugin?.semanticIndex) ? plugin.semanticIndex : [];
+    const usable = chunks.filter((chunk) => chunk
+      && typeof chunk.text === "string" && chunk.text.trim()
+      && !chunk.metadataOnly
+      && chunk.evidenceEligibility !== "metadata"
+      && isEmbeddingVector(chunk.embedding) && chunk.embedding.length);
+    const limit = Math.max(1, Number(EVIDENCE_RERANK_CALIBRATION_POSITIVE_LIMIT) || 12);
+    const markerRegex = noteActionMarkerRegex(settings);
+    const markerPaths = uniqueValues(usable.filter((chunk) => markerRegex.test(chunk.text)).map((chunk) => String(chunk.path || ""))).filter(Boolean);
+    if (markerPaths.length) return Math.min(markerPaths.length, limit);
+    const headings = usable.filter((chunk) => /^#{1,6}\s+\S/.test(String(chunk.text || "").trim()));
+    return Math.min(headings.length, limit);
+  } catch {
+    return 0;
+  }
+}
+
+// The up-front sentence: what is sent, about how many checks, and that the
+// plugin stores nothing on the server.
+function systemOneTransparencySentence(plugin) {
+  const checks = systemOnePlannedCheckCount(plugin);
+  const countText = checks > 0
+    ? `about ${checks} check${checks === 1 ? "" : "s"}`
+    : `up to ${Math.max(1, Number(EVIDENCE_RERANK_CALIBRATION_POSITIVE_LIMIT) || 12)} checks`;
+  return `Check connection sends short excerpts from a sample of your own notes to your server (${countText}); the plugin stores nothing on the server.`;
+}
+
+// Plain-language result view for the settings panel: verdict, what it means
+// (relevance labels will / will not be shown to the writing model; order
+// only), the three numbers for the expandable Details row, and when it ran.
+function systemOneResultViewModel(summary) {
+  if (!summary || typeof summary !== "object" || !summary.verdict) {
+    return { verdictText: "", meaningText: "", detailsText: "", whenText: "" };
+  }
+  const model = String(summary.model || "System One decision model");
+  const latency = Number.isFinite(Number(summary.latencyMs)) ? Number(summary.latencyMs) : 0;
+  const fmt = (value) => (value === null || value === undefined || !Number.isFinite(Number(value)) ? "n/a" : Number(value).toFixed(2));
+  let verdictText = "";
+  let meaningText = "";
+  if (summary.verdict === "ok") {
+    verdictText = "Last calibration: ok.";
+    meaningText = "Relevance labels will be shown to the writing model. The System One decision model only changes the order of your evidence rows.";
+  } else if (summary.verdict === "weak") {
+    verdictText = `Last calibration: weak separation (AUC ${fmt(summary.auc)}).`;
+    meaningText = "Relevance labels will not be shown to the writing model. The System One decision model only changes the order of your evidence rows.";
+  } else if (summary.verdict === "untested") {
+    verdictText = "Last calibration: untested - no usable samples from your notes were found.";
+    meaningText = "Relevance labels will not be shown to the writing model. The System One decision model only orders your evidence rows.";
+  } else {
+    verdictText = "Last check failed.";
+    meaningText = "Relevance labels will not be shown to the writing model.";
+  }
+  const detailsText = `Model: ${model}; latency ${latency} ms. Separation (AUC) ${fmt(summary.auc)}; central band cutoff ${fmt(summary.cutoffHigh)}; background band cutoff ${fmt(summary.cutoffLow)}.`;
+  const whenText = summary.checkedAt ? `Checked: ${String(summary.checkedAt)}` : "";
+  return { verdictText, meaningText, detailsText, whenText };
+}
+
+// Row model for the System One decision model section: the renderer below and
+// the local tests consume the same structure. Off => only the toggle row.
+function systemOneDecisionModelSettingsModel(plugin) {
+  const enabled = plugin?.settings?.evidenceRerankEnabled === true;
+  const summary = plugin?.settings?.evidenceRerankCalibration && typeof plugin.settings.evidenceRerankCalibration === "object"
+    ? plugin.settings.evidenceRerankCalibration
+    : null;
+  const stale = typeof plugin?.systemOneCalibrationStale === "function" ? plugin.systemOneCalibrationStale() === true : false;
+  return {
+    enabled,
+    toggle: { type: "toggle", name: "System One decision model (optional)", key: "evidenceRerankEnabled" },
+    rows: enabled ? [
+      { type: "url", name: "Server address", key: "evidenceRerankUrl" },
+      { type: "check", name: "Check connection" },
+      { type: "status", text: systemOneStatusLineText(summary, stale) }
+    ] : [],
+    advanced: enabled ? [
+      { type: "secret", name: "API key (optional)", key: "evidenceRerankApiKey" },
+      { type: "number", name: "Maximum rows scored per task", key: "evidenceRerankMaxCandidates" },
+      { type: "number", name: "Per-task timeout (ms)", key: "evidenceRerankTimeoutMs" },
+      { type: "toggle", name: "Show relevance bands to the model", key: "evidenceRerankShowBands" },
+      { type: "toggle", name: "Max efficiency", key: "evidenceRerankTier" },
+      { type: "note", text: systemOneCalibrationDetailsText(summary) }
+    ] : []
+  };
+}
+
+// Server address input: accepts only an explicit http(s) URL and saves the
+// normalized origin+path (no trailing slash). Invalid input keeps the
+// previously saved value. Saving never makes a network call.
+function systemOneServerAddressSetting(containerEl, plugin) {
+  new Setting(containerEl)
+    .setName("Server address")
+    .setDesc(settingDescription("Server address", "evidenceRerankUrl"))
+    .addText((text) => text.setValue(String(plugin.settings.evidenceRerankUrl || "")).onChange(async (value) => {
+      const trimmed = String(value || "").trim();
+      if (!trimmed) {
+        plugin.settings.evidenceRerankUrl = "";
+        await plugin.saveSettings();
+        return;
+      }
+      let normalized = "";
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          normalized = `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+        }
+      } catch { normalized = ""; }
+      if (!normalized) return;
+      plugin.settings.evidenceRerankUrl = normalized;
+      await plugin.saveSettings();
+    }));
+}
+
+function systemOneDecisionModelSettings(containerEl, plugin) {
+  new Setting(containerEl)
+    .setName("System One decision model (optional)")
+    .setDesc(settingDescription("System One decision model (optional)", "evidenceRerankEnabled"))
+    .addToggle((toggle) => toggle.setValue(plugin.settings.evidenceRerankEnabled === true).onChange(async (value) => {
+      plugin.settings.evidenceRerankEnabled = value === true;
+      await plugin.saveSettings();
+      renderSystemOneDecisionModelBody();
+    }));
+  const body = containerEl.createDiv({ cls: "semantic-todoist-systemone-body" });
+  let statusEl = null;
+  let running = false;
+  let controller = null;
+  async function runCheck(button) {
+    if (running) {
+      controller?.abort?.();
+      return;
+    }
+    running = true;
+    controller = new AbortController();
+    button.setButtonText("Cancel");
+    statusEl.setText("Checking connection...");
+    // A Notice only when the settings panel is closed: the panel text is
+    // primary and the status line mirrors progress, so a Notice is added only
+    // when neither is visible, and never more than one per run boundary.
+    const panelClosedAtStart = Boolean(statusEl && statusEl.isConnected === false);
+    if (panelClosedAtStart) { try { new Notice("Checking the System One decision model on your notes..."); } catch {} }
+    let result = null;
+    try {
+      result = await plugin.systemOneCheckConnection({ signal: controller.signal, onStatus: (text) => statusEl.setText(text) });
+    } catch { result = null; }
+    running = false;
+    controller = null;
+    button.setButtonText("Check connection");
+    statusEl.setText(result?.status || "Can't reach the server");
+    if (statusEl && statusEl.isConnected === false && result?.status) { try { new Notice(result.status); } catch {} }
+    // Re-render only when a summary exists: the plain-language verdict, the
+    // Details row, when it ran and the Recalibrate button stay visible. A
+    // cancelled run keeps its "Check cancelled" text in place.
+    if (result?.summary) renderSystemOneDecisionModelBody();
+  }
+  function renderSystemOneDecisionModelBody() {
+    body.empty();
+    statusEl = null;
+    const model = systemOneDecisionModelSettingsModel(plugin);
+    if (!model.enabled) {
+      body.style.display = "none";
+      return;
+    }
+    body.style.display = "";
+    systemOneServerAddressSetting(body, plugin);
+    // Transparency before anything runs: one plain sentence (what is sent,
+    // about how many checks, nothing stored on the server). Never a network
+    // call; rendering alone starts nothing.
+    body.createDiv({ cls: "semantic-todoist-systemone-transparency", text: systemOneTransparencySentence(plugin) });
+    const summary = plugin.settings.evidenceRerankCalibration && typeof plugin.settings.evidenceRerankCalibration === "object" ? plugin.settings.evidenceRerankCalibration : null;
+    const stale = typeof plugin.systemOneCalibrationStale === "function" ? plugin.systemOneCalibrationStale() === true : false;
+    // Never silent: a changed model identity / index generation shows the
+    // exact notice and never auto-runs a request.
+    if (stale) body.createDiv({ cls: "semantic-todoist-systemone-stale", text: SYSTEM_ONE_STALE_NOTICE });
+    const check = new Setting(body).setName("Check connection").setDesc("Connects to the server above, verifies the System One decision format, then calibrates on this vault. Sends short excerpts of your notes to the server you configured.");
+    statusEl = check.settingEl.createDiv({ cls: "semantic-todoist-systemone-status", text: model.rows.find((row) => row.type === "status")?.text || "Not checked yet." });
+    check.addButton((button) => button.setButtonText("Check connection").onClick(async () => { await runCheck(button); }));
+    if (summary) {
+      const view = systemOneResultViewModel(summary);
+      body.createDiv({ cls: "semantic-todoist-systemone-verdict", text: view.verdictText });
+      body.createDiv({ cls: "semantic-todoist-systemone-meaning", text: view.meaningText });
+      if (view.whenText) body.createDiv({ cls: "semantic-todoist-systemone-when", text: view.whenText });
+      const details = settingsDisclosure(body, "Details", view.detailsText);
+      details.createDiv({ cls: "semantic-todoist-systemone-details", text: view.detailsText });
+      new Setting(body).setName("Recalibrate").setDesc("Runs Check connection again to recalibrate the System One decision model on this vault.").addButton((button) => button.setButtonText("Recalibrate").onClick(async () => { await runCheck(button); }));
+    }
+    const advanced = settingsDisclosure(body, "Advanced", "API key, row budget, timeout, relevance bands and calibration details.");
+    secretSetting(advanced, "API key (optional)", plugin, "evidenceRerankApiKey");
+    numberSetting(advanced, "Maximum rows scored per task", plugin, "evidenceRerankMaxCandidates");
+    numberSetting(advanced, "Per-task timeout (ms)", plugin, "evidenceRerankTimeoutMs");
+    toggleSetting(advanced, "Show relevance bands to the model", "Show a coarse relevance band (central or background) on evidence rows to the model after a successful calibration. The raw probability is never shown.", plugin, "evidenceRerankShowBands");
+    toggleSetting(advanced, "Max efficiency", "Send fewer notes in full: the System One decision model picks the 8 most relevant passages to send in full and a one-line pointer for the next 16, so each request is shorter and cheaper. Needs the System One decision model to be on. Off by default.", plugin, "evidenceRerankTier");
+    advanced.createDiv({ cls: "semantic-todoist-systemone-calibration", text: model.advanced.find((row) => row.type === "note")?.text || "" });
+  }
+  renderSystemOneDecisionModelBody();
 }
 
 const STABLE_PROVIDER_LABELS = Object.freeze({
@@ -23333,7 +26079,7 @@ function indexSummary(pluginOrSettings) {
   const chunks = Number(meta.chunks || pluginOrSettings.semanticIndex?.length || 0);
   const contentVersion = Number(meta.embeddingContentVersion || 1);
   const upgrade = chunks && contentVersion < SEMANTIC_EMBEDDING_CONTENT_VERSION
-    ? " Retrieval metadata upgrade available: rebuild the semantic vault index to embed project paths and note dates and remove low-value placeholder chunks."
+    ? ` Retrieval metadata upgrade available: rebuild the semantic vault index to embed project paths, note dates, and context headers (note title | date | heading path) in the embedding input. Rebuild re-embeds the vault once; local Qwen3 is free, paid embedding providers will incur one-time cost.`
     : "";
   if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}${total}${upgrade}`;
   if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes}${total} Rebuild the semantic vault index.`;
@@ -23404,8 +26150,53 @@ const MODEL_CACHE_SETTINGS_KEYS = Object.freeze([
   "openrouterEmbeddingModelMetadata",
   "customOpenAIModelMetadata",
   "openrouterMetadataFingerprint",
-  "openrouterMetadataRevision"
+  "openrouterMetadataRevision",
+  "evidenceRerankCalibration"
 ]);
+
+// Per-device persistence (data.json churn offload): volatile bookkeeping that
+// must not rewrite the synced data.json. The small store (timestamps, backoff,
+// snapshot metadata) rides in Obsidian's vault-scoped local storage — not
+// synced, per-device by construction — with a plugin-folder fallback file when
+// the host API is unavailable. Larger rebuildable ledgers/caches live in a
+// debounced plugin-folder file. Both stores are compare-before-write and carry
+// no per-save timestamps. Losing either store is treated as a first run: every
+// value below rebuilds or defaults safely on the device that lost it.
+const DEVICE_STATE_STORAGE_KEY = "semantic-todoist-sync/device-state";
+const DEVICE_STATE_FILE = "device-state.json";
+const RUNTIME_STATE_FILE = "runtime-state.json";
+const RUNTIME_STATE_SAVE_DELAY_MS = 30000;
+const DEVICE_STATE_SCHEMA_VERSION = 1;
+const DEVICE_STATE_SETTINGS_KEYS = Object.freeze([
+  "lastEmailPollAt",
+  "lastReferenceRebuildAt",
+  "lastReferenceRebuildFingerprint",
+  "lastReferenceRebuildCandidateCount",
+  "lastReferenceRebuildAttemptAt",
+  "lastReferenceRebuildState",
+  "lastReferenceRebuildReason",
+  "lastSubtaskIndentRepairFingerprint",
+  "taskReferenceSnapshotMeta",
+  "taskDeduplicationLastRunSummary",
+  "scheduleTodayLastUndo",
+  "emailFailureHolds",
+  "reasoningAutoCorrections",
+  "modelsFetchedAt",
+  "geminiModelsFetchedAt",
+  "todoistProjectsFetchedAt"
+]);
+const RUNTIME_STATE_SETTINGS_KEYS = Object.freeze([
+  "semanticIndexMeta",
+  "processedTodoistEventIds",
+  "todoistSectionCache",
+  "availableTodoistProjects"
+]);
+
+function settingsRequireDeviceStateMigration(loadedData = {}) {
+  if (!loadedData || typeof loadedData !== "object") return false;
+  return DEVICE_STATE_SETTINGS_KEYS.some((key) => Object.prototype.hasOwnProperty.call(loadedData, key))
+    || RUNTIME_STATE_SETTINGS_KEYS.some((key) => Object.prototype.hasOwnProperty.call(loadedData, key));
+}
 
 function settingsRequireSplitMigration(loadedData = {}) {
   if (!loadedData || typeof loadedData !== "object") return false;
@@ -23419,6 +26210,10 @@ function settingsWithoutTaskReferenceTables(settings = DEFAULT_SETTINGS, options
   delete data.pendingTaskReferences;
   delete data.pendingTaskDescriptions;
   delete data.localLog;
+  // Volatile per-device bookkeeping and rebuildable ledgers/caches never ride
+  // in data.json; they persist through the device-state/runtime-state stores.
+  for (const key of DEVICE_STATE_SETTINGS_KEYS) delete data[key];
+  for (const key of RUNTIME_STATE_SETTINGS_KEYS) delete data[key];
   if (options.includeModelCache !== true) {
     for (const key of MODEL_CACHE_SETTINGS_KEYS) delete data[key];
   }
@@ -24515,6 +27310,32 @@ function taskCreationSchema(maxMainTasks = DEFAULT_SETTINGS.maxGeneratedMainTask
   return taskWorkflowResponseSchema(maxMainTasks, maxSubtasks);
 }
 
+// Strict schema for the single bounded due-date recovery send (setting
+// requireModelDueDates): one row per main task index whose due_date needs to
+// be supplied. Deliberately separate from the task schemas so no existing
+// strict structured-output schema changes.
+function requiredDueDateRecoverySchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      due_dates: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            index: { type: "integer", minimum: 0 },
+            due_date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" }
+          },
+          required: ["index", "due_date"]
+        }
+      }
+    },
+    required: ["due_dates"]
+  };
+}
+
 function generationMainTaskLimit(settings = DEFAULT_SETTINGS) {
   return Math.max(1, Math.min(30, parseInt(settings.maxGeneratedMainTasks, 10) || DEFAULT_SETTINGS.maxGeneratedMainTasks));
 }
@@ -25028,12 +27849,13 @@ function schedulerSemanticCandidateQuery(candidate = {}) {
 }
 
 function schedulerCompactSemanticEmbedding(embedding = [], dimensions = 128) {
-  if (!Array.isArray(embedding) || !embedding.length) return [];
-  const target = Math.min(Math.max(8, Number(dimensions || 128)), embedding.length);
-  if (target === embedding.length) return embedding.map((value) => Math.round(Number(value || 0) * 100000) / 100000);
+  if (!isEmbeddingVector(embedding) || !embedding.length) return [];
+  const values = Array.isArray(embedding) ? embedding : Array.from(embedding);
+  const target = Math.min(Math.max(8, Number(dimensions || 128)), values.length);
+  if (target === values.length) return values.map((value) => Math.round(Number(value || 0) * 100000) / 100000);
   const result = new Array(target).fill(0);
   const counts = new Array(target).fill(0);
-  embedding.forEach((value, index) => {
+  values.forEach((value, index) => {
     const bucket = index % target;
     result[bucket] += Number(value || 0);
     counts[bucket] += 1;
@@ -26752,6 +29574,24 @@ function topAiActivityProgress(plugin) {
   return withProgress ? singleLine(withProgress.progress).slice(0, 48) : "";
 }
 
+// The System One decision-model display segment for the live AI status item:
+// the per-task ordering label while a task's evidence is being ordered, or
+// the short fallback notice after the server could not be used. Feature-gated
+// (off => "") and display-only: in-memory, never persisted, never a network
+// call. No timers: the notice expires lazily against the existing status
+// refresh tick.
+function systemOneStatusSubLabel(plugin, now = Date.now()) {
+  try {
+    if (plugin?.settings?.evidenceRerankEnabled !== true) return "";
+    const notice = plugin.systemOneFallbackNotice;
+    if (notice && typeof notice === "object" && String(notice.text || "") && now < Number(notice.until || 0)) return singleLine(notice.text).slice(0, 72);
+    const ordering = plugin.systemOneOrderingText;
+    return ordering ? singleLine(ordering).slice(0, 72) : "";
+  } catch {
+    return "";
+  }
+}
+
 function aiActivityStatusValue(plugin, now = Date.now(), options = {}) {
   const active = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
   const label = topLiveAiActivityLabel(plugin);
@@ -26765,6 +29605,22 @@ function aiActivityStatusValue(plugin, now = Date.now(), options = {}) {
   const extra = active.length > 1 ? ` (+${active.length - 1} more)` : "";
   const duration = startedAt ? ` · ${formatAiActivityDuration(now - startedAt)}` : "";
   const suffix = `${duration}${extra}`;
+  // System One decision-model segment (feature-gated, display-only): while a
+  // task's evidence is being ordered (or briefly after a fallback) it takes
+  // the AI item's slot ahead of the step progress; the Status counter and the
+  // description phase wording are never changed. Feature off => "".
+  const subLabel = systemOneStatusSubLabel(plugin, now);
+  if (subLabel) {
+    const labelPart = options.omitLabel ? "" : label;
+    let text = labelPart ? `${labelPart} · ${subLabel}` : subLabel;
+    if ((text + suffix).length > 80 && labelPart) text = subLabel;
+    let composed = text + suffix;
+    if (composed.length > 80 && extra) composed = text + duration;
+    if (composed.length > 80) composed = subLabel + duration;
+    composed = composed.replace(/^\s*·\s*/, "").trim();
+    if (composed.length > 80) composed = composed.slice(0, 80);
+    return composed || label;
+  }
   // The line is capped at 80 characters. Shorten the progress by dropping words, never by
   // cutting digits: full text, then without "complete", then the counter alone.
   const progressForms = progress
@@ -29914,8 +32770,8 @@ function taskSemanticLaneAlignment(actionResult = null, laneResult = {}) {
   const actionTopScore = Number(actionResult?.admitted?.[0]?.semantic || 0);
   const laneTopScore = Number(laneResult?.admitted?.[0]?.semantic || 0);
   const relativeScore = actionTopScore > 0 ? Math.max(0, laneTopScore / actionTopScore) : 0;
-  const actionEmbedding = Array.isArray(actionResult?.embedding) ? actionResult.embedding : [];
-  const laneEmbedding = Array.isArray(laneResult?.embedding) ? laneResult.embedding : [];
+  const actionEmbedding = isEmbeddingVector(actionResult?.embedding) ? actionResult.embedding : [];
+  const laneEmbedding = isEmbeddingVector(laneResult?.embedding) ? laneResult.embedding : [];
   const embeddingAlignment = actionEmbedding.length > 0 && actionEmbedding.length === laneEmbedding.length
     ? Math.min(1, Math.max(-1, Number(cosine(actionEmbedding, laneEmbedding)) || 0))
     : null;
@@ -33032,12 +35888,24 @@ function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_
     const identities = new Set(list.map((chunk) => `${chunk.path || ""}\u0000${semanticChunkContentFingerprint(chunk.text || "")}`));
     return identities.size > 1;
   }).length;
-  const dimensions = (chunks || []).map((chunk) => Number(chunk.indexMetadata?.dimension || chunk.embeddingDimension || (Array.isArray(chunk.embedding) ? chunk.embedding.length : 0))).filter((value) => value > 0);
+  const dimensions = (chunks || []).map((chunk) => Number(chunk.indexMetadata?.dimension || chunk.embeddingDimension || (isEmbeddingVector(chunk.embedding) ? chunk.embedding.length : 0))).filter((value) => value > 0);
   const expectedDimension = Number(settings.semanticIndexMeta?.dimension || dimensions[0] || 0);
   const expectedIdentity = semanticEmbeddingIdentity(settings, { dimension: expectedDimension });
   const expectedProvider = expectedIdentity.provider;
   const expectedModel = expectedIdentity.model;
   const embeddingCompatibility = semanticEmbeddingIndexCompatibility(settings, Object.assign({}, settings.semanticIndexMeta || {}, { dimension: expectedDimension }));
+  // Mixed-version guard: an index whose persisted metadata claims the current
+  // embedding content version must not contain chunks from another version.
+  // Such a corpus is never scored (readiness degrades to source-only), so a
+  // partially rebuilt index can never leak old-version vectors into ranking.
+  const declaredContentVersion = Number(settings?.semanticIndexMeta?.embeddingContentVersion || 0);
+  let mixedEmbeddingContentVersionCount = 0;
+  if (declaredContentVersion === SEMANTIC_EMBEDDING_CONTENT_VERSION) {
+    for (const chunk of chunks || []) {
+      const version = Number(chunk?.embeddingContentVersion || chunk?.indexMetadata?.contentVersion || 0);
+      if (version && version !== SEMANTIC_EMBEDDING_CONTENT_VERSION) mixedEmbeddingContentVersionCount += 1;
+    }
+  }
   const hierarchy = semanticTaskChunkHierarchyHealth(chunks);
   let missingIdentityCount = 0;
   let invalidDimensionCount = 0;
@@ -33057,7 +35925,7 @@ function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_
     const missingIdentity = !chunk.path || !chunk.text || !chunk.evidenceId || !sourceKind ||
       (Object.prototype.hasOwnProperty.call(raw, "sourceId") && !raw.sourceId) ||
       (Object.prototype.hasOwnProperty.call(raw, "sourceKind") && !raw.sourceKind);
-    const actualDimension = Array.isArray(chunk.embedding) ? chunk.embedding.length : 0;
+    const actualDimension = isEmbeddingVector(chunk.embedding) ? chunk.embedding.length : 0;
     const dimension = Number(chunk.indexMetadata?.dimension || chunk.embeddingDimension || actualDimension);
     const invalidDimension = !actualDimension || !dimension || dimension !== actualDimension || (expectedDimension > 0 && actualDimension !== expectedDimension);
     const chunkProvider = String(chunk.indexMetadata?.provider || chunk.embeddingProvider || "");
@@ -33093,6 +35961,7 @@ function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_
   if (invalidProviderIdentityCount) reasonCodes.push("provider-mismatch");
   if (invalidModelIdentityCount) reasonCodes.push("model-mismatch");
   if (invalidEmbeddingIdentityCount) reasonCodes.push("embedding-identity-mismatch");
+  if (mixedEmbeddingContentVersionCount) reasonCodes.push("mixed-embedding-content-version");
   if (duplicateEvidenceIdCount) reasonCodes.push("duplicate-evidence-id");
   if (conflictingEvidenceIdCount) reasonCodes.push("conflicting-evidence-id");
   if (hierarchy.reasonCodes?.length) reasonCodes.push(...hierarchy.reasonCodes.map((code) => `task-reference-${code}`));
@@ -33109,6 +35978,7 @@ function semanticIndexIntegrity(rawChunks = [], chunks = [], settings = DEFAULT_
     invalidEmbeddingIdentityCount,
     invalidProviderIdentityCount,
     invalidModelIdentityCount,
+    mixedEmbeddingContentVersionCount,
     duplicateEvidenceIdCount,
     conflictingEvidenceIdCount,
     sourceKindCounts,
@@ -33445,6 +36315,13 @@ function labelsAllowedByInstructions(text) {
   return labels.size ? labels : null;
 }
 
+// Setting requireModelDueDates (default on) adds one requirement sentence to
+// every task-structure request (note and email): the model must propose a due
+// date for each main task. Stated once here so each generation request carries
+// it exactly once; validation and the deterministic fallback live with the
+// generated-task completion helpers.
+const REQUIRED_DUE_DATE_INSTRUCTION = "Every main task must include a due_date: a YYYY-MM-DD weekday that is not in the past relative to the supplied current local planning date and avoids the holidays that apply to the user's locale, chosen from this task's own urgency, dependencies, stated deadlines, and timeline evidence; preserve an explicit source due or deadline date; never leave a main task without a due_date, and do not add due dates to subtasks.";
+
 function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTINGS) {
   return [
     "Vault context requirements:",
@@ -33460,7 +36337,9 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     "- Relevance: do not turn background discussion, quoted history, another person's completed work, or loosely related vault context into a task.",
     "- Separation: create distinct main tasks only when they have different immediate actions or independently completable outcomes; do not split one requested outcome into paraphrased task records.",
     "Metadata requirements:",
-    "- For every task and subtask, independently evaluate labels, priority, due_date, and deadline_date under the saved instructions. Use only that task's own evidence. Empty labels, priority 1, and null dates are valid when no different value is supported; do not force nonempty or changed fields.",
+    settings.requireModelDueDates
+      ? "- For every task and subtask, independently evaluate labels, priority, due_date, and deadline_date under the saved instructions. Use only that task's own evidence. Empty labels and priority 1 are valid when no different value is supported; every main task still requires a due_date under the date rule below, and deadline_date stays null when no different value is supported."
+      : "- For every task and subtask, independently evaluate labels, priority, due_date, and deadline_date under the saved instructions. Use only that task's own evidence. Empty labels, priority 1, and null dates are valid when no different value is supported; do not force nonempty or changed fields.",
     "- Apply a saved rule to task-owned meaning when it permits semantic inference. Do not require literal hashtags, priority markers, or ISO date tokens unless the saved instruction explicitly requires them.",
     "- A saved priority rule may infer priority 1 to 4 from this task's own content, urgency, importance, and complexity when that rule permits inference; keep priority 1 when neither the rule nor the evidence supports a higher priority.",
     "- Metadata choices are classifications or planning judgments, not permission to add unsupported facts to task titles or descriptions. Preserve configured label names and priority rules.",
@@ -33468,6 +36347,7 @@ function taskGenerationRequirements(taskInstructions, settings = DEFAULT_SETTING
     `- Priority: ${taskInstructions.priorities || "Assign priority 1 to 4."}`,
     "Dates and deadlines:",
     `- Follow this setting exactly: ${taskInstructions.dates || "Use YYYY-MM-DD dates only when supported by the source."}`,
+    ...(settings.requireModelDueDates ? [`- ${REQUIRED_DUE_DATE_INSTRUCTION}`] : []),
     "- due_date and deadline_date are independent. Do not copy due_date into deadline_date or deadline_date into due_date unless the setting explicitly says to mirror them.",
     "- A saved due-date or deadline planning rule that permits inference may estimate a date from this task's own urgency, complexity, and workload plus the supplied current local planning date. Treat estimates as planning judgments, not source facts; do not force a date when the rule and evidence do not support one.",
     "- When the saved date instructions require an explicit deadline, set deadline_date only when this task's own evidence explicitly states one. Otherwise, follow the saved planning rule using task-owned timing, urgency, complexity, workload, and the supplied current local planning date only when that rule permits it. Never create a deadline merely by copying a due date.",
@@ -35787,6 +38667,785 @@ function taskDescriptionPromptTask(item = {}, providerPayload = null) {
   };
 }
 
+// ---- Optional System One decision model ------------------------------------
+// Off by default. When enabled with an http(s) URL, each task's admitted
+// OPTIONAL supporting rows are scored by the user's System One decision model
+// (one essential/helpful/unrelated choice question per row, packed 8 per
+// request, client concurrency 2) and the task's provider refs are reordered by
+// descending p(essential). Rows keep their identity, labels and count: must
+// refs, protected/closure rows, the current-source row and rows beyond the
+// candidate cap keep their contract positions. Every failure (disabled, bad
+// URL, unreachable server, timeout, bad schema) keeps the semantic order
+// silently and never throws into the workflow. Only task text and short note
+// excerpts are sent, to the URL the user configured.
+const EVIDENCE_RERANK_QUESTIONS_PER_REQUEST = 8;
+const EVIDENCE_RERANK_REQUEST_CONCURRENCY = 2;
+const EVIDENCE_RERANK_REQUEST_TIMEOUT_MS = 4000;
+// Module-level limiter shared by ALL tasks, keyed by baseUrl: the System One
+// server serves one request at a time, so one pool of 2 per task overruns it
+// and the queue wait burns the per-request timeout and the per-task deadline.
+// A generous overall guard keeps a dead (but accepting) server from holding
+// the workflow open; the per-baseUrl failure memory below is the fast path.
+const EVIDENCE_RERANK_LIMITERS = new Map();
+const EVIDENCE_RERANK_QUEUE_GUARD_MS = 30000;
+function evidenceRerankLimiterFor(key) {
+  const id = String(key || "");
+  let limiter = EVIDENCE_RERANK_LIMITERS.get(id);
+  if (!limiter) { limiter = { active: 0, waiters: [] }; EVIDENCE_RERANK_LIMITERS.set(id, limiter); }
+  return limiter;
+}
+// Hands free permits to queued waiters in FIFO order; each grant resolves the
+// waiter with a one-shot release() that frees the permit and drains again.
+function evidenceRerankDrainLimiter(limiter) {
+  while (limiter.active < EVIDENCE_RERANK_REQUEST_CONCURRENCY && limiter.waiters.length) {
+    const waiter = limiter.waiters.shift();
+    if (!waiter || waiter.settled) continue;
+    limiter.active += 1;
+    let released = false;
+    waiter.grant(() => {
+      if (released) return;
+      released = true;
+      limiter.active = Math.max(0, limiter.active - 1);
+      evidenceRerankDrainLimiter(limiter);
+    });
+  }
+}
+// Per-baseUrl failure memory for the scoring path, next to the shared limiter:
+// the scoring request itself is the liveness test, so no separate health probe
+// runs per task. A definite failure (network error / fetch rejects / non-2xx;
+// a bad schema is NOT a down signal) marks the server down for 30 s; a
+// service-time timeout (a request that already held a permit) marks it down
+// for 5 s only (the queue may clear); a queued wait never marks anything down;
+// any HTTP 200 scoring response clears the mark. While marked, tasks fall back
+// as "server-unreachable" without sending a request.
+const EVIDENCE_RERANK_DOWN_CACHE_MS = 30000;
+const EVIDENCE_RERANK_TIMEOUT_DOWN_MS = 5000;
+const EVIDENCE_RERANK_DOWN_UNTIL = new Map();
+function evidenceRerankMarkServerDown(key, ttlMs) {
+  EVIDENCE_RERANK_DOWN_UNTIL.set(String(key || ""), Date.now() + Math.max(0, Number(ttlMs) || 0));
+}
+function evidenceRerankServerDown(key) {
+  const until = EVIDENCE_RERANK_DOWN_UNTIL.get(String(key || ""));
+  return Number.isFinite(until) && Date.now() < until;
+}
+function evidenceRerankClearServerDown(key) {
+  EVIDENCE_RERANK_DOWN_UNTIL.delete(String(key || ""));
+}
+const EVIDENCE_RERANK_HEALTH_CACHE_MS = 30000;
+const EVIDENCE_RERANK_HEALTH_TIMEOUT_MS = 2000;
+const EVIDENCE_RERANK_EXCERPT_CHARS = 350;
+// Bounded in-memory score cache: key = shortHash over [task text, evidence
+// id, excerpt, date]. Task text embeds the note title/date, so repeat runs
+// of the same note re-use every candidate score with zero new requests.
+// LRU-evicted at 2000 entries.
+const EVIDENCE_RERANK_CACHE_MAX_ENTRIES = 2000;
+const evidenceRerankScoreCache = new Map();
+function evidenceRerankCacheKey(taskText, candidate) {
+  return shortHash(JSON.stringify([String(taskText || ""), String(candidate?.evidenceId || ""), String(candidate?.excerpt || ""), String(candidate?.date || "")]));
+}
+function evidenceRerankCachedScore(cacheKey) {
+  const hit = evidenceRerankScoreCache.get(cacheKey);
+  if (hit === undefined) return null;
+  evidenceRerankScoreCache.delete(cacheKey);
+  evidenceRerankScoreCache.set(cacheKey, hit);
+  return hit;
+}
+function evidenceRerankStoreScore(cacheKey, value) {
+  evidenceRerankScoreCache.set(cacheKey, value);
+  if (evidenceRerankScoreCache.size > EVIDENCE_RERANK_CACHE_MAX_ENTRIES) {
+    const oldest = evidenceRerankScoreCache.keys().next();
+    if (!oldest.done) evidenceRerankScoreCache.delete(oldest.value);
+  }
+}
+
+function evidenceRerankSettings(settings = DEFAULT_SETTINGS) {
+  const rawUrl = String(settings.evidenceRerankUrl || "").trim();
+  let baseUrl = "";
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+      }
+    } catch { baseUrl = ""; }
+  }
+  return {
+    enabled: settings.evidenceRerankEnabled === true,
+    baseUrl,
+    endpoint: baseUrl ? `${baseUrl}/v1/systemone` : "",
+    apiKey: String(settings.evidenceRerankApiKey || ""),
+    maxCandidates: Math.max(8, Math.min(60, parseInt(settings.evidenceRerankMaxCandidates, 10) || DEFAULT_SETTINGS.evidenceRerankMaxCandidates)),
+    timeoutMs: Math.max(1000, Math.min(60000, parseInt(settings.evidenceRerankTimeoutMs, 10) || DEFAULT_SETTINGS.evidenceRerankTimeoutMs))
+  };
+}
+
+// Max efficiency (background tier) effective flag. Default OFF in this build;
+// a later change may default it on when System One is configured+calibrated
+// (only after live proof) — that change is this one line.
+function systemOneMaxEfficiencyEnabled(settings = DEFAULT_SETTINGS) {
+  return settings?.evidenceRerankTier === true;
+}
+
+// Background tier bounds: keep the first 8 optional rows in full, render the
+// next 16 as one-line background pointers, drop the rest.
+const EVIDENCE_RERANK_TIER_FULL = 8;
+const EVIDENCE_RERANK_TIER_POINTERS = 16;
+const EVIDENCE_RERANK_TIER_LEGEND_SENTENCE = "Background pointers (marked \"background pointer\") carry only a one-line pointer; their full text is NOT supplied — use a pointer only to know the matter exists, never to state details, and never cite a pointer ref for a factual claim.";
+
+function evidenceRerankExcerpt(value = "") {
+  return singleLine(String(value || "")).slice(0, EVIDENCE_RERANK_EXCERPT_CHARS);
+}
+
+function evidenceRerankDateText(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "unknown";
+  const iso = text.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  return singleLine(text).slice(0, 24) || "unknown";
+}
+
+// Candidate rows for one task: the admitted OPTIONAL supporting rows in the
+// same order the task's provider refs currently carry (the semantic order).
+// Protected/closure rows and the current-source row are never candidates.
+function evidenceRerankCandidatesForTask(task = {}, providerProjection = null) {
+  const rich = task?.taskLocalEvidence || {};
+  const protectedIds = new Set((providerProjection?.protectedEvidenceIds || []).map(String));
+  const candidates = [];
+  const seen = new Set();
+  for (const entry of rich.supportingSemanticEvidence || []) {
+    const evidenceId = String(entry?.evidenceId || "");
+    if (!evidenceId || seen.has(evidenceId) || protectedIds.has(evidenceId)) continue;
+    const excerpt = evidenceRerankExcerpt(entry?.excerpt);
+    if (!excerpt) continue;
+    seen.add(evidenceId);
+    candidates.push({
+      evidenceId,
+      excerpt,
+      date: evidenceRerankDateText(entry?.createdAt || entry?.modifiedAt)
+    });
+  }
+  return candidates;
+}
+
+function evidenceRerankHeaders(spec) {
+  const headers = { "content-type": "application/json" };
+  if (spec?.apiKey) headers.authorization = `Bearer ${spec.apiKey}`;
+  return headers;
+}
+
+// One bounded JSON request. AbortController enforces the per-request timeout;
+// the caller enforces the per-task total deadline. An optional external signal
+// (the settings Check connection / calibration cancel) aborts the request and
+// reports "rerank-cancelled" so callers can stop promptly.
+async function evidenceRerankRequestJson(fetchFn, url, init, timeoutMs, externalSignal = null) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  let timer = null;
+  let onExternalAbort = null;
+  if (controller) {
+    timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 1));
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else {
+        onExternalAbort = () => controller.abort();
+        externalSignal.addEventListener?.("abort", onExternalAbort);
+      }
+    }
+  }
+  try {
+    const response = await fetchFn(url, Object.assign({}, init, controller ? { signal: controller.signal } : {}));
+    const text = await response.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { json = null; }
+    return { status: Number(response?.status || 0), json };
+  } catch (error) {
+    if (externalSignal?.aborted) throw Object.assign(new Error("rerank-cancelled"), { code: "rerank-cancelled" });
+    if (controller?.signal?.aborted) throw Object.assign(new Error("rerank-timeout"), { code: "rerank-timeout" });
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (onExternalAbort) externalSignal.removeEventListener?.("abort", onExternalAbort);
+  }
+}
+
+// Health probe with a 30s cache so a down server is not waited on repeatedly.
+// A successful probe also remembers the reported model identity so a later
+// run can flag the stored calibration as stale when the model changed.
+async function evidenceRerankServerHealthy(plugin, spec, fetchFn) {
+  const cache = plugin._evidenceRerankHealth instanceof Map ? plugin._evidenceRerankHealth : (plugin._evidenceRerankHealth = new Map());
+  const cached = cache.get(spec.baseUrl);
+  const now = Date.now();
+  if (cached && now - cached.at < EVIDENCE_RERANK_HEALTH_CACHE_MS) return cached.ok;
+  let ok = false;
+  try {
+    const result = await evidenceRerankRequestJson(fetchFn, `${spec.baseUrl}/health`, { method: "GET", headers: evidenceRerankHeaders(spec) }, EVIDENCE_RERANK_HEALTH_TIMEOUT_MS);
+    ok = result.status >= 200 && result.status < 300;
+    const identity = ok ? systemOneModelIdentity(result.json, null) : "";
+    if (identity) plugin._evidenceRerankLastSeenModel = identity;
+  } catch { ok = false; }
+  cache.set(spec.baseUrl, { ok, at: now });
+  return ok;
+}
+
+// Score one task's candidates with the System One decision model's best-value
+// question: one essential/helpful/unrelated choice question per candidate,
+// packed 8 per request, client concurrency 2. The choice p(essential) is the
+// strongest single ranking signal over admitted rows (measured rec@5 ~0.9, vs
+// ~0.4-0.5 for a packed noul yes/no question), and at ~110-250 ms per question
+// the per-task wall is ~1-2 s at N=24 and ~5 s at N=32. Any error, timeout or
+// bad schema fails the whole task so the caller keeps the semantic order
+// (never a partial reorder). options.signal cancels promptly (Check
+// connection / calibration); options is absent on every production call.
+//
+// Concurrency: every network request runs inside the module-level limiter
+// for its baseUrl (width EVIDENCE_RERANK_REQUEST_CONCURRENCY, shared across
+// all tasks and samples). The per-request timeout starts when the permit is
+// acquired (service time only), the per-task deadline starts when the task's
+// first request acquires a permit, and one task's failure or cancel releases
+// its queued waiters without leaking permits.
+async function evidenceRerankTaskOrder(spec, taskState, candidates, fetchFn, options = {}) {
+  const probabilities = new Map();
+  const taskText = `From note "${singleLine(taskState?.noteTitle || "")}" (dated ${taskState?.noteDate || "unknown"}): ${singleLine(taskState?.action || "")}`;
+  const state = { task: taskText };
+  let deadline = 0;
+  let failure = "";
+  let model = "";
+  let cacheHits = 0;
+  const limiterKey = String(spec?.baseUrl || "");
+  const limiter = evidenceRerankLimiterFor(limiterKey);
+  // One acquire per network request: wrapped in its own closure so a task's
+  // own failure/cancel drops its remaining queued waiters immediately (the
+  // waiter callback re-checks failure and the caller signal before consuming
+  // a permit). Resolves null when the caller cancelled, the task already
+  // failed, or the generous queue guard elapsed.
+  const acquireRequestPermit = () => new Promise((resolve) => {
+    if (failure || options.signal?.aborted) { resolve(null); return; }
+    const waiter = { settled: false, timer: null, onCallerAbort: null, grant: null };
+    const settle = (release) => {
+      if (waiter.settled) return;
+      waiter.settled = true;
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.onCallerAbort) options.signal?.removeEventListener?.("abort", waiter.onCallerAbort);
+      const at = limiter.waiters.indexOf(waiter);
+      if (at >= 0) limiter.waiters.splice(at, 1);
+      resolve(release);
+    };
+    waiter.timer = setTimeout(() => settle(null), Math.max(1, EVIDENCE_RERANK_QUEUE_GUARD_MS));
+    if (options.signal) {
+      if (options.signal.aborted) { settle(null); return; }
+      waiter.onCallerAbort = () => settle(null);
+      options.signal.addEventListener?.("abort", waiter.onCallerAbort);
+    }
+    waiter.grant = (release) => settle(release);
+    limiter.waiters.push(waiter);
+    evidenceRerankDrainLimiter(limiter);
+  });
+  const useCache = options.useCache !== false;
+  const uncached = [];
+  const uncachedKeys = new Map();
+  for (const candidate of candidates) {
+    const cacheKey = evidenceRerankCacheKey(taskText, candidate);
+    const hit = useCache ? evidenceRerankCachedScore(cacheKey) : null;
+    if (hit !== null) {
+      probabilities.set(candidate.evidenceId, hit);
+      cacheHits += 1;
+    } else {
+      uncachedKeys.set(candidate.evidenceId, cacheKey);
+      uncached.push(candidate);
+    }
+  }
+  const chunks = [];
+  for (let start = 0; start < uncached.length; start += EVIDENCE_RERANK_QUESTIONS_PER_REQUEST) {
+    chunks.push(uncached.slice(start, start + EVIDENCE_RERANK_QUESTIONS_PER_REQUEST));
+  }
+  await asyncPool(chunks, EVIDENCE_RERANK_REQUEST_CONCURRENCY, async (chunk) => {
+    if (failure) return;
+    if (options.signal?.aborted) { failure = failure || "cancelled"; return; }
+    const release = await acquireRequestPermit();
+    if (!release) {
+      if (!failure) failure = options.signal?.aborted ? "cancelled" : "timeout";
+      return;
+    }
+    if (failure) { release(); return; }
+    if (options.signal?.aborted) { release(); failure = failure || "cancelled"; return; }
+    try {
+      // Service-time budget only: queue wait already happened above.
+      if (!deadline) deadline = Date.now() + spec.timeoutMs;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { failure = failure || "timeout"; return; }
+      const body = { state, questions: {} };
+      chunk.forEach((candidate, index) => {
+        body.questions[`q${index}`] = {
+          type: "choice",
+          instructions: `Earlier note (dated ${candidate.date}): "${candidate.excerpt}". Classify how relevant the earlier note is to this task.`,
+          options: {
+            essential: "Explains the origin, decision or blocker of this task and should be included",
+            helpful: "Relevant background context on the same matter",
+            unrelated: "Not about this task's matter"
+          }
+        };
+      });
+      let result = null;
+      try {
+        result = await evidenceRerankRequestJson(fetchFn, spec.endpoint, {
+          method: "POST",
+          headers: evidenceRerankHeaders(spec),
+          body: JSON.stringify(body)
+        }, Math.min(EVIDENCE_RERANK_REQUEST_TIMEOUT_MS, Math.max(1, remaining)), options.signal || null);
+      } catch (error) {
+        if (error?.code === "rerank-cancelled") {
+          failure = failure || "cancelled";
+        } else if (error?.code === "rerank-timeout") {
+          // Service-time timeout (the request already held a permit): the
+          // server may just be slow, so the mark is short.
+          evidenceRerankMarkServerDown(limiterKey, EVIDENCE_RERANK_TIMEOUT_DOWN_MS);
+          failure = failure || "timeout";
+        } else {
+          // Definite failure (network error / fetch rejects).
+          evidenceRerankMarkServerDown(limiterKey, EVIDENCE_RERANK_DOWN_CACHE_MS);
+          failure = failure || "server-unreachable";
+        }
+        return;
+      }
+      if (result.status === 200) {
+        evidenceRerankClearServerDown(limiterKey);
+        if (!model) model = systemOneModelIdentity(result.json, null) || "";
+      } else {
+        evidenceRerankMarkServerDown(limiterKey, EVIDENCE_RERANK_DOWN_CACHE_MS);
+      }
+      if (result.status !== 200 || !result.json || typeof result.json.answers !== "object") {
+        failure = failure || "bad-response";
+        return;
+      }
+      for (let index = 0; index < chunk.length; index += 1) {
+        const answer = result.json.answers?.[`q${index}`];
+        const value = Number(answer?.probabilities?.essential);
+        if (answer?.type !== "choice" || !answer?.probabilities || !Number.isFinite(value)) {
+          failure = failure || "bad-schema";
+          return;
+        }
+        probabilities.set(chunk[index].evidenceId, value);
+        if (useCache) evidenceRerankStoreScore(uncachedKeys.get(chunk[index].evidenceId), value);
+      }
+    } finally {
+      release();
+    }
+  });
+  if (failure) return { ok: false, reason: failure, model };
+  if (probabilities.size !== candidates.length) return { ok: false, reason: "bad-schema", model };
+  const order = candidates
+    .map((candidate, index) => ({ evidenceId: candidate.evidenceId, probability: probabilities.get(candidate.evidenceId), index }))
+    .sort((left, right) => right.probability - left.probability || left.index - right.index)
+    .map((entry) => entry.evidenceId);
+  const probabilityById = {};
+  for (const [evidenceId, probability] of probabilities) probabilityById[evidenceId] = probability;
+  return { ok: true, order, probabilities: probabilityById, cacheHits, model };
+}
+
+// Reorder only the re-ranked refs of one task row: every other ref keeps its
+// exact position, so must/protected/current rows and rows beyond the cap stay
+// where the contract placed them. Ref identity and E# labels never change.
+// The per-task ledger is the authoritative order: requestDescriptionSingleton
+// rebuilds its prompt row via taskDescriptionPromptTask(targetTask,
+// singletonShared), which derives refs from shared.ledgerByTask, so the
+// ledger for this task is reordered first and the cached provider row is kept
+// consistent. taskIndex selects the ledger key; when omitted a singleton
+// payload's single ledger key is used.
+function applyEvidenceRerankOrder(shared, order = [], taskIndex = null) {
+  const row = (shared?.providerTaskRows || [])[0];
+  const handleTable = shared?.handleTable || null;
+  const byHandle = handleTable?.byHandle instanceof Map
+    ? handleTable.byHandle
+    : (handleTable?.byHandle && typeof handleTable.byHandle === "object" ? handleTable.byHandle : null);
+  if (!row || !Array.isArray(row.refs) || !byHandle || !Array.isArray(order) || order.length < 2) return false;
+  const evidenceIdOfHandle = (handle) => String(byHandle instanceof Map ? (byHandle.get(String(handle)) || "") : (byHandle[String(handle)] || ""));
+  const rankByEvidenceId = new Map(order.map((evidenceId, index) => [String(evidenceId), index]));
+  const ledgerByTask = shared?.ledgerByTask && typeof shared.ledgerByTask === "object" ? shared.ledgerByTask : null;
+  let ledgerKeys = [];
+  if (ledgerByTask) {
+    if (taskIndex !== null && taskIndex !== undefined) ledgerKeys = [String(taskIndex)];
+    else {
+      ledgerKeys = Object.keys(ledgerByTask);
+    }
+  }
+  const reorderLedgerKey = (key) => {
+    const ledger = ledgerByTask[key];
+    if (!Array.isArray(ledger)) return null;
+    const ledgerPositions = [];
+    const ledgerRanked = [];
+    for (let index = 0; index < ledger.length; index += 1) {
+      const evidenceId = String(ledger[index]?.evidenceId || "");
+      if (!rankByEvidenceId.has(evidenceId)) continue;
+      ledgerPositions.push(index);
+      ledgerRanked.push({ entry: ledger[index], rank: rankByEvidenceId.get(evidenceId), index });
+    }
+    if (ledgerRanked.length < 2) return null;
+    ledgerRanked.sort((left, right) => left.rank - right.rank || left.index - right.index);
+    const next = ledger.slice();
+    ledgerPositions.forEach((position, orderIndex) => { next[position] = ledgerRanked[orderIndex].entry; });
+    return next;
+  };
+  const nextLedgers = new Map();
+  for (const key of ledgerKeys) {
+    const next = reorderLedgerKey(key);
+    if (!next) return false;
+    nextLedgers.set(key, next);
+  }
+  const positions = [];
+  const ranked = [];
+  for (let index = 0; index < row.refs.length; index += 1) {
+    const evidenceId = evidenceIdOfHandle(row.refs[index]);
+    if (!rankByEvidenceId.has(evidenceId)) continue;
+    positions.push(index);
+    ranked.push({ ref: row.refs[index], rank: rankByEvidenceId.get(evidenceId), index });
+  }
+  if (ranked.length < 2) return false;
+  for (const [key, next] of nextLedgers) {
+    ledgerByTask[key] = next;
+  }
+  ranked.sort((left, right) => left.rank - right.rank || left.index - right.index);
+  const next = row.refs.slice();
+  positions.forEach((position, orderIndex) => { next[position] = ranked[orderIndex].ref; });
+  row.refs = next;
+  return true;
+}
+
+// Background tier (Max efficiency): after a successful reorder, keep the
+// first 8 optional rows in full, render the next 16 as one-line background
+// pointers, and drop the rest. Protected/closure rows and the current-source
+// row are never touched (they are not in `order`). Pointer rows keep their
+// E# handle so citations still resolve, but the model must not cite a pointer
+// for a factual claim (see the legend sentence). Returns tier stats or null
+// when not applicable (<= 8 candidates); callers keep byte-identical output
+// when null is returned.
+function evidenceRerankTierPointerLine(handle = "", evidenceId = "", entry = null) {
+  const ref = String(handle || "").trim() || "E0";
+  const title = singleLine(String(entry?.title || entry?.path || evidenceId || "")).replace(/"/g, "'").trim().slice(0, 40) || String(evidenceId || ref);
+  const date = evidenceRerankDateText(entry?.createdAt || entry?.modifiedAt || "");
+  const kind = singleLine(String(entry?.sourceKind || "")).slice(0, 24);
+  const words = singleLine(String(entry?.excerpt || entry?.evidence || "")).split(/\s+/).filter(Boolean).slice(0, 12);
+  const meta = [];
+  if (date && date !== "unknown") meta.push(date);
+  if (kind) meta.push(kind);
+  let head = `${ref} background pointer -- note "${title}"`;
+  if (meta.length) head += ` (${meta.join(", ")})`;
+  head += ":";
+  const tail = " (full text not supplied)";
+  let bodyWords = words.slice();
+  let line = singleLine(`${head}${bodyWords.length ? ` ${bodyWords.join(" ")}` : ""}${tail}`);
+  while (line.length > 200 && bodyWords.length) {
+    bodyWords.pop();
+    line = singleLine(`${head}${bodyWords.length ? ` ${bodyWords.join(" ")}` : ""}${tail}`);
+  }
+  if (line.length > 200) {
+    const budget = Math.max(0, 200 - tail.length);
+    line = singleLine(head.slice(0, budget) + tail);
+  }
+  return singleLine(line).slice(0, 200);
+}
+
+function applyEvidenceRerankTier(shared, task = {}, providerProjection = null, order = [], taskIndex = null) {
+  if (!shared || !Array.isArray(order)) return null;
+  const orderIds = order.map(String).filter(Boolean);
+  if (orderIds.length <= EVIDENCE_RERANK_TIER_FULL) return null;
+  const fullIds = new Set(orderIds.slice(0, EVIDENCE_RERANK_TIER_FULL));
+  const pointerIds = new Set(orderIds.slice(EVIDENCE_RERANK_TIER_FULL, EVIDENCE_RERANK_TIER_FULL + EVIDENCE_RERANK_TIER_POINTERS));
+  const droppedIds = new Set(orderIds.slice(EVIDENCE_RERANK_TIER_FULL + EVIDENCE_RERANK_TIER_POINTERS));
+  if (!pointerIds.size && !droppedIds.size) return null;
+  const bytesBefore = JSON.stringify(shared.providerHandleLines || []).length;
+  const ledgerByTask = shared?.ledgerByTask && typeof shared.ledgerByTask === "object" ? shared.ledgerByTask : null;
+  let ledgerKeys = [];
+  if (ledgerByTask) {
+    if (taskIndex !== null && taskIndex !== undefined) ledgerKeys = [String(taskIndex)];
+    else ledgerKeys = Object.keys(ledgerByTask);
+  }
+  for (const key of ledgerKeys) {
+    const ledger = ledgerByTask[key];
+    if (!Array.isArray(ledger)) continue;
+    ledgerByTask[key] = ledger.filter((entry) => !droppedIds.has(String(entry?.evidenceId || "")));
+  }
+  const row = (shared?.providerTaskRows || [])[0];
+  const handleTable = shared?.handleTable || null;
+  const byHandleRaw = handleTable?.byHandle instanceof Map
+    ? handleTable.byHandle
+    : (handleTable?.byHandle && typeof handleTable.byHandle === "object" ? handleTable.byHandle : null);
+  const evidenceIdOfHandle = (handle) => {
+    if (!byHandleRaw) return "";
+    return String(byHandleRaw instanceof Map ? (byHandleRaw.get(String(handle)) || "") : (byHandleRaw[String(handle)] || ""));
+  };
+  if (row && Array.isArray(row.refs) && byHandleRaw) {
+    row.refs = row.refs.filter((ref) => !droppedIds.has(evidenceIdOfHandle(ref)));
+  }
+  const supportingById = new Map();
+  for (const entry of task?.taskLocalEvidence?.supportingSemanticEvidence || []) {
+    const evidenceId = String(entry?.evidenceId || "");
+    if (evidenceId && !supportingById.has(evidenceId)) supportingById.set(evidenceId, entry);
+  }
+  if (Array.isArray(shared.providerHandleLines) && shared.providerHandleLines.length && byHandleRaw) {
+    const lines = shared.providerHandleLines.slice();
+    const legend = lines[0];
+    const rest = lines.slice(1);
+    const out = [];
+    let pendingHeader = null;
+    let kept = [];
+    const flush = () => {
+      if (kept.length) {
+        if (pendingHeader) out.push(pendingHeader);
+        out.push(...kept);
+      }
+      pendingHeader = null;
+      kept = [];
+    };
+    for (const line of rest) {
+      if (typeof line === "string" && line.startsWith("## ")) { flush(); pendingHeader = line; continue; }
+      const match = typeof line === "string" ? line.match(/^(E\d+) /) : null;
+      if (!match) { kept.push(line); continue; }
+      const handle = match[1];
+      const evidenceId = evidenceIdOfHandle(handle);
+      if (droppedIds.has(evidenceId)) continue;
+      if (pointerIds.has(evidenceId)) {
+        kept.push(evidenceRerankTierPointerLine(handle, evidenceId, supportingById.get(evidenceId) || null));
+        continue;
+      }
+      void fullIds;
+      kept.push(line);
+    }
+    flush();
+    shared.providerHandleLines = [legend, EVIDENCE_RERANK_TIER_LEGEND_SENTENCE, ...out];
+  }
+  const bytesAfter = JSON.stringify(shared.providerHandleLines || []).length;
+  return { full: fullIds.size, pointers: pointerIds.size, dropped: droppedIds.size, bytesBefore, bytesAfter };
+}
+
+// ---------------------------------------------------------------------------
+// System One decision model: built-in connection check and calibration.
+//
+// Check connection is bounded and cancellable: GET /health and GET /v1/models
+// (either may be missing), ONE tiny POST /v1/systemone with a FIXED GENERIC
+// example (never vault text) to verify the contract, then the calibration.
+// Calibration uses only the user's own vault and semantic index: positives are
+// chunks around marked-action lines (#todo etc.; heading lines as a fallback),
+// negatives are chunks from other top-level folders that are far in time and
+// in the bottom decile of index-vector similarity. All samples are scored with
+// the same packed essential/helpful/unrelated choice question used in
+// production, <= 8 questions per request, client concurrency 2, and at most
+// EVIDENCE_RERANK_CALIBRATION_MAX_REQUESTS requests. The calibration checks
+// basic discrimination on the user's vault (can the model separate related
+// from unrelated notes) and is NOT proof of fine ranking quality; it derives
+// the two display-band cutoffs. Nothing runs until the user clicks Check
+// connection (or a normal run while the feature is on).
+const EVIDENCE_RERANK_CALIBRATION_MAX_REQUESTS = 60;
+const EVIDENCE_RERANK_CALIBRATION_POSITIVE_LIMIT = 12;
+const EVIDENCE_RERANK_CALIBRATION_NEGATIVES_PER_ACTION = 2;
+const EVIDENCE_RERANK_CALIBRATION_MIN_POSITIVES = 6;
+const EVIDENCE_RERANK_CALIBRATION_AUC_MIN = 0.8;
+const EVIDENCE_RERANK_CALIBRATION_POOL_LIMIT = 600;
+const SYSTEM_ONE_CHECK_EXAMPLE = Object.freeze({
+  state: { task: 'From note "Example note" (dated 2026-01-02): Review the example plan' },
+  question: 'Earlier note (dated 2026-01-03): "Example earlier note about the same plan." Classify how relevant the earlier note is to this task.',
+  options: {
+    essential: "Explains the origin, decision or blocker of this task and should be included",
+    helpful: "Relevant background context on the same matter",
+    unrelated: "Not about this task's matter"
+  }
+});
+
+function systemOneModelIdentity(healthJson, modelsJson) {
+  const health = healthJson && typeof healthJson === "object" ? healthJson : null;
+  if (health && typeof health.model === "string" && health.model.trim()) return health.model.trim();
+  const list = modelsJson && typeof modelsJson === "object"
+    ? (Array.isArray(modelsJson.models) ? modelsJson.models : Array.isArray(modelsJson.data) ? modelsJson.data : [])
+    : [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    const name = [entry.model, entry.name, entry.id].find((value) => typeof value === "string" && value.trim());
+    if (name) return name.trim();
+  }
+  return "";
+}
+
+function systemOneIndexGeneration(plugin) {
+  return String(plugin?.settings?.semanticIndexMeta?.generation || plugin?.semanticIndexManifestPublishedGeneration || "");
+}
+
+function systemOneCosine(left, right) {
+  const length = Math.min(left?.length || 0, right?.length || 0);
+  if (!length) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < length; index += 1) {
+    const a = Number(left[index]) || 0;
+    const b = Number(right[index]) || 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  const denominator = Math.sqrt(leftNorm) * Math.sqrt(rightNorm);
+  return denominator ? dot / denominator : 0;
+}
+
+// AUC of positives vs negatives (Mann-Whitney, ties at 0.5) plus the two
+// percentile cutoffs: the positives' lower quartile (central band threshold)
+// and the negatives' upper quartile (background band threshold).
+function evidenceRerankCalibrationMetrics(positives, negatives) {
+  const pos = (positives || []).map(Number).filter(Number.isFinite).sort((left, right) => left - right);
+  const neg = (negatives || []).map(Number).filter(Number.isFinite).sort((left, right) => left - right);
+  if (!pos.length || !neg.length) return { auc: null, positivesMedian: null, negativesMedian: null, cutoffHigh: null, cutoffLow: null };
+  let wins = 0;
+  for (const p of pos) for (const n of neg) wins += p > n ? 1 : p === n ? 0.5 : 0;
+  const median = (sorted) => (sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2);
+  const quantile = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * q)))];
+  return {
+    auc: wins / (pos.length * neg.length),
+    positivesMedian: median(pos),
+    negativesMedian: median(neg),
+    cutoffHigh: quantile(pos, 0.25),
+    cutoffLow: quantile(neg, 0.75)
+  };
+}
+
+function evidenceRerankBandForProbability(calibration, probability) {
+  const value = Number(probability);
+  const high = Number(calibration?.cutoffHigh);
+  const low = Number(calibration?.cutoffLow);
+  if (!Number.isFinite(value) || !Number.isFinite(high) || !Number.isFinite(low)) return "";
+  if (value >= high) return "central";
+  if (value <= low) return "background";
+  return "";
+}
+
+// Compare-before-write rule for the persisted calibration summary: an
+// identical outcome keeps the stored checkedAt/latency, so a repeated Check
+// connection with the same result writes nothing.
+function systemOneCalibrationSummaryUnchanged(previous, next) {
+  if (!previous || !next || typeof previous !== "object" || typeof next !== "object") return false;
+  return previous.model === next.model
+    && previous.verdict === next.verdict
+    && previous.reason === next.reason
+    && previous.auc === next.auc
+    && previous.cutoffHigh === next.cutoffHigh
+    && previous.cutoffLow === next.cutoffLow
+    && previous.indexGeneration === next.indexGeneration;
+}
+
+// Deterministic stride sample so large pools stay bounded and reproducible.
+function systemOneStrideSample(items, limit) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length <= limit) return list.slice();
+  const stride = list.length / limit;
+  const out = [];
+  for (let index = 0; index < limit; index += 1) out.push(list[Math.floor(index * stride)]);
+  return out;
+}
+
+// Sample selection over the user's own vault + semantic index (read-only).
+// Positives: the chunk around a marked-action line of the note; when the vault
+// has no marked actions, heading-line chunks are used instead. Negatives per
+// action: chunks from other top-level folders, bottom decile of index-vector
+// similarity, preferring the largest time distance.
+async function systemOneCalibrationSampleChunks(plugin, options = {}) {
+  const settings = plugin?.settings || DEFAULT_SETTINGS;
+  const chunks = Array.isArray(plugin?.semanticIndex) ? plugin.semanticIndex : [];
+  const markerRegex = noteActionMarkerRegex(settings);
+  const usable = chunks.filter((chunk) => chunk
+    && typeof chunk.text === "string" && chunk.text.trim()
+    && !chunk.metadataOnly
+    && chunk.evidenceEligibility !== "metadata"
+    && isEmbeddingVector(chunk.embedding) && chunk.embedding.length);
+  const positives = [];
+  const limit = Math.max(1, Number(options.positiveLimit) || EVIDENCE_RERANK_CALIBRATION_POSITIVE_LIMIT);
+  const markerPaths = uniqueValues(usable.filter((chunk) => markerRegex.test(chunk.text)).map((chunk) => String(chunk.path || ""))).filter(Boolean).sort();
+  for (const path of systemOneStrideSample(markerPaths, limit)) {
+    if (positives.length >= limit) break;
+    const noteChunks = usable.filter((chunk) => String(chunk.path || "") === path).sort((left, right) => Number(left.lineStart || 0) - Number(right.lineStart || 0));
+    if (!noteChunks.length) continue;
+    let noteText = "";
+    try {
+      const file = plugin?.app?.vault?.getAbstractFileByPath?.(path) || null;
+      noteText = file && typeof plugin.app.vault.cachedRead === "function" ? await plugin.app.vault.cachedRead(file) : "";
+    } catch { noteText = ""; }
+    const markers = noteText ? explicitNoteActionMarkers(noteText, settings) : [];
+    const action = markers.length ? markers[0].action : "";
+    const markerLine = markers.length ? Number(markers[0].line) || 0 : 0;
+    let anchor = null;
+    if (markerLine) {
+      anchor = noteChunks.find((chunk) => Number(chunk.lineStart || 0) <= markerLine && markerLine <= Number(chunk.lineEnd || 0)) || null;
+      if (!anchor) {
+        anchor = noteChunks.slice().sort((left, right) => Math.abs(Number(left.lineStart || 0) - markerLine) - Math.abs(Number(right.lineStart || 0) - markerLine))[0] || null;
+      }
+    }
+    if (!anchor) anchor = noteChunks.find((chunk) => markerRegex.test(chunk.text)) || noteChunks[0] || null;
+    if (!anchor) continue;
+    const excerpt = evidenceRerankExcerpt(anchor.text);
+    if (!excerpt) continue;
+    positives.push({
+      evidenceId: String(anchor.id || `${path}#${positives.length}`),
+      path,
+      noteTitle: String(anchor.title || path.split("/").pop() || "").replace(/\.md$/i, ""),
+      topFolder: String(path).split("/")[0] || "",
+      action: action || singleLine(String(anchor.text || "")).slice(0, 80),
+      excerpt,
+      date: evidenceRerankDateText(anchor.createdAt || anchor.modifiedAt),
+      time: Number(anchor.createdAt || anchor.modifiedAt || 0),
+      embedding: anchor.embedding
+    });
+  }
+  if (!positives.length) {
+    // Fallback: heading lines / notes when the vault has no marked actions.
+    const headings = usable.filter((chunk) => /^#{1,6}\s+\S/.test(String(chunk.text || "").trim()));
+    for (const chunk of systemOneStrideSample(headings, limit)) {
+      const excerpt = evidenceRerankExcerpt(chunk.text);
+      if (!excerpt) continue;
+      positives.push({
+        evidenceId: String(chunk.id || `fallback#${positives.length}`),
+        path: String(chunk.path || ""),
+        noteTitle: String(chunk.title || "").replace(/\.md$/i, ""),
+        topFolder: String(chunk.path || "").split("/")[0] || "",
+        action: singleLine(String(chunk.text || "")).replace(/^#+\s*/, "").slice(0, 80) || "Review the note",
+        excerpt,
+        date: evidenceRerankDateText(chunk.createdAt || chunk.modifiedAt),
+        time: Number(chunk.createdAt || chunk.modifiedAt || 0),
+        embedding: chunk.embedding
+      });
+    }
+  }
+  const pool = systemOneStrideSample(usable, EVIDENCE_RERANK_CALIBRATION_POOL_LIMIT);
+  for (const positive of positives) {
+    const candidates = pool.filter((chunk) => {
+      const path = String(chunk.path || "");
+      if (!path || path === positive.path) return false;
+      return (String(path).split("/")[0] || "") !== positive.topFolder;
+    });
+    if (!candidates.length) { positive.negatives = []; continue; }
+    const scored = candidates.map((chunk) => ({
+      chunk,
+      similarity: systemOneCosine(positive.embedding, chunk.embedding),
+      timeDistance: Math.abs(Number(chunk.createdAt || chunk.modifiedAt || 0) - positive.time)
+    }));
+    scored.sort((left, right) => left.similarity - right.similarity || String(left.chunk.path || "").localeCompare(String(right.chunk.path || "")));
+    const decileCount = Math.max(1, Math.floor(scored.length * 0.1));
+    const bottom = scored.slice(0, decileCount);
+    bottom.sort((left, right) => right.timeDistance - left.timeDistance || String(left.chunk.path || "").localeCompare(String(right.chunk.path || "")));
+    const chosen = [];
+    const chosenIds = new Set();
+    for (const entry of bottom) {
+      if (chosen.length >= EVIDENCE_RERANK_CALIBRATION_NEGATIVES_PER_ACTION) break;
+      const id = String(entry.chunk.id || "");
+      if (chosenIds.has(id)) continue;
+      chosenIds.add(id);
+      chosen.push(entry.chunk);
+    }
+    positive.negatives = chosen.map((chunk) => ({
+      evidenceId: String(chunk.id || ""),
+      excerpt: evidenceRerankExcerpt(chunk.text),
+      date: evidenceRerankDateText(chunk.createdAt || chunk.modifiedAt)
+    })).filter((entry) => entry.evidenceId && entry.excerpt);
+  }
+  return { positives };
+}
+
 function taskEvidenceAnchorHitCount(text = "", anchors = []) {
   const counts = termCounts(text);
   const specificAnchors = (anchors || []).filter((term) => !TASK_DESCRIPTION_GENERIC_EVIDENCE_TERMS.has(term));
@@ -36146,6 +39805,53 @@ function completeEmptyGeneratedTaskFields(tasks = []) {
     }
   }
   return tasks;
+}
+
+// Required model due dates (setting requireModelDueDates, default on): every
+// generated top-level task must carry a usable due date. The model proposes
+// one; these helpers validate it, and after one bounded recovery the
+// deterministic priority-based fallback below fills anything still missing so
+// a task is never left dateless and the workflow never fails for a date.
+function addWorkdaysFromPlanningDate(planningDate, count) {
+  const date = parseLocalDate(planningDate) || new Date();
+  let remaining = Math.max(1, Number(count) || 1);
+  while (remaining > 0) {
+    date.setDate(date.getDate() + 1);
+    if (date.getDay() !== 0 && date.getDay() !== 6) remaining -= 1;
+  }
+  return formatLocalDate(date);
+}
+
+function workdayOnOrAfter(dateText) {
+  const date = parseLocalDate(dateText);
+  if (!date) return "";
+  return date.getDay() === 0 || date.getDay() === 6 ? nextWorkdayDate(dateText) : formatLocalDate(date);
+}
+
+// Normalise a proposed due date for the required-due-date setting: keep a
+// future weekday as-is (explicit source dates are preserved this way), move a
+// past date to the next workday on/after the planning date, move a weekend
+// date to the next workday, and treat anything unparsable as missing ("").
+function requiredDueDateNormalized(value, planningDate = today()) {
+  const dateText = String(value || "").trim();
+  if (!validDate(dateText)) return "";
+  const date = parseLocalDate(dateText);
+  if (!date) return "";
+  const planning = parseLocalDate(planningDate);
+  if (planning && date.getTime() < planning.getTime()) return workdayOnOrAfter(planningDate);
+  if (date.getDay() === 0 || date.getDay() === 6) return nextWorkdayDate(dateText);
+  return dateText;
+}
+
+function requiredDueDateFallbackForTask(task = {}, planningDate = today()) {
+  const workdays = { 4: 1, 3: 3, 2: 5 }[normalizePriority(task?.priority)] || 7;
+  return addWorkdaysFromPlanningDate(planningDate, workdays);
+}
+
+function tasksMissingRequiredDueDate(tasks = [], planningDate = today()) {
+  return (tasks || []).map((task, index) => ({ task, index }))
+    .filter(({ task }) => task && !task.isSubtask && !task.id && !task.deduplication?.todoistId)
+    .filter(({ task }) => !requiredDueDateNormalized(task.due_date, planningDate));
 }
 
 function applyLocalGeneratedTaskQualityCorrections(tasks = [], options = {}) {
@@ -38985,7 +42691,7 @@ function semanticIndexHealthSummary(chunks = []) {
   let tombstonedCount = 0;
   let orphanCount = 0;
   let legacyTaskReferenceCount = 0;
-  const dimensions = (chunks || []).map((chunk) => Array.isArray(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || chunk?.indexMetadata?.dimension || 0)).filter((value) => value > 0);
+  const dimensions = (chunks || []).map((chunk) => isEmbeddingVector(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || chunk?.indexMetadata?.dimension || 0)).filter((value) => value > 0);
   const expectedDimension = dimensions[0] || 0;
   const hierarchy = semanticTaskChunkHierarchyHealth(chunks);
   for (const chunk of chunks || []) {
@@ -38993,7 +42699,7 @@ function semanticIndexHealthSummary(chunks = []) {
     sourceKindCounts[sourceKind] = (sourceKindCounts[sourceKind] || 0) + 1;
     if (isLegacyGroupedTaskReferenceChunk(chunk)) legacyTaskReferenceCount += 1;
     if (!chunk?.path || !chunk?.text || !chunk?.sourceKind || !chunk?.sourceId || !chunk?.evidenceId) missingIdentityCount += 1;
-    const actualDimension = Array.isArray(chunk?.embedding) ? chunk.embedding.length : 0;
+    const actualDimension = isEmbeddingVector(chunk?.embedding) ? chunk.embedding.length : 0;
     const declaredDimension = Number(chunk?.indexMetadata?.dimension || chunk?.embeddingDimension || actualDimension);
     if (!actualDimension || !declaredDimension || actualDimension !== declaredDimension || (expectedDimension > 0 && actualDimension !== expectedDimension)) invalidDimensionCount += 1;
     if (chunk?.stale === true || chunk?.indexMetadata?.stale === true) staleCount += 1;
@@ -39084,8 +42790,8 @@ function semanticEmbeddingStorageProjection(chunkCount = 0, dimension = 0, model
 }
 
 function semanticIndexMetadata(chunks = [], taskReferenceHealth = null) {
-  const embedded = (chunks || []).find((chunk) => Array.isArray(chunk?.embedding) && chunk.embedding.length) || {};
-  const dimension = Array.isArray(embedded.embedding) ? embedded.embedding.length : Number(embedded.embeddingDimension || embedded.indexMetadata?.dimension || 0);
+  const embedded = (chunks || []).find((chunk) => isEmbeddingVector(chunk?.embedding) && chunk.embedding.length) || {};
+  const dimension = isEmbeddingVector(embedded.embedding) ? embedded.embedding.length : Number(embedded.embeddingDimension || embedded.indexMetadata?.dimension || 0);
   const model = String(embedded.embeddingModel || embedded.indexMetadata?.model || "");
   const provider = String(embedded.embeddingProvider || embedded.indexMetadata?.provider || "");
   return Object.assign({}, semanticTaskReferenceMetadata(chunks), {
@@ -39118,7 +42824,7 @@ function semanticPathChunksMatch(index, path, nextChunks, settings = DEFAULT_SET
     if (Number(current.createdAt || 0) !== Number(next.createdAt || 0)) return false;
     if (String(current.createdAtSource || "") !== String(next.createdAtSource || "")) return false;
     const targetDimension = semanticEmbeddingTargetDimension(settings);
-    const actualDimension = Array.isArray(current.embedding) ? current.embedding.length : 0;
+    const actualDimension = isEmbeddingVector(current.embedding) ? current.embedding.length : 0;
     if (targetDimension && actualDimension !== targetDimension) return false;
   }
   return true;
@@ -39142,8 +42848,26 @@ function semanticChunkEmbeddingRequestKey(chunk = {}) {
 function semanticChunkSharedEmbeddingInput(chunk = {}) {
   if (semanticTaskReferenceChunkSelected(chunk)) return semanticTaskReferenceEmbeddingProjection(chunk);
   const sourceKind = semanticChunkSourceKind(chunk);
+  if (sourceKind === "note") {
+    const title = String(chunk.title || "").trim();
+    const headingPath = String(chunk.section || "").trim().replace(/\s*\n+\s*/g, " > ");
+    let dateStr = "";
+    const createdAt = Number(chunk.createdAt || 0);
+    if (createdAt > 0) {
+      try { dateStr = formatDeviceDate(createdAt); } catch { dateStr = new Date(createdAt).toLocaleDateString(); }
+    }
+    const metaParts = [title];
+    if (dateStr) metaParts.push(dateStr);
+    if (headingPath) metaParts.push(headingPath);
+    const metaLine = metaParts.join(" | ");
+    return [
+      "Content type: vault note",
+      metaLine,
+      String(chunk.text || "")
+    ].filter(Boolean).join("\n");
+  }
   return [
-    sourceKind === "note" ? "Content type: vault note" : `Content type: ${sourceKind}`,
+    `Content type: ${sourceKind}`,
     String(chunk.text || "")
   ].filter(Boolean).join("\n");
 }
@@ -39260,6 +42984,59 @@ function semanticChunkEmbeddingsReusable(settings = DEFAULT_SETTINGS, meta = {})
   return true;
 }
 
+function getSemanticIndexRebuildProgress(settings = DEFAULT_SETTINGS) {
+  return settings.semanticIndexRebuildProgress || null;
+}
+
+// Task 9: routed retrieval is opt-in; anything that is not exactly "routed"
+// keeps today's exact full scan (the default).
+function semanticSearchModeOf(settings = DEFAULT_SETTINGS) {
+  return String(settings?.semanticSearchMode || "").trim().toLowerCase() === "routed" ? "routed" : "exact";
+}
+
+function setSemanticIndexRebuildProgress(settings, progress) {
+  settings.semanticIndexRebuildProgress = progress;
+}
+
+function clearSemanticIndexRebuildProgress(settings) {
+  settings.semanticIndexRebuildProgress = null;
+}
+
+function isRebuildProgressValid(progress, contentVersion) {
+  return Boolean(progress &&
+    Number(progress.contentVersion) === contentVersion &&
+    Number(progress.totalChunks) > 0 &&
+    Number(progress.chunksProcessed) >= 0 &&
+    Array.isArray(progress.stagingFiles));
+}
+
+function semanticIndexRebuildStagingFileName(index) {
+  return `${SEMANTIC_INDEX_REBUILD_STAGING_PREFIX}.${String(index).padStart(3, "0")}.json`;
+}
+
+// Reuse map for staged shard vectors. Every staged chunk is checked against the
+// current identity and content version, so a staging file from another version
+// can never contribute a vector to the new index (mixed-version guard).
+function semanticStagingReuseMap(stagedChunks = [], settings = DEFAULT_SETTINGS) {
+  const reuseMap = new Map();
+  const expectedProvider = semanticEmbeddingProvider(settings);
+  const expectedModel = settings.embeddingModel || DEFAULT_SETTINGS.embeddingModel;
+  const expectedDimension = semanticEmbeddingTargetDimension(settings);
+  for (const chunk of stagedChunks || []) {
+    if (!isEmbeddingVector(chunk?.embedding) || !chunk.embedding.length) continue;
+    const version = Number(chunk?.embeddingContentVersion || chunk?.indexMetadata?.contentVersion || 0);
+    if (version !== SEMANTIC_EMBEDDING_CONTENT_VERSION) continue;
+    const provider = String(chunk?.embeddingProvider || chunk?.indexMetadata?.provider || "");
+    if (provider && provider.toLowerCase() !== expectedProvider) continue;
+    const model = String(chunk?.embeddingModel || chunk?.indexMetadata?.model || "");
+    if (model && modelIdentity(model) !== modelIdentity(expectedModel)) continue;
+    if (expectedDimension && chunk.embedding.length !== expectedDimension) continue;
+    const key = semanticChunkReuseKey(chunk);
+    if (key && !reuseMap.has(key)) reuseMap.set(key, chunk.embedding);
+  }
+  return reuseMap;
+}
+
 function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {}) {
   const reuseMap = new Map();
   if (!semanticChunkEmbeddingsReusable(settings, meta)) return reuseMap;
@@ -39294,7 +43071,7 @@ function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {
     return { value: undefined };
   };
   for (const chunk of index || []) {
-    if (!Array.isArray(chunk?.embedding) || !chunk.embedding.length) continue;
+    if (!isEmbeddingVector(chunk?.embedding) || !chunk.embedding.length) continue;
     if (targetDimension ? chunk.embedding.length !== targetDimension : chunk.embedding.length <= 0) continue;
     const dimension = chunkMetadataValue(chunk, ["embeddingDimension", "dimension"], ["dimension", "embeddingDimension"]);
     if (dimension.conflict || (hasValue(dimension.value) && Number(dimension.value) !== chunk.embedding.length)) continue;
@@ -39318,7 +43095,7 @@ function buildSemanticChunkReuseMap(index, settings = DEFAULT_SETTINGS, meta = {
 
 function reusedSemanticChunk(chunk, reuseMap, settings = DEFAULT_SETTINGS) {
   const embedding = reuseMap?.get(semanticChunkReuseKey(chunk));
-  if (!Array.isArray(embedding) || !embedding.length) return null;
+  if (!isEmbeddingVector(embedding) || !embedding.length) return null;
   const provider = semanticEmbeddingProvider(settings);
   const projectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(chunk);
   return Object.assign({}, chunk, {
@@ -39629,8 +43406,36 @@ const TASK_WORKFLOW_EVIDENCE_UNION_FIELDS = Object.freeze({
   factRef: "factRefs"
 });
 
+// Task 7 (L2): the metadata union/dedupe path JSON.stringify's every object
+// value on every call (profile-1 §3 #10). A frozen object whose own values are
+// all primitives cannot change, so its key is memoized by identity in a
+// WeakMap (bounded by reachability; its entries die with the run's structures).
+// Anything that could still mutate keeps the uncached stringify path, so a
+// changed value can never return a stale key.
+const TASK_WORKFLOW_METADATA_KEY_OBJECT_MEMO = new WeakMap();
+const TASK_WORKFLOW_METADATA_KEY_MEMO_STATS = { hits: 0, misses: 0 };
+function taskWorkflowMetadataValueImmutable(value) {
+  if (!Object.isFrozen(value)) return false;
+  for (const key of Object.keys(value)) {
+    const child = value[key];
+    if (child !== null && typeof child === "object") return false;
+  }
+  return true;
+}
 function taskWorkflowMetadataValueKey(value) {
   if (value && typeof value === "object") {
+    if (taskWorkflowMetadataValueImmutable(value)) {
+      const cached = TASK_WORKFLOW_METADATA_KEY_OBJECT_MEMO.get(value);
+      if (cached !== undefined) {
+        TASK_WORKFLOW_METADATA_KEY_MEMO_STATS.hits += 1;
+        return cached;
+      }
+      TASK_WORKFLOW_METADATA_KEY_MEMO_STATS.misses += 1;
+      let key;
+      try { key = JSON.stringify(value); } catch { key = String(value); }
+      TASK_WORKFLOW_METADATA_KEY_OBJECT_MEMO.set(value, key);
+      return key;
+    }
     try { return JSON.stringify(value); } catch { return String(value); }
   }
   return `${typeof value}:${String(value)}`;
@@ -43624,7 +47429,7 @@ function taskDescriptionEvidenceRecordCeiling(settings = DEFAULT_SETTINGS, mainT
 // rows array, owns nothing the registry recognizes and keeps the strict original
 // gate. No new generic framework, no scoring/membership/admission change.
 const taskWorkflowCoverageProofRegistry = new WeakMap();
-const TASK_WORKFLOW_COVERAGE_PROOF_VERSION = 2;
+const TASK_WORKFLOW_COVERAGE_PROOF_VERSION = 3;
 // Only the actual positive-admission rejection reasons may justify an exclusion.
 const TASK_WORKFLOW_COVERAGE_EXCLUSION_REASONS = Object.freeze([
   "positive-admission-native-exclusive-foreign-scope",
@@ -43647,7 +47452,20 @@ function buildTaskWorkflowCoverageProof(coverageMembership = null) {
   if (!complete.length) return null;
   const fingerprint = String(coverageMembership.completeEligibleFingerprint || "");
   if (!fingerprint || fingerprint !== taskWorkflowCoverageFingerprint(complete)) return null;
+  // R9 fix B: routed mode scans only the router-selected shards, so the proof
+  // carries the routed-scanned eligible sets it actually covered. Rows in
+  // unscanned shards are "not scanned in routed mode" and need no accounting;
+  // every scanned row must still be ranked or actually excluded (enforced by
+  // the reconcile functions). Exact mode carries no routed fields and keeps
+  // the strict full-corpus reconciliation.
+  const routedScanned = String(coverageMembership.semanticSearchMode || "") === "routed";
   const completeIds = new Set(complete);
+  const routedScannedByTask = routedScanned && coverageMembership.routedScannedByTask && typeof coverageMembership.routedScannedByTask === "object"
+    ? coverageMembership.routedScannedByTask
+    : {};
+  const routedScannedGlobal = routedScanned && Array.isArray(coverageMembership.routedScannedEvidenceIds)
+    ? uniqueValues(coverageMembership.routedScannedEvidenceIds.map(String).filter((id) => id && completeIds.has(id)))
+    : [];
   const byTask = {};
   for (const [taskKey, entry] of Object.entries(coverageMembership.byTask || {})) {
     const admitted = (Array.isArray(entry?.admittedEvidenceIds) ? entry.admittedEvidenceIds : [])
@@ -43666,11 +47484,18 @@ function buildTaskWorkflowCoverageProof(coverageMembership = null) {
       }));
     byTask[taskKey] = Object.freeze({
       admittedEvidenceIds: Object.freeze(admitted),
-      exclusions: Object.freeze(exclusions)
+      exclusions: Object.freeze(exclusions),
+      ...(routedScanned ? {
+        scannedEvidenceIds: Object.freeze(uniqueValues((Array.isArray(routedScannedByTask[taskKey]) ? routedScannedByTask[taskKey] : []).map(String).filter((id) => id && completeIds.has(id))))
+      } : {})
     });
   }
   return Object.freeze({
     version: TASK_WORKFLOW_COVERAGE_PROOF_VERSION,
+    ...(routedScanned ? {
+      semanticSearchMode: "routed",
+      routedScannedEvidenceIds: Object.freeze(routedScannedGlobal)
+    } : {}),
     indexRevision: Number(coverageMembership.indexRevision || 0),
     sourceContractId: String(coverageMembership.sourceContractId || ""),
     completeEligibleEvidenceIds: Object.freeze(complete),
@@ -43722,6 +47547,14 @@ function taskWorkflowCoverageTaskReconciles(proof = null, taskKey = "", rankedId
   for (const id of ranked) if (!complete.has(id)) return false;
   for (const id of ranked) if (exclusionIds.has(id)) return false;
   const union = new Set([...ranked, ...exclusionIds]);
+  if (proof.semanticSearchMode === "routed" && Array.isArray(entry.scannedEvidenceIds)) {
+    // R9 fix B: routed mode covered only this task's scanned scope; every
+    // scanned row must be ranked or actually excluded, while eligible rows in
+    // unscanned shards stay unaccounted by design. Exact mode never reaches
+    // this branch.
+    for (const id of entry.scannedEvidenceIds) if (!union.has(id)) return false;
+    return true;
+  }
   if (union.size !== complete.size || [...complete].some((id) => !union.has(id))) return false;
   return true;
 }
@@ -43754,6 +47587,15 @@ function taskWorkflowCoverageUnionReconciles(proof = null, rankedCorpusIds = [],
   for (const id of ranked) if (!complete.has(id)) return false;
   if (admittedUnion.size !== ranked.size || [...admittedUnion].some((id) => !ranked.has(id))) return false;
   const union = new Set([...ranked, ...unionExcluded]);
+  if (proof.semanticSearchMode === "routed" && Array.isArray(proof.routedScannedEvidenceIds)) {
+    // R9 fix B: only the routed-scanned scope must reconcile in routed mode;
+    // eligible rows in unscanned shards are "not scanned in routed mode". The
+    // per-task reconcile independently requires every row scanned for a task
+    // to be ranked or actually excluded for that task. Exact mode never
+    // reaches this branch.
+    for (const id of proof.routedScannedEvidenceIds) if (!union.has(id)) return false;
+    return true;
+  }
   if (union.size !== complete.size || [...complete].some((id) => !union.has(id))) return false;
   for (const id of complete) {
     if (ranked.has(id)) continue;
@@ -47030,7 +50872,6 @@ function monthNumber(value) {
   return { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 }[key] || 0;
 }
 
-
 function taskChildTextByParentOid(entries) {
   const map = new Map();
   for (const [, task] of entries || []) {
@@ -47342,23 +51183,43 @@ function vaultBasePath(app) {
   try { return app?.vault?.adapter?.getBasePath?.() || ""; } catch { return ""; }
 }
 // Pure function of (String(value||""), String(basePath||"")): the result never
-// depends on any other state. Memoize it with a bounded cache so the per-note
-// hydration scans and the per-task description renders stop paying the ~6 regex
-// passes + decodeURIComponent for the same raw paths. Clear-on-full keeps the
-// cache bounded (~5000 entries); the NUL separator cannot occur in a real path.
+// depends on any other state. Memoize it with a bounded two-generation cache so
+// the per-note hydration scans and the per-task description renders stop paying
+// the ~6 regex passes + decodeURIComponent for the same raw paths. A scan with
+// more distinct keys than one generation rotates the current generation out
+// instead of clearing the whole cache, so a single large scan never thrashes
+// entries it just computed; total entries stay bounded at two generations and
+// Task 7 releases both with the run. The NUL separator cannot occur in a real
+// path.
 const VAULT_RELATIVE_PATH_CACHE_LIMIT = 5000;
-const VAULT_RELATIVE_PATH_CACHE = new Map();
+let VAULT_RELATIVE_PATH_CACHE = new Map();
+let VAULT_RELATIVE_PATH_CACHE_PREVIOUS = new Map();
+const VAULT_RELATIVE_PATH_MEMO_STATS = { hits: 0, misses: 0 };
 function rememberVaultRelativePath(cacheKey, result) {
-  if (VAULT_RELATIVE_PATH_CACHE.size >= VAULT_RELATIVE_PATH_CACHE_LIMIT) VAULT_RELATIVE_PATH_CACHE.clear();
+  if (VAULT_RELATIVE_PATH_CACHE.size >= VAULT_RELATIVE_PATH_CACHE_LIMIT) {
+    VAULT_RELATIVE_PATH_CACHE_PREVIOUS = VAULT_RELATIVE_PATH_CACHE;
+    VAULT_RELATIVE_PATH_CACHE = new Map();
+  }
   VAULT_RELATIVE_PATH_CACHE.set(cacheKey, result);
   return result;
+}
+// Task 7 (L2): release the run's memo working data; called from the description
+// phase's terminal path (the last local phase of a task-generation run).
+function releaseWalltimeMemos() {
+  VAULT_RELATIVE_PATH_CACHE = new Map();
+  VAULT_RELATIVE_PATH_CACHE_PREVIOUS = new Map();
 }
 function vaultRelativePath(value, basePath = "") {
   const rawValue = String(value || "");
   const rawBase = String(basePath || "");
   const cacheKey = `${rawValue}\u0000${rawBase}`;
-  const cached = VAULT_RELATIVE_PATH_CACHE.get(cacheKey);
-  if (cached !== undefined) return cached;
+  let cached = VAULT_RELATIVE_PATH_CACHE.get(cacheKey);
+  if (cached === undefined) cached = VAULT_RELATIVE_PATH_CACHE_PREVIOUS.get(cacheKey);
+  if (cached !== undefined) {
+    VAULT_RELATIVE_PATH_MEMO_STATS.hits += 1;
+    return cached;
+  }
+  VAULT_RELATIVE_PATH_MEMO_STATS.misses += 1;
   let path = singleLine(rawValue)
     .replace(/^file:\/\//i, "")
     .replace(/\\/g, "/")
@@ -47478,7 +51339,7 @@ function* semanticIndexChunkDecorationIterator(chunks = [], indexRevision = 0) {
     const sourceKind = semanticChunkSourceKind(chunk);
     const taskReferenceProjectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(chunk);
     const sourceId = String(chunk?.sourceId || (sourceKind === "note" ? path : semanticTaskReferenceSourceId(chunk?.taskId || chunk?.oid || "", chunk, sourceKind)));
-    const embeddingDimension = Array.isArray(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || 0);
+    const embeddingDimension = isEmbeddingVector(chunk?.embedding) ? chunk.embedding.length : Number(chunk?.embeddingDimension || 0);
     const duplicateKey = `${path}\u0000${contentFingerprint}`;
     const ordinal = duplicateOrdinals.get(duplicateKey) || 0;
     duplicateOrdinals.set(duplicateKey, ordinal + 1);
@@ -47552,13 +51413,156 @@ async function decorateSemanticIndexChunksCooperative(chunks = [], indexRevision
   }
 }
 
+// Task 4: one compact vector copy. Chunk embeddings are packed ONCE into a
+// single Float64Array (rows*dim); each chunk keeps a subarray VIEW, so the
+// index, the decorated-chunk memo (shallow copies) and the routing lookup
+// (refs) share the buffer instead of holding per-chunk JS number arrays.
+// Float64 (not Float32) is deliberate: parsed JSON numbers are doubles, so
+// Float64 round-trips values exactly and cosine scores stay bit-for-bit
+// identical to the old path. Rows whose length differs from the pack
+// dimension keep their own array and are counted as fallback rows.
+function isEmbeddingVector(value) {
+  return Array.isArray(value) || ArrayBuffer.isView(value);
+}
+function packSemanticIndexVectors(chunks = []) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  let dimension = 0;
+  for (const chunk of list) {
+    const length = Number(chunk?.embedding?.length || 0);
+    if (length > 0) { dimension = length; break; }
+  }
+  if (!dimension) return { vectors: new Float64Array(0), dimension: 0, fallbackRows: list.length };
+  const vectors = new Float64Array(list.length * dimension);
+  let fallbackRows = 0;
+  for (let row = 0; row < list.length; row += 1) {
+    const embedding = list[row]?.embedding;
+    if (!isEmbeddingVector(embedding) || embedding.length !== dimension) { fallbackRows += 1; continue; }
+    for (let index = 0; index < dimension; index += 1) vectors[row * dimension + index] = Number(embedding[index]);
+  }
+  for (let row = 0; row < list.length; row += 1) {
+    const embedding = list[row]?.embedding;
+    if (isEmbeddingVector(embedding) && embedding.length === dimension) list[row].embedding = vectors.subarray(row * dimension, row * dimension + dimension);
+  }
+  return { vectors, dimension, fallbackRows };
+}
+function semanticIndexVectorView(chunks = [], row = 0) {
+  const embedding = chunks?.[row]?.embedding;
+  return isEmbeddingVector(embedding) ? embedding : null;
+}
+function packedIndexVectorsInfo(chunks = []) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const buffers = new Set();
+  let typedRows = 0;
+  let plainRows = 0;
+  let dimension = 0;
+  for (const chunk of list) {
+    const embedding = chunk?.embedding;
+    if (ArrayBuffer.isView(embedding)) {
+      typedRows += 1;
+      if (embedding.buffer) buffers.add(embedding.buffer);
+      if (!dimension) dimension = Number(embedding.length || 0);
+    } else if (Array.isArray(embedding)) {
+      plainRows += 1;
+      if (!dimension) dimension = Number(embedding.length || 0);
+    }
+  }
+  let byteLength = 0;
+  for (const buffer of buffers) byteLength += Number(buffer.byteLength || 0);
+  return { rows: list.length, dimension, typedRows, plainRows, distinctBuffers: buffers.size, byteLength };
+}
+// JSON of a Float64Array view differs from JSON of a number Array, so chunks
+// are converted with Array.from at write/hash time ONLY. Float64 values are
+// exactly the parsed doubles, so the saved bytes stay IDENTICAL to the old
+// format and existing shards/hashes stay valid.
+function serializableSemanticChunk(chunk = {}) {
+  const embedding = chunk?.embedding;
+  if (ArrayBuffer.isView(embedding)) return Object.assign({}, chunk, { embedding: Array.from(embedding) });
+  return chunk;
+}
 function normalizeSemanticIndexPaths(chunks, app, indexRevision = 0) {
   const basePath = vaultBasePath(app);
   const normalized = (chunks || []).map((chunk) => Object.assign({}, chunk, {
     path: vaultRelativePath(chunk.path || "", basePath),
     id: chunk.id && chunk.path ? `${vaultRelativePath(chunk.path, basePath)}${String(chunk.id).includes("#") ? `#${String(chunk.id).split("#").pop()}` : ""}` : chunk.id
   }));
-  return decorateSemanticIndexChunks(normalized, indexRevision);
+  const decorated = decorateSemanticIndexChunks(normalized, indexRevision);
+  packSemanticIndexVectors(decorated);
+  return decorated;
+}
+// Cooperative load-path variants (gentle load): the load must never hold the
+// thread for the whole decoration/pack pass. Same output as the sync
+// functions; slices run under the existing 8 ms budget + idlePause pattern and
+// consult the load gate so a deferred load pauses while the app is busy.
+async function semanticIndexLoadSlicePause(gate) {
+  await idlePause(0);
+  if (typeof gate !== "function") return;
+  while (!gate()) await idlePause(250);
+}
+async function packSemanticIndexVectorsCooperative(chunks = [], gate = null) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  let dimension = 0;
+  for (const chunk of list) {
+    const length = Number(chunk?.embedding?.length || 0);
+    if (length > 0) { dimension = length; break; }
+  }
+  if (!dimension) return { vectors: new Float64Array(0), dimension: 0, fallbackRows: list.length };
+  const vectors = new Float64Array(list.length * dimension);
+  let fallbackRows = 0;
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let row = 0; row < list.length; row += 1) {
+    const embedding = list[row]?.embedding;
+    if (!isEmbeddingVector(embedding) || embedding.length !== dimension) {
+      fallbackRows += 1;
+    } else {
+      const offset = row * dimension;
+      for (let index = 0; index < dimension; index += 1) vectors[offset + index] = Number(embedding[index]);
+      list[row].embedding = vectors.subarray(offset, offset + dimension);
+    }
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  return { vectors, dimension, fallbackRows };
+}
+async function normalizeSemanticIndexPathsCooperative(chunks, app, indexRevision = 0, gate = null) {
+  const basePath = vaultBasePath(app);
+  const source = Array.isArray(chunks) ? chunks : [];
+  const normalized = new Array(source.length);
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let index = 0; index < source.length; index += 1) {
+    const chunk = source[index];
+    normalized[index] = Object.assign({}, chunk, {
+      path: vaultRelativePath(chunk.path || "", basePath),
+      id: chunk.id && chunk.path ? `${vaultRelativePath(chunk.path, basePath)}${String(chunk.id).includes("#") ? `#${String(chunk.id).split("#").pop()}` : ""}` : chunk.id
+    });
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  const decorated = await decorateSemanticIndexChunksCooperative(normalized, indexRevision);
+  await packSemanticIndexVectorsCooperative(decorated, gate);
+  return decorated;
+}
+// Same stale marking as the load's former inline .map: rows keep their object
+// identity unless marked, and the array is a fresh one like .map produced.
+async function markStaleSemanticIndexChunksCooperative(chunks, app, gate = null) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const marked = new Array(list.length);
+  let lastYieldAt = localSemanticRoutingNow();
+  for (let index = 0; index < list.length; index += 1) {
+    const chunk = list[index];
+    const pathMissing = chunk?.path && semanticChunkSourceKind(chunk) === "note" && !(app.vault.getAbstractFileByPath?.(chunk.path) instanceof TFile);
+    marked[index] = isLegacyGroupedTaskReferenceChunk(chunk) || pathMissing
+      ? Object.assign({}, chunk, { stale: true, indexMetadata: Object.assign({}, chunk.indexMetadata || {}, { stale: true, quarantineReason: pathMissing ? "stale-note-path" : "legacy-grouped-task-reference" }) })
+      : chunk;
+    if (localSemanticRoutingNow() - lastYieldAt >= 8) {
+      await semanticIndexLoadSlicePause(gate);
+      lastYieldAt = localSemanticRoutingNow();
+    }
+  }
+  return marked;
 }
 function normalizeStoredTaskReferencePaths(task, basePath = "") {
   const normalized = Object.assign({}, task, {
@@ -47640,7 +51644,7 @@ async function semanticIndexSeedHash(seedMeta, chunks) {
   let checkpointAt = Date.now();
   for (let index = 0; index < list.length; index += 1) {
     if (index) hash = fnv1aStep(hash, ",");
-    const serialized = JSON.stringify(list[index]);
+    const serialized = JSON.stringify(serializableSemanticChunk(list[index]));
     hash = fnv1aStep(hash, serialized === undefined ? "null" : serialized);
     if (Date.now() - checkpointAt >= 8) {
       await idlePause(0);
@@ -47658,7 +51662,7 @@ function semanticIndexPathRemovalChanged(candidateIndex, previousIndex) {
   if (JSON.stringify(candidateIndex.map((chunk) => chunk.id)) !== JSON.stringify(previousIndex.map((chunk) => chunk.id))) return true;
   for (let index = 0; index < candidateIndex.length; index += 1) {
     if (candidateIndex[index] === previousIndex[index]) continue;
-    if (JSON.stringify(candidateIndex[index]) !== JSON.stringify(previousIndex[index])) return true;
+    if (JSON.stringify(serializableSemanticChunk(candidateIndex[index])) !== JSON.stringify(serializableSemanticChunk(previousIndex[index]))) return true;
   }
   return false;
 }
@@ -47896,7 +51900,7 @@ function semanticMaterialityAnchorSetForSettings(settings = DEFAULT_SETTINGS, me
 }
 
 function semanticMaterialityAnchorScores(chunk = {}, anchorSet = null) {
-  if (!anchorSet || !Array.isArray(chunk.embedding)) return null;
+  if (!anchorSet || !isEmbeddingVector(chunk.embedding)) return null;
   const vectors = anchorSet.vectors || {};
   const positive = cosine(vectors.positive || [], chunk.embedding);
   const negative = cosine(vectors.negative || [], chunk.embedding);
@@ -48047,6 +52051,12 @@ function uniqueValues(values) {
     return true;
   });
 }
+// Numeric-safe dedupe for 0-based task index lists: uniqueValues drops falsy
+// values, which silently discards index 0 from description retry selection
+// (retryIndexes / recoveryTelemetry.initialFailedIndexes).
+function uniqueIndexes(values) {
+  return [...new Set((values || []).filter((value) => Number.isInteger(value)))];
+}
 function shallowObjectEqual(a = {}, b = {}) {
   const aKeys = Object.keys(a || {});
   const bKeys = Object.keys(b || {});
@@ -48138,7 +52148,15 @@ function semanticIndexManifestValidation(parsed = {}, indexFile = SEMANTIC_INDEX
   let chunkCount = 0;
   for (const shard of parsed.shards) {
     const file = semanticIndexShardName(indexFile, shard?.file || shard?.path || "", { allowLegacy: !versioned });
-    if (versioned && !file.startsWith(`${String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, "")}.g${meta.generation}.`)) {
+    const shardGeneration = String(shard?.generation || "");
+    const generationPrefix = `${String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, "")}.g`;
+    if (versioned && shardGeneration) {
+      // Incremental saves reference unchanged shards from earlier generations;
+      // the declared generation must match the file name it is declared for.
+      if (!file.startsWith(`${generationPrefix}${shardGeneration}.`)) {
+        throw new Error("Semantic-index shard generation does not match its declared generation.");
+      }
+    } else if (versioned && !file.startsWith(`${generationPrefix}${meta.generation}.`)) {
       throw new Error("Semantic-index shard generation does not match manifest.");
     }
     if (seenFiles.has(file)) throw new Error("Semantic-index manifest contains duplicate shard names.");
@@ -48190,7 +52208,7 @@ function semanticIndexShardValidation(parsed = {}, manifestMeta = {}, shardMeta 
       Number(meta.dimension) !== Number(manifestMeta.dimension) || String(meta.provider) !== String(manifestMeta.provider) ||
       modelIdentity(meta.model) !== modelIdentity(manifestMeta.model) ||
       Number(meta.persistenceSchemaVersion || 0) !== Number(manifestMeta.persistenceSchemaVersion || 0) ||
-      String(meta.generation || "") !== String(manifestMeta.generation || "") ||
+      String(meta.generation || "") !== String(shardMeta.generation || manifestMeta.generation || "") ||
       Number(meta.contentSchemaVersion || 0) !== Number(manifestMeta.contentSchemaVersion || 0) ||
       Number(meta.embeddingContentVersion || 0) !== Number(manifestMeta.embeddingContentVersion || 0)) {
     throw new Error("Semantic-index shard metadata is incompatible.");
@@ -48284,7 +52302,7 @@ async function semanticIndexShardBodiesAsync(indexFile, meta, chunks, maxBytes =
   };
   for (let index = 0; index < (chunks || []).length; index += 1) {
     const chunk = chunks[index];
-    const chunkBody = JSON.stringify(chunk);
+    const chunkBody = JSON.stringify(serializableSemanticChunk(chunk));
     const chunkBytes = utf8ByteLength(chunkBody);
     const nextBytes = currentBytes + chunkBytes;
     const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shards.length, currentBodies.length + 1, nextBytes, generation);
@@ -48320,7 +52338,7 @@ function semanticIndexShardFromBodies(indexFile, meta, shardIndex, chunkBodies, 
   const header = semanticIndexShardHeader(indexFile, meta, shardIndex, chunkBodies.length, generation);
   const body = `${header}${chunkBodies.join(",")}]}`;
   const bytes = utf8ByteLength(body);
-  return { file, body, bytes, chunkCount: chunkBodies.length };
+  return { file, body, bytes, chunkCount: chunkBodies.length, hash: shortHash(body) };
 }
 
 function semanticIndexShardFileName(indexFile, index, generation = "") {
@@ -48329,7 +52347,306 @@ function semanticIndexShardFileName(indexFile, index, generation = "") {
   return `${base}.${String(index + 1).padStart(3, "0")}.json`;
 }
 
+// --- Task 9: binary shard codec ---------------------------------------------
+// A binary shard is a `.bin` payload (little-endian Float64 vectors, bit-exact
+// with the parsed JSON doubles) plus the existing JSON shard name as its
+// sidecar (chunk metadata without embeddings + the bin link). Both files stay
+// at or under SEMANTIC_INDEX_SHARD_MAX_BYTES.
+const SEMANTIC_INDEX_SHARD_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+function semanticIndexShardBinaryFileName(indexFile, index, generation = "") {
+  const base = String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, "");
+  if (generation) return `${base}.g${normalizedPluginBasename(generation, "semantic-index generation")}.${String(index + 1).padStart(3, "0")}.bin`;
+  return `${base}.${String(index + 1).padStart(3, "0")}.bin`;
+}
+
+function isSemanticIndexShardBinaryFile(indexFile, fileName) {
+  const base = escapeRegExp(String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, ""));
+  return new RegExp(`^${base}\\.g[a-z0-9-]+\\.\\d{3}\\.bin$`, "i").test(String(fileName || ""));
+}
+
+function semanticIndexBinaryShortHash(bytes) {
+  let hash = 2166136261;
+  for (let index = 0; index < bytes.length; index += 1) {
+    hash ^= bytes[index];
+    hash = Math.imul(hash, 16777619);
+  }
+  return fnv1aFinish16(hash);
+}
+
+function semanticIndexShardBinaryBytesFromValues(values) {
+  if (SEMANTIC_INDEX_SHARD_LITTLE_ENDIAN) {
+    return new Uint8Array(values.buffer.slice(values.byteOffset, values.byteOffset + values.byteLength));
+  }
+  const bytes = new Uint8Array(values.byteLength);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < values.length; index += 1) view.setFloat64(index * 8, values[index], true);
+  return bytes;
+}
+
+function semanticIndexShardBinaryValuesFromBytes(bytes) {
+  if (SEMANTIC_INDEX_SHARD_LITTLE_ENDIAN) {
+    return new Float64Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+  const values = new Float64Array(bytes.byteLength / 8);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let index = 0; index < values.length; index += 1) values[index] = view.getFloat64(index * 8, true);
+  return values;
+}
+
+function semanticIndexShardBinaryChunkSidecar(chunk = {}) {
+  const copy = Object.assign({}, chunk);
+  delete copy.embedding;
+  return copy;
+}
+
+function semanticIndexShardBinaryFromChunks(indexFile, meta, shardIndex, chunks, generation = "") {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const dimension = Number(list.find((chunk) => isEmbeddingVector(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || meta?.dimension || 0);
+  if (!dimension) throw new Error("Semantic-index binary shard requires a positive embedding dimension.");
+  const file = semanticIndexShardFileName(indexFile, shardIndex, generation);
+  const binFile = semanticIndexShardBinaryFileName(indexFile, shardIndex, generation);
+  const values = new Float64Array(list.length * dimension);
+  for (let row = 0; row < list.length; row += 1) {
+    const embedding = list[row]?.embedding;
+    for (let index = 0; index < dimension; index += 1) values[row * dimension + index] = Number(embedding?.[index] ?? 0);
+  }
+  const binBody = semanticIndexShardBinaryBytesFromValues(values);
+  const binHash = semanticIndexBinaryShortHash(binBody);
+  const sidecars = list.map((chunk) => semanticIndexShardBinaryChunkSidecar(chunk));
+  // Generation-independent payload proof: the generation token (and its length)
+  // varies per save, so byte-count equality between an old file and a freshly
+  // built body is not a valid reuse test; the serialized sidecars + vector
+  // bytes + dimension are.
+  const payloadHash = shortHash(`${dimension}|${binHash}|${JSON.stringify(sidecars)}`);
+  const vectors = { file: binFile, format: SEMANTIC_INDEX_SHARD_BINARY_FORMAT, dimension, count: list.length, byteLength: binBody.byteLength };
+  const body = JSON.stringify({
+    meta: semanticIndexShardMeta(indexFile, meta, shardIndex, list.length, generation),
+    vectors,
+    chunks: sidecars
+  });
+  return {
+    file,
+    binFile,
+    body,
+    binBody,
+    bytes: utf8ByteLength(body),
+    binBytes: binBody.byteLength,
+    chunkCount: list.length,
+    hash: shortHash(`${shortHash(body)}|${binHash}`),
+    binHash,
+    payloadHash
+  };
+}
+
+async function semanticIndexShardBinaryBodiesAsync(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES, generation = "", startIndex = 0) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const dimension = Number(list.find((chunk) => isEmbeddingVector(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || meta?.dimension || 0);
+  const shards = [];
+  let current = [];
+  let currentSidecarBytes = 0;
+  const flush = async () => {
+    if (!current.length) return;
+    shards.push(semanticIndexShardBinaryFromChunks(indexFile, meta, Number(startIndex || 0) + shards.length, current, generation));
+    current = [];
+    currentSidecarBytes = 0;
+    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+  };
+  for (let index = 0; index < list.length; index += 1) {
+    const chunk = list[index];
+    const chunkSidecarBytes = utf8ByteLength(JSON.stringify(semanticIndexShardBinaryChunkSidecar(chunk)));
+    const projectedSidecar = currentSidecarBytes + chunkSidecarBytes + Math.max(0, current.length) + 512;
+    const projectedBin = (current.length + 1) * dimension * 8 + 512;
+    if (current.length && (projectedSidecar > maxBytes || projectedBin > maxBytes)) await flush();
+    current.push(chunk);
+    currentSidecarBytes += chunkSidecarBytes;
+    if (index && index % 50 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
+  }
+  await flush();
+  return shards;
+}
+
+// --- Incremental shard reuse -------------------------------------------------
+// Extracts the generation segment from a versioned shard file name
+// (semantic-index.g<generation>.NNN.json|.bin); "" for legacy names.
+function semanticIndexShardFileGeneration(indexFile, fileName) {
+  const base = escapeRegExp(String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, ""));
+  const match = new RegExp(`^${base}\\.g([a-z0-9-]+)\\.\\d{3}\\.(?:json|bin)$`, "i").exec(String(fileName || ""));
+  return match ? match[1] : "";
+}
+
+// A previous manifest can only anchor reuse when it carries the full
+// content-addressed proof for every shard (hashes + per-entry generation) and
+// its identity matches the save being written. Anything else (old manifest
+// from before this format, shard-size change, content/embedding version
+// change, provider/model/dimension change, missing hashes) falls back to the
+// greedy full repack.
+function semanticIndexShardReuseCompatible(previousManifest, meta = {}, indexFile = SEMANTIC_INDEX_FILE) {
+  if (!previousManifest || typeof previousManifest !== "object") return false;
+  const previousMeta = previousManifest.meta;
+  if (!previousMeta || typeof previousMeta !== "object" || !Array.isArray(previousManifest.shards) || !previousManifest.shards.length) return false;
+  if (!String(previousMeta.generation || "")) return false;
+  if (String(previousMeta.file || "") !== String(meta.file || indexFile || "")) return false;
+  if (Number(previousMeta.persistenceSchemaVersion || 0) !== SEMANTIC_INDEX_PERSISTENCE_SCHEMA_VERSION) return false;
+  if (Number(previousMeta.contentSchemaVersion || 0) !== SEMANTIC_INDEX_CONTENT_SCHEMA_VERSION) return false;
+  if (Number(previousMeta.embeddingContentVersion || 0) !== SEMANTIC_EMBEDDING_CONTENT_VERSION) return false;
+  if (Number(previousMeta.taskReferenceEmbeddingProjectionVersion || 0) !== SEMANTIC_TASK_REFERENCE_EMBEDDING_PROJECTION_VERSION) return false;
+  if (String(previousMeta.provider || "") !== String(meta.provider || "")) return false;
+  if (modelIdentity(String(previousMeta.model || "")) !== modelIdentity(String(meta.model || ""))) return false;
+  if (Number(previousMeta.dimension || 0) !== Number(meta.dimension || 0)) return false;
+  if (Number(previousMeta.targetDimension || 0) !== Number(meta.targetDimension || 0)) return false;
+  if (Number(previousMeta.shardMaxBytes || 0) !== Number(meta.shardMaxBytes || 0)) return false;
+  const shards = previousManifest.shards.slice().sort((a, b) => Number(a?.index ?? a?.shardIndex) - Number(b?.index ?? b?.shardIndex));
+  let chunkCount = 0;
+  const seenFiles = new Set();
+  for (let index = 0; index < shards.length; index += 1) {
+    const shard = shards[index];
+    if (!shard || typeof shard !== "object") return false;
+    if (Number(shard.index ?? shard.shardIndex) !== index) return false;
+    const file = String(shard.file || "");
+    if (!file || seenFiles.has(file)) return false;
+    seenFiles.add(file);
+    const generation = String(shard.generation || "") || semanticIndexShardFileGeneration(indexFile, file);
+    if (!generation || !file.includes(`.g${generation}.`)) return false;
+    const chunks = Number(shard.chunks);
+    if (!Number.isInteger(chunks) || chunks <= 0) return false;
+    if (!Number(shard.bytes) || !Number(shard.binBytes)) return false;
+    if (!String(shard.hash || "") || !String(shard.binHash || "") || !String(shard.payloadHash || "")) return false;
+    if (String(shard.bin || "") !== file.replace(/\.json$/i, ".bin")) return false;
+    chunkCount += chunks;
+  }
+  if (Number(previousMeta.chunks || 0) !== chunkCount) return false;
+  return true;
+}
+
+// Generation-independent proof for one shard's chunks: the vector-bytes hash
+// plus the serialized sidecars, exactly as semanticIndexShardBinaryFromChunks
+// records them in the manifest.
+function semanticIndexShardBinaryPayloadProof(chunks, fallbackDimension = 0) {
+  const list = Array.isArray(chunks) ? chunks : [];
+  const dimension = Number(list.find((chunk) => isEmbeddingVector(chunk?.embedding) && chunk.embedding.length)?.embedding?.length || fallbackDimension || 0);
+  if (!dimension) return null;
+  const values = new Float64Array(list.length * dimension);
+  for (let row = 0; row < list.length; row += 1) {
+    const embedding = list[row]?.embedding;
+    for (let index = 0; index < dimension; index += 1) values[row * dimension + index] = Number(embedding?.[index] ?? 0);
+  }
+  const binHash = semanticIndexBinaryShortHash(semanticIndexShardBinaryBytesFromValues(values));
+  const sidecarJson = JSON.stringify(list.map((chunk) => semanticIndexShardBinaryChunkSidecar(chunk)));
+  return { binHash, payloadHash: shortHash(`${dimension}|${binHash}|${sidecarJson}`) };
+}
+
+// Stable shard ranges + content-addressed reuse: previous shards keep their
+// chunk ranges, removed chunks leave their shard, appended chunks extend the
+// tail shard(s). A shard whose whole range survived with an identical payload
+// proof is reused by reference (same file, declared per-entry generation);
+// every other shard is rebuilt under the new generation. Returns null whenever
+// the mapping cannot be proven, so the caller falls back to the full repack.
+async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex, candidateChunks, previousManifest, generation = "", maxBytes = 0) {
+  const previous = Array.isArray(previousIndex) ? previousIndex : null;
+  const candidate = Array.isArray(candidateChunks) ? candidateChunks : [];
+  if (!previous || !previous.length || !candidate.length) return null;
+  if (!semanticIndexShardReuseCompatible(previousManifest, meta, indexFile)) return null;
+  const entries = previousManifest.shards.slice().sort((a, b) => Number(a?.index ?? a?.shardIndex) - Number(b?.index ?? b?.shardIndex));
+  let total = 0;
+  for (const entry of entries) total += Number(entry.chunks || 0);
+  if (total !== previous.length) return null;
+  const ranges = [];
+  const shardOfPreviousChunk = new Map();
+  let cursor = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    const count = Number(entry.chunks || 0);
+    const range = { index, entry, survivors: [] };
+    for (let position = cursor; position < cursor + count; position += 1) {
+      if (position >= previous.length) return null;
+      shardOfPreviousChunk.set(previous[position], range);
+    }
+    ranges.push(range);
+    cursor += count;
+  }
+  if (cursor !== previous.length) return null;
+  const appended = [];
+  const seen = new Set();
+  let lastShardIndex = -1;
+  let sawAppended = false;
+  for (const chunk of candidate) {
+    if (seen.has(chunk)) return null;
+    seen.add(chunk);
+    const range = shardOfPreviousChunk.get(chunk);
+    if (!range) {
+      sawAppended = true;
+      appended.push(chunk);
+      continue;
+    }
+    if (sawAppended || range.index < lastShardIndex) return null;
+    lastShardIndex = range.index;
+    range.survivors.push(chunk);
+  }
+  const planned = [];
+  for (const range of ranges) planned.push(...range.survivors);
+  planned.push(...appended);
+  if (planned.length !== candidate.length) return null;
+  for (let index = 0; index < candidate.length; index += 1) {
+    if (planned[index] !== candidate[index]) return null;
+  }
+  const shards = [];
+  for (const range of ranges) {
+    const entry = range.entry;
+    const survivors = range.survivors;
+    if (!survivors.length) return null;
+    const isTail = range.index === ranges.length - 1;
+    const allSurvived = survivors.length === Number(entry.chunks || 0) && (!isTail || !appended.length);
+    if (allSurvived) {
+      const proof = semanticIndexShardBinaryPayloadProof(survivors, meta?.dimension);
+      if (proof && proof.payloadHash === String(entry.payloadHash || "")) {
+        const reuseGeneration = String(entry.generation || "") || semanticIndexShardFileGeneration(indexFile, entry.file);
+        shards.push({
+          file: String(entry.file),
+          binFile: String(entry.bin || String(entry.file).replace(/\.json$/i, ".bin")),
+          bytes: Number(entry.bytes || 0),
+          binBytes: Number(entry.binBytes || 0),
+          chunkCount: Number(entry.chunks || 0),
+          hash: String(entry.hash || ""),
+          binHash: String(entry.binHash || ""),
+          payloadHash: String(entry.payloadHash || ""),
+          generation: reuseGeneration,
+          reused: true
+        });
+        continue;
+      }
+    }
+    if (isTail && appended.length) {
+      const packed = await semanticIndexShardBinaryBodiesAsync(indexFile, meta, survivors.concat(appended), Number(maxBytes) || 0, generation, range.index);
+      for (const shard of packed) shards.push(Object.assign({ generation }, shard));
+      continue;
+    }
+    shards.push(Object.assign({ generation }, semanticIndexShardBinaryFromChunks(indexFile, meta, range.index, survivors, generation)));
+  }
+  if (!shards.length) return null;
+  return { shards };
+}
+
+function semanticIndexShardBinaryDecodeChunks(sidecar = {}, binBuffer = null) {
+  const vectors = sidecar?.vectors && typeof sidecar.vectors === "object" ? sidecar.vectors : null;
+  const count = Number(vectors?.count);
+  const dimension = Number(vectors?.dimension);
+  if (!vectors || String(vectors.format || "") !== SEMANTIC_INDEX_SHARD_BINARY_FORMAT || !Number.isInteger(count) || count < 0 || !Number.isInteger(dimension) || dimension < 1) {
+    throw new Error("Semantic-index binary shard sidecar is malformed.");
+  }
+  if (!Array.isArray(sidecar.chunks) || sidecar.chunks.length !== count) throw new Error("Semantic-index binary shard chunk count is invalid.");
+  const bytes = binBuffer instanceof Uint8Array
+    ? binBuffer
+    : binBuffer instanceof ArrayBuffer
+      ? new Uint8Array(binBuffer)
+      : new Uint8Array(binBuffer?.buffer || 0, binBuffer?.byteOffset || 0, binBuffer?.byteLength || 0);
+  if (bytes.byteLength !== count * dimension * 8) throw new Error(`Semantic-index binary shard byte count mismatch: ${String(vectors.file || "")}`);
+  const values = semanticIndexShardBinaryValuesFromBytes(bytes);
+  return sidecar.chunks.map((chunk, row) => Object.assign({}, chunk, { embedding: values.subarray(row * dimension, row * dimension + dimension) }));
+}
+
 function isSemanticIndexShardFile(indexFile, fileName) {
+  if (isSemanticIndexShardBinaryFile(indexFile, fileName)) return true;
   try {
     semanticIndexShardName(indexFile, fileName, { allowLegacy: true });
     return true;
@@ -49997,6 +54314,30 @@ if (typeof module !== "undefined" && module.exports) {
       supportedReasoningEffortsForModel,
       reasoningEffortOptionsForModel,
       modelReasoningConfig
+    },
+    // Test-only seams for Task 8 (context headers, resumable rebuild).
+    __task8ContextHeaders: {
+      SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      semanticChunkSharedEmbeddingInput,
+      buildSemanticChunkReuseMap,
+      semanticStagingReuseMap,
+      getSemanticIndexRebuildProgress,
+      isRebuildProgressValid,
+      clearSemanticIndexRebuildProgress
+    },
+    // Test-only seams for Task 7 (wall-time levers).
+    __walltimeLevers: {
+      vaultRelativePath,
+      sourceReference,
+      taskWorkflowMetadataValueKey,
+      releaseWalltimeMemos,
+      memoStats: () => ({
+        vaultRelativePathEntries: VAULT_RELATIVE_PATH_CACHE.size + VAULT_RELATIVE_PATH_CACHE_PREVIOUS.size,
+        vaultRelativePathHits: VAULT_RELATIVE_PATH_MEMO_STATS.hits,
+        vaultRelativePathMisses: VAULT_RELATIVE_PATH_MEMO_STATS.misses,
+        metadataKeyHits: TASK_WORKFLOW_METADATA_KEY_MEMO_STATS.hits,
+        metadataKeyMisses: TASK_WORKFLOW_METADATA_KEY_MEMO_STATS.misses
+      })
     }
   });
 }

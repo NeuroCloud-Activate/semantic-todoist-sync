@@ -35,7 +35,9 @@ assert.deepStrictEqual(migrated.availableOpenRouterModels, ['FICTIONAL_PROVIDER_
 assert.deepStrictEqual(migrated.unknownNested, { preserve: ['FICTIONAL'] });
 assert.strictEqual(migrated.opencodeGoApiKey, 'INERT_OPENCODEGO_SENTINEL');
 assert.deepStrictEqual(Plugin.resolveOperationReference(migrated, 'scheduler', 'primary'), {
-  provider: 'gemini', model: 'gemini-3.5-flash', reasoningEffort: 'medium'
+  // Shipped default since 0.9.1 is Automatic ("auto"); see CHANGELOG 0.9.1 and
+  // the reasoning feature report (Automatic uses the model's recommended level).
+  provider: 'gemini', model: 'gemini-3.5-flash', reasoningEffort: 'auto'
 });
 
 const removedProvider = Plugin.normalizeStableSettings({ aiModelProvider: 'opencodego', chatModel: 'go-model' });

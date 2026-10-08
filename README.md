@@ -2,15 +2,14 @@
 
 Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day. Local-first, and you pick the AI service for each job.
 
-## What's new in 0.9.1
+## What's new in 0.9.13
 
-- Much faster: a typical note now takes about a minute and a half instead of about twelve, and a real 10-task run finished in about three and a half minutes.
-- Much lighter: peak memory down about a third, and leftover memory now frees itself when idle.
-- Live status everywhere: every step shows a running timer like "Writing descriptions: 4 of 10 · 1:12", ending with a result line. Never shows note names.
-- Better answers from the web: Ask, Internet Search, and Deep Research answers now actually use the pages they found.
-- You control how hard models think, on any provider. The reasoning setting now works for models on OpenRouter, LiteLLM-style gateways, Open WebUI, and custom endpoints, not just a few OpenAI and Gemini ones. DeepSeek V4.1 Flash now defaults to Low reasoning: in testing, a full 10-task run went from about 25 minutes to about 4 minutes and used about 57% fewer tokens, with the same task quality.
-- Open WebUI works again as a provider, including sign-in and streamed replies.
-- Smarter duplicate control: one toggle now also decides whether new tasks may link to existing Todoist tasks with the same title. Off means your existing tasks are never touched.
+- Smaller requests: the per-note series and superseded labels are gone (about 15 percent less input, and they did not improve answers in our tests), and descriptions explain each task in the model's own words.
+- Better related-note matching: notes are embedded with their title, date and heading path. The first start after updating queues one background re-embed of your index; local embedding models are free, paid ones are charged once.
+- Smoother on big vaults: the index opens and rebuilds in small slices, uses less memory, and the settings file only changes when you change a setting.
+- Optional **System One decision model**: point it at a server you run, and the plugin orders the evidence it sends to the AI. An optional **Max efficiency** switch sends fewer notes in full. Both are off by default and send task text and short excerpts only to your server.
+- New switches: **Require model due dates** (on) and **Semantic search mode** (Exact by default, Routed for very large vaults).
+- Reasoning levels follow your endpoint, and Haiku 5.5 defaults to medium.
 
 ## Install
 
@@ -29,6 +28,7 @@ Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day.
 - Pick OpenAI, Google Gemini, OpenRouter, self-hosted Open WebUI with Ollama, or a Custom OpenAI-compatible service. Embeddings are chosen separately per provider.
 - Under **AI Providers** add connections; under **AI Models** pick primary, fallback, and embedding models, with a separate button to check the embedding choice. The shipped embedding default is Custom OpenAI-compatible `qwen3-embedding-0.6b-8k:latest`.
 - **Reasoning, made simple.** Thinking models can spend minutes "reasoning" before they answer. Before 0.9.1 the reasoning setting only reached a few model families, so on OpenRouter, gateways, Open WebUI, and custom endpoints it was quietly ignored. Now the plugin finds out what each model supports (from the endpoint's model list and from the model's own replies, no extra requests) and shows the right choices. The default is **Automatic**: it uses the model's recommended level, which today means Low for DeepSeek V4.1 Flash and nothing special for every other model. Pick Low, Medium, High, or Provider default yourself any time, and your choice always wins. If an endpoint turns down a reasoning setting, the plugin finishes your task without it, switches that model's row to Provider default with a short note, and leaves it there until you choose again. **Check model capabilities** in AI Models runs a quick one-time test.
+- **System One decision model (optional).** Under the System One settings, enter the address of a server you run, press **Check connection**, and the plugin tests it and calibrates it on your own notes with live steps in the status bar. While it is on, each task's evidence is ordered by relevance before the AI sees it. **Max efficiency** goes further and sends the top 8 passages in full plus one-line pointers for the next 16. Neither switch is on by default, and a failed or slow server simply falls back to the normal order.
 - Custom OpenAI-compatible uses one API root you type in full (including `/v1` when your service needs it), an optional display title, and an optional hidden key. "Allow insecure HTTP" stays off unless you knowingly use plain HTTP. Strict jobs need the server to support `response_format.json_schema` or they stop safely. Custom supports discovery, chat, and embeddings, but not web search, the Responses API, streaming, tools, auto-downloading models, multiple endpoints, or provider-specific extras.
 
 ## How it works across models
@@ -64,7 +64,7 @@ We took one real, messy meeting note from a real vault and had each model turn i
 ## Privacy, network, and accounts
 
 - The plugin is free, takes no payments or donations, and has no account of its own. You need a Todoist account and token for Todoist jobs, and a provider account for paid providers; self-hosted options can run without one. No single AI vendor is required, and the source code is open.
-- Network use: Todoist jobs reach `api.todoist.com`; AI jobs reach only the provider you picked; optional Internet Search and Deep Research use your provider's search service; email jobs reach only the helper address you enter; optional debug logging talks only to the collector on your own computer. Each call sends only what that job needs.
+- Network use: Todoist jobs reach `api.todoist.com`; AI jobs reach only the provider you picked; the optional System One decision model reaches only the server address you type in (task text and short note excerpts are sent there; leave it off to send nothing); optional Internet Search and Deep Research use your provider's search service; email jobs reach only the helper address you enter; optional debug logging talks only to the collector on your own computer. Each call sends only what that job needs.
 - Your index, task links, and scheduling memory stay on your device; Todoist only receives task fields when you run Todoist jobs. Optional debug logging can write to your computer's temp folder via the collector.
 - No telemetry is sent to us, there are no ads, and the plugin never installs or updates itself.
 

@@ -4258,7 +4258,7 @@ function taskDescriptionUserInstructionLines({
     "Structured payload rules: treat action/title and subtasks as the task scope; preserve mandatoryRequestFacts. Each task row lists must (mandatory refs: state every must item) and refs (the task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Never borrow another task's refs.",
     "Line semantics: requested-action lines are mandatory current-source requirements: always state and cite them. Same-scope supporting lines that clarify intent, current state, timing, recipient, or criteria should be stated and cited. Keep distinct timing statements attached to their own lines and never merge or reassign them.",
     "Must rule: state every must ref in a natural execution sentence; use separate sentences when must refs add distinct current-state, history, criteria, or dependency content. Label a line as history only when its time is history rather than merely old, and preserve current direction. Never cite a ref without stating its supported content.",
-    "Execution-detail rule: when a listed ref adds a concrete execution detail for this task, include it; an action-only or title-only description fails when such a ref is supplied. When no supported substantive description beyond the title is possible, return an empty description_sentences array for that task instead of restating the title or inventing context.",
+    "Execution-detail rule: when a listed ref adds a concrete execution detail for this task, include it; an action-only or title-only description fails when such a ref is supplied. Never return an empty description_sentences array: when little beyond the title is supported, still write at least one sentence stating what the current source itself says about the task (its request, people, dates, or context) and cite the current-source ref, without inventing context.",
     "Supporting-line rule: use another listed ref only when it helps perform the task as titled (organization, expectations, history, people, decisions, dates), state it directly, and cite it in that sentence's refs; using fewer refs is fine. Ignore refs about other activities or background that only share a topic keyword, and skip refs that are unrelated, superseded or stale.",
     "Citation contract: in current strict workflows return description_sentences, each with {text,refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry the refs of the lines it states; the plugin resolves refs mechanically, then assigns sequential citation numbers per description and appends the matching Sources/Context list. For note workflows, the primary source is (1), followed by retained context sources from (2). The primary current source is authoritative; supporting/history/task-snapshot records belong in Context. If a sentence states anything taken from an older or other note, its refs must include that note's ref so it is cited; always cite any older-note content you use, and never state it without its ref.",
     isEmailSource ? "" : "Context-note cap: cite at most six distinct context notes per task. The primary note is always source (1) and does not count against this cap. When more than six context notes are materially relevant, select the six most material; the plugin assigns context citation numbers consecutively from (2) for each description.",
@@ -4275,7 +4275,7 @@ function taskDescriptionUserInstructionLines({
     contextCitationInstructions(citeContextNotes, structuredEvidence),
     "",
     structuredEvidence ? "Include a listed ref only when it helps perform the task as titled. Use one complete sentence only when the task row supports no additional useful detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives or criteria, urgency, dependencies, timing, history or handoffs, and remaining action when supplied. Include a listed ref only when it helps perform the task as titled, and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
-    "Shared task evidence (one JSON row per task; use refs to bind each sentence and never borrow across task scopes). Each row carries task, title, subtasks, must (mandatory refs: state every must item) and refs (that task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Evidence text for each ref comes from this request's own preceding evidence list; the plugin resolves refs mechanically. An empty description_sentences array stays the signal when no supported substantive description beyond the title is possible:"
+    "Shared task evidence (one JSON row per task; use refs to bind each sentence and never borrow across task scopes). Each row carries task, title, subtasks, must (mandatory refs: state every must item) and refs (that task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Evidence text for each ref comes from this request's own preceding evidence list; the plugin resolves refs mechanically. Always return at least one description sentence per task, citing the current-source ref when nothing else is supported:"
   ];
 }
 
@@ -27866,7 +27866,7 @@ function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGenerated
               // internal evidence_ids/fact_refs/fact_bindings are derived
               // locally from the task index, never returned by the provider.
               type: "array",
-              minItems: 0,
+              minItems: 1,
               items: {
                 type: "object",
                 additionalProperties: false,
@@ -31528,8 +31528,7 @@ function parseRawEmail(raw) {
   const boundary = (/boundary="?([^";]+)"?/i.exec(headers["content-type"] || "") || [])[1];
   let text = "";
   if (boundary) {
-    const parts = body.split(`--${boundary}`);
-    text = decodeMimePart(parts.find((part) => /content-type:\s*text\/plain/i.test(part)) || parts.find((part) => /content-type:\s*text\/html/i.test(part)) || body);
+    text = mimeTextLeaf(body, boundary, "text/plain") || mimeTextLeaf(body, boundary, "text/html") || decodeMimePart(body);
   } else {
     text = decodeBody(body, headers["content-transfer-encoding"] || "", headers["content-type"] || "");
   }
@@ -31576,6 +31575,24 @@ function parseHeaders(text) {
     if (index > -1) headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
   }
   return headers;
+}
+
+// Depth-first search of nested multipart bodies for the first leaf of the given
+// text type, decoded. Returns "" when none exists.
+function mimeTextLeaf(body, boundary, type, depth = 0) {
+  for (const part of body.split(`--${boundary}`)) {
+    const [headerText, ...rest] = part.replace(/\r\n/g, "\n").replace(/^\n/, "").split("\n\n");
+    const headers = parseHeaders(headerText);
+    const contentType = headers["content-type"] || "";
+    const inner = (/boundary="?([^";]+)"?/i.exec(contentType) || [])[1];
+    if (inner && depth < 8) {
+      const found = mimeTextLeaf(rest.join("\n\n"), inner, type, depth + 1);
+      if (found) return found;
+    } else if (contentType.toLowerCase().startsWith(type)) {
+      return decodeMimePart(part);
+    }
+  }
+  return "";
 }
 
 function decodeMimePart(part) {

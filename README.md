@@ -2,6 +2,9 @@
 
 Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day. Local-first, and you pick the AI service for each job.
 
+## What's new in 0.9.17
+- Fixed: forwarded emails with attachments or images (nested email parts) are now read correctly, so tasks and descriptions use the real message text.
+- Fixed: a task description the model cannot fully support no longer blocks the whole email; every task now gets at least one source-grounded sentence.
 ## What's new in 0.9.16
 
 - New: a **Validate connection** button under AI Providers checks the shown provider's credentials by loading its model list.

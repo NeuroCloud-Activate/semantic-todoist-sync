@@ -1,4 +1,8 @@
 # Changelog
+## 0.9.17 - 2026-10-09
+### Fixed
+- Forwarded emails with nested attachments or images (for example Outlook forwards) are now read correctly. Plugin only looked one level deep in email, so for these emails it handed the model undecoded raw text instead of message, and the task and its description had almost nothing to work from. It now finds the real text body, falling back to the HTML body.
+- A task whose description the model could not support was blocking the whole email (Generated task persistence blocked: 1 main task description is missing or invalid). The model is now required to write at least one sentence for every task, grounded in the current source, instead of returning an empty description.
 
 ## 0.9.16 - 2026-10-09
 

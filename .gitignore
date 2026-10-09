@@ -93,3 +93,6 @@ subagent-rules.md
 AGENTS.md
 subagent.md
 PUBLIC-SHARE-MANIFEST.json
+
+# Local test credential (never commit)
+*.rtf

@@ -2,6 +2,10 @@
 
 Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day. Local-first, and you pick the AI service for each job.
 
+## What's new in 0.9.15
+
+- New: **Anthropic** is now an AI provider. Add an Anthropic API key under AI Providers to run Claude models directly, with the model list and reasoning levels read from Anthropic, prompt caching, and Internet Search / Deep Research through Anthropic's web search. Existing setups are unchanged. Anthropic has no embedding models, so the semantic index keeps using your embedding provider.
+
 ## What's new in 0.9.14
 
 - New: **Prompt caching for Claude models** (on by default) lets Anthropic cache the repeated part of each task description request, so the later requests of a note are cheaper and faster. Other models are not affected, and an endpoint that rejects it is handled with one retry and a sidebar note.
@@ -30,7 +34,7 @@ Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day.
 
 ## Providers and models
 
-- Pick OpenAI, Google Gemini, OpenRouter, self-hosted Open WebUI with Ollama, or a Custom OpenAI-compatible service. Embeddings are chosen separately per provider.
+- Pick OpenAI, Google Gemini, Anthropic, OpenRouter, self-hosted Open WebUI with Ollama, or a Custom OpenAI-compatible service. Embeddings are chosen separately per provider.
 - Under **AI Providers** add connections; under **AI Models** pick primary, fallback, and embedding models, with a separate button to check the embedding choice. The shipped embedding default is Custom OpenAI-compatible `qwen3-embedding-0.6b-8k:latest`.
 - **Reasoning, made simple.** Thinking models can spend minutes "reasoning" before they answer. Before 0.9.1 the reasoning setting only reached a few model families, so on OpenRouter, gateways, Open WebUI, and custom endpoints it was quietly ignored. Now the plugin finds out what each model supports (from the endpoint's model list and from the model's own replies, no extra requests) and shows the right choices. The default is **Automatic**: it uses the model's recommended level, which today means Low for DeepSeek V4.1 Flash and nothing special for every other model. Pick Low, Medium, High, or Provider default yourself any time, and your choice always wins. If an endpoint turns down a reasoning setting, the plugin finishes your task without it, switches that model's row to Provider default with a short note, and leaves it there until you choose again. **Check model capabilities** in AI Models runs a quick one-time test.
 - **System One decision model (optional).** Under the System One settings, enter the address of a server you run, press **Check connection**, and the plugin tests it and calibrates it on your own notes with live steps in the status bar. While it is on, each task's evidence is ordered by relevance before the AI sees it. **Max efficiency** goes further and sends the top 8 passages in full plus one-line pointers for the next 16. Neither switch is on by default, and a failed or slow server simply falls back to the normal order.

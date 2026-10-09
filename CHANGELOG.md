@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.15 - 2026-10-08
+
+### Added
+- **Anthropic as an AI provider** (Settings, AI Providers). Paste an Anthropic API key and Claude models run directly against Anthropic, with no gateway in between. The model list and the reasoning levels each model supports (low, medium, high, xhigh, max) come from Anthropic, and the level you pick is the level sent. Automatic uses medium for Haiku 5.5 and Sonnet 5.5. Prompt caching, structured answers and token accounting work as for the other providers. The key is stored like your other keys and sent only to api.anthropic.com. Anthropic has no embedding models, so it is offered for chat, tasks, descriptions and search, not for the semantic index.
+- **Anthropic web search** for Internet Search and Deep Research (Settings, Search provider). Sources and citations are collected the same way as for OpenAI, Gemini and OpenRouter.
+
+### Notes
+- Nothing changes for existing setups: your provider, models and settings stay as they are, and Claude models reached through OpenRouter, Open WebUI or a custom endpoint keep working as before.
+- Anthropic's structured-output rules reject a few schema limits (maximum list length and number bounds). The plugin leaves those out of the request and still checks every answer against its own full limits.
+
 ## 0.9.14 - 2026-10-08
 
 ### Added

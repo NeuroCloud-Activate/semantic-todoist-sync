@@ -18,7 +18,7 @@ const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
 const SEMANTIC_INDEX_PATH_META_FILE = "semantic-index-path-meta.json";
-const SUPPORTED_AI_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai"]);
+const SUPPORTED_AI_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai", "anthropic"]);
 const AI_OPERATION_KEYS = Object.freeze([
   "chat-query", "prompt-response", "task-generation", "task-description",
   "section-title", "scheduler", "policy", "deduplication"
@@ -194,15 +194,16 @@ const ADAPTIVE_CONTEXT_MODE_BUDGETS = {
   description: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 3, maxRetrieval: 28, maxNotes: 8, maxTasks: 14, maxProjects: 6 },
   schedule: { defaultDepth: 7, maxDepth: 7, retrievalMultiplier: 2, maxRetrieval: 18, maxNotes: 6, maxTasks: 16, maxProjects: 6 }
 };
-const WEB_SEARCH_PROVIDER_VALUES = Object.freeze(["openai", "gemini", "openrouter"]);
+const WEB_SEARCH_PROVIDER_VALUES = Object.freeze(["openai", "gemini", "openrouter", "anthropic"]);
 const WEB_SEARCH_PROVIDER_DEFAULT_MODELS = Object.freeze({
   openai: "gpt-5.6",
   gemini: "gemini-3.5-flash-lite",
-  openrouter: "openrouter/free"
+  openrouter: "openrouter/free",
+  anthropic: "claude-haiku-5-5"
 });
 const WEB_SEARCH_MODE_PROFILES = Object.freeze({
-  concise: Object.freeze({ maxOutputTokens: 8000, maxResults: 10, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 3, openrouter: Object.freeze({ max_results: 6, max_total_results: 12, max_uses: 3, max_characters: 4000 }) }),
-  deep: Object.freeze({ maxOutputTokens: 8000, maxResults: 12, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 4, openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 }) })
+  concise: Object.freeze({ maxOutputTokens: 8000, maxResults: 10, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 3, openrouter: Object.freeze({ max_results: 6, max_total_results: 12, max_uses: 3, max_characters: 4000 }), anthropic: Object.freeze({ max_uses: 3 }) }),
+  deep: Object.freeze({ maxOutputTokens: 8000, maxResults: 12, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 4, openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 }), anthropic: Object.freeze({ max_uses: 8 }) })
 });
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
@@ -2825,6 +2826,7 @@ function normalizeStableSettings(input = {}) {
   // Slice B: capability records and auto-correction notes are whitelisted,
   // bounded structures; corrupt or oversized persisted input is reduced here.
   result.providerModelCapabilities = sanitizeProviderModelCapabilities(source.providerModelCapabilities);
+  result.providerModelLimits = sanitizeProviderModelLimits(source.providerModelLimits);
   result.reasoningAutoCorrections = sanitizeReasoningAutoCorrections(source.reasoningAutoCorrections);
   result.enableMultiProviderOperationModels = source.enableMultiProviderOperationModels === true;
   result.chatWebSearchProvider = normalizeWebSearchProvider(source.chatWebSearchProvider);
@@ -3387,6 +3389,7 @@ function semanticIndexPurgeOrphanSelection(inventory = {}) {
 const DEFAULT_SETTINGS = {
   openaiApiKey: "",
   googleApiKey: "",
+  anthropicApiKey: "",
   todoistToken: "",
   workerUrl: "",
   workerToken: "",
@@ -3396,8 +3399,8 @@ const DEFAULT_SETTINGS = {
   sharedGenerationFallback: DEFAULT_GENERATION_FALLBACK,
   aiOperationModels: createStableOperationModels(),
   enableMultiProviderOperationModels: false,
-  providerGenerationModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
-  providerEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [] },
+  providerGenerationModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [], anthropic: [] },
+  providerEmbeddingModels: { openai: [], gemini: [], openrouter: [], openwebui: [], customopenai: [], anthropic: [] },
   customOpenAIConnectionTitle: "",
   customOpenAIAllowInsecureHttp: false,
   openwebuiAllowInsecureHttp: false,
@@ -3422,6 +3425,10 @@ const DEFAULT_SETTINGS = {
   // metadata, observed responses, or the explicit probe. Whitelisted fields
   // only; sanitized in normalizeStableSettings.
   providerModelCapabilities: {},
+  // Discovered per-model output token limits (Anthropic max_tokens). Same
+  // regenerable-cache rules as providerModelCapabilities: whitelisted numbers
+  // only, persisted in model-cache.json, never in data.json.
+  providerModelLimits: {},
   // Slice C seam: per `${provider}:${model}` auto-correct notes. Slice B only
   // creates/sanitizes the structure and clears entries from the probe button.
   reasoningAutoCorrections: {},
@@ -3666,13 +3673,31 @@ function modelRecommendedReasoningEffort(model) {
   return MODEL_RECOMMENDED_REASONING_EFFORTS[id] || "";
 }
 
+// Provider-scoped recommendation for the native Anthropic Messages API only.
+// The shared table above stays global so LiteLLM/OpenRouter Claude behaviour
+// is unchanged (claude-sonnet-5-5 has no global recommendation there); these
+// levels apply only when the request dispatches to the anthropic provider,
+// where the live spike validated output_config.effort=medium for both models.
+const ANTHROPIC_RECOMMENDED_REASONING_EFFORTS = Object.freeze({
+  "claude-haiku-5-5": "medium",
+  "claude-sonnet-5-5": "medium"
+});
+
+function anthropicRecommendedReasoningEffort(provider, model) {
+  if (stableSupportedProvider(provider, "") !== "anthropic") return "";
+  const id = reasoningModelLookupId(model);
+  if (!id || id.includes("nothink")) return "";
+  return ANTHROPIC_RECOMMENDED_REASONING_EFFORTS[id] || "";
+}
+
 // Slice A: resolve the configured effort for one concrete model. 'auto' uses
-// the model's recommended effort when known, otherwise behaves exactly like
+// the model's recommended effort when known (global table first, then the
+// provider-scoped Anthropic recommendation), otherwise behaves exactly like
 // 'default' (nothing is sent). Every other configured value passes through.
-function resolveEffectiveReasoningEffort(configuredEffort, model) {
+function resolveEffectiveReasoningEffort(configuredEffort, model, provider = "") {
   const configured = normalizeReasoningEffort(configuredEffort);
   if (configured !== "auto") return configured;
-  return modelRecommendedReasoningEffort(model) || DEFAULT_REASONING_EFFORT;
+  return modelRecommendedReasoningEffort(model) || anthropicRecommendedReasoningEffort(provider, model) || DEFAULT_REASONING_EFFORT;
 }
 
 // Slice B: per-provider/model reasoning capability discovery. The persisted
@@ -3681,7 +3706,7 @@ function resolveEffectiveReasoningEffort(configuredEffort, model) {
 // parsers never persist raw provider rows: LiteLLM /model/info rows carry
 // secrets in `litellm_params` (api keys, api_base) and are reduced here to
 // booleans and level strings before anything is stored.
-const REASONING_CAPABILITY_SOURCES = ["openrouter", "litellm", "gemini", "observed", "probe"];
+const REASONING_CAPABILITY_SOURCES = ["openrouter", "litellm", "gemini", "anthropic-models-api", "observed", "probe"];
 const REASONING_CAPABILITY_EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const REASONING_CAPABILITY_MAX_MODELS_PER_PROVIDER = 300;
 const REASONING_CAPABILITY_MAX_EFFORTS = 8;
@@ -3726,6 +3751,26 @@ function sanitizeProviderModelCapabilities(raw) {
     }
     // Bound: keep the newest records per provider when over the cap.
     collected.sort((a, b) => (a[1].at || 0) - (b[1].at || 0));
+    const kept = collected.slice(-REASONING_CAPABILITY_MAX_MODELS_PER_PROVIDER);
+    if (kept.length) result[provider] = Object.fromEntries(kept);
+  }
+  return result;
+}
+
+// Per-provider/model discovered output limits (Anthropic max_tokens). Same
+// regenerable-cache rules as providerModelCapabilities: whitelisted positive
+// integers only, bounded per provider, persisted in model-cache.json.
+function sanitizeProviderModelLimits(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const result = {};
+  for (const provider of SUPPORTED_AI_PROVIDERS) {
+    const entries = source[provider] && typeof source[provider] === "object" && !Array.isArray(source[provider]) ? source[provider] : {};
+    const collected = [];
+    for (const [modelId, value] of Object.entries(entries)) {
+      const key = capabilityStoreModelKey(modelId);
+      const limit = Number(value);
+      if (key && Number.isInteger(limit) && limit > 0) collected.push([key, Math.min(limit, 2000000)]);
+    }
     const kept = collected.slice(-REASONING_CAPABILITY_MAX_MODELS_PER_PROVIDER);
     if (kept.length) result[provider] = Object.fromEntries(kept);
   }
@@ -3908,14 +3953,15 @@ function isGemini3ReasoningModel(model) {
   return /^gemini-3(?:\.\d+)?-/.test(id);
 }
 
-function staticSupportedReasoningEffortsForModel(model) {
+function staticSupportedReasoningEffortsForModel(model, provider = "") {
   if (usesOpenAIChatModel(model)) {
     const id = normalizeOpenAIModelId(model);
     if (/^gpt-5\.4(?:-|$)/.test(id)) return ["default", "none", "low", "medium", "high", "xhigh"];
     if (/^gpt-5(?:-|\.)/.test(id) || /^o\d(?:-|\.)/.test(id)) return ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
     // Slice A: recommended gateway models accept an explicit effort so the
     // auto-recommended level and an explicit user choice can both be sent.
-    if (modelRecommendedReasoningEffort(model)) return ["default", "low", "medium", "high"];
+    // The Anthropic-scoped recommendation counts only on the anthropic provider.
+    if (modelRecommendedReasoningEffort(model) || anthropicRecommendedReasoningEffort(provider, model)) return ["default", "low", "medium", "high"];
     return ["default"];
   }
   if (usesGeminiChatModel(model)) {
@@ -3937,7 +3983,7 @@ function supportedReasoningEffortsForModel(model, provider = "", capabilities = 
   // endpoint reports nothing).
   const capability = modelReasoningCapabilityEfforts(provider, model, capabilities);
   if (capability) return capability;
-  return staticSupportedReasoningEffortsForModel(model);
+  return staticSupportedReasoningEffortsForModel(model, provider);
 }
 
 function reasoningEffortLabel(value) {
@@ -3975,6 +4021,11 @@ function reasoningEffortOptionsForModel(model, current = DEFAULT_REASONING_EFFOR
 function modelReasoningConfig(model, configuredEffort, provider = "", capabilities = null) {
   const effort = normalizeReasoningEffort(configuredEffort);
   if (effort === DEFAULT_REASONING_EFFORT || !supportedReasoningEffortsForModel(model, provider, capabilities).includes(effort)) return {};
+  // Native Anthropic Messages API first: a claude-* model on the anthropic
+  // provider sends `output_config.effort` plus adaptive thinking, never the
+  // flat OpenAI `reasoning_effort` shape. usesOpenAIChatModel is name-based and
+  // would otherwise claim every non-Gemini model, including Claude.
+  if (stableSupportedProvider(provider, "") === "anthropic") return { anthropic: { effort, thinkingType: "adaptive" } };
   if (usesOpenAIChatModel(model)) return { openai: { effort } };
   if (isGemini3ReasoningModel(model)) return { gemini: { thinkingLevel: effort } };
   // Models without a static rule (for example Claude behind an OpenAI-compatible gateway): send the
@@ -8622,6 +8673,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (provider === "openrouter" && !this.settings.openrouterApiKey) missing.push("OpenRouter API key");
       if (provider === "openwebui" && (!this.settings.openwebuiBaseUrl || (!this.settings.openwebuiApiKey && !this.settings.openwebuiJwt && !(this.settings.openwebuiAuthMode === "login" && this.openwebuiLoginPassword)))) missing.push("OpenWebUI base URL and authentication");
       if (provider === "customopenai" && !this.settings.customOpenAIBaseUrl) missing.push("Custom OpenAI-compatible base URL");
+      if (provider === "anthropic" && !this.settings.anthropicApiKey) missing.push("Anthropic API key");
     }
     if (missing.length) throw new Error(`Add ${missing.join(", ")} in Semantic Todoist Sync settings.`);
   }
@@ -13210,8 +13262,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const model = String(configuredModel || "").trim();
     const mode = normalizeWebSearchMode(request.mode);
     const profile = webSearchModeProfile(mode);
-    const apiKey = String({ openai: this.settings.openaiApiKey, gemini: this.settings.googleApiKey, openrouter: this.settings.openrouterApiKey }[provider] || "").trim();
-    if (!apiKey) throw providerAdapterError(provider, "web-search-missing-credential", `Internet Search needs the ${stableProviderLabel(provider)} API key.`);
+    const apiKey = String({ openai: this.settings.openaiApiKey, gemini: this.settings.googleApiKey, openrouter: this.settings.openrouterApiKey, anthropic: this.settings.anthropicApiKey }[provider] || "").trim();
+    if (!apiKey) throw providerAdapterError(provider, "web-search-missing-credential", `Internet Search needs the ${STABLE_PROVIDER_LABELS[provider] || stableProviderLabel(provider)} API key.`);
     if (!model) throw providerAdapterError(provider, "web-search-missing-model", "Choose a search model before running Internet Search.");
     const query = truncateAtWord(redactWebContext(request.query || request.prompt || ""), profile.maxRequestChars);
     if (!query) throw providerAdapterError(provider, "web-search-query-empty", "Internet Search needs a non-empty query.");
@@ -13229,17 +13281,26 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           tools: [{ type: "web_search", search_context_size: profile.searchContextSize }],
           input: query
         }
-        : {
-          model,
-          messages: [{ role: "user", content: query }],
-          max_tokens: profile.maxOutputTokens,
-           tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", ...profile.openrouter, search_context_size: profile.searchContextSize } }]
-        };
+        : provider === "anthropic"
+          ? {
+            model,
+            max_tokens: profile.maxOutputTokens,
+            messages: [{ role: "user", content: query }],
+            tools: [{ type: "web_search_20250305", name: "web_search", max_uses: profile.anthropic.max_uses }]
+          }
+          : {
+            model,
+            messages: [{ role: "user", content: query }],
+            max_tokens: profile.maxOutputTokens,
+             tools: [{ type: "openrouter:web_search", parameters: { engine: "auto", ...profile.openrouter, search_context_size: profile.searchContextSize } }]
+          };
     const transport = provider === "gemini"
       ? { url: `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, headers: { "x-goog-api-key": apiKey, "content-type": "application/json" } }
       : provider === "openai"
         ? { url: "https://api.openai.com/v1/responses", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" } }
-        : { url: "https://openrouter.ai/api/v1/chat/completions", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "HTTP-Referer": "https://obsidian.md" } };
+        : provider === "anthropic"
+          ? { url: "https://api.anthropic.com/v1/messages", headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" } }
+          : { url: "https://openrouter.ai/api/v1/chat/completions", headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", "HTTP-Referer": "https://obsidian.md" } };
     const requestFn = options.requestUrl || requestUrl;
     let response;
     try {
@@ -13249,6 +13310,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     if (!response || Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
       const status = Number(response?.status || 0);
+      if (provider === "anthropic") {
+        const apiError = providerResponseJson(response || {}).error || {};
+        const detail = String(apiError.message || "").trim();
+        const code = String(apiError.type || "").trim() || (status ? `http-${status}` : "transport-error");
+        const message = status === 401 || status === 403
+          ? `The Anthropic API key was rejected (${detail || "unauthorized"}).`
+          : detail || `Anthropic web search failed${status ? ` with HTTP ${status}` : ""}.`;
+        throw providerAdapterError("anthropic", code, message, status, [429, 500, 502, 503, 504, 529].includes(status));
+      }
       return webSearchFailureResult(provider, model, status ? `http-${status}` : "transport-error", mode);
     }
     const payload = providerResponseJson(response);
@@ -13256,10 +13326,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       ? extractGeminiWebEvidence(payload)
       : provider === "openai"
         ? extractOpenAIWebEvidence(payload)
-        : extractOpenRouterWebEvidence(payload);
+        : provider === "anthropic"
+          ? extractAnthropicWebSearchEvidence(payload)
+          : extractOpenRouterWebEvidence(payload);
+    if (provider === "anthropic" && extracted.toolError) return webSearchFailureResult(provider, model, extracted.toolError, mode);
     const candidates = extracted.candidates;
     const normalized = normalizeWebEvidenceRows(provider, model, candidates, this.settings, { mode });
-    const tokenUsage = normalizeWebSearchUsage(provider, payload, extracted.queryCount);
+    const tokenUsage = provider === "anthropic"
+      ? Object.assign({ provider }, anthropicWebSearchUsage(payload))
+      : normalizeWebSearchUsage(provider, payload, extracted.queryCount);
     return {
       status: normalized.rows.length ? "searched" : "no-evidence",
       provider,
@@ -13807,13 +13882,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       try {
         if (index > 0) this.setSidebarStatus(`Retrying AI with ${modelDisplayName(candidateModel)}...`);
         const configuredEffort = reasoningEffort || (index > 0 ? this.settings.chatFallbackReasoningEffort : this.settings.chatReasoningEffort);
+        // The provider is resolved first so 'auto' can honor the
+        // provider-scoped Anthropic recommendation without touching any other
+        // provider's resolution.
+        const provider = this.generationProviderForModel(candidateModel);
         // Slice A: resolve 'auto' for the model actually used (override,
         // primary or fallback candidate) before the effort decision and before
         // aiOperationReasoningEffort's structured-use cap.
         const effectiveEffort = reasoningEffort
-          ? resolveEffectiveReasoningEffort(normalizeReasoningEffort(reasoningEffort), candidateModel)
-          : aiOperationReasoningEffort(resolveEffectiveReasoningEffort(configuredEffort, candidateModel), operation, this.settings.optimizeStructuredAiUsage !== false);
-        const provider = this.generationProviderForModel(candidateModel);
+          ? resolveEffectiveReasoningEffort(normalizeReasoningEffort(reasoningEffort), candidateModel, provider)
+          : aiOperationReasoningEffort(resolveEffectiveReasoningEffort(configuredEffort, candidateModel, provider), operation, this.settings.optimizeStructuredAiUsage !== false);
         // Auto-discovery: a customopenai model with no capability record yet
         // triggers one bounded, non-blocking /model/info GET so the resolver
         // gains the endpoint's own effort list. This request still resolves
@@ -13840,12 +13918,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const reasoningConfig = reasoningAutoCorrectionRecordFor(this.settings, provider, candidateModel)
           ? {}
           : modelReasoningConfig(candidateModel, effectiveEffort, provider, capabilitiesForConfig);
-        const sentEffort = Boolean(reasoningConfig.openai?.effort || reasoningConfig.gemini?.thinkingLevel);
+        const sentEffort = Boolean(reasoningConfig.openai?.effort || reasoningConfig.gemini?.thinkingLevel || reasoningConfig.anthropic?.effort);
         const sendRequest = (config) => provider === "gemini"
           ? this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, onResponseIdentity }, activeCapture)
           : provider === "openai"
             ? this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, background, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture)
-            : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture);
+            : provider === "anthropic"
+              ? this.anthropicResponse({ model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture)
+              : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture);
         let response;
         try {
           response = await sendRequest(reasoningConfig);
@@ -14186,6 +14266,144 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
+  async anthropicResponse({ model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
+    const normalizedProvider = "anthropic";
+    const modelId = String(model || this.settings.chatModel || "claude-haiku-5-5").trim();
+    // max_tokens: the discovered per-model limit (Anthropic Models API
+    // `max_tokens`), capped for chat/generation requests; 16000 when unknown.
+    const limits = this.settings?.providerModelLimits?.anthropic;
+    const limitKey = limits && typeof limits === "object" && !Array.isArray(limits)
+      ? Object.keys(limits).find((candidate) => candidate.toLowerCase() === modelId.toLowerCase())
+      : "";
+    const discoveredLimit = limitKey ? Number(limits[limitKey]) : 0;
+    const maxTokens = Number.isInteger(discoveredLimit) && discoveredLimit > 0 ? Math.min(discoveredLimit, 64000) : 16000;
+    const userText = String(user || "");
+    const stableChars = Math.max(0, Math.min(userText.length, parseInt(userStableChars, 10) || 0));
+    // Same gate as the OpenAI-compatible adapters: the 4-argument
+    // descriptionCacheHintsEnabled applies the 4,096-char stable-prefix floor
+    // and consults the remembered-rejection Map; below the floor nothing hints.
+    const hintApplied = stableChars > 0 && stableChars < userText.length && descriptionCacheHintsEnabled(this, normalizedProvider, modelId, stableChars);
+    let userContent;
+    if (hintApplied) {
+      userContent = [
+        { type: "text", text: userText.slice(0, stableChars), cache_control: { type: "ephemeral" } },
+        { type: "text", text: userText.slice(stableChars) }
+      ];
+    } else {
+      userContent = String(user || "");
+    }
+    const body = {
+      model: modelId,
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: userContent }],
+      // Same content join as openAiCompatibleChatMessages: the description
+      // workflow's stable instruction prefix is part of the system prompt.
+      system: [String(promptCachePrefix || ""), String(system || "")].filter(Boolean).join("\n\n")
+    };
+    if (reasoningConfig.anthropic?.effort) {
+      body.thinking = { type: "adaptive" };
+      body.output_config = { effort: reasoningConfig.anthropic.effort };
+    }
+    if (jsonSchema) {
+      const stripped = anthropicSafeSchema(jsonSchema);
+      body.output_config = Object.assign(body.output_config || {}, {
+        format: { type: "json_schema", schema: stripped }
+      });
+    } else if (reasoningConfig.anthropic?.effort) {
+      body.output_config = { effort: reasoningConfig.anthropic.effort };
+    }
+    const headers = {
+      "content-type": "application/json",
+      "x-api-key": String(this.settings.anthropicApiKey || ""),
+      "anthropic-version": "2023-06-01"
+    };
+    let response = await requestProviderUrl(normalizedProvider, {
+      url: "https://api.anthropic.com/v1/messages",
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      throw: false
+    }, captureContext);
+    // One plain retry when the hinted shape is rejected, mirroring
+    // openAiCompatibleResponse: promptCacheHintRejected gates 401/403/429 and
+    // 5xx out, 400/422 always count, and every other field of the body stays
+    // identical because only `messages` is rebuilt.
+    if ((response.status < 200 || response.status >= 300) && hintApplied) {
+      const rejectedDetail = response.json?.error?.message || response.json?.error?.type || response.text || "";
+      if (promptCacheHintRejected(response.status, rejectedDetail)) {
+        notePromptCacheHintRejected(this, normalizedProvider, modelId, response.status);
+        const retryBody = Object.assign({}, body);
+        retryBody.messages = [{ role: "user", content: String(user || "") }];
+        response = await requestProviderUrl(normalizedProvider, {
+          url: "https://api.anthropic.com/v1/messages",
+          method: "POST",
+          headers,
+          body: JSON.stringify(retryBody),
+          throw: false
+        }, captureContext);
+      }
+    }
+    if (response.status < 200 || response.status >= 300) {
+      const apiDetail = response.json?.error?.message || response.json?.error?.type || "anthropic request rejected";
+      // 401/403 name the setting the user can fix; providerAdapterError
+      // redacts any key that the API detail might echo.
+      const detail = response.status === 401 || response.status === 403
+        ? `The Anthropic API key was rejected (${apiDetail}). Check the Anthropic API key in settings.`
+        : apiDetail;
+      const retryable = isRetryableProviderStatus(response.status);
+      throw providerAdapterError(normalizedProvider, response.json?.error?.type || `http-${response.status}`, detail, response.status, retryable);
+    }
+    const contentBlocks = Array.isArray(response.json?.content) ? response.json.content : [];
+    const textBlocks = contentBlocks.filter((b) => b && b.type === "text").map((b) => String(b.text || ""));
+    const text = textBlocks.join("");
+    const stopReason = response.json?.stop_reason;
+    // Truncated structured response: same non-retryable shape as the OpenAI
+    // Responses API incomplete handling, so isRetryableAiModelError treats it
+    // identically (no silent model fallback; the workflow's own recovery runs).
+    if (jsonSchema && stopReason === "max_tokens") {
+      throw providerAdapterError(normalizedProvider, "response-exceeded", "The provider stopped at max_tokens before completing the response.", response.status, false);
+    }
+    if (stopReason === "refusal") {
+      throw providerAdapterError(normalizedProvider, "refusal", "The provider refused to generate a response.", response.status, false);
+    }
+    // pause_turn / tool_use are not expected on these requests (no tools are
+    // sent); treat them as an invalid response instead of returning partial text.
+    if (stopReason === "pause_turn" || stopReason === "tool_use") {
+      throw providerAdapterError(normalizedProvider, "invalid-response", `The provider stopped with unexpected stop_reason "${stopReason}".`, response.status);
+    }
+    if (!text && !contentBlocks.some((b) => b.type === "text")) {
+      throw providerAdapterError(normalizedProvider, "invalid-response", "The provider returned no text.", response.status);
+    }
+    const usage = response.json?.usage || {};
+    // Anthropic input_tokens excludes both cache counters, while the
+    // OpenAI-compatible path reports a prompt total that already includes the
+    // cached part. Sum all three so prompt/cached/completion/reasoning and the
+    // cost view line up across providers; the raw usage object (including
+    // output_tokens_details.thinking_tokens) rides along as nativeUsage.
+    const cacheRead = Number(usage.cache_read_input_tokens || 0);
+    const cacheWrite = Number(usage.cache_creation_input_tokens || 0);
+    const mappedUsage = Object.assign({}, usage, {
+      input_tokens: Number(usage.input_tokens || 0) + cacheRead + cacheWrite,
+      output_tokens: Number(usage.output_tokens || 0),
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: cacheWrite
+    });
+    this.recordAiTokenUsage(operation, modelId, mappedUsage, captureContext);
+    this.observeReasoningCapability(normalizedProvider, modelId, response.json, { effortSent: reasoningConfig?.anthropic?.effort || "" });
+    try {
+      const identity = {
+        requestedModel: String(modelId || ""),
+        responseModel: String(response.json?.model || modelId || ""),
+        responseProvider: normalizedProvider,
+        responseIdPrefix: String(response.json?.id || "").slice(0, 12)
+      };
+      this.lastAiResponseIdentity = identity;
+      if (typeof onResponseIdentity === "function") onResponseIdentity(Object.assign({}, identity));
+    } catch (identityError) {}
+    if (jsonSchema) return extractJsonPayload(text);
+    return text;
+  }
+
   async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", onResponseIdentity = null }, captureContext = null) {
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || "gemini-3.5-flash");
     const generationConfig = {};
@@ -14319,6 +14537,30 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
+  // Capture discovered per-model output limits during a catalog refresh.
+  // Best-effort like the capability capture; the refresh flow's own saveSettings
+  // persists the value through model-cache.json.
+  captureProviderModelLimits(provider, entries) {
+    try {
+      const normalizedProvider = stableSupportedProvider(provider, "");
+      if (!normalizedProvider || !Array.isArray(entries) || !entries.length) return;
+      const store = this.settings && typeof this.settings === "object" ? this.settings : null;
+      if (!store) return;
+      if (!store.providerModelLimits || typeof store.providerModelLimits !== "object" || Array.isArray(store.providerModelLimits)) {
+        store.providerModelLimits = {};
+      }
+      const bucket = store.providerModelLimits[normalizedProvider];
+      const target = bucket && typeof bucket === "object" && !Array.isArray(bucket) ? bucket : (store.providerModelLimits[normalizedProvider] = {});
+      for (const entry of entries) {
+        if (!entry || !entry.model) continue;
+        const limit = Number(entry.maxTokens);
+        if (Number.isInteger(limit) && limit > 0) target[capabilityStoreModelKey(entry.model)] = Math.min(limit, 2000000);
+      }
+    } catch (captureError) {
+      // Limit capture is best-effort; catalog refresh must not fail.
+    }
+  }
+
   // Slice B: clear prior auto-corrected markers for probed models (slice C
   // fills this map when a real request is rejected).
   clearReasoningAutoCorrections(entries = []) {
@@ -14357,6 +14599,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const normalizedProvider = stableSupportedProvider(provider, "");
     if (normalizedProvider === "openai" || normalizedProvider === "gemini") {
       return { outcome: "static", message: `${modelDisplayName(model)} uses its built-in reasoning levels; no probe needed.` };
+    }
+    if (normalizedProvider === "anthropic") {
+      // No probe request: Anthropic capabilities come from the Models API rows
+      // captured by Refresh Models. Report the record state without network.
+      const entries = this.settings?.providerModelCapabilities?.anthropic;
+      const hasRecord = Boolean(entries && typeof entries === "object" && !Array.isArray(entries)
+        && Object.keys(entries).some((candidate) => candidate.toLowerCase() === model.toLowerCase()));
+      return hasRecord
+        ? { outcome: "static", message: `${modelDisplayName(model)}: capabilities come from the Anthropic Models API.` }
+        : { outcome: "no-evidence", message: `${modelDisplayName(model)}: no capability record yet. Use Refresh Models to load Anthropic models; capabilities come from the Anthropic Models API.` };
     }
     const baseBody = {
       model,
@@ -14443,6 +14695,19 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
 
   async refreshOpenAIModels(showNotice = true) {
     const activeProvider = stableSupportedProvider(this.settings.aiModelProvider, "openrouter");
+    if (activeProvider === "anthropic") {
+      if (!this.settings.anthropicApiKey) throw new Error("Add Anthropic API key first.");
+      const discovered = await this.discoverAnthropicModels();
+      this.settings.providerGenerationModels = Object.assign({}, this.settings.providerGenerationModels || {}, { ["anthropic"]: discovered.generation });
+      this.settings.providerGenerationModels["anthropic"] = discovered.generation;
+      this.settings.providerEmbeddingModels = Object.assign({}, this.settings.providerEmbeddingModels || {}, { ["anthropic"]: discovered.embedding });
+      this.settings.providerEmbeddingModels["anthropic"] = discovered.embedding;
+      this.settings.modelsFetchedAt = deviceTimestamp();
+      await this.saveSettings();
+      this.queryEmbeddingCache?.clear?.();
+      if (showNotice) new Notice(`Loaded ${discovered.generation.length} Anthropic generation models.`);
+      return discovered;
+    }
     if (["openrouter", "openwebui", "customopenai"].includes(activeProvider)) {
       const discovered = await this.discoverOpenAiCompatibleModels(activeProvider);
       this.settings.providerGenerationModels = Object.assign({}, this.settings.providerGenerationModels || {}, { [activeProvider]: discovered.generation });
@@ -14542,6 +14807,80 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // Capability capture is best-effort; catalog refresh must not fail.
     }
     return result;
+  }
+
+  async discoverAnthropicModels() {
+    const normalizedProvider = "anthropic";
+    const rows = [];
+    let hasMore = true;
+    let afterId = null;
+    while (hasMore) {
+      const url = new URL("https://api.anthropic.com/v1/models");
+      url.searchParams.set("limit", "100");
+      if (afterId) url.searchParams.set("after_id", afterId);
+      const response = await requestProviderUrl(normalizedProvider, {
+        url: url.toString(),
+        method: "GET",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": String(this.settings.anthropicApiKey || ""),
+          "anthropic-version": "2023-06-01"
+        },
+        throw: false
+      });
+      if (response.status < 200 || response.status >= 300) {
+        const detail = response.json?.error?.message || response.json?.error?.type || "anthropic model discovery failed";
+        throw providerAdapterError(normalizedProvider, response.json?.error?.type || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
+      }
+      const pageRows = Array.isArray(response.json?.data) ? response.json.data : [];
+      rows.push(...pageRows);
+      hasMore = Boolean(response.json?.has_more);
+      afterId = pageRows.length ? String(pageRows[pageRows.length - 1]?.id || "") : null;
+      if (!afterId) hasMore = false;
+      if (rows.length >= 500) hasMore = false; // safety cap
+    }
+    const ids = rows.map((row) => String(row?.id || "").trim()).filter(Boolean);
+    const generation = uniqueValues(ids);
+    // Capture reasoning capabilities from Anthropic native model responses
+    const capabilityEntries = rows
+      .map((row) => {
+        if (!row || typeof row !== "object") return null;
+        const id = String(row.id || "").trim();
+        if (!id) return null;
+        const capabilities = row.capabilities && typeof row.capabilities === "object" ? row.capabilities : null;
+        if (!capabilities) return null;
+        const effort = capabilities.effort && typeof capabilities.effort === "object" ? capabilities.effort : null;
+        const supportedEntries = [];
+        if (effort) {
+          for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+            if (effort[level]?.supported === true) supportedEntries.push(level);
+          }
+        }
+        if (!supportedEntries.length) return null;
+        return { model: id, record: { supportsEffort: true, efforts: supportedEntries, source: "anthropic-models-api", at: Date.now() } };
+      })
+      .filter(Boolean);
+    try {
+      this.captureProviderModelCapabilities("anthropic", capabilityEntries);
+    } catch (capError) {
+      // Capability capture is best-effort; catalog refresh must not fail.
+    }
+    // Discovered output limits: the Messages API `max_tokens` value per model,
+    // used as the request max_tokens (capped) so long structured generations
+    // are not cut at the old fixed 16000.
+    const limitEntries = rows
+      .map((row) => {
+        const id = String(row?.id || "").trim();
+        const maxTokens = Number(row?.max_tokens);
+        return id && Number.isInteger(maxTokens) && maxTokens > 0 ? { model: id, maxTokens } : null;
+      })
+      .filter(Boolean);
+    try {
+      this.captureProviderModelLimits("anthropic", limitEntries);
+    } catch (limitError) {
+      // Limit capture is best-effort; catalog refresh must not fail.
+    }
+    return { generation, embedding: [] };
   }
 
   // Auto-discovery: a customopenai (LiteLLM) model whose reasoning-effort
@@ -23082,6 +23421,7 @@ const SETTING_DESCRIPTIONS = {
   taskGenerationPromptProfile: "Manual task-generation prompt profile. This changes only variable task and description user-prompt guidance.",
   openaiApiKey: "Required for the default OpenAI setup. Create this in OpenAI Platform and paste it here.",
   googleApiKey: "Optional. Required only when you choose a Gemini chat or embedding model.",
+  anthropicApiKey: "Required to use Anthropic models directly. Create it in the Anthropic Console and paste it here. Sent only to api.anthropic.com.",
   aiModelProvider: "Choose which provider to prefer when both OpenAI and Gemini API keys are saved. Model dropdowns follow this provider.",
   chatReasoningEffort: "Controls the primary model's reasoning effort or thinking level when the selected provider supports it. Provider default preserves the model's current API default.",
   chatFallbackModel: "Choose one same-provider fallback model for temporary overload/rate-limit retries.",
@@ -23210,8 +23550,9 @@ function sanitizeLogData(value) {
 
 function redactSecrets(value) {
   return String(value || "")
+    .replace(/sk-ant-[A-Za-z0-9_-]{20,}/g, "[redacted-anthropic-key]")
     .replace(/AIza[0-9A-Za-z_-]{20,}/g, "[redacted-google-key]")
-    .replace(/sk-(proj-)?[0-9A-Za-z_-]{20,}/g, "[redacted-openai-key]")
+    .replace(/sk-(?:proj-)?[0-9A-Za-z_-]{20,}/g, "[redacted-openai-key]")
     .replace(/Bearer\s+[0-9A-Za-z._-]+/gi, "Bearer [redacted]");
 }
 
@@ -23494,6 +23835,7 @@ const STABLE_PROVIDER_LABELS = Object.freeze({
   openai: "OpenAI",
   gemini: "Google Gemini",
   openrouter: "OpenRouter",
+  anthropic: "Anthropic",
   openwebui: "Self-Hosted OpenWebUI",
   customopenai: "Custom OpenAI-compatible"
 });
@@ -23525,7 +23867,11 @@ function providerAdapterError(provider, code, message, status = 0, retryable = f
 }
 
 function isRetryableProviderStatus(status) {
-  return [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(status));
+  // 529 is Anthropic's overloaded_error (server overload). No other supported
+  // provider emits it, so the retry classification of every other status is
+  // unchanged; adding it here keeps the same-provider fallback working for
+  // Anthropic the way 429/5xx already do elsewhere.
+  return [408, 409, 425, 429, 500, 502, 503, 504, 529].includes(Number(status));
 }
 
 function redactProviderAdapterDetail(value) {
@@ -23559,11 +23905,21 @@ function isReasoningEffortRejection(error) {
     .join(" ")
     .toLowerCase();
   const namingText = `${detailText} ${codeText}`;
-  const namesParameter = /reasoning[_\-.\s]?effort/.test(namingText) || /(?:^|[^a-z0-9_])reasoning(?:$|[^a-z0-9_])/.test(namingText);
+  // Anthropic native Messages API names its reasoning fields `output_config.effort`
+  // and `thinking.type`; recognise those field names alongside the OpenAI-style
+  // reasoning/reasoning_effort vocabulary. The schema keyword rejection
+  // (`output_config.format.schema`) deliberately does not match.
+  const namesParameter = /reasoning[_\-.\s]?effort/.test(namingText)
+    || /(?:^|[^a-z0-9_])reasoning(?:$|[^a-z0-9_])/.test(namingText)
+    || /output[_\-.\s]?config[_\-.\s]?effort/.test(namingText)
+    || /thinking[_\-.\s]?type/.test(namingText)
+    || (/input\s+should\s+be/i.test(detailText) && /low|medium|high|xhigh|max/i.test(detailText));
   if (!namesParameter) return false;
   // Qualifier words must come from the provider's own detail text; a generic
   // "invalid_request_error" code alone must never qualify a 400.
   if (/unsupported|not\s+supported|unknown|unrecognized|unexpected|invalid|drop_params|extra[_\-.\s]?(?:inputs|fields|keys)|forbidden/.test(detailText)) return true;
+  // Anthropic native Messages API rejects unsupported effort values with a specific message shape.
+  if (/input\s+should\s+be/i.test(detailText) && /low|medium|high|xhigh|max/i.test(detailText)) return true;
   return /unsupported|unknown|unrecognized|drop_params|unexpected|forbidden/.test(codeText);
 }
 
@@ -24144,9 +24500,9 @@ function normalizeAiTokenUsage(usage = {}) {
   const source = usage && typeof usage === "object" ? usage : {};
   const inputTokens = aiTokenUsageField(source, ["input_tokens", "prompt_tokens", "promptTokenCount"]);
   const outputTokens = aiTokenUsageField(source, ["output_tokens", "completion_tokens", "candidatesTokenCount"]);
-  const reasoningTokens = aiTokenUsageField(source, ["output_tokens_details.reasoning_tokens", "completion_tokens_details.reasoning_tokens", "thoughtsTokenCount"]);
-  const cachedInputTokens = aiTokenUsageField(source, ["input_tokens_details.cached_tokens", "prompt_tokens_details.cached_tokens", "cachedContentTokenCount"]);
-  const cacheWriteTokens = aiTokenUsageField(source, ["input_tokens_details.cache_write_tokens", "prompt_tokens_details.cache_write_tokens", "cacheWritePromptTokenCount"]);
+  const reasoningTokens = aiTokenUsageField(source, ["output_tokens_details.reasoning_tokens", "output_tokens_details.thinking_tokens", "completion_tokens_details.reasoning_tokens", "thoughtsTokenCount"]);
+  const cachedInputTokens = aiTokenUsageField(source, ["input_tokens_details.cached_tokens", "prompt_tokens_details.cached_tokens", "cache_read_input_tokens", "cachedContentTokenCount"]);
+  const cacheWriteTokens = aiTokenUsageField(source, ["input_tokens_details.cache_write_tokens", "prompt_tokens_details.cache_write_tokens", "cache_creation_input_tokens", "cacheWritePromptTokenCount"]);
   const explicitTotal = aiTokenUsageField(source, ["total_tokens", "totalTokenCount"]);
   const totalTokens = explicitTotal !== null
     ? explicitTotal
@@ -24288,6 +24644,7 @@ function requestProviderUrl(provider, request, captureContext = null) {
 function providerAdapterBaseUrl(settings = {}, provider = "") {
   const normalized = stableSupportedProvider(provider, "openrouter");
   if (normalized === "openrouter") return "https://openrouter.ai/api/v1";
+  if (normalized === "anthropic") return "https://api.anthropic.com";
   const source = settings && typeof settings === "object" ? settings : {};
   const configured = normalized === "openwebui" ? source.openwebuiBaseUrl : source.customOpenAIBaseUrl;
   const allowInsecureHttp = normalized === "openwebui"
@@ -24557,6 +24914,8 @@ function providerConnectionDisclosure(containerEl, plugin, provider) {
   } else if (normalized === "openrouter") {
     secretSetting(body, "OpenRouter API key", plugin, "openrouterApiKey");
     providerTextSetting(body, "OpenRouter default model", "Optional saved model used when the provider catalog is empty.", plugin, "openrouterDefaultModel");
+  } else if (normalized === "anthropic") {
+    secretSetting(body, "Anthropic API key", plugin, "anthropicApiKey");
   } else if (normalized === "openwebui") {
     providerTextSetting(body, "OpenWebUI base URL", "Use your server root; /api is added. No endpoint is inferred from a model name.", plugin, "openwebuiBaseUrl", { providerRoot: "openwebui" });
     toggleSetting(body, "Allow insecure HTTP", "Off by default. Allows an explicit http:// root only for this OpenWebUI connection; loopback hosts are not exempt.", plugin, "openwebuiAllowInsecureHttp");
@@ -25366,15 +25725,29 @@ function embeddingCapabilitySummary(settings, provider, model) {
   return listed ? "Provider catalog reports this model as embedding-capable." : "Capability is not reported locally; the explicit provider test is required before rebuilding.";
 }
 
+// Search model groups for the web-research row: modelComboboxGroups only walks
+// its fixed provider order, so the web-search-only anthropic group is composed
+// here from the provider default plus whatever catalog the provider fills in.
+function webSearchModelComboboxGroups(settings, providers) {
+  const groups = modelComboboxGroups(settings, { providers });
+  if (!Array.isArray(providers) || !providers.includes("anthropic")) return groups;
+  const catalog = Array.isArray(settings?.providerGenerationModels?.anthropic) ? settings.providerGenerationModels.anthropic : [];
+  const models = uniqueValues([WEB_SEARCH_PROVIDER_DEFAULT_MODELS.anthropic, ...catalog.map((value) => String(value || "").trim()).filter(Boolean)]);
+  const existing = groups.find((group) => group.provider === "anthropic");
+  if (existing) existing.models = uniqueValues([...models, ...existing.models]);
+  else groups.push({ provider: "anthropic", label: "Anthropic", models });
+  return groups;
+}
+
 function webResearchSettings(containerEl, plugin) {
-  const providers = ["openai", "gemini", "openrouter"];
+  const providers = ["openai", "gemini", "openrouter", "anthropic"];
   const provider = normalizeWebSearchProvider(plugin.settings.chatWebSearchProvider);
-  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is limited to OpenAI, Gemini, and OpenRouter.", plugin, "chatWebSearchProvider", providers);
+  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is available for OpenAI, Gemini, OpenRouter, and Anthropic.", plugin, "chatWebSearchProvider", providers);
   modelComboboxSetting(containerEl, "Search model", "Provider-scoped model used only by an explicit search mode.", plugin, {
     inputValue: plugin.settings.chatWebSearchModel
       ? `${stableProviderLabel(provider)}: ${plugin.settings.chatWebSearchModel}`
       : "Provider default",
-    groups: modelComboboxGroups(plugin.settings, { providers }),
+    groups: webSearchModelComboboxGroups(plugin.settings, providers),
     allowedProviders: providers.slice(),
     includeDefault: true,
     defaultProvider: provider,
@@ -26255,6 +26628,7 @@ const MODEL_CACHE_SETTINGS_KEYS = Object.freeze([
   "availableCustomOpenAIModels",
   "availableCustomOpenAIEmbeddingModels",
   "providerModelCapabilities",
+  "providerModelLimits",
   "openrouterModelMetadata",
   "openaiModelMetadata",
   "openwebuiModelMetadata",
@@ -26861,6 +27235,64 @@ function extractOpenRouterWebEvidence(response = {}) {
     candidates,
     queryCount: Number(response?.usage?.server_tool_use?.web_search_requests || 0)
   };
+}
+
+// Anthropic Messages web search (web_search_20250305): citations arrive as
+// web_search_result_location blocks inside text blocks; the tool results carry
+// only titles/urls. When no citations exist, fall back to those titles/urls so
+// found sources are still reported (title as the bounded excerpt).
+function extractAnthropicWebSearchEvidence(response = {}) {
+  const content = Array.isArray(response?.content) ? response.content : [];
+  const candidates = [];
+  const results = [];
+  let queryCount = 0;
+  let toolError = "";
+  for (const block of content) {
+    const type = String(block?.type || "").toLowerCase();
+    if (type === "server_tool_use") {
+      if (String(block?.name || "").toLowerCase() === "web_search") queryCount += 1;
+      continue;
+    }
+    if (type === "web_search_tool_result") {
+      const inner = block?.content;
+      if (Array.isArray(inner)) {
+        for (const item of inner) {
+          if (String(item?.type || "").toLowerCase() === "web_search_result" && item?.url) results.push({ url: item.url, title: item.title });
+        }
+      } else if (inner && typeof inner === "object") {
+        toolError = String(inner.error_code || "").trim() || "web-search-tool-error";
+      }
+      continue;
+    }
+    if (type === "text") {
+      for (const citation of Array.isArray(block?.citations) ? block.citations : []) {
+        if (String(citation?.type || "").toLowerCase() !== "web_search_result_location" && !citation?.url) continue;
+        candidates.push({
+          url: citation?.url,
+          title: citation?.title,
+          excerpt: boundedWebExcerpt(citation?.cited_text || citation?.text || "", webSearchModeProfile("deep").maxEvidenceChars)
+        });
+      }
+    }
+  }
+  if (!candidates.length) {
+    for (const result of results) {
+      candidates.push({
+        url: result.url,
+        title: result.title,
+        excerpt: boundedWebExcerpt(result.title || "", webSearchModeProfile("deep").maxEvidenceChars)
+      });
+    }
+  }
+  return { candidates, queryCount, toolError };
+}
+
+function anthropicWebSearchUsage(response = {}) {
+  const usage = response?.usage || {};
+  const inputTokens = Math.max(0, Number(usage.input_tokens || 0) || 0);
+  const outputTokens = Math.max(0, Number(usage.output_tokens || 0) || 0);
+  const searchRequests = Math.max(0, Math.round(Number(usage?.server_tool_use?.web_search_requests || 0) || 0));
+  return { inputTokens, outputTokens, totalTokens: Math.max(0, inputTokens + outputTokens), searchRequests };
 }
 
 function normalizeWebEvidenceRows(provider, model, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
@@ -51949,6 +52381,7 @@ function generationProviderForSelectedModel(settings = DEFAULT_SETTINGS, model =
   const selectedModel = String(model || "").trim();
   if (usesGeminiChatModel(selectedModel)) return "gemini";
   if (providerCatalogModels(settings, "openrouter").includes(selectedModel)) return "openrouter";
+  if (providerCatalogModels(settings, "anthropic").includes(selectedModel)) return "anthropic";
   const normalizedOpenAIModel = normalizeOpenAIModelId(selectedModel);
   if (providerCatalogModels(settings, "openai").some((candidate) => normalizeOpenAIModelId(candidate) === normalizedOpenAIModel)) return "openai";
   const fallbackProvider = String(currentProvider || "").trim();
@@ -52922,6 +53355,30 @@ function geminiEmbeddingInput(text, role = "document", model = "") {
   const body = rest.join("\n").trim() || value;
   return `title: ${title} | text: ${body}`;
 }
+// Anthropic Messages API structured output rejects a small set of JSON Schema
+// keywords (`maxItems`, `minimum`, `maximum`) that the plugin's task schema
+// uses. Strip exactly those, at every depth, from a deep clone: the caller's
+// schema object is never mutated (local validation still enforces the original
+// bounds). Pure, module-level so the Module._compile test probe can reach it.
+function anthropicSafeSchema(schema) {
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const stripped = clone(schema);
+  const walk = (o, fn) => {
+    if (Array.isArray(o)) { o.forEach((item) => walk(item, fn)); return; }
+    if (o && typeof o === "object") {
+      fn(o);
+      for (const k of Object.keys(o)) walk(o[k], fn);
+    }
+  };
+  const removedKeywords = new Set(["maxItems", "minimum", "maximum"]);
+  walk(stripped, (o) => {
+    for (const kw of removedKeywords) {
+      if (Object.prototype.hasOwnProperty.call(o, kw)) delete o[kw];
+    }
+  });
+  return stripped;
+}
+
 function geminiCompatibleSchema(schema) {
   if (Array.isArray(schema)) return schema.map(geminiCompatibleSchema);
   if (!schema || typeof schema !== "object") return schema;

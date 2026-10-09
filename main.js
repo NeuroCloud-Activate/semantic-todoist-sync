@@ -14693,8 +14693,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
-  async refreshOpenAIModels(showNotice = true) {
-    const activeProvider = stableSupportedProvider(this.settings.aiModelProvider, "openrouter");
+  async refreshOpenAIModels(showNotice = true, providerOverride) {
+    const activeProvider = providerOverride ? stableSupportedProvider(providerOverride, "openrouter") : stableSupportedProvider(this.settings.aiModelProvider, "openrouter");
     if (activeProvider === "anthropic") {
       if (!this.settings.anthropicApiKey) throw new Error("Add Anthropic API key first.");
       const discovered = await this.discoverAnthropicModels();
@@ -14722,7 +14722,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     let loadedOpenAI = 0;
     let loadedGemini = 0;
-    if (this.settings.openaiApiKey) {
+    let openAiResult = null;
+    let geminiResult = null;
+    // A validate-one-connection call (providerOverride) must touch only that provider.
+    const onlyProvider = providerOverride ? activeProvider : "";
+    if (this.settings.openaiApiKey && (!onlyProvider || onlyProvider === "openai")) {
       const modelsResponse = await requestProviderUrl("openai", {
         url: "https://api.openai.com/v1/models",
         method: "GET",
@@ -14742,6 +14746,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.settings.availableEmbeddingModels = embeddings;
       this.settings.modelsFetchedAt = deviceTimestamp();
       loadedOpenAI = chat.length + embeddings.length;
+      openAiResult = { generation: chat, embedding: embeddings };
       if (usesOpenAIChatModel(this.settings.chatModel) && !chat.includes(normalizeOpenAIModelId(this.settings.chatModel)) && chat.length) this.settings.chatModel = preferredChatModelForProvider(this.settings, "openai");
       // Model-list refresh never rewrites explicit embedding identity: the configured
       // provider/model/dimension persist even when the model is absent from the refreshed
@@ -14751,14 +14756,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // in sync. A string-only fallback here would be reverted by stable normalization
       // (embeddingModelReference wins) and would only create split-brain state.
     }
-    if (this.settings.googleApiKey) {
+    if (this.settings.googleApiKey && (!onlyProvider || onlyProvider === "gemini")) {
       const geminiModels = await this.fetchGeminiModels();
       this.settings.availableGeminiModels = geminiModels.chat.length ? geminiModels.chat : DEFAULT_SETTINGS.availableGeminiModels;
       this.settings.availableGeminiEmbeddingModels = geminiModels.embeddings.length ? geminiModels.embeddings : DEFAULT_SETTINGS.availableGeminiEmbeddingModels;
       this.settings.geminiModelsFetchedAt = deviceTimestamp();
       loadedGemini = this.settings.availableGeminiModels.length + this.settings.availableGeminiEmbeddingModels.length;
+      geminiResult = { generation: this.settings.availableGeminiModels, embedding: this.settings.availableGeminiEmbeddingModels };
     }
-    if (!this.settings.openaiApiKey && !this.settings.googleApiKey) throw new Error("Add an OpenAI API key or Google API key first.");
+    if (!openAiResult && !geminiResult) throw new Error(onlyProvider === "gemini" ? "Add Google API key first." : onlyProvider === "openai" ? "Add OpenAI API key first." : "Add an OpenAI API key or Google API key first.");
     if (!usesGeminiChatModel(this.settings.chatModel) && !usesOpenAIChatModel(this.settings.chatModel)) {
       this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
     }
@@ -14767,6 +14773,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     await this.saveSettings();
     this.queryEmbeddingCache.clear();
     if (showNotice) new Notice(`Loaded ${loadedOpenAI} OpenAI models and ${loadedGemini} Gemini models.`);
+    return openAiResult || geminiResult;
   }
 
   async discoverOpenAiCompatibleModels(provider) {
@@ -14829,7 +14836,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         throw: false
       });
       if (response.status < 200 || response.status >= 300) {
-        const detail = response.json?.error?.message || response.json?.error?.type || "anthropic model discovery failed";
+        const detail = response.json?.error?.message || (response.status === 401 || response.status === 403 ? `Anthropic API key was rejected (${response.status}).` : response.json?.error?.type || "anthropic model discovery failed");
         throw providerAdapterError(normalizedProvider, response.json?.error?.type || `http-${response.status}`, detail, response.status, isRetryableProviderStatus(response.status));
       }
       const pageRows = Array.isArray(response.json?.data) ? response.json.data : [];
@@ -18436,6 +18443,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     else await this.app.vault.create(path, lines.join("\n"));
     if (showNotice) new Notice(`Cloudflare setup note updated: ${path}`);
     return path;
+  }
+
+  async validateProviderConnection(provider) {
+    const normalized = stableSupportedProvider(provider, "openrouter");
+    const missing = [];
+    if (normalized === "openai" && !this.settings.openaiApiKey) missing.push("OpenAI API key");
+    if (normalized === "gemini" && !this.settings.googleApiKey) missing.push("Google Gemini API key");
+    if (normalized === "openrouter" && !this.settings.openrouterApiKey) missing.push("OpenRouter API key");
+    if (normalized === "anthropic" && !this.settings.anthropicApiKey) missing.push("Anthropic API key");
+    if (normalized === "openwebui" && (!this.settings.openwebuiBaseUrl || (!this.settings.openwebuiApiKey && !this.settings.openwebuiJwt && !(this.settings.openwebuiAuthMode === "login" && this.openwebuiLoginPassword)))) missing.push("OpenWebUI base URL and authentication");
+    if (normalized === "customopenai" && !this.settings.customOpenAIBaseUrl) missing.push("Custom OpenAI-compatible base URL");
+    if (missing.length) throw new Error(`Add ${missing.join(", ")} first.`);
+    const discovered = await this.refreshOpenAIModels(false, normalized);
+    const catalogLength = Array.isArray(discovered?.generation) ? discovered.generation.length : 0;
+    return { ok: true, provider: normalized, modelsLoaded: catalogLength };
   }
 
   async validateAiSetup(showNotice = true) {
@@ -24929,6 +24951,18 @@ function providerConnectionDisclosure(containerEl, plugin, provider) {
     secretSetting(body, "Custom OpenAI-compatible API key", plugin, "customOpenAIApiKey");
     providerTextSetting(body, "Custom default model", "Optional model ID used when the provider catalog is empty.", plugin, "customOpenAIModel");
   }
+  new Setting(body).setName("Validate connection").setDesc("Explicitly checks this connection's credentials by loading its model list; never runs automatically.").addButton((button) => button.setButtonText("Validate connection").onClick(async () => {
+    button.setDisabled(true);
+    try {
+      const result = await plugin.validateProviderConnection(normalized);
+      new Notice(`${stableProviderLabel(normalized)} connection OK: loaded ${result.modelsLoaded} models.`);
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : String(error || "Validation failed.");
+      new Notice(`Validation failed: ${redactSecrets(message)}`);
+    } finally {
+      button.setDisabled(false);
+    }
+  }));
   return body;
 }
 
@@ -24976,7 +25010,7 @@ async function saveOperationReferenceField(plugin, operation, role, field, value
 
 // Fixed provider-group display order for every searchable model combobox.
 // Gemini leads so overlapping model IDs stay disambiguated by group order.
-const MODEL_COMBOBOX_PROVIDER_ORDER = Object.freeze(["gemini", "openai", "openrouter", "openwebui", "customopenai"]);
+const MODEL_COMBOBOX_PROVIDER_ORDER = Object.freeze(["gemini", "openai", "openrouter", "openwebui", "customopenai", "anthropic"]);
 
 function modelComboboxDisplayName(provider, model) {
   return model ? `${stableProviderLabel(provider)}: ${model}` : "Provider default";
@@ -25685,7 +25719,7 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
   modelComboboxSetting(containerEl, "Embedding model", "Provider-scoped catalog; changing this control saves state but does not make a network request.", plugin, {
     inputValue: reference.model ? `${stableProviderLabel(reference.provider)}: ${reference.model}` : "",
     groups: modelComboboxGroups(plugin.settings, { embedding: true }),
-    allowedProviders: MODEL_COMBOBOX_PROVIDER_ORDER.slice(),
+    allowedProviders: MODEL_COMBOBOX_PROVIDER_ORDER.filter((p) => p !== "anthropic").slice(),
     current: { provider: reference.provider, model: reference.model },
     onSelect: async (provider, model) => {
       // Same canonical path as above: clear stale caches, load the new identity.
@@ -26195,8 +26229,9 @@ function aiSetupSummary(settings) {
   const connectionReady = provider === "openai" ? Boolean(settings.openaiApiKey)
     : provider === "gemini" ? Boolean(settings.googleApiKey)
       : provider === "openrouter" ? Boolean(settings.openrouterApiKey)
-        : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
-          : Boolean(settings.customOpenAIBaseUrl);
+        : provider === "anthropic" ? Boolean(settings.anthropicApiKey)
+          : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+            : Boolean(settings.customOpenAIBaseUrl);
   const embeddingReady = embeddingProvider === "openai" ? Boolean(settings.openaiApiKey)
     : embeddingProvider === "gemini" ? Boolean(settings.googleApiKey)
       : embeddingProvider === "openrouter" ? Boolean(settings.openrouterApiKey)
@@ -26211,8 +26246,9 @@ function aiAccessConfigured(settings) {
   const chatReady = provider === "openai" ? Boolean(settings.openaiApiKey)
     : provider === "gemini" ? Boolean(settings.googleApiKey)
       : provider === "openrouter" ? Boolean(settings.openrouterApiKey)
-        : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
-          : Boolean(settings.customOpenAIBaseUrl);
+        : provider === "anthropic" ? Boolean(settings.anthropicApiKey)
+          : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt))
+            : Boolean(settings.customOpenAIBaseUrl);
   const embeddingReady = embeddingProvider === "openai" ? Boolean(settings.openaiApiKey)
     : embeddingProvider === "gemini" ? Boolean(settings.googleApiKey)
       : embeddingProvider === "openrouter" ? Boolean(settings.openrouterApiKey)
@@ -52346,6 +52382,7 @@ function providerDisplayName(provider) {
     openai: "OpenAI",
     gemini: "Gemini",
     openrouter: "OpenRouter",
+    anthropic: "Anthropic",
     openwebui: "Open WebUI",
     customopenai: "Custom OpenAI-compatible"
   }[normalized] || "OpenAI";
@@ -54943,6 +54980,14 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeWebEvidenceRows,
     providerAdapterBaseUrl,
     SemanticTodoistSettingTab,
+    // Test-only seams for the Anthropic refresh harness (Node require path
+    // only; not runtime/plugin API).
+    MODEL_COMBOBOX_PROVIDER_ORDER,
+    modelComboboxGroups,
+    aiAccessConfigured,
+    aiSetupSummary,
+    providerConnectionDisclosure,
+    providerDisplayName,
     // Test-only seam for the description context-cap local harness.
     __descriptionContextCoverage: {
       capTaskDescriptionCitationLedger,

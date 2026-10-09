@@ -2,6 +2,11 @@
 
 Turn Obsidian notes into Todoist tasks, chat with your vault, and plan your day. Local-first, and you pick the AI service for each job.
 
+## What's new in 0.9.16
+
+- New: a **Validate connection** button under AI Providers checks the shown provider's credentials by loading its model list.
+- Fixed: Anthropic models now show up in the model pickers after Refresh Models.
+
 ## What's new in 0.9.15
 
 - New: **Anthropic** is now an AI provider. Add an Anthropic API key under AI Providers to run Claude models directly, with the model list and reasoning levels read from Anthropic, prompt caching, and Internet Search / Deep Research through Anthropic's web search. Existing setups are unchanged. Anthropic has no embedding models, so the semantic index keeps using your embedding provider.

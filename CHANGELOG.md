@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.16 - 2026-10-09
+
+### Added
+- **Validate connection button** (Settings, AI Providers). Every provider connection now has a Validate connection button that checks that connection's own credentials by loading its model list, and reports how many models loaded or why it failed. It checks the connection shown, not the provider used for routing, and never runs automatically.
+
+### Fixed
+- Anthropic models now appear in the model pickers after Refresh Models. The refresh already saved them, but the pickers had no Anthropic group, so the list looked empty.
+- An Anthropic primary model with only an Anthropic key is now treated as set up in the AI setup summary and access check; it was being judged by the custom OpenAI-compatible URL.
+- A rejected Anthropic key (401 or 403) now says so instead of a generic discovery failure.
+
 ## 0.9.15 - 2026-10-08
 
 ### Added

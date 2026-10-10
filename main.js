@@ -128,6 +128,7 @@ const LOCAL_SEMANTIC_ROUTING_DEFAULT_DIMENSION = 384;
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION = "int8";
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION_SCALE = 127;
 const GEMINI_EMBEDDING_CONCURRENCY = 3;
+const SEMANTIC_EMBEDDING_BATCH_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
@@ -9479,22 +9480,50 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let embedded = 0;
     let providerInputs = 0;
     let chunksProcessed = reused;
-    // Nothing pending to embed: no visible status (idle stays "Ready").
+
+    // Build descriptors for parallel batch dispatch (Task 4).
+    const descriptors = [];
     for (let i = 0; i < pendingGroups.length; i += batchSize) {
-      const batch = pendingGroups.slice(i, i + batchSize);
-      this.setSidebarStatus(`Embedding ${label} ${Math.min(providerInputs + batch.length, pendingGroups.length)}/${pendingGroups.length}${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
-      const embeddings = await this.embedTexts(batch.map((group) => group.items.length > 1
+      descriptors.push({
+        batchIndex: descriptors.length,
+        groups: pendingGroups.slice(i, i + batchSize)
+      });
+    }
+
+    const batchCount = descriptors.length;
+    const completedFlags = new Array(batchCount).fill(false);
+    const batchResults = new Array(batchCount);
+    let nextProgressBatch = 0;
+    const providerName = semanticEmbeddingProvider(this.settings);
+    const concurrency = providerName === "gemini" ? 1 : SEMANTIC_EMBEDDING_BATCH_CONCURRENCY;
+
+    /** Task 4: parallel batches via existing asyncPool; staged vectors land in indexed[item.index] in original order, so a crash never leaves chunks beyond the contiguous completed prefix unreported (resume re-embeds them). */
+    function cumulativeProgressThrough(batchIdx) {
+      let chunkCount = reused;
+      let groupCount = 0;
+      for (let k = 0; k <= batchIdx && k < batchCount; k += 1) {
+        if (!batchResults[k]) break;
+        chunkCount += (batchResults[k].batchEmbedded || []).length;
+        groupCount += batchResults[k].groupCount || 0;
+      }
+      return { chunksProcessed: chunkCount, embedded: chunkCount - reused, providerInputs: groupCount };
+    }
+
+    await asyncPool(descriptors, concurrency, async (descriptor) => {
+      const { batchIndex, groups } = descriptor;
+      this.setSidebarStatus(`Embedding ${label} batch ${batchIndex + 1}/${batchCount} (${groups.length} inputs)${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
+      const embeddings = await this.embedTexts(groups.map((group) => group.items.length > 1
         ? semanticChunkSharedEmbeddingInput(group.chunk)
         : semanticChunkEmbeddingInput(group.chunk)), "document");
       const batchEmbedded = [];
-      for (let j = 0; j < batch.length; j += 1) {
-        const group = batch[j];
+      for (let j = 0; j < groups.length; j += 1) {
+        const group = groups[j];
         const embedding = compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision);
         const projectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(group.chunk);
         for (const item of group.items) {
           indexed[item.index] = Object.assign({}, item.chunk, {
             embedding,
-            embeddingProvider: semanticEmbeddingProvider(this.settings),
+            embeddingProvider: providerName,
             embeddingModel: this.settings.embeddingModel,
             embeddingDimension: embedding.length,
             embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
@@ -9503,7 +9532,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
             indexMetadata: {
               schemaVersion: 1,
               contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
-              provider: semanticEmbeddingProvider(this.settings),
+              provider: providerName,
               model: this.settings.embeddingModel,
               dimension: embedding.length,
               requestFingerprint: group.requestKey,
@@ -9511,16 +9540,48 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
             }
           });
           batchEmbedded.push(indexed[item.index]);
-          embedded += 1;
-          chunksProcessed += 1;
         }
       }
-      providerInputs += batch.length;
-      if (onProgress) {
-        await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded });
+      providerInputs += groups.length;
+
+      // Store result and advance contiguous progress.
+      const result = {
+        groupCount: groups.length,
+        batchEmbedded
+      };
+      batchResults[batchIndex] = result;
+      completedFlags[batchIndex] = true;
+
+      // Advance progress only through contiguous completed prefix.
+      // Because workers may complete out of order, we advance as far as possible.
+      while (nextProgressBatch < batchCount && completedFlags[nextProgressBatch]) {
+        const prevResult = batchResults[nextProgressBatch];
+        const cumulative = cumulativeProgressThrough(nextProgressBatch);
+        chunksProcessed = cumulative.chunksProcessed;
+        embedded = cumulative.embedded;
+        providerInputs = cumulative.providerInputs;
+        if (onProgress) {
+          await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded: prevResult.batchEmbedded });
+        }
+        nextProgressBatch += 1;
       }
+
       await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
+    });
+
+    // After all batches complete, ensure any remaining progress is emitted.
+    while (nextProgressBatch < batchCount && completedFlags[nextProgressBatch]) {
+      const prevResult = batchResults[nextProgressBatch];
+      const cumulative = cumulativeProgressThrough(nextProgressBatch);
+      chunksProcessed = cumulative.chunksProcessed;
+      embedded = cumulative.embedded;
+      providerInputs = cumulative.providerInputs;
+      if (onProgress) {
+        await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded: prevResult.batchEmbedded });
+      }
+      nextProgressBatch += 1;
     }
+
     return {
       indexed,
       embedded,
@@ -10156,6 +10217,47 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return normalizeProviderEmbeddingRows(response.json?.data, texts.length, dimension, normalizedProvider);
   }
 
+  // One shared runtime query-embedding fallback. Chat mode already built a
+  // query handle from the provider when the identity lookup found no indexed
+  // chunk (see the chat branch of retrieveSemanticContext); the task workflow
+  // needs the same handle, because an email source - or any source with no
+  // indexed path - has no chunk of its own to borrow a query vector from and
+  // would otherwise fail closed with "query-vector-unavailable" and retrieve
+  // nothing. Reuses embedTexts and the shared queryEmbeddingCache. Returns []
+  // when embedding fails so every caller keeps its existing fail-closed branch,
+  // and the returned handle carries no chunk ids (no source evidence/source
+  // identity), so it never satisfies an identity requirement.
+  async runtimeSemanticQueryHandles(query, captureContext = null) {
+    const embeddingDimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const embeddingCacheKey = `${this.settings.embeddingModel}:${embeddingDimension || "native"}:${singleLine(String(query || ""))}`;
+    let cachedEmbedding = this.queryEmbeddingCache.get(embeddingCacheKey);
+    try {
+      if (!cachedEmbedding) {
+        [cachedEmbedding] = await this.embedTexts([query || ""], "query", captureContext);
+        this.queryEmbeddingCache.set(embeddingCacheKey, cachedEmbedding);
+        if (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+      }
+    } catch (error) {
+      this.logLocal("Semantic retrieval embedding failed", { error: error.message || String(error) });
+      return [];
+    }
+    const vector = Array.isArray(cachedEmbedding) ? cachedEmbedding : [];
+    if (!vector.length) return [];
+    return [Object.freeze({
+      source: "chat-provider",
+      encoderId: `${semanticEmbeddingProvider(this.settings)}:${this.settings.embeddingModel}`,
+      encoderVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      vector: Object.freeze(Array.from(vector, Number)),
+      provider: semanticEmbeddingProvider(this.settings),
+      model: this.settings.embeddingModel,
+      dimension: vector.length || embeddingDimension,
+      indexRevision: this.semanticIndexRevision || 0,
+      sourceEvidenceIds: Object.freeze([]),
+      sourceIds: Object.freeze([]),
+      cacheKey: embeddingCacheKey
+    })];
+  }
+
   async retrieveSemanticContext(query, limit, queryPlan = null, captureContext = null) {
     const startedAt = Date.now();
     const plan = queryPlan || contextQueryPlan(query, "chat");
@@ -10309,6 +10411,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const resolved = resolveIndexedSemanticQueryHandles(resolverIndex, queryHandleRequest);
       queryHandles = resolved.handles || [];
       queryHandleTelemetry = Object.assign({}, resolved.telemetry || {}, { source: "indexed", handleSource: "indexed", externalQueryEmbeddingCalls: 0, runtimeExternalCalls: 0 });
+      // An email source (or any source with no indexed path) resolves no indexed
+      // chunk, so no handle can be borrowed from the index. Embed the query at
+      // runtime through the shared fallback, exactly like the chat branch above;
+      // when that yields nothing the fail-closed return below is unchanged.
+      if (!queryHandles.length) {
+        const runtimeHandles = await this.runtimeSemanticQueryHandles(query, captureContext);
+        if (runtimeHandles.length) {
+          queryHandles = runtimeHandles;
+          queryHandleTelemetry = Object.assign({}, resolved.telemetry || {}, { source: "chat-provider", handleSource: "chat-provider", externalQueryEmbeddingCalls: 1, runtimeExternalCalls: 1 });
+        }
+      }
       if (!queryHandles.length) {
         const result = this.finalizeSemanticRetrievalContext([], request, {
           indexState: "degraded-source-only",
@@ -12097,6 +12210,44 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // the background. Healthy indexed notes never take this path (the lane
     // resolver reports no mismatch), so their retrieval stays byte-identical.
     if (localCurrentSourceRow && markedLineMismatchKeys.size) return degraded("marked-source-line-mismatch");
+    // Runtime query fallback for lanes with no indexed handle. Every lane above
+    // borrows its query vector from an indexed chunk of the source
+    // (lane.embedding = lane.queryHandles[0]?.vector); an email source - or any
+    // source with no indexed path - has no such chunk, so every lane would end
+    // with zero handles and routeProductionSemanticCandidateBatches below would
+    // early-return "query-vector-unavailable" with no candidates, leaving the
+    // description with no vault note to cite. Embed the lane text at runtime
+    // through the same shared fallback chat mode uses (one request per distinct
+    // text, deduped by the shared queryEmbeddingCache). Lanes that still get no
+    // handle keep their empty state, so the fail-closed behaviour when the
+    // endpoint is unreachable is unchanged.
+    const runtimeHandlesByText = new Map();
+    for (const entry of laneDataByTask.values()) {
+      for (const lane of entry.lanes || []) {
+        if (lane.queryHandles?.length) continue;
+        const laneText = String(lane.text || "");
+        if (laneText && !runtimeHandlesByText.has(laneText)) runtimeHandlesByText.set(laneText, []);
+      }
+    }
+    for (const laneText of runtimeHandlesByText.keys()) {
+      runtimeHandlesByText.set(laneText, await this.runtimeSemanticQueryHandles(laneText, options.captureContext));
+    }
+    let runtimeHandleLaneCount = 0;
+    for (const entry of laneDataByTask.values()) {
+      for (const lane of entry.lanes || []) {
+        if (lane.queryHandles?.length) continue;
+        const runtimeHandles = runtimeHandlesByText.get(String(lane.text || "")) || [];
+        if (!runtimeHandles.length) continue;
+        lane.queryHandles = runtimeHandles;
+        lane.embedding = runtimeHandles[0].vector;
+        runtimeHandleLaneCount += 1;
+      }
+    }
+    // Only clear the degraded flag once handles were actually obtained.
+    if (runtimeHandleLaneCount) {
+      telemetry.degraded = false;
+      telemetry.degradedReason = "";
+    }
     const allLaneRoutingGroups = [];
     // R9 fix A: in routed mode only the router-selected shards are scanned, so
     // the task's protected rows - the lane query-handle evidence and the
@@ -17070,8 +17221,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
       // Prompt-cache hints: with warm-first the first description request is
       // sent alone so it can warm the provider cache before the pool fans out.
-      const warmFirst = descriptionWarmFirstEnabled(this, this.generationProviderForModel(modelChoice.model), modelChoice.model);
-      await descriptionPhaseDispatch(targets, taskDescriptionConcurrencyFor(this.settings), descriptionWorker, warmFirst);
+      // Warm-skip: the key binds provider+model+prompt prefix hash, so a
+      // model or prefix change warms again instead of reusing a warm entry
+      // from another model or note.
+      const warmProvider = this.generationProviderForModel(modelChoice.model);
+      const warmFirst = descriptionWarmFirstEnabled(this, warmProvider, modelChoice.model);
+      const warmKey = `${warmProvider}|${modelChoice.model}|${options.contextBundle?.promptCachePrefixHash || ""}`;
+      await descriptionPhaseDispatch(targets, taskDescriptionConcurrencyFor(this.settings), descriptionWorker, warmFirst, warmKey, this);
       return slots;
     };
     const providerFailureFor = (error) => error?.providerDiagnostic || {
@@ -19997,6 +20153,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const semanticDedupeState = await this.prepareSemanticTaskDeduplicationState(tasks, candidates, options);
     const matchingOptions = Object.assign({}, options, {
       semanticDedupeState,
+      dedupeStats: stats,
       semanticIndexRevision: this.semanticIndexRevision || 0
     });
     stats.semanticTelemetry = semanticDedupeState.telemetry;
@@ -22182,7 +22339,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     systemOneDecisionModelSettings(embeddings, this.plugin);
 
     const search = settingsDisclosure(containerEl, "Internet Search", "Search is off by default. Selecting a mode only changes saved search preferences; execution belongs to the chat action.", false);
-    webResearchSettings(search, this.plugin);
+    webResearchSettings(search, this.plugin, () => this.display());
 
     const sidebar = settingsDisclosure(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.", false);
     dropdownSettingWithDesc(sidebar, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
@@ -25773,16 +25930,26 @@ function webSearchModelComboboxGroups(settings, providers) {
   return groups;
 }
 
-function webResearchSettings(containerEl, plugin) {
+function webResearchSettings(containerEl, plugin, refreshDisplay = null) {
   const providers = ["openai", "gemini", "openrouter", "anthropic"];
   const provider = normalizeWebSearchProvider(plugin.settings.chatWebSearchProvider);
-  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is available for OpenAI, Gemini, OpenRouter, and Anthropic.", plugin, "chatWebSearchProvider", providers);
+  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is available for OpenAI, Gemini, OpenRouter, and Anthropic.", plugin, "chatWebSearchProvider", providers, (value) => {
+    // A model saved under the previous provider is not valid for the new one,
+    // so drop it before the refresh: the picker then falls back to the new
+    // provider's default instead of sending a foreign model to that API.
+    const nextProvider = normalizeWebSearchProvider(value);
+    const savedModel = String(plugin.settings.chatWebSearchModel || "").trim();
+    const available = !savedModel || webSearchModelComboboxGroups(plugin.settings, [nextProvider])
+      .some((group) => group.models.some((model) => String(model || "") === savedModel));
+    if (!available) plugin.settings.chatWebSearchModel = "";
+    if (refreshDisplay) refreshDisplay();
+  });
   modelComboboxSetting(containerEl, "Search model", "Provider-scoped model used only by an explicit search mode.", plugin, {
     inputValue: plugin.settings.chatWebSearchModel
       ? `${stableProviderLabel(provider)}: ${plugin.settings.chatWebSearchModel}`
       : "Provider default",
-    groups: webSearchModelComboboxGroups(plugin.settings, providers),
-    allowedProviders: providers.slice(),
+    groups: webSearchModelComboboxGroups(plugin.settings, [provider]),
+    allowedProviders: [provider],
     includeDefault: true,
     defaultProvider: provider,
     current: { provider, model: plugin.settings.chatWebSearchModel || "" },
@@ -26057,11 +26224,14 @@ function dropdownSetting(containerEl, name, plugin, key, options) {
   });
 }
 
-function dropdownSettingWithDesc(containerEl, name, desc, plugin, key, options) {
+function dropdownSettingWithDesc(containerEl, name, desc, plugin, key, options, onChanged = null) {
   new Setting(containerEl).setName(name).setDesc(desc || "").addDropdown((dropdown) => {
     for (const option of options) dropdown.addOption(option, option);
     dropdown.setValue(plugin.settings[key] || options[0]).onChange(async (value) => {
       plugin.settings[key] = value;
+      // Invoked before the awaiting save so a caller that re-renders the row
+      // sees the new selection immediately; the save is still awaited.
+      if (onChanged) onChanged(value);
       await plugin.saveSettings();
     });
   });
@@ -29931,13 +30101,36 @@ function openAiCompatibleChatMessages({ provider, model, system, user, userStabl
 // target 1 is sent alone and the rest start only after it settles. Latency
 // cost: one extra serial request time (~15-25 s on the live runs) before the
 // pool fans out; without warm-first the pool behaviour is unchanged.
-async function descriptionPhaseDispatch(targets, workerCount, worker, warmFirst = false) {
+// Warm-skip: provider|model|promptCachePrefixHash -> timestamp of the last
+// successful solo warm (in-memory Map on the plugin, beside
+// promptCacheHintRejected). A dispatch with the same key inside
+// DESCRIPTION_WARM_REUSE_MS skips the solo request and pools everything;
+// a failed warm is never recorded, so the next dispatch warms again.
+const DESCRIPTION_WARM_REUSE_MS = 270000;
+async function descriptionPhaseDispatch(targets, workerCount, worker, warmFirst = false, warmKey = "", plugin = null) {
   const list = Array.from(targets || []);
   if (!warmFirst || list.length <= 1) {
     await asyncPool(list, workerCount, worker);
     return;
   }
-  await asyncPool(list.slice(0, 1), 1, worker);
+  const warmKeyText = String(warmKey || "");
+  let warmAt = plugin && plugin.promptCacheWarmAt instanceof Map ? plugin.promptCacheWarmAt : null;
+  if (!warmAt && plugin && warmKeyText) {
+    warmAt = new Map();
+    plugin.promptCacheWarmAt = warmAt;
+  }
+  if (warmAt && warmKeyText && warmAt.has(warmKeyText)
+    && (Date.now() - Number(warmAt.get(warmKeyText))) < DESCRIPTION_WARM_REUSE_MS) {
+    await asyncPool(list, workerCount, worker);
+    return;
+  }
+  try {
+    await asyncPool(list.slice(0, 1), 1, worker);
+  } catch (error) {
+    if (warmAt && warmKeyText) warmAt.delete(warmKeyText);
+    throw error;
+  }
+  if (warmAt && warmKeyText) warmAt.set(warmKeyText, Date.now());
   await asyncPool(list.slice(1), workerCount, worker);
 }
 
@@ -53867,7 +54060,7 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     const decision = bestTaskDeduplicationMatch(task, candidates, settings, Object.assign({}, options, { isSubtask: false, intraBatch: true }));
     if (!decision.candidate?.generatedTask) continue;
     if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
-    const resolutionOptions = Object.assign({}, options, { intraBatch: true });
+    const resolutionOptions = Object.assign({}, options, { intraBatch: true, dedupeStats: stats });
     const resolution = taskDeduplicationResolution(decision, settings, resolutionOptions);
     if (resolution === "none") {
       if (decision.candidate && (decision.outcome === "ambiguous-ai" || decision.decision === "ambiguous")) {
@@ -54361,8 +54554,11 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
     const semanticCandidates = buildSemanticTaskDedupeCandidates(task, scoredCandidates, options);
     return Object.assign(semanticTaskDedupeDecision(task, semanticCandidates, Object.assign({}, options, { telemetry: options.semanticDedupeState.telemetry })), { sourceTask: task });
   }
+  const degradedFlag = flagSemanticUnavailableCanonicalMatch(task, candidates, settings, options);
+  if (degradedFlag) return degradedFlag;
   return {
     decision: "create",
+    outcome: "create",
     confidence: 0,
     reasons: ["semantic dedupe state unavailable; lexical fallback disabled"],
     candidate: null,
@@ -54370,6 +54566,46 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
     degradedReason: "semantic-dedupe-state-unavailable",
     sourceTask: task
   };
+}
+
+function flagSemanticUnavailableCanonicalMatch(task = {}, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
+  let stats = options.dedupeStats || null;
+  try {
+    const source = canonicalTaskMatchTitle(task.content || "");
+    if (!source) return null;
+    const sourceProject = singleLine(task.projectName || "").toLowerCase();
+    for (const candidate of candidates || []) {
+      const existing = candidate.generatedTask || candidate.task || {};
+      if (existing.isCompleted) continue;
+      if (canonicalTaskMatchTitle(existing.content || "") !== source) continue;
+      const existingProject = singleLine(existing.projectName || "").toLowerCase();
+      // Spec: flag only same project — unknown project on either side is not evidence.
+      const bothPresent = Boolean(sourceProject && existingProject);
+      if (!bothPresent || sourceProject !== existingProject) continue;
+      const statsTarget = stats || emptyTaskDeduplicationStats();
+      const flagTask = (options.intraBatch || candidate.generatedTask) ? task : Object.assign({}, task, { id: "" });
+      flagPossibleDuplicateTask(statsTarget, flagTask, {
+        id: candidate.generatedTask ? "" : (candidate.id || existing.id || ""),
+        candidate: { task: existing, generatedTask: candidate.generatedTask || undefined },
+        confidence: 0,
+        reasons: ["same canonical title while semantic dedupe state unavailable; review in Todoist"]
+      }, settings, options);
+      if (!stats) options.dedupeStats = statsTarget;
+      return {
+        decision: "create",
+        outcome: "create",
+        confidence: 0,
+        reasons: ["semantic dedupe state unavailable; canonical-title candidate flagged for review"],
+        candidate: null,
+        degraded: true,
+        degradedReason: "semantic-dedupe-state-unavailable",
+        sourceTask: task
+      };
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
 }
 
 const TASK_DEDUPE_SCOPE_IDENTIFIER_IGNORES = new Set(["ASAP", "FYI", "TODO"]);

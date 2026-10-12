@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
-    "test": "node -e \"const fs=require('fs'),path=require('path'),{spawnSync}=require('child_process'); const files=fs.readdirSync('scripts').filter(f=>f.match(/-test\\.js$/) && !f.includes("benchmark") && !f.includes("model-quality") && !f.includes("prepare-model-quality") && !f.includes("merge-model-quality") && !f.includes("semantic-responsiveness")); let ok=true; files.forEach(f=>{const r=spawnSync('node',[path.join('scripts',f)],{encoding:'utf8',stdio:'inherit'}); if(r.status!==0){console.log('FAIL: '+f); ok=false;}}); if(!ok) process.exit(1); console.log('All '+files.length+' tests passed');\""
+    "test": "node scripts/run-tests.js"
   },
   "devDependencies": {
     "esbuild": "^0.28.2"

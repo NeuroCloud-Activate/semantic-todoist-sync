@@ -3,7 +3,7 @@
 ## Rules
 1. Built `main.js` is never hand-edited or hand-merged: on any conflict in it, resolve `src/` and run `npm.cmd run build`.
 2. Every edit to `src/main.js` is tagged with `// writing-mode:` and appended to this ledger.
-3. `npm test` runs `scripts/*-test.js` (excluding benchmark/model-quality tool scripts). Any pre-existing failures are recorded, not fixed.
+3. `npm test` runs `scripts/run-tests.js`, which executes every `scripts/*-test.js` sequentially. Any pre-existing failures are recorded, not fixed.
 
 ## Rename commit
 `3adc3f9f653c0c312bfb0509ff4b1429e1e8489d` — `refactor: move main.js to src/main.js (rename only)` (100% similarity).
@@ -15,6 +15,7 @@
 - `esbuild.config.mjs`
 - `docs/writing-mode/MERGE-LEDGER.md`
 - `docs/writing-mode/baseline-tests.txt`
+- `scripts/run-tests.js` (new `npm test` runner)
 
 ## Test changes (Fix round 1 — source-reading tests point at src/main.js)
 Rule: source-reading tests target `src/main.js`; `require()` tests target built `main.js`.
@@ -45,7 +46,25 @@ Key pre-existing failures: openwebui-carrier-recovery-local-test, provider-embed
 - `makeWorkerSource()` serializes `cosine.toString()` correctly into worker source (sanity-checked via `semantic-score-worker-pool-test.js` — all 7 cases PASS).
 - `semantic-score-routing-parity-test.js` and `semantic-score-worker-pool-test.js` run successfully against the source (`src/main.js`).
 - `npm test` against built `main.js` shows identical pre-existing failures plus one NEW failure: `task-selected-note-materiality-test.js` (`ReferenceError: taskWorkflowContextBundle is not defined`). This is caused by esbuild bundle dead-code elimination removing the internal `taskWorkflowContextBundle` variable (used only by tests that inject code into the module scope). Not fixable without editing `src/main.js` (e.g., adding a reference or disabling bundle DCE, which violates spec). Reported BLOCKED.
-- `model-quality-benchmark-local-test.js` is excluded from `npm test` (benchmark tool, not test).
+- `model-quality-benchmark-local-test.js` included by suffix filter; FAIL (`Error: Production provider focus helpers are unavailable from main.js.`) — same pre-existing reason, not excluded by new runner.
+
+## Actual `npm test` results (Fix round 2 — real `node scripts/run-tests.js`)
+PASS: index-compatibility-local-test.js
+PASS: semantic-decoration-yield-test.js
+PASS: semantic-score-worker-pool-test.js (7 cases PASS)
+PASS: settings-migration-local-test.js
+PASS: task-checkbox-source-contract-test.js
+PASS: task-description-sync-preservation-test.js
+PASS: task-field-completion-test.js
+PASS: task-metadata-only-evidence-test.js
+PASS: task-reference-corpus-integrity-local-test.js
+PASS: task-section-marker-ampersand-test.js
+PASS: task-selected-note-materiality-test.js
+PASS: web-research-local-test.js
+FAIL (pre-existing): openwebui-carrier-recovery-local-test.js, provider-embedding-local-test.js, provider-generation-local-test.js, provider-registry-local-test.js, provider-settings-local-test.js, semantic-score-routing-parity-test.js, stable-core-characterization-local-test.js, task-metadata-planning-instructions-test.js, task-primary-evidence-preservation-test.js
+FAIL (same pre-existing reason, now included by suffix filter): model-quality-benchmark-local-test.js (`Production provider focus helpers are unavailable from main.js.`)
+Excluded (not `-test.js` suffix): model-quality-benchmark.js, merge-model-quality-runs.js, prepare-model-quality-judging.js, semantic-responsiveness-benchmark.js
+Summary: 12 PASS, 10 FAIL (9 same pre-existing + 1 included benchmark-local-test)
 
 ## Built size vs target
 Built `main.js`: 2,262,503 bytes (< 3,152,600 bytes target) — OK.

@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const Module = require("node:module");
 const path = require("node:path");
 
-const mainPath = path.join(__dirname, "..", "main.js");
+const mainPath = path.join(__dirname, "..", "src/main.js");
 const mainSource = fs.readFileSync(mainPath, "utf8");
 const testModule = new Module(mainPath, module);
 testModule.filename = mainPath;

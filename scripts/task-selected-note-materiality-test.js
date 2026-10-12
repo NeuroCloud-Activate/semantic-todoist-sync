@@ -8,7 +8,7 @@ const path = require("node:path");
 // Append test-only exports to a fresh copy so this harness exercises the real
 // private projection, materiality, and validator functions without changing
 // main.js or exposing test seams in the plugin API.
-const mainPath = path.join(__dirname, "..", "main.js");
+const mainPath = path.join(__dirname, "..", "src/main.js");
 const mainSource = fs.readFileSync(mainPath, "utf8");
 const testModule = new Module(mainPath, module);
 testModule.filename = mainPath;

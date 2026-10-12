@@ -41,7 +41,7 @@ Module._load = function (request, parent, isMain) {
 };
 
 function loadActualFns() {
-  const mainPath = path.join(__dirname, "..", "main.js");
+  const mainPath = path.join(__dirname, "..", "src/main.js");
   const src = fs.readFileSync(mainPath, "utf8");
   const probe = "\n;module.exports.__sectionAmpersandProbe = { parseTaskLine, extractSection, extractTaskContent, todoistArgsFromParsedTask, taskPriorityForTodoist, taskLabelsForTodoist, removeSectionMarker, setSectionMarker, taskSyntaxMarkerIndexes };";
   const tmp = path.join(os.tmpdir(), "stsync-main-probe-" + Date.now() + "-" + process.pid + ".js");

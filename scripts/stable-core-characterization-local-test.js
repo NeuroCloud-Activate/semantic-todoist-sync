@@ -148,7 +148,7 @@ function main() {
     // Resolve argv[2] to an absolute path; default stays inside the repo root.
     const mainJsPath = process.argv[2]
       ? path.resolve(process.argv[2])
-      : path.join(REPO_ROOT, 'main.js');
+      : path.join(REPO_ROOT, 'src/main.js');
     const { buf } = readBuffer(mainJsPath);
     push('syntax:main.js', mainSyntaxValid(buf), buf.length > 0 ? `compiled ${buf.length}B` : 'empty');
 

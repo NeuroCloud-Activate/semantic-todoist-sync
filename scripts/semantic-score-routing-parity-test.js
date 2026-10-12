@@ -12,7 +12,7 @@ const path = require("path");
 
 const root = path.resolve(__dirname, "..");
 const baselinePath = process.env.SEMANTIC_SCORE_BASELINE_MAIN ? path.resolve(process.env.SEMANTIC_SCORE_BASELINE_MAIN) : "";
-const candidatePath = path.join(root, "main.js");
+const candidatePath = path.join(root, "src/main.js");
 const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
   if (request !== "obsidian") return originalLoad.call(this, request, parent, isMain);

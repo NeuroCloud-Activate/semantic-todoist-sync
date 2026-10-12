@@ -16,9 +16,21 @@
 - `docs/writing-mode/MERGE-LEDGER.md`
 - `docs/writing-mode/baseline-tests.txt`
 
-## Test changes
-- `scripts/provider-settings-local-test.js`: repointed `main.js` → `src/main.js` (lines 88-89)
-- `scripts/semantic-score-worker-pool-test.js`: repointed `main.js` → `src/main.js` (lines 8-9)
+## Test changes (Fix round 1 — source-reading tests point at src/main.js)
+Rule: source-reading tests target `src/main.js`; `require()` tests target built `main.js`.
+- `scripts/task-selected-note-materiality-test.js`: line 11 `mainPath` → `src/main.js`
+- `scripts/task-metadata-planning-instructions-test.js`: line 8 `mainPath` → `src/main.js`
+- `scripts/task-description-sync-preservation-test.js`: line 12 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-metadata-only-evidence-test.js`: line 12 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-primary-evidence-preservation-test.js`: line 13 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-section-marker-ampersand-test.js`: line 44 `mainPath` → `src/main.js`
+- `scripts/semantic-decoration-yield-test.js`: line 9 `candidatePath` → `src/main.js`
+- `scripts/semantic-score-routing-parity-test.js`: line 15 `candidatePath` → `src/main.js`
+- `scripts/stable-core-characterization-local-test.js`: line 151 default `mainJsPath` → `src/main.js`; hash gate NOT updated (pre-existing hash failure preserved)
+
+Prior (Task 1) test changes:
+- `scripts/provider-settings-local-test.js`: line 89
+- `scripts/semantic-score-worker-pool-test.js`: lines 8-9
 
 ## Source edits (`src/main.js`)
 None in this task (rename only, no `// writing-mode:` edits).

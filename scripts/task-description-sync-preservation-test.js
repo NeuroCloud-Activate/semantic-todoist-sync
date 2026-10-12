@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const Module = require("node:module");
 const path = require("node:path");
 
-const mainPath = path.join(__dirname, "..", "main.js");
+const mainPath = path.join(__dirname, "..", "src/main.js");
 const sourcePath = process.env.STSYNC_TEST_MAIN_SOURCE || mainPath;
 const mainSource = fs.readFileSync(sourcePath, "utf8");
 const testModule = new Module(mainPath, module);

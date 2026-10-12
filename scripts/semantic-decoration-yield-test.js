@@ -6,7 +6,7 @@ const Module = require("module");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
-const candidatePath = path.join(root, "main.js");
+const candidatePath = path.join(root, "src/main.js");
 const baselinePath = process.env.SEMANTIC_DECORATION_BASELINE_MAIN
   ? path.resolve(process.env.SEMANTIC_DECORATION_BASELINE_MAIN)
   : "";

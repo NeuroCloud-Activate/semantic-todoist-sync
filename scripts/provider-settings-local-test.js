@@ -85,8 +85,8 @@ Module._load = function (request, parent, isMain) {
 global.window = { setTimeout, clearTimeout, requestIdleCallback: null };
 global.fetch = async () => { throw new Error('network disabled'); };
 
-const Plugin = require(path.join(__dirname, '..', 'main.js'));
-const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+const Plugin = require(path.join(__dirname, '..', 'src', 'main.js'));
+const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 const styles = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
 const requestCounter = { get count() { return networkCount; } };
 

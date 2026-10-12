@@ -5,8 +5,8 @@ const vm = require('node:vm');
 const { Worker: ThreadWorker } = require('node:worker_threads');
 
 const root = path.resolve(__dirname, '..');
-const fragmentPath = path.join(root, 'main.js');
-const mainSource = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+const fragmentPath = path.join(root, 'src/main.js');
+const mainSource = fs.readFileSync(path.join(root, 'src/main.js'), 'utf8');
 const helperStart = mainSource.indexOf('function createSemanticScoreWorkerPool(');
 const helperEnd = mainSource.indexOf('\nfunction cosine(', helperStart);
 assert.ok(helperStart >= 0 && helperEnd > helperStart, 'main.js must provide the score worker pool');

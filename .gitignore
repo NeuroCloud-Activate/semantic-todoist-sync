@@ -54,8 +54,6 @@ liveness/
 .opencode/codebase-index.json
 .merge_file_*
 opencode.json
-package.json
-package-lock.json
 script-live-results.json
 task-generation-live-result.json
 *.log

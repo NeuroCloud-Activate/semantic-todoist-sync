@@ -1,4 +1,16 @@
 # Changelog
+## 0.9.19 - 2026-10-12
+
+### Improved
+- **Faster searches.** Searching your notes now takes about half as long on a large vault (about 98 ms down to about 55 ms per search across our 4,376-passage test vault), with identical results: all 120 test searches returned exactly the same notes in the same order as before.
+- **Startup no longer waits for search preparation.** The search lookup data that used to be rebuilt while the plugin loaded is now prepared in the background; the first search simply waits for it if it is not ready yet. Saved files are byte-for-byte unchanged, so nothing is re-indexed.
+
+### Changed
+- **Internal cleanup (no feature changes).** About 300 lines of unused or repeated code were removed, and several internal caches were made stricter so a changed note can never be served a stale answer.
+
+### Notes
+- This build was checked in a live Obsidian session against a scratch copy of the test vault: it loaded, searched, and rebuilt its background search data without errors. A trial of a different way of phrasing search queries for the embedding model was measured and not included, because it did not clearly improve accuracy.
+
 ## 0.9.18 - 2026-10-09
 
 ### Added

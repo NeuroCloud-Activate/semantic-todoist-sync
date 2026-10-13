@@ -76,7 +76,7 @@ function rewriteCitations(markdown, evidence, noteText) {
   }
 
   const src = typeof markdown === "string" ? markdown : "";
-  const out = src.replace(/\[((?:E\d+\s*(?:,\s*E\d+\s*)*))\]/g, (match, inner) => {
+  const out = src.replace(/( ?)\[((?:E\d+\s*(?:,\s*E\d+\s*)*))\]( ?)/g, (match, pre, inner, post) => {
     const eids = inner
       .split(",")
       .map((s) => s.trim())
@@ -86,8 +86,8 @@ function rewriteCitations(markdown, evidence, noteText) {
       if (byEid.has(eid)) known.push(eid);
       else dropped += 1;
     }
-    if (known.length === 0) return "";
-    return known.map((eid) => "[^" + numFor(eid) + "]").join("");
+    if (known.length === 0) return pre && post ? " " : "";
+    return pre + known.map((eid) => "[^" + numFor(eid) + "]").join("") + post;
   });
 
   const ordered = Array.from(numByEid.entries()).sort((a, b) => a[1] - b[1]);

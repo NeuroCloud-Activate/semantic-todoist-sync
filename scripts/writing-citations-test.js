@@ -175,4 +175,54 @@ function ev(eid, source) {
   console.log("PASS insertDraft once with composed text");
 }
 
-process.stdout.write(JSON.stringify({ passed: 10, failed: 0 }, null, 2) + "\n");
+// 11: planInsertion falls back to cursor when posToOffset throws (deleted lines)
+{
+  const editor = {
+    getValue: () => "hello",
+    posToOffset: () => { throw new Error("position no longer exists"); },
+    getCursor: () => ({ line: 0, ch: 2 }),
+  };
+  const recorded = { path: "Note.md", from: { line: 5, ch: 0 }, to: { line: 5, ch: 0 }, prefix: "0123456789".repeat(4) };
+  let plan;
+  assert.doesNotThrow(() => { plan = planInsertion(editor, recorded, "Note.md"); }, "must never throw");
+  assert.strictEqual(plan.mode, "cursor", "throw -> cursor");
+  assert.deepStrictEqual(plan.from, { line: 0, ch: 2 }, "cursor from");
+  assert.deepStrictEqual(plan.to, { line: 0, ch: 2 }, "cursor to");
+  assert.ok(typeof plan.notice === "string" && plan.notice.length > 0, "notice present");
+  console.log("PASS planInsertion posToOffset throw -> cursor");
+}
+
+// 12: planInsertion falls back to cursor when recorded offset exceeds document length
+{
+  const editor = {
+    getValue: () => "hi",
+    posToOffset: () => 999,
+    getCursor: () => ({ line: 0, ch: 1 }),
+  };
+  const recorded = { path: "Note.md", from: { line: 0, ch: 999 }, to: { line: 0, ch: 999 }, prefix: "0123456789".repeat(4) };
+  let plan;
+  assert.doesNotThrow(() => { plan = planInsertion(editor, recorded, "Note.md"); }, "must never throw");
+  assert.strictEqual(plan.mode, "cursor", "out-of-range offset -> cursor");
+  assert.deepStrictEqual(plan.from, { line: 0, ch: 1 }, "cursor from");
+  assert.deepStrictEqual(plan.to, { line: 0, ch: 1 }, "cursor to");
+  assert.ok(typeof plan.notice === "string" && plan.notice.length > 0, "notice present");
+  console.log("PASS planInsertion out-of-range offset -> cursor");
+}
+
+// 13: composeDraft empty/whitespace body returns footnotes only; empty footnotes returns body only
+{
+  assert.strictEqual(composeDraft("", "[^1]: x"), "[^1]: x", "empty body -> footnotes only");
+  assert.strictEqual(composeDraft("   \n  ", "[^1]: x"), "[^1]: x", "whitespace body -> footnotes only");
+  assert.strictEqual(composeDraft("body", "   "), "body", "whitespace footnotes -> body only");
+  console.log("PASS composeDraft empty-body and empty-footnotes edges");
+}
+
+// 14: removing an unknown eid eats one adjacent space (no double space)
+{
+  const r = rewriteCitations("a [E9] b", [], "");
+  assert.strictEqual(r.markdown, "a b", "no double space left behind");
+  assert.strictEqual(r.dropped, 1, "dropped === 1");
+  console.log("PASS unknown eid leaves single space");
+}
+
+process.stdout.write(JSON.stringify({ passed: 14, failed: 0 }, null, 2) + "\n");

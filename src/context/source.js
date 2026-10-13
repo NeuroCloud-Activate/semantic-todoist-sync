@@ -161,7 +161,8 @@ async function listExternalFiles(root) {
     for (const entry of entries) {
       if (entry.name.startsWith(".")) continue;
       const full = path.join(dir, entry.name);
-      // Dirent.isDirectory() is false for symlinks, so recursion never follows them.
+      // Dirent.isDirectory() is false for symlinks, so listing never follows them
+      // (readContextFile still resolves realpath below, since stat/readFile follow links).
       if (entry.isDirectory()) {
         queue.push(full);
       } else if (entry.isFile()) {
@@ -199,9 +200,22 @@ async function readContextFile(rootInfo, app, id) {
     const resolved = path.resolve(id);
     const rel = path.relative(resolvedRoot, resolved);
     if (rel.split(/[\\/]/)[0] === ".." || path.isAbsolute(rel)) throw outsideRootError(id);
+    // stat/readFile follow symlinks, so re-check containment on real paths
+    // (covers a link inside the root pointing outside, or a symlinked parent dir).
+    let realResolved;
+    try {
+      const realRoot = await fsp.realpath(resolvedRoot);
+      realResolved = await fsp.realpath(resolved);
+      const realRel = path.relative(realRoot, realResolved);
+      if (realRel.split(/[\\/]/)[0] === ".." || path.isAbsolute(realRel)) throw outsideRootError(id);
+    } catch (err) {
+      if (err && err.code === "outside-context-root") throw err;
+      if (err && err.code === "ENOENT") throw notFoundError(id);
+      throw err;
+    }
     let st;
     try {
-      st = await fsp.stat(resolved);
+      st = await fsp.stat(realResolved);
     } catch (err) {
       if (err && err.code === "ENOENT") throw notFoundError(id);
       throw err;
@@ -212,7 +226,7 @@ async function readContextFile(rootInfo, app, id) {
     }
     let buf;
     try {
-      buf = await fsp.readFile(resolved);
+      buf = await fsp.readFile(realResolved);
     } catch (err) {
       if (err && err.code === "ENOENT") throw notFoundError(id);
       throw err;
@@ -224,7 +238,12 @@ async function readContextFile(rootInfo, app, id) {
   if (!normId.startsWith(`${vaultRoot}/`) || normId.split("/").includes("..")) {
     throw outsideRootError(id);
   }
-  const st = await app.vault.adapter.stat(id);
+  let st;
+  try {
+    st = await app.vault.adapter.stat(id);
+  } catch (err) {
+    throw notFoundError(id);
+  }
   if (!st || st.type === "folder") throw notFoundError(id);
   if (st.size > MAX_CONTEXT_FILE_BYTES) {
     throw new Error(`context file too-large: ${id}`);

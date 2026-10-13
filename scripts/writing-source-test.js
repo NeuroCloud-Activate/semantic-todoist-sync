@@ -307,7 +307,47 @@ function bufToString(ab) {
     console.log("PASS missing files report not-found");
   }
 
-  process.stdout.write(JSON.stringify({ passed: 12, failed: 0 }) + "\n");
+  // 13. symlink inside the external root pointing outside is rejected
+  {
+    const dir = await makeTempDir("writing-source-ext-link-");
+    const outsideDir = await makeTempDir("writing-source-ext-link-outside-");
+    const target = nodePath.join(outsideDir, "secret.md");
+    await fs.writeFile(target, "secret");
+    const link = nodePath.join(dir, "link.md");
+    let linked = false;
+    try {
+      await fs.symlink(target, link, "file");
+      linked = true;
+    } catch (err) {
+      if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+        console.log("SKIP symlink (EPERM)");
+      } else {
+        throw err;
+      }
+    }
+    if (linked) {
+      await assert.rejects(
+        source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), link),
+        (err) => err && err.code === "outside-context-root",
+        "symlink escaping the root must be rejected"
+      );
+      console.log("PASS symlink inside external root pointing outside is rejected");
+    }
+  }
+
+  // 14. vault adapter stat throwing yields not-found
+  {
+    const throwingApp = { vault: { adapter: { async stat() { throw new Error("boom"); } } } };
+    const rootInfo = await source.resolveContextRoot(throwingApp, {}, { isDesktop: true });
+    await assert.rejects(
+      source.readContextFile(rootInfo, throwingApp, "Writing Context/a.md"),
+      (err) => err && err.code === "not-found",
+      "vault stat throw must yield not-found"
+    );
+    console.log("PASS vault adapter stat throw yields not-found");
+  }
+
+  process.stdout.write(JSON.stringify({ passed: 14, failed: 0 }) + "\n");
 })().catch((err) => {
   console.error("FAIL writing-source-test:", err && err.message ? err.message : err);
   process.exit(1);

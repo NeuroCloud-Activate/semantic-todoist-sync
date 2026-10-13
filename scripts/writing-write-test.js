@@ -343,6 +343,56 @@ async function main() {
     console.log("PASS fix 2 body tags neutralised (lower + upper case) with exactly 1 open/1 close");
   }
 
+  // Task 9 fix — vault index unavailable: vault skipped, prompt names it NOT searched, result.searched.vault is false.
+  {
+    const plugin = makeStub({ vault: 8, context: 2, modelText: "draft" });
+    plugin.vaultIndexStatus = async () => ({ ready: false, reason: "semantic-index-no-validated-generation" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(plugin.calls.includes("retrieve"), false, "no vault retrieval when index unavailable");
+    assert.strictEqual(result.searched.vault, false, "searched.vault false");
+    assert.strictEqual(result.searched.context, true, "context still searched");
+    assert.strictEqual(result.searched.vaultReason, "semantic-index-no-validated-generation", "reason carried");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- vault: NOT searched"), "prompt marks vault NOT searched");
+    assert.ok(userPrompt.includes("semantic-index-no-validated-generation"), "prompt carries the reason");
+    assert.ok(!userPrompt.includes("No evidence was found in the vault or context folder."), "no blanket vault claim");
+    assert.ok(plugin.captured.request.system.includes("only for sources that were searched"), "system rule limits gaps to searched sources");
+    console.log("PASS task 9 vault unavailable skips vault and marks it NOT searched");
+  }
+
+  // Task 9 fix — vault ready (explicit status): both sources searched.
+  {
+    const plugin = makeStub({ vault: 1, context: 1, modelText: "draft" });
+    plugin.vaultIndexStatus = async () => ({ ready: true });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.searched.vault, true, "searched.vault true");
+    assert.ok(plugin.captured.request.user.includes("- vault: searched"), "prompt marks vault searched");
+    assert.ok(plugin.captured.request.user.includes("- context folder: searched"), "prompt marks context searched");
+    console.log("PASS task 9 vault ready searches both sources");
+  }
+
+  // Task 9 fix — zero evidence with vault unavailable names only the searched source.
+  {
+    const plugin = makeStub({ vault: 0, context: 0, modelText: "nothing found" });
+    plugin.vaultIndexStatus = async () => ({ ready: false, reason: "semantic-index-read-failed" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "brief", active: ACTIVE });
+    assert.ok(plugin.captured.request.user.includes("No evidence was found in the context folder."), "fallback names only the searched source");
+    assert.ok(!plugin.captured.request.user.includes("in the vault or context folder"), "fallback never claims the vault");
+    assert.strictEqual(result.evidenceCount, 0);
+    console.log("PASS task 9 zero evidence with vault down names only searched sources");
+  }
+
+  // Task 9 fix — empty context store: vault evidence kept, context still marked searched.
+  {
+    const plugin = makeStub({ vault: 2, context: 0, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.searched.context, true, "context marked searched even when empty");
+    assert.strictEqual(result.searched.vault, true, "vault searched");
+    assert.strictEqual(result.evidenceCount, 2, "vault-only evidence");
+    assert.ok(plugin.captured.request.user.includes("- context folder: searched"), "prompt notes context searched");
+    console.log("PASS task 9 empty context store still marked searched");
+  }
+
   console.log("writing-write-test: PASS");
 }
 

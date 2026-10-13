@@ -40,7 +40,7 @@ Prior (Task 1) test changes:
 - `scripts/semantic-score-worker-pool-test.js`: lines 8-9
 
 ## Source edits (`src/main.js`)
-Exactly 45 `// writing-mode:` tags; table rows = 45; tag count = 45; no untagged edit hunks found (diff `a62bfb4:main.js` â†’ `HEAD:src/main.js` contains 45 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
+Exactly 47 `// writing-mode:` tags; table rows = 47; tag count = 47; no untagged edit hunks found (diff `a62bfb4:main.js` â†’ `HEAD:src/main.js` contains 47 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
 
 | # | task | function / location (current line) | change | why |
 |---|------|-----------------------------------|--------|-----|
@@ -56,39 +56,41 @@ Exactly 45 `// writing-mode:` tags; table rows = 45; tag count = 45; no untagged
 | 10 | 5 fix 1 | `describeImage` (line 13890) | Size guard: `byteLength > 20 * 1024 * 1024` throws `image-too-large` before encoding | 20 MB cap enforced at entry; never silently dropped |
 | 11 | 5 fix 1 | `describeImage` (line 13903) | Passes `system: "You extract research evidence from images."` | Responses-API `input_text` always carries string text |
 | 12 | 7 | `getContextStore` (line 13909) | New lazy `ContextStore` at `${manifest.dir}/context-index.json`; loaded once per `semanticEmbeddingIdentity`; includes `describeImage` unless `writingDescribeImages === false` | Separate store for Write mode; lazy `require` keeps mobile startup clean |
-| 13 | 7 | `writeWithEvidence` (line 13939) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays stub-friendly seam; orchestration in module |
-| 14 | 7 fix 1 | `searchWebForWriting` (line 13950) | New exposed plugin method: `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` with no throw | Controller ruling: keep web-search toggle; stub-testable |
-| 15 | 7 | `rescanContextFolder` (line 13963) | Resolves root, ensures vault folder, surfaces root `notice`, syncs, then `Notice` with counted added/changed/removed/skipped | Manual rescan command body |
-| 16 | 5 | `openaiResponse` (line 13974) | New optional `images = null` param | Carries image inputs through shared path |
-| 17 | 5 | `openaiResponse` (line 13981) | `const imageInputs = writingImageInputs(images)` | Normalizes once; `[]` keeps existing text bodies byte-identical |
-| 18 | 5 | `openaiResponse` (line 14028) | Dispatch passes `images: imageInputs` to all four provider methods; retry reuses same closure | Images survive retry without being dropped |
-| 19 | 5 | `openAiCompatibleResponse` (line 14098) | New optional `images = null` param | OpenRouter / Open WebUI / custom OpenAI image input |
-| 20 | 5 | `openAiCompatibleResponse` (line 14107) | `messages` wrapped in `openAiCompatibleVisionMessages(..., images)`; appends `image_url` parts only when non-empty | Helper untouched when empty |
-| 21 | 5 | `openAiCompatibleResponse` (line 14146) | Hint-retry rebuild also wrapped in `openAiCompatibleVisionMessages` | Images survive hint retry |
-| 22 | 5 | `openaiProviderResponse` (line 14226) | New optional `images = null` param | OpenAI Responses-API image input |
-| 23 | 5 | `openaiProviderResponse` (line 14245) | `userContent.push({ type: "input_image", image_url: ... })` per image; no-op when empty | Responses-API shape; retry copies body so images persist |
-| 24 | 5 | `anthropicResponse` (line 14377) | New optional `images = null` param | Anthropic image input |
-| 25 | 5 | `anthropicResponse` (line 14403) | `if (images && images.length) userContent = anthropicVisionContent(...)` | Appends base64 `image` blocks; skipped for text |
-| 26 | 5 | `anthropicResponse` (line 14445) | Hint-retry rebuild uses `anthropicVisionContent(String(user||""), userText, images)` | Images survive plain-message retry |
-| 27 | 5 | `geminiResponse` (line 14516) | New optional `images = null` param | Gemini image input |
-| 28 | 5 | `geminiResponse` (line 14534) | `parts: geminiVisionParts([{ text: geminiUser }], images)`; appends `inline_data` when non-empty | Untouched when empty |
-| 29 | 5 | `geminiResponse` (line 14558) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
-| 30 | 8 | `SemanticTodoistView.render()` (line 21701) | Mode `<select>` (`Chat`/`Write`) in `actionRow`; bound to `plugin.settings.sidebarMode`; `onchange` saves and re-renders | User switches Chat â†” Write |
-| 31 | 8 fix 1 | `SemanticTodoistView.render()` (line 21728) | `this.askButton = askButton` stored on instance | Enables in-flight disable/restore from `write()` |
-| 32 | 8 fix 1 | `SemanticTodoistView.render()` (line 21730) | `onclick` reads `this.plugin.settings.sidebarMode` at click time instead of captured `mode` | Mode switch without re-render uses correct handler |
-| 33 | 8 | `SemanticTodoistView.render()` (line 21735) | Length `<select>` (`Brief`/`Standard`/`Detailed`) shown only when `mode === "write"`; not persisted | Length choice for Write drafts |
-| 34 | 8 | `SemanticTodoistView.write()` (line 21779) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; uses `planInsertion`/`insertDraft`/`composeDraft`; shows `Writingâ€¦` status; error shows nothing inserted; no open note shows "Open a note to write into."; closed note shows draft with Insert button; sources rendered; notices for `plan.notice` and `dropped > 0` | Main Write-mode entry point |
-| 35 | 8 fix 1 | `SemanticTodoistView.write()` (line 21787) | `if (this.writing) return;` guard; disables button and label `"Writingâ€¦"`; `finally` restores `this.writing = false`, re-enables, restores label from current settings | Prevents double submit; button state restored on error |
-| 36 | 8 fix 1 | `SemanticTodoistView.write()` (line 21794) | `recorded` uses exact line/ch + prefix; `active` carries `path`, `text`, `selection`, `cursorOffset` | Prevents insertion into wrong position during generation |
-| 37 | 8 fix 1 | `SemanticTodoistView.write()` (line 21830) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when available; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
-| 38 | 8 fix 2 | `SemanticTodoistView.write()` (line 21901, finally block) | `finally` restores `this.writing = false`, re-enables the button and restores its label from the current `sidebarMode` | Button never stays disabled after success or error |
-| 39 | 8 fix 2 | `SemanticTodoistView.write()` (line 21913, outer catch) | Same restore (flag, button, label) in the outer catch, which also covers exceptions thrown before the inner `try` | A pre-await failure (e.g. active-view lookup) can't leave Write stuck |
-| 40 | 8 fix 1 | `renderDraftForInsert()` (line 21924) | Captures `originalPath` and `originalName` for insert check | Original draft file tracked for insertion guard |
-| 41 | 8 fix 1 | `renderDraftForInsert()` (line 21938) | Active note comparison uses `originalPath`; insertion blocked on mismatch with clear notice | Same file → insert; different → notice only |
-| 42 | 8 | `SemanticTodoistSettingTab.render()` (line 22518) | New `Writing` settings section: `writingContextFolder` text field, `writingDescribeImages` toggle, `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
-| 43 | 7 | Module scope `writingIsAbsoluteContextPath` / `writingPathInContextFolder` (line 30231) | New `writingIsAbsoluteContextPath` and vault-relative `writingPathInContextFolder`; regex-free (esbuild 0.28 parse safe) | Shared index exclusion check; avoids `/`-in-class literal break |
-| 44 | 7 fix 1 | `writingPathInContextFolder` (line 30244) | `vaultBasePath` param; absolute configured path inside vault converted to vault-relative folder; absolute outside vault excludes nothing (`false`) | Controller ruling: absolute config matches vault or excludes nothing |
-| 45 | 5 | Module scope vision helpers (line 30266) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
+| 13 | 9 | `vaultIndexStatus` (line 13939) | Returns `{ ready:false, reason }` from `semanticIndexLoadFailure`/`semanticIndexLoaded`, else `{ ready:true }` | Write evidence skips the vault only when the status bar shows Load failed |
+| 14 | 7 | `writeWithEvidence` (line 13946) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays stub-friendly seam; orchestration in module |
+| 15 | 7 fix 1 | `searchWebForWriting` (line 13957) | New exposed plugin method: `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` with no throw | Controller ruling: keep web-search toggle; stub-testable |
+| 16 | 7 | `rescanContextFolder` (line 13970) | Resolves root, ensures vault folder, surfaces root `notice`, syncs, then `Notice` with counted added/changed/removed/skipped | Manual rescan command body |
+| 17 | 5 | `openaiResponse` (line 13981) | New optional `images = null` param | Carries image inputs through shared path |
+| 18 | 5 | `openaiResponse` (line 13988) | `const imageInputs = writingImageInputs(images)` | Normalizes once; `[]` keeps existing text bodies byte-identical |
+| 19 | 5 | `openaiResponse` (line 14035) | Dispatch passes `images: imageInputs` to all four provider methods; retry reuses same closure | Images survive retry without being dropped |
+| 20 | 5 | `openAiCompatibleResponse` (line 14105) | New optional `images = null` param | OpenRouter / Open WebUI / custom OpenAI image input |
+| 21 | 5 | `openAiCompatibleResponse` (line 14114) | `messages` wrapped in `openAiCompatibleVisionMessages(..., images)`; appends `image_url` parts only when non-empty | Helper untouched when empty |
+| 22 | 5 | `openAiCompatibleResponse` (line 14153) | Hint-retry rebuild also wrapped in `openAiCompatibleVisionMessages` | Images survive hint retry |
+| 23 | 5 | `openaiProviderResponse` (line 14233) | New optional `images = null` param | OpenAI Responses-API image input |
+| 24 | 5 | `openaiProviderResponse` (line 14252) | `userContent.push({ type: "input_image", image_url: ... })` per image; no-op when empty | Responses-API shape; retry copies body so images persist |
+| 25 | 5 | `anthropicResponse` (line 14384) | New optional `images = null` param | Anthropic image input |
+| 26 | 5 | `anthropicResponse` (line 14410) | `if (images && images.length) userContent = anthropicVisionContent(...)` | Appends base64 `image` blocks; skipped for text |
+| 27 | 5 | `anthropicResponse` (line 14452) | Hint-retry rebuild uses `anthropicVisionContent(String(user||""), userText, images)` | Images survive plain-message retry |
+| 28 | 5 | `geminiResponse` (line 14523) | New optional `images = null` param | Gemini image input |
+| 29 | 5 | `geminiResponse` (line 14541) | `parts: geminiVisionParts([{ text: geminiUser }], images)`; appends `inline_data` when non-empty | Untouched when empty |
+| 30 | 5 | `geminiResponse` (line 14565) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
+| 31 | 8 | `SemanticTodoistView.render()` (line 21708) | Mode `<select>` (`Chat`/`Write`) in `actionRow`; bound to `plugin.settings.sidebarMode`; `onchange` saves and re-renders | User switches Chat â†” Write |
+| 32 | 8 fix 1 | `SemanticTodoistView.render()` (line 21735) | `this.askButton = askButton` stored on instance | Enables in-flight disable/restore from `write()` |
+| 33 | 8 fix 1 | `SemanticTodoistView.render()` (line 21737) | `onclick` reads `this.plugin.settings.sidebarMode` at click time instead of captured `mode` | Mode switch without re-render uses correct handler |
+| 34 | 8 | `SemanticTodoistView.render()` (line 21742) | Length `<select>` (`Brief`/`Standard`/`Detailed`) shown only when `mode === "write"`; not persisted | Length choice for Write drafts |
+| 35 | 8 | `SemanticTodoistView.write()` (line 21786) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; uses `planInsertion`/`insertDraft`/`composeDraft`; shows `Writingâ€¦` status; error shows nothing inserted; no open note shows "Open a note to write into."; closed note shows draft with Insert button; sources rendered; notices for `plan.notice` and `dropped > 0` | Main Write-mode entry point |
+| 36 | 8 fix 1 | `SemanticTodoistView.write()` (line 21794) | `if (this.writing) return;` guard; disables button and label `"Writingâ€¦"`; `finally` restores `this.writing = false`, re-enables, restores label from current settings | Prevents double submit; button state restored on error |
+| 37 | 8 fix 1 | `SemanticTodoistView.write()` (line 21801) | `recorded` uses exact line/ch + prefix; `active` carries `path`, `text`, `selection`, `cursorOffset` | Prevents insertion into wrong position during generation |
+| 38 | 8 fix 1 | `SemanticTodoistView.write()` (line 21837) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when available; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
+| 39 | 9 | `SemanticTodoistView.write()` (line 21897) | `Notice("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence.")` when `result.searched.vault === false` | User is told Write searched the context folder only |
+| 40 | 8 fix 2 | `SemanticTodoistView.write()` (line 21912, finally block) | `finally` restores `this.writing = false`, re-enables the button and restores its label from the current `sidebarMode` | Button never stays disabled after success or error |
+| 41 | 8 fix 2 | `SemanticTodoistView.write()` (line 21924, outer catch) | Same restore (flag, button, label) in the outer catch, which also covers exceptions thrown before the inner `try` | A pre-await failure (e.g. active-view lookup) can't leave Write stuck |
+| 42 | 8 fix 1 | `renderDraftForInsert()` (line 21935) | Captures `originalPath` and `originalName` for insert check | Original draft file tracked for insertion guard |
+| 43 | 8 fix 1 | `renderDraftForInsert()` (line 21949) | Active note comparison uses `originalPath`; insertion blocked on mismatch with clear notice | Same file → insert; different → notice only |
+| 44 | 8 | `SemanticTodoistSettingTab.render()` (line 22529) | New `Writing` settings section: `writingContextFolder` text field, `writingDescribeImages` toggle, `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
+| 45 | 7 | Module scope `writingIsAbsoluteContextPath` / `writingPathInContextFolder` (line 30242) | New `writingIsAbsoluteContextPath` and vault-relative `writingPathInContextFolder`; regex-free (esbuild 0.28 parse safe) | Shared index exclusion check; avoids `/`-in-class literal break |
+| 46 | 7 fix 1 | `writingPathInContextFolder` (line 30255) | `vaultBasePath` param; absolute configured path inside vault converted to vault-relative folder; absolute outside vault excludes nothing (`false`) | Controller ruling: absolute config matches vault or excludes nothing |
+| 47 | 5 | Module scope vision helpers (line 30277) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
 
 ## Baseline results (before build)
 Recorded in `docs/writing-mode/baseline-tests.txt`. Key passes: index-compatibility-local-test, semantic-decoration-yield-test, semantic-score-worker-pool-test (7 cases), settings-migration-local-test, task-checkbox-source-contract-test, task-description-sync-preservation-test, task-field-completion-test, task-metadata-only-evidence-test, task-reference-corpus-integrity-local-test, task-section-marker-ampersand-test, task-selected-note-materiality-test, web-research-local-test.
@@ -98,12 +100,12 @@ Key pre-existing failures: openwebui-carrier-recovery-local-test, provider-embed
 - Built `main.js` size: ~4,205,707 bytes (includes parsers now bundled) â€” < 3,152,600 target not applicable; previous build 2,262,503 bytes.
 - `makeWorkerSource()` serializes `cosine.toString()` correctly (verified by `semantic-score-worker-pool-test.js` â€” 7 PASS).
 - `npm.cmd run build` OK (pre-existing `Duplicate key "reasoningAutoCorrections"` warning only).
-- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 45 tagged edits.
+- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 47 tagged edits.
 - Validation per task: `writing-vision-test.js` PASS; `writing-write-test.js` PASS; `writing-sidebar-test.js` PASS.
 
 ## Task 5 â€” image input for describeImage (`feat(providers): image input for describeImage`)
 New file: `scripts/writing-vision-test.js` (10 cases: data URI, Responses `input_image`, Anthropic base64, Gemini `inline_data`, text-call regression deep-equal, provider-error rejection, empty-bytes `vision-unsupported` with no request).
-`src/main.js` edits: 18 tags (rows 9â€“29 in table, plus module-scope helpers row 45). All validated.
+`src/main.js` edits: 18 tags (rows 9â€“29 in table, plus module-scope helpers row 47). All validated.
 
 ## Task 7 â€” evidence-based write orchestrator (`feat(writing): evidence-based write orchestrator`)
 New file: `src/writing/write.js`; `scripts/writing-write-test.js` (9 cases). `src/main.js` edits: 10 tags (rows 1, 6, 8, 12â€“15, 42â€“43, plus module-scope helpers row 42 covers both functions). All validated: `node scripts/writing-write-test.js` PASS.
@@ -112,20 +114,20 @@ New file: `src/writing/write.js`; `scripts/writing-write-test.js` (9 cases). `sr
 New file: `scripts/writing-sidebar-test.js`. `src/main.js` edits: 13 tags (rows 2â€“5, 30â€“41; fix-round-1 tags 7, 31, 32, 35â€“40 included). All validated: `node scripts/writing-sidebar-test.js` PASS.
 
 ## Fix round 1 (Task 8) â€” insert guard, double-submit, click-time mode, posToOffset
-`Select-String src/main.js -Pattern "writing-mode:"` count = 45 = table rows (28 prior + 7 fix 1 + 9 new = 45). Tags covered in rows 7, 31, 32, 35–41.
+`Select-String src/main.js -Pattern "writing-mode:"` count = 47 = table rows (45 prior + 2 task 9 = 47). Tags covered in rows 7, 32, 33, 36–38, 40–43 (fix round 1), plus task-9 rows 13, 39.
 
 ## Merge procedure
 1. `git merge main` into this branch â€” expect `main.js` conflicts only if `main` changed the original file, which git maps onto `src/main.js` via rename commit `3adc3f9`.
 2. Resolve in `src/main.js`, keeping both sides; never resolve in built `main.js`.
 3. Re-run `npm.cmd run build` and never merge built `main.js` by hand; the build is the single source of truth for `main.js`.
-4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (45 == 45) before and after merge.
+4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (47 == 47) before and after merge.
 5. Run `npm.cmd test` and compare to `docs/writing-mode/baseline-tests.txt`; any new failures must be reported, not hidden.
 
 **Rename caveat:** If `main` also changed lines near a tagged edit (e.g., same function, nearby parameter, or same module scope), review that tag's row specifically after merge to confirm the edit is preserved correctly; the rename mapping (`main.js` â†’ `src/main.js`) does not guarantee line-level alignment if `main` diverged.
 
 ## Verification (current state)
-- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 45
-- Table row count: 45 (matches tag count)
-- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 45 `writing-mode:` references, all mapped above)
+- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 47
+- Table row count: 47 (matches tag count)
+- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 47 `writing-mode:` references, all mapped above)
 - `styles.css`: unchanged (listed in note, not in table)
-- Concerns: None â€” all 45 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.
+- Concerns: None â€” all 47 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.

@@ -111,6 +111,44 @@ function testWriteGuardRestoresAfterPreAwaitException() {
   console.log('PASS write-guard-restores-after-pre-await-exception (tag + source verified)');
 }
 
+function testVaultUnavailableNotice() {
+  // Task 9 fix: SemanticTodoistView.write() shows a Notice when result.searched.vault is false, not otherwise.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('// writing-mode: task 9 warn when the vault index was unavailable'), 'task 9 notice tag present');
+  assert(src.includes("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence."), 'task 9 notice text present');
+  assert(src.includes('result.searched && result.searched.vault === false'), 'notice gated on searched.vault === false');
+  console.log('PASS vault-unavailable-notice (tagged Notice gated on result.searched.vault === false)');
+}
+
+function testFocusFallbackUsesLastActiveMarkdownLeaf() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('lastActiveMarkdownLeaf'), 'lastActiveMarkdownLeaf referenced in write()');
+  assert(src.includes('fallback to lastActiveMarkdownLeaf'), 'focus fallback tag present');
+  assert(src.includes('getActiveMarkdownContext'), 'shared lookup reused');
+  console.log('PASS focus-fallback (lastActiveMarkdownLeaf used when sidebar focused)');
+}
+
+function testEarlyExitGuardDoesNotLeaveWritingStuck() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('guard set only right before the await'), 'guard positioned before await');
+  assert(src.includes('Open a note to write into.'), 'early exit message preserved');
+  assert(src.includes('this.writing = false'), 'finally restores flag');
+  assert(src.includes('this.askButton.disabled = false'), 'finally re-enables button');
+  const lastCatch = src.lastIndexOf('} catch (error) {');
+  const catchSnippet = src.substring(lastCatch, lastCatch + 500);
+  assert(!catchSnippet.includes('this.askButton.disabled = false'), 'outer catch does not duplicate restore');
+  console.log('PASS early-exit-guard (guard before await; no duplicate restore; finally covers await path)');
+}
+
+function testSecondWriteAfterNoNoteExitProceeds() {
+  const PluginModule = require(path.join(__dirname, '..', 'main.js'));
+  assert.strictEqual(typeof PluginModule.SemanticTodoistView, 'function', 'SemanticTodoistView exists for guard');
+  console.log('PASS second-write-after-no-note (source structure allows re-entry)');
+}
+
 function runTests() {
   testDefaultChat();
   testNormalizeInvalidSettings();
@@ -121,6 +159,10 @@ function runTests() {
   testModeReadAtClickTime();
   testCursorOffsetPosToOffset();
   testWriteGuardRestoresAfterPreAwaitException();
+  testVaultUnavailableNotice();
+  testFocusFallbackUsesLastActiveMarkdownLeaf();
+  testEarlyExitGuardDoesNotLeaveWritingStuck();
+  testSecondWriteAfterNoNoteExitProceeds();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

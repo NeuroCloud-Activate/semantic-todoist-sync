@@ -61,6 +61,32 @@ async function buildDocxBytes() {
   return toArrayBuffer(buf);
 }
 
+async function buildDocxPreambleBytes() {
+  const JSZip = require('jszip');
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml',
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+    '<Default Extension="xml" ContentType="application/xml"/>' +
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+    '</Types>');
+  zip.file('_rels/.rels',
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+    '</Relationships>');
+  zip.file('word/document.xml',
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+    '<w:p><w:r><w:t>Preamble text.</w:t></w:r></w:p>' +
+    '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Report</w:t></w:r></w:p>' +
+    '<w:p><w:r><w:t>Body text.</w:t></w:r></w:p>' +
+    '</w:body></w:document>');
+  const buf = await zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
+  return toArrayBuffer(buf);
+}
+
 async function buildXlsxBytes() {
   const XLSX = require('xlsx');
   const wb = XLSX.utils.book_new();
@@ -186,6 +212,97 @@ async function main() {
     assert.strictEqual(segs[1].locator, 'Beta');
   }
   console.log('PASS md');
+
+  // xlsx cell containing a newline stays on one Markdown table row (<br>).
+  {
+    const XLSX = require('xlsx');
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,
+      XLSX.utils.aoa_to_sheet([['a', 'b'], ['line1\nline2', 'd'], ['p\r\nq', 'y']]), 'S');
+    const bytes = toArrayBuffer(XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }));
+    const segs = await extractContextFile('nl.xlsx', bytes, { htmlToMarkdown: stubHtmlToMarkdown });
+    assert.strictEqual(segs.length, 1);
+    assert.ok(segs[0].text.includes('line1<br>line2'), 'LF -> <br>, got: ' + segs[0].text);
+    assert.ok(segs[0].text.includes('p<br>q'), 'CRLF -> single <br>, got: ' + segs[0].text);
+    assert.ok(!segs[0].text.includes('\r'), 'no raw CR left, got: ' + JSON.stringify(segs[0].text));
+    assert.strictEqual(segs[0].text.split('\n').length, 3, '3 rows stay 3 lines, got: ' + segs[0].text);
+  }
+  console.log('PASS xlsx-newline-cell');
+
+  // headings inside fenced code blocks do not split (docx path via htmlToMarkdown stub).
+  {
+    const fenced = '# Title\nhello\n```\n# comment\ncode\n```\nworld\n';
+    const segs = await extractContextFile('notes.docx', await buildDocxBytes(),
+      { htmlToMarkdown: () => fenced });
+    assert.strictEqual(segs.length, 1, 'fence # stays one segment, got ' + JSON.stringify(segs));
+    assert.strictEqual(segs[0].locator, 'Title');
+    assert.ok(segs[0].text.includes('# comment'), 'fence content kept');
+  }
+  console.log('PASS md-fence-backtick');
+
+  // ~~~ fences also suppress heading splits.
+  {
+    const md = '# Title\nhello\n~~~\n# comment\ncode\n~~~\nworld\n';
+    const segs = await extractContextFile('n.md', toArrayBuffer(Buffer.from(md, 'utf8')),
+      { htmlToMarkdown: stubHtmlToMarkdown });
+    assert.strictEqual(segs.length, 1, 'tilde fence # stays one segment, got ' + JSON.stringify(segs));
+  }
+  console.log('PASS md-fence-tilde');
+
+  // pdf items with missing/undefined str are skipped, never "undefined".
+  {
+    const deps = {
+      htmlToMarkdown: stubHtmlToMarkdown,
+      loadPdfJs: async () => ({
+        getDocument: () => ({
+          promise: {
+            numPages: 1,
+            getPage: async () => ({
+              getTextContent: async () => ({ items: [{ str: 'Hello' }, {}, { str: undefined }, null, undefined, { str: '' }, { str: 'world' }] }),
+            }),
+          },
+        }),
+      }),
+    };
+    const segs = await extractContextFile('doc.pdf', new ArrayBuffer(8), deps);
+    assert.strictEqual(segs.length, 1);
+    assert.ok(!segs[0].text.includes('undefined'), 'no undefined, got: ' + segs[0].text);
+    assert.ok(segs[0].text.includes('Hello world'), 'text joined, got: ' + segs[0].text);
+  }
+  console.log('PASS pdf-undefined-str');
+
+  // uppercase .DOCX is handled.
+  {
+    const segs = await extractContextFile('NOTES.DOCX', await buildDocxBytes(),
+      { htmlToMarkdown: stubHtmlToMarkdown });
+    assert.strictEqual(segs.length, 2);
+    assert.strictEqual(segs[0].locator, 'Report');
+  }
+  console.log('PASS docx-uppercase-ext');
+
+  // docx text before the first heading gets locator "".
+  {
+    const segs = await extractContextFile('pre.docx', await buildDocxPreambleBytes(),
+      { htmlToMarkdown: stubHtmlToMarkdown });
+    assert.strictEqual(segs.length, 2, 'preamble + heading -> 2 segments, got ' + JSON.stringify(segs));
+    assert.strictEqual(segs[0].locator, '');
+    assert.ok(segs[0].text.includes('Preamble text.'), 'preamble kept, got: ' + segs[0].text);
+    assert.strictEqual(segs[1].locator, 'Report');
+  }
+  console.log('PASS docx-preamble-locator');
+
+  // .jpg passes mime image/jpeg to describeImage.
+  {
+    let gotMime = null;
+    const segs = await extractContextFile('pic.jpg', new ArrayBuffer(4), {
+      htmlToMarkdown: stubHtmlToMarkdown,
+      describeImage: async (_bytes, mime) => { gotMime = mime; return 'a dog'; },
+    });
+    assert.strictEqual(gotMime, 'image/jpeg', 'mime, got: ' + gotMime);
+    assert.strictEqual(segs.length, 1);
+    assert.strictEqual(segs[0].text, 'a dog');
+  }
+  console.log('PASS jpg-mime');
 
   // .pptx rejects with code unsupported-type.
   {

@@ -24,17 +24,28 @@ function extensionOf(name) {
 
 // Split Markdown text into segments at ATX headings. Locator is the heading
 // text; content before the first heading gets locator "".
+// Lines inside fenced code blocks (``` / ~~~) never split.
 function splitOnHeadings(markdown) {
   const segments = [];
   let locator = '';
   let lines = [];
+  let inFence = false;
+  let fenceCh = '';
   const push = () => {
     const text = lines.join('\n').trim();
     if (text) segments.push({ text, locator });
     lines = [];
   };
   for (const line of String(markdown).split('\n')) {
-    const m = /^(#{1,6})\s+(.*?)(\s+#+\s*)?$/.exec(line);
+    const fence = /^\s*(```+|~~~+)/.exec(line);
+    if (fence) {
+      const ch = fence[1][0];
+      if (!inFence) { inFence = true; fenceCh = ch; }
+      else if (ch === fenceCh) { inFence = false; fenceCh = ''; }
+      lines.push(line);
+      continue;
+    }
+    const m = !inFence && /^(#{1,6})\s+(.*?)(\s+#+\s*)?$/.exec(line);
     if (m) {
       push();
       locator = m[2].trim();
@@ -47,7 +58,7 @@ function splitOnHeadings(markdown) {
 }
 
 function escapeCell(value) {
-  return String(value).replace(/\|/g, '\\|');
+  return String(value).replace(/\r\n|\r|\n/g, '<br>').replace(/\|/g, '\\|');
 }
 
 function rowsToMarkdownTable(rows) {
@@ -73,9 +84,9 @@ async function convertDocx(arrayBuffer) {
 }
 
 function workbookToSegments(wb, singleSheetLocator) {
+  const XLSX = require('xlsx');
   const segments = [];
   for (const sheetName of wb.SheetNames) {
-    const XLSX = require('xlsx');
     const ws = wb.Sheets[sheetName];
     const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
     while (rows.length && rows[rows.length - 1].every((c) => String(c) === '')) rows.pop();
@@ -101,7 +112,7 @@ async function extractPdf(arrayBuffer, deps) {
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);
     const content = await page.getTextContent();
-    const text = (content.items || []).map((it) => it.str).join(' ').replace(/\s+/g, ' ').trim();
+    const text = (content.items || []).map((it) => (it && it.str) || '').join(' ').replace(/\s+/g, ' ').trim();
     if (text) segments.push({ text, locator: 'p. ' + n });
   }
   return segments;

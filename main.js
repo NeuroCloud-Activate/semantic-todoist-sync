@@ -28122,7 +28122,7 @@ function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
     // ruling: a split marked action is never silently dropped).
     const nested = Math.max(0, Number(task.ownershipStepCount || 0));
     const subtasks = task.subtasks || [];
-    const regular = subtasks.slice(0, subtasks.length - nested);
+    const regular = dropRestatedSubtasks(task, subtasks.slice(0, subtasks.length - nested));
     return Object.assign({}, task, {
       subtasks: [
         ...regular.slice(0, generationSubtaskLimit({ maxGeneratedSubtasksPerMainTask: maxSubtasks })),
@@ -28135,6 +28135,48 @@ function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
 const GENERATED_TASK_GROUNDING_STOP_WORDS = new Set([
   "action", "actions", "ask", "book", "complete", "confirm", "coordinate", "create", "decide", "develop", "draft", "dup", "email", "finalize", "follow", "have", "need", "prepare", "reply", "respond", "review", "send", "start", "task", "tasks", "update", "use", "verify", "want", "work"
 ]);
+
+// A subtask whose content words are all already in its parent title (or in an
+// earlier kept sibling) adds no step: it only restates. Measured on a real
+// generation: 8 of 23 subtasks restated their parent. Generic verbs are ignored
+// so "Review X" under "Draft X" still counts as the same action and object.
+const SUBTASK_RESTATEMENT_GENERIC_WORDS = new Set([
+  ...GENERATED_TASK_GROUNDING_STOP_WORDS,
+  "check", "get", "make", "with", "from", "that", "this", "their", "them", "the", "and", "for", "are", "was", "not", "has", "been", "who", "which", "once", "when", "into", "any", "all", "also", "about", "after", "before", "ready", "needed", "assess", "determine", "identify", "ensure", "discuss", "talk", "full", "main"
+]);
+
+function subtaskRestatementTerms(text = "") {
+  const stem = (word) => {
+    const value = String(word).toLowerCase().replace(/'s$/, "").replace(/[^a-z0-9_-]/g, "");
+    if (value.length > 5 && value.endsWith("ies")) return `${value.slice(0, -3)}y`;
+    if (value.length > 4 && value.endsWith("ed") && !value.endsWith("eed")) return value.slice(0, -2);
+    if (value.length > 5 && value.endsWith("ing")) return value.slice(0, -3);
+    if (value.length > 4 && value.endsWith("s") && !/(?:ss|us|is)$/.test(value)) return value.slice(0, -1);
+    return value;
+  };
+  return new Set((String(text).toLowerCase().match(/[a-z0-9][a-z0-9_'-]+/g) || [])
+    .map(stem)
+    .filter((word) => word.length >= 3 && !SUBTASK_RESTATEMENT_GENERIC_WORDS.has(word)));
+}
+
+function dropRestatedSubtasks(parent = {}, subtasks = []) {
+  const parentTerms = subtaskRestatementTerms(parent.content);
+  const keptTerms = [];
+  const kept = [];
+  for (const subtask of subtasks || []) {
+    // Existing Todoist subtasks and subtasks with their own schedule are never dropped here.
+    const own = Boolean(subtask?.id || subtask?.todoistId || subtask?.oid)
+      || Boolean(subtask?.due_date && subtask.due_date !== parent.due_date)
+      || Boolean(subtask?.deadline_date && subtask.deadline_date !== parent.deadline_date);
+    const terms = subtaskRestatementTerms(subtask?.content);
+    const covered = (reference) => terms.size > 0 && [...terms].every((term) => reference.has(term));
+    if (!own && (covered(parentTerms) || keptTerms.some(covered))) continue;
+    keptTerms.push(terms);
+    kept.push(subtask);
+  }
+  return kept;
+}
+
 
 function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT_SETTINGS) {
   const grounded = [];
@@ -45195,6 +45237,9 @@ function taskWorkflowFactBindingFromFact(fact = {}, evidence = null, scopeId = "
 // resumes the same traversal. One traversal implementation serves both.
 const TASK_WORKFLOW_HASH_YIELD = true;
 const TASK_WORKFLOW_HASH_YIELD_MS = 8;
+// Delivered-recall measured: semantic window cap 1 chunk/note + lexical window 30 (v2 +8.6pp CI 5.9-11.6, chunks 46->56).
+const TASK_EVIDENCE_SEMANTIC_NOTE_CAP = 1;
+const TASK_EVIDENCE_LEXICAL_WINDOW = 30;
 const TASK_WORKFLOW_HASH_STRING_CHUNK = 65536;
 
 const TASK_WORKFLOW_HASH_CHECKPOINT_SKIP = 7;
@@ -48516,6 +48561,9 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
     : fallback);
   const semanticLimit = optionLimit(options?.semanticLimit, 30);
   const lexicalLimit = optionLimit(options?.lexicalLimit, 20);
+  const semanticNoteCap = (Number.isFinite(Number(options?.semanticNoteCap)) && Number(options?.semanticNoteCap) > 0
+    ? Math.floor(Number(options?.semanticNoteCap))
+    : 0);
   const lexicalSourceRows = Array.isArray(options?.lexicalRows)
     ? options.lexicalRows.filter((row) => row && typeof row === "object")
     : rows;
@@ -48595,9 +48643,27 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
   const lexicalWindow = lexical
     .filter((entry) => Number(entry.score) > 0)
     .slice(0, lexicalLimit);
-  const semanticWindow = semantic
-    .filter((entry) => Number(entry.score) > 0)
-    .slice(0, semanticLimit);
+  const semanticPositive = semantic.filter((entry) => Number(entry.score) > 0);
+  let semanticWindow = semanticPositive.slice(0, semanticLimit);
+  if (semanticNoteCap > 0) {
+    const pathByEvidenceId = new Map();
+    for (const row of rows) {
+      const id = String(row.evidenceId || "");
+      if (id && !pathByEvidenceId.has(id)) pathByEvidenceId.set(id, String(row.path || ""));
+    }
+    const capped = [];
+    const perNote = new Map();
+    for (const entry of semanticPositive) {
+      if (capped.length >= semanticLimit) break;
+      const note = pathByEvidenceId.get(entry.evidenceId) || entry.evidenceId;
+      const used = perNote.get(note) || 0;
+      if (used >= semanticNoteCap) continue;
+      perNote.set(note, used + 1);
+      capped.push(entry);
+      if (checkpoint && checkpoint()) yield TASK_WORKFLOW_HASH_YIELD;
+    }
+    semanticWindow = capped;
+  }
 
   const unionIds = new Set();
   for (const entry of semanticWindow) unionIds.add(entry.evidenceId);
@@ -49104,7 +49170,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       scopeId,
       queryHandleEvidenceId
     });
-    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText);
+    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, { semanticNoteCap: TASK_EVIDENCE_SEMANTIC_NOTE_CAP, lexicalLimit: TASK_EVIDENCE_LEXICAL_WINDOW });
     const unionIds = [];
     const unionSeen = new Set();
     for (const evidenceId of scoreSelection.evidenceIds) {

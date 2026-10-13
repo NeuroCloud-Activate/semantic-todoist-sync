@@ -414,6 +414,7 @@ function testFeaturesMenuStructure() {
   assert(src.includes('semantic-todoist-collaborate-features'), 'Features button class present');
   assert(src.includes('openCollaborateFeaturesMenu'), 'menu opener present');
   assert(src.includes('setSubmenu'), 'nested submenus used');
+  assert(src.includes('menu.showAtPosition({ x: anchor.left, y: anchor.bottom })'), 'Features menu anchors at the button left edge');
   assert(src.includes('"Draft length"') || src.includes("'Draft length'"), 'Draft length submenu present');
   assert(src.includes('Brief') && src.includes('Standard') && src.includes('Detailed'), 'all lengths present');
   assert(src.includes('Vault notes') && src.includes('Context folder'), 'evidence toggles present');

@@ -21907,7 +21907,10 @@ class SemanticTodoistView extends ItemView {
         this.updateCollaborateFeaturesLabel();
       });
     });
-    menu.showAtMouseEvent(event);
+    // writing-mode: open at the button's left edge so a click near its right end never clips the menu
+    const anchor = this.collaborateFeaturesButton && this.collaborateFeaturesButton.getBoundingClientRect ? this.collaborateFeaturesButton.getBoundingClientRect() : null;
+    if (anchor && typeof menu.showAtPosition === "function") menu.showAtPosition({ x: anchor.left, y: anchor.bottom });
+    else menu.showAtMouseEvent(event);
   }
 
   async ask() {

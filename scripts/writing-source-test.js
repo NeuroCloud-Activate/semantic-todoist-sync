@@ -185,7 +185,129 @@ function bufToString(ab) {
     console.log("PASS CONTEXT_EXTENSIONS covers md/txt/docx/xlsx/csv/pdf/images");
   }
 
-  process.stdout.write(JSON.stringify({ passed: 7, failed: 0 }) + "\n");
+  // 8. vault traversal outside the context root is rejected
+  {
+    const app = makeVaultApp({
+      "Writing Context/a.md": { size: 5, mtime: 1700000006000, content: "ok" },
+    });
+    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    await assert.rejects(
+      source.readContextFile(rootInfo, app, "Writing Context/../secret.md"),
+      (err) => err && err.code === "outside-context-root",
+      "vault ../ traversal must be rejected"
+    );
+    await assert.rejects(
+      source.readContextFile(rootInfo, app, "Other/x.md"),
+      (err) => err && err.code === "outside-context-root",
+      "vault id outside root must be rejected"
+    );
+    const content = bufToString(await source.readContextFile(rootInfo, app, "Writing Context/a.md"));
+    assert.strictEqual(content, "ok");
+    console.log("PASS vault traversal outside context root is rejected");
+  }
+
+  // 9. external absolute path outside the root is rejected
+  {
+    const dir = await makeTempDir("writing-source-ext-guard-");
+    await fs.writeFile(nodePath.join(dir, "a.md"), "ok");
+    const outside = nodePath.join(nodePath.dirname(dir), `writing-source-outside-${Date.now()}.md`);
+    await fs.writeFile(outside, "evil");
+    try {
+      const rootInfo = { kind: "external", root: dir };
+      await assert.rejects(
+        source.readContextFile(rootInfo, makeVaultApp({}), outside),
+        (err) => err && err.code === "outside-context-root",
+        "external path outside root must be rejected"
+      );
+      const target = nodePath.join(dir, "a.md");
+      const content = bufToString(await source.readContextFile(rootInfo, makeVaultApp({}), target));
+      assert.strictEqual(content, "ok");
+    } finally {
+      try { await fs.rm(outside, { force: true }); } catch { /* cleanup best-effort */ }
+    }
+    console.log("PASS external path outside context root is rejected");
+  }
+
+  // 10. vault folder setting is normalised
+  {
+    const app = makeVaultApp({
+      "Writing Context/a.md": { size: 3, mtime: 1700000007000, content: "ok" },
+    });
+    const slashed = await source.resolveContextRoot(
+      app, { writingContextFolder: "Writing Context/" }, { isDesktop: true }
+    );
+    assert.strictEqual(slashed.root, "Writing Context");
+    assert.deepStrictEqual(
+      (await source.listContextFiles(slashed, app)).map((f) => f.id),
+      ["Writing Context/a.md"]
+    );
+    const app2 = makeVaultApp({
+      "Writing Context/Sub/a.md": { size: 3, mtime: 1700000008000, content: "sub" },
+    });
+    const backslashed = await source.resolveContextRoot(
+      app2, { writingContextFolder: "Writing Context\\Sub" }, { isDesktop: true }
+    );
+    assert.strictEqual(backslashed.root, "Writing Context/Sub");
+    assert.deepStrictEqual(
+      (await source.listContextFiles(backslashed, app2)).map((f) => f.id),
+      ["Writing Context/Sub/a.md"]
+    );
+    const blank = await source.resolveContextRoot(app, { writingContextFolder: "   " }, { isDesktop: true });
+    assert.strictEqual(blank.root, "Writing Context");
+    console.log("PASS vault folder setting is normalised");
+  }
+
+  // 11. dot folders/files are skipped in vault and external recursion
+  {
+    const app = makeVaultApp({
+      "Writing Context/a.md": { size: 2, mtime: 1700000009000, content: "ok" },
+      "Writing Context/.obsidian/x.md": { size: 2, mtime: 1700000010000, content: "hidden" },
+      "Writing Context/.git/y.txt": { size: 2, mtime: 1700000011000, content: "hidden" },
+      "Writing Context/.hidden.md": { size: 2, mtime: 1700000012000, content: "hidden" },
+    });
+    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    assert.deepStrictEqual(
+      (await source.listContextFiles(rootInfo, app)).map((f) => f.id),
+      ["Writing Context/a.md"]
+    );
+    const dir = await makeTempDir("writing-source-ext-dot-");
+    await fs.writeFile(nodePath.join(dir, "a.md"), "ok");
+    await fs.mkdir(nodePath.join(dir, ".obsidian"), { recursive: true });
+    await fs.writeFile(nodePath.join(dir, ".obsidian", "x.md"), "hidden");
+    await fs.mkdir(nodePath.join(dir, ".git"), { recursive: true });
+    await fs.writeFile(nodePath.join(dir, ".git", "y.txt"), "hidden");
+    await fs.writeFile(nodePath.join(dir, ".hidden.md"), "hidden");
+    assert.deepStrictEqual(
+      (await source.listContextFiles({ kind: "external", root: dir }, makeVaultApp({}))).map((f) => f.name),
+      ["a.md"]
+    );
+    console.log("PASS dot folders/files are skipped");
+  }
+
+  // 12. missing files report code not-found
+  {
+    const dir = await makeTempDir("writing-source-ext-missing-");
+    await assert.rejects(
+      source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), nodePath.join(dir, "missing.md")),
+      (err) => err && err.code === "not-found",
+      "external missing file must report not-found"
+    );
+    await assert.rejects(
+      source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), dir),
+      (err) => err && err.code === "not-found",
+      "external directory id must report not-found"
+    );
+    const app = makeVaultApp({});
+    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    await assert.rejects(
+      source.readContextFile(rootInfo, app, "Writing Context/missing.md"),
+      (err) => err && err.code === "not-found",
+      "vault missing file must report not-found"
+    );
+    console.log("PASS missing files report not-found");
+  }
+
+  process.stdout.write(JSON.stringify({ passed: 12, failed: 0 }) + "\n");
 })().catch((err) => {
   console.error("FAIL writing-source-test:", err && err.message ? err.message : err);
   process.exit(1);

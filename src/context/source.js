@@ -36,6 +36,28 @@ function baseNameOf(p) {
   return String(p).split(/[\\/]/).pop();
 }
 
+function normalizeVaultFolder(folder) {
+  const slashed = typeof folder === "string" ? folder.replace(/\\/g, "/").trim() : "";
+  const collapsed = slashed.replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "").trim();
+  return collapsed || DEFAULT_CONTEXT_FOLDER;
+}
+
+function normalizeVaultId(id) {
+  return String(id).replace(/\\/g, "/").replace(/\/+/g, "/");
+}
+
+function outsideRootError(id) {
+  const err = new Error(`context file outside context root: ${id}`);
+  err.code = "outside-context-root";
+  return err;
+}
+
+function notFoundError(id) {
+  const err = new Error(`context file not found: ${id}`);
+  err.code = "not-found";
+  return err;
+}
+
 function toMtimeMs(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (value instanceof Date) return value.getTime();
@@ -54,7 +76,7 @@ async function resolveContextRoot(app, settings, platform) {
       ? settings.writingContextFolder.trim()
       : DEFAULT_CONTEXT_FOLDER;
   if (!isAbsoluteContextPath(configured)) {
-    return { kind: "vault", root: configured };
+    return { kind: "vault", root: normalizeVaultFolder(configured) };
   }
   if (!platform || !platform.isDesktop) {
     return {
@@ -79,6 +101,7 @@ async function resolveContextRoot(app, settings, platform) {
 }
 
 async function listVaultFiles(app, root) {
+  root = normalizeVaultFolder(root);
   const out = [];
   const adapter = app.vault.adapter;
   const queue = [root];
@@ -95,8 +118,12 @@ async function listVaultFiles(app, root) {
     }
     const files = (listed && listed.files) || [];
     const folders = (listed && listed.folders) || [];
-    for (const folder of folders) queue.push(folder);
+    for (const folder of folders) {
+      if (baseNameOf(folder).startsWith(".")) continue;
+      queue.push(folder);
+    }
     for (const file of files) {
+      if (baseNameOf(file).startsWith(".")) continue;
       if (!CONTEXT_EXTENSIONS.includes(extensionOf(file))) continue;
       let st = null;
       try {
@@ -132,7 +159,9 @@ async function listExternalFiles(root) {
       continue;
     }
     for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
       const full = path.join(dir, entry.name);
+      // Dirent.isDirectory() is false for symlinks, so recursion never follows them.
       if (entry.isDirectory()) {
         queue.push(full);
       } else if (entry.isFile()) {
@@ -165,15 +194,38 @@ async function readContextFile(rootInfo, app, id) {
   if (rootInfo && rootInfo.kind === "external") {
     // Desktop only: lazy Node requires so mobile never loads them.
     const fsp = require("fs/promises");
-    const st = await fsp.stat(id);
+    const path = require("path");
+    const resolvedRoot = path.resolve(rootInfo.root);
+    const resolved = path.resolve(id);
+    const rel = path.relative(resolvedRoot, resolved);
+    if (rel.split(/[\\/]/)[0] === ".." || path.isAbsolute(rel)) throw outsideRootError(id);
+    let st;
+    try {
+      st = await fsp.stat(resolved);
+    } catch (err) {
+      if (err && err.code === "ENOENT") throw notFoundError(id);
+      throw err;
+    }
+    if (st.isDirectory()) throw notFoundError(id);
     if (st.size > MAX_CONTEXT_FILE_BYTES) {
       throw new Error(`context file too-large: ${id}`);
     }
-    const buf = await fsp.readFile(id);
+    let buf;
+    try {
+      buf = await fsp.readFile(resolved);
+    } catch (err) {
+      if (err && err.code === "ENOENT") throw notFoundError(id);
+      throw err;
+    }
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
   }
+  const vaultRoot = normalizeVaultFolder(rootInfo ? rootInfo.root : DEFAULT_CONTEXT_FOLDER);
+  const normId = normalizeVaultId(id);
+  if (!normId.startsWith(`${vaultRoot}/`) || normId.split("/").includes("..")) {
+    throw outsideRootError(id);
+  }
   const st = await app.vault.adapter.stat(id);
-  if (!st) throw new Error(`context file not found: ${id}`);
+  if (!st || st.type === "folder") throw notFoundError(id);
   if (st.size > MAX_CONTEXT_FILE_BYTES) {
     throw new Error(`context file too-large: ${id}`);
   }
@@ -181,8 +233,7 @@ async function readContextFile(rootInfo, app, id) {
 }
 
 async function ensureVaultContextFolder(app, folder) {
-  const target =
-    typeof folder === "string" && folder.trim() ? folder.trim() : DEFAULT_CONTEXT_FOLDER;
+  const target = normalizeVaultFolder(folder);
   const adapter = app.vault.adapter;
   if (await adapter.exists(target)) return;
   await adapter.mkdir(target);

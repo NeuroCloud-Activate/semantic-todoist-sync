@@ -18,7 +18,8 @@ function contextHit(i) {
 }
 
 // Stub plugin; every method records its call order in `calls`.
-function makeStub({ vault = 8, context = 8, syncResult = null, syncError = null, modelText = "draft" } = {}) {
+// `research`: null = no research store (toggle off), number = that many saved research hits.
+function makeStub({ vault = 8, context = 8, syncResult = null, syncError = null, modelText = "draft", research = null } = {}) {
   const calls = [];
   const captured = {};
   const store = {
@@ -36,6 +37,24 @@ function makeStub({ vault = 8, context = 8, syncResult = null, syncError = null,
       return Array.from({ length: context }, (_, i) => contextHit(i + 1));
     },
   };
+  const researchStore = {
+    async sync(rootInfo, app) {
+      calls.push("researchSync");
+      return { added: 0, changed: 0, removed: 0, skipped: [] };
+    },
+    search(queryVector, k) {
+      calls.push("researchSearch");
+      captured.researchK = k;
+      return Array.from({ length: research }, (_, i) => ({
+        id: `Semantic Todoist Sync/Research/r-${i + 1}.md#0`,
+        file: `Semantic Todoist Sync/Research/r-${i + 1}.md`,
+        name: `r-${i + 1}.md`,
+        locator: `s. ${i + 1}`,
+        text: `research text ${i + 1}`,
+        score: 1 - i / 100,
+      }));
+    },
+  };
   const plugin = {
     calls,
     captured,
@@ -43,6 +62,11 @@ function makeStub({ vault = 8, context = 8, syncResult = null, syncError = null,
     async getContextStore() {
       calls.push("getContextStore");
       return { store, rootInfo: { kind: "vault", root: "Writing Context" } };
+    },
+    async getResearchStore() {
+      calls.push("getResearchStore");
+      if (research === null) return null;
+      return { store: researchStore, rootInfo: { kind: "vault", root: "Semantic Todoist Sync/Research" } };
     },
     async retrieveSemanticContext(query, limit) {
       calls.push("retrieve");
@@ -74,29 +98,30 @@ const ACTIVE = { path: "Notes/active.md", text: "active note body", selection: "
 async function main() {
   assert.strictEqual(typeof writeWithEvidence, "function", "writeWithEvidence must be exported");
 
-  // 1. merges 8 vault + 8 context with ids E1..E16, vault first; sync before retrieval.
+  // 1. merges 4 research + 8 vault + 8 context with ids E1..E20, research first; sync before retrieval.
   {
-    const plugin = makeStub({ modelText: "draft [E1] plus [E16]" });
+    const plugin = makeStub({ research: 3, modelText: "draft [E1] plus [E16]" });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.deepStrictEqual(
       plugin.calls,
-      ["getContextStore", "sync", "retrieve", "embed", "search", "model:write", "generate"],
-      "sync runs before retrieval, got " + JSON.stringify(plugin.calls));
-    assert.strictEqual(result.evidenceCount, 16, "8 vault + 8 context");
-    assert.strictEqual(result.sources.length, 16);
+      ["getResearchStore", "researchSync", "getContextStore", "sync", "retrieve", "embed", "search", "embed", "researchSearch", "model:write", "generate"],
+      "research sync before retrieval, got " + JSON.stringify(plugin.calls));
+    assert.strictEqual(result.evidenceCount, 19, "3 research + 8 vault + 8 context");
+    assert.strictEqual(result.sources.length, 19);
     assert.deepStrictEqual(result.sources.map((s) => s.eid),
-      Array.from({ length: 16 }, (_, i) => `E${i + 1}`), "ids E1..E16 in order");
-    assert.ok(result.sources[0].path === "Notes/vault-1.md", "vault first");
-    assert.ok(result.sources[8].path === "Writing Context/c-1.md", "context after vault");
+      Array.from({ length: 19 }, (_, i) => `E${i + 1}`), "ids E1..E19 in order");
+    assert.ok(result.sources[0].path === "Semantic Todoist Sync/Research/r-1.md", "research first");
+    assert.ok(result.sources[3].path === "Notes/vault-1.md", "vault after research");
+    assert.ok(result.sources[11].path === "Writing Context/c-1.md", "context after vault");
     assert.ok(result.markdown.includes("[^1]") && result.markdown.includes("[^2]"), "rewrite applied");
     assert.ok(!result.markdown.includes("[E1]"), "[En] rewritten");
     assert.strictEqual(result.dropped, 0);
-    console.log("PASS merges 8 vault + 8 context as E1..E16 with sync before retrieval");
+    console.log("PASS merges 4 research + 8 vault + 8 context as E1..E20 with sync before retrieval");
   }
 
-  // 2. vault-only when the store is empty.
+  // 2. vault-only when the context store is empty and research is off.
   {
-    const plugin = makeStub({ context: 0 });
+    const plugin = makeStub({ context: 0, research: null });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.strictEqual(result.evidenceCount, 8, "vault-only");
     assert.deepStrictEqual(result.sources.map((s) => s.eid),
@@ -113,7 +138,7 @@ async function main() {
     await assert.rejects(
       writeWithEvidence(failing, { instruction: "Draft it", length: "standard", active: ACTIVE }),
       (e) => e && e.code === "embedding-access-unavailable", "sync error surfaces");
-    const skipped = makeStub({ syncResult: { added: 1, changed: 0, removed: 0, skipped: [{ id: "Writing Context/bad.pdf", reason: "pdf-parse-failed" }] } });
+    const skipped = makeStub({ syncResult: { added: 1, changed: 0, removed: 0, skipped: [{ id: "Writing Context/bad.pdf", reason: "pdf-parse-failed" }] }, research: null });
     const result = await writeWithEvidence(skipped, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.strictEqual(result.evidenceCount, 16, "skips do not block writing");
     console.log("PASS sync embed failure surfaces; per-file skips do not block");
@@ -123,7 +148,7 @@ async function main() {
   {
     const selection = "SELECTION-MARKER-ABC";
     const filler = "x".repeat(9000) + "CURSOR-NEIGHBOURHOOD-MARKER" + "y".repeat(11000);
-    const plugin = makeStub({});
+    const plugin = makeStub({ research: 3 });
     await writeWithEvidence(plugin, {
       instruction: "INSTRUCTION-MARKER-XYZ",
       length: "standard",
@@ -136,7 +161,7 @@ async function main() {
     assert.ok(/explicitly/i.test(request.system), "rule: state missing evidence explicitly");
     assert.ok(request.user.includes("INSTRUCTION-MARKER-XYZ"), "instruction present");
     assert.ok(request.user.includes(selection), "selection present");
-    for (let i = 1; i <= 16; i++) assert.ok(request.user.includes(`<evidence id="E${i}"`), `evidence id E${i} listed in evidence block`);
+    for (let i = 1; i <= 19; i++) assert.ok(request.user.includes(`<evidence id="E${i}"`), `evidence id E${i} listed in evidence block`);
     const contextSection = request.user.split("Surrounding note context")[1].split("Evidence (cite by id)")[0];
     assert.ok(contextSection.includes("CURSOR-NEIGHBOURHOOD-MARKER"), "context centred near the cursor");
     assert.ok(contextSection.length <= 6000 + 200, `note context bounded, got ${contextSection.length}`);
@@ -158,7 +183,7 @@ async function main() {
 
   // 6. result passes through rewriteCitations (unknown ids dropped and counted).
   {
-    const plugin = makeStub({ vault: 1, context: 0, modelText: "a [E1] b [E99]" });
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "a [E1] b [E99]", research: null });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.ok(result.markdown.includes("[^1]"), "known id rewritten");
     assert.ok(!result.markdown.includes("[E99]"), "unknown id removed");
@@ -594,7 +619,7 @@ async function main() {
 
   // Task 10 — useVault false: vault never searched, prompt says turned off, context still searched.
   {
-    const plugin = makeStub({ vault: 8, context: 2, modelText: "draft" });
+    const plugin = makeStub({ vault: 8, context: 2, modelText: "draft", research: null });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useVault: false });
     assert.strictEqual(plugin.calls.includes("retrieve"), false, "no vault retrieval when off");
     assert.strictEqual(result.searched.vault, false, "searched.vault false");
@@ -609,7 +634,7 @@ async function main() {
 
   // Task 10 — useContext false: no getContextStore call at all.
   {
-    const plugin = makeStub({ vault: 2, context: 8, modelText: "draft" });
+    const plugin = makeStub({ vault: 2, context: 8, modelText: "draft", research: null });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useContext: false });
     assert.strictEqual(plugin.calls.includes("getContextStore"), false, "no store call when off");
     assert.strictEqual(plugin.calls.includes("sync"), false, "no sync when off");
@@ -623,25 +648,64 @@ async function main() {
 
   // Task 10 — both off: zero-evidence fallback never claims a source lacked evidence.
   {
-    const plugin = makeStub({ vault: 8, context: 8, modelText: "nothing found" });
+    const plugin = makeStub({ vault: 8, context: 8, modelText: "nothing found", research: null });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useVault: false, useContext: false });
     assert.strictEqual(plugin.calls.includes("retrieve"), false, "no vault call");
     assert.strictEqual(plugin.calls.includes("getContextStore"), false, "no store call");
     assert.strictEqual(result.evidenceCount, 0);
     const userPrompt = plugin.captured.request.user;
-    assert.ok(userPrompt.includes("both turned off"), "fallback says both turned off");
+    assert.ok(userPrompt.includes("all turned off"), "fallback says every source turned off");
     assert.ok(!userPrompt.includes("No evidence was found in the"), "no lacked-evidence claim");
     console.log("PASS task 10 both off keeps an honest zero-evidence fallback");
   }
 
-  // Task 10 — defaults when omitted: both searched (existing behavior).
+  // Task 10 — defaults when omitted: vault and context searched (existing behavior); research on by default too.
   {
-    const plugin = makeStub({ vault: 1, context: 1, modelText: "draft" });
+    const plugin = makeStub({ vault: 1, context: 1, research: 3, modelText: "draft" });
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.strictEqual(result.searched.vault, true, "vault searched by default");
     assert.strictEqual(result.searched.context, true, "context searched by default");
-    assert.strictEqual(result.evidenceCount, 2);
+    assert.strictEqual(result.searched.research, true, "research searched by default");
+    assert.strictEqual(result.evidenceCount, 5, "1 vault + 1 context + 3 research");
     console.log("PASS task 10 omitted options default to both searched");
+  }
+
+  // Task 11 — research evidence ranks above vault notes and labels its path.
+  {
+    const plugin = makeStub({ vault: 2, context: 2, research: 2, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.sources[0].path, "Semantic Todoist Sync/Research/r-1.md", "research first");
+    assert.strictEqual(result.sources[1].path, "Semantic Todoist Sync/Research/r-2.md", "research second");
+    assert.strictEqual(result.sources[2].path, "Notes/vault-1.md", "vault after research");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- deep research: searched"), "prompt marks research searched");
+    assert.ok(userPrompt.includes('source="Semantic Todoist Sync/Research/r-1.md, s. 1"'), "research evidence label carries path and locator");
+    console.log("PASS task 11 research evidence outranks vault notes");
+  }
+
+  // Task 11 — useResearch false: store never touched, prompt says turned off.
+  {
+    const plugin = makeStub({ vault: 1, context: 1, research: 4, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useResearch: false });
+    assert.strictEqual(plugin.calls.includes("getResearchStore"), false, "no research store call when off");
+    assert.strictEqual(plugin.calls.includes("researchSync"), false, "no research sync when off");
+    assert.strictEqual(plugin.calls.includes("researchSearch"), false, "no research search when off");
+    assert.strictEqual(result.searched.research, false, "searched.research false");
+    assert.strictEqual(result.evidenceCount, 2, "vault + context only");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- deep research: not searched (turned off)"), "prompt says research turned off");
+    console.log("PASS task 11 useResearch false skips research notes and says turned off");
+  }
+
+  // Task 11 — research store present but empty: searched-and-empty, prompt still marks it searched.
+  {
+    const plugin = makeStub({ vault: 1, context: 1, research: 0, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.searched.research, true, "empty research store still counts as searched");
+    assert.strictEqual(result.evidenceCount, 2, "vault + context only");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- deep research: searched"), "prompt marks research searched");
+    console.log("PASS task 11 empty research store stays honest");
   }
 
   console.log("writing-write-test: PASS");

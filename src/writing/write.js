@@ -2,11 +2,13 @@
 
 // Evidence-based write orchestrator (Task 7).
 //
-// `writeWithEvidence(plugin, { instruction, length, active, webSearchMode })`
+// `writeWithEvidence(plugin, { instruction, length, active, webSearchMode, useVault, useContext, useResearch })`
 // gathers vault evidence (via `plugin.retrieveSemanticContext`) plus context-folder
-// evidence (via the store from `plugin.getContextStore()`), asks the primary model
+// evidence (via the store from `plugin.getContextStore()`) plus saved deep-research
+// notes (via `plugin.getResearchStore()`, ranked first), asks the primary model
 // (operation `"write"`) to draft cited prose, and passes the result through
 // `rewriteCitations`. It receives the plugin so tests can stub its methods.
+// `useVault`/`useContext`/`useResearch` default to true unless explicitly `false`.
 // `webSearchMode` is accepted for forward compatibility; v1 does not run web
 // search from the orchestrator (the sidebar toggle is wired in a later task).
 
@@ -29,6 +31,7 @@ const VAULT_SECTION_MAX_CHARS = 3000;
 const VAULT_TOTAL_MAX_CHARS = 40000;
 const VAULT_WHOLE_NOTE_MAX_CHARS = 8000;
 const CONTEXT_EVIDENCE_LIMIT = 8;
+const RESEARCH_EVIDENCE_LIMIT = 4; // writing-mode: task 11 saved research notes rank first but stay a minority of the evidence
 const SELECTION_QUERY_CHARS = 500;
 
 const LENGTH_WORD_TARGETS = {
@@ -268,6 +271,8 @@ function evidenceLabel(entry) {
   const source = (entry && entry.source) || {};
   if (source.kind === "vault") return source.heading ? `${source.path}#${source.heading}` : source.path;
   if (source.kind === "context-vault") return source.locator ? `${source.path}, ${source.locator}` : source.path;
+  if (source.kind === "research-vault") return source.locator ? `${source.path}, ${source.locator}` : source.path;
+  if (source.kind === "research-external") return source.locator ? `${source.name}, ${source.locator}` : source.name;
   if (source.kind === "context-external") return source.locator ? `${source.name}, ${source.locator}` : source.name;
   if (source.kind === "web") {
     const url = String(source.url || "").trim();
@@ -293,8 +298,22 @@ async function writeWithEvidence(plugin, options) {
   // writing-mode: task 10 evidence toggles default true unless explicitly false
   const useVault = args.useVault !== false;
   const useContext = args.useContext !== false;
+  // writing-mode: task 11 deep-research evidence (saved Research notes) outranks vault notes
+  const useResearch = args.useResearch !== false;
 
   const query = retrievalQuery(instruction, active.selection);
+
+  // writing-mode: task 11 saved research notes are its own store; skipped entirely when off or empty
+  let researchStore = null;
+  let researchRootInfo = null;
+  if (useResearch && typeof plugin.getResearchStore === "function") {
+    const research = await plugin.getResearchStore();
+    if (research && research.store) {
+      researchStore = research.store;
+      researchRootInfo = research.rootInfo || { kind: "vault", root: "Semantic Todoist Sync/Research" };
+      await researchStore.sync(researchRootInfo, plugin.app);
+    }
+  }
 
   // Sync first so retrieval searches fresh context; an embedding failure
   // rejects here and surfaces, while per-file skips stay in the result.
@@ -331,7 +350,30 @@ async function writeWithEvidence(plugin, options) {
     contextHitsReady = (await contextStore.search(queryVector, CONTEXT_EVIDENCE_LIMIT)) || [];
   }
 
+  // writing-mode: task 11 research chunks come first so their [En] ids outrank vault evidence
+  let researchHits = [];
+  if (researchStore) {
+    try {
+      const researchEmbedded = await plugin.embedTexts([query], "query");
+      const researchVector = Array.isArray(researchEmbedded) ? researchEmbedded[0] : [];
+      researchHits = (await researchStore.search(researchVector, RESEARCH_EVIDENCE_LIMIT)) || [];
+    } catch {
+      researchHits = [];
+    }
+  }
+
   const evidence = [];
+  const researchExternal = researchRootInfo && researchRootInfo.kind === "external";
+  for (const hit of researchHits.slice(0, RESEARCH_EVIDENCE_LIMIT)) {
+    const locator = String((hit && hit.locator) || "");
+    evidence.push({
+      eid: `E${evidence.length + 1}`,
+      text: String((hit && hit.text) || ""),
+      source: researchExternal
+        ? { kind: "research-external", name: String((hit && hit.name) || (hit && hit.file) || ""), locator }
+        : { kind: "research-vault", path: String((hit && hit.file) || ""), locator },
+    });
+  }
   for (const item of await vaultEvidenceItems(plugin, vaultChunks.slice(0, VAULT_EVIDENCE_LIMIT), active.path)) {
     evidence.push({ eid: `E${evidence.length + 1}`, text: item.text, source: item.source });
   }
@@ -360,16 +402,20 @@ async function writeWithEvidence(plugin, options) {
 
   // writing-mode: task 10 name only searched sources; a toggled-off source is reported as not searched
   const searchedSources = [];
+  if (researchStore) searchedSources.push("research notes");
   if (vaultReady) searchedSources.push("vault");
   if (useContext) searchedSources.push("context folder");
+  const researchLine = useResearch
+    ? (researchStore ? "- deep research: searched" : "- deep research: not searched (no saved research notes)")
+    : "- deep research: not searched (turned off)";
   const vaultLine = useVault
     ? (vaultReady ? "- vault: searched" : `- vault: NOT searched (vault index unavailable${vaultReason ? `: ${vaultReason}` : ""})`)
     : "- vault: not searched (turned off)";
   const contextLine = useContext ? "- context folder: searched" : "- context folder: not searched (turned off)";
-  const sourcesBlock = `Sources searched:\n${vaultLine}\n${contextLine}`;
+  const sourcesBlock = `Sources searched:\n${researchLine}\n${vaultLine}\n${contextLine}`;
   const evidenceBlock = evidence.length
     ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${escapeSourceAttribute(evidenceLabel(entry))}">\n${neutraliseEvidenceTags(entry.text)}\n</evidence>`).join("\n\n")
-    : (searchedSources.length ? `No evidence was found in the ${searchedSources.join(" or ")}.` : "No evidence was searched: vault and context folder are both turned off.");
+    : (searchedSources.length ? `No evidence was found in the ${searchedSources.join(" or ")}.` : "No evidence was searched: deep research, vault and context folder are all turned off.");
 
   const modelChoice = plugin.aiModelForRequest("write", {});
   const raw = await plugin.openaiResponse({
@@ -409,7 +455,7 @@ async function writeWithEvidence(plugin, options) {
     evidenceCount: evidence.length,
     dropped: rewritten.dropped,
     // writing-mode: task 10 report wanted flags so the sidebar only warns about an unavailable-but-wanted vault
-    searched: { vault: vaultReady, context: useContext, vaultReason, vaultWanted, contextWanted: useContext },
+    searched: { research: !!researchStore, researchWanted: useResearch, vault: vaultReady, context: useContext, vaultReason, vaultWanted, contextWanted: useContext },
   };
 }
 

@@ -416,6 +416,11 @@ function testFeaturesMenuStructure() {
   assert(src.includes('"Draft length"') || src.includes("'Draft length'"), 'Draft length submenu present');
   assert(src.includes('Brief') && src.includes('Standard') && src.includes('Detailed'), 'all lengths present');
   assert(src.includes('Vault notes') && src.includes('Context folder'), 'evidence toggles present');
+  assert(src.includes('Deep research'), 'deep-research evidence toggle present');
+  const researchIdx = src.indexOf('choice.setTitle("Deep research")');
+  const vaultIdx = src.indexOf('choice.setTitle("Vault notes")');
+  assert(researchIdx >= 0 && vaultIdx > researchIdx, 'deep research listed before vault notes');
+  assert(src.includes('writingUseResearch'), 'research setting wired');
   assert(src.includes('Describe images'), 'describe-images toggle present');
   assert(src.includes('updateCollaborateFeaturesLabel'), 'features label updater present');
   console.log('PASS features-menu-structure');
@@ -438,16 +443,19 @@ function testCollaborateSettingsKeys() {
   assert.strictEqual(defaults.writingDraftLength, 'standard', 'length defaults standard');
   assert.strictEqual(defaults.writingUseVault, true, 'vault defaults true');
   assert.strictEqual(defaults.writingUseContext, true, 'context defaults true');
-  const n = Plugin.normalizeStableSettings({ writingDraftLength: 'bogus', writingCollaborateMode: 1, writingUseVault: 0, writingUseContext: 'no' });
+  assert.strictEqual(defaults.writingUseResearch, true, 'research defaults true');
+  const n = Plugin.normalizeStableSettings({ writingDraftLength: 'bogus', writingCollaborateMode: 1, writingUseVault: 0, writingUseContext: 'no', writingUseResearch: 0 });
   assert.strictEqual(n.writingDraftLength, 'standard', 'invalid length falls back');
   assert.strictEqual(n.writingCollaborateMode, false, 'non-true mode is false');
   assert.strictEqual(n.writingUseVault, true, 'non-false vault is true');
   assert.strictEqual(n.writingUseContext, true, 'non-false context is true');
-  const n2 = Plugin.normalizeStableSettings({ writingDraftLength: 'detailed', writingCollaborateMode: true, writingUseVault: false, writingUseContext: false });
+  assert.strictEqual(n.writingUseResearch, true, 'non-false research is true');
+  const n2 = Plugin.normalizeStableSettings({ writingDraftLength: 'detailed', writingCollaborateMode: true, writingUseVault: false, writingUseContext: false, writingUseResearch: false });
   assert.strictEqual(n2.writingDraftLength, 'detailed', 'valid length kept');
   assert.strictEqual(n2.writingCollaborateMode, true, 'true mode kept');
   assert.strictEqual(n2.writingUseVault, false, 'false vault kept');
   assert.strictEqual(n2.writingUseContext, false, 'false context kept');
+  assert.strictEqual(n2.writingUseResearch, false, 'false research kept');
   console.log('PASS collaborate-settings-keys');
 }
 

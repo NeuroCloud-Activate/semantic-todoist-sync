@@ -2860,6 +2860,7 @@ function normalizeStableSettings(input = {}) {
   result.writingCollaborateMode = source.writingCollaborateMode === true;
   result.writingUseVault = source.writingUseVault !== false;
   result.writingUseContext = source.writingUseContext !== false;
+  result.writingUseResearch = source.writingUseResearch !== false; // writing-mode: task 11 deep-research evidence toggle (default on)
   return result;
 }
 
@@ -3604,6 +3605,7 @@ const DEFAULT_SETTINGS = {
   writingDraftLength: "standard", // writing-mode: task 10 draft length default
   writingUseVault: true, // writing-mode: task 10 vault evidence default
   writingUseContext: true, // writing-mode: task 10 context-folder evidence default
+  writingUseResearch: true, // writing-mode: task 11 deep-research evidence default
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
@@ -13954,6 +13956,36 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return { store: this._writingContextStore, rootInfo };
   }
 
+  async getResearchStore() { // writing-mode: task 11 saved deep-research notes as a separate, higher-ranked evidence store
+    if (this.settings && this.settings.writingUseResearch === false) return null;
+    const { ContextStore } = require("./context/store.js");
+    const obsidian = require("obsidian");
+    const identity = semanticEmbeddingIdentity(this.settings);
+    const embeddingKey = `${identity.provider}:${identity.model}`;
+    const rootInfo = { kind: "vault", root: `${PLUGIN_DATA_FOLDER}/Research` };
+    const describeFlag = this.settings && this.settings.writingDescribeImages === false ? "noimg" : "img";
+    const storeKey = `${embeddingKey}:${rootInfo.root}:${describeFlag}`;
+    if (!this._writingResearchStore || this._writingResearchStoreKey !== storeKey) {
+      const store = new ContextStore({
+        adapter: this.app.vault.adapter,
+        path: `${this.manifest.dir}/research-index.json`,
+        embed: (texts) => this.embedTexts(texts, "document"),
+        embeddingKey,
+        extractDeps: {
+          htmlToMarkdown: obsidian.htmlToMarkdown,
+          loadPdfJs: obsidian.loadPdfJs,
+          ...(this.settings && this.settings.writingDescribeImages === false
+            ? {}
+            : { describeImage: (bytes, mime) => this.describeImage(bytes, mime) }),
+        },
+      });
+      await store.load();
+      this._writingResearchStore = store;
+      this._writingResearchStoreKey = storeKey;
+    }
+    return { store: this._writingResearchStore, rootInfo };
+  }
+
   vaultIndexStatus() { // writing-mode: task 9 vault index readiness for write evidence (load failure or unloaded index means the vault was not searched)
     const failure = String(this.semanticIndexLoadFailure || "");
     if (failure) return { ready: false, reason: failure };
@@ -13972,6 +14004,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // writing-mode: task 10 forward evidence toggles (default true when omitted)
       useVault: options && Object.prototype.hasOwnProperty.call(options, "useVault") ? options.useVault !== false : undefined,
       useContext: options && Object.prototype.hasOwnProperty.call(options, "useContext") ? options.useContext !== false : undefined,
+      // writing-mode: task 11 forward the deep-research evidence toggle
+      useResearch: options && Object.prototype.hasOwnProperty.call(options, "useResearch") ? options.useResearch !== false : undefined,
     });
   }
 
@@ -21807,6 +21841,7 @@ class SemanticTodoistView extends ItemView {
     if (!this.collaborateFeaturesButton) return;
     const length = this.plugin.settings.writingDraftLength === "brief" ? "Brief" : this.plugin.settings.writingDraftLength === "detailed" ? "Detailed" : "Standard";
     const parts = [];
+    if (this.plugin.settings.writingUseResearch !== false) parts.push("Research");
     if (this.plugin.settings.writingUseVault !== false) parts.push("Vault");
     if (this.plugin.settings.writingUseContext !== false) parts.push("Context");
     this.collaborateFeaturesButton.textContent = parts.length ? `${length} · ${parts.join(" + ")}` : length;
@@ -21834,6 +21869,15 @@ class SemanticTodoistView extends ItemView {
     menu.addItem((evidenceMenu) => {
       evidenceMenu.setTitle("Evidence");
       const sub = evidenceMenu.setSubmenu() || evidenceMenu.submenu;
+      sub.addItem((choice) => {
+        choice.setTitle("Deep research");
+        choice.setChecked(this.plugin.settings.writingUseResearch !== false);
+        choice.onClick(async () => {
+          this.plugin.settings.writingUseResearch = this.plugin.settings.writingUseResearch === false;
+          await this.plugin.saveSettings();
+          this.updateCollaborateFeaturesLabel();
+        });
+      });
       sub.addItem((choice) => {
         choice.setTitle("Vault notes");
         choice.setChecked(this.plugin.settings.writingUseVault !== false);
@@ -21974,6 +22018,7 @@ class SemanticTodoistView extends ItemView {
           // writing-mode: task 10 forward evidence toggles from settings
           useVault: this.plugin.settings.writingUseVault !== false,
           useContext: this.plugin.settings.writingUseContext !== false,
+          useResearch: this.plugin.settings.writingUseResearch !== false,
         });
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
         const draftText = composeDraft(result.markdown || "", result.footnotes || "");
@@ -22627,6 +22672,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     const writing = settingsDisclosure(containerEl, "Writing", "Sidebar Write mode settings for drafting evidence-based prose into notes.", false);
     textSetting(writing, "Context folder", "Default in-vault folder 'Writing Context', or an absolute desktop path outside the vault. On mobile, an external path falls back to the vault folder.", this.plugin, "writingContextFolder");
     toggleSetting(writing, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
+    toggleSetting(writing, "Deep research evidence", "Use saved Deep research notes from the Research folder as evidence, ranked above vault notes.", this.plugin, "writingUseResearch");
     new Setting(writing).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));
 
     const mcp = settingsDisclosure(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.", false);

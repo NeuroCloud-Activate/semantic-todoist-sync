@@ -555,9 +555,15 @@
   text-overflow: ellipsis;
 }
 
+.semantic-todoist-collaborate-button {
+  border: 1px solid var(--background-modifier-border);
+}
+
 .semantic-todoist-collaborate-button.is-active {
-  border-color: #7567e8;
-  color: #7567e8;
+  background: rgba(117, 103, 232, 0.22);
+  border-color: #b8afff;
+  color: #e6e2ff;
+  font-weight: 600;
 }
 
 .semantic-todoist-collaborate-features {

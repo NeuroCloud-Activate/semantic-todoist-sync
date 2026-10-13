@@ -89,7 +89,7 @@ Exactly 65 `// writing-mode:` tags; table rows = 65; tag count = 65; no untagged
 | 43 | 5 | `geminiResponse` (line 14620) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
 | 44 | 8 fix 2 | `SemanticTodoistView` constructor (line 21651) | `this.writing = false` initial in-flight state | Pre-await exits (e.g. no open note) leave a defined flag instead of `undefined` |
 | 45 | 10 | `SemanticTodoistView.render()` (line 21758) | Chat/write placeholders stored on `dataset`; Enter routes to `write()` when mode is on, `ask()` when off | Mode swaps prompt behavior |
-| 46 | 12 | `SemanticTodoistView.render()` (line 21767) | `topRow` holds the web-search globe, Collaborate and Run buttons above Ask/Tasks; the action label sits above its dropdown | Layout request |
+| 46 | 12 | `SemanticTodoistView.render()` (line 21768) | `topRow` holds the web-search globe, Collaborate and Run buttons below the action row (label above its dropdown), above Ask/Tasks | Layout request |
 | 47 | 10 | `SemanticTodoistView.render()` (line 21777) | Action-row label stored as `this.actionLabelEl` so it reads `Collaborate:` in collaborate mode | Label matches the mode |
 | 48 | 8 fix 1 | `SemanticTodoistView.render()` (line 21791) | `this.collaborateButton` stored on instance | Enables in-flight disable/restore from `write()` |
 | 49 | 10 | `SemanticTodoistView.render()` (line 21795) | `semantic-todoist-collaborate-features` button in the action row, hidden unless mode is on | Features menu entry point |

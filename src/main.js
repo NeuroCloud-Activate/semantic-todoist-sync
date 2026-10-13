@@ -21764,8 +21764,8 @@ class SemanticTodoistView extends ItemView {
       if (this.plugin.settings.writingCollaborateMode === true) this.write();
       else this.ask();
     });
-    const topRow = main.createDiv({ cls: "semantic-todoist-top-row" }); // writing-mode: globe, Collaborate and Run sit above Ask/Tasks
     const actionRow = main.createDiv({ cls: "semantic-todoist-action-row" });
+    const topRow = main.createDiv({ cls: "semantic-todoist-top-row" }); // writing-mode: dropdown row, then globe/Collaborate/Run, above Ask/Tasks
     const webSearchModifier = topRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
     this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
     setIcon(this.webSearchToggleEl, "globe-2");

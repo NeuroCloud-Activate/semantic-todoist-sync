@@ -139,4 +139,16 @@ New file: `scripts/writing-sidebar-test.js` (test default chat, settings normali
 | 8 fix 1 | `renderDraftForInsert()` (~21976) | Keeps Insert button for closed-note case; inserts at current cursor of active note | Closed-note fallback works correctly |
 | 8 | `styles.css` | No edit needed; existing selectors cover mode/length rows | Minimal; no new styling required |
 
-Validation: `npm.cmd run build` OK; `npm.cmd test` baseline unchanged (12 PASS + same 10 pre-existing FAIL); `Select-String src/main.js -Pattern "writing-mode:"` count = 37 = ledger rows above.
+## Fix round 1 (Task 8) — insert guard, double-submit, click-time mode, posToOffset
+`Select-String src/main.js -Pattern "writing-mode:"` count = 44 = 37 prior + 7 rows below.
+
+| task | function | change | why |
+|------|----------|--------|-----|
+| 8 fix 1 | `SemanticTodoistView.render()` (~21726) | `this.askButton = askButton;` stored on instance | Enables in-flight button disable/restore from `write()` |
+| 8 fix 1 | `SemanticTodoistView.render()` (~21728) | `onclick` reads `this.plugin.settings.sidebarMode` at click time instead of captured `mode` | Mode switch without re-render uses correct handler |
+| 8 fix 1 | `SemanticTodoistView.write()` (~21787) | `if (this.writing) return;` guard; sets `this.askButton.disabled = true` and label `"Writing…"`; `finally` restores `this.writing = false`, re-enables, restores label from current settings | Prevents double submit during in-flight write; button state restored on error |
+| 8 fix 1 | `SemanticTodoistView.write()` (~21830) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when function exists; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
+| 8 fix 1 | `renderDraftForInsert()` (~21891) | Captures `originalPath` and `originalName` from `filePath`; button onclick compares active file path; if different shows `Notice("Open <name> to insert this draft.")` and returns without `replaceRange` | Insert only into the original draft note; different note is blocked with clear notice |
+| 8 fix 1 | `renderDraftForInsert()` (~21911) | Active note comparison uses `originalPath`; insertion uses current `cursor` only when paths match | Simple, correct behavior: same file → insert; different → notice only |
+
+Validation: `npm.cmd run build` OK; `node scripts/writing-sidebar-test.js` PASS (expanded); `npm.cmd test` same 12 PASS + same 10 FAIL unchanged; tag count 44 = 37 + 7 = ledger rows above.

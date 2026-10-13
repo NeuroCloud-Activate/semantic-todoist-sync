@@ -21725,8 +21725,11 @@ class SemanticTodoistView extends ItemView {
     const toolbar = main.createDiv({ cls: "semantic-todoist-toolbar" });
     const mode = this.plugin.settings.sidebarMode || "chat";
     const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: mode === "write" ? "Draft cited evidence-based prose into the open note" : "Ask a chat question using vault context" }, text: mode === "write" ? "Write" : "Ask" });
+    this.askButton = askButton; // writing-mode: store button reference for in-flight guard
     askButton.onclick = async () => {
-      if (mode === "write") await this.write();
+      // writing-mode: read mode at click time, not render time
+      const currentMode = (this.plugin && this.plugin.settings && this.plugin.settings.sidebarMode) ? this.plugin.settings.sidebarMode : "chat";
+      if (currentMode === "write") await this.write();
       else await this.ask();
     };
     // writing-mode: length select shown only in Write mode; not persisted
@@ -21781,6 +21784,13 @@ class SemanticTodoistView extends ItemView {
         this.setStatus("Ready");
         return;
       }
+      // writing-mode: double-submit guard
+      if (this.writing) return;
+      this.writing = true;
+      if (this.askButton) {
+        this.askButton.disabled = true;
+        this.askButton.textContent = "Writing…";
+      }
       // writing-mode: capture open Markdown note and position BEFORE await
       const view = this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(MarkdownView) : null;
       const activeMarkdownView = view || null;
@@ -21817,6 +21827,14 @@ class SemanticTodoistView extends ItemView {
       };
       const activeText = value;
       const cursorOffset = (function () {
+        // writing-mode: prefer posToOffset when available (Obsidian normalises getValue to \n)
+        if (editor && typeof editor.posToOffset === "function" && typeof editor.getCursor === "function") {
+          try {
+            return editor.posToOffset(editor.getCursor("from"));
+          } catch (e) {
+            // fall through to line-based split
+          }
+        }
         const c = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
         const text = editor.getValue ? editor.getValue() : "";
         const lines = text.split ? text.split("\n") : [];
@@ -21879,6 +21897,14 @@ class SemanticTodoistView extends ItemView {
           this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
           this.setStatus(`Writing failed: ${error.message || error}`);
         }
+      } finally {
+        // writing-mode: restore button after write finishes (success or error)
+        this.writing = false;
+        if (this.askButton) {
+          this.askButton.disabled = false;
+          const currentMode = (this.plugin && this.plugin.settings && this.plugin.settings.sidebarMode) ? this.plugin.settings.sidebarMode : "chat";
+          this.askButton.textContent = currentMode === "write" ? "Write" : "Ask";
+        }
       }
     } catch (error) {
       console.error(error);
@@ -21888,10 +21914,13 @@ class SemanticTodoistView extends ItemView {
   }
 
   renderDraftForInsert(result, filePath, editor) {
+    // writing-mode: capture original note path for insert check
+    const originalPath = filePath || "";
+    const originalName = originalPath ? (originalPath.split ? originalPath.split("/").pop() || originalPath : originalPath) : "this note";
     const draftMarkdown = (result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : "");
     this.addMessage("user", `Write: ${this.promptEl ? this.promptEl.value.trim() : "(draft)"}`);
     this.addMessage("assistant", draftMarkdown || "No draft generated.");
-    // Add an Insert button that inserts at current cursor of active note
+    // Add an Insert button that inserts at current cursor of active note (same file only)
     const insertBtn = this.messagesEl ? this.messagesEl.createEl("button", { text: "Insert at current cursor", cls: "semantic-todoist-insert-button" }) : null;
     if (insertBtn) {
       insertBtn.onclick = async () => {
@@ -21899,6 +21928,12 @@ class SemanticTodoistView extends ItemView {
         const activeMarkdownView = app?.workspace?.getActiveViewOfType ? app.workspace.getActiveViewOfType(typeof require !== "undefined" ? (function () {
           try { return require("obsidian").MarkdownView; } catch (e) { return null; }
         })() : null) : null;
+        // writing-mode: compare active note path to original draft file
+        const activeFilePath = (activeMarkdownView && activeMarkdownView.file && activeMarkdownView.file.path) ? activeMarkdownView.file.path : "";
+        if (activeFilePath && activeFilePath !== originalPath) {
+          new Notice(`Open ${originalName} to insert this draft.`);
+          return;
+        }
         if (activeMarkdownView && activeMarkdownView.editor && activeMarkdownView.file) {
           const ed = activeMarkdownView.editor;
           const cursor = ed.getCursor ? ed.getCursor() : { line: 0, ch: 0 };

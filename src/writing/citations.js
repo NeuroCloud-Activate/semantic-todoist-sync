@@ -16,6 +16,23 @@ function isUnsafeName(s) {
   return /[|\[\]#]/.test(s);
 }
 
+function normaliseHeading(s) {
+  // Strip leading markdown heading markers
+  let h = String(s || "").trim();
+  h = h.replace(/^#{1,6}\s*/, "").trim();
+  // If nested headings joined by write.js (>), use last segment only
+  if (h.includes(" > ")) {
+    const parts = h.split(" > ");
+    h = parts[parts.length - 1];
+  }
+  h = h.trim();
+  // Replace characters that break wikilink heading anchors
+  h = h.replace(/[#|[\]^]/g, " ");
+  // Collapse whitespace
+  h = h.replace(/\s+/g, " ").trim();
+  return h;
+}
+
 function basenameOf(p) {
   const parts = String(p).split(/[\\/]/);
   return parts[parts.length - 1];
@@ -29,13 +46,15 @@ function labelFor(source) {
   if (!source || typeof source.kind !== "string") return "";
   if (source.kind === "vault") {
     const path = source.path || "";
-    const heading = source.heading || "";
+    const rawHeading = source.heading || "";
+    const heading = normaliseHeading(rawHeading);
+    const baseName = basenameOf(stripMdExtension(path));
     if (isUnsafeName(path)) {
-      const base = basenameOf(stripMdExtension(path));
-      return heading ? base + ", " + heading : base;
+      return heading ? baseName + ", " + heading : baseName;
     }
     const noMd = stripMdExtension(path);
-    return heading ? "[[" + noMd + "#" + heading + "]]" : "[[" + noMd + "]]";
+    const omitHeading = !heading || heading.toLowerCase() === baseName.toLowerCase();
+    return omitHeading ? "[[" + noMd + "]]" : "[[" + noMd + "#" + heading + "]]";
   }
   if (source.kind === "context-vault") {
     const path = source.path || "";

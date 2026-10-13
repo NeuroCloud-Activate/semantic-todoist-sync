@@ -225,4 +225,25 @@ function ev(eid, source) {
   console.log("PASS unknown eid leaves single space");
 }
 
-process.stdout.write(JSON.stringify({ passed: 14, failed: 0 }, null, 2) + "\n");
+// 14b: heading normalisation real values
+{
+  const r1 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Projects/Intake Redesign.md", heading: "# Intake Redesign" })], "");
+  assert.strictEqual(r1.footnotes, "[^1]: [[Projects/Intake Redesign]]", "repeated heading omitted: # Intake Redesign");
+
+  const r2 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Projects/Intake Redesign.md", heading: "## Goals" })], "");
+  assert.strictEqual(r2.footnotes, "[^1]: [[Projects/Intake Redesign#Goals]]", "heading normalised: ## Goals");
+
+  const r3 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Projects/Intake Redesign.md", heading: "Plan > ## Risks #1" })], "");
+  assert.strictEqual(r3.footnotes, "[^1]: [[Projects/Intake Redesign#Risks 1]]", "nested + special chars: Plan > ## Risks #1");
+
+  const r4 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Projects/Intake Redesign.md", heading: "### Q&A | misc" })], "");
+  assert.strictEqual(r4.footnotes, "[^1]: [[Projects/Intake Redesign#Q&A misc]]", "pipe and whitespace: ### Q&A | misc");
+
+  const r5 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Folder/a|b.md", heading: "## H" })], "");
+  assert.ok(!r5.footnotes.includes("[["), "unsafe vault path no wikilink");
+  assert.strictEqual(r5.footnotes, "[^1]: a|b, H", "unsafe vault plain text with normalised heading");
+
+  console.log("PASS heading normalisation real values");
+}
+
+process.stdout.write(JSON.stringify({ passed: 15, failed: 0 }, null, 2) + "\n");

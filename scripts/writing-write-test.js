@@ -394,6 +394,105 @@ async function main() {
     console.log("PASS task 9 empty context store still marked searched");
   }
 
+  // Full-section vault evidence — (i) two chunks of one note collapse to a single item.
+  {
+    const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Research Team/August 17, 2026.md", section: "Intro", text: "first chunk text" },
+      { path: "Research Team/August 17, 2026.md", section: "Intro", text: "second chunk text" },
+    ];
+    plugin.readNoteText = async () => "# Title\n\nWhole note body used as evidence.\n";
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.evidenceCount, 1, "two chunks of one note give one item");
+    assert.strictEqual(result.sources[0].path, "Research Team/August 17, 2026.md");
+    assert.ok(plugin.captured.request.user.includes("Whole note body used as evidence."), "expanded note text in prompt");
+    console.log("PASS vault chunks of one note collapse to one evidence item");
+  }
+
+  // Full-section vault evidence — (ii) answer line outside the chunk, same section, is included.
+  {
+    const answerLine = "After debate, we have to push it to first week of november.";
+    const filler = "Filler minutes line to pad the note body.\n";
+    const note = "# August 17 Meeting\n\n## Attendance\nAlice and Bob were present.\n\n## Committee Schedule\nThe committee reviewed the timeline.\nretrieved fragment about agenda planning details.\n" + answerLine + "\n\n## Budget\n" + filler.repeat(150) + "\n## Next Steps\n" + filler.repeat(150) + "\n";
+    assert.ok(note.length > 10000, `long-note fixture is long, got ${note.length}`);
+    const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Research Team/August 17, 2026.md", section: "Committee Schedule", text: "retrieved fragment about agenda planning details." },
+    ];
+    plugin.readNoteText = async () => note;
+    const result = await writeWithEvidence(plugin, { instruction: "When is the committee meeting?", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.evidenceCount, 1);
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes(answerLine), "answer line from the same section is in the evidence");
+    assert.ok(userPrompt.includes("Section: Committee Schedule"), "section header names the heading");
+    console.log("PASS long note expands to the heading section holding the answer line");
+  }
+
+  // Full-section vault evidence — (iii) short note with front matter is used whole, front matter stripped.
+  {
+    const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Notes/short.md", section: "", text: "stale chunk text" },
+    ];
+    plugin.readNoteText = async () => "---\ntitle: Short Note\ntags: [demo]\n---\n# Hello\n\nShort body text.\n";
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.evidenceCount, 1);
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("Short body text."), "whole short note used");
+    assert.ok(!userPrompt.includes("title: Short Note"), "front matter stripped");
+    console.log("PASS short note used whole with front matter stripped");
+  }
+
+  // Full-section vault evidence — (iv) missing or unreadable note falls back to chunk text.
+  {
+    for (const vault of [
+      { getAbstractFileByPath: () => null },
+      { getAbstractFileByPath: () => ({}), cachedRead: async () => { throw new Error("read failed"); } },
+    ]) {
+      const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+      plugin.retrieveSemanticContext = async () => [
+        { path: "Notes/missing.md", section: "Gone", text: "fallback chunk text here" },
+      ];
+      plugin.app.vault = vault;
+      const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+      assert.strictEqual(result.evidenceCount, 1);
+      assert.ok(plugin.captured.request.user.includes("fallback chunk text here"), "chunk text fallback used");
+    }
+    console.log("PASS missing or unreadable note falls back to chunk text");
+  }
+
+  // Full-section vault evidence — (v) per-note 3000-char window and 20,000-char total budget.
+  {
+    const bigLines = ("## Big Section\n" + "numbered filler line for the oversized section body.\n".repeat(300)).split("\n");
+    const marker = "retrieved marker fragment near the middle of the big section.";
+    bigLines.splice(150, 0, marker);
+    const bigNote = "# Big Note\n\n" + bigLines.join("\n");
+    assert.ok(bigNote.length > 10000, `oversized fixture is long, got ${bigNote.length}`);
+    const solo = makeStub({ context: 0, modelText: "draft [E1]" });
+    solo.retrieveSemanticContext = async () => [{ path: "Notes/big.md", section: "Big Section", text: marker }];
+    solo.readNoteText = async () => bigNote;
+    const soloResult = await writeWithEvidence(solo, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(soloResult.evidenceCount, 1);
+    const soloBlock = solo.captured.request.user.split('<evidence id="E1"')[1].split("</evidence>")[0];
+    const soloTextLines = soloBlock.split("\n");
+    assert.strictEqual(soloTextLines[1], "Section: Big Section", "heading line first, got " + JSON.stringify(soloTextLines[1]));
+    assert.ok(soloTextLines.slice(2).join("\n").length <= 3000, "section window capped at 3000 chars");
+    assert.ok(soloBlock.includes(marker), "window centred on the chunk");
+
+    const plugin = makeStub({ context: 0, modelText: "draft" });
+    plugin.retrieveSemanticContext = async () => Array.from({ length: 8 }, (_, i) => ({ path: `Notes/budget-${i}.md`, section: "Part", text: `chunk ${i}` }));
+    const body = "## Part\n" + "z ".repeat(1480);
+    assert.ok(body.length <= 3000 && body.length > 2500, `budget fixture is ~3000 chars, got ${body.length}`);
+    plugin.readNoteText = async () => body;
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.ok(result.evidenceCount < 8, `budget drops trailing notes, got ${result.evidenceCount}`);
+    const blocks = [...plugin.captured.request.user.matchAll(/<evidence id="E\d+"[^>]*>([\s\S]*?)<\/evidence>/g)];
+    assert.strictEqual(blocks.length, result.evidenceCount, "one prompt block per evidence item");
+    const total = blocks.reduce((n, m) => n + m[1].length - 2, 0);
+    assert.ok(total <= 20000, `vault evidence within the 20,000-char budget, got ${total}`);
+    console.log("PASS oversized section windowed to 3000 chars and total budget enforced");
+  }
+
   console.log("writing-write-test: PASS");
 }
 

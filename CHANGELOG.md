@@ -1,4 +1,14 @@
 # Changelog
+## 0.9.20 - 2026-10-13
+### Improved
+- **Task creation and descriptions now see more of the right notes.** The step that picks which note passages go to the model used to take its top 30 passages by meaning score, and often spent about 11 of those slots on repeats from the same few notes. It now takes at most one passage per note from that list and looks at 30 keyword matches instead of 20. On our three hand-checked test sets (80, 154 and 164 task lines) the share of correct notes that reach the model rose by 8 to 13 points (59.7% to 68.3% on the main set, confidence interval 5.9 to 11.6), at about 10 more passages per task (46 to 56, roughly 22% more prompt text). In a live Obsidian run on 12 of those task lines, 30 of 49 correct notes reached the model instead of 23.
+### Fixed
+- **Subtasks no longer repeat their parent task.** A subtask whose wording is already contained in its parent task, or in an earlier subtask, is dropped. A subtask that repeats a different main task in the same plan (for example a "work through the priority list" task whose children restate the other tasks) is dropped too. Subtasks that add any new wording, already exist in Todoist, or have their own date are always kept, and so are split marked actions. Replaying 35 saved real task plans from two models, 7 of 245 subtasks were dropped and none restated anything afterwards.
+### Notes
+- In live Obsidian runs on 8 test notes with at least four marked tasks each, using two different models (DeepSeek v4.1 flash on low reasoning and Claude Haiku 5.5 on medium reasoning), released and new builds found the same number of main tasks on every note and the descriptions cited real notes. Differences between the two builds were no larger than the differences between two runs of the same build, so this release is not claiming better descriptions, only that more of the right notes reach the model and that duplicated subtasks are gone. Task titles agreed 0.50 to 0.91 between builds against 0.64 to 0.86 between two runs of the same build.
+- Our test gateway cached repeated identical requests, which made some earlier repeat runs look more alike than they were. The comparison above sent every request with the gateway's cache bypass on, so repeated runs are genuinely independent.
+- A very low "Maximum subtasks per main task" setting (2) made task creation fail on one test note with a "ranked corpus is empty" message about one time in three on the released version too; it is not fixed here, so leave the setting at its default of 4.
+- Measured and not included: keyword scoring in the task search, link and date signals, and several ways of reordering the note list. The first two helped in offline checks but have not been tested inside the plugin yet; reordering did nothing, because the model receives a selected set rather than the ordered list.
 ## 0.9.19 - 2026-10-12
 
 ### Improved

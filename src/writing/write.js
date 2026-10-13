@@ -67,6 +67,18 @@ function vaultEvidenceSource(chunk) {
   return heading ? { kind: "vault", path, heading } : { kind: "vault", path };
 }
 
+function escapeSourceAttribute(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function neutraliseEvidenceTags(text) {
+  return String(text || "").replace(/<(?=\/?evidence)/gi, "&lt;");
+}
+
 function evidenceLabel(entry) {
   const source = (entry && entry.source) || {};
   if (source.kind === "vault") return source.heading ? `${source.path}#${source.heading}` : source.path;
@@ -137,7 +149,7 @@ async function writeWithEvidence(plugin, options) {
   }
 
   const evidenceBlock = evidence.length
-    ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${evidenceLabel(entry)}">\n${entry.text}\n</evidence>`).join("\n\n")
+    ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${escapeSourceAttribute(evidenceLabel(entry))}">\n${neutraliseEvidenceTags(entry.text)}\n</evidence>`).join("\n\n")
     : "No evidence was found in the vault or context folder.";
 
   const modelChoice = plugin.aiModelForRequest("write", {});

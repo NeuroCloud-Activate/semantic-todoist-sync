@@ -314,6 +314,35 @@ async function main() {
     console.log("PASS fix 4 empty/whitespace instruction rejected with code empty-instruction before model call");
   }
 
+  // Fix round 2 — evidence attribute escaping and body tag neutralisation.
+  {
+    // A label with `"` should yield a well-formed attribute (escaped to &quot;).
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok" });
+    plugin.retrieveSemanticContext = async () => [{ chunk: { path: 'Notes/"quoted".md', section: '', text: 'body text' } }];
+    const result = await writeWithEvidence(plugin, { instruction: "X", length: "standard", active: ACTIVE });
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes('source="Notes/&quot;quoted&quot;.md"'), 'label quote escaped to &quot;');
+    assert.ok(!userPrompt.includes('Notes/"quoted"'), 'raw quote not present in attribute');
+    assert.ok(userPrompt.includes('<evidence id="E1"'), 'opening tag intact');
+    assert.ok(userPrompt.includes("</evidence>"), 'closing tag intact');
+    console.log("PASS fix 2 quote in source label escaped");
+  }
+  {
+    // Body containing `</evidence>` and `</EVIDENCE >` should produce exactly one opening and one closing tag per item.
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok" });
+    plugin.retrieveSemanticContext = async () => [{ chunk: { path: 'Notes/x.md', section: '', text: 'before </evidence> middle </EVIDENCE > after' } }];
+    const result = await writeWithEvidence(plugin, { instruction: "X", length: "standard", active: ACTIVE });
+    const userPrompt = plugin.captured.request.user;
+    const openTags = (userPrompt.match(/<evidence id=/g) || []).length;
+    const closeTags = (userPrompt.match(/<\/evidence>/g) || []).length;
+    assert.strictEqual(openTags, 1, `exactly one opening tag, got ${openTags}`);
+    assert.strictEqual(closeTags, 1, `exactly one closing tag, got ${closeTags}`);
+    assert.ok(userPrompt.includes("before &lt;/evidence>"), 'closing tag neutralised (lowercase)');
+    assert.ok(userPrompt.includes("middle &lt;/EVIDENCE"), 'closing tag neutralised (uppercase)');
+    assert.ok(userPrompt.includes("after"), 'remaining body text preserved');
+    console.log("PASS fix 2 body tags neutralised (lower + upper case) with exactly 1 open/1 close");
+  }
+
   console.log("writing-write-test: PASS");
 }
 

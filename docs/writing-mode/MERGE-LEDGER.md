@@ -46,9 +46,9 @@ Exactly 65 `// writing-mode:` tags; table rows = 65; tag count = 65; no untagged
 |---|------|-----------------------------------|--------|-----|
 | 1 | 10 | `obsidian` import (line 5) | `Menu` destructured for the collaborate Features menu | Menu available to the sidebar view |
 | 2 | 7 | `AI_OPERATION_KEYS` module scope (line 25) | Added `"write"` to frozen operation list | `write` resolves to primary chat model like `chat-query` |
-| 3 | 12 | `WRITING_CONTEXT_FOLDER_DEFAULT` (line 178) | 12 | Default context folder is `Semantic Todoist Sync/Context`, inside the plugin's vault folder | Context folder lives under the plugin folder by default
+| 3 | 12 | `WRITING_CONTEXT_FOLDER_DEFAULT` (line 178) | Default context folder is `Semantic Todoist Sync/Context`, inside the plugin's vault folder | Context folder lives under the plugin folder by default
 | 4 | 8 | `normalizeStableSettings` (line 2845) | Normalizes `writingContextFolder` (default `"Writing Context"`) and `writingDescribeImages` (`true`); invalid folder falls back | New writing settings default safely |
-| 5 | 12 | `normalizeStableSettings` (writingContextFolder) (line 2856) | 12 | Maps the old default `Writing Context` to `Semantic Todoist Sync/Context` | Existing installs move to the plugin folder
+| 5 | 12 | `normalizeStableSettings` (writingContextFolder) (line 2856) | Maps the old default `Writing Context` to `Semantic Todoist Sync/Context` | Existing installs move to the plugin folder
 | 6 | 10 | `normalizeStableSettings` (line 2858) | Normalizes `writingCollaborateMode` (`false` unless `true`), `writingDraftLength` (`brief|standard|detailed`, invalid → `standard`), `writingUseVault`/`writingUseContext` (anything but `false` → `true`) | Collaborate toggle settings default safely |
 | 7 | 11 | `normalizeStableSettings` (line 2864) | `writingUseResearch` defaults true unless explicitly `false` | Deep-research evidence toggle persists safely |
 | 8 | 8 | `DEFAULT_SETTINGS` (line 3603) | `writingContextFolder: "Writing Context"` key added | Persisted context-folder default |
@@ -58,7 +58,7 @@ Exactly 65 `// writing-mode:` tags; table rows = 65; tag count = 65; no untagged
 | 12 | 10 | `DEFAULT_SETTINGS` (line 3607) | `writingUseVault: true` key added | Vault evidence on by default |
 | 13 | 10 | `DEFAULT_SETTINGS` (line 3608) | `writingUseContext: true` key added | Context-folder evidence on by default |
 | 14 | 11 | `DEFAULT_SETTINGS` (line 3609) | `writingUseResearch: true` key added | Deep-research evidence on by default |
-| 15 | 12 | `onload` (line 4613) | 12 | Calls `ensureWritingContextFolder()` once the workspace is ready | Creates the folder on startup
+| 15 | 12 | `onload` (line 4613) | Calls `ensureWritingContextFolder()` once the workspace is ready | Creates the folder on startup
 | 16 | 7 | `SemanticTodoistSyncPlugin.onload` (line 4614) | Added `semantic-todoist-rescan-context` command calling `rescanContextFolder()` | Manual rescan entry point |
 | 17 | 8 | `SemanticTodoistSyncPlugin.onload` (line 4615) | Added `semantic-todoist-collaborate` command calling `collaborateOnActiveNote()` | "Collaborate on active note": opens sidebar and focuses prompt |
 | 18 | 8 | `collaborateOnActiveNote` (line 8748) | Opens sidebar, focuses `promptEl` without running model | Opens sidebar and focuses prompt without running model |
@@ -69,14 +69,14 @@ Exactly 65 `// writing-mode:` tags; table rows = 65; tag count = 65; no untagged
 | 23 | 5 fix 1 | `describeImage` (line 13923) | Passes `system: "You extract research evidence from images."` | Responses-API `input_text` always carries string text |
 | 24 | 7 | `getContextStore` (line 13929) | New lazy `ContextStore` at `${manifest.dir}/context-index.json`; loaded once per embedding identity; includes `describeImage` unless `writingDescribeImages === false` | Separate store for Write mode; lazy `require` keeps mobile startup clean |
 | 25 | 10 | `getContextStore` (line 13935) | Describe-images flag included in `storeKey` | Toggling Describe images rebuilds the store on next write |
-| 26 | 12 | `getContextStore()` (line 13958) | 12 | Ensures the vault context folder exists before the store syncs | Folder exists before any sync
+| 26 | 12 | `getContextStore()` (line 13958) | Ensures the vault context folder exists before the store syncs | Folder exists before any sync
 | 27 | 11 | `getResearchStore` (line 13962) | Separate `research-index.json` store over `Semantic Todoist Sync/Research`; null when the toggle is off | Saved Deep research notes become a searchable evidence source |
 | 28 | 9 | `vaultIndexStatus` (line 13992) | Returns `{ ready:false, reason }` from `semanticIndexLoadFailure`/`semanticIndexLoaded`, else `{ ready:true }` | Write evidence skips the vault only when the status bar shows Load failed |
 | 29 | 7 | `writeWithEvidence` (line 13999) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays stub-friendly seam; orchestration in module |
 | 30 | 10 | `writeWithEvidence` (line 14007) | Forwards `useVault`/`useContext` (default `true` when omitted) to `src/writing/write.js` | Evidence toggles take effect |
 | 31 | 11 | `writeWithEvidence` (line 14010) | Forwards `useResearch` to `src/writing/write.js` | Deep-research evidence toggle takes effect |
 | 32 | 7 fix 1 | `searchWebForWriting` (line 14015) | New exposed plugin method: `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` with no throw | Controller ruling: keep web-search toggle; stub-testable |
-| 33 | 12 | `ensureWritingContextFolder()` (line 14028) | 12 | Creates the vault context folder; no-op for external folders; failures ignored (retried on write or rescan) | Folder exists without a manual rescan
+| 33 | 12 | `ensureWritingContextFolder()` (line 14028) | Creates the vault context folder; no-op for external folders; failures ignored (retried on write or rescan) | Folder exists without a manual rescan
 | 34 | 7 | `rescanContextFolder` (line 14036) | Resolves root, ensures vault folder, surfaces root `notice`, syncs, then `Notice` with counted added/changed/removed/skipped | Manual rescan command body |
 | 35 | 5 | `openaiResponse` (line 14047) | New optional `images = null` param | Carries image inputs through shared path |
 | 36 | 5 | `openaiResponse` (line 14054) | `const imageInputs = writingImageInputs(images)` | Normalizes once; `[]` keeps existing text bodies byte-identical |

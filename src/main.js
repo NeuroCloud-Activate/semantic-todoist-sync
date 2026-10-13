@@ -21910,6 +21910,13 @@ class SemanticTodoistView extends ItemView {
       console.error(error);
       this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
       this.setStatus(`Writing failed: ${error.message || error}`);
+      // writing-mode: restore button after write finishes (success or error)
+      this.writing = false;
+      if (this.askButton) {
+        this.askButton.disabled = false;
+        const currentMode = (this.plugin && this.plugin.settings && this.plugin.settings.sidebarMode) ? this.plugin.settings.sidebarMode : "chat";
+        this.askButton.textContent = currentMode === "write" ? "Write" : "Ask";
+      }
     }
   }
 

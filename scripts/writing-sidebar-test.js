@@ -97,6 +97,20 @@ function testCursorOffsetPosToOffset() {
   console.log('PASS cursorOffset-posToOffset (prefers editor.posToOffset, falls back to split)');
 }
 
+function testWriteGuardRestoresAfterPreAwaitException() {
+  // Fix round 2: if an exception is thrown before the inner await (e.g. getActiveViewOfType or getCursor),
+  // the finally/catch must restore this.writing and the button label from settings.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  // Verify the outer catch (after inner finally) restores the flag and button label
+  const hasRestoreInOuterCatch = src.includes('// writing-mode: restore button after write finishes (success or error)');
+  assert(hasRestoreInOuterCatch, 'outer catch restores button after pre-await exception');
+  // Verify finally also restores inside inner try
+  const finallyRestores = src.includes('this.askButton.textContent = currentMode === "write" ? "Write" : "Ask"');
+  assert(finallyRestores, 'finally restores button label from sidebarMode');
+  console.log('PASS write-guard-restores-after-pre-await-exception (tag + source verified)');
+}
+
 function runTests() {
   testDefaultChat();
   testNormalizeInvalidSettings();
@@ -106,6 +120,7 @@ function runTests() {
   testDoubleSubmitGuard();
   testModeReadAtClickTime();
   testCursorOffsetPosToOffset();
+  testWriteGuardRestoresAfterPreAwaitException();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

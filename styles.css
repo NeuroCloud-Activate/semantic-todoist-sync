@@ -556,8 +556,8 @@
 }
 
 .semantic-todoist-collaborate-button.is-active {
-  border-color: var(--text-accent);
-  color: var(--text-accent);
+  border-color: #7567e8;
+  color: #7567e8;
 }
 
 .semantic-todoist-collaborate-features {

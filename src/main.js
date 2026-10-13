@@ -21593,6 +21593,7 @@ class SemanticTodoistView extends ItemView {
     this.statusDisplayEntries = new Map();
     this.statusRefreshTimer = null;
     this.webSearchMode = "off";
+    this.writing = false; // writing-mode: Write in-flight flag starts false so pre-await exits leave a defined state
   }
 
   getViewType() { return VIEW_TYPE; }
@@ -21793,10 +21794,8 @@ class SemanticTodoistView extends ItemView {
       }
       // writing-mode: double-submit guard moved immediately before await so pre-await exits don't leave it stuck
       if (this.writing) return;
-      // writing-mode: capture open Markdown note and position BEFORE await (fallback to lastActiveMarkdownLeaf like getActiveMarkdownContext)
-      const MarkdownViewLocal = (typeof MarkdownView !== "undefined" ? MarkdownView : null);
-      const activeMarkdown = this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(MarkdownViewLocal || null) : null;
-      const activeMarkdownView = (activeMarkdown || (this.plugin && this.plugin.lastActiveMarkdownLeaf && this.plugin.lastActiveMarkdownLeaf.view instanceof MarkdownViewLocal ? this.plugin.lastActiveMarkdownLeaf.view : null)) || null;
+      // writing-mode: capture open Markdown note and position BEFORE await (fallback to lastActiveMarkdownLeaf, most-recent, then visible leaf)
+      const activeMarkdownView = findRequestTimeMarkdownView(this.plugin && this.plugin.app ? this.plugin.app : null, this.plugin);
       if (!activeMarkdownView || !activeMarkdownView.editor || !activeMarkdownView.file) {
         this.addMessage("assistant", "Open a note to write into.");
         this.setStatus("Ready");
@@ -30263,6 +30262,40 @@ function writingPathInContextFolder(path, settings, vaultBasePath) {
   const folder = folderConfigured || "Writing Context";
   const value = String(path || "").replace(/\\/g, "/");
   return value === folder || value.startsWith(`${folder}/`);
+}
+
+// writing-mode: fix request-time note lookup falls back to most-recent and visible markdown leaves when sidebar focused without last-active
+function findRequestTimeMarkdownView(app, plugin) {
+  const MarkdownViewLocal = (typeof MarkdownView !== "undefined" ? MarkdownView : null);
+  const asMarkdownView = (view) => (MarkdownViewLocal && view instanceof MarkdownViewLocal && view.file && view.editor) ? view : null;
+  const workspace = app && app.workspace ? app.workspace : null;
+  if (workspace && typeof workspace.getActiveViewOfType === "function") {
+    const active = asMarkdownView(workspace.getActiveViewOfType(MarkdownViewLocal || null));
+    if (active) return active;
+  }
+  const lastActive = asMarkdownView(plugin && plugin.lastActiveMarkdownLeaf ? plugin.lastActiveMarkdownLeaf.view : null);
+  if (lastActive) return lastActive;
+  if (!workspace) return null;
+  if (typeof workspace.getMostRecentLeaf === "function") {
+    const recentLeaf = workspace.getMostRecentLeaf();
+    const recent = asMarkdownView(recentLeaf ? recentLeaf.view : null);
+    if (recent) return recent;
+  }
+  let first = null;
+  let firstVisible = null;
+  const leaves = (typeof workspace.getLeavesOfType === "function") ? workspace.getLeavesOfType("markdown") : [];
+  for (const leaf of (leaves || [])) {
+    const view = asMarkdownView(leaf ? leaf.view : null);
+    if (!view) continue;
+    if (!first) first = view;
+    if (!firstVisible) {
+      const el = view.containerEl;
+      const hidden = el && (typeof el.isShown === "function" ? !el.isShown() : el.offsetParent === null);
+      if (!hidden) firstVisible = view;
+    }
+    if (first && firstVisible) break;
+  }
+  return firstVisible || first || null;
 }
 
 // writing-mode: shared lookup for open markdown leaf with file path; prefers captured view, falls back to any open leaf

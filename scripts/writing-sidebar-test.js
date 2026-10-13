@@ -6,11 +6,14 @@ const path = require('path');
 
 // Mock obsidian module for loading built main.js
 const originalLoad = Module._load;
+// Shared singleton so `instanceof MarkdownView` in tests matches the class the bundle captured.
+let obsidianMock = null;
 function mockObsidian() {
   Module._load = function (request, parent, isMain) {
     if (request !== 'obsidian') return originalLoad.call(this, request, parent, isMain);
+    if (!obsidianMock) {
     class Empty {}
-    return {
+    obsidianMock = {
       ItemView: Empty,
       MarkdownRenderer: { renderMarkdown() {} },
       MarkdownView: Empty,
@@ -31,6 +34,8 @@ function mockObsidian() {
       setIcon() {},
       requestUrl: async () => { throw new Error('network disabled'); },
     };
+    }
+    return obsidianMock;
   };
   global.window = { setTimeout, clearTimeout, requestIdleCallback: null, requestAnimationFrame: (fn) => setTimeout(fn, 0) };
   global.fetch = async () => { throw new Error('network disabled'); };
@@ -187,13 +192,109 @@ function testInsertButtonClosedNoteNotice() {
   console.log('PASS insert-button-closed-note-notice (notice preserved, lookup before replaceRange)');
 }
 
+function makeMarkdownLeaf(filePath, text) {
+  const obsidian = require('obsidian');
+  const view = new obsidian.MarkdownView();
+  const calls = { replaceRange: [] };
+  view.file = { path: filePath, basename: filePath.split('/').pop() };
+  view.editor = {
+    getSelection: () => '',
+    getCursor: () => ({ line: 0, ch: 0 }),
+    getValue: () => text,
+    posToOffset: () => 0,
+    replaceRange: (draft, from, to) => { calls.replaceRange.push({ draft, from, to }); },
+  };
+  return { leaf: { view }, calls };
+}
+
+function makeWriteView(plugin, leaves, mostRecentLeaf) {
+  const view = new Plugin.SemanticTodoistView({}, plugin);
+  view.messages = [];
+  view.promptEl = { value: 'draft a summary' };
+  view.lengthSelectEl = null;
+  view.webSearchMode = 'off';
+  view.askButton = { disabled: false, textContent: 'Write' };
+  view.statusLog = [];
+  view.messageLog = [];
+  view.setStatus = (text) => { view.statusLog.push(text); };
+  view.addMessage = (role, text) => { view.messageLog.push({ role, text }); };
+  view.replaceLastAssistantMessage = (text) => { view.messageLog.push({ role: 'assistant-replaced', text }); };
+  view.renderRelevantNotes = () => {};
+  plugin.app = {
+    workspace: {
+      getActiveViewOfType: () => null, // sidebar focused: no active markdown view
+      getLeavesOfType: (type) => (type === 'markdown' ? leaves : []),
+      getMostRecentLeaf: mostRecentLeaf ? () => mostRecentLeaf : undefined,
+    },
+  };
+  return view;
+}
+
+function makeWritePlugin(leafEntries) {
+  let writeCalls = 0;
+  const plugin = {
+    settings: { sidebarMode: 'write' },
+    lastActiveMarkdownLeaf: null, // reload-while-sidebar-focused: never populated
+    writeWithEvidence: async () => {
+      writeCalls += 1;
+      return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0 };
+    },
+  };
+  plugin.writeCallCount = () => writeCalls;
+  return plugin;
+}
+
+async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
+  // (1) Active view null AND lastActiveMarkdownLeaf null, one markdown leaf open
+  // → write proceeds against THAT note: position captured pre-await,
+  // writeWithEvidence called once, one replaceRange into that editor.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  await view.write();
+  assert.strictEqual(plugin.writeCallCount(), 1, 'model called once for the visible note');
+  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor');
+  assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT', 'draft text inserted');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.askButton.disabled, false, 'button re-enabled');
+  assert(!view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'no open-a-note message');
+  console.log('PASS write-visible-leaf-without-last-active (single open leaf used)');
+}
+
+async function testWritePrefersMostRecentLeaf() {
+  // (2) Several markdown leaves → the getMostRecentLeaf one is chosen.
+  const first = makeMarkdownLeaf('Notes/Old.md', 'old text');
+  const recent = makeMarkdownLeaf('Notes/Recent.md', 'recent text');
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [first.leaf, recent.leaf], recent.leaf);
+  await view.write();
+  assert.strictEqual(plugin.writeCallCount(), 1, 'model called once');
+  assert.strictEqual(first.calls.replaceRange.length, 0, 'older leaf untouched');
+  assert.strictEqual(recent.calls.replaceRange.length, 1, 'most-recent leaf receives the draft');
+  console.log('PASS write-prefers-most-recent-leaf');
+}
+
+async function testWriteWithNoMarkdownLeafKeepsMessage() {
+  // (3) No markdown leaves at all → "Open a note to write into.", no model call,
+  // view.writing === false, button restored.
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [], null);
+  await view.write();
+  assert(view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'open-a-note message kept');
+  assert.strictEqual(plugin.writeCallCount(), 0, 'no model call without a note');
+  assert.strictEqual(view.writing, false, 'writing flag false');
+  assert.strictEqual(view.askButton.disabled, false, 'button restored');
+  assert.strictEqual(view.askButton.textContent, 'Write', 'button label restored');
+  console.log('PASS write-no-leaf-keeps-message (no model call, flag false, button restored)');
+}
+
 function testExistingSidebarTestsStillPass() {
   // (5) Existing test structure intact; all prior assertions preserved.
   assert.strictEqual(typeof Plugin.SemanticTodoistView, 'function', 'existing view class intact');
   console.log('PASS existing-sidebar-tests-still-pass');
 }
 
-function runTests() {
+async function runTests() {
   testDefaultChat();
   testNormalizeInvalidSettings();
   testSettingsMigrationStillPasses();
@@ -211,6 +312,9 @@ function runTests() {
   testClosedNoteShowsDraftAndInsertButton();
   testInsertButtonUsesLeafLookup();
   testInsertButtonClosedNoteNotice();
+  await testWriteProceedsWithVisibleLeafAndNoLastActive();
+  await testWritePrefersMostRecentLeaf();
+  await testWriteWithNoMarkdownLeafKeepsMessage();
   testExistingSidebarTestsStillPass();
   console.log('writing-sidebar-test: PASS (expanded)');
 }

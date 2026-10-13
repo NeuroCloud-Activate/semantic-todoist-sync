@@ -40,7 +40,7 @@ Prior (Task 1) test changes:
 - `scripts/semantic-score-worker-pool-test.js`: lines 8-9
 
 ## Source edits (`src/main.js`)
-Exactly 49 `// writing-mode:` tags; table rows = 49; tag count = 49; no untagged edit hunks found (diff `a62bfb4:main.js` → `HEAD:src/main.js` contains 49 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
+Exactly 51 `// writing-mode:` tags; table rows = 51; tag count = 51; no untagged edit hunks found (diff `a62bfb4:main.js` → `HEAD:src/main.js` contains 51 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
 
 | # | task | function / location (current line) | change | why |
 |---|------|-----------------------------------|--------|-----|
@@ -93,6 +93,8 @@ Exactly 49 `// writing-mode:` tags; table rows = 49; tag count = 49; no untagged
 | 47 | 5 | Module scope vision helpers (line 30277) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
 | 48 | Fix: insertion target when sidebar focused | `findMarkdownEditorForPath` (line 30268) | Shared module-level helper: finds any open markdown leaf with `filePath`, prefers the captured `preferredView`, falls back to first match; returns `null` when none match | Enables post-await insertion when sidebar is active view |
 | 49 | Fix: insertion target when sidebar focused | `SemanticTodoistView.write()` (line 21874) | Post-await lookup uses `findMarkdownEditorForPath(app, currentPath, preferredView)` instead of only `getActiveViewOfType(MarkdownView)`; `renderDraftForInsert()` click handler (line 21944) uses same lookup with `preferredView = null` | Insert works when sidebar has focus; closed-note branch kept as fallback |
+| 50 | Fix: visible note without last-active | `SemanticTodoistView` constructor (line 21596) | `this.writing = false` initial in-flight state | Pre-await exits (e.g. no open note) leave a defined flag instead of `undefined` |
+| 51 | Fix: visible note without last-active | Module scope `findRequestTimeMarkdownView` (line 30267) | New shared request-time lookup: active MarkdownView → `lastActiveMarkdownLeaf` (validated) → `getMostRecentLeaf` → first visible `getLeavesOfType("markdown")` leaf (via `isShown()`/`offsetParent`); `write()` pre-await lookup (line 21797) calls it instead of inline active/last-active only | Write proceeds against the open note after reload-while-sidebar-focused; `null` only when no markdown leaf exists, keeping "Open a note to write into." |
 
 ## Baseline results (before build)
 Recorded in `docs/writing-mode/baseline-tests.txt`. Key passes: index-compatibility-local-test, semantic-decoration-yield-test, semantic-score-worker-pool-test (7 cases), settings-migration-local-test, task-checkbox-source-contract-test, task-description-sync-preservation-test, task-field-completion-test, task-metadata-only-evidence-test, task-reference-corpus-integrity-local-test, task-section-marker-ampersand-test, task-selected-note-materiality-test, web-research-local-test.
@@ -102,7 +104,7 @@ Key pre-existing failures: openwebui-carrier-recovery-local-test, provider-embed
 - Built `main.js` size: ~4,205,707 bytes (includes parsers now bundled) — < 3,152,600 target not applicable; previous build 2,262,503 bytes.
 - `makeWorkerSource()` serializes `cosine.toString()` correctly (verified by `semantic-score-worker-pool-test.js` — 7 PASS).
 - `npm.cmd run build` OK (pre-existing `Duplicate key "reasoningAutoCorrections"` warning only).
-- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 49 tagged edits.
+- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 51 tagged edits.
 - Validation per task: `writing-vision-test.js` PASS; `writing-write-test.js` PASS; `writing-sidebar-test.js` PASS.
 
 ## Task 5 — image input for describeImage (`feat(providers): image input for describeImage`)
@@ -122,14 +124,14 @@ New file: `scripts/writing-sidebar-test.js`. `src/main.js` edits: 13 tags (rows 
 1. `git merge main` into this branch — expect `main.js` conflicts only if `main` changed the original file, which git maps onto `src/main.js` via rename commit `3adc3f9`.
 2. Resolve in `src/main.js`, keeping both sides; never resolve in built `main.js`.
 3. Re-run `npm.cmd run build` and never merge built `main.js` by hand; the build is the single source of truth for `main.js`.
-4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (49 == 49) before and after merge.
+4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (51 == 51) before and after merge.
 5. Run `npm.cmd test` and compare to `docs/writing-mode/baseline-tests.txt`; any new failures must be reported, not hidden.
 
 **Rename caveat:** If `main` also changed lines near a tagged edit (e.g., same function, nearby parameter, or same module scope), review that tag's row specifically after merge to confirm the edit is preserved correctly; the rename mapping (`main.js` → `src/main.js`) does not guarantee line-level alignment if `main` diverged.
 
 ## Verification (current state)
-- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 49
-- Table row count: 49 (matches tag count)
-- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 49 `writing-mode:` references, all mapped above)
+- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 51
+- Table row count: 51 (matches tag count)
+- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 51 `writing-mode:` references, all mapped above)
 - `styles.css`: unchanged (listed in note, not in table)
-- Concerns: None — all 49 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.
+- Concerns: None — all 51 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.

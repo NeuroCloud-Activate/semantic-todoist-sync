@@ -335,6 +335,43 @@ function bufToString(ab) {
     }
   }
 
+  // 13b. directory junction inside the external root pointing outside is rejected
+  // (junctions need no admin/Developer Mode on Windows; on POSIX "junction"
+  // is ignored and creates a dir symlink — the assertions still hold).
+  {
+    const dir = await makeTempDir("writing-source-ext-junction-");
+    const outsideDir = await makeTempDir("writing-source-ext-junction-outside-");
+    await fs.writeFile(nodePath.join(outsideDir, "secret.txt"), "secret");
+    await fs.writeFile(nodePath.join(dir, "ok.md"), "ok");
+    const linkPath = nodePath.join(dir, "linked");
+    await fs.symlink(outsideDir, linkPath, "junction");
+    const rootInfo = { kind: "external", root: dir };
+    const app = makeVaultApp({});
+    const files = await source.listContextFiles(rootInfo, app);
+    const escapedId = nodePath.join(linkPath, "secret.txt");
+    const escaped = files.find((f) => f.id === escapedId);
+    if (!escaped) {
+      assert.ok(
+        !files.some((f) => f.id === escapedId || f.id.startsWith(linkPath + nodePath.sep)),
+        "junction target must not be listed"
+      );
+    } else {
+      await assert.rejects(
+        source.readContextFile(rootInfo, app, escaped.id),
+        (err) => err && err.code === "outside-context-root",
+        "listed junction escape read must be rejected"
+      );
+    }
+    await assert.rejects(
+      source.readContextFile(rootInfo, app, escapedId),
+      (err) => err && err.code === "outside-context-root",
+      "junction escaping the root must be rejected"
+    );
+    const normal = bufToString(await source.readContextFile(rootInfo, app, nodePath.join(dir, "ok.md")));
+    assert.strictEqual(normal, "ok");
+    console.log("PASS directory junction inside external root pointing outside is rejected");
+  }
+
   // 14. vault adapter stat throwing yields not-found
   {
     const throwingApp = { vault: { adapter: { async stat() { throw new Error("boom"); } } } };
@@ -347,7 +384,7 @@ function bufToString(ab) {
     console.log("PASS vault adapter stat throw yields not-found");
   }
 
-  process.stdout.write(JSON.stringify({ passed: 14, failed: 0 }) + "\n");
+  process.stdout.write(JSON.stringify({ passed: 15, failed: 0 }) + "\n");
 })().catch((err) => {
   console.error("FAIL writing-source-test:", err && err.message ? err.message : err);
   process.exit(1);

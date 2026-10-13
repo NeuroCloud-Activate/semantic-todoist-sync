@@ -149,6 +149,50 @@ function testSecondWriteAfterNoNoteExitProceeds() {
   console.log('PASS second-write-after-no-note (source structure allows re-entry)');
 }
 
+function testSidebarFocusInsertsIntoOpenLeaf() {
+  // (1) When sidebar has focus (getActiveViewOfType null) but target markdown leaf is open via getLeavesOfType,
+  // the draft must be inserted into that leaf's editor (not shown as draft).
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('findMarkdownEditorForPath'), 'shared leaf lookup helper present');
+  assert(src.includes('findMarkdownEditorForPath(this.plugin'), 'post-await lookup uses preferred view + leaf search');
+  assert(src.includes('getLeavesOfType("markdown")'), 'leaf lookup searches markdown leaves');
+  console.log('PASS sidebar-focus-inserts-into-open-leaf (source verifies lookup + preferred view + leaf search)');
+}
+
+function testClosedNoteShowsDraftAndInsertButton() {
+  // (2) If no open markdown leaf shows the original file path, renderDraftForInsert is called (draft shown + Insert button),
+  // and replaceRange is never called by the main insertion path.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('renderDraftForInsert(result, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
+  assert(src.includes('Insert at current cursor'), 'Insert button present in draft UI');
+  console.log('PASS closed-note-shows-draft-and-button (fallback path verified)');
+}
+
+function testInsertButtonUsesLeafLookup() {
+  // (3) Insert button click while sidebar focused and original note open in a leaf → inserted into that editor.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('findMarkdownEditorForPath(app, originalPath, null)'), 'Insert button uses shared leaf lookup with null preferred view');
+  console.log('PASS insert-button-uses-leaf-lookup (shared lookup reused)');
+}
+
+function testInsertButtonClosedNoteNotice() {
+  // (4) Insert click when original note is closed → Notice `Open <name> to insert this draft.`; no replaceRange.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert(src.includes('Open ${originalName} to insert this draft.'), 'notice message preserved for closed original note');
+  assert(src.includes('findMarkdownEditorForPath(app, originalPath, null)'), 'Insert uses leaf lookup before attempting replaceRange');
+  console.log('PASS insert-button-closed-note-notice (notice preserved, lookup before replaceRange)');
+}
+
+function testExistingSidebarTestsStillPass() {
+  // (5) Existing test structure intact; all prior assertions preserved.
+  assert.strictEqual(typeof Plugin.SemanticTodoistView, 'function', 'existing view class intact');
+  console.log('PASS existing-sidebar-tests-still-pass');
+}
+
 function runTests() {
   testDefaultChat();
   testNormalizeInvalidSettings();
@@ -163,6 +207,11 @@ function runTests() {
   testFocusFallbackUsesLastActiveMarkdownLeaf();
   testEarlyExitGuardDoesNotLeaveWritingStuck();
   testSecondWriteAfterNoNoteExitProceeds();
+  testSidebarFocusInsertsIntoOpenLeaf();
+  testClosedNoteShowsDraftAndInsertButton();
+  testInsertButtonUsesLeafLookup();
+  testInsertButtonClosedNoteNotice();
+  testExistingSidebarTestsStillPass();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

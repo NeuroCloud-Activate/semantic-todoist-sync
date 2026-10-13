@@ -21871,8 +21871,9 @@ class SemanticTodoistView extends ItemView {
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
         const draftText = composeDraft(result.markdown || "", result.footnotes || "");
         const currentPath = filePath;
-        const currentView = this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(MarkdownView) : null;
-        const currentEditor = (currentView && currentView.editor && currentView.file && currentView.file.path === currentPath) ? currentView.editor : null;
+        // writing-mode: post-await insertion uses shared leaf lookup (prefers captured view, falls back to any open markdown leaf with filePath)
+        const preferredView = (this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(typeof MarkdownView !== "undefined" ? MarkdownView : null) : null);
+        const currentEditor = findMarkdownEditorForPath(this.plugin && this.plugin.app ? this.plugin.app : null, currentPath, preferredView);
         if (currentEditor && currentPath) {
           const plan = planInsertion(currentEditor, recorded, currentPath);
           if (plan.mode === "recorded" || plan.mode === "cursor") {
@@ -21940,17 +21941,9 @@ class SemanticTodoistView extends ItemView {
     if (insertBtn) {
       insertBtn.onclick = async () => {
         const app = this.plugin.app || this.app;
-        const activeMarkdownView = app?.workspace?.getActiveViewOfType ? app.workspace.getActiveViewOfType(typeof require !== "undefined" ? (function () {
-          try { return require("obsidian").MarkdownView; } catch (e) { return null; }
-        })() : null) : null;
-        // writing-mode: compare active note path to original draft file
-        const activeFilePath = (activeMarkdownView && activeMarkdownView.file && activeMarkdownView.file.path) ? activeMarkdownView.file.path : "";
-        if (activeFilePath && activeFilePath !== originalPath) {
-          new Notice(`Open ${originalName} to insert this draft.`);
-          return;
-        }
-        if (activeMarkdownView && activeMarkdownView.editor && activeMarkdownView.file) {
-          const ed = activeMarkdownView.editor;
+        // writing-mode: Insert button looks up any open markdown leaf with originalPath (works when sidebar has focus); preferred view passed as null
+        const ed = findMarkdownEditorForPath(app, originalPath, null);
+        if (ed) {
           const cursor = ed.getCursor ? ed.getCursor() : { line: 0, ch: 0 };
           const draftText = draftMarkdown || "";
           try {
@@ -21960,7 +21953,11 @@ class SemanticTodoistView extends ItemView {
           }
           this.setStatus("Draft inserted.");
         } else {
-          new Notice("No open note to insert into.");
+          if (originalPath) {
+            new Notice(`Open ${originalName} to insert this draft.`);
+          } else {
+            new Notice("No open note to insert into.");
+          }
         }
       };
     }
@@ -30266,6 +30263,23 @@ function writingPathInContextFolder(path, settings, vaultBasePath) {
   const folder = folderConfigured || "Writing Context";
   const value = String(path || "").replace(/\\/g, "/");
   return value === folder || value.startsWith(`${folder}/`);
+}
+
+// writing-mode: shared lookup for open markdown leaf with file path; prefers captured view, falls back to any open leaf
+function findMarkdownEditorForPath(app, filePath, preferredView) {
+  const MarkdownViewLocal = (typeof MarkdownView !== "undefined" ? MarkdownView : null);
+  if (!app || !filePath) return null;
+  const leaves = (typeof app.workspace?.getLeavesOfType === "function") ? app.workspace.getLeavesOfType("markdown") : [];
+  let preferredEditor = null;
+  let firstEditor = null;
+  for (const leaf of (leaves || [])) {
+    const view = leaf && leaf.view instanceof MarkdownViewLocal ? leaf.view : null;
+    if (view && view.file && view.file.path === filePath && view.editor) {
+      if (preferredView && view === preferredView) preferredEditor = view.editor;
+      if (!firstEditor) firstEditor = view.editor;
+    }
+  }
+  return preferredEditor || firstEditor || null;
 }
 
 // Chat-completions message shaping for the OpenAI-compatible adapters.

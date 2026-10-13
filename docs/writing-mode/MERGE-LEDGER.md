@@ -1,4 +1,4 @@
-﻿# Merge Ledger â€” writing-mode
+# Merge Ledger — writing-mode
 
 ## Rules
 1. Built `main.js` is never hand-edited or hand-merged: on any conflict in it, resolve `src/` and run `npm.cmd run build`.
@@ -6,9 +6,9 @@
 3. `npm test` runs `scripts/run-tests.js`, which executes every `scripts/*-test.js` sequentially. Any pre-existing failures are recorded, not fixed.
 
 ## Rename commit
-`3adc3f9f653c0c312bfb0509ff4b1429e1e8489d` â€” `refactor: move main.js to src/main.js (rename only)` (100% similarity).
+`3adc3f9f653c0c312bfb0509ff4b1429e1e8489d` — `refactor: move main.js to src/main.js (rename only)` (100% similarity).
 
-Note: `styles.css` â€” unchanged; existing selectors cover mode/length rows (no new styling required).
+Note: `styles.css` — unchanged; existing selectors cover mode/length rows (no new styling required).
 
 ## New files
 - `src/main.js` (moved from root `main.js`)
@@ -23,24 +23,24 @@ Note: `styles.css` â€” unchanged; existing selectors cover mode/length rows
 - `scripts/writing-write-test.js`
 - `scripts/writing-sidebar-test.js`
 
-## Test changes (Fix round 1 â€” source-reading tests point at src/main.js)
+## Test changes (Fix round 1 — source-reading tests point at src/main.js)
 Rule: source-reading tests target `src/main.js`; `require()` tests target built `main.js`.
-- `scripts/task-selected-note-materiality-test.js`: line 11 `mainPath` â†’ `src/main.js`
-- `scripts/task-metadata-planning-instructions-test.js`: line 8 `mainPath` â†’ `src/main.js`
-- `scripts/task-description-sync-preservation-test.js`: line 12 `mainPath` + `sourcePath` default â†’ `src/main.js`
-- `scripts/task-metadata-only-evidence-test.js`: line 12 `mainPath` + `sourcePath` default â†’ `src/main.js`
-- `scripts/task-primary-evidence-preservation-test.js`: line 13 `mainPath` + `sourcePath` default â†’ `src/main.js`
-- `scripts/task-section-marker-ampersand-test.js`: line 44 `mainPath` â†’ `src/main.js`
-- `scripts/semantic-decoration-yield-test.js`: line 9 `candidatePath` â†’ `src/main.js`
-- `scripts/semantic-score-routing-parity-test.js`: line 15 `candidatePath` â†’ `src/main.js`
-- `scripts/stable-core-characterization-local-test.js`: line 151 default `mainJsPath` â†’ `src/main.js`; hash gate NOT updated (pre-existing hash failure preserved)
+- `scripts/task-selected-note-materiality-test.js`: line 11 `mainPath` → `src/main.js`
+- `scripts/task-metadata-planning-instructions-test.js`: line 8 `mainPath` → `src/main.js`
+- `scripts/task-description-sync-preservation-test.js`: line 12 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-metadata-only-evidence-test.js`: line 12 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-primary-evidence-preservation-test.js`: line 13 `mainPath` + `sourcePath` default → `src/main.js`
+- `scripts/task-section-marker-ampersand-test.js`: line 44 `mainPath` → `src/main.js`
+- `scripts/semantic-decoration-yield-test.js`: line 9 `candidatePath` → `src/main.js`
+- `scripts/semantic-score-routing-parity-test.js`: line 15 `candidatePath` → `src/main.js`
+- `scripts/stable-core-characterization-local-test.js`: line 151 default `mainJsPath` → `src/main.js`; hash gate NOT updated (pre-existing hash failure preserved)
 
 Prior (Task 1) test changes:
 - `scripts/provider-settings-local-test.js`: line 89
 - `scripts/semantic-score-worker-pool-test.js`: lines 8-9
 
 ## Source edits (`src/main.js`)
-Exactly 47 `// writing-mode:` tags; table rows = 47; tag count = 47; no untagged edit hunks found (diff `a62bfb4:main.js` â†’ `HEAD:src/main.js` contains 47 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
+Exactly 49 `// writing-mode:` tags; table rows = 49; tag count = 49; no untagged edit hunks found (diff `a62bfb4:main.js` → `HEAD:src/main.js` contains 49 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
 
 | # | task | function / location (current line) | change | why |
 |---|------|-----------------------------------|--------|-----|
@@ -74,60 +74,62 @@ Exactly 47 `// writing-mode:` tags; table rows = 47; tag count = 47; no untagged
 | 28 | 5 | `geminiResponse` (line 14523) | New optional `images = null` param | Gemini image input |
 | 29 | 5 | `geminiResponse` (line 14541) | `parts: geminiVisionParts([{ text: geminiUser }], images)`; appends `inline_data` when non-empty | Untouched when empty |
 | 30 | 5 | `geminiResponse` (line 14565) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
-| 31 | 8 | `SemanticTodoistView.render()` (line 21708) | Mode `<select>` (`Chat`/`Write`) in `actionRow`; bound to `plugin.settings.sidebarMode`; `onchange` saves and re-renders | User switches Chat â†” Write |
+| 31 | 8 | `SemanticTodoistView.render()` (line 21708) | Mode `<select>` (`Chat`/`Write`) in `actionRow`; bound to `plugin.settings.sidebarMode`; `onchange` saves and re-renders | User switches Chat ↔ Write |
 | 32 | 8 fix 1 | `SemanticTodoistView.render()` (line 21735) | `this.askButton = askButton` stored on instance | Enables in-flight disable/restore from `write()` |
 | 33 | 8 fix 1 | `SemanticTodoistView.render()` (line 21737) | `onclick` reads `this.plugin.settings.sidebarMode` at click time instead of captured `mode` | Mode switch without re-render uses correct handler |
 | 34 | 8 | `SemanticTodoistView.render()` (line 21742) | Length `<select>` (`Brief`/`Standard`/`Detailed`) shown only when `mode === "write"`; not persisted | Length choice for Write drafts |
-| 35 | 8 | `SemanticTodoistView.write()` (line 21786) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; uses `planInsertion`/`insertDraft`/`composeDraft`; shows `Writingâ€¦` status; error shows nothing inserted; no open note shows "Open a note to write into."; closed note shows draft with Insert button; sources rendered; notices for `plan.notice` and `dropped > 0` | Main Write-mode entry point |
-| 36 | 8 fix 1 | `SemanticTodoistView.write()` (line 21794) | `if (this.writing) return;` guard; disables button and label `"Writingâ€¦"`; `finally` restores `this.writing = false`, re-enables, restores label from current settings | Prevents double submit; button state restored on error |
+| 35 | 8 | `SemanticTodoistView.write()` (line 21786) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; uses `planInsertion`/`insertDraft`/`composeDraft`; shows `Writing…` status; error shows nothing inserted; no open note shows "Open a note to write into."; closed note shows draft with Insert button; sources rendered; notices for `plan.notice` and `dropped > 0` | Main Write-mode entry point |
+| 36 | 8 fix 1 | `SemanticTodoistView.write()` (line 21794) | `if (this.writing) return;` guard; disables button and label `"Writing…"`; `finally` restores `this.writing = false`, re-enables, restores label from current settings | Prevents double submit; button state restored on error |
 | 37 | 8 fix 1 | `SemanticTodoistView.write()` (line 21801) | `recorded` uses exact line/ch + prefix; `active` carries `path`, `text`, `selection`, `cursorOffset` | Prevents insertion into wrong position during generation |
 | 38 | 8 fix 1 | `SemanticTodoistView.write()` (line 21837) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when available; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
 | 39 | 9 | `SemanticTodoistView.write()` (line 21897) | `Notice("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence.")` when `result.searched.vault === false` | User is told Write searched the context folder only |
 | 40 | 8 fix 2 | `SemanticTodoistView.write()` (line 21912, finally block) | `finally` restores `this.writing = false`, re-enables the button and restores its label from the current `sidebarMode` | Button never stays disabled after success or error |
 | 41 | 8 fix 2 | `SemanticTodoistView.write()` (line 21924, outer catch) | Same restore (flag, button, label) in the outer catch, which also covers exceptions thrown before the inner `try` | A pre-await failure (e.g. active-view lookup) can't leave Write stuck |
 | 42 | 8 fix 1 | `renderDraftForInsert()` (line 21935) | Captures `originalPath` and `originalName` for insert check | Original draft file tracked for insertion guard |
-| 43 | 8 fix 1 | `renderDraftForInsert()` (line 21949) | Active note comparison uses `originalPath`; insertion blocked on mismatch with clear notice | Same file → insert; different → notice only |
+| 43 | 8 fix 1 | `renderDraftForInsert()` (line 21949) | Active note comparison uses `originalPath`; insertion blocked on mismatch with clear notice | Same file ? insert; different ? notice only |
 | 44 | 8 | `SemanticTodoistSettingTab.render()` (line 22529) | New `Writing` settings section: `writingContextFolder` text field, `writingDescribeImages` toggle, `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
 | 45 | 7 | Module scope `writingIsAbsoluteContextPath` / `writingPathInContextFolder` (line 30242) | New `writingIsAbsoluteContextPath` and vault-relative `writingPathInContextFolder`; regex-free (esbuild 0.28 parse safe) | Shared index exclusion check; avoids `/`-in-class literal break |
 | 46 | 7 fix 1 | `writingPathInContextFolder` (line 30255) | `vaultBasePath` param; absolute configured path inside vault converted to vault-relative folder; absolute outside vault excludes nothing (`false`) | Controller ruling: absolute config matches vault or excludes nothing |
 | 47 | 5 | Module scope vision helpers (line 30277) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
+| 48 | Fix: insertion target when sidebar focused | `findMarkdownEditorForPath` (line 30268) | Shared module-level helper: finds any open markdown leaf with `filePath`, prefers the captured `preferredView`, falls back to first match; returns `null` when none match | Enables post-await insertion when sidebar is active view |
+| 49 | Fix: insertion target when sidebar focused | `SemanticTodoistView.write()` (line 21874) | Post-await lookup uses `findMarkdownEditorForPath(app, currentPath, preferredView)` instead of only `getActiveViewOfType(MarkdownView)`; `renderDraftForInsert()` click handler (line 21944) uses same lookup with `preferredView = null` | Insert works when sidebar has focus; closed-note branch kept as fallback |
 
 ## Baseline results (before build)
 Recorded in `docs/writing-mode/baseline-tests.txt`. Key passes: index-compatibility-local-test, semantic-decoration-yield-test, semantic-score-worker-pool-test (7 cases), settings-migration-local-test, task-checkbox-source-contract-test, task-description-sync-preservation-test, task-field-completion-test, task-metadata-only-evidence-test, task-reference-corpus-integrity-local-test, task-section-marker-ampersand-test, task-selected-note-materiality-test, web-research-local-test.
 Key pre-existing failures: openwebui-carrier-recovery-local-test, provider-embedding-local-test, provider-generation-local-test, provider-registry-local-test, provider-settings-local-test, semantic-score-routing-parity-test, stable-core-characterization-local-test, task-metadata-planning-instructions-test, task-primary-evidence-preservation-test.
 
 ## Post-build results
-- Built `main.js` size: ~4,205,707 bytes (includes parsers now bundled) â€” < 3,152,600 target not applicable; previous build 2,262,503 bytes.
-- `makeWorkerSource()` serializes `cosine.toString()` correctly (verified by `semantic-score-worker-pool-test.js` â€” 7 PASS).
+- Built `main.js` size: ~4,205,707 bytes (includes parsers now bundled) — < 3,152,600 target not applicable; previous build 2,262,503 bytes.
+- `makeWorkerSource()` serializes `cosine.toString()` correctly (verified by `semantic-score-worker-pool-test.js` — 7 PASS).
 - `npm.cmd run build` OK (pre-existing `Duplicate key "reasoningAutoCorrections"` warning only).
-- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 47 tagged edits.
+- `npm.cmd test`: 12 PASS (same baseline) + writing-citations/extract/store/vision/write/sidebar passes; 10 FAIL (same 9 pre-existing + included benchmark-local-test); no new failures introduced by any of the 49 tagged edits.
 - Validation per task: `writing-vision-test.js` PASS; `writing-write-test.js` PASS; `writing-sidebar-test.js` PASS.
 
-## Task 5 â€” image input for describeImage (`feat(providers): image input for describeImage`)
+## Task 5 — image input for describeImage (`feat(providers): image input for describeImage`)
 New file: `scripts/writing-vision-test.js` (10 cases: data URI, Responses `input_image`, Anthropic base64, Gemini `inline_data`, text-call regression deep-equal, provider-error rejection, empty-bytes `vision-unsupported` with no request).
-`src/main.js` edits: 18 tags (rows 9â€“29 in table, plus module-scope helpers row 47). All validated.
+`src/main.js` edits: 18 tags (rows 9–29 in table, plus module-scope helpers row 49). All validated.
 
-## Task 7 â€” evidence-based write orchestrator (`feat(writing): evidence-based write orchestrator`)
-New file: `src/writing/write.js`; `scripts/writing-write-test.js` (9 cases). `src/main.js` edits: 10 tags (rows 1, 6, 8, 12â€“15, 42â€“43, plus module-scope helpers row 42 covers both functions). All validated: `node scripts/writing-write-test.js` PASS.
+## Task 7 — evidence-based write orchestrator (`feat(writing): evidence-based write orchestrator`)
+New file: `src/writing/write.js`; `scripts/writing-write-test.js` (9 cases). `src/main.js` edits: 10 tags (rows 1, 6, 8, 12–15, 42–43, plus module-scope helpers row 42 covers both functions). All validated: `node scripts/writing-write-test.js` PASS.
 
-## Task 8 â€” sidebar Write mode and settings (`feat(writing): sidebar Write mode and settings`)
-New file: `scripts/writing-sidebar-test.js`. `src/main.js` edits: 13 tags (rows 2â€“5, 30â€“41; fix-round-1 tags 7, 31, 32, 35â€“40 included). All validated: `node scripts/writing-sidebar-test.js` PASS.
+## Task 8 — sidebar Write mode and settings (`feat(writing): sidebar Write mode and settings`)
+New file: `scripts/writing-sidebar-test.js`. `src/main.js` edits: 13 tags (rows 2–5, 30–41; fix-round-1 tags 7, 31, 32, 35–40 included). All validated: `node scripts/writing-sidebar-test.js` PASS.
 
-## Fix round 1 (Task 8) â€” insert guard, double-submit, click-time mode, posToOffset
-`Select-String src/main.js -Pattern "writing-mode:"` count = 47 = table rows (45 prior + 2 task 9 = 47). Tags covered in rows 7, 32, 33, 36–38, 40–43 (fix round 1), plus task-9 rows 13, 39.
+## Fix round 1 (Task 8) — insert guard, double-submit, click-time mode, posToOffset
+`Select-String src/main.js -Pattern "writing-mode:"` count = 49 = table rows (45 prior + 2 task 9 = 49). Tags covered in rows 7, 32, 33, 36�38, 40�43 (fix round 1), plus task-9 rows 13, 39.
 
 ## Merge procedure
-1. `git merge main` into this branch â€” expect `main.js` conflicts only if `main` changed the original file, which git maps onto `src/main.js` via rename commit `3adc3f9`.
+1. `git merge main` into this branch — expect `main.js` conflicts only if `main` changed the original file, which git maps onto `src/main.js` via rename commit `3adc3f9`.
 2. Resolve in `src/main.js`, keeping both sides; never resolve in built `main.js`.
 3. Re-run `npm.cmd run build` and never merge built `main.js` by hand; the build is the single source of truth for `main.js`.
-4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (47 == 47) before and after merge.
+4. Check `Select-String src/main.js 'writing-mode:'` count equals table rows (49 == 49) before and after merge.
 5. Run `npm.cmd test` and compare to `docs/writing-mode/baseline-tests.txt`; any new failures must be reported, not hidden.
 
-**Rename caveat:** If `main` also changed lines near a tagged edit (e.g., same function, nearby parameter, or same module scope), review that tag's row specifically after merge to confirm the edit is preserved correctly; the rename mapping (`main.js` â†’ `src/main.js`) does not guarantee line-level alignment if `main` diverged.
+**Rename caveat:** If `main` also changed lines near a tagged edit (e.g., same function, nearby parameter, or same module scope), review that tag's row specifically after merge to confirm the edit is preserved correctly; the rename mapping (`main.js` → `src/main.js`) does not guarantee line-level alignment if `main` diverged.
 
 ## Verification (current state)
-- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 47
-- Table row count: 47 (matches tag count)
-- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 47 `writing-mode:` references, all mapped above)
+- Tag count (`Select-String src/main.js -Pattern 'writing-mode:'`): 49
+- Table row count: 49 (matches tag count)
+- Untagged edit hunks in `git diff a62bfb4:main.js HEAD:src/main.js`: 0 (diff contains exactly 49 `writing-mode:` references, all mapped above)
 - `styles.css`: unchanged (listed in note, not in table)
-- Concerns: None â€” all 47 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.
+- Concerns: None — all 49 tags mapped to current code; no superseded/stale rows remain; duplicate header removed; non-edit `styles.css` row removed; sections for new files/test changes intact; merge procedure added.

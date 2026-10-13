@@ -27,7 +27,8 @@ function normaliseHeading(s) {
   }
   h = h.trim();
   // Replace characters that break wikilink heading anchors
-  h = h.replace(/[#|[\]^]/g, " ");
+  // Obsidian avoids: # | ^ : %% [[ ]]
+  h = h.replace(/[#:[\]^%|]/g, " ");
   // Collapse whitespace
   h = h.replace(/\s+/g, " ").trim();
   return h;

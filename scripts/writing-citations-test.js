@@ -243,7 +243,21 @@ function ev(eid, source) {
   assert.ok(!r5.footnotes.includes("[["), "unsafe vault path no wikilink");
   assert.strictEqual(r5.footnotes, "[^1]: a|b, H", "unsafe vault plain text with normalised heading");
 
+  // 14c: colon and %% heading fixes
+  {
+    const r6 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Research Team/August 17, 2026.md", heading: "Meeting Notes:" })], "");
+    assert.strictEqual(r6.footnotes, "[^1]: [[Research Team/August 17, 2026#Meeting Notes]]", "colon stripped from heading");
+
+    const r7 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Note.md", heading: "## Q3: Plan | Risks" })], "");
+    assert.strictEqual(r7.footnotes, "[^1]: [[Note#Q3 Plan Risks]]", "colon and pipe stripped");
+
+    const r8 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Note.md", heading: "100%% done" })], "");
+    assert.strictEqual(r8.footnotes, "[^1]: [[Note#100 done]]", "double-percent stripped");
+
+    console.log("PASS colon and percent heading fixes");
+  }
+
   console.log("PASS heading normalisation real values");
 }
 
-process.stdout.write(JSON.stringify({ passed: 15, failed: 0 }, null, 2) + "\n");
+process.stdout.write(JSON.stringify({ passed: 18, failed: 0 }, null, 2) + "\n");

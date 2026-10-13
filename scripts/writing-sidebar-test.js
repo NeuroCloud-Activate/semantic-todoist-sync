@@ -31,6 +31,42 @@ function mockObsidian() {
         this.addButton = () => this;
       },
       TFile: Empty,
+      Menu: class {
+        constructor() { this.items = []; }
+        addItem(fn) {
+          const item = {
+            title: "",
+            checked: undefined,
+            submenu: null,
+            setTitle(t) { this.title = t; return this; },
+            setChecked(c) { this.checked = c; return this; },
+            onClick(fn2) { this.handler = fn2; return this; },
+            setSubmenu() {
+              const sub = {
+                items: [],
+                addItem(fn3) {
+                  const child = {
+                    title: "",
+                    checked: undefined,
+                    setTitle(t) { this.title = t; return this; },
+                    setChecked(c) { this.checked = c; return this; },
+                    onClick(fn4) { this.handler = fn4; return this; },
+                  };
+                  fn3(child);
+                  sub.items.push(child);
+                  return child;
+                },
+              };
+              item.submenu = sub;
+              return sub;
+            },
+          };
+          fn(item);
+          this.items.push(item);
+          return item;
+        }
+        showAtMouseEvent() {}
+      },
       setIcon() {},
       requestUrl: async () => { throw new Error('network disabled'); },
     };
@@ -116,12 +152,14 @@ function testToolbarButtonsOrder() {
   console.log('PASS toolbar-buttons-order (Ask, Tasks, Collaborate, Run)');
 }
 
-function testCollaborateCallsWrite() {
+function testCollaborateTogglesMode() {
   const fs = require('fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('const collaborateButton = toolbar.createEl('), 'collaborateButton created in toolbar');
-  assert(src.includes('collaborateButton.onclick = async () => {\n      await this.write();\n    };'), 'Collaborate click calls this.write()');
-  console.log('PASS collaborate-calls-write');
+  assert(/collaborateButton\.onclick = async \(\) => \{\s*await this\.toggleCollaborateMode\(\);\s*\};/.test(src), 'Collaborate click toggles mode');
+  assert(src.includes('async toggleCollaborateMode()'), 'toggleCollaborateMode method present');
+  assert(src.includes('is-active'), 'toggle sets is-active class');
+  console.log('PASS collaborate-toggles-mode');
 }
 
 function testInFlightCollaborate() {
@@ -171,9 +209,9 @@ function testVaultUnavailableNotice() {
   // Task 9 fix: SemanticTodoistView.write() shows a Notice when result.searched.vault is false, not otherwise.
   const fs = require('fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
-  assert(/writing-mode: task 9 warn/.test(src), 'task 9 notice tag present');
+  assert(/writing-mode: task 10 warn/.test(src), 'task 10 notice tag present');
   assert(src.includes("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence."), 'task 9 notice text present');
-  assert(src.includes('result.searched && result.searched.vault === false'), 'notice gated on searched.vault === false');
+  assert(src.includes('result.searched.vaultWanted !== false'), 'notice gated on vault being wanted');
   console.log('PASS vault-unavailable-notice (tagged Notice gated on result.searched.vault === false)');
 }
 
@@ -284,8 +322,9 @@ function makeWriteView(plugin, leaves, mostRecentLeaf) {
 function makeWritePlugin(leafEntries) {
   let writeCalls = 0;
   const plugin = {
-    settings: { sidebarMode: 'write' },
+    settings: { writingCollaborateMode: false, writingDraftLength: 'standard', writingUseVault: true, writingUseContext: true, writingDescribeImages: true },
     lastActiveMarkdownLeaf: null, // reload-while-sidebar-focused: never populated
+    saveSettings: async () => {},
     writeWithEvidence: async () => {
       writeCalls += 1;
       return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0 };
@@ -339,6 +378,79 @@ async function testWriteWithNoMarkdownLeafKeepsMessage() {
   console.log('PASS write-no-leaf-keeps-message (no model call, flag false, button restored)');
 }
 
+function testToolbarFourColumns() {
+  const fs = require('fs');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8').replace(/\r\n/g, '\n');
+  const blocks = css.split('}');
+  const toolbarGrids = blocks.filter((b) => b.includes('.semantic-todoist-toolbar') && b.includes('grid-template-columns'));
+  assert(toolbarGrids.length >= 2, 'toolbar grid rules present, got ' + toolbarGrids.length);
+  assert(toolbarGrids.every((b) => b.includes('repeat(4,')), 'all toolbar grids use 4 columns');
+  assert(toolbarGrids.every((b) => !b.includes('repeat(3,')), 'no 3-column toolbar grid remains');
+  assert(css.includes('text-overflow: ellipsis'), 'toolbar button text ellipsizes');
+  console.log('PASS toolbar-four-columns (4 equal columns, ellipsize)');
+}
+
+function testNoLengthRowInToolbar() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(!src.includes('semantic-todoist-length-row'), 'no length row in toolbar');
+  assert(!src.includes('lengthSelectEl'), 'no lengthSelectEl anywhere');
+  assert(!src.includes('semantic-todoist-length-select'), 'no length select class');
+  assert(!src.includes('semantic-todoist-length-label'), 'no length label class');
+  console.log('PASS no-length-row-in-toolbar');
+}
+
+function testWriteReadsLengthFromSettings() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('this.plugin.settings.writingDraftLength'), 'write() reads persisted length');
+  console.log('PASS write-reads-length-from-settings');
+}
+
+function testFeaturesMenuStructure() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('semantic-todoist-collaborate-features'), 'Features button class present');
+  assert(src.includes('openCollaborateFeaturesMenu'), 'menu opener present');
+  assert(src.includes('setSubmenu'), 'nested submenus used');
+  assert(src.includes('"Draft length"') || src.includes("'Draft length'"), 'Draft length submenu present');
+  assert(src.includes('Brief') && src.includes('Standard') && src.includes('Detailed'), 'all lengths present');
+  assert(src.includes('Vault notes') && src.includes('Context folder'), 'evidence toggles present');
+  assert(src.includes('Describe images'), 'describe-images toggle present');
+  assert(src.includes('updateCollaborateFeaturesLabel'), 'features label updater present');
+  console.log('PASS features-menu-structure');
+}
+
+function testRunWriteSwapAndEnterRouting() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('this.runButton'), 'Run button stored on instance');
+  assert(src.includes('"Write"'), 'Write label present');
+  assert(src.includes('Write prompt into open note'), 'Write title present');
+  assert(src.includes('writingCollaborateMode === true) this.write()'), 'Enter routes to write() in mode');
+  assert(src.includes('What should I write into the open note?'), 'write placeholder present');
+  console.log('PASS run-write-swap-and-enter-routing');
+}
+
+function testCollaborateSettingsKeys() {
+  const defaults = Plugin.DEFAULT_SETTINGS || {};
+  assert.strictEqual(defaults.writingCollaborateMode, false, 'mode defaults false');
+  assert.strictEqual(defaults.writingDraftLength, 'standard', 'length defaults standard');
+  assert.strictEqual(defaults.writingUseVault, true, 'vault defaults true');
+  assert.strictEqual(defaults.writingUseContext, true, 'context defaults true');
+  const n = Plugin.normalizeStableSettings({ writingDraftLength: 'bogus', writingCollaborateMode: 1, writingUseVault: 0, writingUseContext: 'no' });
+  assert.strictEqual(n.writingDraftLength, 'standard', 'invalid length falls back');
+  assert.strictEqual(n.writingCollaborateMode, false, 'non-true mode is false');
+  assert.strictEqual(n.writingUseVault, true, 'non-false vault is true');
+  assert.strictEqual(n.writingUseContext, true, 'non-false context is true');
+  const n2 = Plugin.normalizeStableSettings({ writingDraftLength: 'detailed', writingCollaborateMode: true, writingUseVault: false, writingUseContext: false });
+  assert.strictEqual(n2.writingDraftLength, 'detailed', 'valid length kept');
+  assert.strictEqual(n2.writingCollaborateMode, true, 'true mode kept');
+  assert.strictEqual(n2.writingUseVault, false, 'false vault kept');
+  assert.strictEqual(n2.writingUseContext, false, 'false context kept');
+  console.log('PASS collaborate-settings-keys');
+}
+
 function testExistingSidebarTestsStillPass() {
   // (5) Existing test structure intact; all prior assertions preserved.
   assert.strictEqual(typeof Plugin.SemanticTodoistView, 'function', 'existing view class intact');
@@ -354,7 +466,7 @@ async function runTests() {
   testDoubleSubmitGuard();
   testModeReadAtClickTime();
   testToolbarButtonsOrder();
-  testCollaborateCallsWrite();
+  testCollaborateTogglesMode();
   testInFlightCollaborate();
   testNoModeSelectOrSidebarMode();
   testCursorOffsetPosToOffset();
@@ -371,6 +483,12 @@ async function runTests() {
   await testWritePrefersMostRecentLeaf();
   await testWriteWithNoMarkdownLeafKeepsMessage();
   testExistingSidebarTestsStillPass();
+  testToolbarFourColumns();
+  testNoLengthRowInToolbar();
+  testWriteReadsLengthFromSettings();
+  testFeaturesMenuStructure();
+  testRunWriteSwapAndEnterRouting();
+  testCollaborateSettingsKeys();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

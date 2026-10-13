@@ -2,6 +2,7 @@ const {
   ItemView,
   MarkdownRenderer,
   MarkdownView,
+  Menu, // writing-mode: task 10 Features menu for collaborate mode
   Modal,
   Notice,
   Plugin,
@@ -2853,6 +2854,12 @@ function normalizeStableSettings(input = {}) {
   }
   result.writingContextFolder = folderValue || "Writing Context";
   result.writingDescribeImages = source.writingDescribeImages !== false;
+  // writing-mode: task 10 collaborate toggle settings (length invalid falls back to standard; toggles default true unless explicitly false)
+  const rawLength = typeof source.writingDraftLength === "string" ? source.writingDraftLength.trim().toLowerCase() : "";
+  result.writingDraftLength = rawLength === "brief" || rawLength === "detailed" ? rawLength : "standard";
+  result.writingCollaborateMode = source.writingCollaborateMode === true;
+  result.writingUseVault = source.writingUseVault !== false;
+  result.writingUseContext = source.writingUseContext !== false;
   return result;
 }
 
@@ -3593,6 +3600,10 @@ const DEFAULT_SETTINGS = {
   chatFontSizePx: 13,
   writingContextFolder: "Writing Context", // writing-mode: new context folder default
   writingDescribeImages: true, // writing-mode: new describe-images default
+  writingCollaborateMode: false, // writing-mode: task 10 collaborate toggle off by default
+  writingDraftLength: "standard", // writing-mode: task 10 draft length default
+  writingUseVault: true, // writing-mode: task 10 vault evidence default
+  writingUseContext: true, // writing-mode: task 10 context-folder evidence default
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
@@ -13917,7 +13928,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const identity = semanticEmbeddingIdentity(this.settings);
     const embeddingKey = `${identity.provider}:${identity.model}`;
     const folderConfig = String(this.settings?.writingContextFolder || "Writing Context").trim();
-    const storeKey = `${embeddingKey}:${folderConfig}`;
+    // writing-mode: task 10 include describe-images flag in the store key so toggling it rebuilds the store
+    const describeFlag = this.settings && this.settings.writingDescribeImages === false ? "noimg" : "img";
+    const storeKey = `${embeddingKey}:${folderConfig}:${describeFlag}`;
     if (!this._writingContextStore || this._writingContextStoreKey !== storeKey) {
       const store = new ContextStore({
         adapter: this.app.vault.adapter,
@@ -13956,6 +13969,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       length: options ? options.length : undefined,
       active,
       webSearchMode: options ? options.webSearchMode : undefined,
+      // writing-mode: task 10 forward evidence toggles (default true when omitted)
+      useVault: options && Object.prototype.hasOwnProperty.call(options, "useVault") ? options.useVault !== false : undefined,
+      useContext: options && Object.prototype.hasOwnProperty.call(options, "useContext") ? options.useContext !== false : undefined,
     });
   }
 
@@ -21705,10 +21721,14 @@ class SemanticTodoistView extends ItemView {
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
     this.messagesEl = main.createDiv({ cls: "semantic-todoist-conversation" });
     this.promptEl = main.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt..." });
+    // writing-mode: task 10 collaborate mode swaps the placeholder and routes Enter to write()
+    this.promptEl.dataset.chatPlaceholder = "Ask about your vault or draft a prompt...";
+    this.promptEl.dataset.writePlaceholder = "What should I write into the open note?";
     this.promptEl.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
       event.preventDefault();
-      this.ask();
+      if (this.plugin.settings.writingCollaborateMode === true) this.write();
+      else this.ask();
     });
     const actionRow = main.createDiv({ cls: "semantic-todoist-action-row" });
     const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
@@ -21719,7 +21739,7 @@ class SemanticTodoistView extends ItemView {
       this.updateWebSearchToggleState();
     };
     this.updateWebSearchToggleState();
-    actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Run:" });
+    this.actionLabelEl = actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Run:" }); // writing-mode: task 10 label reads Collaborate: in collaborate mode
     this.actionSelectEl = actionRow.createEl("select", { cls: "semantic-todoist-action-select", attr: { "aria-label": "Action prompt to run", title: "Choose a scheduler action or prompt template" } });
     this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
     this.populateSidebarActionOptions();
@@ -21732,26 +21752,117 @@ class SemanticTodoistView extends ItemView {
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
     };
-    const collaborateButton = toolbar.createEl("button", { cls: "semantic-todoist-collaborate-button", attr: { title: "Draft cited, evidence-based prose into the open note", "aria-label": "Draft cited, evidence-based prose into the open note" }, text: "Collaborate" });
+    const collaborateButton = toolbar.createEl("button", { cls: "semantic-todoist-collaborate-button", attr: { title: "Toggle collaborate mode", "aria-label": "Toggle collaborate mode", "aria-pressed": "false" }, text: "Collaborate" });
     this.collaborateButton = collaborateButton; // writing-mode: wrap existing write() flow with in-flight button state
     collaborateButton.onclick = async () => {
-      await this.write();
+      await this.toggleCollaborateMode();
     };
-    // writing-mode: compact draft-length select always visible near toolbar
-    const lengthRow = toolbar.createDiv({ cls: "semantic-todoist-length-row" });
-    this.lengthSelectEl = lengthRow.createEl("select", { cls: "semantic-todoist-length-select", attr: { "aria-label": "Draft length", title: "Choose draft length" } });
-    this.lengthSelectEl.createEl("option", { value: "brief", text: "Brief" });
-    this.lengthSelectEl.createEl("option", { value: "standard", text: "Standard" });
-    this.lengthSelectEl.createEl("option", { value: "detailed", text: "Detailed" });
-    this.lengthSelectEl.value = "standard";
-    lengthRow.createSpan({ cls: "semantic-todoist-length-label", text: "Length:" });
+    // writing-mode: task 10 Features button hidden in the action row unless collaborate mode is on
+    this.collaborateFeaturesButton = actionRow.createEl("button", { cls: "semantic-todoist-collaborate-features", attr: { title: "Collaborate features", "aria-label": "Collaborate features" }, text: "Features" });
+    this.collaborateFeaturesButton.onclick = (event) => {
+      this.openCollaborateFeaturesMenu(event);
+    };
     const runButton = toolbar.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
+    this.runButton = runButton; // writing-mode: task 10 Run button relabelled Write in collaborate mode
     runButton.onclick = async () => {
-      await this.runSelectedSidebarAction();
+      if (this.plugin.settings.writingCollaborateMode === true) await this.write();
+      else await this.runSelectedSidebarAction();
     };
+    // writing-mode: task 10 apply persisted collaborate mode on every render
+    this.applyCollaborateMode();
     this.statusEl = container.createDiv({ cls: "semantic-todoist-status", attr: { tabindex: "0" } });
     this.setStatus("Ready");
     this.refreshActiveSummary();
+  }
+
+  // writing-mode: task 10 collaborate toggle mode with Features menu, Run/Write swap and placeholder swap
+  async toggleCollaborateMode() {
+    this.plugin.settings.writingCollaborateMode = this.plugin.settings.writingCollaborateMode !== true;
+    await this.plugin.saveSettings();
+    this.applyCollaborateMode();
+  }
+
+  applyCollaborateMode() {
+    const on = this.plugin.settings.writingCollaborateMode === true;
+    if (this.collaborateButton) {
+      this.collaborateButton.classList?.toggle("is-active", on);
+      this.collaborateButton.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    if (this.runButton) {
+      this.runButton.textContent = on ? "Write" : "Run";
+      this.runButton.setAttribute("title", on ? "Write prompt into open note" : "Run the selected scheduler action or prompt");
+    }
+    if (this.actionLabelEl) this.actionLabelEl.textContent = on ? "Collaborate:" : "Run:";
+    if (this.actionSelectEl) this.actionSelectEl.style.display = on ? "none" : "";
+    if (this.collaborateFeaturesButton) {
+      this.collaborateFeaturesButton.style.display = on ? "" : "none";
+      this.updateCollaborateFeaturesLabel();
+    }
+    if (this.promptEl) {
+      this.promptEl.placeholder = on ? this.promptEl.dataset.writePlaceholder : this.promptEl.dataset.chatPlaceholder;
+    }
+  }
+
+  updateCollaborateFeaturesLabel() {
+    if (!this.collaborateFeaturesButton) return;
+    const length = this.plugin.settings.writingDraftLength === "brief" ? "Brief" : this.plugin.settings.writingDraftLength === "detailed" ? "Detailed" : "Standard";
+    const parts = [];
+    if (this.plugin.settings.writingUseVault !== false) parts.push("Vault");
+    if (this.plugin.settings.writingUseContext !== false) parts.push("Context");
+    this.collaborateFeaturesButton.textContent = parts.length ? `${length} · ${parts.join(" + ")}` : length;
+  }
+
+  openCollaborateFeaturesMenu(event) {
+    const menu = new Menu();
+    const lengths = [["brief", "Brief"], ["standard", "Standard"], ["detailed", "Detailed"]];
+    const current = this.plugin.settings.writingDraftLength === "brief" ? "brief" : this.plugin.settings.writingDraftLength === "detailed" ? "detailed" : "standard";
+    menu.addItem((lengthMenu) => {
+      lengthMenu.setTitle("Draft length");
+      const sub = lengthMenu.setSubmenu() || lengthMenu.submenu;
+      for (const [value, label] of lengths) {
+        sub.addItem((choice) => {
+          choice.setTitle(label);
+          choice.setChecked(value === current);
+          choice.onClick(async () => {
+            this.plugin.settings.writingDraftLength = value;
+            await this.plugin.saveSettings();
+            this.updateCollaborateFeaturesLabel();
+          });
+        });
+      }
+    });
+    menu.addItem((evidenceMenu) => {
+      evidenceMenu.setTitle("Evidence");
+      const sub = evidenceMenu.setSubmenu() || evidenceMenu.submenu;
+      sub.addItem((choice) => {
+        choice.setTitle("Vault notes");
+        choice.setChecked(this.plugin.settings.writingUseVault !== false);
+        choice.onClick(async () => {
+          this.plugin.settings.writingUseVault = this.plugin.settings.writingUseVault === false;
+          await this.plugin.saveSettings();
+          this.updateCollaborateFeaturesLabel();
+        });
+      });
+      sub.addItem((choice) => {
+        choice.setTitle("Context folder");
+        choice.setChecked(this.plugin.settings.writingUseContext !== false);
+        choice.onClick(async () => {
+          this.plugin.settings.writingUseContext = this.plugin.settings.writingUseContext === false;
+          await this.plugin.saveSettings();
+          this.updateCollaborateFeaturesLabel();
+        });
+      });
+    });
+    menu.addItem((choice) => {
+      choice.setTitle("Describe images");
+      choice.setChecked(this.plugin.settings.writingDescribeImages !== false);
+      choice.onClick(async () => {
+        this.plugin.settings.writingDescribeImages = this.plugin.settings.writingDescribeImages === false;
+        await this.plugin.saveSettings();
+        this.updateCollaborateFeaturesLabel();
+      });
+    });
+    menu.showAtMouseEvent(event);
   }
 
   async ask() {
@@ -21780,7 +21891,8 @@ class SemanticTodoistView extends ItemView {
     try {
       const prompt = this.promptEl ? this.promptEl.value.trim() : "";
       if (!prompt) {
-        this.setStatus("Ready");
+        // writing-mode: task 10 empty prompt nudges instead of silently returning
+        this.setStatus("Type what to write, then press Enter or Write.");
         return;
       }
       // writing-mode: double-submit guard moved immediately before await so pre-await exits don't leave it stuck
@@ -21837,7 +21949,9 @@ class SemanticTodoistView extends ItemView {
         return off;
       })();
       const active = { path: filePath, text: activeText, selection: selectionText, cursorOffset };
-      const length = (this.lengthSelectEl && this.lengthSelectEl.value) ? this.lengthSelectEl.value : "standard";
+      // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
+      const rawLength = this.plugin.settings.writingDraftLength;
+      const length = rawLength === "brief" || rawLength === "detailed" ? rawLength : "standard";
 
       // writing-mode: guard set only right before the await, so pre-await exits never leave it stuck
       if (this.writing) return;
@@ -21857,6 +21971,9 @@ class SemanticTodoistView extends ItemView {
           length,
           active,
           webSearchMode: this.webSearchMode,
+          // writing-mode: task 10 forward evidence toggles from settings
+          useVault: this.plugin.settings.writingUseVault !== false,
+          useContext: this.plugin.settings.writingUseContext !== false,
         });
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
         const draftText = composeDraft(result.markdown || "", result.footnotes || "");
@@ -21887,8 +22004,8 @@ class SemanticTodoistView extends ItemView {
         if (result.dropped > 0) {
           new Notice(`Dropped ${result.dropped} unknown citation(s).`);
         }
-        // writing-mode: task 9 warn when the vault index was unavailable so Write only searched the context folder
-        if (result.searched && result.searched.vault === false) {
+        // writing-mode: task 10 warn only when the vault was wanted but the index was unavailable
+        if (result.searched && result.searched.vault === false && result.searched.vaultWanted !== false) {
           new Notice("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence.");
         }
         this.setStatus("Collaboration complete.");      } catch (error) {

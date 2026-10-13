@@ -542,7 +542,7 @@
 
 .semantic-todoist-toolbar {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   align-items: center;
 }
@@ -550,6 +550,21 @@
 .semantic-todoist-toolbar button {
   border-radius: 6px;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.semantic-todoist-collaborate-button.is-active {
+  border-color: var(--text-accent);
+  color: var(--text-accent);
+}
+
+.semantic-todoist-collaborate-features {
+  border-radius: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .semantic-todoist-toolbar button {
@@ -1417,7 +1432,7 @@
 
   .semantic-todoist-toolbar {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 4px;
   }
 

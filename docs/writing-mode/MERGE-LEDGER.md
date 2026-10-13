@@ -40,60 +40,76 @@ Prior (Task 1) test changes:
 - `scripts/semantic-score-worker-pool-test.js`: lines 8-9
 
 ## Source edits (`src/main.js`)
-Exactly 50 `// writing-mode:` tags; table rows = 50; tag count = 50; no untagged edit hunks found (diff `a62bfb4:main.js` → `HEAD:src/main.js` contains 50 `writing-mode:` references, all mapped to rows below). Multi-line blocks kept as single rows per tag line.
+Exactly 65 `// writing-mode:` tags; table rows = 65; tag count = 65; no untagged edit hunks found. Multi-line blocks kept as single rows per tag line.
 
 | # | task | function / location (current line) | change | why |
 |---|------|-----------------------------------|--------|-----|
-| 1 | 7 | `AI_OPERATION_KEYS` module scope (line 24) | Added `"write"` to frozen operation list | `write` resolves to primary chat model like `chat-query` |
-| 2 | 8 | `normalizeStableSettings` (line 2843) | Normalizes `writingContextFolder` (default `"Writing Context"`) and `writingDescribeImages` (`true`); invalid folder falls back | New writing settings default safely |
-| 3 | 8 | `DEFAULT_SETTINGS` (line 3594) | `writingContextFolder: "Writing Context"` key added | Persisted context-folder default |
-| 4 | 8 | `DEFAULT_SETTINGS` (line 3595) | `writingDescribeImages: true` key added | Persisted describe-images default |
-| 5 | 7 | `SemanticTodoistSyncPlugin.onload` (line 4599) | Added `semantic-todoist-rescan-context` command calling `rescanContextFolder()` | Manual rescan entry point |
-| 6 | 8 | `SemanticTodoistSyncPlugin.onload` (line 4600) | Added `semantic-todoist-collaborate` command calling `collaborateOnActiveNote()` | "Collaborate on active note": opens sidebar and focuses prompt |
-| 7 | 8 | `collaborateOnActiveNote` (line 8733) | Opens sidebar, focuses `promptEl` without running model | Opens sidebar and focuses prompt without running model |
-| 8 | 7 fix 1 | `isIndexablePath` (line 9188) | Passes `vaultBasePath(this.app)` as `vaultBase` to `writingPathInContextFolder` | Enables absolute-context comparison for index exclusion |
-| 9 | 7 | `isIndexablePath` (line 9189) | Returns `false` inside configured context folder (`writingPathInContextFolder`) | Context `.md` excluded from index |
-| 10 | 5 | `describeImage` (line 13894) | New method `async describeImage(bytes, mime)`; normalizes image, resolves primary chat model, calls `openaiResponse` with `operation: "describe-image"`, `background: false`, fixed brief system/user text | Single image-description entry point |
-| 11 | 5 fix 1 | `describeImage` (line 13895) | Size guard: `imageByteLength > 20 * 1024 * 1024` throws `image-too-large` before encoding | 20 MB cap enforced at entry; never silently dropped |
-| 12 | 5 fix 1 | `describeImage` (line 13908) | Passes `system: "You extract research evidence from images."` | Responses-API `input_text` always carries string text |
-| 13 | 7 | `getContextStore` (line 13914) | New lazy `ContextStore` at `${manifest.dir}/context-index.json`; loaded once per embedding identity; includes `describeImage` unless `writingDescribeImages === false` | Separate store for Write mode; lazy `require` keeps mobile startup clean |
-| 14 | 9 | `vaultIndexStatus` (line 13944) | Returns `{ ready:false, reason }` from `semanticIndexLoadFailure`/`semanticIndexLoaded`, else `{ ready:true }` | Write evidence skips the vault only when the status bar shows Load failed |
-| 15 | 7 | `writeWithEvidence` (line 13951) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays stub-friendly seam; orchestration in module |
-| 16 | 7 fix 1 | `searchWebForWriting` (line 13962) | New exposed plugin method: `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` with no throw | Controller ruling: keep web-search toggle; stub-testable |
-| 17 | 7 | `rescanContextFolder` (line 13975) | Resolves root, ensures vault folder, surfaces root `notice`, syncs, then `Notice` with counted added/changed/removed/skipped | Manual rescan command body |
-| 18 | 5 | `openaiResponse` (line 13986) | New optional `images = null` param | Carries image inputs through shared path |
-| 19 | 5 | `openaiResponse` (line 13993) | `const imageInputs = writingImageInputs(images)` | Normalizes once; `[]` keeps existing text bodies byte-identical |
-| 20 | 5 | `openaiResponse` (line 14040) | Dispatch passes `images: imageInputs` to all four provider methods; retry reuses same closure | Images survive retry without being dropped |
-| 21 | 5 | `openAiCompatibleResponse` (line 14110) | New optional `images = null` param | OpenRouter / Open WebUI / custom OpenAI image input |
-| 22 | 5 | `openAiCompatibleResponse` (line 14119) | `messages` wrapped in `openAiCompatibleVisionMessages(..., images)`; appends `image_url` parts only when non-empty | Helper untouched when empty |
-| 23 | 5 | `openAiCompatibleResponse` (line 14158) | Hint-retry rebuild also wrapped in `openAiCompatibleVisionMessages` | Images survive hint retry |
-| 24 | 5 | `openaiProviderResponse` (line 14238) | New optional `images = null` param | OpenAI Responses-API image input |
-| 25 | 5 | `openaiProviderResponse` (line 14257) | `userContent.push({ type: "input_image", image_url: ... })` per image; no-op when empty | Responses-API shape; retry copies body so images persist |
-| 26 | 5 | `anthropicResponse` (line 14389) | New optional `images = null` param | Anthropic image input |
-| 27 | 5 | `anthropicResponse` (line 14415) | `if (images && images.length) userContent = anthropicVisionContent(...)` | Appends base64 `image` blocks; skipped for text |
-| 28 | 5 | `anthropicResponse` (line 14457) | Hint-retry rebuild uses `anthropicVisionContent(String(user||""), userText, images)` | Images survive plain-message retry |
-| 29 | 5 | `geminiResponse` (line 14528) | New optional `images = null` param | Gemini image input |
-| 30 | 5 | `geminiResponse` (line 14546) | `parts: geminiVisionParts([{ text: geminiUser }], images)`; appends `inline_data` when non-empty | Untouched when empty |
-| 31 | 5 | `geminiResponse` (line 14570) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
-| 32 | 8 fix 2 | `SemanticTodoistView` constructor (line 21601) | `this.writing = false` initial in-flight state | Pre-await exits (e.g. no open note) leave a defined flag instead of `undefined` |
-| 33 | 8 fix 1 | `SemanticTodoistView.render()` (line 21736) | `this.collaborateButton` stored on instance | Enables in-flight disable/restore from `write()` |
-| 34 | 8 | `SemanticTodoistView.render()` (line 21740) | Compact draft-length `<select>` always visible near toolbar; not persisted | Length choice for Write drafts |
-| 35 | 8 | `SemanticTodoistView.write()` (line 21778) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; plans/inserts/composes draft; shows status; no-open-note and closed-note branches | Main Write-mode entry point |
-| 36 | 8 fix 1 | `SemanticTodoistView.write()` (line 21786) | `if (this.writing) return;` guard; sets button label/state; no double submit | Prevents double submit; button state restored on error |
-| 37 | 8 fix 1 | `SemanticTodoistView.write()` (line 21788) | Captures open Markdown view and sets `recorded` (path/from/to/prefix) before await | Avoids insertion into wrong position during generation |
-| 38 | 8 fix 1 | `SemanticTodoistView.write()` (line 21823) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when available; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
-| 39 | 8 fix 1 | `SemanticTodoistView.write()` (line 21842) | Sets in-flight guard and disables Collaborate button immediately before the await | Guard never sticks on pre-await exits |
-| 40 | 8 fix 2 | `SemanticTodoistView.write()` (line 21864) | Post-await insertion uses `findMarkdownEditorForPath(app, currentPath, preferredView)` instead of active view only | Insert works when sidebar has focus |
-| 41 | 9 | `SemanticTodoistView.write()` (line 21890) | `Notice` when `result.searched.vault === false` | User told Write searched the context folder only |
-| 42 | 8 fix 2 | `SemanticTodoistView.write()` (line 21904) | `finally` restores `this.writing = false`, re-enables Collaborate button, restores label | Button never stays disabled after success or error |
-| 43 | 8 fix 1 | `renderDraftForInsert()` (line 21919) | Captures `originalPath` and `originalName` for insert check | Original draft file tracked for insertion guard |
-| 44 | 8 fix 2 | `renderDraftForInsert()` (line 21930) | Insert button lookup uses `findMarkdownEditorForPath(app, originalPath, null)` | Insert works when sidebar has focus; closed-note branch kept as fallback |
-| 45 | 8 | `SemanticTodoistSettingTab.render()` (line 22509) | New `Writing` settings section: `writingContextFolder` text field, `writingDescribeImages` toggle, `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
-| 46 | 7 | Module scope `writingIsAbsoluteContextPath`/`writingPathInContextFolder` (line 30222) | New `writingIsAbsoluteContextPath` and vault-relative `writingPathInContextFolder`; regex-free (esbuild 0.28 parse safe) | Shared index exclusion check; avoids `/`-in-class literal break |
-| 47 | 7 fix 1 | `writingPathInContextFolder` (line 30235) | `vaultBasePath` param; absolute path inside vault converts to vault-relative folder; absolute outside vault excludes nothing (`false`) | Controller ruling: absolute config matches vault or excludes nothing |
-| 48 | 8 fix 2 | `findRequestTimeMarkdownView` (line 30254) | Shared request-time lookup: active MarkdownView → `lastActiveMarkdownLeaf` → `getMostRecentLeaf` → first visible markdown leaf; `write()` pre-await lookup calls it | Write proceeds against open note after reload-while-sidebar-focused |
-| 49 | 8 fix 2 | `findMarkdownEditorForPath` (line 30288) | Shared module-level helper: finds any open markdown leaf with `filePath`, prefers captured `preferredView`, falls back to first match; returns `null` when none match | Enables post-await insertion when sidebar is active view |
-| 50 | 5 | Module scope vision helpers (line 30308) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
+| 1 | 10 | `obsidian` import (line 5) | `Menu` destructured for the collaborate Features menu | Menu available to the sidebar view |
+| 2 | 7 | `AI_OPERATION_KEYS` module scope (line 25) | Added `"write"` to frozen operation list | `write` resolves to primary chat model like `chat-query` |
+| 3 | 8 | `normalizeStableSettings` (line 2844) | Normalizes `writingContextFolder` (default `"Writing Context"`) and `writingDescribeImages` (`true`); invalid folder falls back | New writing settings default safely |
+| 4 | 10 | `normalizeStableSettings` (line 2857) | Normalizes `writingCollaborateMode` (`false` unless `true`), `writingDraftLength` (`brief|standard|detailed`, invalid → `standard`), `writingUseVault`/`writingUseContext` (anything but `false` → `true`) | Collaborate toggle settings default safely |
+| 5 | 8 | `DEFAULT_SETTINGS` (line 3601) | `writingContextFolder: "Writing Context"` key added | Persisted context-folder default |
+| 6 | 8 | `DEFAULT_SETTINGS` (line 3602) | `writingDescribeImages: true` key added | Persisted describe-images default |
+| 7 | 10 | `DEFAULT_SETTINGS` (line 3603) | `writingCollaborateMode: false` key added | Toggle off by default |
+| 8 | 10 | `DEFAULT_SETTINGS` (line 3604) | `writingDraftLength: "standard"` key added | Persisted length default |
+| 9 | 10 | `DEFAULT_SETTINGS` (line 3605) | `writingUseVault: true` key added | Vault evidence on by default |
+| 10 | 10 | `DEFAULT_SETTINGS` (line 3606) | `writingUseContext: true` key added | Context-folder evidence on by default |
+| 11 | 7 | `SemanticTodoistSyncPlugin.onload` (line 4610) | Added `semantic-todoist-rescan-context` command calling `rescanContextFolder()` | Manual rescan entry point |
+| 12 | 8 | `SemanticTodoistSyncPlugin.onload` (line 4611) | Added `semantic-todoist-collaborate` command calling `collaborateOnActiveNote()` | "Collaborate on active note": opens sidebar and focuses prompt |
+| 13 | 8 | `collaborateOnActiveNote` (line 8744) | Opens sidebar, focuses `promptEl` without running model | Opens sidebar and focuses prompt without running model |
+| 14 | 7 fix 1 | `isIndexablePath` (line 9199) | Passes `vaultBasePath(this.app)` as `vaultBase` to `writingPathInContextFolder` | Enables absolute-context comparison for index exclusion |
+| 15 | 7 | `isIndexablePath` (line 9200) | Returns `false` inside configured context folder (`writingPathInContextFolder`) | Context `.md` excluded from index |
+| 16 | 5 | `describeImage` (line 13905) | New method `async describeImage(bytes, mime)`; normalizes image, resolves primary chat model, calls `openaiResponse` with `operation: "describe-image"`, `background: false`, fixed brief system/user text | Single image-description entry point |
+| 17 | 5 fix 1 | `describeImage` (line 13906) | Size guard: `imageByteLength > 20 * 1024 * 1024` throws `image-too-large` before encoding | 20 MB cap enforced at entry; never silently dropped |
+| 18 | 5 fix 1 | `describeImage` (line 13919) | Passes `system: "You extract research evidence from images."` | Responses-API `input_text` always carries string text |
+| 19 | 7 | `getContextStore` (line 13925) | New lazy `ContextStore` at `${manifest.dir}/context-index.json`; loaded once per embedding identity; includes `describeImage` unless `writingDescribeImages === false` | Separate store for Write mode; lazy `require` keeps mobile startup clean |
+| 20 | 10 | `getContextStore` (line 13931) | Describe-images flag included in `storeKey` | Toggling Describe images rebuilds the store on next write |
+| 21 | 9 | `vaultIndexStatus` (line 13957) | Returns `{ ready:false, reason }` from `semanticIndexLoadFailure`/`semanticIndexLoaded`, else `{ ready:true }` | Write evidence skips the vault only when the status bar shows Load failed |
+| 22 | 7 | `writeWithEvidence` (line 13964) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays stub-friendly seam; orchestration in module |
+| 23 | 10 | `writeWithEvidence` (line 13972) | Forwards `useVault`/`useContext` (default `true` when omitted) to `src/writing/write.js` | Evidence toggles take effect |
+| 24 | 7 fix 1 | `searchWebForWriting` (line 13978) | New exposed plugin method: `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` with no throw | Controller ruling: keep web-search toggle; stub-testable |
+| 25 | 7 | `rescanContextFolder` (line 13991) | Resolves root, ensures vault folder, surfaces root `notice`, syncs, then `Notice` with counted added/changed/removed/skipped | Manual rescan command body |
+| 26 | 5 | `openaiResponse` (line 14002) | New optional `images = null` param | Carries image inputs through shared path |
+| 27 | 5 | `openaiResponse` (line 14009) | `const imageInputs = writingImageInputs(images)` | Normalizes once; `[]` keeps existing text bodies byte-identical |
+| 28 | 5 | `openaiResponse` (line 14056) | Dispatch passes `images: imageInputs` to all four provider methods; retry reuses same closure | Images survive retry without being dropped |
+| 29 | 5 | `openAiCompatibleResponse` (line 14126) | New optional `images = null` param | OpenRouter / Open WebUI / custom OpenAI image input |
+| 30 | 5 | `openAiCompatibleResponse` (line 14135) | `messages` wrapped in `openAiCompatibleVisionMessages(..., images)`; appends `image_url` parts only when non-empty | Helper untouched when empty |
+| 31 | 5 | `openAiCompatibleResponse` (line 14174) | Hint-retry rebuild also wrapped in `openAiCompatibleVisionMessages` | Images survive hint retry |
+| 32 | 5 | `openaiProviderResponse` (line 14254) | New optional `images = null` param | OpenAI Responses-API image input |
+| 33 | 5 | `openaiProviderResponse` (line 14273) | `userContent.push({ type: "input_image", image_url: ... })` per image; no-op when empty | Responses-API shape; retry copies body so images persist |
+| 34 | 5 | `anthropicResponse` (line 14405) | New optional `images = null` param | Anthropic image input |
+| 35 | 5 | `anthropicResponse` (line 14431) | `if (images && images.length) userContent = anthropicVisionContent(...)` | Appends base64 `image` blocks; skipped for text |
+| 36 | 5 | `anthropicResponse` (line 14473) | Hint-retry rebuild uses `anthropicVisionContent(String(user||""), userText, images)` | Images survive plain-message retry |
+| 37 | 5 | `geminiResponse` (line 14544) | New optional `images = null` param | Gemini image input |
+| 38 | 5 | `geminiResponse` (line 14562) | `parts: geminiVisionParts([{ text: geminiUser }], images)`; appends `inline_data` when non-empty | Untouched when empty |
+| 39 | 5 | `geminiResponse` (line 14586) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive schema retry |
+| 40 | 8 fix 2 | `SemanticTodoistView` constructor (line 21617) | `this.writing = false` initial in-flight state | Pre-await exits (e.g. no open note) leave a defined flag instead of `undefined` |
+| 41 | 10 | `SemanticTodoistView.render()` (line 21724) | Chat/write placeholders stored on `dataset`; Enter routes to `write()` when mode is on, `ask()` when off | Mode swaps prompt behavior |
+| 42 | 10 | `SemanticTodoistView.render()` (line 21742) | Action-row label stored as `this.actionLabelEl` so it reads `Collaborate:` in collaborate mode | Label matches the mode |
+| 43 | 8 fix 1 | `SemanticTodoistView.render()` (line 21756) | `this.collaborateButton` stored on instance | Enables in-flight disable/restore from `write()` |
+| 44 | 10 | `SemanticTodoistView.render()` (line 21760) | `semantic-todoist-collaborate-features` button in the action row, hidden unless mode is on | Features menu entry point |
+| 45 | 10 | `SemanticTodoistView.render()` (line 21766) | `this.runButton` stored; click runs `write()` in mode, `runSelectedSidebarAction()` when off | Run/Write swap |
+| 46 | 10 | `SemanticTodoistView.render()` (line 21771) | `applyCollaborateMode()` called on every render | Re-render/reopen honours persisted mode |
+| 47 | 10 | `SemanticTodoistView` (line 21778) | `toggleCollaborateMode`, `applyCollaborateMode`, `updateCollaborateFeaturesLabel`, `openCollaborateFeaturesMenu` (Draft length / Evidence / Describe images submenus, auto-save + label summary) | Toggle mode with Features menu |
+| 48 | 8 | `SemanticTodoistView.write()` (line 21889) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; plans/inserts/composes draft; shows status; no-open-note and closed-note branches | Main Write-mode entry point |
+| 49 | 10 | `SemanticTodoistView.write()` (line 21894) | Empty prompt sets status "Type what to write, then press Enter or Write." instead of silently returning | Visible nudge, no message spam |
+| 50 | 8 fix 1 | `SemanticTodoistView.write()` (line 21898) | `if (this.writing) return;` guard; sets button label/state; no double submit | Prevents double submit; button state restored on error |
+| 51 | 8 fix 1 | `SemanticTodoistView.write()` (line 21900) | Captures open Markdown view and sets `recorded` (path/from/to/prefix) before await | Avoids insertion into wrong position during generation |
+| 52 | 8 fix 1 | `SemanticTodoistView.write()` (line 21935) | `cursorOffset` prefers `editor.posToOffset(editor.getCursor("from"))` when available; falls back to `\n` split | Obsidian normalises `getValue()` to `\n`; avoids CRLF offset errors |
+| 53 | 10 | `SemanticTodoistView.write()` (line 21952) | Length read from `plugin.settings.writingDraftLength` (toolbar length row removed) | Length lives only in Features menu |
+| 54 | 8 fix 1 | `SemanticTodoistView.write()` (line 21956) | Sets in-flight guard and disables Collaborate button immediately before the await | Guard never sticks on pre-await exits |
+| 55 | 10 | `SemanticTodoistView.write()` (line 21974) | Forwards `useVault`/`useContext` from settings into `plugin.writeWithEvidence` | Toggles reach the orchestrator |
+| 56 | 8 fix 2 | `SemanticTodoistView.write()` (line 21981) | Post-await insertion uses `findMarkdownEditorForPath(app, currentPath, preferredView)` instead of active view only | Insert works when sidebar has focus |
+| 57 | 10 | `SemanticTodoistView.write()` (line 22007) | `Notice` only when `result.searched.vault === false` and `vaultWanted !== false` | Warns only when the vault was wanted but unavailable |
+| 58 | 8 fix 2 | `SemanticTodoistView.write()` (line 22021) | `finally` restores `this.writing = false`, re-enables Collaborate button, restores label | Button never stays disabled after success or error |
+| 59 | 8 fix 1 | `renderDraftForInsert()` (line 22036) | Captures `originalPath` and `originalName` for insert check | Original draft file tracked for insertion guard |
+| 60 | 8 fix 2 | `renderDraftForInsert()` (line 22047) | Insert button lookup uses `findMarkdownEditorForPath(app, originalPath, null)` | Insert works when sidebar has focus; closed-note branch kept as fallback |
+| 61 | 8 | `SemanticTodoistSettingTab.render()` (line 22626) | New `Writing` settings section: `writingContextFolder` text field, `writingDescribeImages` toggle, `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
+| 62 | 7 | Module scope `writingIsAbsoluteContextPath`/`writingPathInContextFolder` (line 30339) | New `writingIsAbsoluteContextPath` and vault-relative `writingPathInContextFolder`; regex-free (esbuild 0.28 parse safe) | Shared index exclusion check; avoids `/`-in-class literal break |
+| 63 | 7 fix 1 | `writingPathInContextFolder` (line 30352) | `vaultBasePath` param; absolute path inside vault converts to vault-relative folder; absolute outside vault excludes nothing (`false`) | Controller ruling: absolute config matches vault or excludes nothing |
+| 64 | 8 fix 2 | `findRequestTimeMarkdownView` (line 30371) | Shared request-time lookup: active MarkdownView → `lastActiveMarkdownLeaf` → `getMostRecentLeaf` → first visible markdown leaf; `write()` pre-await lookup calls it | Write proceeds against open note after reload-while-sidebar-focused |
+| 65 | 8 fix 2 | `findMarkdownEditorForPath` (line 30405) | Shared module-level helper: finds any open markdown leaf with `filePath`, prefers captured `preferredView`, falls back to first match; returns `null` when none match | Enables post-await insertion when sidebar is active view |
+| 66 | 5 | Module scope vision helpers (line 30425) | New `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts`; malformed images reject with `vision-unsupported`, never silently dropped | Per-provider shaping; empty-input untouched for byte-identical text bodies |
 
 ## Baseline results (before build)
 Recorded in `docs/writing-mode/baseline-tests.txt`. Key passes: index-compatibility-local-test, semantic-decoration-yield-test, semantic-score-worker-pool-test (7 cases), settings-migration-local-test, task-checkbox-source-contract-test, task-description-sync-preservation-test, task-field-completion-test, task-metadata-only-evidence-test, task-reference-corpus-integrity-local-test, task-section-marker-ampersand-test, task-selected-note-materiality-test, web-research-local-test.

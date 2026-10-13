@@ -290,15 +290,23 @@ async function writeWithEvidence(plugin, options) {
   }
   const length = Object.prototype.hasOwnProperty.call(LENGTH_WORD_TARGETS, args.length) ? args.length : "standard";
   const active = args.active || {};
+  // writing-mode: task 10 evidence toggles default true unless explicitly false
+  const useVault = args.useVault !== false;
+  const useContext = args.useContext !== false;
 
   const query = retrievalQuery(instruction, active.selection);
 
   // Sync first so retrieval searches fresh context; an embedding failure
   // rejects here and surfaces, while per-file skips stay in the result.
-  const context = await plugin.getContextStore();
-  const store = context && context.store ? context.store : context;
-  const rootInfo = (context && context.rootInfo) || { kind: "vault", root: "Writing Context" };
-  await store.sync(rootInfo, plugin.app);
+  // writing-mode: task 10 skip the context store entirely when context evidence is off
+  let contextStore = null;
+  let rootInfo = { kind: "vault", root: "Writing Context" };
+  if (useContext) {
+    const context = await plugin.getContextStore();
+    contextStore = context && context.store ? context.store : context;
+    rootInfo = (context && context.rootInfo) || { kind: "vault", root: "Writing Context" };
+    await contextStore.sync(rootInfo, plugin.app);
+  }
 
   // writing-mode: task 9 vault index may be unavailable (status bar "Index: Load failed").
   // An absent vaultIndexStatus means ready, so existing stubs keep working.
@@ -310,20 +318,25 @@ async function writeWithEvidence(plugin, options) {
       vaultStatus = { ready: true };
     }
   }
-  const vaultReady = vaultStatus.ready !== false;
-  const vaultReason = vaultReady ? "" : String(vaultStatus.reason || "unavailable");
+  const vaultReady = (vaultStatus.ready !== false) && useVault;
+  const vaultReason = vaultReady || !useVault ? "" : String(vaultStatus.reason || "unavailable");
+  const vaultWanted = useVault;
   // ponytail: quota merge because the two score scales differ; calibrate if one source keeps crowding out the other.
   const vaultChunks = vaultReady ? ((await plugin.retrieveSemanticContext(query, VAULT_EVIDENCE_LIMIT)) || []) : [];
-  const embedded = await plugin.embedTexts([query], "query");
-  const queryVector = Array.isArray(embedded) ? embedded[0] : [];
-  const contextHits = (await store.search(queryVector, CONTEXT_EVIDENCE_LIMIT)) || [];
+  // writing-mode: task 10 context embedding and search keep their original position (after vault retrieval)
+  let contextHitsReady = [];
+  if (useContext && contextStore) {
+    const embedded = await plugin.embedTexts([query], "query");
+    const queryVector = Array.isArray(embedded) ? embedded[0] : [];
+    contextHitsReady = (await contextStore.search(queryVector, CONTEXT_EVIDENCE_LIMIT)) || [];
+  }
 
   const evidence = [];
   for (const item of await vaultEvidenceItems(plugin, vaultChunks.slice(0, VAULT_EVIDENCE_LIMIT), active.path)) {
     evidence.push({ eid: `E${evidence.length + 1}`, text: item.text, source: item.source });
   }
   const external = rootInfo && rootInfo.kind === "external";
-  for (const hit of contextHits.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
+  for (const hit of contextHitsReady.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
     const locator = String((hit && hit.locator) || "");
     evidence.push({
       eid: `E${evidence.length + 1}`,
@@ -345,14 +358,18 @@ async function writeWithEvidence(plugin, options) {
     } catch { /* web failure stays silent; evidence stays at vault + context only */ }
   }
 
-  // writing-mode: task 9 name only searched sources in the zero-evidence fallback.
-  const searchedSources = vaultReady ? ["vault", "context folder"] : ["context folder"];
-  const sourcesBlock = vaultReady
-    ? "Sources searched:\n- vault: searched\n- context folder: searched"
-    : `Sources searched:\n- vault: NOT searched (vault index unavailable${vaultReason ? `: ${vaultReason}` : ""})\n- context folder: searched`;
+  // writing-mode: task 10 name only searched sources; a toggled-off source is reported as not searched
+  const searchedSources = [];
+  if (vaultReady) searchedSources.push("vault");
+  if (useContext) searchedSources.push("context folder");
+  const vaultLine = useVault
+    ? (vaultReady ? "- vault: searched" : `- vault: NOT searched (vault index unavailable${vaultReason ? `: ${vaultReason}` : ""})`)
+    : "- vault: not searched (turned off)";
+  const contextLine = useContext ? "- context folder: searched" : "- context folder: not searched (turned off)";
+  const sourcesBlock = `Sources searched:\n${vaultLine}\n${contextLine}`;
   const evidenceBlock = evidence.length
     ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${escapeSourceAttribute(evidenceLabel(entry))}">\n${neutraliseEvidenceTags(entry.text)}\n</evidence>`).join("\n\n")
-    : `No evidence was found in the ${searchedSources.join(" or ")}.`;
+    : (searchedSources.length ? `No evidence was found in the ${searchedSources.join(" or ")}.` : "No evidence was searched: vault and context folder are both turned off.");
 
   const modelChoice = plugin.aiModelForRequest("write", {});
   const raw = await plugin.openaiResponse({
@@ -391,7 +408,8 @@ async function writeWithEvidence(plugin, options) {
     }),
     evidenceCount: evidence.length,
     dropped: rewritten.dropped,
-    searched: { vault: vaultReady, context: true, vaultReason },
+    // writing-mode: task 10 report wanted flags so the sidebar only warns about an unavailable-but-wanted vault
+    searched: { vault: vaultReady, context: useContext, vaultReason, vaultWanted, contextWanted: useContext },
   };
 }
 

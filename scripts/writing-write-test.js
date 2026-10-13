@@ -592,6 +592,58 @@ async function main() {
     console.log("PASS defect 2 only-active chunks fall back to zero vault evidence");
   }
 
+  // Task 10 — useVault false: vault never searched, prompt says turned off, context still searched.
+  {
+    const plugin = makeStub({ vault: 8, context: 2, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useVault: false });
+    assert.strictEqual(plugin.calls.includes("retrieve"), false, "no vault retrieval when off");
+    assert.strictEqual(result.searched.vault, false, "searched.vault false");
+    assert.strictEqual(result.searched.vaultWanted, false, "vaultWanted false");
+    assert.strictEqual(result.searched.context, true, "context still searched");
+    assert.strictEqual(result.evidenceCount, 2, "context-only evidence");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- vault: not searched (turned off)"), "prompt says vault turned off");
+    assert.ok(!userPrompt.includes("vault index unavailable"), "no unavailable claim for unsearched vault");
+    console.log("PASS task 10 useVault false skips vault and says turned off");
+  }
+
+  // Task 10 — useContext false: no getContextStore call at all.
+  {
+    const plugin = makeStub({ vault: 2, context: 8, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useContext: false });
+    assert.strictEqual(plugin.calls.includes("getContextStore"), false, "no store call when off");
+    assert.strictEqual(plugin.calls.includes("sync"), false, "no sync when off");
+    assert.strictEqual(plugin.calls.includes("search"), false, "no context search when off");
+    assert.strictEqual(result.searched.context, false, "searched.context false");
+    assert.strictEqual(result.evidenceCount, 2, "vault-only evidence");
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("- context folder: not searched (turned off)"), "prompt says context turned off");
+    console.log("PASS task 10 useContext false skips the store entirely");
+  }
+
+  // Task 10 — both off: zero-evidence fallback never claims a source lacked evidence.
+  {
+    const plugin = makeStub({ vault: 8, context: 8, modelText: "nothing found" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useVault: false, useContext: false });
+    assert.strictEqual(plugin.calls.includes("retrieve"), false, "no vault call");
+    assert.strictEqual(plugin.calls.includes("getContextStore"), false, "no store call");
+    assert.strictEqual(result.evidenceCount, 0);
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes("both turned off"), "fallback says both turned off");
+    assert.ok(!userPrompt.includes("No evidence was found in the"), "no lacked-evidence claim");
+    console.log("PASS task 10 both off keeps an honest zero-evidence fallback");
+  }
+
+  // Task 10 — defaults when omitted: both searched (existing behavior).
+  {
+    const plugin = makeStub({ vault: 1, context: 1, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.searched.vault, true, "vault searched by default");
+    assert.strictEqual(result.searched.context, true, "context searched by default");
+    assert.strictEqual(result.evidenceCount, 2);
+    console.log("PASS task 10 omitted options default to both searched");
+  }
+
   console.log("writing-write-test: PASS");
 }
 

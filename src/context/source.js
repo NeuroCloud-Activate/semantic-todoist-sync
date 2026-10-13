@@ -19,7 +19,7 @@
 // src/context/extract.js; the controller dedupes at integration.
 const CONTEXT_EXTENSIONS = ["md", "txt", "docx", "xlsx", "csv", "pdf", "png", "jpg", "jpeg"];
 
-const DEFAULT_CONTEXT_FOLDER = "Writing Context";
+const DEFAULT_CONTEXT_FOLDER = "Semantic Todoist Sync/Context";
 const MAX_CONTEXT_FILE_BYTES = 20 * 1024 * 1024;
 
 function isAbsoluteContextPath(p) {
@@ -254,8 +254,11 @@ async function readContextFile(rootInfo, app, id) {
 async function ensureVaultContextFolder(app, folder) {
   const target = normalizeVaultFolder(folder);
   const adapter = app.vault.adapter;
-  if (await adapter.exists(target)) return;
-  await adapter.mkdir(target);
+  let current = "";
+  for (const part of target.split("/").filter(Boolean)) {
+    current = current ? current + "/" + part : part;
+    if (!(await adapter.exists(current))) await adapter.mkdir(current);
+  }
 }
 
 module.exports = {

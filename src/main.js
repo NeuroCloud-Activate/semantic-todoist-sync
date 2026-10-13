@@ -175,6 +175,7 @@ const TASK_SUBTASK_STABLE_IDENTITY_FIELDS = [
   "noteRefs", "references", "reference", "taskReference", "deduplication"
 ];
 const PLUGIN_DATA_FOLDER = "Semantic Todoist Sync";
+const WRITING_CONTEXT_FOLDER_DEFAULT = `${PLUGIN_DATA_FOLDER}/Context`; // writing-mode: default context folder lives under the plugin vault folder
 const TASK_CONTEXT_MAX_ROWS = 14;
 const TASK_CONTEXT_MAX_ROWS_PER_PATH = 5;
 const EXTERNAL_MCP_EXPORT_FOLDER = `${PLUGIN_DATA_FOLDER}/MCP Export`;
@@ -2843,16 +2844,16 @@ function normalizeStableSettings(input = {}) {
   }
   // writing-mode: normalize writing settings to defaults
   const rawFolder = source.writingContextFolder;
-  let folderValue = "Writing Context";
+  let folderValue = WRITING_CONTEXT_FOLDER_DEFAULT;
   if (typeof rawFolder === "string" && rawFolder.trim()) {
     folderValue = rawFolder.trim();
   } else if (rawFolder === undefined || rawFolder === null || rawFolder === "") {
-    folderValue = String(DEFAULT_SETTINGS.writingContextFolder || "Writing Context").trim();
+    folderValue = String(DEFAULT_SETTINGS.writingContextFolder || WRITING_CONTEXT_FOLDER_DEFAULT).trim();
   } else {
     // Invalid value (e.g. number, boolean) defaults to Writing Context
-    folderValue = "Writing Context";
+    folderValue = WRITING_CONTEXT_FOLDER_DEFAULT;
   }
-  result.writingContextFolder = folderValue || "Writing Context";
+  result.writingContextFolder = folderValue === "Writing Context" ? WRITING_CONTEXT_FOLDER_DEFAULT : folderValue || WRITING_CONTEXT_FOLDER_DEFAULT; // writing-mode: old default migrates to the plugin Context folder
   result.writingDescribeImages = source.writingDescribeImages !== false;
   // writing-mode: task 10 collaborate toggle settings (length invalid falls back to standard; toggles default true unless explicitly false)
   const rawLength = typeof source.writingDraftLength === "string" ? source.writingDraftLength.trim().toLowerCase() : "";
@@ -3599,7 +3600,7 @@ const DEFAULT_SETTINGS = {
   taskGenerationPromptProfile: "default",
   taskSectionTitleMode: "local",
   chatFontSizePx: 13,
-  writingContextFolder: "Writing Context", // writing-mode: new context folder default
+  writingContextFolder: WRITING_CONTEXT_FOLDER_DEFAULT, // writing-mode: new context folder default
   writingDescribeImages: true, // writing-mode: new describe-images default
   writingCollaborateMode: false, // writing-mode: task 10 collaborate toggle off by default
   writingDraftLength: "standard", // writing-mode: task 10 draft length default
@@ -4609,6 +4610,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-start-provider-capture", name: "Start debug logging", callback: () => this.startProviderCaptureSession() });
     this.addCommand({ id: "semantic-todoist-stop-provider-capture", name: "Stop debug logging", callback: () => this.stopProviderCaptureSession() });
 
+    if (this.app.workspace && typeof this.app.workspace.onLayoutReady === "function") this.app.workspace.onLayoutReady(() => this.ensureWritingContextFolder()); // writing-mode: create the context folder once the vault is ready
     this.addCommand({ id: "semantic-todoist-rescan-context", name: "Rescan writing context folder", callback: () => this.rescanContextFolder() }); // writing-mode: task 7 manual context-folder rescan
     this.addCommand({ id: "semantic-todoist-collaborate", name: "Collaborate on active note", callback: () => this.collaborateOnActiveNote() }); // writing-mode: task 8 open sidebar and focus prompt
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
@@ -13929,7 +13931,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const obsidian = require("obsidian");
     const identity = semanticEmbeddingIdentity(this.settings);
     const embeddingKey = `${identity.provider}:${identity.model}`;
-    const folderConfig = String(this.settings?.writingContextFolder || "Writing Context").trim();
+    const folderConfig = String(this.settings?.writingContextFolder || WRITING_CONTEXT_FOLDER_DEFAULT).trim();
     // writing-mode: task 10 include describe-images flag in the store key so toggling it rebuilds the store
     const describeFlag = this.settings && this.settings.writingDescribeImages === false ? "noimg" : "img";
     const storeKey = `${embeddingKey}:${folderConfig}:${describeFlag}`;
@@ -13953,6 +13955,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     const { resolveContextRoot } = require("./context/source.js");
     const rootInfo = await resolveContextRoot(this.app, this.settings, obsidian.Platform);
+    if (rootInfo && rootInfo.kind === "vault") await require("./context/source.js").ensureVaultContextFolder(this.app, rootInfo.root).catch(() => {}); // writing-mode: folder exists before any sync
     return { store: this._writingContextStore, rootInfo };
   }
 
@@ -14020,6 +14023,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       }
     } catch { /* failure → [] with no throw */ }
     return [];
+  }
+
+  async ensureWritingContextFolder() { // writing-mode: create the vault context folder automatically (no-op for external folders)
+    try {
+      const { resolveContextRoot, ensureVaultContextFolder } = require("./context/source.js");
+      const rootInfo = await resolveContextRoot(this.app, this.settings, require("obsidian").Platform);
+      if (rootInfo && rootInfo.kind === "vault") await ensureVaultContextFolder(this.app, rootInfo.root);
+    } catch (error) { /* best effort: a missing folder is retried on the next write or rescan */ }
   }
 
   async rescanContextFolder() { // writing-mode: task 7 manual rescan of the writing context folder with a counted Notice
@@ -22674,7 +22685,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
     // writing-mode: Writing settings section
     const writing = settingsDisclosure(containerEl, "Writing", "Sidebar Write mode settings for drafting evidence-based prose into notes.", false);
-    textSetting(writing, "Context folder", "Default in-vault folder 'Writing Context', or an absolute desktop path outside the vault. On mobile, an external path falls back to the vault folder.", this.plugin, "writingContextFolder");
+    textSetting(writing, "Context folder", "Default in-vault folder 'Semantic Todoist Sync/Context' (created automatically), or an absolute desktop path outside the vault. On mobile, an external path falls back to the vault folder.", this.plugin, "writingContextFolder");
     toggleSetting(writing, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
     toggleSetting(writing, "Deep research evidence", "Use saved Deep research notes from the Research folder as evidence, ranked above vault notes.", this.plugin, "writingUseResearch");
     new Setting(writing).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));
@@ -30396,7 +30407,7 @@ function writingIsAbsoluteContextPath(value) {
 function writingPathInContextFolder(path, settings, vaultBasePath) {
   const configured = settings && typeof settings.writingContextFolder === "string" && settings.writingContextFolder.trim()
     ? settings.writingContextFolder.trim()
-    : "Writing Context";
+    : WRITING_CONTEXT_FOLDER_DEFAULT;
   const base = String(vaultBasePath || "").replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "");
   const folderConfigured = configured.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "").trim();
   // writing-mode: fix round 1 — absolute path inside vault is converted to vault-relative folder; absolute outside vault excludes nothing.
@@ -30413,7 +30424,7 @@ function writingPathInContextFolder(path, settings, vaultBasePath) {
     return false;
   }
   if (writingIsAbsoluteContextPath(configured)) return false;
-  const folder = folderConfigured || "Writing Context";
+  const folder = folderConfigured || WRITING_CONTEXT_FOLDER_DEFAULT;
   const value = String(path || "").replace(/\\/g, "/");
   return value === folder || value.startsWith(`${folder}/`);
 }

@@ -239,9 +239,10 @@ async function main() {
     }
     const plugin = Object.create(Plugin.prototype);
     plugin.settings = Object.assign({}, Plugin.DEFAULT_SETTINGS);
-    assert.strictEqual(plugin.isIndexablePath("Writing Context/a.md"), false, "default context folder excluded");
-    assert.strictEqual(plugin.isIndexablePath("Writing Context"), false, "folder itself excluded");
-    assert.strictEqual(plugin.isIndexablePath("Writing Contextual/a.md"), true, "prefix sibling still indexed");
+    assert.strictEqual(plugin.isIndexablePath("Semantic Todoist Sync/Context/a.md"), false, "default context folder excluded");
+    assert.strictEqual(plugin.isIndexablePath("Semantic Todoist Sync/Context"), false, "folder itself excluded");
+    plugin.settings = Object.assign({}, Plugin.DEFAULT_SETTINGS, { writingContextFolder: "Research/Ctx" });
+    assert.strictEqual(plugin.isIndexablePath("Research/Ctxual/a.md"), true, "prefix sibling still indexed");
     assert.strictEqual(plugin.isIndexablePath("Notes/a.md"), true, "normal path unchanged");
     plugin.settings = Object.assign({}, Plugin.DEFAULT_SETTINGS, { writingContextFolder: "Research/Ctx/" });
     assert.strictEqual(plugin.isIndexablePath("Research/Ctx/f.md"), false, "custom folder excluded");

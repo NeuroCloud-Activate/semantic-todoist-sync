@@ -71,7 +71,7 @@ function bufToString(ab) {
       "Writing Context/sub/evil.exe": { size: 56, mtime: 1700000002000, content: "x" },
       "Writing Context/notes/UPPER.JPG": { size: 78, mtime: 1700000003000, content: "img" },
     });
-    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     assert.strictEqual(rootInfo.kind, "vault");
     const files = await source.listContextFiles(rootInfo, app);
     const ids = files.map((f) => f.id).sort();
@@ -125,7 +125,7 @@ function bufToString(ab) {
       app, { writingContextFolder: abs }, { isDesktop: false }
     );
     assert.strictEqual(rootInfo.kind, "vault");
-    assert.strictEqual(rootInfo.root, "Writing Context");
+    assert.strictEqual(rootInfo.root, "Semantic Todoist Sync/Context");
     assert.ok(rootInfo.notice && /mobile/i.test(rootInfo.notice), "notice must mention mobile");
     console.log("PASS absolute path on mobile falls back to vault with mobile notice");
   }
@@ -138,7 +138,7 @@ function bufToString(ab) {
       app, { writingContextFolder: missing }, { isDesktop: true }
     );
     assert.strictEqual(rootInfo.kind, "vault");
-    assert.strictEqual(rootInfo.root, "Writing Context");
+    assert.strictEqual(rootInfo.root, "Semantic Todoist Sync/Context");
     assert.ok(rootInfo.notice && rootInfo.notice.length > 0, "missing dir must produce a notice");
     console.log("PASS missing external dir falls back to vault with notice");
   }
@@ -150,7 +150,7 @@ function bufToString(ab) {
       "Writing Context/big.pdf": { size: big, mtime: 1700000004000, content: "too big" },
       "Writing Context/small.md": { size: 5, mtime: 1700000005000, content: "ok" },
     });
-    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     const files = await source.listContextFiles(rootInfo, app);
     const bigEntry = files.find((f) => f.id === "Writing Context/big.pdf");
     assert.ok(bigEntry, "oversize file must still be listed");
@@ -174,6 +174,10 @@ function bufToString(ab) {
     await source.ensureVaultContextFolder(app, "Writing Context/New");
     assert.deepStrictEqual(app.__mkdirCalls, ["Writing Context/New"]);
     console.log("PASS ensureVaultContextFolder creates missing folders only");
+    const nested = makeVaultApp({});
+    await source.ensureVaultContextFolder(nested, "Semantic Todoist Sync/Context");
+    assert.deepStrictEqual(nested.__mkdirCalls, ["Semantic Todoist Sync", "Semantic Todoist Sync/Context"], "parents are created before the context folder");
+    console.log("PASS ensureVaultContextFolder creates missing parent folders");
   }
 
   // 7. CONTEXT_EXTENSIONS covers the spec formats
@@ -190,7 +194,7 @@ function bufToString(ab) {
     const app = makeVaultApp({
       "Writing Context/a.md": { size: 5, mtime: 1700000006000, content: "ok" },
     });
-    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     await assert.rejects(
       source.readContextFile(rootInfo, app, "Writing Context/../secret.md"),
       (err) => err && err.code === "outside-context-root",
@@ -253,7 +257,7 @@ function bufToString(ab) {
       ["Writing Context/Sub/a.md"]
     );
     const blank = await source.resolveContextRoot(app, { writingContextFolder: "   " }, { isDesktop: true });
-    assert.strictEqual(blank.root, "Writing Context");
+    assert.strictEqual(blank.root, "Semantic Todoist Sync/Context");
     console.log("PASS vault folder setting is normalised");
   }
 
@@ -265,7 +269,7 @@ function bufToString(ab) {
       "Writing Context/.git/y.txt": { size: 2, mtime: 1700000011000, content: "hidden" },
       "Writing Context/.hidden.md": { size: 2, mtime: 1700000012000, content: "hidden" },
     });
-    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     assert.deepStrictEqual(
       (await source.listContextFiles(rootInfo, app)).map((f) => f.id),
       ["Writing Context/a.md"]
@@ -298,7 +302,7 @@ function bufToString(ab) {
       "external directory id must report not-found"
     );
     const app = makeVaultApp({});
-    const rootInfo = await source.resolveContextRoot(app, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     await assert.rejects(
       source.readContextFile(rootInfo, app, "Writing Context/missing.md"),
       (err) => err && err.code === "not-found",
@@ -375,7 +379,7 @@ function bufToString(ab) {
   // 14. vault adapter stat throwing yields not-found
   {
     const throwingApp = { vault: { adapter: { async stat() { throw new Error("boom"); } } } };
-    const rootInfo = await source.resolveContextRoot(throwingApp, {}, { isDesktop: true });
+    const rootInfo = await source.resolveContextRoot(throwingApp, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     await assert.rejects(
       source.readContextFile(rootInfo, throwingApp, "Writing Context/a.md"),
       (err) => err && err.code === "not-found",

@@ -97,7 +97,8 @@ function testNormalizeInvalidSettings() {
   const source = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   const readers = source.split(/\r?\n/).filter((line) => /sidebarMode/.test(line) && !/^\s*\/\//.test(line));
   assert.deepStrictEqual(readers, [], 'nothing in src/main.js reads or writes sidebarMode');
-  assert.strictEqual(normalized.writingContextFolder, 'Writing Context', 'invalid folder defaults to Writing Context');
+  assert.strictEqual(normalized.writingContextFolder, 'Semantic Todoist Sync/Context', 'invalid folder defaults to the plugin Context folder');
+  assert.strictEqual(Plugin.normalizeStableSettings({ writingContextFolder: 'Writing Context' }).writingContextFolder, 'Semantic Todoist Sync/Context', 'old default Writing Context migrates to the plugin Context folder');
   assert.strictEqual(normalized.writingDescribeImages, true, 'invalid describeImages defaults to true');
   console.log('PASS settings normalisation without sidebarMode');
 }
@@ -107,7 +108,7 @@ function testSettingsMigrationStillPasses() {
   // and DEFAULT_SETTINGS; we verify the new keys don't break it.
   const defaults = Plugin.DEFAULT_SETTINGS || {};
   assert.strictEqual(defaults.sidebarMode, undefined, 'sidebarMode removed from defaults');
-  assert.strictEqual(defaults.writingContextFolder, 'Writing Context', 'writingContextFolder in defaults');
+  assert.strictEqual(defaults.writingContextFolder, 'Semantic Todoist Sync/Context', 'writingContextFolder in defaults');
   assert.strictEqual(defaults.writingDescribeImages, true, 'writingDescribeImages in defaults');
   console.log('PASS settings keys present in DEFAULT_SETTINGS');
 }

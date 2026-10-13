@@ -319,11 +319,11 @@ async function writeWithEvidence(plugin, options) {
   // rejects here and surfaces, while per-file skips stay in the result.
   // writing-mode: task 10 skip the context store entirely when context evidence is off
   let contextStore = null;
-  let rootInfo = { kind: "vault", root: "Writing Context" };
+  let rootInfo = { kind: "vault", root: "Semantic Todoist Sync/Context" };
   if (useContext) {
     const context = await plugin.getContextStore();
     contextStore = context && context.store ? context.store : context;
-    rootInfo = (context && context.rootInfo) || { kind: "vault", root: "Writing Context" };
+    rootInfo = (context && context.rootInfo) || { kind: "vault", root: "Semantic Todoist Sync/Context" };
     await contextStore.sync(rootInfo, plugin.app);
   }
 

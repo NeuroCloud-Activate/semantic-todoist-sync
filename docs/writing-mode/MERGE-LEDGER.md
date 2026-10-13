@@ -99,3 +99,21 @@ New file: `scripts/writing-vision-test.js` (10 cases: openrouter / customopenai 
 Validation: `node scripts/writing-vision-test.js` PASS (red before: `describeImage` undefined; green after build); `npm.cmd run build` OK; `npm.cmd test` 17/27 — the 12 baseline passes plus `writing-citations/extract/source/store/vision` pass, same 10 pre-existing failures, no new failures.
 
 Fix round 1 validation: `node scripts/writing-vision-test.js` PASS (red before fix: Responses `input_text` part had `undefined` text; green after); `npm.cmd run build` OK (pre-existing esbuild `Duplicate key "reasoningAutoCorrections"` warning only); `npm.cmd test` — see Task 5 report Fix round 1. `Select-String src/main.js -Pattern "writing-mode:"` count = 18 = 18 ledger rows above. Test script extended: Responses `input_text` string-text check, 20 MB `image-too-large` rejection with no request, Anthropic/Gemini/Responses text-only bodies deep-equal (omitted vs `[]`) with no image keys.
+
+## Task 7 — evidence-based write orchestrator (`feat(writing): evidence-based write orchestrator`)
+
+New files: `src/writing/write.js` (`async writeWithEvidence(plugin, { instruction, length, active, webSearchMode })` → `{ markdown, footnotes, sources, evidenceCount, dropped }`; constant `WRITE_SYSTEM_PROMPT`; quota-merge 8 vault + 8 context as `E1..E16`), `scripts/writing-write-test.js` (9 cases: stub-plugin merge/order/sync-errors/prompt-contents/zero-evidence/rewrite/length/operation, plus built-plugin `isIndexablePath` exclusion).
+
+`src/main.js` edits (7 `// writing-mode:` tags; `Select-String src/main.js -Pattern "writing-mode:"` count = 25 = 18 prior + 7 rows below):
+
+| task | function | change | why |
+|------|----------|--------|-----|
+| 7 | module scope `AI_OPERATION_KEYS` (~24) | Added `"write"` to the frozen operation list | The `write` operation resolves to the primary chat model the same way `chat-query` does |
+| 7 | module scope `writingIsAbsoluteContextPath` + `writingPathInContextFolder` (~29983) | Vault-relative context-folder matcher; absolute configured paths never match (vault kind only) | Single shared check for the index exclusion; regex-free (a `/`-in-class literal breaks the esbuild 0.28 parse) |
+| 7 | `isIndexablePath` (~9166) | Returns `false` inside the configured context folder (default `"Writing Context"`; `writingDescribeImages`/`writingContextFolder` read with fallbacks, Task 8 owns the settings) | Context `.md` files must not be indexed twice |
+| 7 | `getContextStore` (new, ~13891) | Lazy `ContextStore` at `${manifest.dir}/context-index.json`, created + loaded once per `semanticEmbeddingIdentity` key; `extractDeps` from `require("obsidian")` (`htmlToMarkdown`, `loadPdfJs`) plus `describeImage` unless `writingDescribeImages === false`; resolves the root per call and returns `{ store, rootInfo }` | Separate store built only for Write mode; lazy `require` keeps mobile startup clean |
+| 7 | `writeWithEvidence` (new, ~13919) | Thin wrapper defaulting `active` via `getActiveMarkdownContext()` and delegating to `src/writing/write.js` | Plugin stays a stub-friendly seam; orchestration lives in the module |
+| 7 | `rescanContextFolder` (new, ~13930) | Resolves root, ensures the vault folder, surfaces a root `notice`, syncs, then `Notice` with added/changed/removed/skipped counts | Manual rescan command body |
+| 7 | `onload` (~4584) | Command `semantic-todoist-rescan-context` ("Rescan writing context folder") | Manual entry point for the rescan |
+
+Validation: `node scripts/writing-write-test.js` PASS (red before: `Cannot find module '../src/writing/write.js'`; green after); `npm.cmd run build` OK (pre-existing `Duplicate key "reasoningAutoCorrections"` warning only; built `main.js` 4,205,707 bytes — parsers now bundled); `npm.cmd test` 18/28 — the 12 baseline passes plus `writing-citations/extract/source/store/vision/write` pass, same 10 pre-existing failures, no new failures.

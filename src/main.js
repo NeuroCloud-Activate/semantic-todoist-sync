@@ -21,7 +21,7 @@ const SEMANTIC_INDEX_PATH_META_FILE = "semantic-index-path-meta.json";
 const SUPPORTED_AI_PROVIDERS = Object.freeze(["openai", "gemini", "openrouter", "openwebui", "customopenai", "anthropic"]);
 const AI_OPERATION_KEYS = Object.freeze([
   "chat-query", "prompt-response", "task-generation", "task-description",
-  "section-title", "scheduler", "policy", "deduplication"
+  "section-title", "scheduler", "policy", "deduplication", "write" // writing-mode: task 7 write operation maps to the primary chat model like chat-query
 ]);
 const DEFAULT_GENERATION_PRIMARY = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-luna", reasoningEffort: "auto" });
 const DEFAULT_GENERATION_FALLBACK = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-terra", reasoningEffort: "auto" });
@@ -4581,6 +4581,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-start-provider-capture", name: "Start debug logging", callback: () => this.startProviderCaptureSession() });
     this.addCommand({ id: "semantic-todoist-stop-provider-capture", name: "Stop debug logging", callback: () => this.stopProviderCaptureSession() });
 
+    this.addCommand({ id: "semantic-todoist-rescan-context", name: "Rescan writing context folder", callback: () => this.rescanContextFolder() }); // writing-mode: task 7 manual context-folder rescan
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
     this.registerInterval(window.setTimeout(() => this.ensurePromptTemplateFolder(false), STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
@@ -9162,6 +9163,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   isIndexablePath(path, include, exclude) {
+    if (writingPathInContextFolder(path, this.settings)) return false; // writing-mode: task 7 context folder excluded from the vault index
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
     if (isEmailLogPath(path, this.settings)) return false;
@@ -13884,6 +13886,56 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       user: "Describe this image for use as research evidence. Transcribe all visible text, tables and figure labels verbatim; then summarise what it shows.",
       images
     });
+  }
+
+  async getContextStore() { // writing-mode: task 7 lazy context store (created and loaded once per embedding identity)
+    const { ContextStore } = require("./context/store.js");
+    const obsidian = require("obsidian");
+    const identity = semanticEmbeddingIdentity(this.settings);
+    const embeddingKey = `${identity.provider}:${identity.model}`;
+    if (!this._writingContextStore || this._writingContextStoreKey !== embeddingKey) {
+      const store = new ContextStore({
+        adapter: this.app.vault.adapter,
+        path: `${this.manifest.dir}/context-index.json`,
+        embed: (texts) => this.embedTexts(texts, "document"),
+        embeddingKey,
+        extractDeps: {
+          htmlToMarkdown: obsidian.htmlToMarkdown,
+          loadPdfJs: obsidian.loadPdfJs,
+          ...(this.settings && this.settings.writingDescribeImages === false
+            ? {}
+            : { describeImage: (bytes, mime) => this.describeImage(bytes, mime) }),
+        },
+      });
+      await store.load();
+      this._writingContextStore = store;
+      this._writingContextStoreKey = embeddingKey;
+    }
+    const { resolveContextRoot } = require("./context/source.js");
+    const rootInfo = await resolveContextRoot(this.app, this.settings, obsidian.Platform);
+    return { store: this._writingContextStore, rootInfo };
+  }
+
+  async writeWithEvidence(instruction, options = {}) { // writing-mode: task 7 thin delegation to src/writing/write.js
+    const { writeWithEvidence } = require("./writing/write.js");
+    const active = options && options.active ? options.active : await this.getActiveMarkdownContext();
+    return writeWithEvidence(this, {
+      instruction,
+      length: options ? options.length : undefined,
+      active,
+      webSearchMode: options ? options.webSearchMode : undefined,
+    });
+  }
+
+  async rescanContextFolder() { // writing-mode: task 7 manual rescan of the writing context folder with a counted Notice
+    const { ensureVaultContextFolder } = require("./context/source.js");
+    const { store, rootInfo } = await this.getContextStore();
+    if (rootInfo && rootInfo.kind === "vault") await ensureVaultContextFolder(this.app, rootInfo.root);
+    if (rootInfo && rootInfo.notice) new Notice(rootInfo.notice);
+    const result = await store.sync(rootInfo, this.app);
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    new Notice(`Rescanned writing context: ${result.added} added, ${result.changed} changed, ${result.removed} removed, ${skipped} skipped.`);
+    return result;
   }
 
   async openaiResponse({ model, modelOverride = "", onResponseIdentity = null, system, user, userStableChars = 0, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", images = null, captureContext = null }) { // writing-mode: task 5 image input option
@@ -29926,6 +29978,23 @@ function clearPromptCacheHintRejection(plugin) {
   if (plugin.promptCacheHintRejected && typeof plugin.promptCacheHintRejected.clear === "function") plugin.promptCacheHintRejected.clear();
   plugin.promptCacheHintRejectedMessage = "";
   if (had && typeof plugin.refreshSidebarStatus === "function") plugin.refreshSidebarStatus();
+}
+
+// writing-mode: task 7 vault-relative context-folder check (vault kind only; an external absolute folder never matches)
+function writingIsAbsoluteContextPath(value) {
+  const text = String(value || "");
+  if (/^[A-Za-z]:/.test(text)) return true;
+  return text.startsWith("/") || text.startsWith("\\");
+}
+
+function writingPathInContextFolder(path, settings) {
+  const configured = settings && typeof settings.writingContextFolder === "string" && settings.writingContextFolder.trim()
+    ? settings.writingContextFolder.trim()
+    : "Writing Context";
+  if (writingIsAbsoluteContextPath(configured)) return false;
+  const folder = configured.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "").trim() || "Writing Context";
+  const value = String(path || "").replace(/\\/g, "/");
+  return value === folder || value.startsWith(`${folder}/`);
 }
 
 // Chat-completions message shaping for the OpenAI-compatible adapters.

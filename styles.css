@@ -542,12 +542,13 @@
 
 .semantic-todoist-toolbar {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   align-items: center;
 }
 
-.semantic-todoist-toolbar button {
+.semantic-todoist-toolbar button,
+.semantic-todoist-top-row > button {
   border-radius: 6px;
   min-width: 0;
   overflow: hidden;
@@ -567,7 +568,8 @@
   white-space: nowrap;
 }
 
-.semantic-todoist-toolbar button {
+.semantic-todoist-toolbar button,
+.semantic-todoist-top-row > button {
   align-items: center;
   display: inline-flex;
   justify-content: center;
@@ -579,11 +581,19 @@
   white-space: nowrap;
 }
 
+.semantic-todoist-top-row {
+  align-items: center;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+  min-width: 0;
+}
+
 .semantic-todoist-action-row {
   align-items: center;
   display: grid;
   gap: 6px;
-  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
 
@@ -1359,7 +1369,8 @@
   }
 
   .semantic-todoist-header button,
-  .semantic-todoist-toolbar button {
+  .semantic-todoist-toolbar button,
+  .semantic-todoist-top-row > button {
     font-size: var(--font-ui-small);
     height: 30px;
     min-height: 30px;
@@ -1432,18 +1443,23 @@
 
   .semantic-todoist-toolbar {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 4px;
   }
 
-  .semantic-todoist-toolbar button {
+  .semantic-todoist-toolbar button,
+  .semantic-todoist-top-row > button {
     padding-inline: 4px;
     width: 100%;
   }
 
+  .semantic-todoist-top-row {
+    gap: 4px;
+  }
+
   .semantic-todoist-action-row {
     gap: 4px;
-    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .semantic-todoist-action-row select {
@@ -1548,6 +1564,7 @@
 @media (hover: none), (pointer: coarse) {
   .semantic-todoist-tabs button,
   .semantic-todoist-toolbar button,
+  .semantic-todoist-top-row > button,
   .semantic-todoist-header button,
   .semantic-todoist-settings button,
   .semantic-todoist-modal button {
@@ -1556,6 +1573,7 @@
   }
 
   .semantic-todoist-toolbar button,
+  .semantic-todoist-top-row > button,
   .semantic-todoist-header button {
     height: 44px;
   }
@@ -1607,7 +1625,8 @@
 }
 
 .is-mobile .semantic-todoist-header button,
-.is-mobile .semantic-todoist-toolbar button {
+.is-mobile .semantic-todoist-toolbar button,
+.is-mobile .semantic-todoist-top-row > button {
   height: 34px;
   min-height: 34px;
   padding-block: 4px;

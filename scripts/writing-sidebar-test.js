@@ -155,7 +155,7 @@ function testToolbarButtonsOrder() {
 function testCollaborateTogglesMode() {
   const fs = require('fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
-  assert(src.includes('const collaborateButton = toolbar.createEl('), 'collaborateButton created in toolbar');
+  assert(src.includes('const collaborateButton = topRow.createEl('), 'collaborateButton created in top row');
   assert(/collaborateButton\.onclick = async \(\) => \{\s*await this\.toggleCollaborateMode\(\);\s*\};/.test(src), 'Collaborate click toggles mode');
   assert(src.includes('async toggleCollaborateMode()'), 'toggleCollaborateMode method present');
   assert(src.includes('is-active'), 'toggle sets is-active class');
@@ -384,10 +384,11 @@ function testToolbarFourColumns() {
   const blocks = css.split('}');
   const toolbarGrids = blocks.filter((b) => b.includes('.semantic-todoist-toolbar') && b.includes('grid-template-columns'));
   assert(toolbarGrids.length >= 2, 'toolbar grid rules present, got ' + toolbarGrids.length);
-  assert(toolbarGrids.every((b) => b.includes('repeat(4,')), 'all toolbar grids use 4 columns');
+  assert(toolbarGrids.every((b) => b.includes('repeat(2,')), 'all toolbar grids use 2 columns (Ask, Tasks)');
   assert(toolbarGrids.every((b) => !b.includes('repeat(3,')), 'no 3-column toolbar grid remains');
+  assert(css.includes('.semantic-todoist-top-row {'), 'top row grid rule present');
   assert(css.includes('text-overflow: ellipsis'), 'toolbar button text ellipsizes');
-  console.log('PASS toolbar-four-columns (4 equal columns, ellipsize)');
+  console.log('PASS toolbar-two-columns (Ask/Tasks row, ellipsize)');
 }
 
 function testNoLengthRowInToolbar() {

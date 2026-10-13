@@ -21764,8 +21764,9 @@ class SemanticTodoistView extends ItemView {
       if (this.plugin.settings.writingCollaborateMode === true) this.write();
       else this.ask();
     });
+    const topRow = main.createDiv({ cls: "semantic-todoist-top-row" }); // writing-mode: globe, Collaborate and Run sit above Ask/Tasks
     const actionRow = main.createDiv({ cls: "semantic-todoist-action-row" });
-    const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
+    const webSearchModifier = topRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
     this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
     setIcon(this.webSearchToggleEl, "globe-2");
     this.webSearchToggleEl.onclick = () => {
@@ -21786,7 +21787,7 @@ class SemanticTodoistView extends ItemView {
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
     };
-    const collaborateButton = toolbar.createEl("button", { cls: "semantic-todoist-collaborate-button", attr: { title: "Toggle collaborate mode", "aria-label": "Toggle collaborate mode", "aria-pressed": "false" }, text: "Collaborate" });
+    const collaborateButton = topRow.createEl("button", { cls: "semantic-todoist-collaborate-button", attr: { title: "Toggle collaborate mode", "aria-label": "Toggle collaborate mode", "aria-pressed": "false" }, text: "Collaborate" });
     this.collaborateButton = collaborateButton; // writing-mode: wrap existing write() flow with in-flight button state
     collaborateButton.onclick = async () => {
       await this.toggleCollaborateMode();
@@ -21796,7 +21797,7 @@ class SemanticTodoistView extends ItemView {
     this.collaborateFeaturesButton.onclick = (event) => {
       this.openCollaborateFeaturesMenu(event);
     };
-    const runButton = toolbar.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
+    const runButton = topRow.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
     this.runButton = runButton; // writing-mode: task 10 Run button relabelled Write in collaborate mode
     runButton.onclick = async () => {
       if (this.plugin.settings.writingCollaborateMode === true) await this.write();

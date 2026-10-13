@@ -1,4 +1,11 @@
 # Changelog
+## 0.9.21 - 2026-10-13
+### Fixed
+- **"Ranked corpus is empty" no longer appears when a note changes during task creation.** The plugin checked its note index against a live revision that an edit had already moved past, so it rejected its own evidence and returned no tasks. The same rejection could follow the automatic task-reference repair, which swapped in rebuilt task rows without clearing cached search results; that cache is now cleared too.
+### Notes
+- Live check in Obsidian on disposable copies of the test vault, Claude Haiku 5.5 through the provider, 9 test notes: released 0.9.20 had 3 of 9 notes blocked on their first attempt by this error (each recovered on retry); this build had 0 of 9. Task counts were 8.6 per run for 0.9.20 and 9.0 for this build.
+- A keyword boost for the task search was tested offline against the gold sets and lowered the share of correct notes delivered to the model by 4.4 points (confidence interval -9.0 to -0.2), so it is not included.
+- A low "Maximum subtasks per main task" setting of 2 was briefly suspected during testing; it was not the cause.
 ## 0.9.20 - 2026-10-13
 ### Improved
 - **Task creation and descriptions now see more of the right notes.** The step that picks which note passages go to the model used to take its top 30 passages by meaning score, and often spent about 11 of those slots on repeats from the same few notes. It now takes at most one passage per note from that list and looks at 30 keyword matches instead of 20. On our three hand-checked test sets (80, 154 and 164 task lines) the share of correct notes that reach the model rose by 8 to 13 points (59.7% to 68.3% on the main set, confidence interval 5.9 to 11.6), at about 10 more passages per task (46 to 56, roughly 22% more prompt text). In a live Obsidian run on 12 of those task lines, 30 of 49 correct notes reached the model instead of 23.

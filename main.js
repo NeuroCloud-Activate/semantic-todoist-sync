@@ -5435,6 +5435,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndex = candidate;
       this.taskReferenceIntegrity = candidateIntegrity;
       this.taskReferenceRepairRevision += 1;
+      this.invalidateSemanticRetrievalCache();
       this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidate, candidateIntegrity.graph), {
         taskReferenceSnapshotFingerprint: targetFingerprint,
         taskReferenceSnapshotUpdatedAt: this.settings.taskReferenceSnapshotMeta?.updatedAt || previousMeta.taskReferenceSnapshotUpdatedAt || "",
@@ -15404,7 +15405,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const prestructureSelection = retrievalIsNote
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         preStructureScopes.taskRelevanceRankings || {},
-        { sourceContract, settings: this.settings, coverageIndexRevision: Number(this.semanticIndexRevision || 0) })
+        { sourceContract, settings: this.settings, coverageIndexRevision: Number(preStructureScopes.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
     const prestructureSupplement = retrievalIsNote
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
@@ -16064,7 +16065,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const poststructureSelection = poststructureIsNote
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         taskRelevanceRankings,
-        { sourceContract, settings: this.settings, coverageIndexRevision: Number(this.semanticIndexRevision || 0) })
+        { sourceContract, settings: this.settings, coverageIndexRevision: Number(taskSemanticRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
     const poststructureSupplement = poststructureIsNote
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
@@ -16099,7 +16100,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       : await taskWorkflowSelectTaskRelevantEvidenceCooperative(taskRelevanceRankings, {
         sourceContract,
         settings: this.settings,
-        coverageIndexRevision: Number(this.semanticIndexRevision || 0)
+        coverageIndexRevision: Number(taskSemanticRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0)
       });
     const poststructureAllowedEvidenceIdsByScope = taskWorkflowAllowedEvidenceIdsByScope(poststructureAttachmentSelection);
     await attachTaskWorkflowSemanticEvidenceCooperative(limitedTasks, sourceContract, evidenceCatalog, preStructureScopes, taskSemanticRetrieval, {

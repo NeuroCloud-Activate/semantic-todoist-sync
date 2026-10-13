@@ -13867,12 +13867,20 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   async describeImage(bytes, mime) { // writing-mode: task 5 image description through the configured provider
+    // writing-mode: task 5 fix round 1 rejects images over 20 MB before encoding
+    const imageByteLength = bytes instanceof ArrayBuffer ? bytes.byteLength : (bytes?.byteLength ?? bytes?.length ?? 0);
+    if (imageByteLength > 20 * 1024 * 1024) {
+      const tooLarge = new Error("Image is larger than the 20 MB file cap and was skipped.");
+      tooLarge.code = "image-too-large";
+      throw tooLarge;
+    }
     const images = writingImageInputs([{ mime, base64: writingImageBytesToBase64(bytes) }]);
     const modelChoice = this.aiModelForRequest("describe-image", {});
     return this.openaiResponse({
       operation: "describe-image",
       model: modelChoice && modelChoice.model,
       background: false,
+      system: "You extract research evidence from images.", // writing-mode: task 5 fix round 1 system string so Responses input_text parts always carry text
       user: "Describe this image for use as research evidence. Transcribe all visible text, tables and figure labels verbatim; then summarise what it shows.",
       images
     });

@@ -73,7 +73,7 @@ Built `main.js`: 2,262,503 bytes (< 3,152,600 bytes target) — OK.
 
 New file: `scripts/writing-vision-test.js` (10 cases: openrouter / customopenai / openwebui `image_url` data URI, OpenAI Responses API `input_image`, Anthropic base64 `image` source, Gemini `inline_data`, text-call regression deep-equal, provider-error rejection, empty-bytes `vision-unsupported` with no request).
 
-`src/main.js` edits (16 `// writing-mode:` tags; `Select-String src/main.js -Pattern "writing-mode:"` count = 16 = row count below):
+`src/main.js` edits (18 `// writing-mode:` tags; `Select-String src/main.js -Pattern "writing-mode:"` count = 18 = row count below):
 
 | task | function | change | why |
 |------|----------|--------|-----|
@@ -93,5 +93,9 @@ New file: `scripts/writing-vision-test.js` (10 cases: openrouter / customopenai 
 | 5 | `geminiResponse` (~14441) | `parts` wrapped in `geminiVisionParts([{text: geminiUser}], images)` | Appends `{inline_data:{mime_type, data}}`; helper returns input untouched when empty |
 | 5 | `geminiResponse` (~14465) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive the schema retry instead of being silently dropped |
 | 5 | module scope (~29926) | New helpers `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts` | Bytes→base64 (Buffer with chunked-btoa fallback; obsidian import untouched) and per-provider shaping; malformed images reject with `vision-unsupported`, never silently dropped |
+| 5 fix round 1 | `describeImage` (~13869) | Size guard before base64: `byteLength > 20 * 1024 * 1024` rejects with `code: "image-too-large"` and zero requests | Controller ruling: 20 MB file-cap constant enforced at the entry point, never silently dropped |
+| 5 fix round 1 | `describeImage` (~13869) | Passes `system: "You extract research evidence from images."` to `openaiResponse` | Responses-API `systemContent` `input_text` part always carries string `text`; shared provider code untouched |
 
 Validation: `node scripts/writing-vision-test.js` PASS (red before: `describeImage` undefined; green after build); `npm.cmd run build` OK; `npm.cmd test` 17/27 — the 12 baseline passes plus `writing-citations/extract/source/store/vision` pass, same 10 pre-existing failures, no new failures.
+
+Fix round 1 validation: `node scripts/writing-vision-test.js` PASS (red before fix: Responses `input_text` part had `undefined` text; green after); `npm.cmd run build` OK (pre-existing esbuild `Duplicate key "reasoningAutoCorrections"` warning only); `npm.cmd test` — see Task 5 report Fix round 1. `Select-String src/main.js -Pattern "writing-mode:"` count = 18 = 18 ledger rows above. Test script extended: Responses `input_text` string-text check, 20 MB `image-too-large` rejection with no request, Anthropic/Gemini/Responses text-only bodies deep-equal (omitted vs `[]`) with no image keys.

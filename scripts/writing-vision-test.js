@@ -157,6 +157,64 @@ function chatCompletionsFixture() {
   await assert.rejects(() => makePlugin().describeImage(new Uint8Array(0), 'image/png'), (error) => error.code === 'vision-unsupported');
   assert.strictEqual(requestCalls.length, 0, 'unrepresentable image makes no request');
 
+  // Fix round 1: Responses-path describeImage carries a string text in every input_text part.
+  reset([{ status: 200, json: { id: 'resp-fictional', model: 'gpt-fictional', status: 'completed', output_text: DESCRIPTION, usage: {} }, text: 'FICTIONAL_RESPONSES' }]);
+  text = await makePlugin({ aiModelProvider: 'openai', chatModel: 'gpt-fictional', openaiApiKey: 'FICTIONAL_OPENAI_KEY' }).describeImage(BYTES, 'image/png');
+  assert.strictEqual(text, DESCRIPTION);
+  body = lastBody();
+  const responseInputTexts = body.input.flatMap((item) => item.content || []).filter((part) => part.type === 'input_text');
+  assert.ok(responseInputTexts.length > 0, 'Responses body has input_text parts');
+  for (const part of responseInputTexts) assert.strictEqual(typeof part.text, 'string', 'every Responses input_text part carries string text');
+
+  // Fix round 1: images larger than 20 MB reject with image-too-large before any request.
+  reset(chatCompletionsFixture());
+  const bigBytes = new Uint8Array((20 * 1024 * 1024) + 1);
+  await assert.rejects(() => makePlugin().describeImage(bigBytes, 'image/png'), (error) => error.code === 'image-too-large');
+  assert.strictEqual(requestCalls.length, 0, 'oversize image makes no request');
+
+  // Fix round 1: text-only bodies on Anthropic / Gemini / Responses carry no image keys
+  // and are identical with images omitted vs images: [].
+  function anthropicTextFixture() {
+    return { status: 200, json: { id: 'msg-fictional', model: 'claude-fictional', content: [{ type: 'text', text: DESCRIPTION }], usage: { input_tokens: 1, output_tokens: 2 } }, text: 'FICTIONAL_ANTHROPIC' };
+  }
+  function geminiTextFixture() {
+    return { status: 200, json: { candidates: [{ content: { parts: [{ text: DESCRIPTION }] } }], usageMetadata: {} }, text: 'FICTIONAL_GEMINI' };
+  }
+  function responsesTextFixture() {
+    return { status: 200, json: { id: 'resp-fictional', model: 'gpt-fictional', status: 'completed', output_text: DESCRIPTION, usage: {} }, text: 'FICTIONAL_RESPONSES' };
+  }
+  // Anthropic text path.
+  reset([anthropicTextFixture(), anthropicTextFixture()]);
+  const anthropicPlugin = makePlugin({ aiModelProvider: 'anthropic', chatModel: 'claude-fictional', anthropicApiKey: 'FICTIONAL_ANTHROPIC_KEY' });
+  await anthropicPlugin.openaiResponse({ operation: 'chat', model: 'claude-fictional', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' });
+  const anthropicOmitted = JSON.parse(requestCalls[0].body);
+  await anthropicPlugin.openaiResponse({ operation: 'chat', model: 'claude-fictional', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER', images: [] });
+  const anthropicEmpty = JSON.parse(requestCalls[1].body);
+  assert.deepStrictEqual(anthropicEmpty, anthropicOmitted, 'anthropic text body identical with images omitted vs []');
+  assert.strictEqual(typeof anthropicOmitted.messages[0].content, 'string', 'anthropic text call keeps string content');
+  assert.ok(!JSON.stringify(anthropicOmitted).includes('"image"'), 'anthropic text body has no image keys');
+  // Gemini text path.
+  reset([geminiTextFixture(), geminiTextFixture()]);
+  const geminiPlugin = makePlugin({ aiModelProvider: 'gemini', chatModel: 'gemini-fictional-flash', googleApiKey: 'FICTIONAL_GEMINI_KEY' });
+  await geminiPlugin.openaiResponse({ operation: 'chat', model: 'gemini-fictional-flash', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' });
+  const geminiOmitted = JSON.parse(requestCalls[0].body);
+  await geminiPlugin.openaiResponse({ operation: 'chat', model: 'gemini-fictional-flash', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER', images: [] });
+  const geminiEmpty = JSON.parse(requestCalls[1].body);
+  assert.deepStrictEqual(geminiEmpty, geminiOmitted, 'gemini text body identical with images omitted vs []');
+  assert.ok(geminiOmitted.contents[0].parts.every((part) => !part.inline_data), 'gemini text body has no inline_data');
+  assert.ok(!JSON.stringify(geminiOmitted).includes('image_url'), 'gemini text body has no image keys');
+  // Responses text path.
+  reset([responsesTextFixture(), responsesTextFixture()]);
+  const responsesPlugin = makePlugin({ aiModelProvider: 'openai', chatModel: 'gpt-fictional', openaiApiKey: 'FICTIONAL_OPENAI_KEY' });
+  await responsesPlugin.openaiResponse({ operation: 'chat', model: 'gpt-fictional', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER' });
+  const responsesOmitted = JSON.parse(requestCalls[0].body);
+  await responsesPlugin.openaiResponse({ operation: 'chat', model: 'gpt-fictional', system: 'FICTIONAL_SYSTEM', user: 'FICTIONAL_USER', images: [] });
+  const responsesEmpty = JSON.parse(requestCalls[1].body);
+  assert.deepStrictEqual(responsesEmpty, responsesOmitted, 'responses text body identical with images omitted vs []');
+  const responsesTexts = responsesOmitted.input.flatMap((item) => item.content || []).filter((part) => part.type === 'input_text');
+  for (const part of responsesTexts) assert.strictEqual(typeof part.text, 'string', 'responses text call input_text carries string text');
+  assert.ok(!JSON.stringify(responsesOmitted).includes('input_image'), 'responses text body has no input_image');
+
   console.log('writing-vision-test: PASS');
 })().catch((error) => {
   console.error(error);

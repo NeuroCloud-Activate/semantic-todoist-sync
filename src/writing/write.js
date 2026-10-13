@@ -26,7 +26,8 @@ const WRITE_SYSTEM_PROMPT = [
 const NOTE_CONTEXT_MAX_CHARS = 6000;
 const VAULT_EVIDENCE_LIMIT = 8;
 const VAULT_SECTION_MAX_CHARS = 3000;
-const VAULT_TOTAL_MAX_CHARS = 20000;
+const VAULT_TOTAL_MAX_CHARS = 30000;
+const VAULT_WHOLE_NOTE_MAX_CHARS = 8000;
 const CONTEXT_EVIDENCE_LIMIT = 8;
 const SELECTION_QUERY_CHARS = 500;
 
@@ -182,10 +183,20 @@ function windowText(text, center, budget) {
   return text.slice(start, end).replace(/\s+$/, "");
 }
 
-// Full-note expansion for one note's chunks; null means use the chunk text.
+// Vault paths compared case-insensitively with separators normalised.
+function normaliseVaultPath(p) {
+  return String(p || "").replace(/\\/g, "/").toLowerCase();
+}
+
+// Note expansion for one note's chunks; null means use the chunk text.
+// Notes of <= VAULT_WHOLE_NOTE_MAX_CHARS (front matter stripped) pass whole;
+// longer notes fall back to the section/window logic capped per note.
 function expandVaultNote(note, chunkText, chunkHeading) {
   const body = stripYamlFrontMatter(note);
   if (!body.trim()) return null;
+  if (body.length <= VAULT_WHOLE_NOTE_MAX_CHARS) {
+    return { text: body.replace(/\s+$/, ""), heading: String(chunkHeading || "") || firstHeading(body) };
+  }
   const anchor = findChunkAnchor(body, chunkText);
   if (anchor < 0) {
     const heading = String(chunkHeading || "") || firstHeading(body);
@@ -208,12 +219,14 @@ function expandVaultNote(note, chunkText, chunkHeading) {
 // One evidence item per note, ordered by first appearance (best score first);
 // notes past the per-note cap, the total vault budget, or unreadable notes
 // fall back to their retrieved chunk text.
-async function vaultEvidenceItems(plugin, chunks) {
+async function vaultEvidenceItems(plugin, chunks, activePath) {
+  const excluded = normaliseVaultPath(activePath);
   const groups = new Map();
   const order = [];
   for (const chunk of chunks) {
     const row = (chunk && chunk.chunk) || chunk || {};
     const path = String(row.path || "");
+    if (excluded && normaliseVaultPath(path) === excluded) continue;
     if (!groups.has(path)) { groups.set(path, []); order.push(path); }
     groups.get(path).push(chunk);
   }
@@ -305,7 +318,7 @@ async function writeWithEvidence(plugin, options) {
   const contextHits = (await store.search(queryVector, CONTEXT_EVIDENCE_LIMIT)) || [];
 
   const evidence = [];
-  for (const item of await vaultEvidenceItems(plugin, vaultChunks.slice(0, VAULT_EVIDENCE_LIMIT))) {
+  for (const item of await vaultEvidenceItems(plugin, vaultChunks.slice(0, VAULT_EVIDENCE_LIMIT), active.path)) {
     evidence.push({ eid: `E${evidence.length + 1}`, text: item.text, source: item.source });
   }
   const external = rootInfo && rootInfo.kind === "external";

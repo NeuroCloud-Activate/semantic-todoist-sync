@@ -481,16 +481,105 @@ async function main() {
 
     const plugin = makeStub({ context: 0, modelText: "draft" });
     plugin.retrieveSemanticContext = async () => Array.from({ length: 8 }, (_, i) => ({ path: `Notes/budget-${i}.md`, section: "Part", text: `chunk ${i}` }));
-    const body = "## Part\n" + "z ".repeat(1480);
-    assert.ok(body.length <= 3000 && body.length > 2500, `budget fixture is ~3000 chars, got ${body.length}`);
+    const body = "## Part\n" + "z ".repeat(2000);
+    assert.ok(body.length <= 4500 && body.length > 3500, `budget fixture is ~4000 chars, got ${body.length}`);
     plugin.readNoteText = async () => body;
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.ok(result.evidenceCount < 8, `budget drops trailing notes, got ${result.evidenceCount}`);
     const blocks = [...plugin.captured.request.user.matchAll(/<evidence id="E\d+"[^>]*>([\s\S]*?)<\/evidence>/g)];
     assert.strictEqual(blocks.length, result.evidenceCount, "one prompt block per evidence item");
     const total = blocks.reduce((n, m) => n + m[1].length - 2, 0);
-    assert.ok(total <= 20000, `vault evidence within the 20,000-char budget, got ${total}`);
+    assert.ok(total <= 30000, `vault evidence within the 30,000-char budget, got ${total}`);
     console.log("PASS oversized section windowed to 3000 chars and total budget enforced");
+  }
+
+  // DEFECT 1 — answer in a different section of a retrieved note (whole-note threshold).
+  // A 6,390-char note retrieved via `# Questions` must pass its `# Meeting Notes:`
+  // answer line to the model; a 12,000-char note stays windowed to <=3,000 chars.
+  {
+    const answerLine = "- November 2 date secured for IRGP Review Committee Meeting";
+    const meetingNotes = "# Meeting Notes:\n" + answerLine + "\n" + "follow-up line one.\nfollow-up line two.\n";
+    const questions = "# Questions\n" + "open question one?\nopen question two?\nretrieved fragment about open questions.\n";
+    const pad = "background context line to pad the note body length.\n";
+    let note = `# September 15 Research\n\n${meetingNotes}\n${questions}\n`;
+    while (note.length + pad.length <= 6390) note += pad;
+    assert.ok(note.length > 6000 && note.length <= 8000, `whole-note fixture is ~6,390 chars, got ${note.length}`);
+    const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Research Team/September 15, 2026.md", section: "Questions", text: "retrieved fragment about open questions." },
+    ];
+    plugin.readNoteText = async () => note;
+    const result = await writeWithEvidence(plugin, { instruction: "When is the committee date?", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.evidenceCount, 1);
+    const userPrompt = plugin.captured.request.user;
+    assert.ok(userPrompt.includes(answerLine), "answer line from the other section is in evidence");
+    const block = userPrompt.split('<evidence id="E1"')[1].split("</evidence>")[0];
+    assert.ok(!block.includes("Section:"), "whole note carries no Section: line");
+    assert.strictEqual(result.sources[0].path, "Research Team/September 15, 2026.md");
+    assert.strictEqual(result.sources[0].label, "Research Team/September 15, 2026.md#Questions", "source.heading stays the retrieved section");
+    console.log("PASS defect 1 short note passes answer line from another section whole");
+  }
+  {
+    const marker = "retrieved marker fragment deep in the long note.";
+    const answerLine = "- November 2 date secured for IRGP Review Committee Meeting";
+    const padA = "meeting context filler line before the answer.\n";
+    const padB = "unrelated trailing filler line after the answer.\n";
+    let note = "# Long Note\n\n# Meeting Notes:\n" + padA.repeat(120) + answerLine + "\n" + padB.repeat(60) + "\n# Questions\n" + marker + "\n" + padB.repeat(120);
+    assert.ok(note.length > 8000 && note.length < 16000, `long-note fixture is ~12,000 chars, got ${note.length}`);
+    const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Notes/long.md", section: "Questions", text: marker },
+    ];
+    plugin.readNoteText = async () => note;
+    const result = await writeWithEvidence(plugin, { instruction: "When is the committee date?", length: "standard", active: ACTIVE });
+    assert.strictEqual(result.evidenceCount, 1);
+    const block = plugin.captured.request.user.split('<evidence id="E1"')[1].split("</evidence>")[0];
+    const bodyLen = block.split("\n").slice(2).join("\n").length;
+    assert.ok(bodyLen <= 3000, `long note still windowed to 3000 chars, got ${bodyLen}`);
+    assert.ok(block.includes(marker), "window centred on the chunk");
+    console.log("PASS defect 1 long note stays windowed to 3000 chars");
+  }
+
+  // DEFECT 2 — the note being written into must not appear as vault evidence.
+  {
+    const normCases = [
+      ["Drafts\\Write test.md", "drafts/write test.md"],
+      ["DRAFTS/WRITE TEST.MD", "Drafts/Write test.md"],
+    ];
+    for (const [retrieved, activePath] of normCases) {
+      const plugin = makeStub({ context: 0, modelText: "draft [E1]" });
+      plugin.retrieveSemanticContext = async () => [
+        { path: retrieved, section: "Draft", text: "earlier draft of the same answer" },
+        { path: "Notes/other.md", section: "Facts", text: "independent fact text" },
+      ];
+      plugin.readNoteText = async (p) => (String(p) === "Notes/other.md" ? "# Other\n\nindependent fact text.\n" : null);
+      const result = await writeWithEvidence(plugin, {
+        instruction: "Draft it",
+        length: "standard",
+        active: { path: activePath, text: "active note body", selection: "", cursorOffset: 5 },
+      });
+      assert.strictEqual(result.evidenceCount, 1, `active note excluded (${retrieved} vs ${activePath})`);
+      assert.strictEqual(result.sources[0].path, "Notes/other.md");
+      assert.strictEqual(result.sources[0].eid, "E1", "ids stay contiguous from E1");
+      assert.ok(!plugin.captured.request.user.includes("earlier draft of the same answer"), "active note text absent from evidence");
+    }
+    console.log("PASS defect 2 active note excluded incl backslash/case variants");
+  }
+  {
+    // (b) only chunks from the active note -> zero vault evidence, no crash.
+    const plugin = makeStub({ context: 0, modelText: "nothing found" });
+    plugin.retrieveSemanticContext = async () => [
+      { path: "Drafts/Write test.md", section: "Draft", text: "earlier draft text" },
+    ];
+    const result = await writeWithEvidence(plugin, {
+      instruction: "Draft it",
+      length: "brief",
+      active: { path: "Drafts/Write test.md", text: "active note body", selection: "", cursorOffset: 5 },
+    });
+    assert.strictEqual(result.evidenceCount, 0, "only-active chunks fall back to zero vault evidence");
+    assert.ok(plugin.captured.request.user.includes("No evidence was found"), "prompt states the gap");
+    assert.strictEqual(result.markdown, "nothing found");
+    console.log("PASS defect 2 only-active chunks fall back to zero vault evidence");
   }
 
   console.log("writing-write-test: PASS");

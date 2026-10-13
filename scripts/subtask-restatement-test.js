@@ -94,4 +94,19 @@ if (fs.existsSync(gen)) {
   console.log(`live generated tree: ${before} subtasks -> ${kept}`);
 }
 
+// 7. cross-main restatement: a wrapper task's children that repeat OTHER main tasks are dropped
+out = limit([make("Work through the January 8 prioritization list for ESTMTA briefing note, Crystal touchpoint, Don Branch DRG review, Travel Bursary", [
+  "Book a touchpoint with Crystal for next week Wednesday or Thursday",
+  "Complete the ESTMTA briefing note as priority 1",
+  "Review the Don Branch DRG application to understand the changes",
+  "Address the Travel Bursary item"
+]), make("Revise the ESTMTA briefing note based on Sophie's comments", []), make("Review the Don Branch DRG application changes made for budget changes", []), make("Book a touchpoint with Crystal on a Wednesday or Thursday", [])], 10, 4);
+const wrapper = out.find((t) => t.content.startsWith("Work through the January 8"));
+assert.deepEqual(contents(wrapper), ["Book a touchpoint with Crystal for next week Wednesday or Thursday", "Address the Travel Bursary item"], "children repeating other main tasks are dropped, distinct children stay");
+assert.equal(out.length, 4, "main tasks are never removed by the subtask rule");
+
+// 8. the same child is kept when no other main task carries it
+out = limit([make("Work through the January 8 prioritization list", ["Complete the ESTMTA briefing note as priority 1"])], 10, 4);
+assert.equal(out[0].subtasks.length, 1, "no other main task to duplicate, so the child stays");
+
 console.log("subtask-restatement-test: PASS");

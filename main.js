@@ -28116,13 +28116,20 @@ function generationSubtaskLimit(settings = DEFAULT_SETTINGS) {
 }
 
 function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
-  return (tasks || []).slice(0, generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks })).map((task) => {
+  const limited = (tasks || []).slice(0, generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks }));
+  // A subtask that only restates a DIFFERENT main task in the same plan is the
+  // same duplication as one restating its own parent (seen live: a
+  // "work through the prioritisation list" wrapper whose children repeated the
+  // sibling mains). Main-task word sets are collected once for that check.
+  const mainTermSets = limited.map((task) => subtaskRestatementTerms(task?.content));
+  return limited.map((task, index) => {
     // A step nested by taskWorkflowAssignMarkedActionOwnership is carried in
     // ownershipStepCount trailing subtasks and is kept past the cap (user
     // ruling: a split marked action is never silently dropped).
     const nested = Math.max(0, Number(task.ownershipStepCount || 0));
     const subtasks = task.subtasks || [];
-    const regular = dropRestatedSubtasks(task, subtasks.slice(0, subtasks.length - nested));
+    const otherMainTerms = mainTermSets.filter((_, otherIndex) => otherIndex !== index);
+    const regular = dropRestatedSubtasks(task, subtasks.slice(0, subtasks.length - nested), otherMainTerms);
     return Object.assign({}, task, {
       subtasks: [
         ...regular.slice(0, generationSubtaskLimit({ maxGeneratedSubtasksPerMainTask: maxSubtasks })),
@@ -28142,7 +28149,7 @@ const GENERATED_TASK_GROUNDING_STOP_WORDS = new Set([
 // so "Review X" under "Draft X" still counts as the same action and object.
 const SUBTASK_RESTATEMENT_GENERIC_WORDS = new Set([
   ...GENERATED_TASK_GROUNDING_STOP_WORDS,
-  "check", "get", "make", "with", "from", "that", "this", "their", "them", "the", "and", "for", "are", "was", "not", "has", "been", "who", "which", "once", "when", "into", "any", "all", "also", "about", "after", "before", "ready", "needed", "assess", "determine", "identify", "ensure", "discuss", "talk", "full", "main"
+  "check", "get", "make", "with", "from", "that", "this", "their", "them", "the", "and", "for", "are", "was", "not", "has", "been", "who", "which", "once", "when", "into", "any", "all", "also", "about", "after", "before", "ready", "needed", "assess", "determine", "identify", "ensure", "discuss", "talk", "full", "main", "priority", "priorities", "prioritization", "prioritisation", "item", "items"
 ]);
 
 function subtaskRestatementTerms(text = "") {
@@ -28159,18 +28166,33 @@ function subtaskRestatementTerms(text = "") {
     .filter((word) => word.length >= 3 && !SUBTASK_RESTATEMENT_GENERIC_WORDS.has(word)));
 }
 
-function dropRestatedSubtasks(parent = {}, subtasks = []) {
+function dropRestatedSubtasks(parent = {}, subtasks = [], otherMainTermSets = []) {
   const parentTerms = subtaskRestatementTerms(parent.content);
   const keptTerms = [];
   const kept = [];
+  // Parent/sibling restatement is exact containment (conservative: a child that
+  // adds any single new content word is kept). A child of one main task that
+  // repeats ANOTHER main task of the same plan is duplication too, and there the
+  // wording differs more freely, so it is judged at 80% overlap with at least
+  // two shared terms (measured live: a "work through the prioritisation list"
+  // wrapper whose children repeated the sibling mains).
+  const containedBy = (terms, reference) => terms.size > 0 && [...terms].every((term) => reference.has(term));
+  const restatesOtherMain = (terms, reference) => {
+    if (terms.size < 2 || !reference || reference.size < 2) return false;
+    let hit = 0;
+    for (const term of terms) if (reference.has(term)) hit++;
+    return hit / terms.size >= 0.8;
+  };
   for (const subtask of subtasks || []) {
     // Existing Todoist subtasks and subtasks with their own schedule are never dropped here.
     const own = Boolean(subtask?.id || subtask?.todoistId || subtask?.oid)
       || Boolean(subtask?.due_date && subtask.due_date !== parent.due_date)
       || Boolean(subtask?.deadline_date && subtask.deadline_date !== parent.deadline_date);
     const terms = subtaskRestatementTerms(subtask?.content);
-    const covered = (reference) => terms.size > 0 && [...terms].every((term) => reference.has(term));
-    if (!own && (covered(parentTerms) || keptTerms.some(covered))) continue;
+    const restated = containedBy(terms, parentTerms)
+      || keptTerms.some((keptSet) => containedBy(terms, keptSet))
+      || (otherMainTermSets || []).some((reference) => restatesOtherMain(terms, reference));
+    if (!own && restated) continue;
     keptTerms.push(terms);
     kept.push(subtask);
   }

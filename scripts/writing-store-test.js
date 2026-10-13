@@ -310,6 +310,159 @@ async function main() {
     console.log("PASS embed batches of 32");
   }
 
+  // 10. transient read failure keeps the previous entry + chunks (removed === 0);
+  // a NEW file that fails stays absent. Next working sync re-indexes.
+  {
+    const fileMap = {
+      "Writing Context/keep.md": { size: 30, mtime: 1000, content: "# Keep\nBASEBALL old notes\n" },
+    };
+    const app = makeVaultApp(fileMap);
+    const mem = makeMemAdapter();
+    const store = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store.load();
+    await store.sync(ROOT, app);
+    assert.strictEqual(mem.writeCount, 1);
+    fileMap["Writing Context/keep.md"] = { size: 31, mtime: 2000, content: "# Keep\nBASEBALL new notes\n" };
+    fileMap["Writing Context/fresh.md"] = { size: 20, mtime: 2000, content: "# Fresh\nBASEBALL fresh\n" };
+    const badApp = makeVaultApp(fileMap);
+    const origRead = badApp.vault.adapter.readBinary;
+    badApp.vault.adapter.readBinary = async (p) => {
+      if (p.endsWith("keep.md") || p.endsWith("fresh.md")) {
+        const err = new Error("transient outage");
+        err.code = "transient-read";
+        throw err;
+      }
+      return origRead(p);
+    };
+    const store2 = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store2.load();
+    const r = await store2.sync(ROOT, badApp);
+    assert.strictEqual(r.removed, 0, "failed files are not removed, got " + JSON.stringify(r));
+    assert.strictEqual(r.added, 0);
+    assert.strictEqual(r.changed, 0);
+    assert.strictEqual(r.skipped.length, 2);
+    assert.ok(r.skipped.some((s) => s.id.endsWith("keep.md") && s.reason === "transient-read"),
+      "changed failure skipped with reason, got " + JSON.stringify(r.skipped));
+    assert.ok(r.skipped.some((s) => s.id.endsWith("fresh.md")),
+      "new failure skipped, got " + JSON.stringify(r.skipped));
+    assert.strictEqual(mem.writeCount, 1, "failure-only sync must not save");
+    const hits = store2.search([1, 0, 0], 5);
+    assert.strictEqual(hits.length, 1, "old chunks still searchable");
+    assert.ok(hits[0].text.includes("old notes"), "old text kept, got: " + hits[0].text);
+    assert.ok(persisted(mem).files["Writing Context/keep.md"], "previous files entry kept on disk");
+    assert.ok(!persisted(mem).files["Writing Context/fresh.md"], "failed new file stays absent");
+    const store3 = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store3.load();
+    const r3 = await store3.sync(ROOT, app);
+    assert.deepStrictEqual([r3.added, r3.changed, r3.removed, r3.skipped],
+      [1, 1, 0, []], "working sync re-indexes, got " + JSON.stringify(r3));
+    const hits3 = store3.search([1, 0, 0], 5);
+    assert.ok(hits3.some((h) => h.text.includes("new notes")), "re-indexed new text");
+    console.log("PASS transient failure keeps previous entry and chunks; retry re-indexes");
+  }
+
+  // 11. embedding dimensions persisted and enforced.
+  {
+    const fileMap = {
+      "Writing Context/a.md": { size: 30, mtime: 1000, content: "# A\nBASEBALL notes\n" },
+    };
+    const app = makeVaultApp(fileMap);
+    const mem = makeMemAdapter();
+    const store = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store.load();
+    await store.sync(ROOT, app);
+    assert.strictEqual(persisted(mem).dimensions, 3, "dimensions persisted");
+    // first batch sets dimensions on an empty store.
+    const mem5 = makeMemAdapter();
+    const store5 = makeStore(mem5, async (texts) => texts.map(() => [1, 0, 0, 0, 0]), "k1");
+    await store5.load();
+    await store5.sync(ROOT, app);
+    assert.strictEqual(persisted(mem5).dimensions, 5, "first batch sets dimensions");
+    // wrong-length vectors reject and change nothing.
+    fileMap["Writing Context/a.md"] = { size: 31, mtime: 2000, content: "# A\nBASEBALL changed\n" };
+    const before = mem.__readRaw(IDX);
+    const writesBefore = mem.writeCount;
+    const bad5 = async (texts) => texts.map(() => [1, 0, 0, 0, 0]);
+    const storeBad = makeStore(mem, bad5, "k1");
+    await storeBad.load();
+    await assert.rejects(storeBad.sync(ROOT, app),
+      (err) => err && err.code === "embedding-dimension-mismatch",
+      "sync must reject with embedding-dimension-mismatch");
+    assert.strictEqual(mem.__readRaw(IDX), before, "disk untouched on dimension mismatch");
+    assert.strictEqual(mem.writeCount, writesBefore, "save not called on dimension mismatch");
+    const still = storeBad.search([1, 0, 0], 5);
+    assert.strictEqual(still.length, 1, "in-memory state kept");
+    assert.ok(still[0].text.includes("notes") && !still[0].text.includes("changed"),
+      "old text kept, got: " + still[0].text);
+    // search with a different-length query returns [].
+    assert.deepStrictEqual(storeBad.search([1, 0], 5), [], "short query -> []");
+    assert.deepStrictEqual(storeBad.search([1, 0, 0, 0], 5), [], "long query -> []");
+    // load with chunk vectors disagreeing with dimensions discards and rebuilds.
+    const tampered = persisted(mem);
+    tampered.chunks[0].vector = [1, 0];
+    await mem.write(IDX, JSON.stringify(tampered));
+    const store6 = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store6.load();
+    const r6 = await store6.sync(ROOT, app);
+    assert.strictEqual(r6.added, 1, "dimension drift rebuilds all, got " + JSON.stringify(r6));
+    assert.strictEqual(persisted(mem).dimensions, 3);
+    assert.ok(store6.search([1, 0, 0], 5).some((h) => h.text.includes("changed")),
+      "rebuilt store searches new text");
+    console.log("PASS embedding dimensions persisted and enforced");
+  }
+
+  // 12. search validates query/k; zero-norm vectors score 0 (no NaN).
+  {
+    const fileMap = {
+      "Writing Context/cats.md": { size: 10, mtime: 1000, content: "BASEBALL BASEBALL\n" },
+      "Writing Context/dogs.md": { size: 10, mtime: 1000, content: "PHOTOSYNTHESIS PHOTOSYNTHESIS\n" },
+      "Writing Context/other.md": { size: 10, mtime: 1000, content: "nothing distinctive\n" },
+    };
+    const app = makeVaultApp(fileMap);
+    const mem = makeMemAdapter();
+    const store = makeStore(mem, makeCountingEmbed(keywordEmbed), "k");
+    await store.load();
+    await store.sync(ROOT, app);
+    assert.deepStrictEqual(store.search("nope", 5), [], "non-array query -> []");
+    assert.deepStrictEqual(store.search(null, 5), [], "null query -> []");
+    assert.deepStrictEqual(store.search([], 5), [], "empty query -> []");
+    assert.strictEqual(store.search([1, 0, 0]).length, 3, "missing k defaults to 8");
+    assert.strictEqual(store.search([1, 0, 0], 0).length, 3, "k=0 defaults to 8");
+    assert.strictEqual(store.search([1, 0, 0], -2).length, 3, "negative k defaults to 8");
+    assert.strictEqual(store.search([1, 0, 0], 2.5).length, 3, "non-integer k defaults to 8");
+    assert.strictEqual(store.search([1, 0, 0], 2).length, 2, "valid k honored");
+    const zero = store.search([0, 0, 0], 5);
+    assert.strictEqual(zero.length, 3);
+    assert.ok(zero.every((h) => h.score === 0), "zero-norm scores 0, got " + JSON.stringify(zero));
+    console.log("PASS search validates query/k; zero-norm scores 0");
+  }
+
+  // 13. save() throwing during sync restores in-memory state and rethrows.
+  {
+    const fileMap = {
+      "Writing Context/a.md": { size: 30, mtime: 1000, content: "# A\nBASEBALL old\n" },
+    };
+    const app = makeVaultApp(fileMap);
+    const mem = makeMemAdapter();
+    const store = makeStore(mem, makeCountingEmbed(keywordEmbed), "k1");
+    await store.load();
+    await store.sync(ROOT, app);
+    fileMap["Writing Context/a.md"] = { size: 31, mtime: 2000, content: "# A\nBASEBALL new\n" };
+    const realWrite = mem.write.bind(mem);
+    const boom = new Error("disk full");
+    boom.code = "EIO";
+    mem.write = async () => { throw boom; };
+    await assert.rejects(store.sync(ROOT, app), (err) => err && err.code === "EIO",
+      "sync must rethrow the save error");
+    const hits = store.search([1, 0, 0], 5);
+    assert.strictEqual(hits.length, 1);
+    assert.ok(hits[0].text.includes("old"), "memory restored, got: " + hits[0].text);
+    mem.write = realWrite;
+    const r = await store.sync(ROOT, app);
+    assert.strictEqual(r.changed, 1, "store usable after save failure, got " + JSON.stringify(r));
+    console.log("PASS save failure restores memory and rethrows");
+  }
+
   console.log("writing-store-test: PASS");
 }
 

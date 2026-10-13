@@ -14,11 +14,11 @@ const EMBED_BATCH_SIZE = 32;
 
 // ponytail: brute-force cosine over one JSON file; shard if a folder exceeds ~5k chunks.
 function cosine(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return 0;
   let dot = 0;
   let na = 0;
   let nb = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     na += a[i] * a[i];
     nb += b[i] * b[i];
@@ -74,6 +74,7 @@ class ContextStore {
     this._extractDeps = extractDeps || {};
     this._files = {};
     this._chunks = [];
+    this._dimensions = null;
   }
 
   async load() {
@@ -86,6 +87,7 @@ class ContextStore {
     if (!raw) {
       this._files = {};
       this._chunks = [];
+      this._dimensions = null;
       return;
     }
     let data = null;
@@ -100,16 +102,34 @@ class ContextStore {
       || !data.files || typeof data.files !== "object" || !Array.isArray(data.chunks)) {
       this._files = {};
       this._chunks = [];
+      this._dimensions = null;
+      return;
+    }
+    // Every chunk vector must match the persisted dimensions (falling back to
+    // the first chunk for stores written before dimensions existed); any drift
+    // discards and rebuilds, same as a key change.
+    const dims = (Number.isInteger(data.dimensions) && data.dimensions > 0)
+      ? data.dimensions
+      : (data.chunks.length
+        ? (Array.isArray(data.chunks[0].vector) ? data.chunks[0].vector.length : -1)
+        : null);
+    if (dims === -1 || (dims != null && data.chunks.some((c) =>
+      !Array.isArray(c.vector) || c.vector.length !== dims))) {
+      this._files = {};
+      this._chunks = [];
+      this._dimensions = null;
       return;
     }
     this._files = data.files;
     this._chunks = data.chunks;
+    this._dimensions = dims;
   }
 
   async save() {
     await this._adapter.write(this._path, JSON.stringify({
       version: STORE_VERSION,
       embeddingKey: this._embeddingKey,
+      dimensions: this._dimensions,
       files: this._files,
       chunks: this._chunks,
     }));
@@ -134,10 +154,12 @@ class ContextStore {
     }
     const removedIds = Object.keys(prevFiles).filter((id) => !indexableIds.has(id));
 
-    // Snapshot for rollback: state is only ever replaced wholesale below, so an
-    // embed failure restores memory by reference and save() is never reached.
+    // Snapshot for rollback: state is only ever replaced wholesale below, so a
+    // failure restores memory by reference and save() is never reached on the
+    // embed path; the save path below restores explicitly.
     const snapshotFiles = prevFiles;
     const snapshotChunks = this._chunks;
+    const snapshotDimensions = this._dimensions;
 
     const piecesByFile = new Map();
     const failedIds = new Set();
@@ -167,8 +189,10 @@ class ContextStore {
 
     const added = addedEntries.filter((e) => !failedIds.has(e.id));
     const changed = changedEntries.filter((e) => !failedIds.has(e.id));
-    const droppedFailed = [...failedIds].filter((id) => prevFiles[id]).length;
-    const removed = removedIds.length + droppedFailed;
+    // Only files absent from the listing count as removed: a file whose
+    // read/extract failed this sync keeps its previous entry and chunks
+    // (reported in `skipped`) and is retried next sync.
+    const removed = removedIds.length;
 
     if (added.length === 0 && changed.length === 0 && removed === 0) {
       return { added: 0, changed: 0, removed: 0, skipped };
@@ -179,6 +203,7 @@ class ContextStore {
       for (const piece of piecesByFile.get(entry.id) || []) texts.push(piece.text);
     }
     const vectors = [];
+    let expectedDims = this._dimensions;
     try {
       for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
         const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
@@ -191,15 +216,31 @@ class ContextStore {
         }
         for (const v of vecs) vectors.push(v);
       }
+      // Every embedded vector must match the store dimensions (the first
+      // batch sets them on an empty store); otherwise nothing is saved/changed.
+      if (expectedDims == null && vectors.length) {
+        expectedDims = (Array.isArray(vectors[0]) && vectors[0].length > 0) ? vectors[0].length : -1;
+      }
+      for (const v of vectors) {
+        if (!Array.isArray(v) || v.length !== expectedDims) {
+          const err = new Error("embedding dimension mismatch: expected " + expectedDims
+            + ", got " + (Array.isArray(v) ? v.length : typeof v));
+          err.code = "embedding-dimension-mismatch";
+          throw err;
+        }
+      }
     } catch (err) {
       this._files = snapshotFiles;
       this._chunks = snapshotChunks;
+      this._dimensions = snapshotDimensions;
       throw err;
     }
 
     const nextFiles = {};
     for (const id of Object.keys(prevFiles)) {
-      if (indexableIds.has(id) && !failedIds.has(id)) nextFiles[id] = prevFiles[id];
+      // Failed files keep their previous entry (new failures stay absent:
+      // they have no previous entry to keep).
+      if (indexableIds.has(id) && prevFiles[id]) nextFiles[id] = prevFiles[id];
     }
     const freshChunks = [];
     let vi = 0;
@@ -216,16 +257,32 @@ class ContextStore {
         });
       });
     }
+    // Failed files have no fresh pieces, so their old chunks survive this
+    // filter and stay searchable until a retry succeeds.
     const keptChunks = this._chunks.filter(
-      (c) => indexableIds.has(c.file) && !piecesByFile.has(c.file) && !failedIds.has(c.file));
+      (c) => indexableIds.has(c.file) && !piecesByFile.has(c.file));
     this._files = nextFiles;
     this._chunks = [...keptChunks, ...freshChunks];
-    await this.save();
+    this._dimensions = expectedDims;
+    try {
+      await this.save();
+    } catch (err) {
+      this._files = snapshotFiles;
+      this._chunks = snapshotChunks;
+      this._dimensions = snapshotDimensions;
+      throw err;
+    }
     return { added: added.length, changed: changed.length, removed, skipped };
   }
 
   search(queryVector, k) {
+    if (!Array.isArray(queryVector) || queryVector.length === 0) return [];
     if (!this._chunks.length) return [];
+    // A query of a different length matches nothing (never truncate scores).
+    const expected = this._dimensions != null ? this._dimensions
+      : (Array.isArray(this._chunks[0].vector) ? this._chunks[0].vector.length : -1);
+    if (queryVector.length !== expected) return [];
+    const limit = Number.isInteger(k) && k > 0 ? k : 8;
     const scored = this._chunks.map((c) => ({
       id: c.id,
       file: c.file,
@@ -235,7 +292,7 @@ class ContextStore {
       score: cosine(queryVector, c.vector),
     }));
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, k);
+    return scored.slice(0, limit);
   }
 }
 

@@ -132,6 +132,7 @@ async function main() {
     const { request } = plugin.captured;
     assert.ok(request.system.includes("only the evidence supplied") || request.system.includes("Only the evidence supplied"), "rule: only supplied evidence");
     assert.ok(request.system.includes("[En]") || request.system.includes("[E1]"), "rule: cite with [En]");
+    assert.ok(/never use ranges/i.test(request.system), "rule: never use ranges");
     assert.ok(/explicitly/i.test(request.system), "rule: state missing evidence explicitly");
     assert.ok(request.user.includes("INSTRUCTION-MARKER-XYZ"), "instruction present");
     assert.ok(request.user.includes(selection), "selection present");

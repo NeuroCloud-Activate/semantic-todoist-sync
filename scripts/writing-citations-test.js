@@ -260,4 +260,45 @@ function ev(eid, source) {
   console.log("PASS heading normalisation real values");
 }
 
-process.stdout.write(JSON.stringify({ passed: 18, failed: 0 }, null, 2) + "\n");
+// 15: evidence id ranges (live defect [E1, E3–E8]: raw range marker stayed in note)
+{
+  const evs = Array.from({ length: 8 }, (_, i) =>
+    ev("E" + (i + 1), { kind: "vault", path: "A" + (i + 1) + ".md" }));
+  // live case: comma list plus en-dash range expands every id in order
+  const live = rewriteCitations("x [E1, E3–E8] y", evs, "");
+  assert.ok(!live.markdown.includes("[E"), "live range fully rewritten, no raw marker");
+  assert.deepStrictEqual(live.used, ["E1", "E3", "E4", "E5", "E6", "E7", "E8"], "live range expands E3-E8 after E1");
+  assert.strictEqual(live.dropped, 0, "no drops when every id is listed");
+  // all three dash forms plus E3-8 shorthand
+  for (const input of ["[E3-E5]", "[E3–E5]", "[E3—E5]", "[E3-5]", "[E3–5]", "[E3—5]"]) {
+    const r = rewriteCitations("x " + input + " y", evs, "");
+    assert.deepStrictEqual(r.used, ["E3", "E4", "E5"], "dash form expands: " + input);
+    assert.ok(!r.markdown.includes("[E"), "no raw marker: " + input);
+    assert.strictEqual(r.dropped, 0, "no drops: " + input);
+  }
+  // mixed list and range in one group
+  const mix = rewriteCitations("[E1, E3-E4]", evs, "");
+  assert.deepStrictEqual(mix.used, ["E1", "E3", "E4"], "mixed list and range");
+  // range ids not in the evidence list each count one dropped (as today)
+  const gap = rewriteCitations("[E1-E4]", [ev("E1", { kind: "vault", path: "A.md" }), ev("E3", { kind: "vault", path: "B.md" })], "");
+  assert.deepStrictEqual(gap.used, ["E1", "E3"], "only listed ids kept");
+  assert.strictEqual(gap.dropped, 2, "E2 and E4 each drop once");
+  assert.ok(!gap.markdown.includes("[E"), "no raw marker when partially unknown");
+  // reversed range rejected as one unknown
+  const rev = rewriteCitations("a [E5-E3] b", evs, "");
+  assert.deepStrictEqual(rev.used, [], "reversed expands nothing");
+  assert.strictEqual(rev.dropped, 1, "reversed counts one drop");
+  assert.strictEqual(rev.markdown, "a b", "reversed eats adjacent space like unknown");
+  // single range capped at 32 ids: oversized rejected as one unknown
+  const big = rewriteCitations("a [E1-E40] b", evs, "");
+  assert.deepStrictEqual(big.used, [], "oversized expands nothing");
+  assert.strictEqual(big.dropped, 1, "oversized counts one drop");
+  assert.ok(!big.markdown.includes("[E"), "oversized marker removed");
+  // "to" is NOT a range: only the three dash forms expand
+  const to = rewriteCitations("a [E3 to E5] b", evs, "");
+  assert.ok(to.markdown.includes("[E3 to E5]"), "to-form left raw");
+  assert.deepStrictEqual(to.used, [], "to-form defines nothing");
+  console.log("PASS evidence id ranges");
+}
+
+process.stdout.write(JSON.stringify({ passed: 19, failed: 0 }, null, 2) + "\n");

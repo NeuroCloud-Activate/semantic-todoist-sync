@@ -101,15 +101,32 @@ function rewriteCitations(markdown, evidence, noteText) {
     return numByEid.get(eid);
   }
 
+  const RANGE_CAP = 32;
+  const RANGE_RE = /^E(\d+)\s*[-–—]\s*(E)?(\d+)$/;
   const src = typeof markdown === "string" ? markdown : "";
-  const out = src.replace(/( ?)\[((?:E\d+\s*(?:,\s*E\d+\s*)*))\]( ?)/g, (match, pre, inner, post) => {
-    const eids = inner
+  const out = src.replace(/( ?)\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*))\]( ?)/g, (match, pre, inner, post) => {
+    const tokens = inner
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
     const known = [];
-    for (const eid of eids) {
-      if (byEid.has(eid)) known.push(eid);
+    for (const token of tokens) {
+      const rm = RANGE_RE.exec(token);
+      if (rm) {
+        const start = parseInt(rm[1], 10);
+        const end = parseInt(rm[3], 10);
+        if (!(start <= end) || end - start + 1 > RANGE_CAP) {
+          dropped += 1;
+          continue;
+        }
+        for (let n = start; n <= end; n += 1) {
+          const eid = "E" + n;
+          if (byEid.has(eid)) known.push(eid);
+          else dropped += 1;
+        }
+        continue;
+      }
+      if (byEid.has(token)) known.push(token);
       else dropped += 1;
     }
     if (known.length === 0) return pre && post ? " " : "";

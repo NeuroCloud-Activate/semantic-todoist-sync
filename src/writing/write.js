@@ -15,7 +15,7 @@ const { rewriteCitations } = require("./citations.js");
 const WRITE_SYSTEM_PROMPT = [
   "You are drafting evidence-based prose inside an Obsidian note.",
   "Use only the evidence supplied in this request. Never invent facts, figures, names, dates, or sources.",
-  "Cite every factual claim with its evidence id in square brackets, for example [E1] or [E2, E3].",
+  "Cite every factual claim with its evidence id in square brackets, for example [E1] or [E2, E3]. Cite each id separately; never use ranges like [E3-E8], list every id explicitly.",
   "When no supplied evidence covers something the instruction asks for, state the gap explicitly, but only for sources that were searched,",
   "for example: \"No evidence in the searched sources covers ...\". Never claim a source lacks evidence when the request says it was not searched; say it was unavailable instead.",
   "Write professional, detailed prose in Markdown that matches the surrounding note's style.",

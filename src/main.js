@@ -13866,13 +13866,26 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     };
   }
 
-  async openaiResponse({ model, modelOverride = "", onResponseIdentity = null, system, user, userStableChars = 0, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", captureContext = null }) {
+  async describeImage(bytes, mime) { // writing-mode: task 5 image description through the configured provider
+    const images = writingImageInputs([{ mime, base64: writingImageBytesToBase64(bytes) }]);
+    const modelChoice = this.aiModelForRequest("describe-image", {});
+    return this.openaiResponse({
+      operation: "describe-image",
+      model: modelChoice && modelChoice.model,
+      background: false,
+      user: "Describe this image for use as research evidence. Transcribe all visible text, tables and figure labels verbatim; then summarise what it shows.",
+      images
+    });
+  }
+
+  async openaiResponse({ model, modelOverride = "", onResponseIdentity = null, system, user, userStableChars = 0, jsonSchema, appendFallbackNotice = false, background = true, operation = "chat", reasoningEffort = "", promptCachePrefix = "", promptCacheKey = "", images = null, captureContext = null }) { // writing-mode: task 5 image input option
     // A standalone call (no explicit context) begins its own workflow root; a
     // parent-workflow descendant must inherit the root passed by its caller.
     // t19: optional per-call modelOverride wins over model/settings; when set,
     // the fallback list is suppressed so a retry never silently leaves the
     // override model (single candidate; failure surfaces per existing policy).
     const activeCapture = captureContext || this.beginProviderCapture(operation || "chat");
+    const imageInputs = writingImageInputs(images); // writing-mode: task 5 normalized image inputs (empty for text calls)
     const overrideId = String(modelOverride || "").trim();
     const primaryModel = overrideId || model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel;
     const candidates = overrideId ? [primaryModel] : [primaryModel].concat(this.sameProviderFallbackModels(primaryModel));
@@ -13919,13 +13932,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           ? {}
           : modelReasoningConfig(candidateModel, effectiveEffort, provider, capabilitiesForConfig);
         const sentEffort = Boolean(reasoningConfig.openai?.effort || reasoningConfig.gemini?.thinkingLevel || reasoningConfig.anthropic?.effort);
+        // writing-mode: task 5 passes the normalized image inputs to every provider path (empty array keeps text bodies byte-identical).
         const sendRequest = (config) => provider === "gemini"
-          ? this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, onResponseIdentity }, activeCapture)
+          ? this.geminiResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, onResponseIdentity, images: imageInputs }, activeCapture)
           : provider === "openai"
-            ? this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, background, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture)
+            ? this.openaiProviderResponse({ model: candidateModel, system, user, jsonSchema, reasoningConfig: config, background, operation, promptCachePrefix, promptCacheKey, onResponseIdentity, images: imageInputs }, activeCapture)
             : provider === "anthropic"
-              ? this.anthropicResponse({ model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture)
-              : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity }, activeCapture);
+              ? this.anthropicResponse({ model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity, images: imageInputs }, activeCapture)
+              : this.openAiCompatibleResponse({ provider, model: candidateModel, system, user, userStableChars, jsonSchema, reasoningConfig: config, operation, promptCachePrefix, promptCacheKey, onResponseIdentity, images: imageInputs }, activeCapture);
         let response;
         try {
           response = await sendRequest(reasoningConfig);
@@ -13988,7 +14002,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       .filter((model) => model && model !== primary).slice(0, 1);
   }
 
-  async openAiCompatibleResponse({ provider, model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
+  async openAiCompatibleResponse({ provider, model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null, images = null }, captureContext = null) { // writing-mode: task 5 image input option
     const normalizedProvider = stableSupportedProvider(provider, "openrouter");
     const body = {
       model: String(model || "").trim(),
@@ -13997,7 +14011,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // the description user message becomes two text blocks with ONE
       // cache_control marker at the end of the stable block; otherwise this
       // shape is byte-identical to today.
-      messages: openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this })
+      messages: openAiCompatibleVisionMessages(openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this }), images) // writing-mode: task 5 image parts (untouched when empty)
     };
     // OpenWebUI can answer with SSE even when `stream` is omitted (a model's
     // Stream Chat Response setting, or a pipe/function model that streams).
@@ -14036,7 +14050,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // Retry once with the plain user message; every other body field is
         // identical because only `messages` is rebuilt (the rejection Map is
         // already set, so the shaper returns the plain string form).
-        body.messages = openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this });
+        body.messages = openAiCompatibleVisionMessages(openAiCompatibleChatMessages({ provider: normalizedProvider, model, system, user, userStableChars, promptCachePrefix, plugin: this }), images); // writing-mode: task 5 image parts survive the hint retry
         response = await this.openAiCompatibleRequest(normalizedProvider, "/chat/completions", body, { captureContext });
         payload = openAiCompatibleChatPayload(response, normalizedProvider);
       }
@@ -14116,7 +14130,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
-  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
+  async openaiProviderResponse({ model, system, user, jsonSchema, reasoningConfig = {}, background = true, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null, images = null }, captureContext = null) { // writing-mode: task 5 image input option
     const modelId = normalizeOpenAIModelId(model || this.settings.chatModel || DEFAULT_SETTINGS.chatModel);
     const supportsPromptCacheControls = supportsExplicitOpenAiPromptCaching(modelId);
     const usePromptCache = this.settings.enableOpenAiPromptCaching !== false && supportsPromptCacheControls;
@@ -14135,6 +14149,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       });
     }
     if (user) userContent.push({ type: "input_text", text: user });
+    for (const image of images || []) userContent.push({ type: "input_image", image_url: writingImageDataUri(image) }); // writing-mode: task 5 Responses-API image part (no-op when empty)
     const body = {
       model: modelId,
       input: [
@@ -14266,7 +14281,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
-  async anthropicResponse({ model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null }, captureContext = null) {
+  async anthropicResponse({ model, system, user, userStableChars = 0, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", promptCacheKey = "", onResponseIdentity = null, images = null }, captureContext = null) { // writing-mode: task 5 image input option
     const normalizedProvider = "anthropic";
     const modelId = String(model || this.settings.chatModel || "claude-haiku-5-5").trim();
     // max_tokens: the discovered per-model limit (Anthropic Models API
@@ -14292,6 +14307,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     } else {
       userContent = String(user || "");
     }
+    if (images && images.length) userContent = anthropicVisionContent(userContent, userText, images); // writing-mode: task 5 base64 image blocks (skipped for text calls)
     const body = {
       model: modelId,
       max_tokens: maxTokens,
@@ -14333,7 +14349,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (promptCacheHintRejected(response.status, rejectedDetail)) {
         notePromptCacheHintRejected(this, normalizedProvider, modelId, response.status);
         const retryBody = Object.assign({}, body);
-        retryBody.messages = [{ role: "user", content: String(user || "") }];
+        retryBody.messages = [{ role: "user", content: anthropicVisionContent(String(user || ""), userText, images) }]; // writing-mode: task 5 image blocks survive the hint retry
         response = await requestProviderUrl(normalizedProvider, {
           url: "https://api.anthropic.com/v1/messages",
           method: "POST",
@@ -14404,7 +14420,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return text;
   }
 
-  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", onResponseIdentity = null }, captureContext = null) {
+  async geminiResponse({ model, system, user, jsonSchema, reasoningConfig = {}, operation = "chat", promptCachePrefix = "", onResponseIdentity = null, images = null }, captureContext = null) { // writing-mode: task 5 image input option
     const modelId = normalizeGeminiModelId(model || this.settings.chatModel || "gemini-3.5-flash");
     const generationConfig = {};
     const geminiUser = [promptCachePrefix, user].filter(Boolean).join("\n\n");
@@ -14422,7 +14438,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system || "" }] },
-        contents: [{ role: "user", parts: [{ text: geminiUser }] }],
+        contents: [{ role: "user", parts: geminiVisionParts([{ text: geminiUser }], images) }], // writing-mode: task 5 inline_data image parts (untouched when empty)
         generationConfig
       }),
       throw: false
@@ -14441,12 +14457,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         },
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: fallbackSystem }] },
-          contents: [{ role: "user", parts: [{ text: [
+          contents: [{ role: "user", parts: geminiVisionParts([{ text: [
             "JSON schema to match:",
             JSON.stringify(geminiCompatibleSchema(jsonSchema)),
             "",
             geminiUser
-          ].join("\n") }] }],
+          ].join("\n") }], images) }], // writing-mode: task 5 image parts survive the schema retry
           generationConfig: Object.assign({}, generationConfig, { responseSchema: undefined })
         }),
         throw: false
@@ -29907,6 +29923,84 @@ function clearPromptCacheHintRejection(plugin) {
 // Chat-completions message shaping for the OpenAI-compatible adapters.
 // userStableChars = 0 (every caller except the description workflow) returns
 // today's exact message shape.
+// writing-mode: task 5 vision helpers — bytes-to-base64, input normalization, and per-provider part appenders. Every appender returns its input untouched when images is empty, so text request bodies stay byte-identical; malformed images reject with vision-unsupported instead of being silently dropped.
+function writingImageBytesToBase64(bytes) {
+  let view = null;
+  if (bytes instanceof Uint8Array) view = bytes;
+  else if (bytes && ArrayBuffer.isView(bytes)) view = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  else if (bytes instanceof ArrayBuffer) view = new Uint8Array(bytes);
+  else view = new Uint8Array(0);
+  if (typeof Buffer !== "undefined" && typeof Buffer.from === "function") return Buffer.from(view).toString("base64");
+  let binary = "";
+  for (let offset = 0; offset < view.length; offset += 8192) binary += String.fromCharCode.apply(null, view.subarray(offset, offset + 8192));
+  return typeof btoa === "function" ? btoa(binary) : "";
+}
+
+function writingImageInputs(images) {
+  if (!images) return [];
+  return (Array.isArray(images) ? images : [images]).map((image) => {
+    const mime = String(image?.mime || "").trim().toLowerCase();
+    const base64 = String(image?.base64 || "").replace(/\s+/g, "");
+    if (!mime.startsWith("image/") || !base64) {
+      const error = new Error("Image description requires each image to carry a mime type and base64 data.");
+      error.code = "vision-unsupported";
+      throw error;
+    }
+    return { mime, base64 };
+  });
+}
+
+function writingImageDataUri(image) {
+  const mime = String(image?.mime || "").trim().toLowerCase();
+  const base64 = String(image?.base64 || "").replace(/\s+/g, "");
+  if (!mime.startsWith("image/") || !base64) {
+    const error = new Error("Image description requires each image to carry a mime type and base64 data.");
+    error.code = "vision-unsupported";
+    throw error;
+  }
+  return `data:${mime};base64,${base64}`;
+}
+
+function openAiCompatibleVisionMessages(messages, images) {
+  if (!images || !images.length) return messages;
+  return (messages || []).map((message) => {
+    if (!message || message.role !== "user") return message;
+    const parts = Array.isArray(message.content) ? message.content.slice() : [{ type: "text", text: typeof message.content === "string" ? message.content : "" }];
+    for (const image of images) parts.push({ type: "image_url", image_url: { url: writingImageDataUri(image) } });
+    return Object.assign({}, message, { content: parts });
+  });
+}
+
+function anthropicVisionContent(userContent, userText, images) {
+  if (!images || !images.length) return userContent;
+  const parts = Array.isArray(userContent) ? userContent.slice() : [{ type: "text", text: String(userText || "") }];
+  for (const image of images) {
+    const mime = String(image?.mime || "").trim().toLowerCase();
+    const base64 = String(image?.base64 || "").replace(/\s+/g, "");
+    if (!mime.startsWith("image/") || !base64) {
+      const error = new Error("Image description requires each image to carry a mime type and base64 data.");
+      error.code = "vision-unsupported";
+      throw error;
+    }
+    parts.push({ type: "image", source: { type: "base64", media_type: mime, data: base64 } });
+  }
+  return parts;
+}
+
+function geminiVisionParts(textParts, images) {
+  if (!images || !images.length) return textParts;
+  return textParts.concat((images || []).map((image) => {
+    const mime = String(image?.mime || "").trim().toLowerCase();
+    const base64 = String(image?.base64 || "").replace(/\s+/g, "");
+    if (!mime.startsWith("image/") || !base64) {
+      const error = new Error("Image description requires each image to carry a mime type and base64 data.");
+      error.code = "vision-unsupported";
+      throw error;
+    }
+    return { inline_data: { mime_type: mime, data: base64 } };
+  }));
+}
+
 function openAiCompatibleChatMessages({ provider, model, system, user, userStableChars = 0, promptCachePrefix = "", plugin = null }) {
   const systemContent = [promptCachePrefix, system].filter(Boolean).join("\n\n");
   const userText = String(user || "");

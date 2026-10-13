@@ -68,3 +68,30 @@ Summary: 12 PASS, 10 FAIL (9 same pre-existing + 1 included benchmark-local-test
 
 ## Built size vs target
 Built `main.js`: 2,262,503 bytes (< 3,152,600 bytes target) — OK.
+
+## Task 5 — image input for describeImage (`feat(providers): image input for describeImage`)
+
+New file: `scripts/writing-vision-test.js` (10 cases: openrouter / customopenai / openwebui `image_url` data URI, OpenAI Responses API `input_image`, Anthropic base64 `image` source, Gemini `inline_data`, text-call regression deep-equal, provider-error rejection, empty-bytes `vision-unsupported` with no request).
+
+`src/main.js` edits (16 `// writing-mode:` tags; `Select-String src/main.js -Pattern "writing-mode:"` count = 16 = row count below):
+
+| task | function | change | why |
+|------|----------|--------|-----|
+| 5 | `describeImage` (new, ~13869) | New plugin method `async describeImage(bytes, mime)`; normalizes to `[{mime, base64}]`, resolves the primary chat model via `aiModelForRequest("describe-image", {})`, calls `openaiResponse` with operation `"describe-image"`, `background: false`, the fixed brief instruction as user text, and `images` | Single entry point for image description through the configured provider |
+| 5 | `openaiResponse` (~13881) | New optional `images = null` param | Carries image inputs down the narrowest shared path without touching existing callers |
+| 5 | `openaiResponse` (~13888) | `const imageInputs = writingImageInputs(images)` | Normalize once; `[]` for text calls so every existing body is byte-identical |
+| 5 | `openaiResponse` (~13935) | Dispatch passes `images: imageInputs` to all four provider methods | Every provider path receives the images; the Slice-C effort retry reuses the same closure so images survive it |
+| 5 | `openAiCompatibleResponse` (~14005) | New optional `images = null` param | OpenRouter / Open WebUI / custom OpenAI image input |
+| 5 | `openAiCompatibleResponse` (~14014) | Initial `messages` wrapped in `openAiCompatibleVisionMessages(..., images)` | Appends `{type:"image_url", image_url:{url:"data:..."}}` only when non-empty; helper returns input untouched otherwise |
+| 5 | `openAiCompatibleResponse` (~14053) | Hint-rejection retry rebuild also wrapped in `openAiCompatibleVisionMessages` | Images survive the plain-message retry instead of being silently dropped |
+| 5 | `openaiProviderResponse` (~14133) | New optional `images = null` param | OpenAI Responses-API image input |
+| 5 | `openaiProviderResponse` (~14152) | `userContent` gains `{type:"input_image", image_url:"data:..."}` per image | Responses-API shape; loop is a no-op when empty; the 400-background retry copies `body` so images persist |
+| 5 | `anthropicResponse` (~14284) | New optional `images = null` param | Anthropic image input |
+| 5 | `anthropicResponse` (~14310) | `userContent` rebuilt via `anthropicVisionContent` when non-empty | Appends `{type:"image", source:{type:"base64", media_type, data}}`; string/array (hint) forms both handled; skipped for text calls |
+| 5 | `anthropicResponse` (~14352) | Hint-rejection retry rebuild uses `anthropicVisionContent` | Images survive the plain-message retry; helper returns input untouched when empty |
+| 5 | `geminiResponse` (~14423) | New optional `images = null` param | Gemini image input |
+| 5 | `geminiResponse` (~14441) | `parts` wrapped in `geminiVisionParts([{text: geminiUser}], images)` | Appends `{inline_data:{mime_type, data}}`; helper returns input untouched when empty |
+| 5 | `geminiResponse` (~14465) | Schema-fallback retry `parts` also wrapped in `geminiVisionParts` | Images survive the schema retry instead of being silently dropped |
+| 5 | module scope (~29926) | New helpers `writingImageBytesToBase64`, `writingImageInputs`, `writingImageDataUri`, `openAiCompatibleVisionMessages`, `anthropicVisionContent`, `geminiVisionParts` | Bytes→base64 (Buffer with chunked-btoa fallback; obsidian import untouched) and per-provider shaping; malformed images reject with `vision-unsupported`, never silently dropped |
+
+Validation: `node scripts/writing-vision-test.js` PASS (red before: `describeImage` undefined; green after build); `npm.cmd run build` OK; `npm.cmd test` 17/27 — the 12 baseline passes plus `writing-citations/extract/source/store/vision` pass, same 10 pre-existing failures, no new failures.

@@ -97,6 +97,21 @@ function ev(eid, source) {
   console.log("PASS definitions per kind");
 }
 
+// 4b: saved deep-research notes render as vault-style links (task 11)
+{
+  const evidence = [
+    ev("E1", { kind: "research-vault", path: "Semantic Todoist Sync/Research/r.md", locator: "Findings" }),
+    ev("E2", { kind: "research-vault", path: "Semantic Todoist Sync/Research/r.md", locator: "" }),
+    ev("E3", { kind: "research-external", name: "r.pdf", locator: "p. 2" }),
+  ];
+  const r = rewriteCitations("[E1] [E2] [E3]", evidence, "");
+  const lines = r.footnotes.split("\n");
+  assert.strictEqual(lines[0], "[^1]: [[Semantic Todoist Sync/Research/r.md]], Findings", "research-vault with locator");
+  assert.strictEqual(lines[1], "[^2]: [[Semantic Todoist Sync/Research/r.md]]", "research-vault omits empty locator");
+  assert.strictEqual(lines[2], "[^3]: r.pdf, p. 2", "research-external with locator");
+  console.log("PASS research footnote definitions");
+}
+
 // 5: vault without heading omits #heading; context-vault without locator omits it
 {
   const r1 = rewriteCitations("[E1]", [ev("E1", { kind: "vault", path: "Folder/Note.md" })], "");

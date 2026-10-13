@@ -66,6 +66,21 @@ function labelFor(source) {
     }
     return locator ? "[[" + path + "]], " + locator : "[[" + path + "]]";
   }
+  // writing-mode: task 11 saved deep-research notes render like vault/context sources
+  if (source.kind === "research-vault") {
+    const path = source.path || "";
+    const locator = source.locator || "";
+    if (isUnsafeName(path)) {
+      const base = basenameOf(path);
+      return locator ? base + ", " + locator : base;
+    }
+    return locator ? "[[" + path + "]], " + locator : "[[" + path + "]]";
+  }
+  if (source.kind === "research-external") {
+    const name = source.name || "";
+    const locator = source.locator || "";
+    return locator ? name + ", " + locator : name;
+  }
   if (source.kind === "context-external") {
     const name = source.name || "";
     const locator = source.locator || "";

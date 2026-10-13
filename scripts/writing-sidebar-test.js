@@ -50,23 +50,27 @@ mockObsidian();
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
 
 function testDefaultChat() {
-  assert.strictEqual(Plugin.DEFAULT_SETTINGS.sidebarMode, 'chat', 'default sidebarMode is chat');
-  console.log('PASS default sidebarMode is chat');
+  assert.strictEqual(Plugin.DEFAULT_SETTINGS.sidebarMode, undefined, 'sidebarMode removed from defaults');
+  console.log('PASS sidebarMode removed from defaults');
 }
 
 function testNormalizeInvalidSettings() {
-  const normalized = Plugin.normalizeStableSettings({ sidebarMode: 'invalid', writingContextFolder: 42, writingDescribeImages: 'yes' });
-  assert.strictEqual(normalized.sidebarMode, 'chat', 'invalid sidebarMode defaults to chat');
+  // normalizeStableSettings keeps unknown keys (same as the 0.9.20 release), so a legacy saved sidebarMode is
+  // simply inert: it must not throw, must not change the other values, and nothing in the source may read it.
+  const normalized = Plugin.normalizeStableSettings({ sidebarMode: 'write', writingContextFolder: 42, writingDescribeImages: 'yes' });
+  const source = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const readers = source.split(/\r?\n/).filter((line) => /sidebarMode/.test(line) && !/^\s*\/\//.test(line));
+  assert.deepStrictEqual(readers, [], 'nothing in src/main.js reads or writes sidebarMode');
   assert.strictEqual(normalized.writingContextFolder, 'Writing Context', 'invalid folder defaults to Writing Context');
   assert.strictEqual(normalized.writingDescribeImages, true, 'invalid describeImages defaults to true');
-  console.log('PASS settings normalisation for new keys');
+  console.log('PASS settings normalisation without sidebarMode');
 }
 
 function testSettingsMigrationStillPasses() {
   // The existing settings-migration-local-test relies on normalizeStableSettings
   // and DEFAULT_SETTINGS; we verify the new keys don't break it.
   const defaults = Plugin.DEFAULT_SETTINGS || {};
-  assert.strictEqual(defaults.sidebarMode, 'chat', 'sidebarMode in defaults');
+  assert.strictEqual(defaults.sidebarMode, undefined, 'sidebarMode removed from defaults');
   assert.strictEqual(defaults.writingContextFolder, 'Writing Context', 'writingContextFolder in defaults');
   assert.strictEqual(defaults.writingDescribeImages, true, 'writingDescribeImages in defaults');
   console.log('PASS settings keys present in DEFAULT_SETTINGS');
@@ -91,10 +95,57 @@ function testDoubleSubmitGuard() {
 }
 
 function testModeReadAtClickTime() {
-  // Verify askButton.onclick uses this.plugin.settings.sidebarMode at click time
-  const PluginModule = require(path.join(__dirname, '..', 'main.js'));
-  // We cannot fully simulate click in this mock, but we confirm source contains the tag
-  console.log('PASS mode-at-click-time (onclick reads settings.sidebarMode at click)');
+  // Ask now maps directly to chat() and no longer switches by sidebarMode.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const hasAskCall = /askButton\.onclick = async \(\) => \{\s*await this\.ask\(\);\s*\};/.test(src);
+  assert(hasAskCall, 'Ask click calls this.ask()');
+  const hasModeBranch = src.includes('if (currentMode === "write") await this.write()');
+  assert(!hasModeBranch, 'Ask click does not run writeWithEvidence');
+  console.log('PASS ask-is-chat-only (Ask no longer switches by sidebarMode)');
+}
+
+function testToolbarButtonsOrder() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const askIdx = src.indexOf('semantic-todoist-ask-button');
+  const tasksIdx = src.indexOf('semantic-todoist-tasks-button');
+  const collabIdx = src.indexOf('semantic-todoist-collaborate-button');
+  const runIdx = src.indexOf('semantic-todoist-run-action');
+  assert(askIdx >= 0 && tasksIdx > askIdx && collabIdx > tasksIdx && runIdx > collabIdx, 'toolbar contains Ask, Tasks, Collaborate, Run in that order');
+  console.log('PASS toolbar-buttons-order (Ask, Tasks, Collaborate, Run)');
+}
+
+function testCollaborateCallsWrite() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('const collaborateButton = toolbar.createEl('), 'collaborateButton created in toolbar');
+  assert(src.includes('collaborateButton.onclick = async () => {\n      await this.write();\n    };'), 'Collaborate click calls this.write()');
+  console.log('PASS collaborate-calls-write');
+}
+
+function testInFlightCollaborate() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('this.collaborateButton.disabled = true;'), 'collaborate disabled while in flight');
+  assert(src.includes('this.collaborateButton.textContent = "Collaborating…";'), 'collaborate labeled Collaborating… while in flight');
+  assert(src.includes('this.collaborateButton.disabled = false;'), 'collaborate re-enabled when done');
+  assert(src.includes('this.collaborateButton.textContent = "Collaborate";'), 'collaborate label restored');
+  assert(!src.includes('this.askButton.disabled = true;'), 'collaborate flight does not disable Ask');
+  console.log('PASS in-flight-collaborate (Collaborating… and restore; Ask untouched)');
+}
+
+function testNoModeSelectOrSidebarMode() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(!src.includes('modeSelectEl'), 'no modeSelectEl defined');
+  assert(!src.includes('plugin.settings.sidebarMode'), 'no runtime sidebarMode dependency');
+  assert(!Plugin.DEFAULT_SETTINGS || !Object.prototype.hasOwnProperty.call(Plugin.DEFAULT_SETTINGS, 'sidebarMode'), 'no sidebarMode default');
+  const nor = Plugin.normalizeStableSettings({ sidebarMode: 'write', writingContextFolder: 'X', writingDescribeImages: true });
+  // Unknown keys are preserved by normalizeStableSettings (as in 0.9.20): a legacy saved sidebarMode is inert, not removed.
+  assert.strictEqual(nor.writingContextFolder, 'X', 'legacy sidebarMode does not disturb other settings');
+  assert.strictEqual(src.split('\n').filter((l) => /sidebarMode/.test(l) && !/^\s*\/\//.test(l)).length, 0, 'nothing in src/main.js touches sidebarMode');
+  console.log('PASS no-mode-select-or-sidebarMode');
 }
 
 function testCursorOffsetPosToOffset() {
@@ -106,21 +157,21 @@ function testWriteGuardRestoresAfterPreAwaitException() {
   // Fix round 2: if an exception is thrown before the inner await (e.g. getActiveViewOfType or getCursor),
   // the finally/catch must restore this.writing and the button label from settings.
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   // Verify the outer catch (after inner finally) restores the flag and button label
-  const hasRestoreInOuterCatch = src.includes('// writing-mode: restore button after write finishes (success or error)');
+  const hasRestoreInOuterCatch = /\}\s*finally\s*\{[\s\S]{0,260}this\.writing = false;[\s\S]{0,200}this\.collaborateButton\.disabled = false;/.test(src);
   assert(hasRestoreInOuterCatch, 'outer catch restores button after pre-await exception');
   // Verify finally also restores inside inner try
-  const finallyRestores = src.includes('this.askButton.textContent = currentMode === "write" ? "Write" : "Ask"');
-  assert(finallyRestores, 'finally restores button label from sidebarMode');
+  const finallyRestores = src.includes('this.collaborateButton.textContent = "Collaborate"');
+  assert(finallyRestores, 'finally restores Collaborate button label');
   console.log('PASS write-guard-restores-after-pre-await-exception (tag + source verified)');
 }
 
 function testVaultUnavailableNotice() {
   // Task 9 fix: SemanticTodoistView.write() shows a Notice when result.searched.vault is false, not otherwise.
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-  assert(src.includes('// writing-mode: task 9 warn when the vault index was unavailable'), 'task 9 notice tag present');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(/writing-mode: task 9 warn/.test(src), 'task 9 notice tag present');
   assert(src.includes("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence."), 'task 9 notice text present');
   assert(src.includes('result.searched && result.searched.vault === false'), 'notice gated on searched.vault === false');
   console.log('PASS vault-unavailable-notice (tagged Notice gated on result.searched.vault === false)');
@@ -128,7 +179,7 @@ function testVaultUnavailableNotice() {
 
 function testFocusFallbackUsesLastActiveMarkdownLeaf() {
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('lastActiveMarkdownLeaf'), 'lastActiveMarkdownLeaf referenced in write()');
   assert(src.includes('fallback to lastActiveMarkdownLeaf'), 'focus fallback tag present');
   assert(src.includes('getActiveMarkdownContext'), 'shared lookup reused');
@@ -137,14 +188,14 @@ function testFocusFallbackUsesLastActiveMarkdownLeaf() {
 
 function testEarlyExitGuardDoesNotLeaveWritingStuck() {
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('guard set only right before the await'), 'guard positioned before await');
   assert(src.includes('Open a note to write into.'), 'early exit message preserved');
   assert(src.includes('this.writing = false'), 'finally restores flag');
-  assert(src.includes('this.askButton.disabled = false'), 'finally re-enables button');
+  assert(src.includes('this.collaborateButton.disabled = false'), 'finally re-enables button');
   const lastCatch = src.lastIndexOf('} catch (error) {');
   const catchSnippet = src.substring(lastCatch, lastCatch + 500);
-  assert(!catchSnippet.includes('this.askButton.disabled = false'), 'outer catch does not duplicate restore');
+  assert(!catchSnippet.includes('this.collaborateButton.disabled = false'), 'outer catch does not duplicate restore');
   console.log('PASS early-exit-guard (guard before await; no duplicate restore; finally covers await path)');
 }
 
@@ -158,7 +209,7 @@ function testSidebarFocusInsertsIntoOpenLeaf() {
   // (1) When sidebar has focus (getActiveViewOfType null) but target markdown leaf is open via getLeavesOfType,
   // the draft must be inserted into that leaf's editor (not shown as draft).
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('findMarkdownEditorForPath'), 'shared leaf lookup helper present');
   assert(src.includes('findMarkdownEditorForPath(this.plugin'), 'post-await lookup uses preferred view + leaf search');
   assert(src.includes('getLeavesOfType("markdown")'), 'leaf lookup searches markdown leaves');
@@ -169,7 +220,7 @@ function testClosedNoteShowsDraftAndInsertButton() {
   // (2) If no open markdown leaf shows the original file path, renderDraftForInsert is called (draft shown + Insert button),
   // and replaceRange is never called by the main insertion path.
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('renderDraftForInsert(result, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
   assert(src.includes('Insert at current cursor'), 'Insert button present in draft UI');
   console.log('PASS closed-note-shows-draft-and-button (fallback path verified)');
@@ -178,7 +229,7 @@ function testClosedNoteShowsDraftAndInsertButton() {
 function testInsertButtonUsesLeafLookup() {
   // (3) Insert button click while sidebar focused and original note open in a leaf → inserted into that editor.
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('findMarkdownEditorForPath(app, originalPath, null)'), 'Insert button uses shared leaf lookup with null preferred view');
   console.log('PASS insert-button-uses-leaf-lookup (shared lookup reused)');
 }
@@ -186,7 +237,7 @@ function testInsertButtonUsesLeafLookup() {
 function testInsertButtonClosedNoteNotice() {
   // (4) Insert click when original note is closed → Notice `Open <name> to insert this draft.`; no replaceRange.
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   assert(src.includes('Open ${originalName} to insert this draft.'), 'notice message preserved for closed original note');
   assert(src.includes('findMarkdownEditorForPath(app, originalPath, null)'), 'Insert uses leaf lookup before attempting replaceRange');
   console.log('PASS insert-button-closed-note-notice (notice preserved, lookup before replaceRange)');
@@ -213,7 +264,7 @@ function makeWriteView(plugin, leaves, mostRecentLeaf) {
   view.promptEl = { value: 'draft a summary' };
   view.lengthSelectEl = null;
   view.webSearchMode = 'off';
-  view.askButton = { disabled: false, textContent: 'Write' };
+  view.collaborateButton = { disabled: false, textContent: 'Collaborate' };
   view.statusLog = [];
   view.messageLog = [];
   view.setStatus = (text) => { view.statusLog.push(text); };
@@ -256,7 +307,7 @@ async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor');
   assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT', 'draft text inserted');
   assert.strictEqual(view.writing, false, 'writing flag restored');
-  assert.strictEqual(view.askButton.disabled, false, 'button re-enabled');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button re-enabled');
   assert(!view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'no open-a-note message');
   console.log('PASS write-visible-leaf-without-last-active (single open leaf used)');
 }
@@ -283,8 +334,8 @@ async function testWriteWithNoMarkdownLeafKeepsMessage() {
   assert(view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'open-a-note message kept');
   assert.strictEqual(plugin.writeCallCount(), 0, 'no model call without a note');
   assert.strictEqual(view.writing, false, 'writing flag false');
-  assert.strictEqual(view.askButton.disabled, false, 'button restored');
-  assert.strictEqual(view.askButton.textContent, 'Write', 'button label restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  assert.strictEqual(view.collaborateButton.textContent, 'Collaborate', 'button label restored');
   console.log('PASS write-no-leaf-keeps-message (no model call, flag false, button restored)');
 }
 
@@ -302,6 +353,10 @@ async function runTests() {
   testInsertButtonRespectsOriginalFile();
   testDoubleSubmitGuard();
   testModeReadAtClickTime();
+  testToolbarButtonsOrder();
+  testCollaborateCallsWrite();
+  testInFlightCollaborate();
+  testNoModeSelectOrSidebarMode();
   testCursorOffsetPosToOffset();
   testWriteGuardRestoresAfterPreAwaitException();
   testVaultUnavailableNotice();

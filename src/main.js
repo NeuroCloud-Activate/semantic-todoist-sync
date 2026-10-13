@@ -2840,8 +2840,7 @@ function normalizeStableSettings(input = {}) {
   if (result.providerApiRootContractVersion !== PROVIDER_API_ROOT_CONTRACT_VERSION) {
     result.providerApiRootContractVersion = PROVIDER_API_ROOT_CONTRACT_VERSION;
   }
-  // writing-mode: normalize new sidebar/write settings to defaults
-  result.sidebarMode = source.sidebarMode === "write" ? "write" : "chat";
+  // writing-mode: normalize writing settings to defaults
   const rawFolder = source.writingContextFolder;
   let folderValue = "Writing Context";
   if (typeof rawFolder === "string" && rawFolder.trim()) {
@@ -3592,7 +3591,6 @@ const DEFAULT_SETTINGS = {
   taskGenerationPromptProfile: "default",
   taskSectionTitleMode: "local",
   chatFontSizePx: 13,
-  sidebarMode: "chat", // writing-mode: new sidebar mode default
   writingContextFolder: "Writing Context", // writing-mode: new context folder default
   writingDescribeImages: true, // writing-mode: new describe-images default
   taskContextSummaryMaxNotes: 5,
@@ -4599,6 +4597,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-stop-provider-capture", name: "Stop debug logging", callback: () => this.stopProviderCaptureSession() });
 
     this.addCommand({ id: "semantic-todoist-rescan-context", name: "Rescan writing context folder", callback: () => this.rescanContextFolder() }); // writing-mode: task 7 manual context-folder rescan
+    this.addCommand({ id: "semantic-todoist-collaborate", name: "Collaborate on active note", callback: () => this.collaborateOnActiveNote() }); // writing-mode: task 8 open sidebar and focus prompt
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
     this.registerInterval(window.setTimeout(() => this.ensurePromptTemplateFolder(false), STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
@@ -8729,6 +8728,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const active = await this.getActiveMarkdownContext();
       view.setPrompt(active.selection || active.text || "");
     }
+  }
+
+  async collaborateOnActiveNote() { // writing-mode: open sidebar and focus prompt without running the model
+    await this.openSidebar();
+    const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+    if (view && view.promptEl && typeof view.promptEl.focus === "function") view.promptEl.focus();
   }
 
   async promptGptFromCommandPalette() {
@@ -21706,18 +21711,6 @@ class SemanticTodoistView extends ItemView {
       this.ask();
     });
     const actionRow = main.createDiv({ cls: "semantic-todoist-action-row" });
-    // writing-mode: sidebar mode selector (Chat / Write) with persisted settings
-    const modeRow = actionRow.createDiv({ cls: "semantic-todoist-mode-row" });
-    this.modeSelectEl = modeRow.createEl("select", { cls: "semantic-todoist-mode-select", attr: { "aria-label": "Sidebar mode", title: "Chat or Write mode" } });
-    this.modeSelectEl.createEl("option", { value: "chat", text: "Chat" });
-    this.modeSelectEl.createEl("option", { value: "write", text: "Write" });
-    this.modeSelectEl.value = this.plugin.settings.sidebarMode === "write" ? "write" : "chat";
-    this.modeSelectEl.onchange = async () => {
-      this.plugin.settings.sidebarMode = this.modeSelectEl.value;
-      await this.plugin.saveSettings();
-      this.render();
-    };
-    actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Mode:" });
     const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
     this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
     setIcon(this.webSearchToggleEl, "globe-2");
@@ -21731,29 +21724,27 @@ class SemanticTodoistView extends ItemView {
     this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
     this.populateSidebarActionOptions();
     const toolbar = main.createDiv({ cls: "semantic-todoist-toolbar" });
-    const mode = this.plugin.settings.sidebarMode || "chat";
-    const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: mode === "write" ? "Draft cited evidence-based prose into the open note" : "Ask a chat question using vault context" }, text: mode === "write" ? "Write" : "Ask" });
-    this.askButton = askButton; // writing-mode: store button reference for in-flight guard
+    const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: "Ask a chat question using vault context", "aria-label": "Ask a chat question using vault context" }, text: "Ask" });
     askButton.onclick = async () => {
-      // writing-mode: read mode at click time, not render time
-      const currentMode = (this.plugin && this.plugin.settings && this.plugin.settings.sidebarMode) ? this.plugin.settings.sidebarMode : "chat";
-      if (currentMode === "write") await this.write();
-      else await this.ask();
+      await this.ask();
     };
-    // writing-mode: length select shown only in Write mode; not persisted
-    if (mode === "write") {
-      const lengthRow = toolbar.createDiv({ cls: "semantic-todoist-length-row" });
-      this.lengthSelectEl = lengthRow.createEl("select", { cls: "semantic-todoist-length-select", attr: { "aria-label": "Draft length", title: "Choose draft length" } });
-      this.lengthSelectEl.createEl("option", { value: "brief", text: "Brief" });
-      this.lengthSelectEl.createEl("option", { value: "standard", text: "Standard" });
-      this.lengthSelectEl.createEl("option", { value: "detailed", text: "Detailed" });
-      this.lengthSelectEl.value = "standard";
-      lengthRow.createSpan({ cls: "semantic-todoist-length-label", text: "Length:" });
-    }
     const tasksButton = toolbar.createEl("button", { cls: "semantic-todoist-tasks-button", attr: { title: "Generate Todoist tasks from the selected or active note" }, text: "Tasks" });
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
     };
+    const collaborateButton = toolbar.createEl("button", { cls: "semantic-todoist-collaborate-button", attr: { title: "Draft cited, evidence-based prose into the open note", "aria-label": "Draft cited, evidence-based prose into the open note" }, text: "Collaborate" });
+    this.collaborateButton = collaborateButton; // writing-mode: wrap existing write() flow with in-flight button state
+    collaborateButton.onclick = async () => {
+      await this.write();
+    };
+    // writing-mode: compact draft-length select always visible near toolbar
+    const lengthRow = toolbar.createDiv({ cls: "semantic-todoist-length-row" });
+    this.lengthSelectEl = lengthRow.createEl("select", { cls: "semantic-todoist-length-select", attr: { "aria-label": "Draft length", title: "Choose draft length" } });
+    this.lengthSelectEl.createEl("option", { value: "brief", text: "Brief" });
+    this.lengthSelectEl.createEl("option", { value: "standard", text: "Standard" });
+    this.lengthSelectEl.createEl("option", { value: "detailed", text: "Detailed" });
+    this.lengthSelectEl.value = "standard";
+    lengthRow.createSpan({ cls: "semantic-todoist-length-label", text: "Length:" });
     const runButton = toolbar.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
     runButton.onclick = async () => {
       await this.runSelectedSidebarAction();
@@ -21851,14 +21842,14 @@ class SemanticTodoistView extends ItemView {
       // writing-mode: guard set only right before the await, so pre-await exits never leave it stuck
       if (this.writing) return;
       this.writing = true;
-      if (this.askButton) {
-        this.askButton.disabled = true;
-        this.askButton.textContent = "Writing…";
+      if (this.collaborateButton) {
+        this.collaborateButton.disabled = true;
+        this.collaborateButton.textContent = "Collaborating…";
       }
 
-      this.setStatus("Writing…");
+      this.setStatus("Collaborating…");
       this.addMessage("user", prompt);
-      this.addMessage("assistant", "Writing…");
+      this.addMessage("assistant", "Collaborating…");
       if (this.promptEl) this.promptEl.value = "";
 
       try {
@@ -21882,13 +21873,11 @@ class SemanticTodoistView extends ItemView {
             }
           } else if (plan.mode === "closed") {
             this.renderDraftForInsert(result, filePath, null);
-            this.setStatus("Writing complete (draft shown).");
-            return;
+            this.setStatus("Collaboration complete (draft shown).");            return;
           }
         } else {
           this.renderDraftForInsert(result, filePath, null);
-          this.setStatus("Writing complete (draft shown).");
-          return;
+          this.setStatus("Collaboration complete (draft shown).");          return;
         }
         this.renderRelevantNotes(result.sources ? result.sources : []);
         this.replaceLastAssistantMessage((result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : ""));
@@ -21902,8 +21891,7 @@ class SemanticTodoistView extends ItemView {
         if (result.searched && result.searched.vault === false) {
           new Notice("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence.");
         }
-        this.setStatus("Writing complete.");
-      } catch (error) {
+        this.setStatus("Collaboration complete.");      } catch (error) {
         console.error(error);
         if (error && error.code === "empty-instruction") {
           this.replaceLastAssistantMessage(`Error: Instruction cannot be empty.`);
@@ -21913,12 +21901,11 @@ class SemanticTodoistView extends ItemView {
           this.setStatus(`Writing failed: ${error.message || error}`);
         }
       } finally {
-        // writing-mode: restore button after write finishes (success or error)
+        // writing-mode: restore Collaborate button after write finishes (success or error)
         this.writing = false;
-        if (this.askButton) {
-          this.askButton.disabled = false;
-          const currentMode = (this.plugin && this.plugin.settings && this.plugin.settings.sidebarMode) ? this.plugin.settings.sidebarMode : "chat";
-          this.askButton.textContent = currentMode === "write" ? "Write" : "Ask";
+        if (this.collaborateButton) {
+          this.collaborateButton.disabled = false;
+          this.collaborateButton.textContent = "Collaborate";
         }
       }
     } catch (error) {

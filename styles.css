@@ -561,9 +561,15 @@
 }
 
 .semantic-todoist-collaborate-features {
+  align-items: center;
   border-radius: 6px;
+  display: inline-flex;
+  height: 26px;
+  justify-content: center;
+  min-height: 26px;
   min-width: 0;
   overflow: hidden;
+  padding-block: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1468,6 +1474,12 @@
     min-height: 30px;
   }
 
+  .semantic-todoist-collaborate-features {
+    font-size: var(--font-ui-small);
+    height: 30px;
+    min-height: 30px;
+  }
+
   .semantic-todoist-chat-prompt {
     min-height: 42px;
     max-height: 15vh;
@@ -1593,6 +1605,11 @@
     min-height: 34px;
   }
 
+  .semantic-todoist-collaborate-features {
+    height: 34px;
+    min-height: 34px;
+  }
+
   .semantic-todoist-schedule-block-controls button {
     min-height: 28px;
   }
@@ -1643,6 +1660,11 @@
 }
 
 .is-mobile .semantic-todoist-action-row select {
+  height: 34px;
+  min-height: 34px;
+}
+
+.is-mobile .semantic-todoist-collaborate-features {
   height: 34px;
   min-height: 34px;
 }

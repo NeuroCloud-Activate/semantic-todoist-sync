@@ -481,18 +481,28 @@ async function main() {
 
     const plugin = makeStub({ context: 0, modelText: "draft" });
     plugin.retrieveSemanticContext = async () => Array.from({ length: 8 }, (_, i) => ({ path: `Notes/budget-${i}.md`, section: "Part", text: `chunk ${i}` }));
-    const body = "## Part\n" + "z ".repeat(2000);
-    assert.ok(body.length <= 4500 && body.length > 3500, `budget fixture is ~4000 chars, got ${body.length}`);
+    const body = "## Part\n" + "z ".repeat(3400);
+    assert.ok(body.length > 6500 && body.length <= 8000, `budget fixture is a whole-note-sized note (~7000 chars), got ${body.length}`);
     plugin.readNoteText = async () => body;
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.ok(result.evidenceCount < 8, `budget drops trailing notes, got ${result.evidenceCount}`);
     const blocks = [...plugin.captured.request.user.matchAll(/<evidence id="E\d+"[^>]*>([\s\S]*?)<\/evidence>/g)];
     assert.strictEqual(blocks.length, result.evidenceCount, "one prompt block per evidence item");
     const total = blocks.reduce((n, m) => n + m[1].length - 2, 0);
-    assert.ok(total <= 30000, `vault evidence within the 30,000-char budget, got ${total}`);
+    assert.ok(total <= 40000, `vault evidence within the 40,000-char budget, got ${total}`);
     console.log("PASS oversized section windowed to 3000 chars and total budget enforced");
   }
 
+  // Budget skips an oversized note and keeps later ones (a later short note may hold the answer).
+  {
+    const stub = makeStub({ context: 0, modelText: "draft [E1]" });
+    const bigChunks = Array.from({ length: 6 }, (_, i) => ({ path: `Notes/big-${i}.md`, section: "S", text: `big ${i}` }));
+    stub.retrieveSemanticContext = async () => [...bigChunks, { path: "Notes/answer.md", section: "S", text: "answer chunk" }];
+    stub.readNoteText = async (p) => (p === "Notes/answer.md" ? "November 2 date secured" : "## S\n" + "y ".repeat(3900));
+    await writeWithEvidence(stub, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.ok(stub.captured.request.user.includes("November 2 date secured"), "later short note still reaches the model after bigger notes fill the budget");
+    console.log("PASS budget skips oversized notes instead of stopping");
+  }
   // DEFECT 1 — answer in a different section of a retrieved note (whole-note threshold).
   // A 6,390-char note retrieved via `# Questions` must pass its `# Meeting Notes:`
   // answer line to the model; a 12,000-char note stays windowed to <=3,000 chars.

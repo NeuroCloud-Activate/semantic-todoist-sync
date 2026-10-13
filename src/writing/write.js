@@ -26,7 +26,7 @@ const WRITE_SYSTEM_PROMPT = [
 const NOTE_CONTEXT_MAX_CHARS = 6000;
 const VAULT_EVIDENCE_LIMIT = 8;
 const VAULT_SECTION_MAX_CHARS = 3000;
-const VAULT_TOTAL_MAX_CHARS = 30000;
+const VAULT_TOTAL_MAX_CHARS = 40000;
 const VAULT_WHOLE_NOTE_MAX_CHARS = 8000;
 const CONTEXT_EVIDENCE_LIMIT = 8;
 const SELECTION_QUERY_CHARS = 500;
@@ -244,7 +244,8 @@ async function vaultEvidenceItems(plugin, chunks, activePath) {
       const expanded = expandVaultNote(note, row.text, source.heading || "");
       if (expanded) { text = expanded.text; heading = expanded.heading; }
     }
-    if (used + text.length > VAULT_TOTAL_MAX_CHARS) break;
+    // Skip (not stop at) a note that no longer fits: a later, shorter note may still be the one that answers.
+    if (used + text.length > VAULT_TOTAL_MAX_CHARS) continue;
     used += text.length;
     items.push({ text, source });
   }

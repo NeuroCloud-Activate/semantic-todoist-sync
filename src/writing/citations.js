@@ -51,6 +51,12 @@ function labelFor(source) {
     const locator = source.locator || "";
     return locator ? name + ", " + locator : name;
   }
+  if (source.kind === "web") {
+    const title = String(source.title || "").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+    const url = String(source.url || "").trim();
+    if (url && /^https?:\/\//i.test(url)) return `[${title}](${url})`;
+    return title || url;
+  }
   return "";
 }
 

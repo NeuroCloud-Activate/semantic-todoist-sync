@@ -9163,7 +9163,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   isIndexablePath(path, include, exclude) {
-    if (writingPathInContextFolder(path, this.settings)) return false; // writing-mode: task 7 context folder excluded from the vault index
+    const vaultBase = typeof vaultBasePath === "function" ? vaultBasePath(this.app) : ""; // writing-mode: fix round 1 pass vault base for absolute-context comparison
+    if (writingPathInContextFolder(path, this.settings, vaultBase)) return false; // writing-mode: task 7 context folder excluded from the vault index
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
     if (isEmailLogPath(path, this.settings)) return false;
@@ -13925,6 +13926,19 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       active,
       webSearchMode: options ? options.webSearchMode : undefined,
     });
+  }
+
+  async searchWebForWriting(instruction, mode, active) { // writing-mode: fix round 1 — expose plugin web-search for write mode; returns [{title, url, text}] or [] on failure; no throw
+    try {
+      const provider = normalizeWebSearchProvider(this.settings.chatWebSearchProvider);
+      const model = normalizeWebSearchModel(this.settings.chatWebSearchModel, provider);
+      const webMode = mode || "concise";
+      const result = await this.runWebSearch(buildWebSearchRequest({ provider, model, mode: webMode, prompt: instruction || "", active, context: [] }));
+      if (result && result.status === "searched" && Array.isArray(result.evidence) && result.evidence.length) {
+        return result.evidence.slice(0, 6).map((row) => ({ title: String(row.title || row.excerpt || "").trim(), url: String(row.url || "").trim(), text: String(row.excerpt || row.text || "").trim() })).filter((r) => r.text || r.url);
+      }
+    } catch { /* failure → [] with no throw */ }
+    return [];
   }
 
   async rescanContextFolder() { // writing-mode: task 7 manual rescan of the writing context folder with a counted Notice
@@ -29987,12 +30001,27 @@ function writingIsAbsoluteContextPath(value) {
   return text.startsWith("/") || text.startsWith("\\");
 }
 
-function writingPathInContextFolder(path, settings) {
+function writingPathInContextFolder(path, settings, vaultBasePath) {
   const configured = settings && typeof settings.writingContextFolder === "string" && settings.writingContextFolder.trim()
     ? settings.writingContextFolder.trim()
     : "Writing Context";
+  const base = String(vaultBasePath || "").replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "");
+  const folderConfigured = configured.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "").trim();
+  // writing-mode: fix round 1 — absolute path inside vault is converted to vault-relative folder; absolute outside vault excludes nothing.
+  if (writingIsAbsoluteContextPath(configured) && base) {
+    const normConfig = configured.replace(/\\/g, "/").toLowerCase();
+    const normBase = base.toLowerCase();
+    const insideVault = normConfig === normBase || normConfig.startsWith(normBase + "/");
+    if (insideVault) {
+      const relativeFolder = folderConfigured.slice(normBase.length).replace(/^\//, "");
+      const rel = relativeFolder || folderConfigured;
+      const value = String(path || "").replace(/\\/g, "/");
+      return value === rel || value.startsWith(rel + "/");
+    }
+    return false;
+  }
   if (writingIsAbsoluteContextPath(configured)) return false;
-  const folder = configured.replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, "").trim() || "Writing Context";
+  const folder = folderConfigured || "Writing Context";
   const value = String(path || "").replace(/\\/g, "/");
   return value === folder || value.startsWith(`${folder}/`);
 }

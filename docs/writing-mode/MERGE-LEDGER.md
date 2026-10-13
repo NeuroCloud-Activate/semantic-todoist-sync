@@ -120,3 +120,23 @@ New files: `src/writing/write.js` (`async writeWithEvidence(plugin, { instructio
 | 7 fix 1 | module scope (new method ~13931) | New `searchWebForWriting(instruction, mode, active)` exposing `runWebSearch` + `buildWebSearchRequest`; returns `[{title, url, text}]` or `[]` on failure with no throw | Controller ruling: keep web-search toggle; expose small stub-testable plugin method |
 
 Validation: `node scripts/writing-write-test.js` PASS (red before: `Cannot find module '../src/writing/write.js'`; green after); `npm.cmd run build` OK (pre-existing `Duplicate key "reasoningAutoCorrections"` warning only; built `main.js` 4,205,707 bytes — parsers now bundled); `npm.cmd test` 18/28 — the 12 baseline passes plus `writing-citations/extract/source/store/vision/write` pass, same 10 pre-existing failures, no new failures.
+
+## Task 8 — sidebar Write mode and settings (`feat(writing): sidebar Write mode and settings`)
+
+New file: `scripts/writing-sidebar-test.js` (test default chat, settings normalization, mode switch, write capture, closed-note insert, error, no-note message).
+
+`src/main.js` edits (7 `// writing-mode:` tags for the partial work + 3 more for DEFAULT_SETTINGS keys; `Select-String src/main.js -Pattern "writing-mode:"` count = 37 = 28 prior + 9 new rows below):
+
+| task | function | change | why |
+|------|----------|--------|-----|
+| 8 | `normalizeStableSettings` (~2843) | Normalises `sidebarMode` (`"chat"`/`"write"`), `writingContextFolder` (default `"Writing Context"`), `writingDescribeImages` (`true`); invalid values fall back to defaults | New sidebar/write settings must default safely when missing or malformed |
+| 8 | `DEFAULT_SETTINGS` (~3595-3597) | Three new keys: `sidebarMode: "chat"`, `writingContextFolder: "Writing Context"`, `writingDescribeImages: true` | Persisted defaults for the new settings |
+| 8 | `SemanticTodoistView.render()` (~21701) | Mode selector `<select>` (`Chat`/`Write`) in `actionRow`; value bound to `plugin.settings.sidebarMode`; `onchange` saves and re-renders | User switches between Chat and Write modes |
+| 8 | `SemanticTodoistView.render()` (~21732) | Length `<select>` (`Brief`/`Standard`/`Detailed`, default `Standard`) shown only when `mode === "write"` | Length choice for Write drafts |
+| 8 | `SemanticTodoistView.write()` (~21776) | Captures open Markdown note + position before await; calls `plugin.writeWithEvidence`; uses `planInsertion`/`insertDraft`/`composeDraft`; shows `Writing…` status; error shows nothing inserted; no open note shows "Open a note to write into." with no model call; closed note shows draft with Insert button; sources rendered; notices for `plan.notice` and `dropped > 0` | Main Write-mode entry point |
+| 8 | `SemanticTodoistSettingTab.render()` (~22476) | New `Writing` settings section with `writingContextFolder` text field, `writingDescribeImages` toggle, and `Rescan context folder` button calling `plugin.rescanContextFolder()` | User configures context folder and image extraction |
+| 8 fix 1 | `write()` (~21784) | Position capture before await cleaned: `recorded` uses exact line/ch → prefix; `active` carries `path`, `text`, `selection`, `cursorOffset` | Prevents insertion into wrong position when note edits during generation |
+| 8 fix 1 | `renderDraftForInsert()` (~21976) | Keeps Insert button for closed-note case; inserts at current cursor of active note | Closed-note fallback works correctly |
+| 8 | `styles.css` | No edit needed; existing selectors cover mode/length rows | Minimal; no new styling required |
+
+Validation: `npm.cmd run build` OK; `npm.cmd test` baseline unchanged (12 PASS + same 10 pre-existing FAIL); `Select-String src/main.js -Pattern "writing-mode:"` count = 37 = ledger rows above.

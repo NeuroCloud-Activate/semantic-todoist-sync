@@ -2840,6 +2840,20 @@ function normalizeStableSettings(input = {}) {
   if (result.providerApiRootContractVersion !== PROVIDER_API_ROOT_CONTRACT_VERSION) {
     result.providerApiRootContractVersion = PROVIDER_API_ROOT_CONTRACT_VERSION;
   }
+  // writing-mode: normalize new sidebar/write settings to defaults
+  result.sidebarMode = source.sidebarMode === "write" ? "write" : "chat";
+  const rawFolder = source.writingContextFolder;
+  let folderValue = "Writing Context";
+  if (typeof rawFolder === "string" && rawFolder.trim()) {
+    folderValue = rawFolder.trim();
+  } else if (rawFolder === undefined || rawFolder === null || rawFolder === "") {
+    folderValue = String(DEFAULT_SETTINGS.writingContextFolder || "Writing Context").trim();
+  } else {
+    // Invalid value (e.g. number, boolean) defaults to Writing Context
+    folderValue = "Writing Context";
+  }
+  result.writingContextFolder = folderValue || "Writing Context";
+  result.writingDescribeImages = source.writingDescribeImages !== false;
   return result;
 }
 
@@ -3578,6 +3592,9 @@ const DEFAULT_SETTINGS = {
   taskGenerationPromptProfile: "default",
   taskSectionTitleMode: "local",
   chatFontSizePx: 13,
+  sidebarMode: "chat", // writing-mode: new sidebar mode default
+  writingContextFolder: "Writing Context", // writing-mode: new context folder default
+  writingDescribeImages: true, // writing-mode: new describe-images default
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
@@ -13894,7 +13911,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const obsidian = require("obsidian");
     const identity = semanticEmbeddingIdentity(this.settings);
     const embeddingKey = `${identity.provider}:${identity.model}`;
-    if (!this._writingContextStore || this._writingContextStoreKey !== embeddingKey) {
+    const folderConfig = String(this.settings?.writingContextFolder || "Writing Context").trim();
+    const storeKey = `${embeddingKey}:${folderConfig}`;
+    if (!this._writingContextStore || this._writingContextStoreKey !== storeKey) {
       const store = new ContextStore({
         adapter: this.app.vault.adapter,
         path: `${this.manifest.dir}/context-index.json`,
@@ -13910,7 +13929,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       });
       await store.load();
       this._writingContextStore = store;
-      this._writingContextStoreKey = embeddingKey;
+      this._writingContextStoreKey = storeKey;
     }
     const { resolveContextRoot } = require("./context/source.js");
     const rootInfo = await resolveContextRoot(this.app, this.settings, obsidian.Platform);
@@ -21679,6 +21698,18 @@ class SemanticTodoistView extends ItemView {
       this.ask();
     });
     const actionRow = main.createDiv({ cls: "semantic-todoist-action-row" });
+    // writing-mode: sidebar mode selector (Chat / Write) with persisted settings
+    const modeRow = actionRow.createDiv({ cls: "semantic-todoist-mode-row" });
+    this.modeSelectEl = modeRow.createEl("select", { cls: "semantic-todoist-mode-select", attr: { "aria-label": "Sidebar mode", title: "Chat or Write mode" } });
+    this.modeSelectEl.createEl("option", { value: "chat", text: "Chat" });
+    this.modeSelectEl.createEl("option", { value: "write", text: "Write" });
+    this.modeSelectEl.value = this.plugin.settings.sidebarMode === "write" ? "write" : "chat";
+    this.modeSelectEl.onchange = async () => {
+      this.plugin.settings.sidebarMode = this.modeSelectEl.value;
+      await this.plugin.saveSettings();
+      this.render();
+    };
+    actionRow.createSpan({ cls: "semantic-todoist-action-label", text: "Mode:" });
     const webSearchModifier = actionRow.createDiv({ cls: "semantic-todoist-web-search-modifier" });
     this.webSearchToggleEl = webSearchModifier.createEl("button", { cls: "semantic-todoist-web-search-toggle", attr: { type: "button", "aria-label": webSearchModeLabel("off"), title: `${webSearchModeLabel("off")}; click to cycle`, "aria-pressed": "false", "data-web-search-mode": "off" } });
     setIcon(this.webSearchToggleEl, "globe-2");
@@ -21692,10 +21723,22 @@ class SemanticTodoistView extends ItemView {
     this.actionSelectEl.createEl("option", { text: "Loading actions...", value: "" });
     this.populateSidebarActionOptions();
     const toolbar = main.createDiv({ cls: "semantic-todoist-toolbar" });
-    const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: "Ask a chat question using vault context" }, text: "Ask" });
+    const mode = this.plugin.settings.sidebarMode || "chat";
+    const askButton = toolbar.createEl("button", { cls: "semantic-todoist-ask-button", attr: { title: mode === "write" ? "Draft cited evidence-based prose into the open note" : "Ask a chat question using vault context" }, text: mode === "write" ? "Write" : "Ask" });
     askButton.onclick = async () => {
-      await this.ask();
+      if (mode === "write") await this.write();
+      else await this.ask();
     };
+    // writing-mode: length select shown only in Write mode; not persisted
+    if (mode === "write") {
+      const lengthRow = toolbar.createDiv({ cls: "semantic-todoist-length-row" });
+      this.lengthSelectEl = lengthRow.createEl("select", { cls: "semantic-todoist-length-select", attr: { "aria-label": "Draft length", title: "Choose draft length" } });
+      this.lengthSelectEl.createEl("option", { value: "brief", text: "Brief" });
+      this.lengthSelectEl.createEl("option", { value: "standard", text: "Standard" });
+      this.lengthSelectEl.createEl("option", { value: "detailed", text: "Detailed" });
+      this.lengthSelectEl.value = "standard";
+      lengthRow.createSpan({ cls: "semantic-todoist-length-label", text: "Length:" });
+    }
     const tasksButton = toolbar.createEl("button", { cls: "semantic-todoist-tasks-button", attr: { title: "Generate Todoist tasks from the selected or active note" }, text: "Tasks" });
     tasksButton.onclick = async () => {
       await this.runDefaultTaskPrompt();
@@ -21727,6 +21770,149 @@ class SemanticTodoistView extends ItemView {
       console.error(error);
       this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
       this.setStatus(`Chat failed: ${error.message || error}`);
+    }
+  }
+
+  // writing-mode: sidebar Write mode that drafts cited prose into the open note
+  async write() {
+    try {
+      const prompt = this.promptEl ? this.promptEl.value.trim() : "";
+      if (!prompt) {
+        this.setStatus("Ready");
+        return;
+      }
+      // writing-mode: capture open Markdown note and position BEFORE await
+      const view = this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(MarkdownView) : null;
+      const activeMarkdownView = view || null;
+      if (!activeMarkdownView || !activeMarkdownView.editor || !activeMarkdownView.file) {
+        this.addMessage("assistant", "Open a note to write into.");
+        this.setStatus("Ready");
+        return;
+      }
+      const editor = activeMarkdownView.editor;
+      const filePath = activeMarkdownView.file.path || "";
+      const selectionText = editor.getSelection ? editor.getSelection() : "";
+      let fromPos = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
+      let toPos = fromPos;
+      if (selectionText) {
+        toPos = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
+      }
+      const value = editor.getValue ? editor.getValue() : "";
+      let recordedPrefix = "";
+      try {
+        const cursor = fromPos;
+        const lines = value.split ? value.split("\n") : [];
+        let charOffset = 0;
+        for (let i = 0; i < (cursor ? cursor.line : 0); i++) charOffset += (lines[i] ? lines[i].length + 1 : 1);
+        charOffset += (cursor ? cursor.ch : 0);
+        recordedPrefix = value.slice ? value.slice(Math.max(0, charOffset - 40), charOffset) : "";
+      } catch (e) {
+        recordedPrefix = "";
+      }
+      const recorded = {
+        path: filePath,
+        from: fromPos,
+        to: toPos,
+        prefix: recordedPrefix,
+      };
+      const activeText = value;
+      const cursorOffset = (function () {
+        const c = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
+        const text = editor.getValue ? editor.getValue() : "";
+        const lines = text.split ? text.split("\n") : [];
+        let off = 0;
+        for (let i = 0; i < c.line; i++) off += (lines[i] ? lines[i].length + 1 : 1);
+        off += c.ch;
+        return off;
+      })();
+      const active = { path: filePath, text: activeText, selection: selectionText, cursorOffset };
+      const length = (this.lengthSelectEl && this.lengthSelectEl.value) ? this.lengthSelectEl.value : "standard";
+
+      this.setStatus("Writing…");
+      this.addMessage("user", prompt);
+      this.addMessage("assistant", "Writing…");
+      if (this.promptEl) this.promptEl.value = "";
+
+      try {
+        const result = await this.plugin.writeWithEvidence(prompt, {
+          length,
+          active,
+          webSearchMode: this.webSearchMode,
+        });
+        const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
+        const draftText = composeDraft(result.markdown || "", result.footnotes || "");
+        const currentPath = filePath;
+        const currentView = this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(MarkdownView) : null;
+        const currentEditor = (currentView && currentView.editor && currentView.file && currentView.file.path === currentPath) ? currentView.editor : null;
+        if (currentEditor && currentPath) {
+          const plan = planInsertion(currentEditor, recorded, currentPath);
+          if (plan.mode === "recorded" || plan.mode === "cursor") {
+            insertDraft(currentEditor, plan, draftText);
+            if (plan.notice) {
+              new Notice(plan.notice);
+            }
+          } else if (plan.mode === "closed") {
+            this.renderDraftForInsert(result, filePath, null);
+            this.setStatus("Writing complete (draft shown).");
+            return;
+          }
+        } else {
+          this.renderDraftForInsert(result, filePath, null);
+          this.setStatus("Writing complete (draft shown).");
+          return;
+        }
+        this.renderRelevantNotes(result.sources ? result.sources : []);
+        this.replaceLastAssistantMessage((result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : ""));
+        if (result.notice) {
+          new Notice(result.notice);
+        }
+        if (result.dropped > 0) {
+          new Notice(`Dropped ${result.dropped} unknown citation(s).`);
+        }
+        this.setStatus("Writing complete.");
+      } catch (error) {
+        console.error(error);
+        if (error && error.code === "empty-instruction") {
+          this.replaceLastAssistantMessage(`Error: Instruction cannot be empty.`);
+          this.setStatus("Writing failed: empty instruction.");
+        } else {
+          this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
+          this.setStatus(`Writing failed: ${error.message || error}`);
+        }
+      }
+    } catch (error) {
+      console.error(error);
+      this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
+      this.setStatus(`Writing failed: ${error.message || error}`);
+    }
+  }
+
+  renderDraftForInsert(result, filePath, editor) {
+    const draftMarkdown = (result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : "");
+    this.addMessage("user", `Write: ${this.promptEl ? this.promptEl.value.trim() : "(draft)"}`);
+    this.addMessage("assistant", draftMarkdown || "No draft generated.");
+    // Add an Insert button that inserts at current cursor of active note
+    const insertBtn = this.messagesEl ? this.messagesEl.createEl("button", { text: "Insert at current cursor", cls: "semantic-todoist-insert-button" }) : null;
+    if (insertBtn) {
+      insertBtn.onclick = async () => {
+        const app = this.plugin.app || this.app;
+        const activeMarkdownView = app?.workspace?.getActiveViewOfType ? app.workspace.getActiveViewOfType(typeof require !== "undefined" ? (function () {
+          try { return require("obsidian").MarkdownView; } catch (e) { return null; }
+        })() : null) : null;
+        if (activeMarkdownView && activeMarkdownView.editor && activeMarkdownView.file) {
+          const ed = activeMarkdownView.editor;
+          const cursor = ed.getCursor ? ed.getCursor() : { line: 0, ch: 0 };
+          const draftText = draftMarkdown || "";
+          try {
+            ed.replaceRange ? ed.replaceRange(draftText, cursor, cursor) : null;
+          } catch (e) {
+            new Notice("Insert failed: " + (e.message || e));
+          }
+          this.setStatus("Draft inserted.");
+        } else {
+          new Notice("No open note to insert into.");
+        }
+      };
     }
   }
 
@@ -22286,6 +22472,12 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     taskGenerationPromptTemplateSetting(sidebar, this.plugin);
     new Setting(sidebar).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
     new Setting(sidebar).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
+
+    // writing-mode: Writing settings section
+    const writing = settingsDisclosure(containerEl, "Writing", "Sidebar Write mode settings for drafting evidence-based prose into notes.", false);
+    textSetting(writing, "Context folder", "Default in-vault folder 'Writing Context', or an absolute desktop path outside the vault. On mobile, an external path falls back to the vault folder.", this.plugin, "writingContextFolder");
+    toggleSetting(writing, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
+    new Setting(writing).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));
 
     const mcp = settingsDisclosure(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.", false);
     toggleSetting(mcp, "Publish MCP bridge manifest", "Point an external read-only bridge at existing plugin databases without copying them.", this.plugin, "externalMcpExportEnabled");

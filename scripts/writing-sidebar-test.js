@@ -462,6 +462,30 @@ function testCollaborateSettingsKeys() {
   console.log('PASS collaborate-settings-keys');
 }
 
+function testRelevantNotesSetting() {
+  const defaults = Plugin.DEFAULT_SETTINGS || {};
+  assert.strictEqual(defaults.showRelevantNotes, true, 'relevant notes defaults true');
+  const n = Plugin.normalizeStableSettings({ showRelevantNotes: 0 });
+  assert.strictEqual(n.showRelevantNotes, true, 'non-false relevant notes is true');
+  const n2 = Plugin.normalizeStableSettings({ showRelevantNotes: false });
+  assert.strictEqual(n2.showRelevantNotes, false, 'false relevant notes kept');
+  const n3 = Plugin.normalizeStableSettings({});
+  assert.strictEqual(n3.showRelevantNotes, true, 'missing relevant notes defaults true');
+  console.log('PASS relevant-notes-setting');
+}
+
+function testTaskTabsSplit() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('"Note Tasks"'), 'Note Tasks tab present');
+  assert(src.includes('"Email Tasks"'), 'Email Tasks tab present');
+  assert(src.includes('renderNoteTasks(containerEl)'), 'renderNoteTasks exists');
+  assert(src.includes('renderEmailTasks(containerEl)'), 'renderEmailTasks exists');
+  assert(src.includes('goTo("Note Tasks")'), 'notes link lands on Note Tasks');
+  assert(src.includes('goTo("Email Tasks")'), 'email link lands on Email Tasks');
+  console.log('PASS task-tabs-split');
+}
+
 function testExistingSidebarTestsStillPass() {
   // (5) Existing test structure intact; all prior assertions preserved.
   assert.strictEqual(typeof Plugin.SemanticTodoistView, 'function', 'existing view class intact');
@@ -500,6 +524,8 @@ async function runTests() {
   testFeaturesMenuStructure();
   testRunWriteSwapAndEnterRouting();
   testCollaborateSettingsKeys();
+  testRelevantNotesSetting();
+  testTaskTabsSplit();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

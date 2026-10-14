@@ -2824,6 +2824,7 @@ function normalizeStableSettings(input = {}) {
   result.writingUseVault = source.writingUseVault !== false;
   result.writingUseContext = source.writingUseContext !== false;
   result.writingUseResearch = source.writingUseResearch !== false; // writing-mode: task 11 deep-research evidence toggle (default on)
+  result.showRelevantNotes = source.showRelevantNotes !== false; // writing-mode: relevant-notes panel defaults on
   return result;
 }
 
@@ -3569,6 +3570,7 @@ const DEFAULT_SETTINGS = {
   writingUseVault: true, // writing-mode: task 10 vault evidence default
   writingUseContext: true, // writing-mode: task 10 context-folder evidence default
   writingUseResearch: true, // writing-mode: task 11 deep-research evidence default
+  showRelevantNotes: true, // writing-mode: relevant-notes panel enabled by default
   taskContextSummaryMaxNotes: 5,
   excludedLinkDomains: "",
   builtInPromptTemplates: [
@@ -21950,6 +21952,7 @@ class SemanticTodoistView extends ItemView {
     this.noteResultsEl = picker.createDiv({ cls: "semantic-todoist-note-results" });
     this.relevantEl = main.createDiv({ cls: "semantic-todoist-relevant" });
     this.relevantEl.setText("Relevant notes will appear here after search or chat.");
+    if (this.plugin.settings.showRelevantNotes === false) { this.relevantEl.remove(); this.relevantEl = null; } // writing-mode: hide relevant-notes panel when disabled
     this.messagesEl = main.createDiv({ cls: "semantic-todoist-conversation" });
     this.promptEl = main.createEl("textarea", { cls: "semantic-todoist-chat-prompt", placeholder: "Ask about your vault or draft a prompt..." });
     // writing-mode: task 10 collaborate mode swaps the placeholder and routes Enter to write()
@@ -22727,7 +22730,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
-    const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Daily Scheduler", "Task Integrity", "Activity"];
+    const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Note Tasks", "Email Tasks", "Daily Scheduler", "Task Integrity", "Activity"]; // writing-mode: note and email task tabs split from workflows
     let activeButton = null;
     for (const tab of tabNames) {
       const button = tabs.createEl("button", { text: tab, attr: { type: "button", "aria-label": `Open ${tab} settings` } });
@@ -22749,6 +22752,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       "AI Providers": "renderAiProviders",
       "AI Models": "renderAiModels",
       "Task Workflows": "renderTaskWorkflows",
+      "Note Tasks": "renderNoteTasks", // writing-mode: note tasks tab renderer
+      "Email Tasks": "renderEmailTasks", // writing-mode: email tasks tab renderer
       "Daily Scheduler": "renderScheduleToday",
       "Task Integrity": "renderTaskIntegrity",
       Activity: "renderActivity"
@@ -22811,17 +22816,17 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       ["Validate Todoist", async () => { try { await this.plugin.validateTodoistSetup(true); this.display(); } catch (error) { new Notice(`Todoist setup check failed: ${error.message || error}`); } }]
     ]);
     setupStatusSetting(containerEl, "Notes workflow", notesSetupSummary(this.plugin.settings), [
-      ["Open Task Workflows", () => this.goTo("Task Workflows")],
+      ["Open Note Tasks", () => this.goTo("Note Tasks")], // writing-mode: notes link lands on split tab
       ["Validate notes", async () => { try { await this.plugin.validateNotesWorkflowSetup(true); this.display(); } catch (error) { new Notice(`Notes setup check failed: ${error.message || error}`); } }]
     ]);
     setupStatusSetting(containerEl, "Email workflow (optional)", emailSetupSummary(this.plugin.settings), [
-      ["Open Task Workflows", () => this.goTo("Task Workflows")],
+      ["Open Email Tasks", () => this.goTo("Email Tasks")], // writing-mode: email link lands on split tab
       ["Validate email", async () => { try { await this.plugin.validateEmailSetup(true); this.display(); } catch (error) { new Notice(`Email setup check failed: ${error.message || error}`); } }]
     ]);
     setupStatusSetting(containerEl, "Overall setup", "Run a bounded check for services that have credentials saved. No note content is sent by this check.", [
       ["Check setup", async () => { await this.plugin.validateConfiguredSetup(true); this.display(); }]
     ]);
-    settingsHeading(containerEl, "Next steps", "AI Providers holds provider keys and endpoints. AI Models holds routing and models. AI & Search holds search, the semantic index, and sidebar behavior. Task Workflows holds Todoist, note, and email settings. Daily Scheduler and Task Integrity hold their own workflow controls.");
+    settingsHeading(containerEl, "Next steps", "AI Providers holds provider keys and endpoints. AI Models holds routing and models. AI & Search holds search, the semantic index, and sidebar behavior. Task Workflows holds Todoist and shared task generation. Note Tasks and Email Tasks hold their own workflow settings. Daily Scheduler and Task Integrity hold their own workflow controls."); // writing-mode: next-steps text reflects split task tabs
   }
 
   renderAiSearch(containerEl) {
@@ -22862,6 +22867,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     numberSetting(sidebar, "Chat font size", this.plugin, "chatFontSizePx");
     toggleSetting(sidebar, "Add active note to chat context", "Include the active note in sidebar chat by default.", this.plugin, "autoAddActiveContentToContext");
     toggleSetting(sidebar, "Include active note in search", "Include the active note alongside semantic search by default.", this.plugin, "searchIncludeActiveNote");
+    toggleSetting(sidebar, "Show relevant notes", "Hide the sidebar panel listing notes found by search and chat.", this.plugin, "showRelevantNotes", () => { for (const leaf of this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE)) { const view = leaf.view; if (view instanceof SemanticTodoistView) view.render(); } }); // writing-mode: relevant-notes toggle re-renders open sidebar
     numberSetting(sidebar, "Maximum chat result chunks", this.plugin, "maxChatContextChunks");
     numberSetting(sidebar, "Maximum task context chunks", this.plugin, "maxTaskContextChunks");
     textSetting(sidebar, "Prompt folder", "Markdown files in this folder become reusable prompt actions.", this.plugin, "promptTemplatesFolder");
@@ -22912,7 +22918,9 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(containerEl, "Require model due dates", "When on, the AI always proposes a due date for each new task from its own judgment of urgency and timeline, even if the note gives none. Turn off to only use dates the note states.", this.plugin, "requireModelDueDates");
     toggleSetting(containerEl, "Use Todoist app links", "Use todoist:// links when task references are shown in the sidebar.", this.plugin, "linksAppURI");
     numberSetting(containerEl, "Subtask indent spaces", this.plugin, "subtaskIndentSpaces");
+  }
 
+  renderNoteTasks(containerEl) { // writing-mode: note tasks live on their own tab
     settingsHeading(containerEl, "Notes-To-Todoist", "Create and sync tasks from notes or selected text. Required-action markers remain mandatory coverage anchors.");
     textSetting(containerEl, "Required-action hashtags", "Comma-separated markers such as #todo that require a relevant generated task.", this.plugin, "noteActionMarkerTags");
     textSetting(containerEl, "Main sync tag", "Marker used on main task lines.", this.plugin, "syncTag");
@@ -22942,6 +22950,9 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
         try { await this.plugin.recoverTodoistIdsFromTaskNames(true); this.display(); } catch {}
       }));
 
+  }
+
+  renderEmailTasks(containerEl) { // writing-mode: email tasks live on their own tab
     settingsHeading(containerEl, "Email-To-Todoist", "Process forwarded email through your own Cloudflare Worker. This workflow has no user-facing character cap; use the source and task rules below to shape generated tasks.");
     textSetting(containerEl, "Cloudflare Worker URL", "HTTPS queue endpoint.", this.plugin, "workerUrl");
     secretSetting(containerEl, "Cloudflare Worker token", this.plugin, "workerToken");

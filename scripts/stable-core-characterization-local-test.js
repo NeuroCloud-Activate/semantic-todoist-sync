@@ -113,7 +113,7 @@ function cssWellFormed(text) {
 function mainSyntaxValid(buf) {
   try {
     // eslint-disable-next-line no-new
-    new vm.Script(buf, { filename: 'main.js' });
+    new vm.Script(buf, { filename: 'src/main.js' });
     return true;
   } catch (_e) {
     return false;

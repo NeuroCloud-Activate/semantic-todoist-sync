@@ -100,7 +100,7 @@ const SEMANTIC_TASK_REFERENCE_SCHEMA_VERSION = 2;
 const SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND = "task-reference-parent-stub";
 const SEMANTIC_TASK_REFERENCE_NON_VAULT_PATH_PREFIX = "@todoist/task/";
 const SEMANTIC_TASK_REFERENCE_PARENT_STUB_PATH_PREFIX = "@todoist/parent-stub/";
-const SEMANTIC_RETRIEVAL_CACHE_MAX_ENTRIES = 32;
+
 const SEMANTIC_RETRIEVAL_CACHE_TTL_MS = 5 * 60 * 1000;
 const SEMANTIC_RETRIEVAL_SCHEMA_VERSION = 1;
 const TASK_SEMANTIC_CONTEXT_CACHE_MAX_ENTRIES = 3;
@@ -129,6 +129,7 @@ const LOCAL_SEMANTIC_ROUTING_DEFAULT_DIMENSION = 384;
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION = "int8";
 const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION_SCALE = 127;
 const GEMINI_EMBEDDING_CONCURRENCY = 3;
+const SEMANTIC_EMBEDDING_BATCH_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
@@ -2489,13 +2490,13 @@ async function serializeProductionSemanticRoutingArtifactCooperative(state = {},
     storageFingerprint: String(options.storageFingerprint || state.telemetry?.storageFingerprint || ""),
     generation: String(index.generation || ""),
     count: Number(index.count || 0),
-    evidenceIds: Array.from(index.evidenceIds || []),
-    sourceIds: Array.from(index.sourceIds || []),
-    shardRefs: Array.from(index.shardRefs || []),
-    scopeRefs: Array.from(index.scopeRefs || [], (value) => Array.from(value || [])),
-    taskRefs: Array.from(index.taskRefs || [], (value) => Array.from(value || [])),
-    temporalMetadata: Array.from(index.temporalMetadata || []),
-    routingMetadata: Array.from(index.routingMetadata || []),
+    evidenceIds: index.evidenceIds || [],
+    sourceIds: index.sourceIds || [],
+    shardRefs: index.shardRefs || [],
+    scopeRefs: index.scopeRefs || [],
+    taskRefs: index.taskRefs || [],
+    temporalMetadata: index.temporalMetadata || [],
+    routingMetadata: index.routingMetadata || [],
     vectorStore: {
       format: vectorStore.format,
       scale: Number(vectorStore.scale),
@@ -2537,10 +2538,20 @@ async function serializeProductionSemanticRoutingArtifactCooperative(state = {},
     ["routingMetadata", arrayTexts.routingMetadata],
     ["vectorStore", vectorStoreText]
   ].filter(([, text]) => text !== undefined);
-  const jsonWithoutIntegrityHash = `{${fieldEntries.map(([key, text]) => `${JSON.stringify(key)}:${text}`).join(",")}}`;
-  const integrityHash = fnv1aFinish16(await productionSemanticRoutingFoldCooperative(2166136261, jsonWithoutIntegrityHash, slice));
+  const fieldTexts = fieldEntries.map(([key, text]) => `${JSON.stringify(key)}:${text}`);
+  // Incremental integrity fold over the exact same character stream as
+  // `{${fieldTexts.join(",")}}`, without materializing the intermediate full
+  // JSON copy; one yield per piece keeps the fold cooperative.
+  let integrityState = 2166136261;
+  integrityState = await productionSemanticRoutingFoldCooperative(integrityState, "{", slice);
+  for (let index = 0; index < fieldTexts.length; index += 1) {
+    if (index > 0) integrityState = await productionSemanticRoutingFoldCooperative(integrityState, ",", slice);
+    integrityState = await productionSemanticRoutingFoldCooperative(integrityState, fieldTexts[index], slice);
+  }
+  integrityState = await productionSemanticRoutingFoldCooperative(integrityState, "}", slice);
+  const integrityHash = fnv1aFinish16(integrityState);
   artifact.integrityHash = integrityHash;
-  const json = `${jsonWithoutIntegrityHash.slice(0, -1)},"integrityHash":${JSON.stringify(integrityHash)}}`;
+  const json = `{${fieldTexts.join(",")},"integrityHash":${JSON.stringify(integrityHash)}}`;
   return { artifact, json };
 }
 
@@ -2555,16 +2566,13 @@ async function serializeProductionSemanticRoutingArtifactPartsCooperative(artifa
     integrityHash: String(artifact.integrityHash || ""),
     length: json.length
   };
-  const chunks = [];
-  for (let cursor = 0; cursor < json.length; cursor += partBytes) {
-    chunks.push(json.slice(cursor, cursor + partBytes));
-    await slice();
-  }
+  const totalParts = Math.max(1, Math.ceil(json.length / partBytes));
   const parts = [];
-  for (let index = 0; index < chunks.length; index += 1) {
+  for (let index = 0; index < totalParts; index += 1) {
+    const cursor = index * partBytes;
     parts.push({
       file: productionSemanticRoutingPartFileName(index, header.generation),
-      body: JSON.stringify(Object.assign({}, header, { part: index + 1, parts: chunks.length, chunk: chunks[index] }))
+      body: JSON.stringify(Object.assign({}, header, { part: index + 1, parts: totalParts, chunk: json.slice(cursor, Math.min(cursor + partBytes, json.length)) }))
     });
     await slice();
   }
@@ -2580,24 +2588,7 @@ async function serializeProductionSemanticRoutingArtifactPartsCooperative(artifa
   return { parts, pointer: { file: LOCAL_SEMANTIC_ROUTING_ARTIFACT_FILE, body: JSON.stringify(pointer) } };
 }
 
-function parseProductionSemanticRoutingArtifactParts(pointer = {}, partBodies = []) {
-  const partCount = Number(pointer?.parts);
-  if (!pointer || !Number.isInteger(partCount) || partCount < 1) throw localSemanticRoutingError("artifact-pointer-invalid", "Production routing artifact pointer is malformed.");
-  const bodies = Array.isArray(partBodies) ? partBodies : [];
-  if (bodies.length !== partCount) throw localSemanticRoutingError("artifact-parts-missing", "Production routing artifact parts are incomplete.");
-  let json = "";
-  for (let index = 0; index < bodies.length; index += 1) {
-    const parsed = typeof bodies[index] === "string" ? JSON.parse(bodies[index]) : bodies[index];
-    if (!parsed || Number(parsed.part) !== index + 1 || Number(parsed.parts) !== partCount || typeof parsed.chunk !== "string") {
-      throw localSemanticRoutingError("artifact-part-invalid", "Production routing artifact part is malformed.");
-    }
-    json += parsed.chunk;
-  }
-  if (Number(pointer.length) !== json.length) throw localSemanticRoutingError("artifact-length-mismatch", "Production routing artifact length check failed.");
-  const artifact = JSON.parse(json);
-  if (String(pointer.integrityHash || "") !== String(artifact.integrityHash || "")) throw localSemanticRoutingError("artifact-integrity-failed", "Production routing artifact pointer integrity check failed.");
-  return artifact;
-}
+
 // Cooperative load-path variant: parts are parsed one per slice, the
 // reassembled parse stays one isolated ~25 ms unit (under the 50 ms desktop
 // budget) and the gate is consulted between slices. Byte-identical result to
@@ -2628,36 +2619,7 @@ async function parseProductionSemanticRoutingArtifactPartsCooperative(pointer = 
   return artifact;
 }
 
-function deserializeProductionSemanticRoutingArtifact(artifact = {}) {
-  if (!artifact || Number(artifact.schemaVersion) !== LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION || Number(artifact.persistenceSchemaVersion) !== LOCAL_SEMANTIC_ROUTING_PERSISTENCE_SCHEMA_VERSION) throw localSemanticRoutingError("artifact-schema-mismatch", "Production routing artifact schema is unsupported.");
-  if (!artifact.vectorStore || artifact.vectorStore.encoding !== "base64") throw localSemanticRoutingError("artifact-encoding-invalid", "Production routing artifact encoding is unsupported.");
-  if (String(artifact.integrityHash || "") !== productionSemanticRoutingArtifactIntegrity(artifact)) throw localSemanticRoutingError("artifact-integrity-failed", "Production routing artifact integrity check failed.");
-  const count = Number(artifact.count);
-  const dimension = Number(artifact.dimension);
-  const valuesBytes = productionSemanticRoutingBase64ToBytes(artifact.vectorStore.data);
-  if (!Number.isInteger(count) || count < 0 || !Number.isInteger(dimension) || dimension < 1 || valuesBytes.length !== count * dimension) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact vector count is invalid.");
-  const index = {
-    schemaVersion: LOCAL_SEMANTIC_ROUTING_SCHEMA_VERSION,
-    generation: String(artifact.generation || ""),
-    encoder: localSemanticRoutingDescriptor({ id: `indexed-routing:${String(artifact.provider || "")}:${String(artifact.model || "")}`, version: artifact.contentVersion, dimension, normalization: "l2", quantization: { type: artifact.vectorStore.format, scale: Number(artifact.vectorStore.scale) } }),
-    evidenceIds: Object.freeze(Array.from(artifact.evidenceIds || [], String)),
-    sourceIds: Object.freeze(Array.from(artifact.sourceIds || [], String)),
-    shardRefs: Object.freeze(Array.from(artifact.shardRefs || [], String)),
-    scopeRefs: Object.freeze(Array.from(artifact.scopeRefs || [], (value) => Object.freeze(Array.from(value || [], String)))),
-    taskRefs: Object.freeze(Array.from(artifact.taskRefs || [], (value) => Object.freeze(Array.from(value || [], String)))),
-    temporalMetadata: Object.freeze(Array.from(artifact.temporalMetadata || [], (value) => localSemanticRoutingMetadata(value))),
-    routingMetadata: Object.freeze(Array.from(artifact.routingMetadata || [], (value) => localSemanticRoutingCompactMetadata(value))),
-    vectorStore: Object.freeze({ format: artifact.vectorStore.format, scale: Number(artifact.vectorStore.scale), dimension, count, values: new Int8Array(valuesBytes.buffer, valuesBytes.byteOffset, valuesBytes.byteLength) }),
-    integrityHash: "",
-    count
-  };
-  if (index.evidenceIds.length !== count || index.sourceIds.length !== count || index.shardRefs.length !== count || index.scopeRefs.length !== count || index.taskRefs.length !== count || index.temporalMetadata.length !== count) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact metadata count is invalid.");
-  if (!index.routingMetadata.length) index.routingMetadata = Object.freeze(Array.from({ length: count }, () => Object.freeze({})));
-  if (index.routingMetadata.length !== count) throw localSemanticRoutingError("artifact-count-mismatch", "Production routing artifact routing metadata count is invalid.");
-  index.integrityHash = localSemanticRoutingIndexIntegrity(index);
-  Object.freeze(index);
-  return index;
-}
+
 // Cooperative load-path variant (byte-identical index): the artifact
 // integrity fold, the base64 decode, every metadata array build and the final
 // index integrity fold run in ~8 ms slices under the load gate. The sync
@@ -4287,7 +4249,7 @@ function taskDescriptionUserInstructionLines({
     "Structured payload rules: treat action/title and subtasks as the task scope; preserve mandatoryRequestFacts. Each task row lists must (mandatory refs: state every must item) and refs (the task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Never borrow another task's refs.",
     "Line semantics: requested-action lines are mandatory current-source requirements: always state and cite them. Same-scope supporting lines that clarify intent, current state, timing, recipient, or criteria should be stated and cited. Keep distinct timing statements attached to their own lines and never merge or reassign them.",
     "Must rule: state every must ref in a natural execution sentence; use separate sentences when must refs add distinct current-state, history, criteria, or dependency content. Label a line as history only when its time is history rather than merely old, and preserve current direction. Never cite a ref without stating its supported content.",
-    "Execution-detail rule: when a listed ref adds a concrete execution detail for this task, include it; an action-only or title-only description fails when such a ref is supplied. When no supported substantive description beyond the title is possible, return an empty description_sentences array for that task instead of restating the title or inventing context.",
+    "Execution-detail rule: when a listed ref adds a concrete execution detail for this task, include it; an action-only or title-only description fails when such a ref is supplied. Never return an empty description_sentences array: when little beyond the title is supported, still write at least one sentence stating what the current source itself says about the task (its request, people, dates, or context) and cite the current-source ref, without inventing context.",
     "Supporting-line rule: use another listed ref only when it helps perform the task as titled (organization, expectations, history, people, decisions, dates), state it directly, and cite it in that sentence's refs; using fewer refs is fine. Ignore refs about other activities or background that only share a topic keyword, and skip refs that are unrelated, superseded or stale.",
     "Citation contract: in current strict workflows return description_sentences, each with {text,refs}. Do not return model numeric citations and do not rely on a free-form description string. Every sentence must carry the refs of the lines it states; the plugin resolves refs mechanically, then assigns sequential citation numbers per description and appends the matching Sources/Context list. For note workflows, the primary source is (1), followed by retained context sources from (2). The primary current source is authoritative; supporting/history/task-snapshot records belong in Context. If a sentence states anything taken from an older or other note, its refs must include that note's ref so it is cited; always cite any older-note content you use, and never state it without its ref.",
     isEmailSource ? "" : "Context-note cap: cite at most six distinct context notes per task. The primary note is always source (1) and does not count against this cap. When more than six context notes are materially relevant, select the six most material; the plugin assigns context citation numbers consecutively from (2) for each description.",
@@ -4304,7 +4266,7 @@ function taskDescriptionUserInstructionLines({
     contextCitationInstructions(citeContextNotes, structuredEvidence),
     "",
     structuredEvidence ? "Include a listed ref only when it helps perform the task as titled. Use one complete sentence only when the task row supports no additional useful detail beyond the action; otherwise use multiple complete natural sentences. Never pad sparse evidence to meet a count." : "Use only the matching task evidence fields; preserve explicit people, objects, conditions, decision alternatives or criteria, urgency, dependencies, timing, history or handoffs, and remaining action when supplied. Include a listed ref only when it helps perform the task as titled, and use multiple complete natural sentences when the evidence supports multiple execution dimensions.",
-    "Shared task evidence (one JSON row per task; use refs to bind each sentence and never borrow across task scopes). Each row carries task, title, subtasks, must (mandatory refs: state every must item) and refs (that task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Evidence text for each ref comes from this request's own preceding evidence list; the plugin resolves refs mechanically. An empty description_sentences array stays the signal when no supported substantive description beyond the title is possible:"
+    "Shared task evidence (one JSON row per task; use refs to bind each sentence and never borrow across task scopes). Each row carries task, title, subtasks, must (mandatory refs: state every must item) and refs (that task's closed evidence set in relevance order: use another listed ref only when it helps perform the task as titled, and cite a ref if and only if the sentence uses it; skip unrelated, superseded or stale refs). Evidence text for each ref comes from this request's own preceding evidence list; the plugin resolves refs mechanically. Always return at least one description sentence per task, citing the current-source ref when nothing else is supported:"
   ];
 }
 
@@ -5505,6 +5467,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticIndex = candidate;
       this.taskReferenceIntegrity = candidateIntegrity;
       this.taskReferenceRepairRevision += 1;
+      this.invalidateSemanticRetrievalCache();
       this.settings.semanticIndexMeta = Object.assign({}, previousMeta, semanticIndexMetadata(candidate, candidateIntegrity.graph), {
         taskReferenceSnapshotFingerprint: targetFingerprint,
         taskReferenceSnapshotUpdatedAt: this.settings.taskReferenceSnapshotMeta?.updatedAt || previousMeta.taskReferenceSnapshotUpdatedAt || "",
@@ -6394,6 +6357,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let settingsChanged = false;
       let loadedFromDisk = false;
       let compatibilityRefreshCandidate = null;
+      let lastIndexReadError = null;
       const rememberCompatibilityRefresh = (error) => {
         if (error?.code !== "semantic-index-compatibility-refresh-required") return;
         compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
@@ -6432,6 +6396,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         loadedFromDisk = true;
       } catch (error) {
         if (error?.code === "semantic-index-read-failed") throw error;
+        lastIndexReadError = error;
         rememberCompatibilityRefresh(error);
         // Legacy semantic-index.json fallback is OpenAI-only: legacy model inference
         // (usesOpenAIEmbeddingModel) is true for custom OpenAI-compatible models, so gate
@@ -6446,6 +6411,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             compatibilityRefreshCandidate = null;
           } catch (legacyError) {
             if (legacyError?.code === "semantic-index-read-failed") throw legacyError;
+            lastIndexReadError = legacyError;
             rememberCompatibilityRefresh(legacyError);
           }
         }
@@ -6492,7 +6458,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!loadedFromDisk) {
         restorePreviousState();
         this.semanticIndexLoadFailure = "semantic-index-no-validated-generation";
-        this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure });
+        this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure, error: singleLine(lastIndexReadError?.message || "").slice(0, 200) });
         return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
       }
       if (!this.semanticIndex.length) {
@@ -6518,7 +6484,9 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       // Prepare the provider-free routing generation before the index becomes
       // observable as warm. Persistence/load may refine this state later, but
       // a missing artifact never authorizes an unbounded retrieval scan.
-      await this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: true });
+      // Idle-schedule build when no valid artifact is saved; startup load
+      // resolves immediately (does not await) so queries never degrade.
+      this.ensureProductionSemanticRoutingState({ allowLoad: true, persist: true });
       if (settingsChanged) await this.saveSettings();
       this.scheduleDeferredTaskReferenceIntegrityScan("index-load-integrity", 1000);
       loadSucceeded = true;
@@ -7668,7 +7636,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       || String(current?.routingIndex?.generation || "") === String(options.generation || generation);
     const currentShardLayoutMatches = expectedShardCount <= 0
       || new Set(current?.routingIndex?.shardRefs || []).size === expectedShardCount;
-    if (!options.forceBuild && current?.routingIndex && currentGenerationMatches && currentShardLayoutMatches && Number(current.telemetry?.revision || -1) === revision && String(current.telemetry?.storageFingerprint || "") === storageFingerprint && Number(current.routingIndex.count || 0) === chunkCount) {
+    if (!options.forceBuild && current?.routingIndex && currentGenerationMatches && currentShardLayoutMatches && Number(current.telemetry?.revision ?? -1) === revision && String(current.telemetry?.storageFingerprint || "") === storageFingerprint && Number(current.routingIndex.count || 0) === chunkCount) {
       this.productionSemanticRoutingTelemetry = Object.assign({}, current.telemetry, { cacheHit: true, coldBuild: false, loadHit: Boolean(current.telemetry?.loadHit) });
       return current;
     }
@@ -7681,7 +7649,102 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.invalidateProductionSemanticRoutingState("routing-state-migration-required");
       return null;
     }
+    // Startup idle-build: when allowLoad && persist && !forceBuild && the artifact
+    // failed to load (stale/missing), do NOT build synchronously. Build once at
+    // idle; queries (allowBuild:false) await the same single-flight promise.
+    // Startup call returns immediately (does not await); query calls await it.
+    // Callers that must never wait (startup) ignore the return; exact queries
+    // must always await the returned promise so they never degrade.
+    const isStartupBuild = options.allowLoad !== false && options.persist !== false && options.forceBuild !== true && options.allowBuild !== false;
+    if (isStartupBuild) {
+      const inFlightKey = `${generation}|${revision}|${storageFingerprint}`;
+      this.productionSemanticRoutingInFlight = this.productionSemanticRoutingInFlight || new Map();
+      const existing = this.productionSemanticRoutingInFlight.get(inFlightKey);
+      if (existing && existing.idleBuildPromise) {
+        return existing.idleBuildPromise;
+      }
+      // Capture the serial at entry so post-yield staleness checks compare
+      // against the pre-yield value, not the (possibly changed) current one.
+      const entrySerial = Number(this.productionSemanticRoutingInvalidationSerial || 0);
+      // Register the idle build promise (single-flight for this generation/revision/fingerprint)
+      const idleBuildPromise = (async () => {
+        try {
+          // Yield to idle (uses existing idlePause which races timer + requestIdleCallback + MessageChannel)
+          await idlePause(0);
+          if (this.isUnloading) return null;
+          // Re-check staleness after yield: index may have changed during the yield
+          if (entrySerial !== Number(this.productionSemanticRoutingInvalidationSerial || 0)
+            || Number(this.semanticIndexRevision ?? revision) !== revision
+            || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint) return null;
+          if (this.isUnloading) return null;
+          if (!this.canStartBackgroundWork()) {
+            // If still busy, wait one bounded poll then re-verify; reuse the
+            // entry serial so a change during the wait is still detected.
+            await idlePause(PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_POLL_MS);
+            if (this.isUnloading) return null;
+            if (entrySerial !== Number(this.productionSemanticRoutingInvalidationSerial || 0)
+              || Number(this.semanticIndexRevision ?? revision) !== revision
+              || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint) return null;
+          }
+          const buildSerial = Number(this.productionSemanticRoutingInvalidationSerial || 0);
+          const buildLiveGeneration = String(this.settings?.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "");
+          const buildAbortCheck = () => Number(this.productionSemanticRoutingInvalidationSerial || 0) !== buildSerial
+            || Number(this.semanticIndexRevision ?? revision) !== revision
+            || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint
+            || String(this.settings?.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "") !== buildLiveGeneration;
+          const prepared = await prepareProductionSemanticRoutingStateCooperative(chunks, settings, revision, storageFingerprint, Object.assign({}, options, { shouldAbort: buildAbortCheck }));
+          const telemetry = Object.freeze(Object.assign({}, prepared.telemetry, { cacheHit: false, coldBuild: true, loadHit: false, artifactCompatibility: "rebuilt-local", artifactCompatibilityReason: artifactCompatibilityReason || "idle-rebuild" }));
+          const state = Object.freeze(Object.assign({}, prepared, { telemetry }));
+          this.productionSemanticRoutingState = state;
+          this.productionSemanticRoutingTelemetry = telemetry;
+          if (options.persist !== false) {
+            const persisted = await this.persistProductionSemanticRoutingArtifact(state, { revision, storageFingerprint, provider: options.provider, model: options.model });
+            if (!persisted) {
+              this.productionSemanticRoutingState = null;
+              this.productionSemanticRoutingTelemetry = Object.assign({}, this.productionSemanticRoutingTelemetry || {}, {
+                state: "migration-required",
+                reasonCode: "routing-artifact-persistence-failed",
+                providerCalls: 0,
+                networkCalls: 0,
+                revision,
+                storageFingerprint
+              });
+              return null;
+            }
+          }
+          return state;
+        } catch (error) {
+          this.productionSemanticRoutingState = null;
+          this.productionSemanticRoutingTelemetry = {
+            state: "migration-required",
+            reasonCode: String(error?.code || "routing-state-build-failed"),
+            message: String(error?.message || "Production semantic routing state could not be prepared.").slice(0, 240),
+            providerCalls: 0,
+            networkCalls: 0,
+            revision,
+            storageFingerprint
+          };
+          return null;
+        } finally {
+          // Clean up the single-flight entry so a later invalidation starts fresh
+          const registered = this.productionSemanticRoutingInFlight?.get(inFlightKey);
+          if (registered && registered.idleBuildPromise === idleBuildPromise) {
+            this.productionSemanticRoutingInFlight.delete(inFlightKey);
+          }
+        }
+      })();
+      // Single-flight: register the promise so queries with allowBuild:false can await it
+      this.productionSemanticRoutingInFlight.set(inFlightKey, { promise: idleBuildPromise, allowBuild: true, invalidationSerial: entrySerial, idleBuildPromise });
+      // Startup call returns the promise (callers may await it or ignore it)
+      return idleBuildPromise;
+    }
     if (options.allowBuild === false) {
+      // Query path: await the in-flight idle build if one exists for this key
+      const inFlightKey = `${generation}|${revision}|${storageFingerprint}`;
+      const entry = this.productionSemanticRoutingInFlight?.get(inFlightKey);
+      if (entry && entry.idleBuildPromise) {
+        return entry.idleBuildPromise;
+      }
       this.productionSemanticRoutingState = null;
       this.productionSemanticRoutingTelemetry = {
         state: "migration-required",
@@ -7708,9 +7771,11 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         }
       }
       const buildInvalidationSerial = Number(this.productionSemanticRoutingInvalidationSerial || 0);
+      const buildLiveGeneration = String(this.settings?.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "");
       const buildAbortCheck = () => buildInvalidationSerial !== Number(this.productionSemanticRoutingInvalidationSerial || 0)
         || Number(this.semanticIndexRevision ?? revision) !== revision
-        || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint;
+        || String(this.semanticIndexStorageFingerprint ?? storageFingerprint) !== storageFingerprint
+        || String(this.settings?.semanticIndexMeta?.generation || this.semanticIndexManifestPublishedGeneration || "") !== buildLiveGeneration;
       const prepared = await prepareProductionSemanticRoutingStateCooperative(chunks, settings, revision, storageFingerprint, Object.assign({}, options, { shouldAbort: buildAbortCheck }));
       const telemetry = Object.freeze(Object.assign({}, prepared.telemetry, { cacheHit: false, coldBuild: true, loadHit: false, artifactCompatibility: "rebuilt-local", artifactCompatibilityReason: artifactCompatibilityReason || "forced-rebuild" }));
       const state = Object.freeze(Object.assign({}, prepared, { telemetry }));
@@ -8071,41 +8136,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return false;
   }
 
-  async setChatModel(value) {
-    this.settings.chatModel = value;
-    this.settings.aiModelProvider = generationProviderForSelectedModel(this.settings, value, this.settings.aiModelProvider);
-    this.settings.sharedGenerationPrimary = stableReference(Object.assign({}, this.settings.sharedGenerationPrimary, {
-      provider: this.settings.aiModelProvider,
-      model: value
-    }), DEFAULT_GENERATION_PRIMARY);
-    this.ensureSameProviderFallbackModel();
-    await this.ensureCompatibleEmbeddingForChatModel();
-    await this.saveSettings();
-  }
 
-  async setAiModelProvider(value) {
-    const provider = normalizeAiProvider(value, this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel));
-    const currentModelProvider = generationProviderForSelectedModel(
-      this.settings,
-      this.settings.chatModel,
-      this.settings.aiModelProvider || aiProviderForModel(this.settings.chatModel)
-    );
-    // Embedding identity is explicit and independent of the generation provider:
-    // a generation-provider change must not rewrite it or unload the index.
-    this.settings.aiModelProvider = provider;
-    if (currentModelProvider !== provider) {
-      this.settings.chatModel = preferredChatModelForProvider(this.settings, provider);
-    }
-    this.settings.sharedGenerationPrimary = stableReference(Object.assign({}, this.settings.sharedGenerationPrimary, {
-      provider,
-      model: this.settings.chatModel
-    }), DEFAULT_GENERATION_PRIMARY);
-    this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, provider, this.settings.chatModel);
-    if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== provider) {
-      this.settings.taskDeduplicationAiModel = "";
-    }
-    await this.saveSettings();
-  }
+
+
 
   ensureSameProviderFallbackModel() {
     const provider = aiProviderForModel(this.settings.chatModel);
@@ -8432,44 +8465,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
 
   // Frozen collector interface (the external collector consumes these).
   // Success is explicit: true or {ok:true}. Everything else fails closed.
-  attachDebugLogCollector(identity, emitFrame) {
-    const source = identity && typeof identity === "object" ? identity : null;
-    if (!source) return { ok: false, reasonCode: "debug-identity-missing" };
-    const sessionId = typeof source.sessionId === "string" ? source.sessionId.trim() : "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) return { ok: false, reasonCode: "debug-session-id-invalid" };
-    if (typeof emitFrame !== "function") return { ok: false, reasonCode: "debug-sink-not-callable" };
-    if (!providerCaptureSameVaultPath(source.vaultPath, vaultBasePath(this.app))) return { ok: false, reasonCode: "debug-vault-mismatch" };
-    const pluginVersion = String(source.pluginVersion || "");
-    const expectedVersion = String(this.manifest?.version || "");
-    if (!pluginVersion || !expectedVersion || pluginVersion !== expectedVersion) return { ok: false, reasonCode: "debug-plugin-version-mismatch" };
-    const active = this.providerCaptureSession;
-    if (active && !active.finalized) return { ok: false, reasonCode: "debug-session-active" };
-    this.debugLogCollector = { sessionId, emitFrame, attachedAt: Date.now() };
-    this.lastDebugLogSessionId = sessionId;
-    return { ok: true, sessionId };
-  }
 
-  acknowledgeDebugLog(sessionId, sequence) {
-    const session = this.providerCaptureSession;
-    if (!session) return { ok: false, reasonCode: "debug-session-inactive" };
-    return session.acknowledge(sessionId, sequence);
-  }
 
-  detachDebugLogCollector(sessionId) {
-    const id = String(sessionId || "");
-    const session = this.providerCaptureSession;
-    const collector = this.debugLogCollector;
-    const known = [session && session.id, collector && collector.sessionId, this.lastDebugLogSessionId].filter(Boolean);
-    if (!id || !known.includes(id)) return { ok: false, reasonCode: "debug-session-mismatch" };
-    let lifecycle = "";
-    if (session && session.id === id) {
-      lifecycle = session.detach().lifecycle;
-      if (this.providerCaptureSession === session) this.providerCaptureSession = null;
-    }
-    if (collector && collector.sessionId === id) this.debugLogCollector = null;
-    this.lastDebugLogSessionId = id;
-    return { ok: true, sessionId: id, lifecycle };
-  }
+
+
+
 
   // Cheap admission guard used before walking task arrays or building payloads.
   debugLogEnabled() {
@@ -9084,6 +9084,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
       await this.saveSemanticIndex();
       persistenceCommitted = true;
+      // A committed generation now exists on disk, so a stale fresh-device load
+      // failure (no validated index yet) is resolved even if a later step in
+      // this rebuild fails after the commit.
+      this.retireSemanticIndexLoadStatus();
       // Clear the staging record and files only after the new index is committed.
       await this.clearSemanticIndexRebuildStaging();
       try {
@@ -9519,22 +9523,50 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let embedded = 0;
     let providerInputs = 0;
     let chunksProcessed = reused;
-    // Nothing pending to embed: no visible status (idle stays "Ready").
+
+    // Build descriptors for parallel batch dispatch (Task 4).
+    const descriptors = [];
     for (let i = 0; i < pendingGroups.length; i += batchSize) {
-      const batch = pendingGroups.slice(i, i + batchSize);
-      this.setSidebarStatus(`Embedding ${label} ${Math.min(providerInputs + batch.length, pendingGroups.length)}/${pendingGroups.length}${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
-      const embeddings = await this.embedTexts(batch.map((group) => group.items.length > 1
+      descriptors.push({
+        batchIndex: descriptors.length,
+        groups: pendingGroups.slice(i, i + batchSize)
+      });
+    }
+
+    const batchCount = descriptors.length;
+    const completedFlags = new Array(batchCount).fill(false);
+    const batchResults = new Array(batchCount);
+    let nextProgressBatch = 0;
+    const providerName = semanticEmbeddingProvider(this.settings);
+    const concurrency = providerName === "gemini" ? 1 : SEMANTIC_EMBEDDING_BATCH_CONCURRENCY;
+
+    /** Task 4: parallel batches via existing asyncPool; staged vectors land in indexed[item.index] in original order, so a crash never leaves chunks beyond the contiguous completed prefix unreported (resume re-embeds them). */
+    function cumulativeProgressThrough(batchIdx) {
+      let chunkCount = reused;
+      let groupCount = 0;
+      for (let k = 0; k <= batchIdx && k < batchCount; k += 1) {
+        if (!batchResults[k]) break;
+        chunkCount += (batchResults[k].batchEmbedded || []).length;
+        groupCount += batchResults[k].groupCount || 0;
+      }
+      return { chunksProcessed: chunkCount, embedded: chunkCount - reused, providerInputs: groupCount };
+    }
+
+    await asyncPool(descriptors, concurrency, async (descriptor) => {
+      const { batchIndex, groups } = descriptor;
+      this.setSidebarStatus(`Embedding ${label} batch ${batchIndex + 1}/${batchCount} (${groups.length} inputs)${reused ? `; reused ${reused}` : ""}${pending.length > pendingGroups.length ? `; deduplicated ${pending.length - pendingGroups.length}` : ""}...`);
+      const embeddings = await this.embedTexts(groups.map((group) => group.items.length > 1
         ? semanticChunkSharedEmbeddingInput(group.chunk)
         : semanticChunkEmbeddingInput(group.chunk)), "document");
       const batchEmbedded = [];
-      for (let j = 0; j < batch.length; j += 1) {
-        const group = batch[j];
+      for (let j = 0; j < groups.length; j += 1) {
+        const group = groups[j];
         const embedding = compactEmbedding(embeddings[j], this.settings.semanticIndexEmbeddingPrecision);
         const projectionVersion = semanticTaskReferenceEmbeddingProjectionVersion(group.chunk);
         for (const item of group.items) {
           indexed[item.index] = Object.assign({}, item.chunk, {
             embedding,
-            embeddingProvider: semanticEmbeddingProvider(this.settings),
+            embeddingProvider: providerName,
             embeddingModel: this.settings.embeddingModel,
             embeddingDimension: embedding.length,
             embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
@@ -9543,7 +9575,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
             indexMetadata: {
               schemaVersion: 1,
               contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
-              provider: semanticEmbeddingProvider(this.settings),
+              provider: providerName,
               model: this.settings.embeddingModel,
               dimension: embedding.length,
               requestFingerprint: group.requestKey,
@@ -9551,16 +9583,48 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
             }
           });
           batchEmbedded.push(indexed[item.index]);
-          embedded += 1;
-          chunksProcessed += 1;
         }
       }
-      providerInputs += batch.length;
-      if (onProgress) {
-        await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded });
+      providerInputs += groups.length;
+
+      // Store result and advance contiguous progress.
+      const result = {
+        groupCount: groups.length,
+        batchEmbedded
+      };
+      batchResults[batchIndex] = result;
+      completedFlags[batchIndex] = true;
+
+      // Advance progress only through contiguous completed prefix.
+      // Because workers may complete out of order, we advance as far as possible.
+      while (nextProgressBatch < batchCount && completedFlags[nextProgressBatch]) {
+        const prevResult = batchResults[nextProgressBatch];
+        const cumulative = cumulativeProgressThrough(nextProgressBatch);
+        chunksProcessed = cumulative.chunksProcessed;
+        embedded = cumulative.embedded;
+        providerInputs = cumulative.providerInputs;
+        if (onProgress) {
+          await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded: prevResult.batchEmbedded });
+        }
+        nextProgressBatch += 1;
       }
+
       await idlePause(SEMANTIC_INDEX_EMBED_PAUSE_MS);
+    });
+
+    // After all batches complete, ensure any remaining progress is emitted.
+    while (nextProgressBatch < batchCount && completedFlags[nextProgressBatch]) {
+      const prevResult = batchResults[nextProgressBatch];
+      const cumulative = cumulativeProgressThrough(nextProgressBatch);
+      chunksProcessed = cumulative.chunksProcessed;
+      embedded = cumulative.embedded;
+      providerInputs = cumulative.providerInputs;
+      if (onProgress) {
+        await onProgress({ chunksProcessed, totalChunks: chunks.length, providerInputs, embedded, reused, batchEmbedded: prevResult.batchEmbedded });
+      }
+      nextProgressBatch += 1;
     }
+
     return {
       indexed,
       embedded,
@@ -10196,18 +10260,78 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return normalizeProviderEmbeddingRows(response.json?.data, texts.length, dimension, normalizedProvider);
   }
 
+  // One shared runtime query-embedding fallback. Chat mode already built a
+  // query handle from the provider when the identity lookup found no indexed
+  // chunk (see the chat branch of retrieveSemanticContext); the task workflow
+  // needs the same handle, because an email source - or any source with no
+  // indexed path - has no chunk of its own to borrow a query vector from and
+  // would otherwise fail closed with "query-vector-unavailable" and retrieve
+  // nothing. Reuses embedTexts and the shared queryEmbeddingCache. Returns []
+  // when embedding fails so every caller keeps its existing fail-closed branch,
+  // and the returned handle carries no chunk ids (no source evidence/source
+  // identity), so it never satisfies an identity requirement.
+  async runtimeSemanticQueryHandles(query, captureContext = null) {
+    const embeddingDimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const embeddingCacheKey = `${this.settings.embeddingModel}:${embeddingDimension || "native"}:${singleLine(String(query || ""))}`;
+    let cachedEmbedding = this.queryEmbeddingCache.get(embeddingCacheKey);
+    try {
+      if (!cachedEmbedding) {
+        [cachedEmbedding] = await this.embedTexts([query || ""], "query", captureContext);
+        this.queryEmbeddingCache.set(embeddingCacheKey, cachedEmbedding);
+        if (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
+      }
+    } catch (error) {
+      this.logLocal("Semantic retrieval embedding failed", { error: error.message || String(error) });
+      return [];
+    }
+    const vector = Array.isArray(cachedEmbedding) ? cachedEmbedding : [];
+    if (!vector.length) return [];
+    return [Object.freeze({
+      source: "chat-provider",
+      encoderId: `${semanticEmbeddingProvider(this.settings)}:${this.settings.embeddingModel}`,
+      encoderVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      vector: Object.freeze(Array.from(vector, Number)),
+      provider: semanticEmbeddingProvider(this.settings),
+      model: this.settings.embeddingModel,
+      dimension: vector.length || embeddingDimension,
+      indexRevision: this.semanticIndexRevision || 0,
+      sourceEvidenceIds: Object.freeze([]),
+      sourceIds: Object.freeze([]),
+      cacheKey: embeddingCacheKey
+    })];
+  }
+
+  // Chat-branch runtime query handles: shared runtimeSemanticQueryHandles plus
+  // chat telemetry (external/runtme call counts on cache miss, "chat-provider"
+  // source). Returns { handles, embedding, telemetryUpdate } so the caller keeps
+  // its exact fail-closed branch and handle shape.
+  async chatRuntimeQueryHandles(query, captureContext, embeddingDimension, baseTelemetry) {
+    const telemetry = Object.assign({}, baseTelemetry, { source: "chat-provider", handleSource: "chat-provider", externalQueryEmbeddingCalls: 0, runtimeExternalCalls: 0 });
+    const sharedDimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
+    const embeddingCacheKey = `${this.settings.embeddingModel}:${sharedDimension || "native"}:${singleLine(String(query || ""))}`;
+    const hadCached = Boolean(this.queryEmbeddingCache.get(embeddingCacheKey));
+    const handles = await this.runtimeSemanticQueryHandles(query, captureContext);
+    if (!handles.length) return { handles, embedding: [], telemetry, embeddingCacheKey, failed: !hadCached && !this.queryEmbeddingCache.get(embeddingCacheKey) };
+    if (!hadCached) {
+      telemetry.externalQueryEmbeddingCalls = 1;
+      telemetry.runtimeExternalCalls = 1;
+    }
+    const embedding = Array.isArray(this.queryEmbeddingCache.get(embeddingCacheKey)) ? this.queryEmbeddingCache.get(embeddingCacheKey) : [];
+    return { handles, embedding, telemetry, embeddingCacheKey, failed: false };
+  }
+
   async retrieveSemanticContext(query, limit, queryPlan = null, captureContext = null) {
     const startedAt = Date.now();
     const plan = queryPlan || contextQueryPlan(query, "chat");
     const request = semanticRetrievalRequestMetadata(query, limit, plan, this.settings);
     const cacheKey = this.semanticRetrievalCacheKey(query, limit, plan);
     if (this.semanticIndexCompatibilityRefreshPending?.() === true) {
-      return this.finalizeSemanticRetrievalContext([], request, {
+      return this.degradedRetrievalResult(request, cacheKey, {
         indexState: "degraded-source-only",
         degradedReason: "semantic-index-compatibility-refresh-pending",
         candidateCount: 0,
         elapsedMs: Date.now() - startedAt
-      });
+      }, false);
     }
     const cached = this.getSemanticRetrievalCache(cacheKey);
     if (cached) return cached;
@@ -10230,17 +10354,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const usableIndex = integrity.validChunks;
     const readiness = semanticIndexReadiness(rawIndex, index, settingsSnapshot, integrity);
     if (indexLoadError) {
-      const result = this.finalizeSemanticRetrievalContext([], request, {
+      return this.degradedRetrievalResult(request, cacheKey, {
         indexState: "failed",
         degradedReason: "index-load-failed",
         candidateCount: 0,
         indexHealth: integrity.health,
         elapsedMs: Date.now() - startedAt
       });
-      return this.setSemanticRetrievalCache(cacheKey, result);
     }
     if (readiness.state === "configured/non-empty-degraded") {
-      const result = this.finalizeSemanticRetrievalContext([], request, {
+      return this.degradedRetrievalResult(request, cacheKey, {
         indexState: "degraded-source-only",
         readinessState: readiness.state,
         degradedReason: readiness.reasonCode,
@@ -10248,17 +10371,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         indexHealth: integrity.health,
         elapsedMs: Date.now() - startedAt
       });
-      return this.setSemanticRetrievalCache(cacheKey, result);
     }
     if (!usableIndex.length) {
-      const result = this.finalizeSemanticRetrievalContext([], request, {
+      return this.degradedRetrievalResult(request, cacheKey, {
         indexState: "degraded-source-only",
         degradedReason: index.length ? "index-integrity-failed" : "semantic-index-empty",
         candidateCount: 0,
         indexHealth: integrity.health,
         elapsedMs: Date.now() - startedAt
       });
-      return this.setSemanticRetrievalCache(cacheKey, result);
     }
     const embeddingDimension = semanticEmbeddingRequestDimension(this.settings, "query", this.settings.semanticIndexMeta || {});
     const retrievalMode = String(plan.mode || "chat");
@@ -10304,53 +10425,44 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         queryEmbedding = queryHandles[0].vector;
       } else {
         queryHandleTelemetry = Object.assign({}, indexedResolved.telemetry || {}, { source: "chat-provider", handleSource: "chat-provider", externalQueryEmbeddingCalls: 0, runtimeExternalCalls: 0 });
-        const embeddingQueryIdentity = singleLine(String(query || ""));
-        const embeddingCacheKey = `${this.settings.embeddingModel}:${embeddingDimension || "native"}:${embeddingQueryIdentity}`;
-        let cachedEmbedding = this.queryEmbeddingCache.get(embeddingCacheKey);
-        try {
-          if (!cachedEmbedding) {
-            [cachedEmbedding] = await this.embedTexts([query || ""], "query", captureContext);
-            this.queryEmbeddingCache.set(embeddingCacheKey, cachedEmbedding);
-            if (this.queryEmbeddingCache.size > 50) this.queryEmbeddingCache.delete(this.queryEmbeddingCache.keys().next().value);
-            queryHandleTelemetry.externalQueryEmbeddingCalls = 1;
-            queryHandleTelemetry.runtimeExternalCalls = 1;
+        {
+          const chatHandles = await this.chatRuntimeQueryHandles(query, captureContext, embeddingDimension, indexedResolved.telemetry || {});
+          queryHandleTelemetry = chatHandles.telemetry;
+          if (chatHandles.failed) {
+            this.logLocal("Semantic retrieval embedding failed", { error: "query embedding failed" });
+            return this.degradedRetrievalResult(request, cacheKey, {
+              indexState: "failed",
+              degradedReason: "query-embedding-failed",
+              candidateCount: usableIndex.length,
+              indexHealth: integrity.health,
+              queryHandleSource: "chat-provider",
+              queryHandleTelemetry,
+              externalQueryEmbeddingCalls: queryHandleTelemetry.externalQueryEmbeddingCalls,
+              runtimeExternalCalls: queryHandleTelemetry.runtimeExternalCalls,
+              elapsedMs: Date.now() - startedAt
+            });
           }
-        } catch (error) {
-          this.logLocal("Semantic retrieval embedding failed", { error: error.message || String(error) });
-          const result = this.finalizeSemanticRetrievalContext([], request, {
-            indexState: "failed",
-            degradedReason: "query-embedding-failed",
-            candidateCount: usableIndex.length,
-            indexHealth: integrity.health,
-            queryHandleSource: "chat-provider",
-            queryHandleTelemetry,
-            externalQueryEmbeddingCalls: queryHandleTelemetry.externalQueryEmbeddingCalls,
-            runtimeExternalCalls: queryHandleTelemetry.runtimeExternalCalls,
-            elapsedMs: Date.now() - startedAt
-          });
-          return this.setSemanticRetrievalCache(cacheKey, result);
+          queryEmbedding = chatHandles.embedding;
+          queryHandles = chatHandles.handles;
         }
-        queryEmbedding = Array.isArray(cachedEmbedding) ? cachedEmbedding : [];
-        queryHandles = [Object.freeze({
-           source: "chat-provider",
-           encoderId: `${semanticEmbeddingProvider(this.settings)}:${this.settings.embeddingModel}`,
-          encoderVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
-           vector: Object.freeze(Array.from(queryEmbedding, Number)),
-           provider: semanticEmbeddingProvider(this.settings),
-          model: this.settings.embeddingModel,
-          dimension: queryEmbedding.length || embeddingDimension,
-          indexRevision: this.semanticIndexRevision || 0,
-          sourceEvidenceIds: Object.freeze([]),
-          sourceIds: Object.freeze([]),
-          cacheKey: embeddingCacheKey
-        })];
       }
     } else {
       const resolved = resolveIndexedSemanticQueryHandles(resolverIndex, queryHandleRequest);
       queryHandles = resolved.handles || [];
       queryHandleTelemetry = Object.assign({}, resolved.telemetry || {}, { source: "indexed", handleSource: "indexed", externalQueryEmbeddingCalls: 0, runtimeExternalCalls: 0 });
+      // An email source (or any source with no indexed path) resolves no indexed
+      // chunk, so no handle can be borrowed from the index. Embed the query at
+      // runtime through the shared fallback, exactly like the chat branch above;
+      // when that yields nothing the fail-closed return below is unchanged.
       if (!queryHandles.length) {
-        const result = this.finalizeSemanticRetrievalContext([], request, {
+        const runtimeHandles = await this.runtimeSemanticQueryHandles(query, captureContext);
+        if (runtimeHandles.length) {
+          queryHandles = runtimeHandles;
+          queryHandleTelemetry = Object.assign({}, resolved.telemetry || {}, { source: "chat-provider", handleSource: "chat-provider", externalQueryEmbeddingCalls: 1, runtimeExternalCalls: 1 });
+        }
+      }
+      if (!queryHandles.length) {
+        return this.degradedRetrievalResult(request, cacheKey, {
           indexState: "degraded-source-only",
           degradedReason: resolved.degradedReason || "query-vector-unavailable",
           candidateCount: usableIndex.length,
@@ -10361,7 +10473,6 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           runtimeExternalCalls: 0,
           elapsedMs: Date.now() - startedAt
         });
-        return this.setSemanticRetrievalCache(cacheKey, result);
       }
       queryEmbedding = queryHandles[0].vector;
     }
@@ -10382,7 +10493,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       degradedReason: routedBatch.groups[0]?.degradedReason || routedBatch.degradedReason || ""
     };
     if (routed.degradedReason) {
-      const result = this.finalizeSemanticRetrievalContext([], request, {
+      return this.degradedRetrievalResult(request, cacheKey, {
         indexState: "degraded-source-only",
         degradedReason: routed.degradedReason,
         candidateCount: usableIndex.length,
@@ -10395,7 +10506,6 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         contextBundleElapsedMs: Date.now() - startedAt,
         elapsedMs: Date.now() - startedAt
       });
-      return this.setSemanticRetrievalCache(cacheKey, result);
     }
     const semanticRawCandidates = routed.candidates.map((item) => {
       const chunk = item.chunk;
@@ -10424,22 +10534,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // source eligibility and explicit scope filters as the semantic rows;
       // only the positive-semantic-score condition is relaxed for this branch
       // (semanticCandidateNonScoreAdmissible).
-      const lexicalCandidateById = new Map();
-      const lexicalSelectorRows = [];
-      for (const chunk of usableIndex) {
-        if (!chunk || typeof chunk !== "object") continue;
-        const evidenceId = String(chunk.evidenceId || chunk.id || "");
-        if (!evidenceId || lexicalCandidateById.has(evidenceId)) continue;
-        const lexicalItem = Object.assign({
-          chunk,
-          useNoteCreatedTime,
-          recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime }))
-        }, contextCandidateScopeMetadata(chunk, profile, {}));
-        if (!filterContextCandidatesForPlan([lexicalItem], profile).length) continue;
-        if (!semanticCandidateNonScoreAdmissible(lexicalItem)) continue;
-        lexicalCandidateById.set(evidenceId, lexicalItem);
-        lexicalSelectorRows.push({ evidenceId, text: String(chunk.text || "") });
-      }
+      const { lexicalCandidateById, lexicalSelectorRows } = buildLexicalUnionRows(usableIndex, profile, useNoteCreatedTime);
       const unionSelection = taskWorkflowSelectScoreEvidence(semanticSelectorRows, String(query || ""), {
         semanticLimit: requestedLimit,
         lexicalLimit: requestedLimit,
@@ -10484,6 +10579,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       elapsedMs: Date.now() - startedAt
     });
     return this.setSemanticRetrievalCache(cacheKey, result);
+  }
+
+  // Shared fail-closed return for retrieveSemanticContext: identical details
+  // object per call site (same keys/values/order), stored in the retrieval
+  // cache unless cacheStore is false (early refresh-pending check).
+  degradedRetrievalResult(request, cacheKey, details, cacheStore = true) {
+    const result = this.finalizeSemanticRetrievalContext([], request, details);
+    return cacheStore ? this.setSemanticRetrievalCache(cacheKey, result) : result;
   }
 
   finalizeSemanticRetrievalContext(context = [], request = {}, details = {}) {
@@ -11057,32 +11160,24 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   // One-time migration entry: the next save/rebuild writes every shard as
   // `.bin` + sidecar under a fresh generation, verifies each file, publishes
   // the manifest and only then removes the old JSON shards.
-  async migrateSemanticIndexShardsToBinary(options = {}) {
-    const chunks = Array.isArray(this.semanticIndex) ? this.semanticIndex : [];
-    if (!chunks.length) return semanticOperationResult({ ok: false, reasonCode: "empty-index-deferred" });
-    const adapter = this.app?.vault?.adapter;
-    if (!adapter?.write || typeof adapter.writeBinary !== "function" || typeof adapter.readBinary !== "function") {
-      return semanticOperationResult({ ok: false, reasonCode: "binary-write-unsupported" });
-    }
-    await this.saveSemanticIndex(Object.assign({ allowEmpty: false }, options || {}));
-    return semanticOperationResult({
-      ok: true,
-      reasonCode: "binary-shards-published",
-      chunkCount: chunks.length,
-      shardCount: Array.isArray(this.semanticIndexShardBinaryFiles) ? this.semanticIndexShardBinaryFiles.length : 0
-    });
-  }
+
 
   async routeProductionSemanticCandidateBatches(handleGroups = [], usableIndex = [], options = {}) {
     const startedAt = localSemanticRoutingNow();
     const scoreYieldBudgetMs = 8;
     let scoreYieldStartedAt = startedAt;
+    let scoreCheckpointCalls = 0;
     const semanticScoreDisposedError = () => Object.assign(new Error("Semantic scoring stopped during plugin unload."), { code: "semantic-scoring-disposed" });
     const throwIfSemanticScoreDisposed = () => {
       if (this.isUnloading) throw semanticScoreDisposedError();
     };
     const scoreWorkCheckpoint = () => {
       throwIfSemanticScoreDisposed();
+      // Strided clock reads: the 8 ms cooperative budget only needs ms
+      // granularity, so read performance.now() every 32 calls. Disposal stays
+      // per-call (cheap boolean); a yield fires at most ~31 iterations late.
+      scoreCheckpointCalls += 1;
+      if ((scoreCheckpointCalls & 31) !== 0) return null;
       const now = localSemanticRoutingNow();
       if (now - scoreYieldStartedAt < scoreYieldBudgetMs) return null;
       return idlePause(0).then(() => {
@@ -11176,6 +11271,42 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const currentGeneration = String(this.productionSemanticRoutingState?.routingIndex?.generation || this.productionSemanticRoutingState?.telemetry?.generation || this.semanticIndexManifestPublishedGeneration || generation);
       return !this.isUnloading && currentRevision === revision && currentGeneration === generation;
     };
+    const exactPathMetaKey = `${revision}|${generation}|${storageFingerprint}|${String(this.settings?.indexedFolders || "")}|${String(this.settings?.excludedFolders || "")}`;
+    if (this._exactPathChunkMetaKey !== exactPathMetaKey) {
+      this._exactPathChunkMetaKey = exactPathMetaKey;
+      this._exactPathChunkMeta = new Map();
+    }
+    const exactPathChunkMeta = this._exactPathChunkMeta;
+    const hasIndexableFn = typeof this.isIndexablePath === "function";
+    // Per-revision eligibility memo: noise (singleLine) + indexable are pure
+    // functions of (revision, chunk content, index folders). The 4 request-view
+    // Maps are still rebuilt per query from the caller's usableIndex so
+    // different callers keep their own filtered view; only the per-chunk
+    // predicates are shared. Bounded (index-sized, cleared on key change).
+    // Key includes contentFingerprint + path so same evidenceId with different
+    // content inside one revision cannot collide (review finding #1).
+    const cachedChunkEligible = (chunk) => {
+      const evidenceId = chunk?.evidenceId || "";
+      if (!evidenceId) {
+        if (chunk?.text && isSemanticNoiseChunk(chunk)) return false;
+        if (hasIndexableFn && !this.isIndexablePath(chunk?.path || "")) return false;
+        return true;
+      }
+      const entry = exactPathChunkMeta.get(evidenceId);
+      const contentFingerprint = chunk?.contentFingerprint;
+      const path = chunk?.path;
+      if (contentFingerprint && entry && entry.contentFingerprint === contentFingerprint && entry.path === path) {
+        return !entry.noise && entry.indexable;
+      }
+      const newEntry = {
+        noise: Boolean(chunk?.text && isSemanticNoiseChunk(chunk)),
+        indexable: hasIndexableFn ? Boolean(this.isIndexablePath(chunk?.path || "")) : true,
+        contentFingerprint,
+        path
+      };
+      if (contentFingerprint && exactPathChunkMeta.size < 20000) exactPathChunkMeta.set(evidenceId, newEntry);
+      return !newEntry.noise && newEntry.indexable;
+    };
     const requestViewByEvidenceId = new Map();
     const requestViewByIdentity = new Map();
     const requestViewOrderByEvidenceId = new Map();
@@ -11183,8 +11314,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     for (const requestChunk of Array.isArray(usableIndex) ? usableIndex : []) {
       const requestPreparationPause = scoreWorkCheckpoint();
       if (requestPreparationPause) await requestPreparationPause;
-      if (!requestChunk || (requestChunk.text && isSemanticNoiseChunk(requestChunk))) continue;
-      if (typeof this.isIndexablePath === "function" && !this.isIndexablePath(requestChunk.path || "")) continue;
+      if (!requestChunk || !cachedChunkEligible(requestChunk)) continue;
       const evidenceId = String(requestChunk.evidenceId || "").trim();
       if (evidenceId) {
         requestViewByEvidenceId.set(evidenceId, requestChunk);
@@ -11394,12 +11524,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const pairs = [];
       const staged = [];
       const queuedByHandle = new Map();
+      const exactKeyPrefixByHandle = new Map();
+      const exactKeyPrefixFor = (handleKey) => {
+        let prefix = exactKeyPrefixByHandle.get(handleKey);
+        if (!prefix) {
+          prefix = `${generation}|${revision}|${handleKey}|`;
+          exactKeyPrefixByHandle.set(handleKey, prefix);
+        }
+        return prefix;
+      };
       for (const request of scoreRequests) {
         const { handleKey, handle, evidenceId, chunk } = request;
         if (!handle || !chunk || !evidenceId) continue;
         const localScores = nestedMap(requestScoresByHandle, handleKey, true);
         if (localScores.has(evidenceId)) continue;
-        const exactKey = `${generation}|${revision}|${handleKey}|${evidenceId}`;
+        const exactKey = exactKeyPrefixFor(handleKey) + evidenceId;
         if (exactCache.has(exactKey)) {
           const cachedScore = exactCache.get(exactKey);
           if (typeof cachedScore === "number" && Number.isFinite(cachedScore)) {
@@ -11428,6 +11567,24 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (!Array.isArray(scores) || scores.length !== pairs.length) {
         throw Object.assign(new Error("Semantic score worker returned an incomplete batch."), { code: "semantic-scoring-result-invalid" });
       }
+      // Batched exact-score insert: one currency check + one timestamp per
+      // batch, single stride eviction at the end. Keys embed the query handle
+      // (stableHandleKey: cacheKey/vector-hash), so distinct queries never hit
+      // and within a query each pair is staged once (localScores + queued set
+      // above); the insert only serves same-query repeats, whose lookup path
+      // above is unchanged. A miss recomputes the identical score, and batched
+      // oldest-first eviction of the total excess yields the same surviving set
+      // as per-pair eviction, so results are unchanged.
+      // Capture revision at batch start; re-check after each checkpoint so a
+      // mid-batch revision bump doesn't cache stale-revision keys (review
+      // finding #2).
+      const batchRevision = revision;
+      const batchGeneration = generation;
+      const sharedCacheableAtStart = sharedScoreCacheIsCurrent();
+      const batchNow = sharedCacheableAtStart ? Date.now() : 0;
+      const exactTimestamps = this._semanticExactScoreCacheTimestamps instanceof Map
+        ? this._semanticExactScoreCacheTimestamps
+        : (this._semanticExactScoreCacheTimestamps = new Map());
       for (let index = 0; index < staged.length; index += 1) {
         const score = scores[index];
         if (typeof score !== "number" || !Number.isFinite(score)) {
@@ -11437,18 +11594,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         nestedMap(requestScoresByHandle, handleKey, true).set(evidenceId, score);
         nestedMap(scoreOriginsByHandle, handleKey, true).set(evidenceId, "worker");
         exactScorePairCount += 1;
-        if (sharedScoreCacheIsCurrent()) {
+        // Re-check cache currency after each checkpoint yield (cheap compare).
+        const sharedCacheable = sharedCacheableAtStart && batchRevision === revision && batchGeneration === generation;
+        if (sharedCacheable) {
           exactCache.set(exactKey, score);
-          this._semanticExactScoreCacheTimestamps.set(exactKey, Date.now());
+          exactTimestamps.set(exactKey, batchNow);
           // Task 3(a): bound the exact-score cache DURING a run (oldest-first,
           // insertion-ordered; the between-run sweep keeps its 5000 idle cap).
           // A miss recomputes the identical exact score, so results are
           // unchanged; the run cap is chosen from the measured working set
           // (see SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES).
-          this._evictOldestBeyondCap(exactCache, SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES, this._semanticExactScoreCacheTimestamps);
         }
         const resultAssemblyPause = scoreWorkCheckpoint();
         if (resultAssemblyPause) await resultAssemblyPause;
+      }
+      if (sharedCacheableAtStart && batchRevision === revision && batchGeneration === generation && exactCache.size > SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES) {
+        this._evictOldestBeyondCap(exactCache, SEMANTIC_EXACT_SCORE_CACHE_RUN_MAX_ENTRIES, exactTimestamps);
       }
     };
     const exactScore = (handleKey, evidenceId) => {
@@ -11475,7 +11636,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         if (routedIdPause) await routedIdPause;
       }
     }
-    const ordinaryNoteFingerprint = (chunk = {}) => {
+    const ordinaryNoteFingerprintUncached = (chunk = {}) => {
       const sourceKind = String(chunk.sourceKind || chunk.provenance?.sourceKind || "").trim().toLowerCase();
       const authorityState = String(chunk.authorityState || chunk.provenance?.authorityState || chunk.authority || chunk.provenance?.authority || "").trim().toLowerCase();
       const sourceId = String(chunk.sourceId || "").trim();
@@ -11483,6 +11644,54 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       if (sourceKind !== "note" || authorityState === "authoritative" || !sourceId || !contentFingerprint) return null;
       return { key: `${sourceKind}\u0000${contentFingerprint}`, sourceId };
     };
+    // Memo keyed by evidenceId. Each entry stores the raw fields the uncached function reads
+    // plus its result; a hit needs every raw field === the stored one, so a chunk that differs
+    // in any input recomputes. Up to 3 entries per evidenceId; no trim on the hit path.
+    // Reset per revision/generation/storageFingerprint; cap at 20,000 evidenceIds.
+    const fingerprintCacheKey = `${revision}|${generation}|${storageFingerprint}`;
+    if (this._ordinaryNoteFingerprintCacheKey !== fingerprintCacheKey) {
+      this._ordinaryNoteFingerprintCacheKey = fingerprintCacheKey;
+      this._ordinaryNoteFingerprintCache = new Map();
+    }
+    const fingerprintCache = this._ordinaryNoteFingerprintCache;
+    const ordinaryNoteFingerprint = (chunk = {}) => {
+      const evidenceId = chunk?.evidenceId;
+      if (!evidenceId) return ordinaryNoteFingerprintUncached(chunk);
+      const provenance = chunk.provenance;
+      const rawContentFingerprint = chunk.contentFingerprint;
+      const rawSourceId = chunk.sourceId;
+      const rawSourceKind = chunk.sourceKind;
+      const rawProvSourceKind = provenance?.sourceKind;
+      const rawAuthorityState = chunk.authorityState;
+      const rawProvAuthorityState = provenance?.authorityState;
+      const rawAuthority = chunk.authority;
+      const rawProvAuthority = provenance?.authority;
+      const entries = fingerprintCache.get(evidenceId);
+      if (entries) {
+        for (let i = 0; i < entries.length; i += 1) {
+          const e = entries[i];
+          if (e.contentFingerprint === rawContentFingerprint && e.sourceId === rawSourceId
+            && e.sourceKind === rawSourceKind && e.provSourceKind === rawProvSourceKind
+            && e.authorityState === rawAuthorityState && e.provAuthorityState === rawProvAuthorityState
+            && e.authority === rawAuthority && e.provAuthority === rawProvAuthority) return e.result;
+        }
+      }
+      // Miss: recompute (the uncached function trims/normalizes).
+      const result = ordinaryNoteFingerprintUncached(chunk);
+      const newEntry = {
+        contentFingerprint: rawContentFingerprint, sourceId: rawSourceId,
+        sourceKind: rawSourceKind, provSourceKind: rawProvSourceKind,
+        authorityState: rawAuthorityState, provAuthorityState: rawProvAuthorityState,
+        authority: rawAuthority, provAuthority: rawProvAuthority, result
+      };
+      if (!entries) {
+        if (fingerprintCache.size < 20000) fingerprintCache.set(evidenceId, [newEntry]);
+      } else if (entries.length < 3) {
+        entries.push(newEntry);
+      }
+      return result;
+    };
+    // Built per request: routedEvidenceIds depends on this request's query handles.
     const semanticDistinctivenessSources = new Map();
     for (const evidenceId of routedEvidenceIds) {
       const identity = ordinaryNoteFingerprint(routingState.chunkByEvidenceId.get(evidenceId));
@@ -12137,6 +12346,44 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // the background. Healthy indexed notes never take this path (the lane
     // resolver reports no mismatch), so their retrieval stays byte-identical.
     if (localCurrentSourceRow && markedLineMismatchKeys.size) return degraded("marked-source-line-mismatch");
+    // Runtime query fallback for lanes with no indexed handle. Every lane above
+    // borrows its query vector from an indexed chunk of the source
+    // (lane.embedding = lane.queryHandles[0]?.vector); an email source - or any
+    // source with no indexed path - has no such chunk, so every lane would end
+    // with zero handles and routeProductionSemanticCandidateBatches below would
+    // early-return "query-vector-unavailable" with no candidates, leaving the
+    // description with no vault note to cite. Embed the lane text at runtime
+    // through the same shared fallback chat mode uses (one request per distinct
+    // text, deduped by the shared queryEmbeddingCache). Lanes that still get no
+    // handle keep their empty state, so the fail-closed behaviour when the
+    // endpoint is unreachable is unchanged.
+    const runtimeHandlesByText = new Map();
+    for (const entry of laneDataByTask.values()) {
+      for (const lane of entry.lanes || []) {
+        if (lane.queryHandles?.length) continue;
+        const laneText = String(lane.text || "");
+        if (laneText && !runtimeHandlesByText.has(laneText)) runtimeHandlesByText.set(laneText, []);
+      }
+    }
+    for (const laneText of runtimeHandlesByText.keys()) {
+      runtimeHandlesByText.set(laneText, await this.runtimeSemanticQueryHandles(laneText, options.captureContext));
+    }
+    let runtimeHandleLaneCount = 0;
+    for (const entry of laneDataByTask.values()) {
+      for (const lane of entry.lanes || []) {
+        if (lane.queryHandles?.length) continue;
+        const runtimeHandles = runtimeHandlesByText.get(String(lane.text || "")) || [];
+        if (!runtimeHandles.length) continue;
+        lane.queryHandles = runtimeHandles;
+        lane.embedding = runtimeHandles[0].vector;
+        runtimeHandleLaneCount += 1;
+      }
+    }
+    // Only clear the degraded flag once handles were actually obtained.
+    if (runtimeHandleLaneCount) {
+      telemetry.degraded = false;
+      telemetry.degradedReason = "";
+    }
     const allLaneRoutingGroups = [];
     // R9 fix A: in routed mode only the router-selected shards are scanned, so
     // the task's protected rows - the lane query-handle evidence and the
@@ -12475,23 +12722,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           const evidenceId = String(chunk.evidenceId || chunk.id || item.evidenceId || "");
           if (evidenceId && !poolItemById.has(evidenceId)) poolItemById.set(evidenceId, item);
         }
-        const lexicalCandidateById = new Map();
-        const lexicalSelectorRows = [];
-        const taskUseNoteCreatedTime = semanticNoteCreatedTimeEnabled(this.settings);
-        for (const chunk of usableIndex) {
-          if (!chunk || typeof chunk !== "object") continue;
-          const evidenceId = String(chunk.evidenceId || chunk.id || "");
-          if (!evidenceId || lexicalCandidateById.has(evidenceId)) continue;
-          const lexicalItem = Object.assign({
-            chunk,
-            useNoteCreatedTime: taskUseNoteCreatedTime,
-            recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime: taskUseNoteCreatedTime }))
-          }, contextCandidateScopeMetadata(chunk, profile, {}));
-          if (!filterContextCandidatesForPlan([lexicalItem], profile).length) continue;
-          if (!semanticCandidateNonScoreAdmissible(lexicalItem)) continue;
-          lexicalCandidateById.set(evidenceId, lexicalItem);
-          lexicalSelectorRows.push({ evidenceId, text: String(chunk.text || "") });
-        }
+        const { lexicalCandidateById, lexicalSelectorRows } = buildLexicalUnionRows(usableIndex, profile, semanticNoteCreatedTimeEnabled(this.settings));
         const semanticRows = semanticAdmissionPool.map((item) => {
           const chunk = item.chunk || item;
           return {
@@ -15290,6 +15521,42 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
+  // Shared pre-model-call failure return for createTaskPlan: identical object
+  // shape per site (same keys/values/order). protectedErrors: array for the
+  // pre-structure supplement bundle validation; bundle: null (supplement
+  // failure) or the workflowContext bundle (later failures).
+  makeTaskFailureReturn(source, sourceSummary, semanticContext, sourceContract, evidenceCatalog, bundle, failure, protectedErrors = null) {
+    const taskWorkflowContextBundle = bundle || {
+      version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
+      sourceType: source.type,
+      sourceContract,
+      contextBundleValidation: {
+        dispatchAllowed: false,
+        protectedReferenceErrors: protectedErrors || [],
+        foreignReferenceErrors: [],
+        taskEvidenceRefs: {},
+        taskEvidenceRefsDropped: {}
+      },
+      taskRelevanceSelectionTelemetry: prestructureSelectionTelemetryForFailure(failure.taskRelevanceSelection)
+    };
+    const result = {
+      tasks: [],
+      sectionName: cleanGeneratedSectionName(source.sectionName),
+      sourceSummary,
+      semanticContext,
+      contextNotes: [],
+      sourceContract,
+      sourceContractId: sourceContract.id,
+      evidenceCatalog,
+      taskWorkflowContextBundle,
+      contextBundle: bundle || null,
+      workflowContextFailure: failure
+    };
+    if (bundle && bundle.requiredPromptBlockError !== undefined) result.requiredPromptBlockError = bundle.requiredPromptBlockError;
+    else if (!bundle) result.requiredPromptBlockError = "";
+    return result;
+  }
+
   async createTaskPlan(source, options = {}, activity = null) {
     // Explicit immutable workflow context: one root workflowId shared across the
     // parallel descriptions/retrieval, with a distinct attemptId per generation/
@@ -15327,7 +15594,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const prestructureSelection = retrievalIsNote
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         preStructureScopes.taskRelevanceRankings || {},
-        { sourceContract, settings: this.settings, coverageIndexRevision: Number(this.semanticIndexRevision || 0) })
+        { sourceContract, settings: this.settings, coverageIndexRevision: Number(preStructureScopes.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
     const prestructureSupplement = retrievalIsNote
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
@@ -15346,32 +15613,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         source: source.type || "",
         ...failure
       });
-      return {
-        tasks: [],
-        sectionName: cleanGeneratedSectionName(source.sectionName),
-        sourceSummary,
-        semanticContext: initialSemanticContext,
-        contextNotes: [],
-        sourceContract,
-        sourceContractId: sourceContract.id,
-        evidenceCatalog: null,
-        taskWorkflowContextBundle: {
-          version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
-          sourceType: source.type,
-          sourceContract,
-          contextBundleValidation: {
-            dispatchAllowed: false,
-            protectedReferenceErrors: prestructureSupplement.conflicts.slice(),
-            foreignReferenceErrors: [],
-            taskEvidenceRefs: {},
-            taskEvidenceRefsDropped: {}
-          },
-          taskRelevanceSelectionTelemetry: prestructureSelectionTelemetryForFailure(prestructureSelection)
-        },
-        contextBundle: null,
-        workflowContextFailure: failure,
-        requiredPromptBlockError: ""
-      };
+      return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, null, null, failure, prestructureSupplement.conflicts.slice());
     }
     if (retrievalIsNote && (prestructureSupplement.missingSupplementalEvidenceIds || []).length) {
       const failure = {
@@ -15384,32 +15626,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         source: source.type || "",
         ...failure
       });
-      return {
-        tasks: [],
-        sectionName: cleanGeneratedSectionName(source.sectionName),
-        sourceSummary,
-        semanticContext: initialSemanticContext,
-        contextNotes: [],
-        sourceContract,
-        sourceContractId: sourceContract.id,
-        evidenceCatalog: null,
-        taskWorkflowContextBundle: {
-          version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
-          sourceType: source.type,
-          sourceContract,
-          contextBundleValidation: {
-            dispatchAllowed: false,
-            protectedReferenceErrors: failure.reason.slice(),
-            foreignReferenceErrors: [],
-            taskEvidenceRefs: {},
-            taskEvidenceRefsDropped: {}
-          },
-          taskRelevanceSelectionTelemetry: prestructureSelectionTelemetryForFailure(prestructureSelection)
-        },
-        contextBundle: null,
-        workflowContextFailure: failure,
-        requiredPromptBlockError: ""
-      };
+      return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, null, null, failure, failure.reason.slice());
     }
     this.setSidebarStatus("Building evidence catalog...");
     let evidenceCatalog = await buildTaskEvidenceCatalogCooperative(sourceContract, initialSemanticContext, this.settings, { source, sourceSummary });
@@ -15500,20 +15717,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         source: source.type || "",
         ...failure
       });
-      return {
-        tasks: [],
-        sectionName: cleanGeneratedSectionName(source.sectionName),
-        sourceSummary,
-        semanticContext: initialSemanticContext,
-        contextNotes: [],
-        sourceContract,
-        sourceContractId: sourceContract.id,
-        evidenceCatalog,
-        taskWorkflowContextBundle: workflowContext,
-        contextBundle: workflowContext,
-        workflowContextFailure: failure,
-        requiredPromptBlockError: workflowContext.requiredPromptBlockError
-      };
+      return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, evidenceCatalog, workflowContext, failure);
     }
     if (workflowContext.contextBundleValidation?.dispatchAllowed === false) {
       const failure = {
@@ -15525,19 +15729,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         source: source.type || "",
         ...failure
       });
-      return {
-        tasks: [],
-        sectionName: cleanGeneratedSectionName(source.sectionName),
-        sourceSummary,
-        semanticContext: initialSemanticContext,
-        contextNotes: [],
-        sourceContract,
-        sourceContractId: sourceContract.id,
-        evidenceCatalog,
-        taskWorkflowContextBundle: workflowContext,
-        contextBundle: workflowContext,
-        workflowContextFailure: failure
-      };
+      return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, evidenceCatalog, Object.assign({}, workflowContext, { requiredPromptBlockError: undefined }), failure);
     }
     const initialProjectedPromptOverride = {
       promptCachePrefix: workflowContext.promptCachePrefix,
@@ -15563,19 +15755,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         indexHealth: semanticDispatchGate.indexHealth
       };
       this.logLocal("Task workflow blocked before model call because the configured semantic index was degraded", failure);
-      return {
-        tasks: [],
-        sectionName: cleanGeneratedSectionName(source.sectionName),
-        sourceSummary,
-        semanticContext: initialSemanticContext,
-        contextNotes: [],
-        sourceContract,
-        sourceContractId: sourceContract.id,
-        evidenceCatalog,
-        taskWorkflowContextBundle: workflowContext,
-        contextBundle: workflowContext,
-        workflowContextFailure: failure
-      };
+      return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, evidenceCatalog, Object.assign({}, workflowContext, { requiredPromptBlockError: undefined }), failure);
     }
     const modelChoice = this.aiModelForRequest("task-generation", {
       prompt: [taskQuery, instructions].join("\n"),
@@ -16074,7 +16254,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const poststructureSelection = poststructureIsNote
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         taskRelevanceRankings,
-        { sourceContract, settings: this.settings, coverageIndexRevision: Number(this.semanticIndexRevision || 0) })
+        { sourceContract, settings: this.settings, coverageIndexRevision: Number(taskSemanticRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
     const poststructureSupplement = poststructureIsNote
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
@@ -16109,7 +16289,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       : await taskWorkflowSelectTaskRelevantEvidenceCooperative(taskRelevanceRankings, {
         sourceContract,
         settings: this.settings,
-        coverageIndexRevision: Number(this.semanticIndexRevision || 0)
+        coverageIndexRevision: Number(taskSemanticRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0)
       });
     const poststructureAllowedEvidenceIdsByScope = taskWorkflowAllowedEvidenceIdsByScope(poststructureAttachmentSelection);
     await attachTaskWorkflowSemanticEvidenceCooperative(limitedTasks, sourceContract, evidenceCatalog, preStructureScopes, taskSemanticRetrieval, {
@@ -17252,8 +17432,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
       // Prompt-cache hints: with warm-first the first description request is
       // sent alone so it can warm the provider cache before the pool fans out.
-      const warmFirst = descriptionWarmFirstEnabled(this, this.generationProviderForModel(modelChoice.model), modelChoice.model);
-      await descriptionPhaseDispatch(targets, taskDescriptionConcurrencyFor(this.settings), descriptionWorker, warmFirst);
+      // Warm-skip: the key binds provider+model+prompt prefix hash, so a
+      // model or prefix change warms again instead of reusing a warm entry
+      // from another model or note.
+      const warmProvider = this.generationProviderForModel(modelChoice.model);
+      const warmFirst = descriptionWarmFirstEnabled(this, warmProvider, modelChoice.model);
+      const warmKey = `${warmProvider}|${modelChoice.model}|${options.contextBundle?.promptCachePrefixHash || ""}`;
+      await descriptionPhaseDispatch(targets, taskDescriptionConcurrencyFor(this.settings), descriptionWorker, warmFirst, warmKey, this);
       return slots;
     };
     const providerFailureFor = (error) => error?.providerDiagnostic || {
@@ -20179,6 +20364,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const semanticDedupeState = await this.prepareSemanticTaskDeduplicationState(tasks, candidates, options);
     const matchingOptions = Object.assign({}, options, {
       semanticDedupeState,
+      dedupeStats: stats,
       semanticIndexRevision: this.semanticIndexRevision || 0
     });
     stats.semanticTelemetry = semanticDedupeState.telemetry;
@@ -22668,7 +22854,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     systemOneDecisionModelSettings(embeddings, this.plugin);
 
     const search = settingsDisclosure(containerEl, "Internet Search", "Search is off by default. Selecting a mode only changes saved search preferences; execution belongs to the chat action.", false);
-    webResearchSettings(search, this.plugin);
+    webResearchSettings(search, this.plugin, () => this.display());
 
     const sidebar = settingsDisclosure(containerEl, "Sidebar and prompts", "Choose how the sidebar starts and where reusable prompt files are loaded.", false);
     dropdownSettingWithDesc(sidebar, "Default sidebar mode", "Vault QA uses semantic search and active-note context. Chat is general conversation. Task Creation prepares Todoist tasks.", this.plugin, "chatMode", ["Vault QA", "Chat", "Task Creation"]);
@@ -26266,16 +26452,26 @@ function webSearchModelComboboxGroups(settings, providers) {
   return groups;
 }
 
-function webResearchSettings(containerEl, plugin) {
+function webResearchSettings(containerEl, plugin, refreshDisplay = null) {
   const providers = ["openai", "gemini", "openrouter", "anthropic"];
   const provider = normalizeWebSearchProvider(plugin.settings.chatWebSearchProvider);
-  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is available for OpenAI, Gemini, OpenRouter, and Anthropic.", plugin, "chatWebSearchProvider", providers);
+  dropdownSettingWithDesc(containerEl, "Search provider", "Native search is available for OpenAI, Gemini, OpenRouter, and Anthropic.", plugin, "chatWebSearchProvider", providers, (value) => {
+    // A model saved under the previous provider is not valid for the new one,
+    // so drop it before the refresh: the picker then falls back to the new
+    // provider's default instead of sending a foreign model to that API.
+    const nextProvider = normalizeWebSearchProvider(value);
+    const savedModel = String(plugin.settings.chatWebSearchModel || "").trim();
+    const available = !savedModel || webSearchModelComboboxGroups(plugin.settings, [nextProvider])
+      .some((group) => group.models.some((model) => String(model || "") === savedModel));
+    if (!available) plugin.settings.chatWebSearchModel = "";
+    if (refreshDisplay) refreshDisplay();
+  });
   modelComboboxSetting(containerEl, "Search model", "Provider-scoped model used only by an explicit search mode.", plugin, {
     inputValue: plugin.settings.chatWebSearchModel
       ? `${stableProviderLabel(provider)}: ${plugin.settings.chatWebSearchModel}`
       : "Provider default",
-    groups: webSearchModelComboboxGroups(plugin.settings, providers),
-    allowedProviders: providers.slice(),
+    groups: webSearchModelComboboxGroups(plugin.settings, [provider]),
+    allowedProviders: [provider],
     includeDefault: true,
     defaultProvider: provider,
     current: { provider, model: plugin.settings.chatWebSearchModel || "" },
@@ -26550,11 +26746,14 @@ function dropdownSetting(containerEl, name, plugin, key, options) {
   });
 }
 
-function dropdownSettingWithDesc(containerEl, name, desc, plugin, key, options) {
+function dropdownSettingWithDesc(containerEl, name, desc, plugin, key, options, onChanged = null) {
   new Setting(containerEl).setName(name).setDesc(desc || "").addDropdown((dropdown) => {
     for (const option of options) dropdown.addOption(option, option);
     dropdown.setValue(plugin.settings[key] || options[0]).onChange(async (value) => {
       plugin.settings[key] = value;
+      // Invoked before the awaiting save so a caller that re-renders the row
+      // sees the new selection immediately; the save is still awaited.
+      if (onChanged) onChanged(value);
       await plugin.saveSettings();
     });
   });
@@ -28359,7 +28558,7 @@ function taskWorkflowResponseSchema(maxMainTasks = DEFAULT_SETTINGS.maxGenerated
               // internal evidence_ids/fact_refs/fact_bindings are derived
               // locally from the task index, never returned by the provider.
               type: "array",
-              minItems: 0,
+              minItems: 1,
               items: {
                 type: "object",
                 additionalProperties: false,
@@ -28418,13 +28617,20 @@ function generationSubtaskLimit(settings = DEFAULT_SETTINGS) {
 }
 
 function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
-  return (tasks || []).slice(0, generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks })).map((task) => {
+  const limited = (tasks || []).slice(0, generationMainTaskLimit({ maxGeneratedMainTasks: maxMainTasks }));
+  // A subtask that only restates a DIFFERENT main task in the same plan is the
+  // same duplication as one restating its own parent (seen live: a
+  // "work through the prioritisation list" wrapper whose children repeated the
+  // sibling mains). Main-task word sets are collected once for that check.
+  const mainTermSets = limited.map((task) => subtaskRestatementTerms(task?.content));
+  return limited.map((task, index) => {
     // A step nested by taskWorkflowAssignMarkedActionOwnership is carried in
     // ownershipStepCount trailing subtasks and is kept past the cap (user
     // ruling: a split marked action is never silently dropped).
     const nested = Math.max(0, Number(task.ownershipStepCount || 0));
     const subtasks = task.subtasks || [];
-    const regular = subtasks.slice(0, subtasks.length - nested);
+    const otherMainTerms = mainTermSets.filter((_, otherIndex) => otherIndex !== index);
+    const regular = dropRestatedSubtasks(task, subtasks.slice(0, subtasks.length - nested), otherMainTerms);
     return Object.assign({}, task, {
       subtasks: [
         ...regular.slice(0, generationSubtaskLimit({ maxGeneratedSubtasksPerMainTask: maxSubtasks })),
@@ -28437,6 +28643,63 @@ function limitGeneratedTasks(tasks, maxMainTasks, maxSubtasks) {
 const GENERATED_TASK_GROUNDING_STOP_WORDS = new Set([
   "action", "actions", "ask", "book", "complete", "confirm", "coordinate", "create", "decide", "develop", "draft", "dup", "email", "finalize", "follow", "have", "need", "prepare", "reply", "respond", "review", "send", "start", "task", "tasks", "update", "use", "verify", "want", "work"
 ]);
+
+// A subtask whose content words are all already in its parent title (or in an
+// earlier kept sibling) adds no step: it only restates. Measured on a real
+// generation: 8 of 23 subtasks restated their parent. Generic verbs are ignored
+// so "Review X" under "Draft X" still counts as the same action and object.
+const SUBTASK_RESTATEMENT_GENERIC_WORDS = new Set([
+  ...GENERATED_TASK_GROUNDING_STOP_WORDS,
+  "check", "get", "make", "with", "from", "that", "this", "their", "them", "the", "and", "for", "are", "was", "not", "has", "been", "who", "which", "once", "when", "into", "any", "all", "also", "about", "after", "before", "ready", "needed", "assess", "determine", "identify", "ensure", "discuss", "talk", "full", "main", "priority", "priorities", "prioritization", "prioritisation", "item", "items"
+]);
+
+function subtaskRestatementTerms(text = "") {
+  const stem = (word) => {
+    const value = String(word).toLowerCase().replace(/'s$/, "").replace(/[^a-z0-9_-]/g, "");
+    if (value.length > 5 && value.endsWith("ies")) return `${value.slice(0, -3)}y`;
+    if (value.length > 4 && value.endsWith("ed") && !value.endsWith("eed")) return value.slice(0, -2);
+    if (value.length > 5 && value.endsWith("ing")) return value.slice(0, -3);
+    if (value.length > 4 && value.endsWith("s") && !/(?:ss|us|is)$/.test(value)) return value.slice(0, -1);
+    return value;
+  };
+  return new Set((String(text).toLowerCase().match(/[a-z0-9][a-z0-9_'-]+/g) || [])
+    .map(stem)
+    .filter((word) => word.length >= 3 && !SUBTASK_RESTATEMENT_GENERIC_WORDS.has(word)));
+}
+
+function dropRestatedSubtasks(parent = {}, subtasks = [], otherMainTermSets = []) {
+  const parentTerms = subtaskRestatementTerms(parent.content);
+  const keptTerms = [];
+  const kept = [];
+  // Parent/sibling restatement is exact containment (conservative: a child that
+  // adds any single new content word is kept). A child of one main task that
+  // repeats ANOTHER main task of the same plan is duplication too, and there the
+  // wording differs more freely, so it is judged at 80% overlap with at least
+  // two shared terms (measured live: a "work through the prioritisation list"
+  // wrapper whose children repeated the sibling mains).
+  const containedBy = (terms, reference) => terms.size > 0 && [...terms].every((term) => reference.has(term));
+  const restatesOtherMain = (terms, reference) => {
+    if (terms.size < 2 || !reference || reference.size < 2) return false;
+    let hit = 0;
+    for (const term of terms) if (reference.has(term)) hit++;
+    return hit / terms.size >= 0.8;
+  };
+  for (const subtask of subtasks || []) {
+    // Existing Todoist subtasks and subtasks with their own schedule are never dropped here.
+    const own = Boolean(subtask?.id || subtask?.todoistId || subtask?.oid)
+      || Boolean(subtask?.due_date && subtask.due_date !== parent.due_date)
+      || Boolean(subtask?.deadline_date && subtask.deadline_date !== parent.deadline_date);
+    const terms = subtaskRestatementTerms(subtask?.content);
+    const restated = containedBy(terms, parentTerms)
+      || keptTerms.some((keptSet) => containedBy(terms, keptSet))
+      || (otherMainTermSets || []).some((reference) => restatesOtherMain(terms, reference));
+    if (!own && restated) continue;
+    keptTerms.push(terms);
+    kept.push(subtask);
+  }
+  return kept;
+}
+
 
 function groundGeneratedTaskPlan(tasks = [], sourceText = "", settings = DEFAULT_SETTINGS) {
   const grounded = [];
@@ -30585,13 +30848,36 @@ function openAiCompatibleChatMessages({ provider, model, system, user, userStabl
 // target 1 is sent alone and the rest start only after it settles. Latency
 // cost: one extra serial request time (~15-25 s on the live runs) before the
 // pool fans out; without warm-first the pool behaviour is unchanged.
-async function descriptionPhaseDispatch(targets, workerCount, worker, warmFirst = false) {
+// Warm-skip: provider|model|promptCachePrefixHash -> timestamp of the last
+// successful solo warm (in-memory Map on the plugin, beside
+// promptCacheHintRejected). A dispatch with the same key inside
+// DESCRIPTION_WARM_REUSE_MS skips the solo request and pools everything;
+// a failed warm is never recorded, so the next dispatch warms again.
+const DESCRIPTION_WARM_REUSE_MS = 270000;
+async function descriptionPhaseDispatch(targets, workerCount, worker, warmFirst = false, warmKey = "", plugin = null) {
   const list = Array.from(targets || []);
   if (!warmFirst || list.length <= 1) {
     await asyncPool(list, workerCount, worker);
     return;
   }
-  await asyncPool(list.slice(0, 1), 1, worker);
+  const warmKeyText = String(warmKey || "");
+  let warmAt = plugin && plugin.promptCacheWarmAt instanceof Map ? plugin.promptCacheWarmAt : null;
+  if (!warmAt && plugin && warmKeyText) {
+    warmAt = new Map();
+    plugin.promptCacheWarmAt = warmAt;
+  }
+  if (warmAt && warmKeyText && warmAt.has(warmKeyText)
+    && (Date.now() - Number(warmAt.get(warmKeyText))) < DESCRIPTION_WARM_REUSE_MS) {
+    await asyncPool(list, workerCount, worker);
+    return;
+  }
+  try {
+    await asyncPool(list.slice(0, 1), 1, worker);
+  } catch (error) {
+    if (warmAt && warmKeyText) warmAt.delete(warmKeyText);
+    throw error;
+  }
+  if (warmAt && warmKeyText) warmAt.set(warmKeyText, Date.now());
   await asyncPool(list.slice(1), workerCount, worker);
 }
 
@@ -30795,28 +31081,7 @@ function normalizeStatusComparisonText(text) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function liveWorkflowActivityLabels(plugin) {
-  const labels = [];
-  try {
-    const stacked = Array.isArray(plugin?.aiActivities) ? plugin.aiActivities : [];
-    for (const entry of stacked) {
-      const label = singleLine((entry && entry.label) || "");
-      if (label) labels.push(label);
-    }
-    const current = singleLine(plugin?.aiActivity || "");
-    if (current) labels.push(current);
-    const activities = plugin?.workflowActivities && typeof plugin.workflowActivities === "object" ? plugin.workflowActivities : null;
-    if (activities) {
-      for (const key of Object.keys(activities)) {
-        const label = singleLine(activities[key]?.label || "");
-        if (label) labels.push(label);
-      }
-    }
-  } catch {
-    // Display-only: never break status composition.
-  }
-  return labels;
-}
+
 
 // In-progress phase shapes used by the real status writers: every live phase
 // message ends with an ellipsis ("Writing descriptions 3 of 10...") or carries
@@ -30830,15 +31095,7 @@ function isStatusInProgressMessage(status) {
 
 const STATUS_ERROR_PATTERN = /\b(fail\w*|errors?|unavailable)\b/i;
 
-function isStatusOutcomeMessage(status) {
-  const raw = singleLine(status || "");
-  // Errors always carry information the activity item lacks.
-  if (STATUS_ERROR_PATTERN.test(raw)) return true;
-  // A live phase shape is never an outcome, even when it contains a
-  // result-like word ("Estimating 3 triaged durations..." matches estimat*).
-  if (isStatusInProgressMessage(raw)) return false;
-  return STATUS_OUTCOME_PATTERN.test(raw);
-}
+
 
 function statusMessageDuplicatesLiveActivity(status, liveLabels = []) {
   const normalized = normalizeStatusComparisonText(status);
@@ -32182,8 +32439,7 @@ function parseRawEmail(raw) {
   const boundary = (/boundary="?([^";]+)"?/i.exec(headers["content-type"] || "") || [])[1];
   let text = "";
   if (boundary) {
-    const parts = body.split(`--${boundary}`);
-    text = decodeMimePart(parts.find((part) => /content-type:\s*text\/plain/i.test(part)) || parts.find((part) => /content-type:\s*text\/html/i.test(part)) || body);
+    text = mimeTextLeaf(body, boundary, "text/plain") || mimeTextLeaf(body, boundary, "text/html") || decodeMimePart(body);
   } else {
     text = decodeBody(body, headers["content-transfer-encoding"] || "", headers["content-type"] || "");
   }
@@ -32230,6 +32486,24 @@ function parseHeaders(text) {
     if (index > -1) headers[line.slice(0, index).toLowerCase()] = line.slice(index + 1).trim();
   }
   return headers;
+}
+
+// Depth-first search of nested multipart bodies for the first leaf of the given
+// text type, decoded. Returns "" when none exists.
+function mimeTextLeaf(body, boundary, type, depth = 0) {
+  for (const part of body.split(`--${boundary}`)) {
+    const [headerText, ...rest] = part.replace(/\r\n/g, "\n").replace(/^\n/, "").split("\n\n");
+    const headers = parseHeaders(headerText);
+    const contentType = headers["content-type"] || "";
+    const inner = (/boundary="?([^";]+)"?/i.exec(contentType) || [])[1];
+    if (inner && depth < 8) {
+      const found = mimeTextLeaf(rest.join("\n\n"), inner, type, depth + 1);
+      if (found) return found;
+    } else if (contentType.toLowerCase().startsWith(type)) {
+      return decodeMimePart(part);
+    }
+  }
+  return "";
 }
 
 function decodeMimePart(part) {
@@ -33442,9 +33716,7 @@ function taskSemanticPositiveAdmissionCandidate(item = {}, options = {}) {
   return { admitted: true, identity: identity.identity, evidenceId: identity.evidenceId, bodyFingerprint: identity.bodyFingerprint, rawScore };
 }
 
-function taskSemanticPositiveAdmissionStream(laneStreams = [], options = {}) {
-  return drainTaskWorkflowStepsSync(taskSemanticPositiveAdmissionStreamSteps(null, laneStreams, options));
-}
+
 
 // Cooperative twin: same admission stream in the same order; the per-candidate
 // loop yields at the ~8 ms slice boundary.
@@ -33521,9 +33793,7 @@ function taskSemanticCandidateNeedsSiblingOwnership(item = {}, options = {}) {
   return !metadata.evidenceTaskId && !metadata.evidenceScopeId && !metadata.nativeAssociations.length;
 }
 
-function buildTaskSemanticSiblingOwnershipIndex(flattened = [], laneDataByTask = new Map(), routedById = new Map(), options = {}) {
-  return drainTaskWorkflowStepsSync(buildTaskSemanticSiblingOwnershipIndexSteps(null, flattened, laneDataByTask, routedById, options));
-}
+
 
 // Cooperative twin: same ownership index in the same order; the per-task and
 // per-routed-candidate loops yield at the ~8 ms slice boundary.
@@ -39651,17 +39921,7 @@ function taskDescriptionRichLocalPayload(task = {}, evidence = null, sourceContr
   };
 }
 
-function validateTaskDescriptionCitationNumbers(value = "", citationLedger = []) {
-  const allowed = new Set((citationLedger || []).map((entry) => Number(entry.number)).filter(Number.isFinite));
-  const used = Array.from(String(value || "").matchAll(/\((\d+)\)/g)).map((match) => Number(match[1]));
-  const unknown = uniqueValues(used.filter((number) => !allowed.has(number)).map(String));
-  return {
-    valid: unknown.length === 0,
-    usedNumbers: uniqueValues(used.map(String)),
-    unknownNumbers: unknown,
-    reason: unknown.length ? "description citation number was not present in the task-local ledger" : ""
-  };
-}
+
 
 function taskDescriptionSentenceText(value = "") {
   return String(value || "")
@@ -40231,21 +40491,7 @@ async function evidenceRerankRequestJson(fetchFn, url, init, timeoutMs, external
 // Health probe with a 30s cache so a down server is not waited on repeatedly.
 // A successful probe also remembers the reported model identity so a later
 // run can flag the stored calibration as stale when the model changed.
-async function evidenceRerankServerHealthy(plugin, spec, fetchFn) {
-  const cache = plugin._evidenceRerankHealth instanceof Map ? plugin._evidenceRerankHealth : (plugin._evidenceRerankHealth = new Map());
-  const cached = cache.get(spec.baseUrl);
-  const now = Date.now();
-  if (cached && now - cached.at < EVIDENCE_RERANK_HEALTH_CACHE_MS) return cached.ok;
-  let ok = false;
-  try {
-    const result = await evidenceRerankRequestJson(fetchFn, `${spec.baseUrl}/health`, { method: "GET", headers: evidenceRerankHeaders(spec) }, EVIDENCE_RERANK_HEALTH_TIMEOUT_MS);
-    ok = result.status >= 200 && result.status < 300;
-    const identity = ok ? systemOneModelIdentity(result.json, null) : "";
-    if (identity) plugin._evidenceRerankLastSeenModel = identity;
-  } catch { ok = false; }
-  cache.set(spec.baseUrl, { ok, at: now });
-  return ok;
-}
+
 
 // Score one task's candidates with the System One decision model's best-value
 // question: one essential/helpful/unrelated choice question per candidate,
@@ -45211,12 +45457,7 @@ function taskWorkflowOwnershipKey(task = {}, index = 0) {
   return String(task?.taskId || task?.id || task?.oid || `task-${index}`);
 }
 
-function taskWorkflowLegacyCompatibilityEnabled(source = {}, settings = DEFAULT_SETTINGS) {
-  return source?.taskWorkflowCompatibility === "legacy-import"
-    || source?.workflowCompatibility === "legacy-import"
-    || source?.importedWorkflow === true
-    || settings?.taskWorkflowCompatibilityMode === "legacy-import";
-}
+
 
 // t41: local current-source evidence row for degraded note task retrieval.
 // When the semantic index is empty/unbuilt/still building/unavailable, the
@@ -45567,18 +45808,7 @@ const TASK_WORKFLOW_FACT_TYPES = Object.freeze([
   "deadline", "priority", "marker", "summary", "date", "link"
 ]);
 const TASK_WORKFLOW_FACT_MANDATORY_TARGETS = Object.freeze(["task", "description", "identity"]);
-const TASK_WORKFLOW_FACT_BINDING_SCHEMA = Object.freeze({
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    factId: { type: "string", minLength: 1 },
-    type: { type: "string", enum: TASK_WORKFLOW_FACT_TYPES },
-    role: { type: "string", minLength: 1 },
-    evidenceId: { type: "string", minLength: 1 },
-    scopeId: { type: "string", minLength: 1 }
-  },
-  required: ["factId", "type", "role", "evidenceId", "scopeId"]
-});
+
 
 function taskWorkflowFactTypeForKind(kind = "", fact = {}) {
   const declared = String(fact.type || fact.factType || "").trim();
@@ -45691,6 +45921,9 @@ function taskWorkflowFactBindingFromFact(fact = {}, evidence = null, scopeId = "
 // resumes the same traversal. One traversal implementation serves both.
 const TASK_WORKFLOW_HASH_YIELD = true;
 const TASK_WORKFLOW_HASH_YIELD_MS = 8;
+// Delivered-recall measured: semantic window cap 1 chunk/note + lexical window 30 (v2 +8.6pp CI 5.9-11.6, chunks 46->56).
+const TASK_EVIDENCE_SEMANTIC_NOTE_CAP = 1;
+const TASK_EVIDENCE_LEXICAL_WINDOW = 30;
 const TASK_WORKFLOW_HASH_STRING_CHUNK = 65536;
 
 const TASK_WORKFLOW_HASH_CHECKPOINT_SKIP = 7;
@@ -46732,28 +46965,7 @@ function taskWorkflowNativeTaskScopeAssociations(chunk = {}) {
 // A record's own query stamp excludes only that same record's same-value
 // claims (exact equality, no prefix bypass); it never erases another row's
 // genuine claim (per-row exclusion happens in the merge).
-function taskWorkflowNativeTaskOwners(evidence = {}) {
-  const queryTaskId = String(evidence.queryTaskId || evidence.query_task_id || "").trim();
-  const ownStamped = (value) => queryTaskId && String(value || "").trim() === queryTaskId;
-  const candidates = [
-    evidence.taskId,
-    ...(Array.isArray(evidence.taskIdValues) ? evidence.taskIdValues : []),
-    ...(Array.isArray(evidence.nativeTaskIdValues) ? evidence.nativeTaskIdValues : []),
-    ...(Array.isArray(evidence.taskIds) ? evidence.taskIds : []),
-    ...(Array.isArray(evidence.task_ids) ? evidence.task_ids : []),
-    ...(Array.isArray(evidence.nativeTaskIds) ? evidence.nativeTaskIds : []),
-    ...(Array.isArray(evidence.evidenceTaskIds) ? evidence.evidenceTaskIds : []),
-    ...(evidence.nativeTaskId !== undefined && evidence.nativeTaskId !== null && evidence.nativeTaskId !== "" ? [evidence.nativeTaskId] : []),
-    evidence.evidenceTaskId,
-    evidence.evidence_task_id,
-    taskWorkflowNativeTaskId(evidence),
-    ...taskWorkflowNativeTaskScopeAssociations(evidence).map((association) => association?.taskId || association?.task_id)
-  ].map((value) => String(value || "").trim()).filter(Boolean);
-  // Preserve the record's own native-only association list verbatim when the
-  // catalog carried it; drop only the record's OWN query-stamp value.
-  const preserved = uniqueValues(candidates.filter((value) => !ownStamped(value)));
-  return preserved;
-}
+
 
 function taskWorkflowRetrievalTaskScopeAssociations(chunk = {}) {
   const queryTaskId = String(chunk.queryTaskId || chunk.query_task_id || chunk.taskId || chunk.task_id || "");
@@ -47538,9 +47750,7 @@ function taskWorkflowIdentitySnapshot(task = {}, index = 0, sourceContract = nul
   };
 }
 
-function taskWorkflowFactCatalogMaps(sourceContract = null, evidenceCatalog = null) {
-  return drainTaskWorkflowStepsSync(taskWorkflowFactCatalogMapsSteps(null, sourceContract, evidenceCatalog));
-}
+
 
 // Cooperative twin body: same maps in the same insertion order; the
 // item × structured-fact normalize loop yields at the ~8 ms slice boundary.
@@ -47572,68 +47782,7 @@ function* taskWorkflowFactCatalogMapsSteps(checkpoint, sourceContract = null, ev
   return { factsById, evidenceById };
 }
 
-function taskWorkflowFactBindingErrors(task = {}, factsById = new Map(), evidenceById = new Map(), sourceContract = null, options = {}) {
-  const errors = [];
-  const reasonCodes = [];
-  const add = (code) => { errors.push(code); reasonCodes.push(code); };
-  const factRefs = uniqueValues((task.fact_refs || task.factRefs || []).map(String).filter(Boolean));
-  let bindings = Array.isArray(task.fact_bindings || task.factBindings)
-    ? (task.fact_bindings || task.factBindings).slice()
-    : [];
-  let legacy = false;
-  if (!bindings.length) add("fact-binding-missing");
-  const normalizedBindings = [];
-  const scopeId = String(task.scope_id || task.scopeId || "");
-  const selectedEvidenceIds = new Set((task.evidence_ids || task.evidenceIds || []).map(String).filter(Boolean));
-  const contractScopeIds = new Set((sourceContract?.scopeIds || []).map(String));
-  for (const rawBinding of bindings) {
-    const factId = String(rawBinding?.factId || rawBinding?.fact_id || "");
-    const type = String(rawBinding?.type || "");
-    const role = String(rawBinding?.role || "");
-    const evidenceId = String(rawBinding?.evidenceId || rawBinding?.evidence_id || "");
-    const bindingScopeId = String(rawBinding?.scopeId || rawBinding?.scope_id || "");
-    const fact = factsById.get(factId);
-    const evidence = evidenceById.get(evidenceId);
-    if (!fact) { add("fact-binding-foreign-fact"); continue; }
-    if (!evidence) add("fact-binding-foreign-evidence");
-    if (!selectedEvidenceIds.has(evidenceId)) add("fact-binding-evidence-not-selected");
-    if (!type || type !== fact.type) add("fact-binding-type-mismatch");
-    if (!role || role !== fact.role) add("fact-binding-role-mismatch");
-    if (!evidenceId || evidenceId !== String(fact.evidenceId)) add("fact-binding-evidence-mismatch");
-    const sharedSourceScope = String(sourceContract?.sourceScopeId || sourceContract?.source_scope_id || "");
-    if (!bindingScopeId || bindingScopeId !== String(fact.scopeId) || (scopeId && bindingScopeId !== scopeId && bindingScopeId !== sharedSourceScope)) add("fact-binding-scope-mismatch");
-    if (contractScopeIds.size && !contractScopeIds.has(bindingScopeId)) add("fact-binding-foreign-scope");
-    const mandatory = Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.some((target) => ["task", "identity", "description"].includes(target));
-    if (mandatory && (fact.current !== true || fact.authorityState !== "authoritative" || fact.conflictState !== "none")) add("fact-binding-non-current");
-    const unusableFact = fact.authorityState === "rejected" || fact.authorityState === "conflict" || fact.conflictState === "conflict" || fact.conflictState === "conflicted";
-    const unusableEvidence = evidence && (evidence.authorityState === "rejected" || evidence.authorityState === "conflict" || evidence.conflictState === "conflict" || evidence.conflictState === "conflicted");
-    if (unusableFact || unusableEvidence) add("fact-binding-unusable");
-    if (fact && evidence && evidence.scopeIds?.length && !evidence.scopeIds.map(String).includes(bindingScopeId)) add("fact-binding-scope-mismatch");
-    if (fact && type === fact.type && role === fact.role && evidenceId === String(fact.evidenceId) && bindingScopeId === String(fact.scopeId)) {
-      normalizedBindings.push(Object.freeze({ factId, type, role, evidenceId, scopeId: bindingScopeId }));
-    }
-  }
-  const bindingIds = new Set(normalizedBindings.map((binding) => binding.factId));
-  for (const factRef of factRefs) if (!bindingIds.has(factRef)) add("fact-binding-ref-mismatch");
-  for (const binding of normalizedBindings) if (!factRefs.includes(binding.factId)) add("fact-binding-ref-mismatch");
-  const selectedFacts = factRefs.map((id) => factsById.get(id)).filter(Boolean);
-  const validMandatory = (target) => selectedFacts.filter((fact) =>
-    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
-    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes(target) && (!scopeId || String(fact.scopeId) === scopeId)
-  );
-  const allMandatory = (sourceContract?.facts || []).filter((fact) =>
-    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
-    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("task") && (!scopeId || String(fact.scopeId) === scopeId)
-  );
-  for (const fact of allMandatory) if (!bindingIds.has(String(fact.factId))) add("fact-binding-mandatory-task-omitted");
-  const identityMandatory = (sourceContract?.facts || []).filter((fact) =>
-    fact.current === true && fact.authorityState === "authoritative" && fact.conflictState === "none" &&
-    Array.isArray(fact.mandatoryFor) && fact.mandatoryFor.includes("identity") && (!scopeId || String(fact.scopeId) === scopeId)
-  );
-  for (const fact of identityMandatory) if (!bindingIds.has(String(fact.factId))) add("fact-binding-mandatory-identity-omitted");
-  if (!allMandatory.length && !selectedFacts.some((fact) => fact.current === true && fact.evidenceId === sourceContract?.primaryEvidenceId)) add("fact-binding-current-source-fact-missing");
-  return { valid: errors.length === 0, errors: uniqueValues(errors), reasonCodes: uniqueValues(reasonCodes), bindings: normalizedBindings, legacy, factRefs, selectedFacts };
-}
+
 
 function enrichTaskWorkflowPrimaryContextFacts(tasks = [], sourceContract = null) {
   const contract = sourceContract || {};
@@ -49058,6 +49207,30 @@ function taskWorkflowRankingCorpusCoverageError(params = {}) {
 // after present ranks for tie-break purposes; it never receives a made-up
 // score or rank. Lexical-only IDs (outside `ranked`) report their actual
 // lexical-admission reason with missing semantic data explicitly absent.
+// Shared lexical-union scan for the chat-only D5 union: walks the SAME guarded
+// usableIndex snapshot with the SAME eligibility filters as the semantic rows
+// (only the positive-score condition relaxed). Both chat and task-chat modes
+// keep their own gates, ceilings, score fields, and assembly tails.
+function buildLexicalUnionRows(usableIndex, profile, useNoteCreatedTime) {
+  const lexicalCandidateById = new Map();
+  const lexicalSelectorRows = [];
+  for (const chunk of usableIndex) {
+    if (!chunk || typeof chunk !== "object") continue;
+    const evidenceId = String(chunk.evidenceId || chunk.id || "");
+    if (!evidenceId || lexicalCandidateById.has(evidenceId)) continue;
+    const lexicalItem = Object.assign({
+      chunk,
+      useNoteCreatedTime,
+      recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime }))
+    }, contextCandidateScopeMetadata(chunk, profile, {}));
+    if (!filterContextCandidatesForPlan([lexicalItem], profile).length) continue;
+    if (!semanticCandidateNonScoreAdmissible(lexicalItem)) continue;
+    lexicalCandidateById.set(evidenceId, lexicalItem);
+    lexicalSelectorRows.push({ evidenceId, text: String(chunk.text || "") });
+  }
+  return { lexicalCandidateById, lexicalSelectorRows };
+}
+
 function taskWorkflowSelectScoreEvidence(ranked, actionText, options = {}) {
   return drainTaskWorkflowStepsSync(taskWorkflowSelectScoreEvidenceSteps(null, ranked, actionText, options));
 }
@@ -49072,6 +49245,9 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
     : fallback);
   const semanticLimit = optionLimit(options?.semanticLimit, 30);
   const lexicalLimit = optionLimit(options?.lexicalLimit, 20);
+  const semanticNoteCap = (Number.isFinite(Number(options?.semanticNoteCap)) && Number(options?.semanticNoteCap) > 0
+    ? Math.floor(Number(options?.semanticNoteCap))
+    : 0);
   const lexicalSourceRows = Array.isArray(options?.lexicalRows)
     ? options.lexicalRows.filter((row) => row && typeof row === "object")
     : rows;
@@ -49151,9 +49327,27 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
   const lexicalWindow = lexical
     .filter((entry) => Number(entry.score) > 0)
     .slice(0, lexicalLimit);
-  const semanticWindow = semantic
-    .filter((entry) => Number(entry.score) > 0)
-    .slice(0, semanticLimit);
+  const semanticPositive = semantic.filter((entry) => Number(entry.score) > 0);
+  let semanticWindow = semanticPositive.slice(0, semanticLimit);
+  if (semanticNoteCap > 0) {
+    const pathByEvidenceId = new Map();
+    for (const row of rows) {
+      const id = String(row.evidenceId || "");
+      if (id && !pathByEvidenceId.has(id)) pathByEvidenceId.set(id, String(row.path || ""));
+    }
+    const capped = [];
+    const perNote = new Map();
+    for (const entry of semanticPositive) {
+      if (capped.length >= semanticLimit) break;
+      const note = pathByEvidenceId.get(entry.evidenceId) || entry.evidenceId;
+      const used = perNote.get(note) || 0;
+      if (used >= semanticNoteCap) continue;
+      perNote.set(note, used + 1);
+      capped.push(entry);
+      if (checkpoint && checkpoint()) yield TASK_WORKFLOW_HASH_YIELD;
+    }
+    semanticWindow = capped;
+  }
 
   const unionIds = new Set();
   for (const entry of semanticWindow) unionIds.add(entry.evidenceId);
@@ -49660,7 +49854,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       scopeId,
       queryHandleEvidenceId
     });
-    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText);
+    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, { semanticNoteCap: TASK_EVIDENCE_SEMANTIC_NOTE_CAP, lexicalLimit: TASK_EVIDENCE_LEXICAL_WINDOW });
     const unionIds = [];
     const unionSeen = new Set();
     for (const evidenceId of scoreSelection.evidenceIds) {
@@ -49956,9 +50150,7 @@ function taskWorkflowAttachTaskRelevanceScores(rows = [], taskKey = "", scoreByT
 // chunk by every carrier task.
 // Nothing returned places chunks on reachable serialized surfaces (chunk
 // references stay in-memory only).
-function taskWorkflowDeriveSelectedCatalogSupplement(existingContext = [], taskRelevanceSelection = null, options = {}) {
-  return drainTaskWorkflowStepsSync(taskWorkflowDeriveSelectedCatalogSupplementSteps(null, existingContext, taskRelevanceSelection, options));
-}
+
 
 // Cooperative twin: same supplement derivation and ordering; the existing-row,
 // per-task and selected-ID loops yield at the ~8 ms slice boundary.
@@ -52806,31 +52998,8 @@ function packSemanticIndexVectors(chunks = []) {
   }
   return { vectors, dimension, fallbackRows };
 }
-function semanticIndexVectorView(chunks = [], row = 0) {
-  const embedding = chunks?.[row]?.embedding;
-  return isEmbeddingVector(embedding) ? embedding : null;
-}
-function packedIndexVectorsInfo(chunks = []) {
-  const list = Array.isArray(chunks) ? chunks : [];
-  const buffers = new Set();
-  let typedRows = 0;
-  let plainRows = 0;
-  let dimension = 0;
-  for (const chunk of list) {
-    const embedding = chunk?.embedding;
-    if (ArrayBuffer.isView(embedding)) {
-      typedRows += 1;
-      if (embedding.buffer) buffers.add(embedding.buffer);
-      if (!dimension) dimension = Number(embedding.length || 0);
-    } else if (Array.isArray(embedding)) {
-      plainRows += 1;
-      if (!dimension) dimension = Number(embedding.length || 0);
-    }
-  }
-  let byteLength = 0;
-  for (const buffer of buffers) byteLength += Number(buffer.byteLength || 0);
-  return { rows: list.length, dimension, typedRows, plainRows, distinctBuffers: buffers.size, byteLength };
-}
+
+
 // JSON of a Float64Array view differs from JSON of a number Array, so chunks
 // are converted with Array.from at write/hash time ONLY. Float64 values are
 // exactly the parsed doubles, so the saved bytes stay IDENTICAL to the old
@@ -53651,32 +53820,7 @@ function semanticIndexStorageFingerprint(manifestBody, shards = []) {
   return shortHash(parts.join("|"));
 }
 
-async function semanticIndexShardBodiesAsync(indexFile, meta, chunks, maxBytes = SEMANTIC_INDEX_SHARD_MAX_BYTES, generation = "") {
-  const shards = [];
-  let currentBodies = [];
-  let currentBytes = 0;
-  const flush = async () => {
-    if (!currentBodies.length) return;
-    const shard = semanticIndexShardFromBodies(indexFile, meta, shards.length, currentBodies, currentBytes, generation);
-    shards.push(shard);
-    currentBodies = [];
-    currentBytes = 0;
-    await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-  };
-  for (let index = 0; index < (chunks || []).length; index += 1) {
-    const chunk = chunks[index];
-    const chunkBody = JSON.stringify(serializableSemanticChunk(chunk));
-    const chunkBytes = utf8ByteLength(chunkBody);
-    const nextBytes = currentBytes + chunkBytes;
-    const projectedBytes = semanticIndexShardProjectedBytes(indexFile, meta, shards.length, currentBodies.length + 1, nextBytes, generation);
-    if (currentBodies.length && projectedBytes > maxBytes) await flush();
-    currentBodies.push(chunkBody);
-    currentBytes += chunkBytes;
-    if (index && index % 50 === 0) await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
-  }
-  await flush();
-  return shards;
-}
+
 
 function semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount, generation = "") {
   const file = semanticIndexShardFileName(indexFile, shardIndex, generation);
@@ -53688,21 +53832,11 @@ function semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount, generat
   });
 }
 
-function semanticIndexShardHeader(indexFile, meta, shardIndex, chunkCount, generation = "") {
-  return `{"meta":${JSON.stringify(semanticIndexShardMeta(indexFile, meta, shardIndex, chunkCount, generation))},"chunks":[`;
-}
 
-function semanticIndexShardProjectedBytes(indexFile, meta, shardIndex, chunkCount, chunkBytes, generation = "") {
-  return utf8ByteLength(semanticIndexShardHeader(indexFile, meta, shardIndex, chunkCount, generation)) + chunkBytes + Math.max(0, chunkCount - 1) + 2;
-}
 
-function semanticIndexShardFromBodies(indexFile, meta, shardIndex, chunkBodies, chunkBytes, generation = "") {
-  const file = semanticIndexShardFileName(indexFile, shardIndex, generation);
-  const header = semanticIndexShardHeader(indexFile, meta, shardIndex, chunkBodies.length, generation);
-  const body = `${header}${chunkBodies.join(",")}]}`;
-  const bytes = utf8ByteLength(body);
-  return { file, body, bytes, chunkCount: chunkBodies.length, hash: shortHash(body) };
-}
+
+
+
 
 function semanticIndexShardFileName(indexFile, index, generation = "") {
   const base = String(indexFile || SEMANTIC_INDEX_FILE).replace(/\.json$/i, "");
@@ -54046,6 +54180,7 @@ function geminiEmbeddingInput(text, role = "document", model = "") {
   const body = rest.join("\n").trim() || value;
   return `title: ${title} | text: ${body}`;
 }
+
 // Anthropic Messages API structured output rejects a small set of JSON Schema
 // keywords (`maxItems`, `minimum`, `maximum`) that the plugin's task schema
 // uses. Strip exactly those, at every depth, from a deep clone: the caller's
@@ -54504,7 +54639,7 @@ async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETT
     const decision = bestTaskDeduplicationMatch(task, candidates, settings, Object.assign({}, options, { isSubtask: false, intraBatch: true }));
     if (!decision.candidate?.generatedTask) continue;
     if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
-    const resolutionOptions = Object.assign({}, options, { intraBatch: true });
+    const resolutionOptions = Object.assign({}, options, { intraBatch: true, dedupeStats: stats });
     const resolution = taskDeduplicationResolution(decision, settings, resolutionOptions);
     if (resolution === "none") {
       if (decision.candidate && (decision.outcome === "ambiguous-ai" || decision.decision === "ambiguous")) {
@@ -54998,8 +55133,11 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
     const semanticCandidates = buildSemanticTaskDedupeCandidates(task, scoredCandidates, options);
     return Object.assign(semanticTaskDedupeDecision(task, semanticCandidates, Object.assign({}, options, { telemetry: options.semanticDedupeState.telemetry })), { sourceTask: task });
   }
+  const degradedFlag = flagSemanticUnavailableCanonicalMatch(task, candidates, settings, options);
+  if (degradedFlag) return degradedFlag;
   return {
     decision: "create",
+    outcome: "create",
     confidence: 0,
     reasons: ["semantic dedupe state unavailable; lexical fallback disabled"],
     candidate: null,
@@ -55007,6 +55145,46 @@ function bestTaskDeduplicationMatch(task, candidates = [], settings = DEFAULT_SE
     degradedReason: "semantic-dedupe-state-unavailable",
     sourceTask: task
   };
+}
+
+function flagSemanticUnavailableCanonicalMatch(task = {}, candidates = [], settings = DEFAULT_SETTINGS, options = {}) {
+  let stats = options.dedupeStats || null;
+  try {
+    const source = canonicalTaskMatchTitle(task.content || "");
+    if (!source) return null;
+    const sourceProject = singleLine(task.projectName || "").toLowerCase();
+    for (const candidate of candidates || []) {
+      const existing = candidate.generatedTask || candidate.task || {};
+      if (existing.isCompleted) continue;
+      if (canonicalTaskMatchTitle(existing.content || "") !== source) continue;
+      const existingProject = singleLine(existing.projectName || "").toLowerCase();
+      // Spec: flag only same project — unknown project on either side is not evidence.
+      const bothPresent = Boolean(sourceProject && existingProject);
+      if (!bothPresent || sourceProject !== existingProject) continue;
+      const statsTarget = stats || emptyTaskDeduplicationStats();
+      const flagTask = (options.intraBatch || candidate.generatedTask) ? task : Object.assign({}, task, { id: "" });
+      flagPossibleDuplicateTask(statsTarget, flagTask, {
+        id: candidate.generatedTask ? "" : (candidate.id || existing.id || ""),
+        candidate: { task: existing, generatedTask: candidate.generatedTask || undefined },
+        confidence: 0,
+        reasons: ["same canonical title while semantic dedupe state unavailable; review in Todoist"]
+      }, settings, options);
+      if (!stats) options.dedupeStats = statsTarget;
+      return {
+        decision: "create",
+        outcome: "create",
+        confidence: 0,
+        reasons: ["semantic dedupe state unavailable; canonical-title candidate flagged for review"],
+        candidate: null,
+        degraded: true,
+        degradedReason: "semantic-dedupe-state-unavailable",
+        sourceTask: task
+      };
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
 }
 
 const TASK_DEDUPE_SCOPE_IDENTIFIER_IGNORES = new Set(["ASAP", "FYI", "TODO"]);

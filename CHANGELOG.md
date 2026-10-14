@@ -1,4 +1,62 @@
 # Changelog
+## 0.9.22 - 2026-10-13
+### Fixed
+- **"Index: Load failed (semantic-index-no-validated-generation)" no longer sticks after a rebuild.** On a device with no saved semantic index yet, such as a phone or tablet where Obsidian Sync does not copy the plugin's index files, the startup load reports this failure. A successful rebuild built and saved the index but never cleared the message, so the status kept showing the failure. It now clears as soon as a rebuild saves a new index.
+- The local log line for this load failure now includes the underlying reason, so a failed load can be diagnosed.
+## 0.9.21 - 2026-10-13
+### Fixed
+- **"Ranked corpus is empty" no longer appears when a note changes during task creation.** The plugin checked its note index against a live revision that an edit had already moved past, so it rejected its own evidence and returned no tasks. The same rejection could follow the automatic task-reference repair, which swapped in rebuilt task rows without clearing cached search results; that cache is now cleared too.
+### Notes
+- Live check in Obsidian on disposable copies of the test vault, Claude Haiku 5.5 through the provider, 9 test notes: released 0.9.20 had 3 of 9 notes blocked on their first attempt by this error (each recovered on retry); this build had 0 of 9. Task counts were 8.6 per run for 0.9.20 and 9.0 for this build.
+- A keyword boost for the task search was tested offline against the gold sets and lowered the share of correct notes delivered to the model by 4.4 points (confidence interval -9.0 to -0.2), so it is not included.
+- A low "Maximum subtasks per main task" setting of 2 was briefly suspected during testing; it was not the cause.
+## 0.9.20 - 2026-10-13
+### Improved
+- **Task creation and descriptions now see more of the right notes.** The step that picks which note passages go to the model used to take its top 30 passages by meaning score, and often spent about 11 of those slots on repeats from the same few notes. It now takes at most one passage per note from that list and looks at 30 keyword matches instead of 20. On our three hand-checked test sets (80, 154 and 164 task lines) the share of correct notes that reach the model rose by 8 to 13 points (59.7% to 68.3% on the main set, confidence interval 5.9 to 11.6), at about 10 more passages per task (46 to 56, roughly 22% more prompt text). In a live Obsidian run on 12 of those task lines, 30 of 49 correct notes reached the model instead of 23.
+### Fixed
+- **Subtasks no longer repeat their parent task.** A subtask whose wording is already contained in its parent task, or in an earlier subtask, is dropped. A subtask that repeats a different main task in the same plan (for example a "work through the priority list" task whose children restate the other tasks) is dropped too. Subtasks that add any new wording, already exist in Todoist, or have their own date are always kept, and so are split marked actions. Replaying 35 saved real task plans from two models, 7 of 245 subtasks were dropped and none restated anything afterwards.
+### Notes
+- In live Obsidian runs on 8 test notes with at least four marked tasks each, using two different models (DeepSeek v4.1 flash on low reasoning and Claude Haiku 5.5 on medium reasoning), released and new builds found the same number of main tasks on every note and the descriptions cited real notes. Differences between the two builds were no larger than the differences between two runs of the same build, so this release is not claiming better descriptions, only that more of the right notes reach the model and that duplicated subtasks are gone. Task titles agreed 0.50 to 0.91 between builds against 0.64 to 0.86 between two runs of the same build.
+- Our test gateway cached repeated identical requests, which made some earlier repeat runs look more alike than they were. The comparison above sent every request with the gateway's cache bypass on, so repeated runs are genuinely independent.
+- A very low "Maximum subtasks per main task" setting (2) made task creation fail on one test note with a "ranked corpus is empty" message about one time in three on the released version too; it is not fixed here, so leave the setting at its default of 4.
+- Measured and not included: keyword scoring in the task search, link and date signals, and several ways of reordering the note list. The first two helped in offline checks but have not been tested inside the plugin yet; reordering did nothing, because the model receives a selected set rather than the ordered list.
+## 0.9.19 - 2026-10-12
+
+### Improved
+- **Faster searches.** Searching your notes now takes about half as long on a large vault (about 98 ms down to about 55 ms per search across our 4,376-passage test vault), with identical results: all 120 test searches returned exactly the same notes in the same order as before.
+- **Startup no longer waits for search preparation.** The search lookup data that used to be rebuilt while the plugin loaded is now prepared in the background; the first search simply waits for it if it is not ready yet. Saved files are byte-for-byte unchanged, so nothing is re-indexed.
+
+### Changed
+- **Internal cleanup (no feature changes).** About 300 lines of unused or repeated code were removed, and several internal caches were made stricter so a changed note can never be served a stale answer.
+
+### Notes
+- This build was checked in a live Obsidian session against a scratch copy of the test vault: it loaded, searched, and rebuilt its background search data without errors. A trial of a different way of phrasing search queries for the embedding model was measured and not included, because it did not clearly improve accuracy.
+
+## 0.9.18 - 2026-10-09
+
+### Added
+- **Possible-duplicate flags when the semantic index is unavailable** (task generation). When embeddings cannot be compared, an open task in the same project whose title matches a task already in Todoist is now marked as a possible duplicate so you can check it, instead of nothing being reported at all. Nothing is linked or merged on its own: in our test set of 62 hand-checked task pairs (25 real duplicates, 37 genuinely different tasks) this flagged 23 of the 25 duplicates and none of the 37 different ones, and the duplicate-detection numbers themselves are unchanged because a flag only tells you to look.
+
+### Changed
+- **Background index rebuilds now send 3 embedding batches at a time instead of one.** On our test vault the steady-state rebuild took the same time, because the local embedding endpoint works through one request at a time anyway, and only the first cold run was up to 3 times faster while the model was still loading. The rebuilt text, the saved index and the progress numbers are the same as before, and a batch that fails still stops the rebuild where it did. A full rebuild of our 4,376-chunk test index finished in about 14 seconds in a live Obsidian run with no freezing.
+
+### Improved
+- Task descriptions start faster when a note is retried or re-run. The first description request of a note is still sent on its own to warm the provider cache, but when the same model and note prompt ran successfully less than 4 and a half minutes ago the plugin now skips that solo request and starts the whole batch together. A different model or a changed note prompt still warms again.
+
+### Fixed
+- **Internet Search settings: the Search model list now follows the Search provider.** Picking a Search provider used to leave every provider's models in the Search model list, and changing the provider did not update that list until the settings tab was closed and opened again. The list now shows only the selected provider's models (plus its Provider default) and updates as soon as the provider is changed, and a model saved under a different provider is dropped instead of being sent to the new provider by mistake.
+- **Email task descriptions can now cite related notes from your vault.** Notes did this already, but an email is not a note in the vault, so the plugin had no starting point to search from and every email description ended up with nothing but the email itself. It now asks the embedding model for a search vector built from the email's own task wording (one small extra embedding request per task) and adds the related notes it finds, numbered the same way as for notes. This needs the embedding model to be reachable; when it is not, descriptions behave exactly as before. In a live run on our test vault the lookup returned the related notes for a sample email that previously returned none.
+
+### Notes
+- Two changes were measured on the test set and then taken back out: adding keyword matching to semantic search when a task description is written moved the first right note higher (up 7.6 points, with the confidence interval above zero) and helped notes find their own source note (up 15 points in the top 8 and 32.5 points in the top 24 on 40 such queries), but it did not reliably put more of the right related notes in the top 8 or top 24 on the 80 related-note queries (up 1.7 points and down 0.2 points, both within the margin of error), so it was not shipped, and matching titles the way the duplicate check does when a new task is linked to an existing one (it changed no duplicate detection either). What ships is unchanged in both places, and the measurement script stays in the repository so it can be tuned and retried.
+- Semantic search stays on Exact by default. On an index rebuilt in the current format, routed search ran in about 40 to 50 percent of Exact's time but found fewer of the right notes: on our 80 hand-checked queries it surfaced about 7 points fewer of the related notes in the top 8 (21.4 percent for Exact against 14.7 percent for Routed; the difference is larger than the test's margin of error), and about 7 points fewer in the top 24. Routed therefore stays an opt-in speed setting and the default is unchanged.
+- The two evaluation scripts behind these numbers are now in the repository (retrieval-eval for note retrieval, dedup-eval for task matching). They read a vault read-only and write their results next to the plugin's own data files inside that vault, never into the repository; the labelled examples they use, 80 retrieval queries and 62 task pairs mined automatically and then confirmed by reading the actual notes, stay with the vault as well, so nothing from any vault ships here.
+- This build was checked in a live Obsidian session against a scratch copy of the test vault: the plugin loaded as 0.9.18, the index rebuilt in the current format, the Internet Search model list followed each of the four providers, and the email note lookup worked. The faster description start (skipped warm-up) and the possible-duplicate flags were checked by tests only, not in a live run.
+
+## 0.9.17 - 2026-10-09
+### Fixed
+- Forwarded emails with nested attachments or images (for example Outlook forwards) are now read correctly. Plugin only looked one level deep in email, so for these emails it handed the model undecoded raw text instead of message, and the task and its description had almost nothing to work from. It now finds the real text body, falling back to the HTML body.
+- A task whose description the model could not support was blocking the whole email (Generated task persistence blocked: 1 main task description is missing or invalid). The model is now required to write at least one sentence for every task, grounded in the current source, instead of returning an empty description.
 
 ## 0.9.16 - 2026-10-09
 

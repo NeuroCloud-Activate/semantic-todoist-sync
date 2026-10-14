@@ -6325,6 +6325,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       let settingsChanged = false;
       let loadedFromDisk = false;
       let compatibilityRefreshCandidate = null;
+      let lastIndexReadError = null;
       const rememberCompatibilityRefresh = (error) => {
         if (error?.code !== "semantic-index-compatibility-refresh-required") return;
         compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
@@ -6363,6 +6364,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         loadedFromDisk = true;
       } catch (error) {
         if (error?.code === "semantic-index-read-failed") throw error;
+        lastIndexReadError = error;
         rememberCompatibilityRefresh(error);
         // Legacy semantic-index.json fallback is OpenAI-only: legacy model inference
         // (usesOpenAIEmbeddingModel) is true for custom OpenAI-compatible models, so gate
@@ -6377,6 +6379,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             compatibilityRefreshCandidate = null;
           } catch (legacyError) {
             if (legacyError?.code === "semantic-index-read-failed") throw legacyError;
+            lastIndexReadError = legacyError;
             rememberCompatibilityRefresh(legacyError);
           }
         }
@@ -6423,7 +6426,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!loadedFromDisk) {
         restorePreviousState();
         this.semanticIndexLoadFailure = "semantic-index-no-validated-generation";
-        this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure });
+        this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure, error: singleLine(lastIndexReadError?.message || "").slice(0, 200) });
         return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
       }
       if (!this.semanticIndex.length) {
@@ -9043,6 +9046,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
       await this.saveSemanticIndex();
       persistenceCommitted = true;
+      // A committed generation now exists on disk, so a stale fresh-device load
+      // failure (no validated index yet) is resolved even if a later step in
+      // this rebuild fails after the commit.
+      this.retireSemanticIndexLoadStatus();
       // Clear the staging record and files only after the new index is committed.
       await this.clearSemanticIndexRebuildStaging();
       try {

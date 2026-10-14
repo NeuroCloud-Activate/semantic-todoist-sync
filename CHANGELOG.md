@@ -1,4 +1,8 @@
 # Changelog
+## 0.9.22 - 2026-10-13
+### Fixed
+- **"Index: Load failed (semantic-index-no-validated-generation)" no longer sticks after a rebuild.** On a device with no saved semantic index yet, such as a phone or tablet where Obsidian Sync does not copy the plugin's index files, the startup load reports this failure. A successful rebuild built and saved the index but never cleared the message, so the status kept showing the failure. It now clears as soon as a rebuild saves a new index.
+- The local log line for this load failure now includes the underlying reason, so a failed load can be diagnosed.
 ## 0.9.21 - 2026-10-13
 ### Fixed
 - **"Ranked corpus is empty" no longer appears when a note changes during task creation.** The plugin checked its note index against a live revision that an edit had already moved past, so it rejected its own evidence and returned no tasks. The same rejection could follow the automatic task-reference repair, which swapped in rebuilt task rows without clearing cached search results; that cache is now cleared too.

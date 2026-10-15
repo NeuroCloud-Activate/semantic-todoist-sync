@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.24 - 2026-10-15
+### Added
+- **Ask answers now group related claims under `**Topic:**` headings**, with code-side subset merge reuniting per-item labels (for example Jim items across sources) so related claims stay together instead of scattering per source.
+- `scripts/structured-chat-evidence-test.js` — structured chat evidence regression test.
+### Fixed
+- Ask follow-up / action answers omit completed items unless explicitly asked, and flag open items older than 6 months (relative to 2026-10-15) as possibly stale.
+### Notes
+- Live vault validation passed; `npm test` 49/49. Merge-pass comment `// Merge pass: model emits varied per-claim topic labels; subset merge reunites same-item labels.` confirmed in built `main.js` (SHA-256 8d0050d4...).
+
 ## 0.9.23 - 2026-10-15
 ### Added
 - **Write and Collaborate mode in the sidebar.** A Collaborate toggle and a Write button draft text straight into the open note from your vault notes, saved research notes, optional web search and a context folder, with footnote links to every source and a "Sources searched" list. A Features menu sets draft length, evidence sources and image description; Internet Search has its own toggle.

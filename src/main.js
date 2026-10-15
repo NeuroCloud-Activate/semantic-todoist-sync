@@ -13857,9 +13857,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "Cite only sources resolved from the supplied selected evidence ledger or the explicitly supplied current-source lane. Todoist and note links are eligible only when their admitted source record supplies them; a task-context pointer alone does not authorize an additional source.",
         "Use the task context to identify whether a task already exists before suggesting task creation.",
         "When referring to an existing task, include its supplied Todoist task link when available after explaining the relevant note-based evidence.",
+        "For follow-up, action, or to-do questions: omit items whose evidence shows them completed (checked - [x], marked complete/done) unless the user asks about completed work; for open items whose source date is more than 6 months before today's date, keep them but say they are older than 6 months and may be stale.",
+        "Topic labels name the person, project, or item, never the missing fact: all claims about the same person's or item's follow-ups use one identical topic string, and a not-established claim takes the identical topic of the claim it qualifies.",
         "Avoid long preambles."
       ].join(" "),
       user: [
+        `Today's date: ${deviceDateString()}`,
         `Mode: ${this.settings.chatMode}`,
         "",
         "Recent chat:",
@@ -28316,9 +28319,10 @@ function chatResponseSchema() {
               type: "string",
               enum: ["fact", "intent", "current-state", "history", "owner", "recipient", "deliverable", "dependency", "next-step", "timing", "criteria", "hierarchy", "unsupported"],
               description: "Exactly one category; use unsupported only for a single missing or unestablished element."
-            }
+            },
+            topic: { type: "string", minLength: 1, description: "Person, project, or item the claim is about; never the missing fact. Claims about the same item, including a not-established claim qualifying them, use the identical topic." }
           },
-          required: ["text", "established", "evidence_ids", "category"]
+          required: ["text", "established", "evidence_ids", "category", "topic"]
         }
       }
     },
@@ -33114,6 +33118,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   if (!parsed) {
     return validateChatEvidenceCitations(value, ledger, options);
   }
+  const groupMap = new Map();
   for (const claim of parsed.claims) {
     const sentences = chatClaimSentences(claim?.text);
     if (!sentences.length) continue;
@@ -33130,12 +33135,66 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
       const url = String(link).match(/\]\(([^)]+)\)$/)?.[1] || "";
       if (url) sourceUrlsUsed.add(url);
     });
+    const topicRaw = String(claim?.topic || "").trim();
+    const topicKey = topicRaw ? topicRaw.toLowerCase() : "__untitled__";
+    if (!groupMap.has(topicKey)) {
+      groupMap.set(topicKey, { firstText: topicRaw, bullets: [] });
+    }
+    const currentGroup = groupMap.get(topicKey);
     for (const sentence of sentences) {
       const clean = finalizeStructuredChatSentence(sentence);
       if (!clean) continue;
-      renderedClaims.push(`- ${clean}${links.length ? ` ${links.join(" ")}` : ""}`.trim());
+      const bullet = `- ${clean}${links.length ? ` ${links.join(" ")}` : ""}`.trim();
+      renderedClaims.push(bullet);
+      currentGroup.bullets.push({ text: bullet, claimIndex: parsed.claims.indexOf(claim) });
     }
   }
+  // Merge pass: model emits varied per-claim topic labels; subset merge reunites same-item labels.
+  const cleanStopwords = new Set(["for","the","a","an","and","or","of","on","to","up","ups","follow","follows","followed","following","followup","followups"]);
+  function makeKw(text) {
+    if (!text || !text.trim()) return null;
+    const toks = String(text).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/).filter(t => t && !cleanStopwords.has(t));
+    const s = new Set(toks);
+    return s.size ? s : null;
+  }
+  const rebuilt = [];
+  for (const [key, grp] of Array.from(groupMap.entries())) {
+    const topicText = (grp.firstText || "").trim();
+    if (key === "__untitled__" || topicText === "") {
+      rebuilt.push({ label: topicText, bullets: grp.bullets.slice(), untitled: true });
+      continue;
+    }
+    const kw = makeKw(topicText);
+    if (!kw) {
+      rebuilt.push({ label: topicText, bullets: grp.bullets.slice(), untitled: false, emptyKw: true });
+      continue;
+    }
+    let found = false;
+    for (const rb of rebuilt) {
+      if (rb.untitled || rb.emptyKw) continue;
+      const rbKw = rb.kw || makeKw(rb.label);
+      if (!rbKw) continue;
+      const subset = (a, b) => { for (const x of a) if (!b.has(x)) return false; return true; };
+      if (subset(kw, rbKw) || subset(rbKw, kw)) {
+        rb.bullets.push(...grp.bullets);
+        rb.kw = new Set([...Array.from(rbKw || rb.kw || new Set()), ...Array.from(kw)]);
+        found = true; break;
+      }
+    }
+    if (!found) {
+      rebuilt.push({ label: topicText, bullets: grp.bullets.slice(), untitled: false, emptyKw: false, kw: new Set(kw) });
+    }
+  }
+  const sortedRebuilt = rebuilt.map(rb => ({
+    ...rb,
+    bullets: rb.bullets.slice().sort((a, b) => (a.claimIndex ?? 0) - (b.claimIndex ?? 0))
+  }));
+  const newGroupEntries = sortedRebuilt.map((rb, idx) => {
+    const newGrp = { firstText: rb.label, bullets: rb.bullets.map(b => b.text) };
+    return [rb.untitled ? "__untitled__" : (`__merged_${idx}`), newGrp];
+  });
+  groupMap.clear();
+  for (const [k, grp] of newGroupEntries) groupMap.set(k, grp);
   if (!renderedClaims.length) {
     reasonCodes.push("structured-response-empty");
   }
@@ -33167,7 +33226,30 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     selectedEvidenceIds: entries.map((entry) => entry.evidenceId).slice(0, 32),
     sourceIds: entries.map((entry) => entry.sourceId).filter(Boolean).slice(0, 32)
   };
-  return { answer: renderedClaims.join("\n"), telemetry };
+  const groupEntries = Array.from(groupMap.entries());
+  const nonEmptyTopicKeys = new Set(groupEntries.filter(([k, g]) => g.firstText && g.firstText.trim()).map(([k, g]) => k));
+  const showHeadings = nonEmptyTopicKeys.size >= 2;
+  let answer;
+  if (!showHeadings) {
+    answer = renderedClaims.join("\n");
+  } else {
+    const lines = [];
+    for (let i = 0; i < groupEntries.length; i++) {
+      const [key, grp] = groupEntries[i];
+      const hasTitle = Boolean(grp.firstText && grp.firstText.trim());
+      if (showHeadings && hasTitle) {
+        lines.push(`**Topic: ${grp.firstText.trim()}**`);
+      }
+      for (const bullet of grp.bullets) {
+        lines.push(typeof bullet === "object" ? bullet.text : bullet);
+      }
+      if (i < groupEntries.length - 1) {
+        lines.push("");
+      }
+    }
+    answer = lines.join("\n");
+  }
+  return { answer, telemetry };
 }
 
 function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {

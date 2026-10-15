@@ -1,6 +1,6 @@
 {
   "name": "semantic-todoist-sync",
-  "version": "0.9.16",
+  "version": "0.9.24",
   "private": true,
   "description": "Obsidian plugin for semantic Todoist sync",
   "scripts": {

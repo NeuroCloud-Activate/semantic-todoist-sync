@@ -328,7 +328,7 @@ function makeWritePlugin(leafEntries) {
     saveSettings: async () => {},
     writeWithEvidence: async () => {
       writeCalls += 1;
-      return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0 };
+      return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: 'Sources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched' };
     },
   };
   plugin.writeCallCount = () => writeCalls;
@@ -345,7 +345,8 @@ async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   await view.write();
   assert.strictEqual(plugin.writeCallCount(), 1, 'model called once for the visible note');
   assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor');
-  assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT', 'draft text inserted');
+  assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT\n\nSources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched', 'draft plus Sources searched block inserted');
+  assert(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === calls.replaceRange[0].draft), 'sidebar shows exactly what was inserted');
   assert.strictEqual(view.writing, false, 'writing flag restored');
   assert.strictEqual(view.collaborateButton.disabled, false, 'button re-enabled');
   assert(!view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'no open-a-note message');

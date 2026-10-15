@@ -1,9 +1,9 @@
 "use strict";
 
-// Regression for a ready post-structure context replacing a valid provider
-// task's primary action evidence. The source module can be overridden with
-// STSYNC_PRIMARY_EVIDENCE_SOURCE_OVERRIDE so a proposed production patch can
-// be exercised in a private temporary copy without editing main.js.
+// Regression for authorized evidence handling in attachTaskWorkflowSemanticEvidence:
+// a ready post-structure secondary chunk that is not authorized is dropped, while
+// a valid provider task's primary action evidence is preserved. The source
+// module can still be overridden via STSYNC_PRIMARY_EVIDENCE_SOURCE_OVERRIDE.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -179,7 +179,7 @@ function runReadySecondaryHandoff(providerTask, {
   assert.ok(result.final.tasks.length === 1,
     `ready same-scope secondary evidence must preserve the valid provider task; rejected=${JSON.stringify(result.final.rejected.map((entry) => entry.errors))}`);
   assert.ok(finalTask.evidence_ids.includes(primaryEvidenceId), "replacement must retain the usable incoming primary evidence id");
-  assert.ok(finalTask.evidence_ids.includes(SECONDARY_EVIDENCE_ID), "replacement must still use ready secondary context");
+  assert.ok(!finalTask.evidence_ids.includes(SECONDARY_EVIDENCE_ID), "the ready secondary chunk is not authorized and must not be attached to the final task");
   assert.ok(finalTask.fact_bindings.some((binding) => binding.factId === actionFact.factId && binding.evidenceId === primaryEvidenceId),
     "replacement must keep the valid primary action binding");
   assert.equal(finalTask.content, "Follow up with the clinic about the blood drive results");
@@ -200,7 +200,7 @@ function runReadySecondaryHandoff(providerTask, {
   }), { preStructureEvidenceIds: [OLD_SECONDARY_EVIDENCE_ID] });
   assert.equal(result.final.tasks.length, 1, "ready secondary context must keep the validated task");
   assert.ok(result.final.tasks[0].evidence_ids.includes(primaryEvidenceId), "primary action evidence must remain selected");
-  assert.ok(result.final.tasks[0].evidence_ids.includes(SECONDARY_EVIDENCE_ID), "new ready context must replace supporting context");
+  assert.ok(!result.final.tasks[0].evidence_ids.includes(SECONDARY_EVIDENCE_ID), "unauthorized ready secondary context must not be attached");
   assert.ok(!result.final.tasks[0].evidence_ids.includes(OLD_SECONDARY_EVIDENCE_ID), "old supporting evidence must be removed");
 }
 

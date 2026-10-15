@@ -1,4 +1,18 @@
 # Changelog
+
+## 0.9.23 - 2026-10-15
+### Added
+- **Write and Collaborate mode in the sidebar.** A Collaborate toggle and a Write button draft text straight into the open note from your vault notes, saved research notes, optional web search and a context folder, with footnote links to every source and a "Sources searched" list. A Features menu sets draft length, evidence sources and image description; Internet Search has its own toggle.
+- **Context folder** under the plugin folder (created automatically), indexed as its own store, with external folder and image support.
+- **Relevant notes toggle** in settings (on by default), and separate **Note Tasks** and **Email Tasks** settings tabs.
+### Fixed
+- Task headings that start with "Task" are no longer stripped.
+- A `#todo` action can sit before, after or on both sides of the tag.
+- Email task creation accepts existing Todoist task rows as read-only reference evidence.
+- Completing a task in Todoist updates the checkbox in the real note instead of a stale cached path.
+- Task creation no longer fails with `action-source-mismatch` when the top-ranked passage has no markers.
+### Notes
+- Validated live in Obsidian on a copy of the vault with Claude Haiku 5.5: Write, Tasks, Ask, Collaborate, Schedule Today preview, Index and email to Todoist. Test suite: 48 of 48 pass; 11 stale tests updated or removed.
 ## 0.9.22 - 2026-10-13
 ### Fixed
 - **"Index: Load failed (semantic-index-no-validated-generation)" no longer sticks after a rebuild.** On a device with no saved semantic index yet, such as a phone or tablet where Obsidian Sync does not copy the plugin's index files, the startup load reports this failure. A successful rebuild built and saved the index but never cleared the message, so the status kept showing the failure. It now clears as soon as a rebuild saves a new index.

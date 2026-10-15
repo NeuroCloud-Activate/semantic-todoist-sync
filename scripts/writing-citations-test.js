@@ -232,6 +232,19 @@ function ev(eid, source) {
   console.log("PASS composeDraft empty-body and empty-footnotes edges");
 }
 
+// 13b: composeDraft appends the Sources searched block last (after footnotes), once, only with a body
+{
+  const block = "Sources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched";
+  assert.strictEqual(composeDraft("body", "[^1]: x", block), "body\n\n[^1]: x\n\n" + block, "block appended last after footnotes");
+  assert.strictEqual(composeDraft("body", "", block), "body\n\n" + block, "block appended without footnotes");
+  assert.strictEqual(composeDraft("body", "[^1]: x"), "body\n\n[^1]: x", "omitted block -> identical output");
+  assert.strictEqual(composeDraft("body", "[^1]: x", "   "), "body\n\n[^1]: x", "blank block -> unchanged");
+  assert.strictEqual(composeDraft("", "[^1]: x", block), "[^1]: x", "no body -> block not added");
+  assert.strictEqual(composeDraft("", "", block), "", "empty draft -> unchanged");
+  assert.strictEqual(composeDraft("body\n\n" + block, "", block), "body\n\n" + block, "model-echoed block not duplicated");
+  console.log("PASS composeDraft appends Sources searched last, once, only with a body");
+}
+
 // 14: removing an unknown eid eats one adjacent space (no double space)
 {
   const r = rewriteCitations("a [E9] b", [], "");

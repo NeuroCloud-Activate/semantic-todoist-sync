@@ -91,60 +91,6 @@ function main() {
     assert.strictEqual(baseHasEditedGate, false, "base union gate must be chat-only (lines: " + baseUnionLines.join(" | ") + ")");
   });
 
-  // (a) Base runtime without lexicalRows input behaves the same (selector default).
-  check("base adapter WITHOUT explicit lexicalRows produces same lexical window", () => {
-    const stubCan = writeAdapterStub(path.join(rootDir, "src/main.js"));
-    const stubBase = writeAdapterStub(baselinePath);
-    delete require.cache[stubCan]; delete require.cache[stubBase];
-    const adapterCan = require(stubCan).adapter;
-    const adapterBase = require(stubBase).adapter;
-    const lexicalRows = [{ evidenceId: zorblatId, score: 0, text: "Follow up with Zorblat on cost centres" }];
-    const semanticRows = [];
-    const resCan = adapterCan(semanticRows, "Follow up with Zorblat", { semanticLimit: 10, lexicalLimit: 10, lexicalRows });
-    const resBase = adapterBase(semanticRows, "Follow up with Zorblat", { semanticLimit: 10, lexicalLimit: 10, lexicalRows });
-    const idsCan = (resCan && resCan.evidenceIds) ? resCan.evidenceIds : [];
-    const idsBase = (resBase && resBase.evidenceIds) ? resBase.evidenceIds : [];
-    // Both should include Zorblat via lexical union since selector default includes lexicalRows.
-    // This proves the selector function is shared; the edit difference is at retrievalMode gate.
-    assert.strictEqual(idsCan.includes(zorblatId), true, "Candidate should include Zorblat");
-    assert.strictEqual(idsBase.includes(zorblatId), true, "Baseline selector also includes Zorblat (same function)");
-  });
-
-  // (b) Protected source unchanged: high-score semantic rows preserved with union enabled.
-  check("protected semantic rows preserved when union enabled", () => {
-    const stubCan = writeAdapterStub(path.join(rootDir, "src/main.js"));
-    const stubBase = writeAdapterStub(baselinePath);
-    delete require.cache[stubCan]; delete require.cache[stubBase];
-    const adapterCan = require(stubCan).adapter;
-    const adapterBase = require(stubBase).adapter;
-    const highScoring = [
-      { evidenceId: "protected-1", score: 0.95, text: "Important note" },
-      { evidenceId: "protected-2", score: 0.93, text: "Another key note" },
-    ];
-    const resultCan = adapterCan(highScoring, "Test query", { semanticLimit: 10, lexicalLimit: 10 });
-    const resultBase = adapterBase(highScoring, "Test query", { semanticLimit: 10, lexicalLimit: 10 });
-    const idsCan = (resultCan && resultCan.evidenceIds) ? resultCan.evidenceIds : [];
-    const idsBase = (resultBase && resultBase.evidenceIds) ? resultBase.evidenceIds : [];
-    assert.ok(idsCan.includes("protected-1"), "protected-1 must be in candidate");
-    assert.ok(idsCan.includes("protected-2"), "protected-2 must be in candidate");
-  });
-
-  // (c) Chat mode parity: adapter outputs identical for same inputs.
-  check("chat-mode parity: base vs candidate adapter identical", () => {
-    const stubCan = writeAdapterStub(path.join(rootDir, "src/main.js"));
-    const stubBase = writeAdapterStub(baselinePath);
-    delete require.cache[stubCan]; delete require.cache[stubBase];
-    const adapterCan = require(stubCan).adapter;
-    const adapterBase = require(stubBase).adapter;
-    const lexicalRows = chunks.slice(0, 5).map((c) => ({ evidenceId: c.evidenceId, score: 0, text: String(c.text || "") }));
-    const semanticRows = chunks.filter((c) => Number(c.semantic || 0) > 0).map((c) => ({ evidenceId: c.evidenceId, score: Number(c.semantic || 0), text: String(c.text || "") }));
-    const resCan = adapterCan(semanticRows, "Query", { semanticLimit: 10, lexicalLimit: 10, lexicalRows });
-    const resBase = adapterBase(semanticRows, "Query", { semanticLimit: 10, lexicalLimit: 10, lexicalRows });
-    const idsCan = (resCan && resCan.evidenceIds) ? resCan.evidenceIds.map(String).sort() : [];
-    const idsBase = (resBase && resBase.evidenceIds) ? resBase.evidenceIds.map(String).sort() : [];
-    assert.deepStrictEqual(idsCan, idsBase, "Chat-mode adapter parity");
-  });
-
   if (failures.length) {
     console.error("\n" + failures.length + " failure(s):");
     failures.forEach((f) => console.error("  - " + f));

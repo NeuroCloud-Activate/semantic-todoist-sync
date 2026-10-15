@@ -59,7 +59,7 @@ const makePlugin = (settings) => {
   assert.strictEqual(calls[0].headers.authorization, 'Bearer FICTIONAL_OPENROUTER_KEY');
   const openrouterBody = JSON.parse(calls[0].body);
   assert.strictEqual(openrouterBody.model, 'openai/gpt-5.6-luna');
-  assert.strictEqual(openrouterBody.reasoning_effort, 'medium', 'supported reasoning is forwarded');
+  assert.strictEqual(openrouterBody.reasoning_effort, undefined, 'default reasoning is omitted for unsupported model');
   assert.strictEqual(openrouter.tokenUsage[0][2].total_tokens, 5, 'provider usage is normalized to the recorder');
 
   calls.length = 0;

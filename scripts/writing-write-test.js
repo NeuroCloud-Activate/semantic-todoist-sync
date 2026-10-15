@@ -709,6 +709,28 @@ async function main() {
     console.log("PASS task 11 empty research store stays honest");
   }
 
+  // Sources searched — the result carries the code-generated block reflecting toggled-off sources.
+  {
+    const plugin = makeStub({ vault: 1, context: 1, research: null, modelText: "draft" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE, useVault: false, useResearch: false });
+    assert.strictEqual(typeof result.sourcesBlock, "string", "sourcesBlock returned");
+    assert.ok(result.sourcesBlock.startsWith("Sources searched:\n"), "block header");
+    assert.ok(result.sourcesBlock.includes("- deep research: not searched (turned off)"), "research off line");
+    assert.ok(result.sourcesBlock.includes("- vault: not searched (turned off)"), "vault off line");
+    assert.ok(result.sourcesBlock.includes("- context folder: searched"), "context searched line");
+    console.log("PASS sourcesBlock reflects toggled-off sources");
+  }
+
+  // Sources searched — vault wanted but index unavailable stays honest in the returned block.
+  {
+    const plugin = makeStub({ vault: 1, context: 1, research: null, modelText: "draft" });
+    plugin.vaultIndexStatus = async () => ({ ready: false, reason: "semantic-index-not-loaded" });
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.ok(result.sourcesBlock.includes("- vault: NOT searched (vault index unavailable: semantic-index-not-loaded)"), "vault unavailable line, got: " + result.sourcesBlock);
+    assert.ok(result.sourcesBlock.includes("- deep research: not searched (no saved research notes)"), "empty research line");
+    console.log("PASS sourcesBlock reflects unavailable vault");
+  }
+
   console.log("writing-write-test: PASS");
 }
 

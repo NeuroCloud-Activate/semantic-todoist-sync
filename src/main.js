@@ -3414,9 +3414,6 @@ const DEFAULT_SETTINGS = {
   // regenerable-cache rules as providerModelCapabilities: whitelisted numbers
   // only, persisted in model-cache.json, never in data.json.
   providerModelLimits: {},
-  // Slice C seam: per `${provider}:${model}` auto-correct notes. Slice B only
-  // creates/sanitizes the structure and clears entries from the probe button.
-  reasoningAutoCorrections: {},
   openAiEmbeddingDimensions: 1024,
   warmEmbeddingServerOnStartup: false,
   availableChatModels: ["gpt-5.6-terra", "gpt-5.6-luna"],
@@ -21539,11 +21536,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
 
   async updateCachedLine(taskId, replacer) {
     const cached = this.settings.taskCache[taskId];
-    const file = this.app.vault.getAbstractFileByPath(cached.path);
-    if (!(file instanceof TFile)) return;
-    const lines = (await this.app.vault.read(file)).split("\n");
-    const idx = lines.findIndex((line) => getTodoistId(line, this.settings) === taskId || (cached.oid && getTaskOid(line) === cached.oid));
-    if (idx === -1) return;
+    const matchesTaskLine = (line) => getTodoistId(line, this.settings) === taskId || (cached.oid && getTaskOid(line) === cached.oid); // writing-mode: shared matcher so stale-path rescan uses the same task identity
+    let file = this.app.vault.getAbstractFileByPath(cached.path);
+    let lines = file instanceof TFile ? (await this.app.vault.read(file)).split("\n") : [];
+    let idx = lines.findIndex(matchesTaskLine);
+    if (idx === -1) { // writing-mode: stale taskCache.path re-resolves to the canonical note; zero/ambiguous matches skip instead of miswriting
+      const hits = [];
+      for (const candidate of this.app.vault.getMarkdownFiles?.() || []) { const candidateLines = (await this.app.vault.read(candidate)).split("\n"); const at = candidateLines.findIndex(matchesTaskLine); if (at !== -1) hits.push([candidate, candidateLines, at]); }
+      if (hits.length !== 1) { this.logLocal("Todoist line update skipped: task path stale", { id: taskId }); return; }
+      cached.path = hits[0][0].path; file = hits[0][0]; lines = hits[0][1]; idx = hits[0][2];
+    }
     const originalLine = lines[idx];
     const nextLine = replacer(originalLine);
     const hasSubtaskMarker = hasSubtaskSyncMarker(originalLine, this.settings) || hasSubtaskSyncMarker(nextLine, this.settings);
@@ -22225,7 +22227,8 @@ class SemanticTodoistView extends ItemView {
           useResearch: this.plugin.settings.writingUseResearch !== false,
         });
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
-        const draftText = composeDraft(result.markdown || "", result.footnotes || "");
+        // writing-mode: sources searched block inserted with the draft so the note honestly shows searched sources
+        const draftText = composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock);
         const currentPath = filePath;
         // writing-mode: post-await insertion uses shared leaf lookup (prefers captured view, falls back to any open markdown leaf with filePath)
         const preferredView = (this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(typeof MarkdownView !== "undefined" ? MarkdownView : null) : null);
@@ -22246,7 +22249,8 @@ class SemanticTodoistView extends ItemView {
           this.setStatus("Collaboration complete (draft shown).");          return;
         }
         this.renderRelevantNotes(result.sources ? result.sources : []);
-        this.replaceLastAssistantMessage((result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : ""));
+        // writing-mode: sources searched block shown in the sidebar message exactly as inserted into the note
+        this.replaceLastAssistantMessage(composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock));
         if (result.notice) {
           new Notice(result.notice);
         }
@@ -22285,7 +22289,9 @@ class SemanticTodoistView extends ItemView {
     // writing-mode: capture original note path for insert check
     const originalPath = filePath || "";
     const originalName = originalPath ? (originalPath.split ? originalPath.split("/").pop() || originalPath : originalPath) : "this note";
-    const draftMarkdown = (result.markdown || "") + (result.footnotes ? (result.markdown ? "\n\n" + result.footnotes : result.footnotes) : "");
+    // writing-mode: sources searched block composed into the fallback draft so the Insert button inserts it too
+    const { composeDraft } = require("./writing/insert.js");
+    const draftMarkdown = composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock);
     this.addMessage("user", `Write: ${this.promptEl ? this.promptEl.value.trim() : "(draft)"}`);
     this.addMessage("assistant", draftMarkdown || "No draft generated.");
     // Add an Insert button that inserts at current cursor of active note (same file only)
@@ -24737,12 +24743,6 @@ function providerCaptureSafeText(value, knownSecrets) {
   } catch (error) {
     return { ok: false, text: null };
   }
-}
-
-function providerCaptureSameVaultPath(left, right) {
-  const normalize = (value) => String(value || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-  const normalizedLeft = normalize(left);
-  return normalizedLeft !== "" && normalizedLeft === normalize(right);
 }
 
 // Controlled error codes for wrapper failure events: an existing bounded code
@@ -31076,7 +31076,6 @@ function activeWorkflowStatusItems(plugin, currentStatus = "Ready") {
 // Display-only dedupe helpers for activeWorkflowStatusItems. They compare the
 // free-text sidebar message against the structured live activity labels and
 // never change status text content, request behavior, throttling, or timers.
-const STATUS_OUTCOME_PATTERN = /\b(answer ready|ready|done|complete[sd]?|validat\w*|fail\w*|errors?|unavailable|succeed\w*|success|saved?|generated?|created?|confirmed?|synced?|applied|undone|rebuilt|repaired|estimat\w*|reused?|written|processed|no web|save failed)\b/i;
 
 function normalizeStatusComparisonText(text) {
   let value = singleLine(text || "").toLowerCase();
@@ -31103,8 +31102,6 @@ function isStatusInProgressMessage(status) {
   if (/[.…]{2,}\s*$/.test(raw)) return true;
   return /\b\d+\s+of\s+\d+\b/.test(raw) || /\b\d+\s*\/\s*\d+/.test(raw);
 }
-
-const STATUS_ERROR_PATTERN = /\b(fail\w*|errors?|unavailable)\b/i;
 
 
 
@@ -38157,6 +38154,13 @@ function explicitNoteActionMarkers(sourceText = "", settings = DEFAULT_SETTINGS)
       const match = matches[markerIndex];
       const end = matches[markerIndex + 1]?.index ?? lines[index].length;
       let action = cleanMarkedActionSourceText(lines[index].slice((match.index || 0) + match[0].length, end));
+      if (matches.length === 1 && action) { // writing-mode: single marker with text on both sides combines before and after
+        const before = cleanMarkedActionSourceText(lines[index].slice(0, match.index || 0).replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")); // writing-mode: combined action strips bullet and number syntax from the before-text
+        if (before) action = `${before} ${action}`.replace(/\s+/g, " ").trim(); // writing-mode: combined marker action collapses whitespace
+      }
+      if (!action && markerIndex === 0) { // writing-mode: same-line before-text fallback applies to the first marker only
+        action = cleanMarkedActionSourceText(lines[index].slice(0, match.index || 0).replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")); // writing-mode: trailing tag keeps the same-line text before the marker
+      }
       if (!action) {
         for (let next = index + 1; next < lines.length; next += 1) {
           const candidate = lines[next].trim();
@@ -40363,7 +40367,6 @@ function evidenceRerankServerDown(key) {
 function evidenceRerankClearServerDown(key) {
   EVIDENCE_RERANK_DOWN_UNTIL.delete(String(key || ""));
 }
-const EVIDENCE_RERANK_HEALTH_CACHE_MS = 30000;
 const EVIDENCE_RERANK_HEALTH_TIMEOUT_MS = 2000;
 const EVIDENCE_RERANK_EXCERPT_CHARS = 350;
 // Bounded in-memory score cache: key = shortHash over [task text, evidence
@@ -42876,7 +42879,7 @@ function stripGeneratedActionItemsSection(text) {
   const lines = String(text || "").split("\n");
   const output = [];
   let skipping = false;
-  const headingLevel = /^(\s*#{1,6})\s*(?:Semantic Todoist Sync\s*-\s*)?(?:[^\w#]+[-\s]*)?(?:Actionable\s+Items(?:\s+from\s+Note)?|Action\s+Items|Tasks?\s*&\s*Projects?|Tasks?|Projects?)\b/i;
+  const headingLevel = /^(\s*#{1,6})\s*(?:Semantic Todoist Sync\s*-\s*)?(?:[^\w#]+[-\s]*)?(?:Actionable\s+Items(?:\s+from\s+Note)?|Action\s+Items|Tasks?\s*&\s*Projects?|Tasks?|Projects?)(?:\s+(?:Completed|Processed|Delegated))?\s*:?\s*$/i; // writing-mode: whole-heading match so Task-prefixed note headings survive
   let skipLevel = 0;
   // Properties (YAML front matter) are never headings: an alias such as
   // "- Project: #Name" must not start a skipped section and shift line numbers.
@@ -42910,7 +42913,7 @@ function stripGeneratedActionItemsSection(text) {
 
 function isStandaloneActionItemsHeading(line) {
   const value = singleLine(line).replace(/^#+\s*/, "").replace(/^[^\w]+[-\s]*/, "");
-  return /^(?:Semantic Todoist Sync\s*-\s*)?(Actionable\s+Items(?:\s+from\s+Note)?|Action\s+Items|Tasks?\s*&\s*Projects?|Tasks?|Projects?)(?:\s+Completed|\s+Processed|\s+Delegated|[\s:-]|$)/i.test(value);
+  return /^(?:Semantic Todoist Sync\s*-\s*)?(Actionable\s+Items(?:\s+from\s+Note)?|Action\s+Items|Tasks?\s*&\s*Projects?|Tasks?|Projects?)(?:\s+(?:Completed|Processed|Delegated))?\s*:?\s*$/i.test(value); // writing-mode: whole-heading match so Task-prefixed note headings survive
 }
 
 function sanitizeStoredTodoistDescription(value, settings = DEFAULT_SETTINGS) {
@@ -47212,6 +47215,56 @@ function taskWorkflowAttributionForItem(item = {}, producerContext = {}) {
   return normalizeTaskWorkflowEvidenceAttribution(source, producerContext);
 }
 
+// A validated Todoist task-reference row (snapshot kind + canonical identity +
+// todoist-snapshot source surface + usable body/path) is read-only reference
+// evidence: its native owner is the REFERENCED Todoist task, never a competing
+// generation task. Recognized only through the existing snapshot validators, so
+// a spoofed kind, mismatched path, missing identity, or empty body fails closed
+// (never treated as a reference). Ownership of ordinary evidence is untouched.
+function taskWorkflowIsReadOnlyTaskReference(item = {}) { // writing-mode: read-only Todoist reference rows skip the foreign-owner denial when retrieval-bound
+  const source = item && typeof item === "object" ? item : {};
+  const chunk = source.sourceChunk && typeof source.sourceChunk === "object" ? source.sourceChunk : null;
+  const sourceKind = String(source.sourceKind || chunk?.sourceKind || "");
+  if (!isTaskReferenceSnapshotSourceKind(sourceKind)) return false;
+  const taskReference = (source.taskReference && typeof source.taskReference === "object" ? source.taskReference : null)
+    || (chunk?.taskReference && typeof chunk.taskReference === "object" ? chunk.taskReference : null);
+  if (!taskReference) return false;
+  const identity = semanticTaskReferenceCanonicalIdentity(taskReference, {});
+  if (!identity.key) return false;
+  const recordPath = String(source.path || chunk?.path || source.provenance?.path || "");
+  const recordText = String(source.text ?? source.excerpt ?? source.content ?? chunk?.text ?? chunk?.content ?? "");
+  if (!recordPath || !recordText.trim()) return false;
+  const record = {
+    sourceKind,
+    path: recordPath,
+    task: Object.assign({}, taskReference, {
+      nonVaultSource: taskReference.nonVaultSource ?? chunk?.nonVaultSource ?? source.nonVaultSource,
+      sourceSurface: taskReference.sourceSurface || chunk?.sourceSurface || source.sourceSurface,
+      retrievalEligible: taskReference.retrievalEligible ?? chunk?.retrievalEligible ?? source.retrievalEligible
+    })
+  };
+  if (!semanticTaskReferenceRecordSourceSurfaceValid(record)) return false;
+  // Every native owner must be the referenced Todoist identity itself: a row
+  // that also carries another generation task's ownership stays foreign-owned.
+  const referenceIds = new Set([
+    String(taskReference.todoistId || "").trim(),
+    String(taskReference.taskId || "").trim(),
+    String(taskReference.id || "").trim(),
+    String(source.taskId || "").trim(),
+    String(source.todoistId || "").trim(),
+    String(chunk?.taskId || "").trim(),
+    String(chunk?.todoistId || "").trim()
+  ].filter(Boolean));
+  if (identity.oid) {
+    referenceIds.add(identity.oid);
+    referenceIds.add(String(identity.oid).toLowerCase());
+  }
+  const owners = taskWorkflowAttributionForItem(source, {}).nativeOwnerIds.map(String);
+  if (!owners.length) return false;
+  return owners.every((owner) => referenceIds.has(owner)
+    || (Boolean(identity.oid) && String(owner).toUpperCase() === identity.oid));
+}
+
 // The single authorization decision for supplemental evidence. Both the
 // selected and pruned-reference paths and ownership-sensitive fact/bundle
 // consumers call this; classifications such as selected/missing/protected/
@@ -47252,7 +47305,16 @@ function taskWorkflowEvidenceAuthorization(item = {}, taskId = "", scopeId = "",
   if (!activeContractId) return Object.freeze({ allowed: false, reason: "unbound" });
   if (attribution.unresolvedOwnerIds.length) return Object.freeze({ allowed: false, reason: "unresolved-owner" });
   const nativeOwnerIds = attribution.nativeOwnerIds.map(String);
-  if (nativeOwnerIds.length && !nativeOwnerIds.includes(citingTaskId)) {
+  const retrievalBound = attribution.retrievalBindings.some((binding) => scopeMatches(binding) && citesCitingTask(binding));
+  // Read-only reference exception: a validated Todoist task-reference row whose
+  // native owner is the referenced Todoist task (not a generation task) skips
+  // the foreign-owner denial ONLY when it is retrieval-bound for this citing
+  // task/scope and the ACTIVE contract. Unresolved owners still deny above;
+  // rows with empty/foreign-contract bindings, rows without a binding for the
+  // citing task+scope, and ordinary cross-task ownership still deny here (when
+  // not reference-bound) or as `unbound` below.
+  const referenceRetrievalBound = retrievalBound && taskWorkflowIsReadOnlyTaskReference(item); // writing-mode: retrieval-bound Todoist reference rows skip the foreign-owner denial
+  if (!referenceRetrievalBound && nativeOwnerIds.length && !nativeOwnerIds.includes(citingTaskId)) {
     return Object.freeze({ allowed: false, reason: "foreign-owner" });
   }
   if (nativeOwnerIds.length > 1 && nativeOwnerIds.includes(citingTaskId)) {
@@ -47262,7 +47324,6 @@ function taskWorkflowEvidenceAuthorization(item = {}, taskId = "", scopeId = "",
       String(binding?.taskId || "") === citingTaskId && scopeMatches(binding));
     if (!ownNativeBound || !ownRetrievalBound) return Object.freeze({ allowed: false, reason: "foreign-owner" });
   }
-  const retrievalBound = attribution.retrievalBindings.some((binding) => scopeMatches(binding) && citesCitingTask(binding));
   if (!retrievalBound) return Object.freeze({ allowed: false, reason: "unbound" });
   return Object.freeze({ allowed: true, reason: "authorized" });
 }
@@ -49843,8 +49904,17 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
         .filter((marker) => (marker.action === actionText || (marker.action.startsWith(actionText) && /^\s/.test(marker.action.slice(actionText.length))))
         && Array.isArray(scopeForAction?.lines)
         && scopeForAction.lines.some((line) => Number(line) >= self.lineStart && Number(line) <= self.lineEnd)) : [];
+    // writing-mode: when the top query-handle chunk does not hold the marker line (list-group
+    // split), validate against the source contract's marker record for this scope instead:
+    // same action match rule, and the marker's line must lie in the scope's own lines.
+    const scopeMarkerOk = Array.isArray(sourceContract.explicitMarkers) && Array.isArray(scopeForAction?.lines)
+      && scopeForAction.lines.some((line) => sourceContract.explicitMarkers.some((marker) => marker.scopeId === scopeForAction.scopeId
+        && Number(marker.line) === Number(line)
+        && (marker.action === actionText || (marker.action.startsWith(actionText) && /^\s/.test(marker.action.slice(actionText.length))))));
+    // writing-mode: single-match rule keeps governing the chunk-local path; the contract-marker
+    // fallback above only satisfies it when scopeForAction.action already equals actionText.
     if (!self || !sourcePath || self.path !== sourcePath || !scopeForAction
-      || String(scopeForAction.action || "").trim() !== actionText || markerMatches.length !== 1) {
+      || String(scopeForAction.action || "").trim() !== actionText || (markerMatches.length !== 1 && !scopeMarkerOk)) {
       // Say which sub-check failed (counts and flags only, never note text).
       const why = [];
       if (!self) why.push("self-missing");
@@ -53248,16 +53318,6 @@ function usesOpenAIEmbeddingModel(value) {
 function aiProviderForModel(value) {
   return usesGeminiChatModel(value) || usesGeminiEmbeddingModel(value) ? "gemini" : "openai";
 }
-function generationProviderForSelectedModel(settings = DEFAULT_SETTINGS, model = "", currentProvider = "") {
-  const selectedModel = String(model || "").trim();
-  if (usesGeminiChatModel(selectedModel)) return "gemini";
-  if (providerCatalogModels(settings, "openrouter").includes(selectedModel)) return "openrouter";
-  if (providerCatalogModels(settings, "anthropic").includes(selectedModel)) return "anthropic";
-  const normalizedOpenAIModel = normalizeOpenAIModelId(selectedModel);
-  if (providerCatalogModels(settings, "openai").some((candidate) => normalizeOpenAIModelId(candidate) === normalizedOpenAIModel)) return "openai";
-  const fallbackProvider = String(currentProvider || "").trim();
-  return fallbackProvider ? stableSupportedProvider(fallbackProvider, "openai") : "openai";
-}
 
 // Embedding identity is explicit when settings provide it.  aiProviderForModel
 // remains a legacy fallback for pre-provider settings only; a custom OpenAI-
@@ -55864,6 +55924,7 @@ if (typeof module !== "undefined" && module.exports) {
     // Test-only seams for the Task 6 focused harness (Node require path only;
     // not runtime/plugin API).
     buildTaskSourceContract,
+    sourceContractSourceText, // writing-mode: test seam so the heading-strip test exercises the real strip
     buildTaskEvidenceCatalog,
     attachTaskWorkflowSemanticEvidence,
     resolveTaskWorkflowReferences,

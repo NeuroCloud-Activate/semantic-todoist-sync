@@ -265,6 +265,7 @@ module.exports = {
   CONTEXT_EXTENSIONS,
   DEFAULT_CONTEXT_FOLDER,
   MAX_CONTEXT_FILE_BYTES,
+  baseNameOf,
   isAbsoluteContextPath,
   resolveContextRoot,
   listContextFiles,

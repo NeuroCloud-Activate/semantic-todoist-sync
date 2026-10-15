@@ -1,5 +1,7 @@
 "use strict";
 
+const { baseNameOf } = require("../context/source.js");
+
 function startNumber(noteText) {
   const text = typeof noteText === "string" ? noteText : "";
   const re = /\[\^(\d+)\]/g;
@@ -34,11 +36,6 @@ function normaliseHeading(s) {
   return h;
 }
 
-function basenameOf(p) {
-  const parts = String(p).split(/[\\/]/);
-  return parts[parts.length - 1];
-}
-
 function stripMdExtension(path) {
   return path.endsWith(".md") ? path.slice(0, -3) : path;
 }
@@ -49,7 +46,7 @@ function labelFor(source) {
     const path = source.path || "";
     const rawHeading = source.heading || "";
     const heading = normaliseHeading(rawHeading);
-    const baseName = basenameOf(stripMdExtension(path));
+    const baseName = baseNameOf(stripMdExtension(path));
     if (isUnsafeName(path)) {
       return heading ? baseName + ", " + heading : baseName;
     }
@@ -61,7 +58,7 @@ function labelFor(source) {
     const path = source.path || "";
     const locator = source.locator || "";
     if (isUnsafeName(path)) {
-      const base = basenameOf(path);
+      const base = baseNameOf(path);
       return locator ? base + ", " + locator : base;
     }
     return locator ? "[[" + path + "]], " + locator : "[[" + path + "]]";
@@ -71,7 +68,7 @@ function labelFor(source) {
     const path = source.path || "";
     const locator = source.locator || "";
     if (isUnsafeName(path)) {
-      const base = basenameOf(path);
+      const base = baseNameOf(path);
       return locator ? base + ", " + locator : base;
     }
     return locator ? "[[" + path + "]], " + locator : "[[" + path + "]]";

@@ -1,4 +1,4 @@
-"use strict";
+﻿"use strict";
 
 // Provider-free routing contract: background scoring must preserve the
 // pre-change retrieval result while covering route rows and required rows.
@@ -136,7 +136,7 @@ function makeCorpus(count = 180) {
       path: pathname,
       text,
       embedding: [2 - index * 0.01, 0.5, 0.3, 0.1],
-      embeddingContentVersion: 3,
+      embeddingContentVersion: 4,
       sourceKind: "note",
       scopeRefs: [`scope-${index % 3}`],
       taskRefs: [`task-${index % 5}`],
@@ -202,12 +202,11 @@ async function prepare(Plugin, count = 180) {
     dimension: 4
   });
   assert.ok(routingState && routingState.routingIndex, "offline fixture routing state must prepare");
-  instance.productionSemanticRoutingState = routingState;
   return { instance, chunks, routingState };
 }
 
 function handle(vector) {
-  return { provider: "openai", model: "text-embedding-3-small", encoderVersion: 3, dimension: vector.length, vector };
+  return { provider: "openai", model: "text-embedding-3-small", encoderVersion: 4, dimension: vector.length, vector };
 }
 
 function referenceCosine(a, b) {

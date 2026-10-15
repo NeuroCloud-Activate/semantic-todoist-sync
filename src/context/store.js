@@ -6,7 +6,7 @@
 // (`exists`/`read`/`write`); `path` is a vault-relative file path.
 
 const { extractContextFile } = require("./extract.js");
-const { listContextFiles, readContextFile } = require("./source.js");
+const { baseNameOf, listContextFiles, readContextFile } = require("./source.js");
 
 const STORE_VERSION = 1;
 const MAX_CHUNK_CHARS = 1500;
@@ -25,10 +25,6 @@ function cosine(a, b) {
   }
   if (na === 0 || nb === 0) return 0;
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-function baseNameOf(p) {
-  return String(p).split(/[\\/]/).pop();
 }
 
 // Split a segment longer than MAX_CHUNK_CHARS on paragraph boundaries

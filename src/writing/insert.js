@@ -35,12 +35,23 @@ function insertDraft(editor, plan, text) {
   editor.replaceRange(text, plan.from, plan.to);
 }
 
-function composeDraft(markdown, footnotes) {
+function composeDraft(markdown, footnotes, sourcesBlock) {
   const body = typeof markdown === "string" ? markdown : "";
   const foot = typeof footnotes === "string" ? footnotes : "";
-  if (!foot.trim()) return body;
+  const block = typeof sourcesBlock === "string" ? sourcesBlock : "";
+  if (!foot.trim()) {
+    if (!block.trim() || !body.trim() || hasSourcesBlock(body)) return body;
+    return body + "\n\n" + block;
+  }
   if (!body.trim()) return foot;
-  return body + "\n\n" + foot;
+  const base = body + "\n\n" + foot;
+  if (!block.trim() || hasSourcesBlock(base)) return base;
+  return base + "\n\n" + block;
+}
+
+// A model-echoed Sources searched section never triggers a second code-generated one.
+function hasSourcesBlock(text) {
+  return /^Sources searched:/m.test(String(text || ""));
 }
 
 module.exports = { planInsertion, insertDraft, composeDraft };

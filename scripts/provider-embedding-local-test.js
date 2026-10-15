@@ -82,7 +82,7 @@ const makePlugin = (settings) => {
     openwebuiApiKey: 'FICTIONAL_WEBUI_TOKEN'
   });
   await webui.embedTexts(['FICTIONAL_A'], 'document');
-  assert.strictEqual(calls[0].url, 'https://sentinel.invalid/api/v1/embeddings');
+  assert.strictEqual(calls[0].url, 'https://sentinel.invalid/api/embeddings');
 
   calls.length = 0;
   const openai = makePlugin({ embeddingProvider: 'openai', embeddingModel: 'text-embedding-3-large', openAiEmbeddingDimensions: 3, openaiApiKey: 'FICTIONAL_OPENAI_KEY' });

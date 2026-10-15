@@ -56,7 +56,7 @@ assert.match(systemPrompt, /never resolve source-relative terms from the current
 assert.match(systemPrompt, /never invent a source date/);
 assert.match(defaultPrompt, /For every task and subtask, independently evaluate labels, priority, due_date, and deadline_date/);
 assert.match(defaultPrompt, /Do not require literal hashtags, priority markers, or ISO date tokens unless the saved instruction explicitly requires them/);
-assert.match(defaultPrompt, /Empty labels, priority 1, and null dates are valid when no different value is supported/);
+assert.match(defaultPrompt, /Empty labels and priority 1 are valid when no different value is supported; every main task still requires a due_date under the date rule below, and deadline_date stays null when no different value is supported\./);
 assert.match(defaultPrompt, /Labels: Do not add labels unless explicitly instructed\./);
 assert.match(defaultPrompt, /Priority: Assign priority 1 to 4\./);
 assert.match(defaultPrompt, /Use YYYY-MM-DD dates only when supported by the source\./);

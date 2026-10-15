@@ -454,6 +454,8 @@ async function writeWithEvidence(plugin, options) {
     }),
     evidenceCount: evidence.length,
     dropped: rewritten.dropped,
+    // writing-mode: sources searched block returned so every note insert shows honestly which sources were (not) searched
+    sourcesBlock,
     // writing-mode: task 10 report wanted flags so the sidebar only warns about an unavailable-but-wanted vault
     searched: { research: !!researchStore, researchWanted: useResearch, vault: vaultReady, context: useContext, vaultReason, vaultWanted, contextWanted: useContext },
   };

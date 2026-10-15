@@ -94,3 +94,5 @@ PUBLIC-SHARE-MANIFEST.json
 
 # Local test credential (never commit)
 *.rtf
+
+.tmp-gold-*/

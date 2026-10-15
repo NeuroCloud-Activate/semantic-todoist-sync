@@ -18,17 +18,17 @@ global.window = { setTimeout, clearTimeout, requestIdleCallback: null };
 global.fetch = async () => { throw new Error('network disabled'); };
 
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
-assert.deepStrictEqual(Plugin.SUPPORTED_AI_PROVIDERS, ['openai', 'gemini', 'openrouter', 'openwebui', 'customopenai']);
+assert.deepStrictEqual(Plugin.SUPPORTED_AI_PROVIDERS, ['openai', 'gemini', 'openrouter', 'openwebui', 'customopenai', 'anthropic']);
 assert.deepStrictEqual(Plugin.AI_OPERATION_KEYS, [
   'chat-query', 'prompt-response', 'task-generation', 'task-description',
-  'section-title', 'scheduler', 'policy', 'deduplication'
+  'section-title', 'scheduler', 'policy', 'deduplication', 'write'
 ]);
 assert.strictEqual(typeof Plugin.resolveOperationReference, 'function');
 assert.strictEqual(typeof Plugin.normalizeStableSettings, 'function');
 
 const defaults = Plugin.DEFAULT_SETTINGS;
 const primary = Plugin.resolveOperationReference(defaults, 'chat-query', 'primary');
-assert.deepStrictEqual(primary, { provider: 'openrouter', model: 'openai/gpt-5.6-luna', reasoningEffort: 'medium' });
+assert.deepStrictEqual(primary, { provider: 'openrouter', model: 'openai/gpt-5.6-luna', reasoningEffort: 'auto' });
 const fallback = Plugin.resolveOperationReference(defaults, 'chat-query', 'fallback');
 assert.notStrictEqual(`${primary.provider}:${primary.model}`, `${fallback.provider}:${fallback.model}`);
 for (const operation of Plugin.AI_OPERATION_KEYS) {

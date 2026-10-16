@@ -43,4 +43,9 @@ assert.deepStrictEqual(Plugin.resolveOperationReference(migrated, 'scheduler', '
 const removedProvider = Plugin.normalizeStableSettings({ aiModelProvider: 'opencodego', chatModel: 'go-model' });
 assert.notStrictEqual(removedProvider.aiModelProvider, 'opencodego');
 assert.notStrictEqual(Plugin.resolveOperationReference(removedProvider, 'chat-query', 'primary').provider, 'opencodego');
+const absMigrated = Plugin.normalizeStableSettings({ writingContextFolder: 'C:\\Notes\\Ctx' });
+assert.strictEqual(absMigrated.writingContextFolder, 'Semantic Todoist Sync/Context');
+const relMigrated = Plugin.normalizeStableSettings({ writingContextFolder: 'My/Context' });
+assert.strictEqual(relMigrated.writingContextFolder, 'My/Context');
+
 console.log('settings-migration-local-test: PASS');

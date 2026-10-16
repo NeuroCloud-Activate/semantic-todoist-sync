@@ -1,4 +1,22 @@
 # Changelog
+## 0.9.25 - 2026-10-16
+### Changed
+- **Writing context folder is now vault-only.** An absolute folder path outside the vault is no longer read from disk: the setting rejects it on save and a path already saved is resolved to the in-vault context folder (`Semantic Todoist Sync/Context`). This clears the Obsidian review finding "Direct Filesystem Access".
+### Fixed
+- **No Node filesystem access outside the vault API.** `src/context/source.js` lists and reads context files through the vault adapter only; its `fs`/`path` requires are gone.
+- **Built `main.js` no longer creates script elements at runtime.** The async polyfill that did `document.createElement("script")` and `new Function` is replaced by a MessageChannel shim, and the spreadsheet library's Node `fs` fallback with an inert stub, both wired as esbuild aliases. Clear the review findings "Code creates script elements at runtime" and the bundled `require("fs")`.
+- `.docx`, `.xlsx`, `.csv` and `.pdf` context extraction is unchanged: mammoth, jszip and SheetJS are still bundled and their tests still pass.
+### Notes
+- `npm test` 49/49. Built `main.js` (SHA-256 0067a96e...) greps clean for `createElement("script")`, `require("fs")` and `require("fs/promises")`.
+- Kept by design and reported as recommendations only: vault file enumeration (the plugin's index), the "Copy token" clipboard write behind a user click, and `new Function` inside mammoth's bundled template helper (removing it would drop `.docx` support).
+## 0.9.24 - 2026-10-15
+### Added
+- **Ask answers now group related claims under `**Topic:**` headings**, with code-side subset merge reuniting per-item labels (for example Jim items across sources) so related claims stay together instead of scattering per source.
+- `scripts/structured-chat-evidence-test.js` — structured chat evidence regression test.
+### Fixed
+- Ask follow-up / action answers omit completed items unless explicitly asked, and flag open items older than 6 months (relative to 2026-10-15) as possibly stale.
+### Notes
+- Live vault validation passed; `npm test` 49/49. Merge-pass comment `// Merge pass: model emits varied per-claim topic labels; subset merge reunites same-item labels.` confirmed in built `main.js` (SHA-256 8d0050d4...).
 
 ## 0.9.23 - 2026-10-15
 ### Added

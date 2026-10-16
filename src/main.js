@@ -24480,7 +24480,7 @@ function systemOneServerAddressSetting(containerEl, plugin) {
 }
 
 function systemOneDecisionModelSettings(containerEl, plugin) {
-  new Setting(containerEl)
+  const systemOneDecisionModelSetting = new Setting(containerEl)
     .setName("System One decision model (optional)")
     .setDesc(settingDescription("System One decision model (optional)", "evidenceRerankEnabled"))
     .addToggle((toggle) => toggle.setValue(plugin.settings.evidenceRerankEnabled === true).onChange(async (value) => {
@@ -24488,6 +24488,7 @@ function systemOneDecisionModelSettings(containerEl, plugin) {
       await plugin.saveSettings();
       renderSystemOneDecisionModelBody();
     }));
+  systemOneDecisionModelSetting.settingEl.addClass("semantic-todoist-toggle-setting");
   const body = containerEl.createDiv({ cls: "semantic-todoist-systemone-body" });
   let statusEl = null;
   let running = false;
@@ -26447,13 +26448,14 @@ function providerEmbeddingSettings(containerEl, plugin, refreshDisplay) {
       try { await plugin.validateEmbeddingProvider(true); } catch (error) { /* label-only: validateEmbeddingProvider already reports safely */ }
     });
   });
-  new Setting(containerEl).setName("Warm embedding server on startup").setDesc(settingDescription("Warm embedding server on startup", "warmEmbeddingServerOnStartup")).addToggle((toggle) => {
+  const warmEmbeddingServerSetting = new Setting(containerEl).setName("Warm embedding server on startup").setDesc(settingDescription("Warm embedding server on startup", "warmEmbeddingServerOnStartup")).addToggle((toggle) => {
     toggle.setValue(plugin.settings.warmEmbeddingServerOnStartup === true).onChange(async (value) => {
       plugin.settings.warmEmbeddingServerOnStartup = value === true;
       if (value === true) plugin.semanticEmbeddingWarmupAttemptedFor = "";
       await plugin.saveSettings();
     });
   });
+  warmEmbeddingServerSetting.settingEl.addClass("semantic-todoist-toggle-setting");
 }
 
 function embeddingCapabilitySummary(settings, provider, model) {
@@ -26753,11 +26755,12 @@ function taskSectionTitleModeSetting(containerEl, plugin) {
 }
 
 function toggleSetting(containerEl, name, desc, plugin, key, onChanged = null) {
-  new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc)).addToggle((toggle) => toggle.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
+  const setting = new Setting(containerEl).setName(name).setDesc(settingDescription(name, key, desc)).addToggle((toggle) => toggle.setValue(Boolean(plugin.settings[key])).onChange(async (value) => {
     plugin.settings[key] = value;
     if (typeof onChanged === "function") onChanged(value);
     await plugin.saveSettings();
   }));
+  setting.settingEl.addClass("semantic-todoist-toggle-setting");
 }
 
 function dropdownSetting(containerEl, name, plugin, key, options) {

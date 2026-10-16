@@ -1,4 +1,10 @@
 # Changelog
+## 0.9.26 - 2026-10-16
+### Fixed
+- **Obsidian lint: CSS warnings cleared.** The settings toggle-row layout no longer uses `:has()` or `column-gap`; the rows are tagged with a `semantic-todoist-toggle-setting` class instead, with the same layout.
+- **Dependency advisory cleared.** `sprintf-js` (CVE-2026-97058, no patched version) is removed from the install tree by pinning the CLI-only `argparse` used by mammoth to 2.0.1. Nothing from it is in the built plugin.
+### Notes
+- `npm test` 50/50. Built `main.js` greps clean for `sprintf-js`, `argparse`, `createElement("script")` and `require("fs")`.
 ## 0.9.25 - 2026-10-16
 ### Changed
 - **Writing context folder is now vault-only.** An absolute folder path outside the vault is no longer read from disk: the setting rejects it on save and a path already saved is resolved to the in-vault context folder (`Semantic Todoist Sync/Context`). This clears the Obsidian review finding "Direct Filesystem Access".

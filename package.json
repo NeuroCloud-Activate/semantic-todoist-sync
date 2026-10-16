@@ -1,6 +1,6 @@
 {
   "name": "semantic-todoist-sync",
-  "version": "0.9.25",
+  "version": "0.9.26",
   "private": true,
   "description": "Obsidian plugin for semantic Todoist sync",
   "scripts": {
@@ -10,6 +10,9 @@
   },
   "devDependencies": {
     "esbuild": "^0.28.2"
+  },
+  "overrides": {
+    "argparse": "2.0.1"
   },
   "dependencies": {
     "mammoth": "^1.9.0",

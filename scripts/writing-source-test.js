@@ -1,10 +1,14 @@
 "use strict";
 
-// Task 3 (context folder source) — TDD test. Requires src/context/source.js.
+// Task 3 (context folder source) — TDD test, vault-only contract.
+// Absolute configured paths are rejected at resolve time (vault default +
+// notice); legacy { kind: "external" } rootInfo values are rejected/handled
+// without touching Node fs. Static assert below pins the no-fs requirement.
 const assert = require("assert");
 const fs = require("fs/promises");
 const os = require("os");
 const nodePath = require("path");
+const ownFs = require("fs");
 
 const source = require("../src/context/source.js");
 
@@ -62,6 +66,9 @@ function bufToString(ab) {
   return Buffer.from(ab).toString("utf8");
 }
 
+const VAULT_DEFAULT = "Semantic Todoist Sync/Context";
+const OUTSIDE_NOTICE_RE = /outside the vault.*no longer supported/i;
+
 (async () => {
   // 1. vault mode lists nested files, filters .exe, returns size/mtime
   {
@@ -90,34 +97,27 @@ function bufToString(ab) {
     console.log("PASS vault mode lists nested files, filters .exe, returns size/mtime");
   }
 
-  // 2. external mode on desktop lists files from a real temp dir via fs
+  // 2. absolute configured path on desktop resolves to the vault default + notice
   {
     const dir = await makeTempDir("writing-source-ext-");
     await fs.writeFile(nodePath.join(dir, "a.md"), "ext hello");
-    await fs.mkdir(nodePath.join(dir, "sub"), { recursive: true });
-    await fs.writeFile(nodePath.join(dir, "sub", "b.csv"), "x,y\n1,2\n");
-    await fs.writeFile(nodePath.join(dir, "sub", "evil.exe"), "nope");
-    const app = makeVaultApp({});
+    const app = makeVaultApp({
+      "Semantic Todoist Sync/Context/from-vault.md": { size: 9, mtime: 1700000013000, content: "vault wins" },
+    });
     const rootInfo = await source.resolveContextRoot(
       app, { writingContextFolder: dir }, { isDesktop: true }
     );
-    assert.strictEqual(rootInfo.kind, "external");
-    assert.strictEqual(rootInfo.root, dir);
+    assert.strictEqual(rootInfo.kind, "vault");
+    assert.strictEqual(rootInfo.root, VAULT_DEFAULT);
+    assert.ok(rootInfo.notice && OUTSIDE_NOTICE_RE.test(rootInfo.notice), `notice must say outside-vault/no-longer-supported, got: ${rootInfo.notice}`);
+    assert.ok(rootInfo.notice.includes(dir), "notice must echo the configured path");
+    // The on-disk temp file must NOT leak into the listing: vault wins.
     const files = await source.listContextFiles(rootInfo, app);
-    const names = files.map((f) => f.name).sort();
-    assert.deepStrictEqual(names, ["a.md", "b.csv"]);
-    for (const f of files) {
-      assert.ok(nodePath.isAbsolute(f.id), `id must be absolute: ${f.id}`);
-      assert.strictEqual(typeof f.size, "number");
-      assert.strictEqual(typeof f.mtime, "number");
-    }
-    const target = files.find((f) => f.name === "a.md");
-    const content = bufToString(await source.readContextFile(rootInfo, app, target.id));
-    assert.strictEqual(content, "ext hello");
-    console.log("PASS external mode on desktop lists files from a real temp dir");
+    assert.deepStrictEqual(files.map((f) => f.id), ["Semantic Todoist Sync/Context/from-vault.md"]);
+    console.log("PASS absolute path on desktop resolves to vault default with notice");
   }
 
-  // 3. absolute path with isDesktop:false -> kind vault, notice mentions mobile
+  // 3. absolute path on mobile resolves to the same vault default + notice
   {
     const app = makeVaultApp({});
     const abs = nodePath.join(os.tmpdir(), "writing-source-mobile-absent");
@@ -125,12 +125,12 @@ function bufToString(ab) {
       app, { writingContextFolder: abs }, { isDesktop: false }
     );
     assert.strictEqual(rootInfo.kind, "vault");
-    assert.strictEqual(rootInfo.root, "Semantic Todoist Sync/Context");
-    assert.ok(rootInfo.notice && /mobile/i.test(rootInfo.notice), "notice must mention mobile");
-    console.log("PASS absolute path on mobile falls back to vault with mobile notice");
+    assert.strictEqual(rootInfo.root, VAULT_DEFAULT);
+    assert.ok(rootInfo.notice && OUTSIDE_NOTICE_RE.test(rootInfo.notice), `notice must say outside-vault/no-longer-supported, got: ${rootInfo.notice}`);
+    console.log("PASS absolute path on mobile resolves to vault default with notice");
   }
 
-  // 4. missing external dir -> kind vault + notice
+  // 4. missing absolute dir -> vault default + notice (no fs probe)
   {
     const app = makeVaultApp({});
     const missing = nodePath.join(os.tmpdir(), `writing-source-gone-${Date.now()}`);
@@ -138,9 +138,9 @@ function bufToString(ab) {
       app, { writingContextFolder: missing }, { isDesktop: true }
     );
     assert.strictEqual(rootInfo.kind, "vault");
-    assert.strictEqual(rootInfo.root, "Semantic Todoist Sync/Context");
-    assert.ok(rootInfo.notice && rootInfo.notice.length > 0, "missing dir must produce a notice");
-    console.log("PASS missing external dir falls back to vault with notice");
+    assert.strictEqual(rootInfo.root, VAULT_DEFAULT);
+    assert.ok(rootInfo.notice && OUTSIDE_NOTICE_RE.test(rootInfo.notice), `missing absolute dir must produce the outside-vault notice, got: ${rootInfo.notice}`);
+    console.log("PASS missing absolute dir resolves to vault default with notice");
   }
 
   // 5. files > 20MB are returned with skipped too-large and are not readable
@@ -175,8 +175,8 @@ function bufToString(ab) {
     assert.deepStrictEqual(app.__mkdirCalls, ["Writing Context/New"]);
     console.log("PASS ensureVaultContextFolder creates missing folders only");
     const nested = makeVaultApp({});
-    await source.ensureVaultContextFolder(nested, "Semantic Todoist Sync/Context");
-    assert.deepStrictEqual(nested.__mkdirCalls, ["Semantic Todoist Sync", "Semantic Todoist Sync/Context"], "parents are created before the context folder");
+    await source.ensureVaultContextFolder(nested, VAULT_DEFAULT);
+    assert.deepStrictEqual(nested.__mkdirCalls, ["Semantic Todoist Sync", VAULT_DEFAULT], "parents are created before the context folder");
     console.log("PASS ensureVaultContextFolder creates missing parent folders");
   }
 
@@ -210,26 +210,27 @@ function bufToString(ab) {
     console.log("PASS vault traversal outside context root is rejected");
   }
 
-  // 9. external absolute path outside the root is rejected
+  // 9. legacy { kind: "external" } rootInfo never touches fs: reads rejected,
+  // listing falls back to the vault default
   {
     const dir = await makeTempDir("writing-source-ext-guard-");
     await fs.writeFile(nodePath.join(dir, "a.md"), "ok");
-    const outside = nodePath.join(nodePath.dirname(dir), `writing-source-outside-${Date.now()}.md`);
-    await fs.writeFile(outside, "evil");
-    try {
-      const rootInfo = { kind: "external", root: dir };
-      await assert.rejects(
-        source.readContextFile(rootInfo, makeVaultApp({}), outside),
-        (err) => err && err.code === "outside-context-root",
-        "external path outside root must be rejected"
-      );
-      const target = nodePath.join(dir, "a.md");
-      const content = bufToString(await source.readContextFile(rootInfo, makeVaultApp({}), target));
-      assert.strictEqual(content, "ok");
-    } finally {
-      try { await fs.rm(outside, { force: true }); } catch { /* cleanup best-effort */ }
-    }
-    console.log("PASS external path outside context root is rejected");
+    const vaultApp = makeVaultApp({
+      "Semantic Todoist Sync/Context/kept.md": { size: 2, mtime: 1700000014000, content: "kept" },
+    });
+    const rootInfo = { kind: "external", root: dir };
+    await assert.rejects(
+      source.readContextFile(rootInfo, vaultApp, nodePath.join(dir, "a.md")),
+      (err) => err && (err.code === "outside-context-root" || err.code === "not-found"),
+      "legacy external read must be rejected without fs"
+    );
+    const files = await source.listContextFiles(rootInfo, vaultApp);
+    assert.ok(
+      files.every((f) => !nodePath.isAbsolute(f.id)),
+      "legacy external listing must not return absolute fs ids"
+    );
+    assert.deepStrictEqual(files.map((f) => f.id), ["Semantic Todoist Sync/Context/kept.md"]);
+    console.log("PASS legacy external rootInfo is rejected/handled without fs");
   }
 
   // 10. vault folder setting is normalised
@@ -257,11 +258,12 @@ function bufToString(ab) {
       ["Writing Context/Sub/a.md"]
     );
     const blank = await source.resolveContextRoot(app, { writingContextFolder: "   " }, { isDesktop: true });
-    assert.strictEqual(blank.root, "Semantic Todoist Sync/Context");
+    assert.strictEqual(blank.root, VAULT_DEFAULT);
     console.log("PASS vault folder setting is normalised");
   }
 
-  // 11. dot folders/files are skipped in vault and external recursion
+  // 11. dot folders/files are skipped in vault recursion; absolute roots
+  // resolve to the vault default instead of walking fs
   {
     const app = makeVaultApp({
       "Writing Context/a.md": { size: 2, mtime: 1700000009000, content: "ok" },
@@ -275,32 +277,15 @@ function bufToString(ab) {
       ["Writing Context/a.md"]
     );
     const dir = await makeTempDir("writing-source-ext-dot-");
-    await fs.writeFile(nodePath.join(dir, "a.md"), "ok");
-    await fs.mkdir(nodePath.join(dir, ".obsidian"), { recursive: true });
-    await fs.writeFile(nodePath.join(dir, ".obsidian", "x.md"), "hidden");
-    await fs.mkdir(nodePath.join(dir, ".git"), { recursive: true });
-    await fs.writeFile(nodePath.join(dir, ".git", "y.txt"), "hidden");
     await fs.writeFile(nodePath.join(dir, ".hidden.md"), "hidden");
-    assert.deepStrictEqual(
-      (await source.listContextFiles({ kind: "external", root: dir }, makeVaultApp({}))).map((f) => f.name),
-      ["a.md"]
-    );
+    const absRoot = await source.resolveContextRoot(app, { writingContextFolder: dir }, { isDesktop: true });
+    assert.strictEqual(absRoot.kind, "vault");
+    assert.strictEqual(absRoot.root, VAULT_DEFAULT);
     console.log("PASS dot folders/files are skipped");
   }
 
-  // 12. missing files report code not-found
+  // 12. missing vault files report code not-found
   {
-    const dir = await makeTempDir("writing-source-ext-missing-");
-    await assert.rejects(
-      source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), nodePath.join(dir, "missing.md")),
-      (err) => err && err.code === "not-found",
-      "external missing file must report not-found"
-    );
-    await assert.rejects(
-      source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), dir),
-      (err) => err && err.code === "not-found",
-      "external directory id must report not-found"
-    );
     const app = makeVaultApp({});
     const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: "Writing Context" }, { isDesktop: true });
     await assert.rejects(
@@ -311,69 +296,31 @@ function bufToString(ab) {
     console.log("PASS missing files report not-found");
   }
 
-  // 13. symlink inside the external root pointing outside is rejected
+  // 13. source file contains no direct Node filesystem requires
   {
-    const dir = await makeTempDir("writing-source-ext-link-");
-    const outsideDir = await makeTempDir("writing-source-ext-link-outside-");
-    const target = nodePath.join(outsideDir, "secret.md");
-    await fs.writeFile(target, "secret");
-    const link = nodePath.join(dir, "link.md");
-    let linked = false;
-    try {
-      await fs.symlink(target, link, "file");
-      linked = true;
-    } catch (err) {
-      if (err && (err.code === "EPERM" || err.code === "EACCES")) {
-        console.log("SKIP symlink (EPERM)");
-      } else {
-        throw err;
-      }
+    const srcText = ownFs.readFileSync(nodePath.join(__dirname, "..", "src", "context", "source.js"), "utf8");
+    for (const banned of ['require("fs")', "require('fs')", 'require("fs/promises")', "require('fs/promises')", 'require("path")', "require('path')"]) {
+      assert.ok(!srcText.includes(banned), `source.js must not contain ${banned}`);
     }
-    if (linked) {
-      await assert.rejects(
-        source.readContextFile({ kind: "external", root: dir }, makeVaultApp({}), link),
-        (err) => err && err.code === "outside-context-root",
-        "symlink escaping the root must be rejected"
-      );
-      console.log("PASS symlink inside external root pointing outside is rejected");
-    }
+    console.log("PASS source.js has no direct fs/path requires");
   }
 
-  // 13b. directory junction inside the external root pointing outside is rejected
-  // (junctions need no admin/Developer Mode on Windows; on POSIX "junction"
-  // is ignored and creates a dir symlink — the assertions still hold).
+  // 13b. resolving an absolute path performs no fs access (missing absolute
+  // path still resolves; a real temp file outside the vault is never read)
   {
-    const dir = await makeTempDir("writing-source-ext-junction-");
-    const outsideDir = await makeTempDir("writing-source-ext-junction-outside-");
-    await fs.writeFile(nodePath.join(outsideDir, "secret.txt"), "secret");
-    await fs.writeFile(nodePath.join(dir, "ok.md"), "ok");
-    const linkPath = nodePath.join(dir, "linked");
-    await fs.symlink(outsideDir, linkPath, "junction");
-    const rootInfo = { kind: "external", root: dir };
+    const dir = await makeTempDir("writing-source-no-fs-");
+    const outsideFile = nodePath.join(dir, "secret.md");
+    await fs.writeFile(outsideFile, "secret");
     const app = makeVaultApp({});
-    const files = await source.listContextFiles(rootInfo, app);
-    const escapedId = nodePath.join(linkPath, "secret.txt");
-    const escaped = files.find((f) => f.id === escapedId);
-    if (!escaped) {
-      assert.ok(
-        !files.some((f) => f.id === escapedId || f.id.startsWith(linkPath + nodePath.sep)),
-        "junction target must not be listed"
-      );
-    } else {
-      await assert.rejects(
-        source.readContextFile(rootInfo, app, escaped.id),
-        (err) => err && err.code === "outside-context-root",
-        "listed junction escape read must be rejected"
-      );
-    }
+    const rootInfo = await source.resolveContextRoot(app, { writingContextFolder: dir }, { isDesktop: true });
+    assert.strictEqual(rootInfo.kind, "vault");
+    assert.strictEqual(rootInfo.root, VAULT_DEFAULT);
     await assert.rejects(
-      source.readContextFile(rootInfo, app, escapedId),
+      source.readContextFile(rootInfo, app, outsideFile),
       (err) => err && err.code === "outside-context-root",
-      "junction escaping the root must be rejected"
+      "absolute id under a vault root must be rejected without fs"
     );
-    const normal = bufToString(await source.readContextFile(rootInfo, app, nodePath.join(dir, "ok.md")));
-    assert.strictEqual(normal, "ok");
-    console.log("PASS directory junction inside external root pointing outside is rejected");
+    console.log("PASS absolute paths resolve without fs access");
   }
 
   // 14. vault adapter stat throwing yields not-found

@@ -2815,6 +2815,8 @@ function normalizeStableSettings(input = {}) {
     // Invalid value (e.g. number, boolean) defaults to Writing Context
     folderValue = WRITING_CONTEXT_FOLDER_DEFAULT;
   }
+  // writing-mode: security — absolute (legacy) folders are never persisted; resolve to vault default
+  if (writingIsAbsoluteContextPath(folderValue)) folderValue = WRITING_CONTEXT_FOLDER_DEFAULT;
   result.writingContextFolder = folderValue === "Writing Context" ? WRITING_CONTEXT_FOLDER_DEFAULT : folderValue || WRITING_CONTEXT_FOLDER_DEFAULT; // writing-mode: old default migrates to the plugin Context folder
   result.writingDescribeImages = source.writingDescribeImages !== false;
   // writing-mode: task 10 collaborate toggle settings (length invalid falls back to standard; toggles default true unless explicitly false)
@@ -22886,7 +22888,15 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
 
     // writing-mode: Writing settings section
     const writing = settingsDisclosure(containerEl, "Writing", "Sidebar Write mode settings for drafting evidence-based prose into notes.", false);
-    textSetting(writing, "Context folder", "Default in-vault folder 'Semantic Todoist Sync/Context' (created automatically), or an absolute desktop path outside the vault. On mobile, an external path falls back to the vault folder.", this.plugin, "writingContextFolder");
+    new Setting(writing).setName("Context folder").setDesc("Folder inside the vault used for writing context files (default 'Semantic Todoist Sync/Context')").addText((text) => text.setValue(String(this.plugin.settings.writingContextFolder || "")).onChange(async (value) => {
+      if (writingIsAbsoluteContextPath(String(value || "").trim())) {
+        new Notice("Context folder must be a path inside the vault.");
+        text.setValue(String(this.plugin.settings.writingContextFolder || ""));
+        return;
+      }
+      this.plugin.settings.writingContextFolder = value;
+      await this.plugin.saveSettings();
+    }));
     toggleSetting(writing, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
     toggleSetting(writing, "Deep research evidence", "Use saved Deep research notes from the Research folder as evidence, ranked above vault notes.", this.plugin, "writingUseResearch");
     new Setting(writing).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));

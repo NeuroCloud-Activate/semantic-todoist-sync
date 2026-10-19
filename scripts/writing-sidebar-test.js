@@ -3,11 +3,58 @@
 const assert = require('assert');
 const Module = require('module');
 const path = require('path');
+const { typedRewriteInstruction } = require(path.join(__dirname, '..', 'src', 'writing', 'rewrite.js'));
 
 // Mock obsidian module for loading built main.js
 const originalLoad = Module._load;
 // Shared singleton so `instanceof MarkdownView` in tests matches the class the bundle captured.
 let obsidianMock = null;
+
+// A DOM mock that mirrors Obsidian's `createEl` for the case that matters here:
+// Obsidian honours `{ value }` on an <input> but NOT on a <textarea> (a textarea's
+// value is its text content, which createEl never sets). Verified live: a textarea
+// created with `{ value: 'x' }` has `.value === ''`, an input has `.value === 'x'`.
+class FakeElement {
+  constructor(tagName = 'div', options = {}) {
+    this.tagName = tagName;
+    this.children = [];
+    this.textContent = options.text || '';
+    this.className = options.cls || '';
+    this.attributes = { ...(options.attr || {}) };
+    this.dataset = {};
+    this.style = { setProperty() {} };
+    this.focused = false;
+    this._value = '';
+    if (this.tagName === 'input' && options.value !== undefined) this._value = String(options.value);
+  }
+  get value() { return this._value; }
+  set value(next) { this._value = String(next == null ? '' : next); }
+  createEl(tagName, options = {}) { const child = new FakeElement(tagName, options); this.children.push(child); return child; }
+  createDiv(options = {}) { return this.createEl('div', options); }
+  createSpan(options = {}) { return this.createEl('span', options); }
+  addClass(value) { this.className = `${this.className} ${value}`.trim(); return this; }
+  setAttribute(key, value) { this.attributes[key] = value; return this; }
+  setAttr(key, value) { return this.setAttribute(key, value); }
+  setText(text) { this.textContent = String(text == null ? '' : text); return this; }
+  empty() { this.children = []; this.textContent = ''; return this; }
+  focus() { this.focused = true; return this; }
+  remove() { this.removed = true; return this; }
+  insertBefore(node) { this.children.unshift(node); return node; }
+  setCta() { return this; }
+  getBoundingClientRect() { return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
+}
+
+// Depth-first search for a class the mock recorded (the modal builds its panes in the DOM).
+function findByClass(root, cls) {
+  if (!root) return null;
+  if (String(root.className || '').split(/\s+/).includes(cls)) return root;
+  for (const child of root.children || []) {
+    const found = findByClass(child, cls);
+    if (found) return found;
+  }
+  return null;
+}
+
 function mockObsidian() {
   Module._load = function (request, parent, isMain) {
     if (request !== 'obsidian') return originalLoad.call(this, request, parent, isMain);
@@ -17,8 +64,24 @@ function mockObsidian() {
       ItemView: Empty,
       MarkdownRenderer: { renderMarkdown() {} },
       MarkdownView: Empty,
-      Modal: Empty,
-      Notice: function () {},
+      Modal: class {
+        constructor(app, opts) {
+          this.app = app;
+          this.opts = opts;
+          this.modalEl = new FakeElement('div');
+          this.contentEl = new FakeElement('div');
+          this.modalEl.children.push(this.contentEl);
+          obsidianMock.modalInstances = obsidianMock.modalInstances || [];
+          obsidianMock.modalInstances.push(this);
+        }
+        // Obsidian calls onOpen() when the modal opens and onClose() when it closes.
+        open() { this.opened = true; if (typeof this.onOpen === 'function') this.onOpen(); }
+        close() { this.opened = false; if (typeof this.onClose === 'function') this.onClose(); }
+      },
+      Notice: function (msg) {
+        obsidianMock.notices = obsidianMock.notices || [];
+        obsidianMock.notices.push(String(msg));
+      },
       Plugin: Empty,
       PluginSettingTab: Empty,
       Setting: function (container) {
@@ -71,6 +134,7 @@ function mockObsidian() {
       requestUrl: async () => { throw new Error('network disabled'); },
     };
     }
+    global.MarkdownView = obsidianMock.MarkdownView;
     return obsidianMock;
   };
   global.window = { setTimeout, clearTimeout, requestIdleCallback: null, requestAnimationFrame: (fn) => setTimeout(fn, 0) };
@@ -84,6 +148,10 @@ function restoreLoad() {
 mockObsidian();
 
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
+// The rewrite-preview fixes live in src/main.js; the root main.js is the built bundle the
+// coordinator regenerates, so the new preview assertions run against the source module
+// (the bundle is built from it) and stay green until that pending rebuild.
+const SourcePlugin = require(path.join(__dirname, '..', 'src', 'main.js'));
 
 function testDefaultChat() {
   assert.strictEqual(Plugin.DEFAULT_SETTINGS.sidebarMode, undefined, 'sidebarMode removed from defaults');
@@ -282,23 +350,97 @@ function testInsertButtonClosedNoteNotice() {
   console.log('PASS insert-button-closed-note-notice (notice preserved, lookup before replaceRange)');
 }
 
+function charOffset(text, pos) {
+  const lines = String(text || '').split('\n');
+  let off = 0;
+  for (let i = 0; i < pos.line && i < lines.length; i++) off += lines[i].length + 1;
+  return off + (pos.ch || 0);
+}
+
 function makeMarkdownLeaf(filePath, text) {
   const obsidian = require('obsidian');
   const view = new obsidian.MarkdownView();
-  const calls = { replaceRange: [] };
+  let current = String(text || '');
+  const calls = { replaceRange: [], transaction: [] };
   view.file = { path: filePath, basename: filePath.split('/').pop() };
   view.editor = {
-    getSelection: () => '',
-    getCursor: () => ({ line: 0, ch: 0 }),
-    getValue: () => text,
-    posToOffset: () => 0,
+    getSelection: () => current.slice(charOffset(current, { line: 0, ch: 0 }), charOffset(current, { line: 0, ch: current.length })),
+    getCursor: (mode) => {
+      if (mode === 'from') return { line: 0, ch: 0 };
+      if (mode === 'to') return { line: 0, ch: current.length };
+      return { line: 0, ch: 0 };
+    },
+    getValue: () => current,
+    setValue: (v) => { current = String(v || ''); },
+    posToOffset: (pos) => charOffset(current, pos),
+    offsetToPos: (offset) => {
+      const lines = current.split('\n');
+      let off = 0, line = 0;
+      for (; line < lines.length; line++) {
+        const next = off + lines[line].length + 1;
+        if (offset <= next) return { line, ch: offset - off };
+        off = next;
+      }
+      return { line: lines.length - 1, ch: lines[lines.length - 1].length };
+    },
+    getRange: (from, to) => current.slice(charOffset(current, from), charOffset(current, to)),
     replaceRange: (draft, from, to) => { calls.replaceRange.push({ draft, from, to }); },
+    transaction: ({ changes }) => { calls.transaction.push(changes || []); },
   };
-  return { leaf: { view }, calls };
+  return { leaf: { view }, calls, setText: (t) => { current = String(t || ''); } };
 }
 
-function makeWriteView(plugin, leaves, mostRecentLeaf) {
-  const view = new Plugin.SemanticTodoistView({}, plugin);
+// Editor for pinned-range tests: reports a real selection (from/to) and a mutable text.
+// Obsidian's editor methods need `this` (they reach into the CodeMirror instance), so an
+// extracted method — `const getCursor = editor.getCursor; getCursor("from")` — throws
+// "Cannot read properties of undefined (reading 'cm')" on a live editor. This mock reads
+// `this._state`, so an unbound call throws the same way instead of quietly working.
+function makePinEditor(text, path, from, to) {
+  const obsidian = require('obsidian');
+  const view = new obsidian.MarkdownView();
+  const calls = { replaceRange: [], transaction: [] };
+  const editor = {
+    _state: { current: String(text || ''), from, to },
+    // Obsidian reports the selected text whichever way the range runs; the mock matches that.
+    getSelection() {
+      const { current, from: f, to: t } = this._state;
+      const a = charOffset(current, f);
+      const b = charOffset(current, t);
+      return current.slice(Math.min(a, b), Math.max(a, b));
+    },
+    getCursor(mode) {
+      const { from: f, to: t } = this._state;
+      if (mode === 'from') return f;
+      if (mode === 'to') return t;
+      return f;
+    },
+    somethingSelected() { return true; },
+    getValue() { return this._state.current; },
+    setValue(v) { this._state.current = String(v || ''); },
+    posToOffset(pos) { return charOffset(this._state.current, pos); },
+    offsetToPos(offset) {
+      const lines = this._state.current.split('\n');
+      let off = 0, line = 0;
+      for (; line < lines.length; line++) {
+        const next = off + lines[line].length + 1;
+        if (offset <= next) return { line, ch: offset - off };
+        off = next;
+      }
+      return { line: lines.length - 1, ch: lines[lines.length - 1].length };
+    },
+    getRange(f, t) { return this._state.current.slice(charOffset(this._state.current, f), charOffset(this._state.current, t)); },
+    replaceRange(draft, f, t) { calls.replaceRange.push({ draft, from: f, to: t }); },
+    transaction({ changes }) { calls.transaction.push(changes || []); },
+  };
+  view.file = { path, basename: path.split('/').pop() };
+  view.editor = editor;
+  return { view, leaf: { view }, calls, selection: editor.getSelection(), setText: (t) => { editor._state.current = String(t || ''); } };
+}
+
+function makeWriteView(plugin, leaves, mostRecentLeaf, PluginModule) {
+  // The root main.js is the built bundle the coordinator regenerates; the view class comes
+  // from src/main.js (the bundle is built from it), so the pin/rewrite paths run the source.
+  const view = new (PluginModule || SourcePlugin).SemanticTodoistView({}, plugin);
   view.messages = [];
   view.promptEl = { value: 'draft a summary' };
   view.lengthSelectEl = null;
@@ -320,18 +462,24 @@ function makeWriteView(plugin, leaves, mostRecentLeaf) {
   return view;
 }
 
-function makeWritePlugin(leafEntries) {
+function makeWritePlugin(leafEntries, writeWithEvidenceImpl) {
   let writeCalls = 0;
+  let lastWriteArgs = null;
+  const defaultStub = async () => ({ markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: 'Sources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched' });
+  const impl = writeWithEvidenceImpl || defaultStub;
   const plugin = {
-    settings: { writingCollaborateMode: false, writingDraftLength: 'standard', writingUseVault: true, writingUseContext: true, writingDescribeImages: true },
+    settings: { writingCollaborateMode: false, writingCitationStyle: 'footnotes', writingDraftLength: 'standard', writingUseVault: true, writingUseContext: true, writingDescribeImages: true },
     lastActiveMarkdownLeaf: null, // reload-while-sidebar-focused: never populated
     saveSettings: async () => {},
-    writeWithEvidence: async () => {
+    // every stub (default or per-test) is counted, so call counts never depend on which stub a test passed
+    writeWithEvidence: async (inst, opts) => {
       writeCalls += 1;
-      return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: 'Sources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched' };
+      lastWriteArgs = { instruction: inst, opts };
+      return impl(inst, opts);
     },
   };
   plugin.writeCallCount = () => writeCalls;
+  plugin.lastWriteArgs = () => lastWriteArgs;
   return plugin;
 }
 
@@ -487,10 +635,654 @@ function testTaskTabsSplit() {
   console.log('PASS task-tabs-split');
 }
 
+// Source-slice helper: the body of one class method in src/main.js, cut at the
+// next method (or at the end of the class).
+function srcClassMethodBody(src, name) {
+  const start = src.indexOf(`\n  ${name}(`);
+  assert(start >= 0, `method ${name} exists`);
+  const rest = src.slice(start + 1);
+  const nextMethod = rest.search(/\n  (?:async )?[A-Za-z_$][\w$]*\(/);
+  const classEnd = rest.indexOf('\n}\n');
+  const bounds = [nextMethod, classEnd].filter((value) => value >= 0);
+  return rest.slice(0, bounds.length ? Math.min(...bounds) : rest.length);
+}
+
+// Source-slice helper: the body of one class in src/main.js, cut at the class end.
+function srcClassBody(src, className) {
+  const start = src.indexOf(`class ${className} `);
+  assert(start >= 0, `class ${className} exists`);
+  const end = src.indexOf('\n}\n', start);
+  return src.slice(start, end < 0 ? src.length : end);
+}
+
+function testCollaborateSettingsTab() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const body = srcClassMethodBody(src, 'renderCollaborate');
+  const citation = body.indexOf('"Citation style"');
+  const context = body.indexOf('"Context folder"');
+  const rescan = body.indexOf('"Rescan context folder"');
+  const describe = body.indexOf('"Describe images"');
+  assert(citation >= 0, 'Collaborate tab has a Citation style setting');
+  assert(context > citation, 'Context folder comes after Citation style');
+  assert(rescan > context, 'Rescan context folder comes after Context folder');
+  assert(describe > rescan, 'Describe images comes after Rescan context folder');
+  for (const [value, label] of [['footnotes', 'Footnotes'], ['apa', 'APA 7'], ['nature', 'Nature']]) {
+    assert(body.includes(`addOption("${value}", "${label}")`), `citation style offers ${value} as ${label}`);
+  }
+  assert(body.includes('this.plugin.settings.writingCitationStyle || "footnotes"'), 'citation style shows the saved value');
+  assert(body.includes('this.goTo("AI & Search")'), 'Collaborate tab links to the AI & Search tab');
+  console.log('PASS collaborate-settings-tab');
+}
+
+function testAiSearchNoLongerOwnsWriting() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const body = srcClassMethodBody(src, 'renderAiSearch');
+  for (const key of ['writingContextFolder', 'writingDescribeImages', 'writingUseResearch']) {
+    assert(!body.includes(key), `AI & Search no longer owns ${key}`);
+  }
+  assert(!body.includes('settingsDisclosure(containerEl, "Writing"'), 'AI & Search no longer has a Writing section');
+  console.log('PASS ai-search-no-longer-owns-writing');
+}
+
+function testFeaturesMenuHotSwapOnly() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const body = srcClassMethodBody(src, 'openCollaborateFeaturesMenu');
+  const titles = [];
+  let at = 0;
+  while (true) {
+    const next = body.indexOf('menu.addItem(', at);
+    if (next < 0) break;
+    const following = body.indexOf('menu.addItem(', next + 1);
+    const chunk = body.slice(next, following < 0 ? body.length : following);
+    const title = chunk.match(/setTitle\("([^"]*)"\)/);
+    titles.push(title ? title[1] : '');
+    at = next + 1;
+  }
+  assert.deepStrictEqual(titles, ['Draft length', 'Evidence'], 'Features menu holds only Draft length and Evidence');
+  assert(!body.includes('setTitle("Describe images")'), 'Features menu no longer offers Describe images');
+  const label = srcClassMethodBody(src, 'updateCollaborateFeaturesLabel');
+  assert(!label.includes('images'), 'the Features label no longer mentions images');
+  console.log('PASS features-menu-hot-swap-only');
+}
+
 function testExistingSidebarTestsStillPass() {
   // (5) Existing test structure intact; all prior assertions preserved.
   assert.strictEqual(typeof Plugin.SemanticTodoistView, 'function', 'existing view class intact');
   console.log('PASS existing-sidebar-tests-still-pass');
+}
+
+function testCitationStyleDefault() {
+  assert.strictEqual(Plugin.DEFAULT_SETTINGS.writingCitationStyle, 'footnotes', 'citation style defaults to footnotes');
+  assert.strictEqual(Plugin.normalizeStableSettings({ writingCitationStyle: 'bogus' }).writingCitationStyle, 'footnotes', 'invalid style falls back to footnotes');
+  assert.strictEqual(Plugin.normalizeStableSettings({ writingCitationStyle: 'nature' }).writingCitationStyle, 'nature', 'nature kept');
+  assert.strictEqual(Plugin.normalizeStableSettings({ writingCitationStyle: 'apa' }).writingCitationStyle, 'apa', 'apa kept');
+  console.log('PASS citation-style-default');
+}
+
+function testEditorMenuGuards() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('editor-menu'), 'editor-menu handler registered');
+  assert(/writingCollaborateMode\s*!==/.test(src), 'menu guarded on collaborate mode');
+  assert(/somethingSelected/.test(src), 'menu requires selection');
+  assert(/addSeparator/.test(src), 'separator added before items');
+  assert(src.includes('Rewrite with instruction'), 'typed entry present');
+  const titles = ['Fix spelling & grammar','Improve writing','Plain language','Make concise','Expand','Continue writing','Strengthen for funders','Policy wording','Numbered steps','Formal','Neutral','Persuasive','Casual','Check against my notes'];
+  for (const t of titles) assert(src.includes(t), 'preset title present: ' + t);
+  console.log('PASS editor-menu-guards');
+}
+
+function testMenuHiddenWhenModeOff() {
+  const obsidian = require('obsidian');
+  const { rewriteMenuPin, addRewritePresetItems } = Plugin;
+  const { REWRITE_PRESETS } = require(path.join(__dirname, '..', 'src', 'writing', 'rewrite.js'));
+  const editor = {
+    somethingSelected: () => true,
+    getCursor: (mode) => (mode === 'from' ? { line: 0, ch: 0 } : { line: 0, ch: 26 }),
+    getSelection: () => 'The original passage here.',
+  };
+  const info = { file: { path: 'Notes/Passage.md' } };
+  assert.strictEqual(rewriteMenuPin({ settings: { writingCollaborateMode: false } }, editor, info), null, 'no pin while collaborate mode is off');
+  assert.strictEqual(rewriteMenuPin({ settings: { writingCollaborateMode: true } }, { somethingSelected: () => false }, info), null, 'no pin without a selection');
+  const pin = rewriteMenuPin({ settings: { writingCollaborateMode: true } }, editor, info);
+  assert.ok(pin, 'pin captured when the mode is on and text is selected');
+  assert.strictEqual(pin.original, 'The original passage here.', 'pin keeps the selected text');
+  assert.strictEqual(pin.path, 'Notes/Passage.md', 'pin keeps the file path');
+  const menu = new obsidian.Menu();
+  addRewritePresetItems(menu, REWRITE_PRESETS, { onPreset: () => {}, onTyped: () => {} });
+  assert.deepStrictEqual(
+    menu.items.map((i) => i.title),
+    ['Fix spelling & grammar', 'Improve writing', 'Plain language', 'Make concise', 'Expand', 'Continue writing', 'Grant & policy', 'Change tone', 'Check against my notes', 'Rewrite with instruction…'],
+    'menu titles follow the plan order'
+  );
+  const grant = menu.items.find((i) => i.title === 'Grant & policy');
+  assert.deepStrictEqual(grant.submenu.items.map((i) => i.title), ['Strengthen for funders', 'Policy wording', 'Numbered steps'], 'grant submenu titles');
+  const tone = menu.items.find((i) => i.title === 'Change tone');
+  assert.deepStrictEqual(tone.submenu.items.map((i) => i.title), ['Formal', 'Neutral', 'Persuasive', 'Casual'], 'tone submenu titles');
+  console.log('PASS menu-hidden-when-off');
+}
+
+async function testPinnedSelectionOpensPreview() {
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  let captured = null;
+  const plugin = makeWritePlugin(null, async (inst, opts) => {
+    captured = { mode: opts.mode, citationStyle: opts.citationStyle, inst };
+    return { markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} };
+  });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  assert.strictEqual(view.pinned.original, 'The original passage here.', 'pin original captured');
+  await view.write();
+  assert.ok(captured, 'the model was called');
+  assert.strictEqual(captured.mode, 'rewrite', 'a pinned range asks for a rewrite');
+  assert.strictEqual(captured.citationStyle, 'apa', 'the citation style comes from the settings');
+  assert.strictEqual(view.rewriteModal.before, 'The original passage here.', 'before is pinned original');
+  assert.strictEqual(view.rewriteModal.after, 'B', 'after is model markdown');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the preview does not edit the note');
+  assert.strictEqual(calls.transaction.length, 0, 'the preview does not edit the note');
+  console.log('PASS pinned-selection-opens-preview');
+}
+
+async function testPinnedRewriteUsesPinnedNote() {
+  // Two notes are open and the last-active leaf is note A, but the pin belongs to note B.
+  // The request and the preview's reference plan must use note B (pinned.path), not note A.
+  const aText = 'Alpha note body.';
+  const bText = 'Beta note body.\n\n## References\n\n1. Zed, Z. (2020). Zed entry. http://z\n';
+  const a = makePinEditor(aText, 'Notes/A.md', { line: 0, ch: 0 }, { line: 0, ch: aText.length });
+  const b = makePinEditor(bText, 'Notes/B.md', { line: 0, ch: 0 }, { line: 0, ch: 15 });
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'nature',
+    cited: [{ meta: { title: 'Alpha source', url: 'http://a' } }],
+    numbers: { 'http://a': 2 },
+  }));
+  const view = makeWriteView(plugin, [a.leaf, b.leaf], a.leaf);
+  // the last-active leaf is note A, so the old request-time lookup would pick note A
+  plugin.lastActiveMarkdownLeaf = a.leaf;
+  view.plugin.settings.writingCitationStyle = 'nature';
+  view.pinSelection(b.view.editor, 'Notes/B.md');
+  await view.write();
+  const args = plugin.lastWriteArgs();
+  assert.strictEqual(args.opts.active.path, 'Notes/B.md', 'the request names the pinned note');
+  assert.strictEqual(args.opts.active.text, bText, 'the request carries the pinned note text');
+  assert.strictEqual(args.opts.active.selection, 'Beta note body.', 'the request carries the pinned passage');
+  const modal = view.rewriteModal;
+  assert.ok(modal, 'the preview opened');
+  // note B already lists one reference, so the new entry is number 2; note A would have planned number 1
+  assert.deepStrictEqual(modal.references, ['2. Alpha source. http://a'], 'the references were planned against the pinned note text');
+  console.log('PASS pinned-rewrite-uses-pinned-note');
+}
+
+async function testBackwardsSelectionPin() {
+  const { view: leafView, leaf } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 10 }, { line: 0, ch: 0 });
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  assert.deepStrictEqual(view.pinned.from, { line: 0, ch: 10 }, 'from is getCursor("from")');
+  assert.deepStrictEqual(view.pinned.to, { line: 0, ch: 0 }, 'to is getCursor("to")');
+  assert.strictEqual(view.pinned.original, 'The origin', 'the pin keeps the whole selected text, not an empty pin');
+  console.log('PASS backwards-selection');
+}
+
+async function testChipClearsPin() {
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 5 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  assert.ok(view.pinned, 'pin set');
+  view.clearPin();
+  assert.strictEqual(view.pinned, null, 'pin cleared');
+  await view.write();
+  assert.strictEqual(plugin.writeCallCount(), 1, 'insert path taken when no pin');
+  const args = plugin.lastWriteArgs();
+  assert.strictEqual(args.opts.mode, 'draft', 'a sidebar write without a pin stays a draft');
+  assert.strictEqual(args.opts.length, 'standard', 'the insert path sends the draft length');
+  assert.strictEqual(calls.replaceRange.length, 1, 'the draft is inserted into the note');
+  assert.ok(calls.replaceRange[0].draft.includes('DRAFT'), 'the draft text is what got inserted');
+  console.log('PASS chip-clears-pin');
+}
+
+// A prompt box in a DOM container, so the pin chip is really rendered (as in Obsidian).
+function makePromptDom() {
+  const container = new FakeElement('div');
+  const prompt = container.createEl('textarea');
+  prompt.parentElement = container;
+  return { container, prompt };
+}
+
+async function testPinSelectionCallsEditorMethods() {
+  // Live defect: pinSelection extracted editor.getCursor and called it unbound. A real
+  // Obsidian editor needs `this` ("Cannot read properties of undefined (reading 'cm')"),
+  // so the editor-menu "Rewrite with instruction…" never pinned the selection and no
+  // pin chip appeared. The strict mock throws the same way when a method is unbound.
+  const text = 'The original passage here. '.repeat(6);
+  const { view: leafView, leaf } = makePinEditor(text, 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: text.length });
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const { prompt } = makePromptDom();
+  view.promptEl = prompt;
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  assert.ok(view.pinned, 'the selection is pinned');
+  assert.deepStrictEqual(view.pinned.from, { line: 0, ch: 0 }, 'from is editor.getCursor("from")');
+  assert.deepStrictEqual(view.pinned.to, { line: 0, ch: text.length }, 'to is editor.getCursor("to")');
+  assert.strictEqual(view.pinned.original, text, 'the pin keeps the selected text');
+  const chip = view.pinChipEl;
+  assert.ok(chip, 'the pin chip is rendered');
+  const label = chip.children[0];
+  assert.ok(label.textContent.startsWith('✎ "'), 'the chip shows the pin marker');
+  assert.ok(label.textContent.includes(text.slice(0, 60)), 'the chip shows the first 60 characters of the selection');
+  const clear = findByClass(chip, 'semantic-todoist-pin-chip-clear');
+  assert.ok(clear, 'the chip has a clear button');
+  assert.strictEqual(clear.textContent, '×', 'the clear button is the × button');
+  clear.onclick();
+  assert.strictEqual(view.pinned, null, 'clicking × clears the pin');
+  assert.strictEqual(view.pinChipEl, null, 'the chip is removed');
+  console.log('PASS pin-selection-calls-editor-methods');
+}
+
+async function testEditorMenuTypedPathPinsSelection() {
+  // The editor-menu "Rewrite with instruction…" item pins the selection through the
+  // exported helpers. The plugin's own onload handler is not drivable here (the obsidian
+  // mock has no Plugin base class to register the workspace event), so the helper path
+  // is driven directly and the production wiring is pinned by a source check.
+  const text = 'The original passage here.';
+  const { view: leafView, leaf } = makePinEditor(text, 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: text.length });
+  const plugin = makeWritePlugin();
+  plugin.settings.writingCollaborateMode = true;
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const { prompt } = makePromptDom();
+  view.promptEl = prompt;
+  const editor = leafView.editor;
+  const pinned = SourcePlugin.rewriteMenuPin(plugin, editor, { file: { path: 'Notes/Passage.md' } });
+  assert.ok(pinned, 'the editor menu captures the pin');
+  assert.deepStrictEqual(pinned.from, { line: 0, ch: 0 }, 'the menu pin starts at the selection');
+  assert.deepStrictEqual(pinned.to, { line: 0, ch: text.length }, 'the menu pin ends at the selection');
+  assert.strictEqual(pinned.original, text, 'the menu pin keeps the selected text');
+  const obsidian = require('obsidian');
+  const { REWRITE_PRESETS } = require(path.join(__dirname, '..', 'src', 'writing', 'rewrite.js'));
+  const menu = new obsidian.Menu();
+  SourcePlugin.addRewritePresetItems(menu, REWRITE_PRESETS, {
+    onPreset: () => {},
+    onTyped: () => { view.pinSelection(editor, pinned.path); },
+  });
+  const typed = menu.items.find((i) => i.title === 'Rewrite with instruction…');
+  assert.ok(typed, 'the typed item is in the menu');
+  typed.handler();
+  assert.ok(view.pinned, 'clicking the typed item pins the selection');
+  assert.strictEqual(view.pinned.original, text, 'the pinned text is the selection');
+  assert.ok(view.pinChipEl, 'the pin chip is rendered');
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('view.pinSelection(editor, pinned.path, pinned);'), 'the production editor-menu handler pins the captured selection');
+  console.log('PASS editor-menu-typed-path-pins-selection');
+}
+
+async function testEditorMenuTypedPathUsesCapturedPin() {
+  // The user right-clicks a passage, then moves the selection before the sidebar opens.
+  // The chip must show the passage captured at menu time, not the live selection.
+  const text = 'The original passage here.';
+  const { view: leafView, leaf } = makePinEditor(text, 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: text.length });
+  const plugin = makeWritePlugin();
+  plugin.settings.writingCollaborateMode = true;
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const { prompt } = makePromptDom();
+  view.promptEl = prompt;
+  const editor = leafView.editor;
+  const pinned = SourcePlugin.rewriteMenuPin(plugin, editor, { file: { path: 'Notes/Passage.md' } });
+  assert.ok(pinned, 'the editor menu captures the pin');
+  assert.strictEqual(pinned.original, text, 'the captured pin keeps the passage');
+  // the selection moves before the sidebar opens
+  editor._state.from = { line: 0, ch: 5 };
+  editor._state.to = { line: 0, ch: 9 };
+  view.pinSelection(editor, pinned.path, pinned);
+  assert.strictEqual(view.pinned.original, text, 'the pin keeps the passage captured at menu time');
+  assert.deepStrictEqual(view.pinned.from, { line: 0, ch: 0 }, 'the pin starts where the selection was');
+  assert.deepStrictEqual(view.pinned.to, { line: 0, ch: text.length }, 'the pin ends where the selection was');
+  const chip = view.pinChipEl;
+  assert.ok(chip, 'the pin chip is rendered');
+  assert.ok(chip.children[0].textContent.includes(text.slice(0, 60)), 'the chip shows the captured passage');
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('view.pinSelection(editor, pinned.path, pinned);'), 'the production editor-menu handler pins the captured pin');
+  console.log('PASS editor-menu-typed-path-uses-captured-pin');
+}
+
+async function testApplyUsesEditedAfterText() {
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  assert.ok(modal, 'modal opened');
+  const ok = modal.onApply('B edited');
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange');
+  assert.deepStrictEqual(calls.replaceRange[0], { draft: 'B edited', from: { line: 0, ch: 0 }, to: { line: 0, ch: 10 } }, 'replaceRange replaces pinned range');
+  assert.strictEqual(view.pinned, null, 'pin cleared after apply');
+  console.log('PASS apply-uses-edited-after-text');
+}
+
+async function testContinueInsertsAfterSelection() {
+  const { view: leafView, leaf, calls } = makePinEditor('Passage text.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'Next.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write({ instruction: 'continue', evidence: 'toggles', apply: 'after', pinned: view.pinned });
+  const modal = view.rewriteModal;
+  const ok = modal.onApply('Next.');
+  assert.strictEqual(ok, true);
+  assert.strictEqual(calls.transaction.length, 1, 'one transaction');
+  assert.strictEqual(calls.transaction[0].length, 1, 'one change');
+  assert.deepStrictEqual(calls.transaction[0][0], { from: { line: 0, ch: 10 }, to: { line: 0, ch: 10 }, text: '\n\nNext.' }, 'inserts after pinned to');
+  console.log('PASS continue-inserts-after-selection');
+}
+
+async function testApaApplyAddsReferencesInTransaction() {
+  const { view: leafView, leaf, calls } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  const ok = modal.onApply('Revised edited.');
+  assert.strictEqual(ok, true);
+  assert.strictEqual(calls.transaction.length, 1, 'one transaction');
+  assert.strictEqual(calls.transaction[0].length, 2, 'two changes: passage + references');
+  console.log('PASS apa-apply-adds-references-in-transaction');
+}
+
+async function testNatureNumberingChangedRefuses() {
+  const { view: leafView, leaf, calls } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'nature',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: { '[[Notes/Passage]]': 9 },
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'nature';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  const ok = modal.onApply('Revised.');
+  assert.strictEqual(ok, false, 'returns false on numbering mismatch');
+  assert.strictEqual(calls.transaction.length, 0, 'no transaction');
+  assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange');
+  const notices = require('obsidian').notices;
+  assert.ok(notices.some((n) => n.includes('References changed while writing; run again.')), 'numbering notice shown');
+  console.log('PASS nature-numbering-changed-refuses');
+}
+
+async function testSelectionInsideReferencesRefuses() {
+  const { view: leafView, leaf, calls } = makePinEditor('## References\n1. Existing.', 'Notes/Passage.md', { line: 1, ch: 0 }, { line: 1, ch: 10 });
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'nature',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'nature';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  const ok = modal.onApply('Revised.');
+  assert.strictEqual(ok, false, 'returns false on overlap');
+  assert.strictEqual(calls.transaction.length, 0, 'no transaction');
+  const notices = require('obsidian').notices;
+  assert.ok(notices.includes('The selection overlaps the reference list; not applied.'), 'overlap notice shown');
+  console.log('PASS selection-inside-references-refuses');
+}
+
+async function testStaleApplyRefuses() {
+  const { view: leafView, leaf, calls, setText } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  setText('The modified passage here.');
+  const modal = view.rewriteModal;
+  const ok = modal.onApply('B edited');
+  assert.strictEqual(ok, false, 'stale apply returns false');
+  assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange after stale');
+  assert.strictEqual(calls.transaction.length, 0, 'no transaction after stale');
+  const notices = require('obsidian').notices;
+  assert.ok(notices.some((n) => n.includes('Selected text changed; not applied.')), 'stale notice shown');
+  console.log('PASS stale-apply-refuses');
+}
+
+async function testStaleAfterApplyRefuses() {
+  // The continuation path ("apply after") must refuse a stale range too, and must not write anything.
+  const { view: leafView, leaf, calls, setText } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'Next.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write({ instruction: 'continue', evidence: 'toggles', apply: 'after', pinned: view.pinned });
+  const modal = view.rewriteModal;
+  assert.ok(modal, 'modal opened for the continuation');
+  setText('The modified passage here.');
+  const ok = modal.onApply('Next.');
+  assert.strictEqual(ok, false, 'a stale continuation returns false');
+  assert.strictEqual(calls.transaction.length, 0, 'no transaction after a stale continuation');
+  assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange after a stale continuation');
+  console.log('PASS stale-after-apply-refuses');
+}
+
+function testDomMockMirrorsObsidianCreateEl() {
+  // The mock must not be more convenient than Obsidian: a textarea created with
+  // { value } stays empty (that is the live defect), an input keeps the value.
+  const parent = new FakeElement('div');
+  const textarea = parent.createEl('textarea', { value: 'x' });
+  assert.strictEqual(textarea.value, '', 'Obsidian ignores { value } on a textarea');
+  const input = parent.createEl('input', { value: 'x' });
+  assert.strictEqual(input.value, 'x', 'Obsidian honours { value } on an input');
+  console.log('PASS dom-mock-mirrors-obsidian-create-el');
+}
+
+function testNoTextareaReliesOnCreateElValue() {
+  // Every other textarea in the plugin (the sidebar prompt, the PromptModal, the template
+  // preview) sets its value explicitly, so the Obsidian quirk cannot bite them.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const offenders = src.split('\n').filter((line) => /createEl\((["'])textarea\1/.test(line) && /\bvalue\s*:/.test(line));
+  assert.deepStrictEqual(offenders, [], 'no textarea relies on createEl { value }');
+  console.log('PASS no-textarea-relies-on-create-el-value');
+}
+
+function testRewritePreviewTextareaValueIsSet() {
+  // Source pin for the two live fixes: the After pane sets its value explicitly and
+  // applyRewrite refuses an empty passage.
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const modal = srcClassBody(src, 'RewritePreviewModal');
+  assert(!modal.includes('createEl("textarea", { value'), 'the After pane does not rely on createEl { value }');
+  assert(modal.includes('afterEl.value = this.after || ""'), 'the After pane sets its value explicitly');
+  const apply = srcClassMethodBody(src, 'applyRewrite');
+  assert(apply.includes('new Notice("Nothing to apply.")'), 'applyRewrite refuses an empty passage');
+  assert(apply.indexOf('Nothing to apply.') > apply.indexOf('Open ${fileBase} to apply.'), 'the empty guard sits after the editor lookup');
+  console.log('PASS rewrite-preview-textarea-value-is-set');
+}
+
+async function testPreviewAfterPaneShowsRewrite() {
+  // Live defect: the After pane opened empty, so Apply replaced the passage with nothing.
+  const { view: leafView, leaf } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: '**Rewritten** passage.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf, SourcePlugin);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  assert.ok(modal, 'the preview modal opened');
+  const after = findByClass(modal.contentEl, 'semantic-todoist-rewrite-after');
+  assert.ok(after, 'the After pane is rendered');
+  assert.strictEqual(after.tagName, 'textarea', 'the After pane is a textarea');
+  assert.strictEqual(after.value, '**Rewritten** passage.', 'the After pane shows the model markdown');
+  console.log('PASS preview-after-pane-shows-rewrite');
+}
+
+async function testApplyButtonUsesTextareaValue() {
+  // Clicking Apply must send the textarea's current value, not the original rewrite.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: '**Rewritten** passage.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf, SourcePlugin);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  const after = findByClass(modal.contentEl, 'semantic-todoist-rewrite-after');
+  const applyBtn = findByClass(modal.contentEl, 'semantic-todoist-rewrite-apply');
+  assert.ok(after && applyBtn, 'the preview renders the After pane and the Apply button');
+  after.value = 'Edited in the pane.';
+  await applyBtn.onclick();
+  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange');
+  assert.strictEqual(calls.replaceRange[0].draft, 'Edited in the pane.', 'the edited textarea value is what got applied');
+  console.log('PASS apply-button-uses-textarea-value');
+}
+
+async function testEmptyAfterPaneRefusesApply() {
+  // An emptied After pane must not wipe the selected passage.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: '**Rewritten** passage.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf, SourcePlugin);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  const modal = view.rewriteModal;
+  const after = findByClass(modal.contentEl, 'semantic-todoist-rewrite-after');
+  const applyBtn = findByClass(modal.contentEl, 'semantic-todoist-rewrite-apply');
+  assert.ok(after && applyBtn, 'the preview renders the After pane and the Apply button');
+  const noticesBefore = (require('obsidian').notices || []).length;
+  after.value = '   ';
+  await applyBtn.onclick();
+  const notices = require('obsidian').notices || [];
+  assert.ok(notices.slice(noticesBefore).includes('Nothing to apply.'), 'the empty pane is refused with a notice');
+  assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange after an empty pane');
+  assert.strictEqual(calls.transaction.length, 0, 'no transaction after an empty pane');
+  assert.strictEqual(modal.opened, true, 'the modal stays open');
+  console.log('PASS empty-after-pane-refuses-apply');
+}
+
+async function testCheckGoesToSidebar() {
+  const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const seen = [];
+  const plugin = makeWritePlugin(null, async (inst, opts) => {
+    seen.push(opts);
+    assert.strictEqual(opts.mode, 'check', 'check mode');
+    assert.strictEqual(opts.useVault, true, 'useVault true for check');
+    return { markdown: 'Contradiction found.', footnotes: '', sources: [{ eid: 'E1', label: 'x' }], dropped: 0, sourcesBlock: 'Sources searched:\n- vault: searched', citationStyle: 'apa', cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002 }, path: 'Notes/Passage.md' }], numbers: {} };
+  });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  view.plugin.settings.writingUseVault = true;
+  view.plugin.settings.writingUseContext = true;
+  view.plugin.settings.writingUseResearch = true;
+  view.webSearchMode = 'concise';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: view.pinned });
+  assert.strictEqual(view.rewriteModal, undefined, 'no modal for check');
+  const last = view.messageLog[view.messageLog.length - 1];
+  assert.ok(last.text.includes('Contradiction found.'), 'contains markdown');
+  assert.ok(last.text.includes('Schott'), 'contains formatted reference entries');
+  assert.ok(last.text.includes('Sources searched'), 'contains sources block');
+  // "vault" evidence is the Features toggles with the vault forced on, not everything else off
+  assert.strictEqual(seen[0].useVault, true, 'vault evidence searches the vault');
+  assert.strictEqual(seen[0].useContext, true, 'vault evidence keeps the context-folder toggle');
+  assert.strictEqual(seen[0].useResearch, true, 'vault evidence keeps the deep-research toggle');
+  assert.strictEqual(seen[0].webSearchMode, 'concise', 'vault evidence keeps the globe setting');
+  // a toggle that is off stays off
+  view.plugin.settings.writingUseContext = false;
+  await view.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: view.pinned });
+  assert.strictEqual(view.rewriteModal, undefined, 'still no modal for check');
+  assert.strictEqual(seen[1].useContext, false, 'an off context-folder toggle stays off');
+  assert.strictEqual(seen[1].useVault, true, 'vault evidence still searches the vault');
+  console.log('PASS check-goes-to-sidebar');
+}
+
+async function testVaultEvidenceForcesVault() {
+  // "vault" evidence forces the vault on even when the vault toggle is off; the other toggles keep their state.
+  const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const seen = [];
+  const plugin = makeWritePlugin(null, async (inst, opts) => {
+    seen.push(opts);
+    return { markdown: 'Checked.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} };
+  });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingUseVault = false;
+  view.plugin.settings.writingUseContext = false;
+  view.plugin.settings.writingUseResearch = false;
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: view.pinned });
+  assert.strictEqual(seen.length, 1, 'one model call');
+  assert.strictEqual(seen[0].useVault, true, 'vault evidence forces the vault on');
+  assert.strictEqual(seen[0].useContext, false, 'an off context-folder toggle stays off');
+  assert.strictEqual(seen[0].useResearch, false, 'an off deep-research toggle stays off');
+  assert.strictEqual(seen[0].webSearchMode, 'off', 'the globe setting is unchanged');
+  console.log('PASS vault-evidence-forces-vault');
+}
+
+async function testEvidenceOff() {
+  const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const seen = [];
+  const plugin = makeWritePlugin(null, async (inst, opts) => {
+    seen.push(opts);
+    assert.strictEqual(opts.useVault, false);
+    assert.strictEqual(opts.useContext, false);
+    assert.strictEqual(opts.useResearch, false);
+    assert.strictEqual(opts.webSearchMode, 'off');
+    return { markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} };
+  });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write({ instruction: 'x', evidence: 'off', apply: 'replace', pinned: view.pinned });
+  // the stub's own assertions only run if the stub runs, so the call is counted as well
+  assert.strictEqual(seen.length, 1, 'the model was called once');
+  assert.strictEqual(seen[0].useVault, false, 'the vault was not searched');
+  assert.strictEqual(seen[0].useContext, false, 'the context folder was not searched');
+  assert.strictEqual(seen[0].useResearch, false, 'deep research was not searched');
+  assert.strictEqual(seen[0].webSearchMode, 'off', 'web search was off');
+  console.log('PASS evidence-off');
+}
+
+async function testEmptyModelOutput() {
+  const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+  const plugin = makeWritePlugin(null, async () => ({ markdown: '  ', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  await view.write();
+  assert.strictEqual(view.rewriteModal, undefined, 'no modal for empty output');
+  const last = view.messageLog[view.messageLog.length - 1];
+  assert.strictEqual(last.text, 'No rewrite returned.', 'no rewrite returned message');
+  console.log('PASS empty-model-output');
+}
+
+async function testInsertAtCursorApa() {
+  // No pin + APA: the draft and the new ## References section land in one transaction.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Passage.md', 'Body text.');
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with a citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  await view.write();
+  assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange for the apa insert');
+  assert.strictEqual(calls.transaction.length, 1, 'one transaction');
+  assert.strictEqual(calls.transaction[0].length, 2, 'two changes: draft + references');
+  const [draftChange, refsChange] = calls.transaction[0];
+  assert.ok(draftChange.text.includes('Draft with a citation'), 'draft inserted at the cursor');
+  assert.ok(refsChange.text.includes('## References'), 'references section added');
+  assert.ok(refsChange.text.includes('Schott'), 'reference entry carries the source');
+  console.log('PASS insert-at-cursor-apa');
 }
 
 async function runTests() {
@@ -527,6 +1319,37 @@ async function runTests() {
   testCollaborateSettingsKeys();
   testRelevantNotesSetting();
   testTaskTabsSplit();
+  testCollaborateSettingsTab();
+  testAiSearchNoLongerOwnsWriting();
+  testFeaturesMenuHotSwapOnly();
+  testCitationStyleDefault();
+  testEditorMenuGuards();
+  testMenuHiddenWhenModeOff();
+  await testPinnedSelectionOpensPreview();
+  await testPinnedRewriteUsesPinnedNote();
+  await testBackwardsSelectionPin();
+  await testChipClearsPin();
+  await testPinSelectionCallsEditorMethods();
+  await testEditorMenuTypedPathPinsSelection();
+  await testEditorMenuTypedPathUsesCapturedPin();
+  await testApplyUsesEditedAfterText();
+  await testContinueInsertsAfterSelection();
+  await testApaApplyAddsReferencesInTransaction();
+  await testNatureNumberingChangedRefuses();
+  await testSelectionInsideReferencesRefuses();
+  await testStaleApplyRefuses();
+  await testStaleAfterApplyRefuses();
+  testDomMockMirrorsObsidianCreateEl();
+  testNoTextareaReliesOnCreateElValue();
+  testRewritePreviewTextareaValueIsSet();
+  await testPreviewAfterPaneShowsRewrite();
+  await testApplyButtonUsesTextareaValue();
+  await testEmptyAfterPaneRefusesApply();
+  await testCheckGoesToSidebar();
+  await testVaultEvidenceForcesVault();
+  await testEvidenceOff();
+  await testEmptyModelOutput();
+  await testInsertAtCursorApa();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

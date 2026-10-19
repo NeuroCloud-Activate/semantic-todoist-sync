@@ -100,7 +100,7 @@ try {
     `${mainSource}\nmodule.exports.__emailRetrievalContext = {\n` +
       "  DEFAULT_SETTINGS, SEMANTIC_EMBEDDING_CONTENT_VERSION, semanticEmbeddingIdentity,\n" +
       "  buildTaskSourceContract, buildTaskEvidenceCatalog, taskWorkflowEvidenceSourceList,\n" +
-      "  contextNotesForTaskPlan\n" +
+      "  contextNotesForTaskPlan, addContextToTaskDescriptions\n" +
       "};\n",
     mainPath
   );
@@ -117,7 +117,8 @@ const {
   buildTaskSourceContract,
   buildTaskEvidenceCatalog,
   taskWorkflowEvidenceSourceList,
-  contextNotesForTaskPlan
+  contextNotesForTaskPlan,
+  addContextToTaskDescriptions
 } = runtime.__emailRetrievalContext;
 
 // ---------------------------------------------------------------------------
@@ -451,6 +452,36 @@ async function main() {
     `contextRows=${emailContext.length} notePaths=${notePaths.length} embedCalls=${emailArm.harness.calls.length}`
   );
 
+  // Catalog + citation ledger for the email arm, shared by the source-list and
+  // the final-description checks below.
+  const emailCatalog = buildTaskEvidenceCatalog(emailArm.contract, emailContext, emailArm.harness.plugin.settings, {
+    source: emailArm.source,
+    sourceSummary: EMAIL_SUMMARY
+  });
+  const emailSupporting = (emailCatalog.items || []).filter((item) => item.sourceKind !== "current-source" && String(item.provenance?.path || ""));
+  // Real citation numbering assigns one number per cited source identity, so
+  // collapse the retrieved rows to one numbered entry per distinct note path.
+  const emailNumberByPath = new Map();
+  const emailLedger = [];
+  for (const item of emailSupporting) {
+    const itemPath = String(item.provenance?.path || "");
+    if (emailNumberByPath.has(itemPath)) continue;
+    emailNumberByPath.set(itemPath, emailNumberByPath.size + 1);
+    emailLedger.push({
+      number: emailNumberByPath.get(itemPath),
+      evidenceId: item.evidenceId,
+      sourceId: item.provenance?.sourceId || "",
+      title: item.provenance?.title || "",
+      path: itemPath,
+      sourceKind: item.sourceKind || "semantic-index-chunk"
+    });
+  }
+  const emailTask = Object.assign({}, emailArm.tasks[0], {
+    descriptionEvidenceBundle: { acceptedEvidenceIds: emailLedger.map((entry) => entry.evidenceId), evidenceIds: emailLedger.map((entry) => entry.evidenceId), items: emailCatalog.items },
+    descriptionCitedEvidenceIds: emailLedger.map((entry) => entry.evidenceId),
+    descriptionCitationLedger: emailLedger
+  });
+
   check("email arm is not degraded with query-vector-unavailable", () => {
     assert.notEqual(String(emailArm.result.telemetry?.degradedReason || ""), "query-vector-unavailable");
     assert.equal(emailArm.result.telemetry?.degraded, false);
@@ -462,42 +493,73 @@ async function main() {
     assert.ok(notePaths.includes(ACME_PATH), `the nearest Acme note must be retrieved, got ${notePaths.join(" | ") || "(none)"}`);
   });
   check("email arm yields >= 2 catalog evidence rows and a numbered Context Notes list", () => {
-    const catalog = buildTaskEvidenceCatalog(emailArm.contract, emailContext, emailArm.harness.plugin.settings, {
-      source: emailArm.source,
-      sourceSummary: EMAIL_SUMMARY
-    });
-    assert.ok((catalog.items || []).length >= 2, `catalog needs >= 2 evidence rows, got ${(catalog.items || []).length}`);
+    assert.ok((emailCatalog.items || []).length >= 2, `catalog needs >= 2 evidence rows, got ${(emailCatalog.items || []).length}`);
     const planNotes = contextNotesForTaskPlan(emailContext, String(emailArm.source.path || ""), 7, `${EMAIL_TITLE}\n${EMAIL_SUMMARY}`, emailArm.harness.plugin.settings);
     assert.ok(planNotes.length > 0, "contextNotesForTaskPlan must derive context notes from the retrieved rows");
-    const supporting = (catalog.items || []).filter((item) => item.sourceKind !== "current-source" && String(item.provenance?.path || ""));
-    assert.ok(supporting.length > 0, "the catalog must carry non-current-source (vault note) rows");
-    // Real citation numbering assigns one number per cited source identity, so
-    // collapse the retrieved rows to one numbered entry per distinct note path.
-    const numberByPath = new Map();
-    const ledger = [];
-    for (const item of supporting) {
-      const itemPath = String(item.provenance?.path || "");
-      if (!numberByPath.has(itemPath)) {
-        numberByPath.set(itemPath, numberByPath.size + 1);
-        ledger.push({
-          number: numberByPath.get(itemPath),
-          evidenceId: item.evidenceId,
-          sourceId: item.provenance?.sourceId || "",
-          title: item.provenance?.title || "",
-          path: itemPath,
-          sourceKind: item.sourceKind || "semantic-index-chunk"
-        });
-      }
-    }
-    const task = Object.assign({}, emailArm.tasks[0], {
-      descriptionEvidenceBundle: { acceptedEvidenceIds: ledger.map((entry) => entry.evidenceId), evidenceIds: ledger.map((entry) => entry.evidenceId), items: catalog.items },
-      descriptionCitedEvidenceIds: ledger.map((entry) => entry.evidenceId),
-      descriptionCitationLedger: ledger
-    });
-    const list = taskWorkflowEvidenceSourceList(task, {}, "", true, "email");
+    assert.ok(emailSupporting.length > 0, "the catalog must carry non-current-source (vault note) rows");
+    const list = taskWorkflowEvidenceSourceList(emailTask, {}, "", true, "email");
     assert.ok(/^Context Notes:/.test(list), `email source list must start with "Context Notes:", got ${JSON.stringify(list.slice(0, 80))}`);
     assert.match(list, /^1\. /m, "the first context note must be numbered (1)");
     assert.match(list, /obsidian:\/\/open\?file=/, "context notes must render as vault links");
+  });
+  check("email task description cites the primary email identity line", () => {
+    // Production wiring guard: the hand-built `active` below would still pass if
+    // processPendingEmailItem stopped forwarding the email identity, so assert the
+    // real sourceContext literal it hands to prepareGeneratedTasksForTodoistWorkflow
+    // (options.sourceContext -> addContextToTaskDescriptions `active`).
+    const methodStart = mainSource.indexOf("async processPendingEmailItem(item) {");
+    assert.ok(methodStart > 0, "src/main.js must still define processPendingEmailItem");
+    const methodEnd = mainSource.indexOf("\n  async ", methodStart + 1);
+    const methodSource = mainSource.slice(methodStart, methodEnd > methodStart ? methodEnd : mainSource.length);
+    const contextStart = methodSource.indexOf("sourceContext:");
+    assert.ok(contextStart > 0, "processPendingEmailItem must forward a sourceContext literal");
+    const literalStart = methodSource.indexOf("{", contextStart);
+    let depth = 0;
+    let literalEnd = -1;
+    for (let index = literalStart; index < methodSource.length; index += 1) {
+      if (methodSource[index] === "{") depth += 1;
+      else if (methodSource[index] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          literalEnd = index;
+          break;
+        }
+      }
+    }
+    assert.ok(literalEnd > literalStart, "the forwarded sourceContext literal must be brace-balanced");
+    const literal = methodSource.slice(literalStart, literalEnd + 1);
+    for (const key of ["from", "receivedAt", "subject"]) {
+      assert.match(literal, new RegExp(`[,{]\\s*${key}\\s*[:,}]`), `the forwarded sourceContext must carry ${key}, got ${JSON.stringify(literal)}`);
+    }
+    const active = {
+      type: "email",
+      title: EMAIL_TITLE,
+      path: "",
+      text: EMAIL_SUMMARY,
+      from: "Alex Rivera <alex@example.com>",
+      receivedAt: "Oct 9, 2026, 1:23 PM EDT",
+      subject: EMAIL_TITLE
+    };
+    const task = Object.assign({}, emailTask, {
+      description: "Submit the Acme Atlas intake form, which is due on October 13.",
+      descriptionEvidenceBundle: Object.assign({}, emailTask.descriptionEvidenceBundle, {
+        factRefs: ["fact-1"],
+        facts: [{ factId: "fact-1", kind: "source-link", value: "https://example.com/atlas" }]
+      })
+    });
+    const tasks = [task];
+    addContextToTaskDescriptions(tasks, [], active, emailArm.harness.plugin.settings, [], "", true, "email");
+    const description = String(tasks[0].description || "");
+    assert.ok(description.includes("From Alex Rivera <alex@example.com>"), `the final description must name the email sender, got ${JSON.stringify(description)}`);
+    assert.ok(description.includes("Oct 9, 2026"), `the final description must carry the email date, got ${JSON.stringify(description)}`);
+    assert.ok(description.includes(EMAIL_TITLE), `the final description must carry the email subject, got ${JSON.stringify(description)}`);
+    assert.match(description, /Context Notes:/, "the email source block must keep its Context Notes heading");
+    assert.match(description, /^1\. /m, "the context note citations must stay numbered");
+    assert.ok(description.includes(ACME_PATH), `the context notes must stay listed, got ${JSON.stringify(description)}`);
+    const identityLine = description.split("\n").find((line) => line.includes("From Alex Rivera"));
+    assert.ok(identityLine, `the email identity must be its own line, got ${JSON.stringify(description)}`);
+    assert.ok(!/^\d+\.\s/.test(identityLine), `the email identity line must stay unnumbered, got ${JSON.stringify(identityLine)}`);
+    assert.ok(description.indexOf(identityLine) > description.indexOf("Context Notes:"), "the email identity line must live in the source block, not in the description open");
   });
   check("email arm embeds a bounded number of query texts", () => {
     const laneCount = Number(emailArm.result.telemetry?.laneCount || 0);

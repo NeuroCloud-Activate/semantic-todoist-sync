@@ -1,6 +1,7 @@
 "use strict";
 
 const { baseNameOf } = require("../context/source.js");
+const { formatInText, planReferences, sourceKey } = require("./styles.js");
 
 function startNumber(noteText) {
   const text = typeof noteText === "string" ? noteText : "";
@@ -92,13 +93,14 @@ function labelFor(source) {
   return "";
 }
 
-function rewriteCitations(markdown, evidence, noteText) {
+function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   const byEid = new Map();
   for (const entry of evidence || []) {
     if (entry && typeof entry.eid === "string" && !byEid.has(entry.eid)) {
       byEid.set(entry.eid, entry);
     }
   }
+  const nonFootnotes = style === "apa" || style === "nature";
   let next = startNumber(noteText);
   const numByEid = new Map();
   const used = [];
@@ -115,9 +117,14 @@ function rewriteCitations(markdown, evidence, noteText) {
 
   const RANGE_CAP = 32;
   const RANGE_RE = /^E(\d+)\s*[-–—]\s*(E)?(\d+)$/;
+  const MARKER_RE = /( ?)\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*))\]( ?)/g;
   const src = typeof markdown === "string" ? markdown : "";
-  const out = src.replace(/( ?)\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*))\]( ?)/g, (match, pre, inner, post) => {
-    const tokens = inner
+
+  // Collect marker groups first so apa/nature can plan reference numbers
+  // for every cited source before any marker is replaced.
+  const groups = [];
+  for (const m of src.matchAll(MARKER_RE)) {
+    const tokens = m[2]
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
@@ -141,17 +148,44 @@ function rewriteCitations(markdown, evidence, noteText) {
       if (byEid.has(token)) known.push(token);
       else dropped += 1;
     }
-    if (known.length === 0) return pre && post ? " " : "";
-    return pre + known.map((eid) => "[^" + numFor(eid) + "]").join("") + post;
-  });
+    groups.push({ pre: m[1], post: m[3], known });
+  }
+
+  for (const g of groups) {
+    for (const eid of g.known) numFor(eid);
+  }
 
   const ordered = Array.from(numByEid.entries()).sort((a, b) => a[1] - b[1]);
+  const cited = ordered.map(([eid]) => byEid.get(eid).source).filter(Boolean);
+
+  let numbers = {};
+  if (nonFootnotes) {
+    numbers = planReferences(noteText, style, cited).numbers;
+  }
+
+  let gi = 0;
+  const out = src.replace(MARKER_RE, (match, pre, inner, post) => {
+    const g = groups[gi];
+    gi += 1;
+    if (g.known.length === 0) return pre && post ? " " : "";
+    if (!nonFootnotes) {
+      return pre + g.known.map((eid) => "[^" + numByEid.get(eid) + "]").join("") + post;
+    }
+    const items = g.known.map((eid) => {
+      const source = byEid.get(eid).source;
+      const item = { source };
+      if (style === "nature") item.number = numbers[sourceKey(source)];
+      return item;
+    });
+    return pre + formatInText(style, items) + post;
+  });
+
   const lines = ordered.map(([eid, n]) => {
     const entry = byEid.get(eid);
     return "[^" + n + "]: " + labelFor(entry ? entry.source : null);
   });
 
-  return { markdown: out, footnotes: lines.join("\n"), used, dropped };
+  return { markdown: out, footnotes: nonFootnotes ? "" : lines.join("\n"), used, cited, numbers, dropped };
 }
 
 module.exports = { rewriteCitations };

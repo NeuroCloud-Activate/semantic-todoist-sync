@@ -7,7 +7,7 @@
 
 const assert = require("assert");
 
-const { writeWithEvidence } = require("../src/writing/write.js");
+const { writeWithEvidence, REWRITE_SYSTEM_PROMPT, CHECK_SYSTEM_PROMPT } = require("../src/writing/write.js");
 
 function vaultChunk(i) {
   return { path: `Notes/vault-${i}.md`, title: `vault-${i}`, section: `H${i}`, text: `vault text ${i}` };
@@ -718,6 +718,7 @@ async function main() {
     assert.ok(result.sourcesBlock.includes("- deep research: not searched (turned off)"), "research off line");
     assert.ok(result.sourcesBlock.includes("- vault: not searched (turned off)"), "vault off line");
     assert.ok(result.sourcesBlock.includes("- context folder: searched"), "context searched line");
+    assert.ok(result.sourcesBlock.includes("- web: not searched (turned off)"), "web line present");
     console.log("PASS sourcesBlock reflects toggled-off sources");
   }
 
@@ -728,7 +729,184 @@ async function main() {
     const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
     assert.ok(result.sourcesBlock.includes("- vault: NOT searched (vault index unavailable: semantic-index-not-loaded)"), "vault unavailable line, got: " + result.sourcesBlock);
     assert.ok(result.sourcesBlock.includes("- deep research: not searched (no saved research notes)"), "empty research line");
+    assert.ok(result.sourcesBlock.includes("- web: not searched (turned off)"), "web line present");
     console.log("PASS sourcesBlock reflects unavailable vault");
+  }
+
+  // Task 2 — rewrite mode uses REWRITE_SYSTEM_PROMPT with a selection prompt and no target length.
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok [E1]", research: null });
+    await writeWithEvidence(plugin, { instruction: "Fix this", active: { ...ACTIVE, selection: "SELECTION-TEXT-1" }, mode: "rewrite" });
+    const { request } = plugin.captured;
+    assert.strictEqual(request.system, REWRITE_SYSTEM_PROMPT, "rewrite mode uses REWRITE_SYSTEM_PROMPT");
+    assert.ok(request.user.includes("Selected passage:"), "user prompt names the selected passage");
+    assert.ok(request.user.includes("SELECTION-TEXT-1"), "selection included in prompt");
+    assert.ok(!request.user.includes("Target length:"), "no target length in rewrite mode");
+    console.log("PASS rewrite mode uses REWRITE_SYSTEM_PROMPT");
+  }
+
+  // Task 2 — rewrite mode returns an empty sourcesBlock (no "Sources searched" footer).
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok", research: null });
+    const result = await writeWithEvidence(plugin, { instruction: "Fix this", active: ACTIVE, mode: "rewrite" });
+    assert.strictEqual(result.sourcesBlock, "", "rewrite mode returns empty sourcesBlock");
+    console.log("PASS rewrite mode returns empty sourcesBlock");
+  }
+
+  // Task 2 — rewrite mode with all evidence off makes no retrieval calls.
+  {
+    const plugin = makeStub({ vault: 0, context: 0, modelText: "ok", research: null });
+    await writeWithEvidence(plugin, { instruction: "Fix this", active: ACTIVE, mode: "rewrite", useVault: false, useContext: false, useResearch: false, webSearchMode: "off" });
+    assert.strictEqual(plugin.calls.filter((c) => c === "retrieve").length, 0, "no retrieveSemanticContext");
+    assert.strictEqual(plugin.calls.filter((c) => c === "getContextStore").length, 0, "no getContextStore");
+    assert.strictEqual(plugin.calls.filter((c) => c === "getResearchStore").length, 0, "no getResearchStore");
+    assert.strictEqual(plugin.calls.filter((c) => c === "embed").length, 0, "no embedTexts");
+    console.log("PASS rewrite mode with all evidence off makes no retrieval calls");
+  }
+
+  // Task 2 — rewrite mode still rewrites [E1] to a footnote (default style).
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok [E1]", research: null });
+    const result = await writeWithEvidence(plugin, { instruction: "Fix this", active: ACTIVE, mode: "rewrite" });
+    assert.ok(result.markdown.includes("[^1]"), "[E1] rewritten to a footnote marker");
+    assert.ok(result.footnotes.startsWith("[^1]:"), "footnote defined");
+    assert.ok(!result.markdown.includes("[E1]"), "raw id removed");
+    console.log("PASS rewrite mode still rewrites [E1] to footnote");
+  }
+
+  // Task 2 — check mode uses CHECK_SYSTEM_PROMPT and keeps sourcesBlock.
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "- finding [E1]", research: null });
+    const result = await writeWithEvidence(plugin, { instruction: "Check this", active: ACTIVE, mode: "check" });
+    assert.strictEqual(plugin.captured.request.system, CHECK_SYSTEM_PROMPT, "check mode uses CHECK_SYSTEM_PROMPT");
+    assert.ok(result.sourcesBlock.startsWith("Sources searched:"), "check mode keeps sourcesBlock");
+    assert.ok(plugin.captured.request.user.includes("Report your findings."), "check prompt asks for findings");
+    console.log("PASS check mode uses CHECK_SYSTEM_PROMPT and keeps sourcesBlock");
+  }
+
+  // Task 2 — sources block lists web search after the context line in every non-rewrite mode.
+  {
+    const deep = makeStub({ vault: 0, context: 0, modelText: "ok", research: null });
+    const deepResult = await writeWithEvidence(deep, { instruction: "Draft", active: ACTIVE, webSearchMode: "deep" });
+    assert.ok(deepResult.sourcesBlock.includes("- web: searched (Deep Research)"), "deep web line");
+    assert.ok(deepResult.sourcesBlock.indexOf("- context folder: searched") < deepResult.sourcesBlock.indexOf("- web:"), "web line after context line");
+
+    const concise = makeStub({ vault: 0, context: 0, modelText: "ok", research: null });
+    const conciseResult = await writeWithEvidence(concise, { instruction: "Draft", active: ACTIVE, webSearchMode: "concise" });
+    assert.ok(conciseResult.sourcesBlock.includes("- web: searched (Internet Search)"), "concise web line");
+
+    const off = makeStub({ vault: 0, context: 0, modelText: "ok", research: null });
+    const offResult = await writeWithEvidence(off, { instruction: "Draft", active: ACTIVE, webSearchMode: "off" });
+    assert.ok(offResult.sourcesBlock.includes("- web: not searched (turned off)"), "off web line");
+
+    const missing = makeStub({ vault: 0, context: 0, modelText: "ok", research: null });
+    const missingResult = await writeWithEvidence(missing, { instruction: "Draft", active: ACTIVE });
+    assert.ok(missingResult.sourcesBlock.includes("- web: not searched (turned off)"), "missing web line");
+    console.log("PASS sources block lists web");
+  }
+
+  // Task 2 — vault evidence carries front matter meta.
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "ok [E1]", research: null });
+    plugin.app.vault = { getAbstractFileByPath: (p) => ({ path: p }) };
+    plugin.app.metadataCache = {
+      getFileCache(file) {
+        if (file && file.path === "Notes/vault-1.md") return { frontmatter: { author: "Dale H. Schott", year: 2002, journal: "J. Cell Biol." } };
+        return {};
+      },
+    };
+    const result = await writeWithEvidence(plugin, { instruction: "Draft", active: ACTIVE });
+    assert.ok(result.cited[0] && result.cited[0].meta, "cited source carries meta");
+    assert.ok(result.cited[0].meta.authors[0].includes("Schott"), "front matter author in meta, got " + JSON.stringify(result.cited[0].meta.authors));
+    console.log("PASS vault evidence carries front matter meta");
+  }
+
+  // Task 2 — web evidence passes through with meta (site = hostname without www).
+  {
+    const plugin = makeStub({ vault: 0, context: 0, modelText: "ok [E1]", research: null });
+    plugin.searchWebForWriting = async () => [{ title: "Example Page", url: "https://www.example.org/x", text: "web text" }];
+    const result = await writeWithEvidence(plugin, { instruction: "Draft", active: ACTIVE, webSearchMode: "concise" });
+    assert.ok(plugin.captured.request.user.includes('<evidence id="E1"'), "web evidence block in user message");
+    assert.ok(result.cited[0] && result.cited[0].meta, "web source carries meta");
+    assert.strictEqual(result.cited[0].meta.site, "example.org", "site is the hostname without www");
+    console.log("PASS web evidence passes through with meta");
+  }
+
+  // Task 2 — apa style end to end: in-text marker, no footnotes, style returned.
+  {
+    const plugin = makeStub({ vault: 1, context: 0, modelText: "Claim [E1].", research: null });
+    plugin.app.vault = { getAbstractFileByPath: (p) => ({ path: p }) };
+    plugin.app.metadataCache = {
+      getFileCache(file) {
+        if (file && file.path === "Notes/vault-1.md") return { frontmatter: { author: "Dale H. Schott", year: 2002, journal: "J. Cell Biol." } };
+        return {};
+      },
+    };
+    const result = await writeWithEvidence(plugin, { instruction: "Draft", active: ACTIVE, citationStyle: "apa" });
+    assert.ok(result.markdown.includes("(Schott, 2002)"), "apa in-text marker, got: " + result.markdown);
+    assert.strictEqual(result.footnotes, "", "apa produces no footnotes");
+    assert.strictEqual(result.citationStyle, "apa", "citationStyle returned");
+    console.log("PASS apa style end to end");
+  }
+
+  // Fix 3 — the REAL plugin wrapper (src/main.js) must forward the collaborate mode
+  // and the citation style. Live defect: it forwarded neither, so every pinned
+  // rewrite ran as a plain draft with footnote citations.
+  {
+    const Module = require("module");
+    const path = require("path");
+    const originalLoad = Module._load;
+    Module._load = function (request, parent, isMain) {
+      if (request !== "obsidian") return originalLoad.call(this, request, parent, isMain);
+      class Empty {}
+      return {
+        ItemView: Empty, MarkdownRenderer: { renderMarkdown() {} }, MarkdownView: Empty, Menu: Empty, Modal: Empty,
+        Notice: Empty, Plugin: Empty, PluginSettingTab: Empty, Setting: Empty, TFile: Empty, setIcon() {},
+        requestUrl: async () => { throw new Error("network disabled"); },
+      };
+    };
+    global.window = global.window || { setTimeout, clearTimeout, requestIdleCallback: null };
+    let SourcePlugin;
+    try {
+      SourcePlugin = require(path.join(__dirname, "..", "src", "main.js"));
+    } finally {
+      Module._load = originalLoad;
+    }
+    const captured = {};
+    const plugin = Object.create(SourcePlugin.prototype);
+    plugin.app = {
+      vault: { getAbstractFileByPath: (p) => ({ path: p }) },
+      metadataCache: {
+        getFileCache() {
+          return { frontmatter: { author: "Dale H. Schott", year: 2002, journal: "J. Cell Biol." } };
+        },
+      },
+    };
+    plugin.getContextStore = async () => ({
+      store: {
+        async sync() { return { added: 0, changed: 0, removed: 0, skipped: [] }; },
+        async search() { return []; },
+      },
+      rootInfo: { kind: "vault", root: "Semantic Todoist Sync/Context" },
+    });
+    plugin.vaultIndexStatus = async () => ({ ready: true });
+    plugin.retrieveSemanticContext = async () => [{ path: "Notes/vault-1.md", title: "vault-1", section: "H1", text: "vault text 1" }];
+    plugin.embedTexts = async () => [[1, 0, 0]];
+    plugin.aiModelForRequest = () => ({ model: "fictional-write-model" });
+    plugin.openaiResponse = async (request) => { captured.request = request; return "Text [E1]."; };
+    const result = await plugin.writeWithEvidence("Fix this", {
+      mode: "rewrite",
+      citationStyle: "apa",
+      active: { path: "Notes/active.md", text: "active note body", selection: "selected passage", cursorOffset: 5 },
+      webSearchMode: "off",
+      useVault: true,
+      useContext: false,
+      useResearch: false,
+    });
+    assert.strictEqual(captured.request.system, REWRITE_SYSTEM_PROMPT, "the real wrapper forwards the collaborate mode (rewrite prompt), got: " + String(captured.request.system).slice(0, 60));
+    assert.ok(result.markdown.includes("(Schott, 2002)"), "the real wrapper forwards the citation style (apa in-text), got: " + result.markdown);
+    assert.ok(!result.markdown.includes("[^1]"), "no footnote marker for apa, got: " + result.markdown);
+    console.log("PASS real wrapper forwards mode and citationStyle");
   }
 
   console.log("writing-write-test: PASS");

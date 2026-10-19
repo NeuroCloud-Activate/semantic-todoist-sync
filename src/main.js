@@ -2823,6 +2823,11 @@ function normalizeStableSettings(input = {}) {
   const rawLength = typeof source.writingDraftLength === "string" ? source.writingDraftLength.trim().toLowerCase() : "";
   result.writingDraftLength = rawLength === "brief" || rawLength === "detailed" ? rawLength : "standard";
   result.writingCollaborateMode = source.writingCollaborateMode === true;
+  // writing-mode: task 4 citation style — keep only footnotes|apa|nature, else footnotes
+  result.writingCitationStyle =
+    source.writingCitationStyle === "apa" || source.writingCitationStyle === "nature"
+      ? source.writingCitationStyle
+      : "footnotes";
   result.writingUseVault = source.writingUseVault !== false;
   result.writingUseContext = source.writingUseContext !== false;
   result.writingUseResearch = source.writingUseResearch !== false; // writing-mode: task 11 deep-research evidence toggle (default on)
@@ -3565,6 +3570,7 @@ const DEFAULT_SETTINGS = {
   writingContextFolder: WRITING_CONTEXT_FOLDER_DEFAULT, // writing-mode: new context folder default
   writingDescribeImages: true, // writing-mode: new describe-images default
   writingCollaborateMode: false, // writing-mode: task 10 collaborate toggle off by default
+  writingCitationStyle: "footnotes", // writing-mode: task 4 citation style default
   writingDraftLength: "standard", // writing-mode: task 10 draft length default
   writingUseVault: true, // writing-mode: task 10 vault evidence default
   writingUseContext: true, // writing-mode: task 10 context-folder evidence default
@@ -4576,6 +4582,32 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (this.app.workspace && typeof this.app.workspace.onLayoutReady === "function") this.app.workspace.onLayoutReady(() => this.ensureWritingContextFolder()); // writing-mode: create the context folder once the vault is ready
     this.addCommand({ id: "semantic-todoist-rescan-context", name: "Rescan writing context folder", callback: () => this.rescanContextFolder() }); // writing-mode: task 7 manual context-folder rescan
     this.addCommand({ id: "semantic-todoist-collaborate", name: "Collaborate on active note", callback: () => this.collaborateOnActiveNote() }); // writing-mode: task 8 open sidebar and focus prompt
+    // writing-mode: task 4 editor menu — collaborate presets from right-click on a selection (mode on + selection only)
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor, info) => {
+      // capture the pin synchronously before focus leaves the editor
+      const pinned = rewriteMenuPin(this, editor, info);
+      if (!pinned) return;
+      menu.addSeparator();
+      const { REWRITE_PRESETS } = require("./writing/rewrite.js");
+      addRewritePresetItems(menu, REWRITE_PRESETS, {
+        onPreset: async (preset) => {
+          await this.openSidebar();
+          const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+          if (view && view instanceof SemanticTodoistView) {
+            await view.write({ instruction: preset.instruction, evidence: preset.evidence, apply: preset.apply, pinned });
+          }
+        },
+        onTyped: async () => {
+          await this.openSidebar();
+          const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+          if (view && view instanceof SemanticTodoistView) {
+            // writing-mode: task 4 fix 5 — pin the passage captured at menu time, not the selection that is live now
+            view.pinSelection(editor, pinned.path, pinned);
+            if (view.promptEl && typeof view.promptEl.focus === "function") view.promptEl.focus();
+          }
+        },
+      });
+    }));
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
     this.registerInterval(window.setTimeout(() => this.ensurePromptTemplateFolder(false), STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
@@ -14244,6 +14276,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       useContext: options && Object.prototype.hasOwnProperty.call(options, "useContext") ? options.useContext !== false : undefined,
       // writing-mode: task 11 forward the deep-research evidence toggle
       useResearch: options && Object.prototype.hasOwnProperty.call(options, "useResearch") ? options.useResearch !== false : undefined,
+      // writing-mode: fix 3 forward the collaborate mode and the citation style; without them a pinned rewrite ran as a plain draft with footnote citations
+      mode: options && Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : undefined,
+      citationStyle: options && Object.prototype.hasOwnProperty.call(options, "citationStyle") ? options.citationStyle : undefined,
     });
   }
 
@@ -18697,7 +18732,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         path: "",
         sectionName,
         sourceTitle: subject,
-        sourceContext: { title: subject, path: "", text: emailSourceText },
+        // Structured email identity (sender/date/subject) so the created task
+        // can cite the primary email as its source.
+        sourceContext: { title: subject, path: "", text: emailSourceText, from: email.from || parsed.from || "", receivedAt: displayedReceivedAt, subject },
         citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false,
         prepareTodoistSection: true,
         status: "Preparing descriptions and Todoist section...",
@@ -22105,15 +22142,7 @@ class SemanticTodoistView extends ItemView {
         });
       });
     });
-    menu.addItem((choice) => {
-      choice.setTitle("Describe images");
-      choice.setChecked(this.plugin.settings.writingDescribeImages !== false);
-      choice.onClick(async () => {
-        this.plugin.settings.writingDescribeImages = this.plugin.settings.writingDescribeImages === false;
-        await this.plugin.saveSettings();
-        this.updateCollaborateFeaturesLabel();
-      });
-    });
+    // writing-mode: Describe images moved to the Collaborate settings tab
     // writing-mode: open at the button's left edge so a click near its right end never clips the menu
     const anchor = this.collaborateFeaturesButton && this.collaborateFeaturesButton.getBoundingClientRect ? this.collaborateFeaturesButton.getBoundingClientRect() : null;
     if (anchor && typeof menu.showAtPosition === "function") menu.showAtPosition({ x: anchor.left, y: anchor.bottom });
@@ -22142,10 +22171,34 @@ class SemanticTodoistView extends ItemView {
   }
 
   // writing-mode: sidebar Write mode that drafts cited prose into the open note
-  async write() {
+  // writing-mode: task 4 write() takes an override (instruction, evidence, apply, pinned) from the
+  // editor-menu presets; without it, write() behaves as before (insert at cursor / visible note).
+  async write(override = {}) {
     try {
-      const prompt = this.promptEl ? this.promptEl.value.trim() : "";
-      if (!prompt) {
+      const { instruction: overrideInstruction, evidence, apply = "replace", pinned: overridePinned } = override;
+      const pinned = overridePinned !== undefined ? overridePinned : this.pinned;
+      const citationStyle = this.plugin.settings.writingCitationStyle;
+      const { typedRewriteInstruction } = require("./writing/rewrite.js");
+
+      const isChat = apply === "chat";
+      // writing-mode: task 4 only a pinned range rewrites or checks; a plain sidebar Write stays a draft
+      const mode = isChat ? "check" : (pinned ? "rewrite" : "draft");
+
+      let instruction;
+      if (overrideInstruction) {
+        instruction = String(overrideInstruction);
+      } else if (pinned) {
+        const typed = this.promptEl ? this.promptEl.value.trim() : "";
+        // writing-mode: task 4 a pinned rewrite needs something to rewrite towards, so an empty prompt nudges
+        if (!typed) {
+          this.setStatus("Type what to write, then press Enter or Write.");
+          return;
+        }
+        instruction = typedRewriteInstruction(typed);
+      } else {
+        instruction = this.promptEl ? this.promptEl.value.trim() : "";
+      }
+      if (!instruction) {
         // writing-mode: task 10 empty prompt nudges instead of silently returning
         this.setStatus("Type what to write, then press Enter or Write.");
         return;
@@ -22153,7 +22206,12 @@ class SemanticTodoistView extends ItemView {
       // writing-mode: double-submit guard moved immediately before await so pre-await exits don't leave it stuck
       if (this.writing) return;
       // writing-mode: capture open Markdown note and position BEFORE await (fallback to lastActiveMarkdownLeaf, most-recent, then visible leaf)
-      const activeMarkdownView = findRequestTimeMarkdownView(this.plugin && this.plugin.app ? this.plugin.app : null, this.plugin);
+      let activeMarkdownView = findRequestTimeMarkdownView(this.plugin && this.plugin.app ? this.plugin.app : null, this.plugin);
+      // writing-mode: task 4 fix — a pinned rewrite resolves the note by pinned.path, not by the last-active leaf
+      if (pinned && pinned.path) {
+        const pinnedEditor = findMarkdownEditorForPath(this.plugin && this.plugin.app ? this.plugin.app : null, pinned.path, null);
+        if (pinnedEditor) activeMarkdownView = { file: { path: pinned.path }, editor: pinnedEditor };
+      }
       if (!activeMarkdownView || !activeMarkdownView.editor || !activeMarkdownView.file) {
         this.addMessage("assistant", "Open a note to write into.");
         this.setStatus("Ready");
@@ -22161,31 +22219,22 @@ class SemanticTodoistView extends ItemView {
       }
       const editor = activeMarkdownView.editor;
       const filePath = activeMarkdownView.file.path || "";
-      const selectionText = editor.getSelection ? editor.getSelection() : "";
-      let fromPos = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
-      let toPos = fromPos;
-      if (selectionText) {
-        toPos = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
-      }
       const value = editor.getValue ? editor.getValue() : "";
-      let recordedPrefix = "";
-      try {
-        const cursor = fromPos;
-        const lines = value.split ? value.split("\n") : [];
-        let charOffset = 0;
-        for (let i = 0; i < (cursor ? cursor.line : 0); i++) charOffset += (lines[i] ? lines[i].length + 1 : 1);
-        charOffset += (cursor ? cursor.ch : 0);
-        recordedPrefix = value.slice ? value.slice(Math.max(0, charOffset - 40), charOffset) : "";
-      } catch (e) {
-        recordedPrefix = "";
-      }
-      const recorded = {
-        path: filePath,
-        from: fromPos,
-        to: toPos,
-        prefix: recordedPrefix,
-      };
       const activeText = value;
+      // writing-mode: task 4 the insert position and the text before it are captured before the await, so a note edited meanwhile is detected
+      const recordedFrom = editor.getCursor ? editor.getCursor() : { line: 0, ch: 0 };
+      const recordedPrefix = (function () {
+        try {
+          const cursor = recordedFrom;
+          const lines = activeText.split ? activeText.split("\n") : [];
+          let charOffset = 0;
+          for (let i = 0; i < (cursor ? cursor.line : 0); i++) charOffset += (lines[i] ? lines[i].length + 1 : 1);
+          charOffset += (cursor ? cursor.ch : 0);
+          return activeText.slice ? activeText.slice(Math.max(0, charOffset - 40), charOffset) : "";
+        } catch (e) {
+          return "";
+        }
+      })();
       const cursorOffset = (function () {
         // writing-mode: prefer posToOffset when available (Obsidian normalises getValue to \n)
         if (editor && typeof editor.posToOffset === "function" && typeof editor.getCursor === "function") {
@@ -22203,10 +22252,31 @@ class SemanticTodoistView extends ItemView {
         off += c.ch;
         return off;
       })();
+      // writing-mode: task 4 the pinned passage travels with the request; without a pin the live selection is sent as before
+      const selectionText = pinned ? String(pinned.original || "") : (editor.getSelection ? editor.getSelection() : "");
       const active = { path: filePath, text: activeText, selection: selectionText, cursorOffset };
-      // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
-      const rawLength = this.plugin.settings.writingDraftLength;
-      const length = rawLength === "brief" || rawLength === "detailed" ? rawLength : "standard";
+
+      // writing-mode: task 4 evidence flags per preset legend
+      let useVault, useContext, useResearch, webSearchMode;
+      if (evidence === "off") {
+        useVault = false;
+        useContext = false;
+        useResearch = false;
+        webSearchMode = "off";
+      } else if (evidence === "vault") {
+        // writing-mode: task 4 fix — "vault" evidence is the Features toggles with the vault forced on, not everything else off
+        useVault = true;
+        useContext = this.plugin.settings.writingUseContext !== false;
+        useResearch = this.plugin.settings.writingUseResearch !== false;
+        webSearchMode = this.webSearchMode;
+      } else {
+        // "toggles" — Features menu settings + current globe toggle
+        // writing-mode: task 10 forward evidence toggles from settings
+        useVault = this.plugin.settings.writingUseVault !== false;
+        useContext = this.plugin.settings.writingUseContext !== false;
+        useResearch = this.plugin.settings.writingUseResearch !== false;
+        webSearchMode = this.webSearchMode;
+      }
 
       // writing-mode: guard set only right before the await, so pre-await exits never leave it stuck
       if (this.writing) return;
@@ -22217,20 +22287,70 @@ class SemanticTodoistView extends ItemView {
       }
 
       this.setStatus("Collaborating…");
-      this.addMessage("user", prompt);
+      // writing-mode: task 4 the sidebar message shows the resolved instruction (preset or typed), not the raw prompt
+      this.addMessage("user", instruction);
       this.addMessage("assistant", "Collaborating…");
       if (this.promptEl) this.promptEl.value = "";
 
       try {
-        const result = await this.plugin.writeWithEvidence(prompt, {
-          length,
+        // writing-mode: task 4 the request carries the resolved instruction and the citation style
+        const result = await this.plugin.writeWithEvidence(instruction, {
+          mode,
+          citationStyle,
           active,
-          webSearchMode: this.webSearchMode,
-          // writing-mode: task 10 forward evidence toggles from settings
-          useVault: this.plugin.settings.writingUseVault !== false,
-          useContext: this.plugin.settings.writingUseContext !== false,
-          useResearch: this.plugin.settings.writingUseResearch !== false,
+          webSearchMode,
+          useVault,
+          useContext,
+          useResearch,
+          // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
+          ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
         });
+
+        // writing-mode: task 4 a pinned range drives the rewrite/check path: preview modal, chat answer, or continuation
+        // ---- pinned selection: collaborate rewrite/check path ----
+        if (pinned) {
+          if (!result.markdown || !String(result.markdown).trim()) {
+            this.replaceLastAssistantMessage("No rewrite returned.");
+            this.setStatus("Collaboration complete.");
+            return;
+          }
+          if (isChat) {
+            // chat (Check against my notes): assistant message, no modal, no edit
+            const { formatReference } = require("./writing/styles.js");
+            const refs = citationStyle === "footnotes"
+              ? (result.footnotes || "")
+              : ((result.cited || []).map((s) => formatReference(citationStyle, s)).join("\n"));
+            const parts = [result.markdown || "", refs, result.sourcesBlock || ""].filter(Boolean);
+            this.replaceLastAssistantMessage(parts.join("\n\n"));
+            this.renderRelevantNotes(result.sources || []);
+            this.setStatus("Collaboration complete.");
+            return;
+          }
+          // replace / after: open the Before | After preview modal
+          const { planReferences } = require("./writing/styles.js");
+          let references = [];
+          if (citationStyle === "footnotes") {
+            references = (result.footnotes || "").split("\n").filter(Boolean);
+          } else {
+            const planned = planReferences(active.text, citationStyle, result.cited || []);
+            references = (planned && planned.added) || [];
+          }
+          const modal = new RewritePreviewModal(this.app, {
+            title: apply === "after" ? "Review continuation" : "Review rewrite",
+            before: pinned.original || "",
+            after: result.markdown || "",
+            references,
+            onApply: (text) => this.applyRewrite(pinned, text, result, citationStyle, apply),
+            onCancel: () => this.clearPin(),
+          });
+          this.rewriteModal = modal;
+          modal.open();
+          this.replaceLastAssistantMessage("Preview ready — apply or cancel in the dialog.");
+          this.setStatus("Collaboration complete.");
+          return;
+        }
+
+        // ---- no pin: existing insert-at-cursor / visible-note path ----
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
         // writing-mode: sources searched block inserted with the draft so the note honestly shows searched sources
         const draftText = composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock);
@@ -22239,9 +22359,32 @@ class SemanticTodoistView extends ItemView {
         const preferredView = (this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(typeof MarkdownView !== "undefined" ? MarkdownView : null) : null);
         const currentEditor = findMarkdownEditorForPath(this.plugin && this.plugin.app ? this.plugin.app : null, currentPath, preferredView);
         if (currentEditor && currentPath) {
+          // writing-mode: task 4 the insert plan re-checks the recorded position and the text before it
+          const recorded = {
+            path: filePath,
+            from: recordedFrom,
+            to: recordedFrom,
+            prefix: recordedPrefix,
+          };
           const plan = planInsertion(currentEditor, recorded, currentPath);
           if (plan.mode === "recorded" || plan.mode === "cursor") {
-            insertDraft(currentEditor, plan, draftText);
+            // writing-mode: task 4 a non-footnote style adds its reference list in the same transaction as the insert
+            if (citationStyle !== "footnotes") {
+              const { planReferences } = require("./writing/styles.js");
+              const currentText = currentEditor.getValue ? currentEditor.getValue() : "";
+              const planned = planReferences(currentText, citationStyle, result.cited || []);
+              const changes = [{ from: plan.from, to: plan.to, text: draftText }];
+              if (planned && planned.edit) {
+                changes.push({
+                  from: currentEditor.offsetToPos(planned.edit.from),
+                  to: currentEditor.offsetToPos(planned.edit.to),
+                  text: planned.edit.text,
+                });
+              }
+              currentEditor.transaction({ changes });
+            } else {
+              insertDraft(currentEditor, plan, draftText);
+            }
             if (plan.notice) {
               new Notice(plan.notice);
             }
@@ -22288,6 +22431,116 @@ class SemanticTodoistView extends ItemView {
       this.replaceLastAssistantMessage(`Error: ${error.message || error}`);
       this.setStatus(`Writing failed: ${error.message || error}`);
     }
+  }
+
+  // writing-mode: task 4 — pin the selected range so it survives focus leaving the editor
+  // writing-mode: task 4 fix 4 — call getCursor on the editor: an extracted method loses `this` and a live editor throws
+  // writing-mode: task 4 fix 5 — a pin captured at menu time is used as-is, so the passage is the one the user right-clicked
+  pinSelection(editor, path, captured) {
+    const hasGetCursor = !captured && !!editor && typeof editor.getCursor === "function";
+    const from = captured ? captured.from : (hasGetCursor ? editor.getCursor("from") : null);
+    const to = captured ? captured.to : (hasGetCursor ? editor.getCursor("to") : null);
+    this.pinned = {
+      path: String((captured && captured.path) || path || ""),
+      from: from && typeof from.line === "number" ? from : { line: 0, ch: 0 },
+      to: to && typeof to.line === "number" ? to : { line: 0, ch: 0 },
+      original: captured ? String(captured.original || "") : (editor.getSelection ? editor.getSelection() : ""),
+    };
+    this.renderPinChip();
+  }
+
+  clearPin() {
+    this.pinned = null;
+    const chip = this.pinChipEl;
+    if (chip) {
+      try { chip.remove(); } catch (e) {}
+      this.pinChipEl = null;
+    }
+  }
+
+  renderPinChip() {
+    const existing = this.pinChipEl;
+    if (existing) {
+      try { existing.remove(); } catch (e) {}
+      this.pinChipEl = null;
+    }
+    if (!this.pinned) return;
+    const container = this.promptEl && this.promptEl.parentElement;
+    if (!container || typeof container.createEl !== "function") return;
+    const chip = container.createEl("div", { cls: "semantic-todoist-pin-chip" });
+    chip.createEl("span", { text: `✎ "${String(this.pinned.original || "").slice(0, 60)}…"` });
+    const clear = chip.createEl("button", { text: "×", cls: "semantic-todoist-pin-chip-clear" });
+    clear.onclick = () => this.clearPin();
+    container.insertBefore(chip, this.promptEl);
+    this.pinChipEl = chip;
+  }
+
+  // writing-mode: task 4 — apply the edited After text to the pinned range
+  applyRewrite(pinned, text, result, citationStyle, apply) {
+    const app = this.plugin && this.plugin.app ? this.plugin.app : this.app;
+    const currentPath = pinned.path;
+    const editor = findMarkdownEditorForPath(app, currentPath, null);
+    if (!editor) {
+      const fileBase = (currentPath || "").split("/").pop() || currentPath || "this note";
+      new Notice(`Open ${fileBase} to apply.`);
+      return false;
+    }
+    // writing-mode: task 4 fix — an empty After pane must never replace the passage with nothing
+    if (!String(text == null ? "" : text).trim()) {
+      new Notice("Nothing to apply.");
+      return false;
+    }
+    const { planReplacement } = require("./writing/rewrite.js");
+    const recorded = { path: currentPath, from: pinned.from, to: pinned.to, original: pinned.original };
+    const plan = planReplacement(editor, recorded, currentPath);
+    if (!plan.ok) {
+      new Notice(plan.notice);
+      return false;
+    }
+    const currentText = editor.getValue ? editor.getValue() : "";
+    // writing-mode: task 4 footnote definitions ride along with the applied passage
+    const footnoteText = citationStyle === "footnotes" ? String(result.footnotes || "").trim() : "";
+    const changes = [];
+    if (apply === "after") {
+      changes.push({ from: plan.to, to: plan.to, text: "\n\n" + text + (footnoteText ? "\n\n" + footnoteText : "") });
+    } else if (citationStyle === "footnotes") {
+      // footnotes keep the byte-for-byte replaceRange path
+      editor.replaceRange(footnoteText ? text + "\n\n" + footnoteText : text, plan.from, plan.to);
+      this.clearPin();
+      return true;
+    } else {
+      changes.push({ from: plan.from, to: plan.to, text: text });
+    }
+    // non-footnote: combine the passage edit with the reference edit in one transaction
+    if (citationStyle !== "footnotes") {
+      const { planReferences } = require("./writing/styles.js");
+      const planned = planReferences(currentText, citationStyle, result.cited || []);
+      if (citationStyle === "nature") {
+        const resultNumbers = result.numbers || {};
+        for (const key of Object.keys(resultNumbers)) {
+          if (planned.numbers[key] !== resultNumbers[key]) {
+            new Notice("References changed while writing; run again.");
+            return false;
+          }
+        }
+      }
+      if (planned.edit) {
+        const pinnedStart = editor.posToOffset(pinned.from);
+        const pinnedEnd = editor.posToOffset(pinned.to);
+        if (pinnedStart < planned.edit.to && pinnedEnd > planned.edit.from) {
+          new Notice("The selection overlaps the reference list; not applied.");
+          return false;
+        }
+        changes.push({
+          from: editor.offsetToPos(planned.edit.from),
+          to: editor.offsetToPos(planned.edit.to),
+          text: planned.edit.text,
+        });
+      }
+    }
+    editor.transaction({ changes });
+    this.clearPin();
+    return true;
   }
 
   renderDraftForInsert(result, filePath, editor) {
@@ -22741,7 +22994,8 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     containerEl.addClass("semantic-todoist-settings");
     new Setting(containerEl).setName("Semantic Todoist Sync").setHeading();
     const tabs = containerEl.createDiv({ cls: "semantic-todoist-tabs" });
-    const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Note Tasks", "Email Tasks", "Daily Scheduler", "Task Integrity", "Activity"]; // writing-mode: note and email task tabs split from workflows
+    // writing-mode: Collaborate tab sits between AI Models and Task Workflows
+    const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Collaborate", "Task Workflows", "Note Tasks", "Email Tasks", "Daily Scheduler", "Task Integrity", "Activity"]; // writing-mode: note and email task tabs split from workflows
     let activeButton = null;
     for (const tab of tabNames) {
       const button = tabs.createEl("button", { text: tab, attr: { type: "button", "aria-label": `Open ${tab} settings` } });
@@ -22762,6 +23016,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
       "AI & Search": "renderAiSearch",
       "AI Providers": "renderAiProviders",
       "AI Models": "renderAiModels",
+      Collaborate: "renderCollaborate", // writing-mode: Collaborate tab renderer
       "Task Workflows": "renderTaskWorkflows",
       "Note Tasks": "renderNoteTasks", // writing-mode: note tasks tab renderer
       "Email Tasks": "renderEmailTasks", // writing-mode: email tasks tab renderer
@@ -22886,21 +23141,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     new Setting(sidebar).setName("Open sidebar").addButton((button) => button.setButtonText("Open").onClick(() => this.plugin.openSidebar()));
     new Setting(sidebar).setName("Run prompts").setDesc("Run a saved prompt or task template.").addButton((button) => button.setButtonText("Run").onClick(() => this.plugin.runTaskTemplateFromCommandPalette()));
 
-    // writing-mode: Writing settings section
-    const writing = settingsDisclosure(containerEl, "Writing", "Sidebar Write mode settings for drafting evidence-based prose into notes.", false);
-    new Setting(writing).setName("Context folder").setDesc("Folder inside the vault used for writing context files (default 'Semantic Todoist Sync/Context')").addText((text) => text.setValue(String(this.plugin.settings.writingContextFolder || "")).onChange(async (value) => {
-      if (writingIsAbsoluteContextPath(String(value || "").trim())) {
-        new Notice("Context folder must be a path inside the vault.");
-        text.setValue(String(this.plugin.settings.writingContextFolder || ""));
-        return;
-      }
-      this.plugin.settings.writingContextFolder = value;
-      await this.plugin.saveSettings();
-    }));
-    toggleSetting(writing, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
-    toggleSetting(writing, "Deep research evidence", "Use saved Deep research notes from the Research folder as evidence, ranked above vault notes.", this.plugin, "writingUseResearch");
-    new Setting(writing).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));
-
+    // writing-mode: the Writing section moved to the Collaborate tab
     const mcp = settingsDisclosure(containerEl, "Optional MCP bridge", "Writes a small read-only manifest for a separately configured MCP server. This plugin does not start an MCP server.", false);
     toggleSetting(mcp, "Publish MCP bridge manifest", "Point an external read-only bridge at existing plugin databases without copying them.", this.plugin, "externalMcpExportEnabled");
     textSetting(mcp, "MCP bridge folder", "Vault folder for the discoverable bridge manifest.", this.plugin, "externalMcpExportFolder");
@@ -23130,6 +23371,34 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     log.setAttribute("tabindex", "0");
     log.setAttribute("aria-label", "Semantic Todoist Sync activity log");
     log.setText((this.plugin.settings.localLog || []).length ? (this.plugin.settings.localLog || []).map((entry) => `${formatDeviceDateTime(entry.at) || "Unknown time"}  ${entry.message}  ${activityLogDataText(entry.data || {})}`).join("\n") : "No local activity logged yet.");
+  }
+
+  renderCollaborate(containerEl) { // writing-mode: durable Collaborate settings (citation style, context folder, rescan, describe images)
+    settingsHeading(containerEl, "Collaborate", "Durable settings for Collaborate mode. Hot-swappable choices stay in the sidebar Features menu.");
+    new Setting(containerEl)
+      .setName("Citation style")
+      .setDesc("How Collaborate cites sources: Obsidian footnotes, APA 7 (Author, Year) with a References list, or Nature numbered [1] with a References list.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("footnotes", "Footnotes");
+        dropdown.addOption("apa", "APA 7");
+        dropdown.addOption("nature", "Nature");
+        dropdown.setValue(this.plugin.settings.writingCitationStyle || "footnotes").onChange(async (value) => {
+          this.plugin.settings.writingCitationStyle = value;
+          await this.plugin.saveSettings();
+        });
+      });
+    new Setting(containerEl).setName("Context folder").setDesc("Folder inside the vault used for writing context files (default 'Semantic Todoist Sync/Context')").addText((text) => text.setValue(String(this.plugin.settings.writingContextFolder || "")).onChange(async (value) => {
+      if (writingIsAbsoluteContextPath(String(value || "").trim())) {
+        new Notice("Context folder must be a path inside the vault.");
+        text.setValue(String(this.plugin.settings.writingContextFolder || ""));
+        return;
+      }
+      this.plugin.settings.writingContextFolder = value;
+      await this.plugin.saveSettings();
+    })); // 0.9.25 security: vault-only context folder (guard kept when moved to the Collaborate tab)
+    new Setting(containerEl).setName("Rescan context folder").setDesc("Rebuild the separate context-folder store. Runs before each write request automatically; use this when files change.").addButton((button) => button.setButtonText("Rescan").onClick(async () => { try { await this.plugin.rescanContextFolder(); this.display(); } catch (e) { new Notice(`Rescan failed: ${e.message || e}`); } }));
+    toggleSetting(containerEl, "Describe images", "Send images to the vision-capable model for evidence extraction. Off skips images to save tokens.", this.plugin, "writingDescribeImages");
+    new Setting(containerEl).setDesc("Web search provider and saving research notes: AI & Search tab.").addButton((button) => button.setButtonText("Open").onClick(() => this.goTo("AI & Search")));
   }
 }
 
@@ -23825,6 +24094,76 @@ class PromptModal extends Modal {
   }
 
   onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// writing-mode: task 4 — Before | After rewrite preview modal with an editable After pane
+class RewritePreviewModal extends Modal {
+  constructor(app, { title, before, after, references = [], onApply, onCancel }) {
+    super(app);
+    this.title = title;
+    this.before = before;
+    this.after = after;
+    this.references = references;
+    this.onApply = onApply;
+    this.onCancel = onCancel;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-rewrite-modal");
+    contentEl.addClass("semantic-todoist-modal-content");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: this.title });
+
+    const grid = contentEl.createEl("div", { cls: "semantic-todoist-rewrite-grid" });
+
+    const beforePanel = grid.createEl("div", { cls: "semantic-todoist-rewrite-pane" });
+    beforePanel.createEl("div", { text: "Before" });
+    const beforeEl = beforePanel.createEl("div", { cls: "semantic-todoist-rewrite-before" });
+    beforeEl.setText(this.before || "");
+
+    const afterPanel = grid.createEl("div", { cls: "semantic-todoist-rewrite-pane" });
+    afterPanel.createEl("div", { text: "After" });
+    // writing-mode: task 4 fix — Obsidian's createEl ignores { value } on a textarea, so the pane opened empty
+    const afterEl = afterPanel.createEl("textarea");
+    afterEl.value = this.after || "";
+    afterEl.addClass("semantic-todoist-rewrite-after");
+    afterEl.focus();
+
+    if (this.references && this.references.length) {
+      const refsPanel = contentEl.createEl("div", { cls: "semantic-todoist-rewrite-refs" });
+      refsPanel.createEl("div", { text: "References to add" });
+      const list = refsPanel.createEl("ul", { cls: "semantic-todoist-rewrite-refs-list" });
+      for (const ref of this.references) {
+        list.createEl("li", { text: ref });
+      }
+    }
+
+    const buttonBar = contentEl.createEl("div", { cls: "semantic-todoist-rewrite-buttons" });
+    const cancelBtn = buttonBar.createEl("button", { text: "Cancel", cls: "semantic-todoist-rewrite-cancel" });
+    cancelBtn.onclick = () => this.close();
+    const copyBtn = buttonBar.createEl("button", { text: "Copy", cls: "semantic-todoist-rewrite-copy" });
+    copyBtn.onclick = async () => {
+      try { await navigator.clipboard.writeText(afterEl.value); } catch (e) {}
+    };
+    const applyBtn = buttonBar.createEl("button", { text: "Apply", cls: "semantic-todoist-rewrite-apply" });
+    if (typeof applyBtn.setCta === "function") applyBtn.setCta();
+    applyBtn.onclick = async () => {
+      if (typeof this.onApply === "function") {
+        const ok = await this.onApply(afterEl.value);
+        if (ok !== false) this.close();
+      } else {
+        this.close();
+      }
+    };
+  }
+
+  onClose() {
+    // writing-mode: task 4 cancel (or Esc) unpins the range
+    if (typeof this.onCancel === "function") this.onCancel();
     this.contentEl.empty();
   }
 }
@@ -30718,6 +31057,55 @@ function writingPathInContextFolder(path, settings, vaultBasePath) {
   const folder = folderConfigured || WRITING_CONTEXT_FOLDER_DEFAULT;
   const value = String(path || "").replace(/\\/g, "/");
   return value === folder || value.startsWith(`${folder}/`);
+}
+
+// writing-mode: task 4 editor menu — the pinned range for the collaborate items, or null when the menu stays untouched
+function rewriteMenuPin(plugin, editor, info) {
+  if (!plugin || !plugin.settings || plugin.settings.writingCollaborateMode !== true) return null;
+  if (!editor || typeof editor.somethingSelected !== "function" || !editor.somethingSelected()) return null;
+  const file = info && info.file ? info.file : (info && info.view ? info.view.file : null);
+  const path = file && file.path ? String(file.path) : "";
+  if (!path) return null;
+  return {
+    path,
+    from: editor.getCursor && typeof editor.getCursor === "function" ? editor.getCursor("from") : { line: 0, ch: 0 },
+    to: editor.getCursor && typeof editor.getCursor === "function" ? editor.getCursor("to") : { line: 0, ch: 0 },
+    original: editor.getSelection ? editor.getSelection() : "",
+  };
+}
+
+// writing-mode: task 4 editor menu — preset items in table order, grouped rows behind one submenu each
+function addRewritePresetItems(menu, presets, handlers) {
+  const groups = new Map();
+  for (const preset of presets || []) {
+    if (!preset.group) continue;
+    if (!groups.has(preset.group)) groups.set(preset.group, []);
+    groups.get(preset.group).push(preset);
+  }
+  const emitted = new Set();
+  const addItems = (items, parent) => {
+    for (const preset of items) {
+      parent.addItem((item) => {
+        item.setTitle(preset.title).onClick(() => handlers.onPreset(preset));
+      });
+    }
+  };
+  for (const preset of presets || []) {
+    if (!preset.group) {
+      addItems([preset], menu);
+      continue;
+    }
+    if (emitted.has(preset.group)) continue;
+    emitted.add(preset.group);
+    menu.addItem((gitem) => {
+      gitem.setTitle(preset.group);
+      const sub = gitem.setSubmenu() || gitem.submenu;
+      addItems(groups.get(preset.group), sub);
+    });
+  }
+  menu.addItem((item) => {
+    item.setTitle("Rewrite with instruction…").onClick(() => handlers.onTyped());
+  });
 }
 
 // writing-mode: fix request-time note lookup falls back to most-recent and visible markdown leaves when sidebar focused without last-active
@@ -42367,6 +42755,8 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     active
   );
   const lines = [workflowSourceType === "email" ? "Context Notes:" : "Sources:"];
+  const emailIdentity = workflowSourceType === "email" ? emailSourceIdentityLine(active) : "";
+  if (emailIdentity) lines.push(emailIdentity);
   const seen = new Set();
   const rendered = [];
   let ledgerRenderedLines = null;
@@ -42426,7 +42816,7 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       }
     }
   }
-  if (!rendered.length && !ledgerRenderedLines?.length) return "";
+  if (!rendered.length && !ledgerRenderedLines?.length && !emailIdentity) return "";
   return lines.concat(ledgerRenderedLines || rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n");
 }
 
@@ -42657,6 +43047,19 @@ function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) 
   return raw === "email" || raw === "email-to-todoist" ? "email" : "note";
 }
 
+// The primary email is cited as ONE unnumbered identity line inside the email
+// source block ("From <sender> on <date> ΓÇö <subject>"). It is not a citation:
+// it takes no number and never renumbers the inline (N) markers.
+function emailSourceIdentityLine(active = {}) {
+  const from = singleLine(active?.from || "");
+  const receivedAt = singleLine(active?.receivedAt || "");
+  const subject = singleLine(active?.subject || active?.title || "");
+  if (!from && !receivedAt && !subject) return "";
+  const head = `From ${from || "unknown sender"}`;
+  const when = receivedAt ? ` on ${receivedAt}` : "";
+  return [head + when, subject ? `ΓÇö ${subject}` : ""].filter(Boolean).join(" ");
+}
+
 function descriptionSourceList(active, contextNotes, basePath = "", sourceType = "") {
   const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, active);
   const heading = workflowSourceType === "email" ? "Context Notes:" : "Sources:";
@@ -42671,8 +43074,10 @@ function descriptionSourceList(active, contextNotes, basePath = "", sourceType =
   };
   if (workflowSourceType !== "email") add(sourceReference(active, basePath));
   for (const note of contextNotes || []) add(sourceReference(note, basePath));
-  if (!sourceLines.length) return "";
+  const identity = workflowSourceType === "email" ? emailSourceIdentityLine(active) : "";
+  if (!sourceLines.length && !identity) return "";
   lines.push(heading);
+  if (identity) lines.push(identity);
   sourceLines.forEach((line, index) => lines.push(`${index + 1}. ${line}`));
   return lines.join("\n");
 }
@@ -43036,8 +43441,26 @@ function isRichTodoistDescription(value) {
   return true;
 }
 
+// The email source block carries ONE unnumbered identity line. Pull it out
+// before the numbered-list restore so a subject like "Week 1. Plan" cannot be
+// split into a bogus citation entry.
+function splitEmailSourceIdentityLine(value) {
+  const text = String(value || "");
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const headingIndex = lines.findIndex((line) => /^\s*context notes?\s*:/i.test(line));
+  if (headingIndex < 0) return { identity: "", body: text };
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) continue;
+    if (!/^from\s+\S/i.test(trimmed)) return { identity: "", body: text };
+    return { identity: trimmed, body: lines.slice(0, index).concat(lines.slice(index + 1)).join("\n") };
+  }
+  return { identity: "", body: text };
+}
+
 function normalizeStoredSourceList(value) {
-  const rawLines = String(value || "")
+  const identitySplit = splitEmailSourceIdentityLine(value);
+  const rawLines = identitySplit.body
     .replace(/\r\n/g, "\n")
     .replace(/[\s\S]*/, (text) => restoreSourceListLineBreaks(text))
     .replace(/\[[^\]]+\]\(obsidian:\/\/open\?file=([^)]+)\)/g, (_, file) => decodeURIComponent(file))
@@ -43073,7 +43496,9 @@ function normalizeStoredSourceList(value) {
     ...((primary || sourceHeadingIndex >= 0) ? contextItems : [])
   ]).slice(0, 8);
   if (noteSources.length) return ["Sources:", ...noteSources.map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
-  if (contextItems.length) return ["Context Notes:", ...dedupeNumberedSources(contextItems).slice(0, 8).map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
+  const identity = identitySplit.identity;
+  if (contextItems.length) return ["Context Notes:", ...(identity ? [identity] : []), ...dedupeNumberedSources(contextItems).slice(0, 8).map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
+  if (identity) return ["Context Notes:", identity].join("\n");
   return "";
 }
 
@@ -56020,6 +56445,9 @@ if (typeof module !== "undefined" && module.exports) {
     // not runtime/plugin API).
     buildTaskSourceContract,
     sourceContractSourceText, // writing-mode: test seam so the heading-strip test exercises the real strip
+    // writing-mode: task 4 test seam so the editor-menu guard and item order run for real
+    rewriteMenuPin,
+    addRewritePresetItems,
     buildTaskEvidenceCatalog,
     attachTaskWorkflowSemanticEvidence,
     resolveTaskWorkflowReferences,

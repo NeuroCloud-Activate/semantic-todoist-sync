@@ -126,8 +126,9 @@ assert.ok(!source.includes('const tabNames = ["Setup", "AI & Search", "AI Models
 assert.ok(source.includes('renderAiModels(containerEl)'), 'AI Models renderer exists');
 // Task 2 RED: eight canonical groups with AI Providers owning the
 // presentation-only provider dropdown and single connection disclosure.
-const TEN_TABS = 'const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Task Workflows", "Note Tasks", "Email Tasks", "Daily Scheduler", "Task Integrity", "Activity"]';
-assert.ok(source.includes(TEN_TABS), 'ten setting groups exist in the required order');
+// Task 5: the Collaborate tab joins them, between AI Models and Task Workflows.
+const ELEVEN_TABS = 'const tabNames = ["Setup", "AI & Search", "AI Providers", "AI Models", "Collaborate", "Task Workflows", "Note Tasks", "Email Tasks", "Daily Scheduler", "Task Integrity", "Activity"]';
+assert.ok(source.includes(ELEVEN_TABS), 'eleven setting groups exist in required order');
 assert.ok(source.includes('renderAiProviders(containerEl)'), 'AI Providers renderer exists');
 assert.ok(source.includes('this.goTo("AI Providers")'), 'Setup navigates to AI Providers');
 
@@ -292,6 +293,25 @@ assert.ok(collect(searchRoot, (element) => element.textContent === 'Sidebar and 
 const searchSettings = renderedSettings.slice(searchSettingsStart);
 assert.ok(searchSettings.some((setting) => setting.name === 'Semantic vault index'), 'AI & Search renders semantic-index controls');
 assert.ok(!renderedSettings.slice(0, searchSettingsStart).some((setting) => setting.name === 'Semantic vault index'), 'AI Models does not duplicate semantic-index controls');
+// Task 5: the Collaborate tab owns the durable writing settings and renders
+// them in the documented order.
+const collaborateRoot = new FakeElement('section');
+const collaborateSettingsStart = renderedSettings.length;
+tab.renderCollaborate(collaborateRoot);
+const collaborateSettings = renderedSettings.slice(collaborateSettingsStart);
+assert.deepStrictEqual(
+  collaborateSettings.map((setting) => setting.name).filter(Boolean),
+  ['Citation style', 'Context folder', 'Rescan context folder', 'Describe images'],
+  'Collaborate tab renders citation style, context folder, rescan and describe images in order'
+);
+const citationStyleSetting = collaborateSettings.find((setting) => setting.name === 'Citation style');
+assert.deepStrictEqual(
+  citationStyleSetting?.control?.options,
+  [{ value: 'footnotes', label: 'Footnotes' }, { value: 'apa', label: 'APA 7' }, { value: 'nature', label: 'Nature' }],
+  'citation style dropdown stores footnotes/apa/nature behind the house labels'
+);
+assert.strictEqual(citationStyleSetting?.control?.value, 'footnotes', 'citation style defaults to footnotes');
+assert.ok(collaborateSettings.some((setting) => setting.description === 'Web search provider and saving research notes: AI & Search tab.'), 'Collaborate tab points at the AI & Search tab');
 const providerSelector = renderedSettings.find((setting) => setting.name === 'Provider connection to show');
 assert.ok(providerSelector?.control?.change, 'provider-view selector is rendered');
 providerSelector.control.change('gemini');

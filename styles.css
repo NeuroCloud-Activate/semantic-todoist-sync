@@ -2246,3 +2246,111 @@
 .semantic-todoist-settings .semantic-todoist-index-file-list li {
   overflow-wrap: anywhere;
 }
+
+/* writing-mode: task 4 — pin chip shown above the prompt box when a range is pinned */
+.semantic-todoist-pin-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin: 0 0 6px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-secondary);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.semantic-todoist-pin-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+  display: inline-block;
+}
+.semantic-todoist-pin-chip .semantic-todoist-pin-chip-clear {
+  margin: 0 0 0 6px;
+  padding: 0 6px;
+  font-size: var(--font-ui-small);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+/* writing-mode: task 4 — Before | After rewrite preview modal: two-column grid, stacks under 600px */
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 10px 0 14px 0;
+}
+@media (max-width: 600px) {
+  .semantic-todoist-rewrite-modal .semantic-todoist-rewrite-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-pane > div:first-child {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-before {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--background-secondary-alt);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+  max-height: 260px;
+  overflow: auto;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-after {
+  width: 100%;
+  min-height: 220px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+  resize: vertical;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-refs {
+  margin-top: 10px;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-refs > div:first-child {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-refs-list {
+  margin: 0 0 10px 0;
+  padding-left: 18px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-secondary);
+  max-height: 160px;
+  overflow: auto;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-refs-list li {
+  padding: 4px 2px;
+  font-size: var(--font-ui-smaller);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-buttons button {
+  min-height: 34px;
+  padding: 0 14px;
+  font-size: var(--font-ui-small);
+}

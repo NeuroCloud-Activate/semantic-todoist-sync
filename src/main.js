@@ -43048,7 +43048,7 @@ function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) 
 }
 
 // The primary email is cited as ONE unnumbered identity line inside the email
-// source block ("From <sender> on <date> ΓÇö <subject>"). It is not a citation:
+// source block ("From <sender> on <date> — <subject>"). It is not a citation:
 // it takes no number and never renumbers the inline (N) markers.
 function emailSourceIdentityLine(active = {}) {
   const from = singleLine(active?.from || "");
@@ -43057,7 +43057,7 @@ function emailSourceIdentityLine(active = {}) {
   if (!from && !receivedAt && !subject) return "";
   const head = `From ${from || "unknown sender"}`;
   const when = receivedAt ? ` on ${receivedAt}` : "";
-  return [head + when, subject ? `ΓÇö ${subject}` : ""].filter(Boolean).join(" ");
+  return [head + when, subject ? `\u2014 ${subject}` : ""].filter(Boolean).join(" ");
 }
 
 function descriptionSourceList(active, contextNotes, basePath = "", sourceType = "") {

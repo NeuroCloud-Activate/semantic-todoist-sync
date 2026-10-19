@@ -559,6 +559,8 @@ async function main() {
     const identityLine = description.split("\n").find((line) => line.includes("From Alex Rivera"));
     assert.ok(identityLine, `the email identity must be its own line, got ${JSON.stringify(description)}`);
     assert.ok(!/^\d+\.\s/.test(identityLine), `the email identity line must stay unnumbered, got ${JSON.stringify(identityLine)}`);
+    assert.ok(identityLine.includes(` \u2014 ${EMAIL_TITLE}`), `the email identity line must join the subject with an em dash, got ${JSON.stringify(identityLine)}`);
+    assert.ok(!/[\u0393\u00C7\u00F6]/.test(identityLine), `the email identity line must not carry mojibake, got ${JSON.stringify(identityLine)}`);
     assert.ok(description.indexOf(identityLine) > description.indexOf("Context Notes:"), "the email identity line must live in the source block, not in the description open");
   });
   check("email arm embeds a bounded number of query texts", () => {

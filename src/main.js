@@ -18683,15 +18683,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const fallbackSectionName = makeSectionName(receivedAt, subject);
     const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
     const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
-    const emailSourceText = [
-      `From: ${email.from || parsed.from || ""}`,
-      `To: ${email.to || parsed.to || ""}`,
-      `Original email received: ${displayedReceivedAt}`,
-      displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
-      `Subject: ${subject}`,
-      "",
-      parsed.text
-    ].filter(Boolean).join("\n");
+    const emailSourceText = emailSourceTextForModel(parsed, email, {
+      subject,
+      receivedAt: displayedReceivedAt,
+      cloudflareReceivedAt: displayedCloudflareReceivedAt
+    });
     // One workflow root context, created before planning, shared by this
     // email workflow's retrieval/planning and its parallel section/description
     // calls.
@@ -32912,6 +32908,24 @@ function emailSourceSender(parsed = {}, envelopeFrom = "") {
   return extractForwardedOriginalSender(parsed?.text || "") || singleLine(envelopeFrom || parsed?.from || "");
 }
 
+// The AI-facing source text for an email. The user forwards every email in,
+// so the original sender names the message; the forwarder keeps its own line
+// so the model still knows the message was relayed.
+function emailSourceTextForModel(parsed = {}, email = {}, options = {}) {
+  const originalSender = emailSourceSender(parsed, email.from);
+  const forwarder = singleLine(email.from || parsed?.from || "");
+  return [
+    `From: ${originalSender}`,
+    forwarder && forwarder !== originalSender ? `Forwarded by: ${forwarder}` : "",
+    `To: ${email.to || parsed?.to || ""}`,
+    `Original email received: ${options.receivedAt || ""}`,
+    options.cloudflareReceivedAt ? `Forward received by Cloudflare: ${options.cloudflareReceivedAt}` : "",
+    `Subject: ${options.subject || ""}`,
+    "",
+    parsed?.text || ""
+  ].filter(Boolean).join("\n");
+}
+
 function normalizeEmailDate(value) {
   const raw = singleLine(String(value || "").replace(/\([^)]*\)/g, " ").replace(/\bat\b/gi, " "));
   if (!raw) return "";
@@ -40562,9 +40576,12 @@ function validateTaskDescriptionSentences(item = {}, task = {}, structuredRefs =
       .filter((entry) => entry.sourceKind !== SEMANTIC_TASK_REFERENCE_PARENT_STUB_SOURCE_KIND)
       .filter((entry) => entry.path || entry.taskId || entry.sourceId || entry.title);
   const displaySelection = workflowSourceType === "email"
-    ? { ledger: citationLedger, retainedEvidenceIds: null }
+    // Email rows are not capped, so their numbers are compacted instead: the
+    // cited rows are renumbered to 1..k and the inline (N) markers and the
+    // displayed rows read from that one compacted ledger.
+    ? { ledger: compactTaskDescriptionCitationLedger(citationLedger, citedEvidenceIds), retainedEvidenceIds: null }
     : capTaskDescriptionCitationLedger(displayableCitedLedger, 6, basePath);
-  const renderedCitationLedger = workflowSourceType === "email" ? citationLedger : displaySelection.ledger;
+  const renderedCitationLedger = displaySelection.ledger;
   const renderedCitedEvidenceIds = workflowSourceType === "email"
     ? citedEvidenceIds
     : citedEvidenceIds.filter((evidenceId) => displaySelection.retainedEvidenceIds.has(evidenceId));
@@ -42616,6 +42633,31 @@ function capTaskDescriptionCitationLedger(ledger = [], maxContextNotes = 6, base
   };
 }
 
+// Email tasks keep every cited source row (their rows are not capped at six),
+// so their citation numbers follow the full per-task ledger and skip numbers
+// (1, 18, ...). The displayed list must read 1..k, so the cited rows are
+// compacted to consecutive numbers in ascending order. Rows that share a
+// number keep sharing one, and a row that is not cited keeps its own number
+// after the compacted block. Rows numbered 0 (the email current source) stay 0.
+function compactTaskDescriptionCitationLedger(ledger = [], citedEvidenceIds = []) {
+  const entries = Array.isArray(ledger) ? ledger : [];
+  const citedIds = new Set((Array.isArray(citedEvidenceIds) ? citedEvidenceIds : []).map(String).filter(Boolean));
+  const numberOf = (entry) => (entry && Number.isInteger(Number(entry.number)) && Number(entry.number) > 0 ? Number(entry.number) : 0);
+  const citedNumbers = uniqueValues(entries.filter((entry) => numberOf(entry) > 0 && citedIds.has(String(entry.evidenceId || ""))).map(numberOf)).sort((left, right) => left - right);
+  if (!citedNumbers.length) return entries;
+  const otherNumbers = uniqueValues(entries.filter((entry) => numberOf(entry) > 0).map(numberOf))
+    .filter((number) => !citedNumbers.includes(number))
+    .sort((left, right) => left - right);
+  const numberByOriginal = new Map();
+  citedNumbers.forEach((number, index) => numberByOriginal.set(number, index + 1));
+  otherNumbers.forEach((number, index) => numberByOriginal.set(number, citedNumbers.length + index + 1));
+  return entries.map((entry) => {
+    const number = numberOf(entry);
+    const next = numberByOriginal.get(number);
+    return number && next !== undefined ? Object.assign({}, entry, { number: next }) : entry;
+  });
+}
+
 // Shared canonical-source classification for description source lists. Two
 // entries that share one citation number (different source identity) or one
 // source identity under two numbers make the list ambiguous, so classification
@@ -42842,8 +42884,9 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     }
   }
   // The email identity line takes the first free slot: it is numbered "1." only
-  // when no displayed row already uses 1, so the visible list never appears to
-  // start at 2. No other row and no inline (N) marker is renumbered.
+  // when no displayed row uses 1 (with the compacted email citation numbers
+  // that is only the no-rows case), so the visible list never appears to start
+  // at 2. The cited rows themselves are renumbered to 1..k.
   const rowsUseOne = ledgerRenderedLines
     ? ledgerRenderedLines.some((row) => /^1\.\s/.test(row))
     : rendered.length > 0;
@@ -43085,8 +43128,9 @@ function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) 
 // The primary email is cited as ONE identity line inside the email source
 // block ("From <sender> on <date> — <subject>"). It is not a citation of its
 // own: it never renumbers the inline (N) markers. It takes the number 1 only
-// when no displayed source row already uses 1, so the visible list does not
-// appear to start at 2.
+// when no displayed source row uses 1 — the compacted email citation numbers
+// give the first cited row 1, so the identity line normally stays unnumbered
+// and the visible list never appears to start at 2.
 function emailSourceIdentityLine(active = {}, number = 0) {
   const from = singleLine(active?.from || "");
   const receivedAt = singleLine(active?.receivedAt || "");

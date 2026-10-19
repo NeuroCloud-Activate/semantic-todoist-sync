@@ -102,7 +102,10 @@ try {
       "  buildTaskSourceContract, buildTaskEvidenceCatalog, taskWorkflowEvidenceSourceList,\n" +
       "  contextNotesForTaskPlan, addContextToTaskDescriptions,\n" +
       "  extractForwardedOriginalSender, emailSourceSender, emailSourceIdentityLine,\n" +
-      "  stripForwardSubjectPrefix, splitEmailSourceIdentityLine, normalizeStoredSourceList\n" +
+      "  stripForwardSubjectPrefix, splitEmailSourceIdentityLine, normalizeStoredSourceList,\n" +
+      "  validateTaskDescriptionSentences,\n" +
+      // Guarded so this file still loads (and fails cleanly) before the helper exists.
+      "  emailSourceTextForModel: typeof emailSourceTextForModel === 'function' ? emailSourceTextForModel : null\n" +
       "};\n",
     mainPath
   );
@@ -126,7 +129,9 @@ const {
   emailSourceIdentityLine,
   stripForwardSubjectPrefix,
   splitEmailSourceIdentityLine,
-  normalizeStoredSourceList
+  normalizeStoredSourceList,
+  validateTaskDescriptionSentences,
+  emailSourceTextForModel
 } = runtime.__emailRetrievalContext;
 
 // ---------------------------------------------------------------------------
@@ -434,6 +439,28 @@ function stripVolatile(value) {
   return output;
 }
 
+// Run the production email description path: validateTaskDescriptionSentences
+// resolves the sentence refs and compacts the citation ledger, and the source
+// list is then rendered from that compacted ledger, exactly as the plugin does
+// for an email task.
+function renderEmailSourceList({ ledger, sentences, citedEvidenceIds, items, acceptedEvidenceIds, active }) {
+  const validation = validateTaskDescriptionSentences(
+    { description_sentences: sentences },
+    {},
+    { evidenceIds: citedEvidenceIds, factRefs: [], bundle: { facts: [], items } },
+    { sourceType: "email" },
+    ledger,
+    ""
+  );
+  const accepted = acceptedEvidenceIds || citedEvidenceIds;
+  const task = {
+    descriptionEvidenceBundle: { acceptedEvidenceIds: accepted, evidenceIds: accepted, items },
+    descriptionCitedEvidenceIds: validation.descriptionCitedEvidenceIds,
+    descriptionCitationLedger: validation.citationLedger
+  };
+  return { validation, task, list: taskWorkflowEvidenceSourceList(task, active, "", true, "email") };
+}
+
 const failures = [];
 const checks = [];
 function check(name, fn) {
@@ -632,32 +659,138 @@ async function main() {
     assert.equal(stripForwardSubjectPrefix(`  Fwd:   ${FORWARDED_SUBJECT}  `), FORWARDED_SUBJECT, "the prefix strip must trim and collapse the subject");
   });
 
-  check("the email identity line takes slot 1 when no cited row uses it", () => {
-    // The user's case: the email is not a cited evidence id and note row 1 is
-    // not cited either, so the list would start at "2." without the email's
-    // own "1." line.
+  check("the email identity line stays unnumbered and the cited note takes 1 after compaction", () => {
+    // The user's case: the email is not a cited evidence id and the ledger
+    // numbers have gaps (1 uncited, 18 cited), so the list would start at
+    // "18.". Compaction renumbers the cited rows to 1..k, so the cited note
+    // takes "1." and the identity line stays unnumbered above it.
     const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT };
     const mitacsPath = "Projects/Mitacs/November 25, 2025 - Donor Generations Program.md";
     const ledger = [
       { number: 0, evidenceId: "ev-email", sourceId: "src-email", title: "Email", path: "", sourceKind: "current-source" },
       { number: 1, evidenceId: "ev-note-uncited", sourceId: "src-uncited", title: "Uncited note", path: "Projects/Mitacs/Uncited.md", sourceKind: "note" },
-      { number: 2, evidenceId: "ev-note", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" }
+      { number: 18, evidenceId: "ev-note", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" }
     ];
     const items = [
       { evidenceId: "ev-email", sourceKind: "current-source", provenance: { path: "", sourceId: "src-email", title: "Email" } },
       { evidenceId: "ev-note", sourceKind: "note", provenance: { path: mitacsPath, sourceId: "src-mitacs", title: "Donor Generations Program" } }
     ];
-    const task = {
-      descriptionEvidenceBundle: { acceptedEvidenceIds: ["ev-note"], evidenceIds: ["ev-note"], items },
-      descriptionCitedEvidenceIds: ["ev-note"],
-      descriptionCitationLedger: ledger
-    };
-    const lines = taskWorkflowEvidenceSourceList(task, active, "", true, "email").split("\n");
+    const { list } = renderEmailSourceList({
+      ledger,
+      sentences: [{ text: "The intake form must be submitted.", evidence_ids: ["ev-note"] }],
+      citedEvidenceIds: ["ev-note"],
+      items,
+      acceptedEvidenceIds: ["ev-note"],
+      active
+    });
+    const lines = list.split("\n");
     assert.equal(lines[0], "Context Notes:", `the email source list must keep its heading, got ${JSON.stringify(lines[0])}`);
-    assert.equal(lines[1], `1. From ${ORIGINAL_SENDER} on Oct 19, 2026, 1:37 PM EDT \u2014 ${FORWARDED_SUBJECT}`, `the email identity line must take slot 1, got ${JSON.stringify(lines[1])}`);
-    assert.ok(/^2\. /.test(lines[2]), `the cited note must keep its own number 2, got ${JSON.stringify(lines[2])}`);
+    assert.equal(lines[1], `From ${ORIGINAL_SENDER} on Oct 19, 2026, 1:37 PM EDT \u2014 ${FORWARDED_SUBJECT}`, `the email identity line must stay unnumbered, got ${JSON.stringify(lines[1])}`);
+    assert.ok(/^1\. /.test(lines[2]), `the cited note must take number 1, got ${JSON.stringify(lines[2])}`);
     assert.ok(lines[2].includes(mitacsPath), `the cited note must keep its vault path, got ${JSON.stringify(lines[2])}`);
     assert.equal(lines.length, 3, `the list must hold only the heading, the identity line and the cited note, got ${JSON.stringify(lines)}`);
+  });
+
+  check("an email task compacts its citation numbers so the markers and the rows agree", () => {
+    // The real case: the per-task ledger numbers the cited rows 1 and 18, so
+    // the prose and the list showed 1 and 18. The displayed numbers must be
+    // 1..k in both places.
+    const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT };
+    const mitacsPath = "Projects/Mitacs/November 25, 2025 - Donor Generations Program.md";
+    const researchPath = "Research Team/September 21, 2026.md";
+    const ledger = [
+      { number: 0, evidenceId: "ev-email", sourceId: "src-email", title: "Email", path: "", sourceKind: "current-source" },
+      { number: 1, evidenceId: "ev-note-1", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" },
+      { number: 18, evidenceId: "ev-note-18", sourceId: "src-research", title: "Research Team", path: researchPath, sourceKind: "note" }
+    ];
+    const items = [
+      { evidenceId: "ev-email", sourceKind: "current-source", provenance: { path: "", sourceId: "src-email", title: "Email" } },
+      { evidenceId: "ev-note-1", sourceKind: "note", provenance: { path: mitacsPath, sourceId: "src-mitacs", title: "Donor Generations Program" } },
+      { evidenceId: "ev-note-18", sourceKind: "note", provenance: { path: researchPath, sourceId: "src-research", title: "Research Team" } }
+    ];
+    const { validation, list } = renderEmailSourceList({
+      ledger,
+      sentences: [
+        { text: "The intake form must be submitted.", evidence_ids: ["ev-note-1"] },
+        { text: "The research team confirmed the budget.", evidence_ids: ["ev-note-18"] }
+      ],
+      citedEvidenceIds: ["ev-note-1", "ev-note-18"],
+      items,
+      acceptedEvidenceIds: ["ev-note-1", "ev-note-18"],
+      active
+    });
+    assert.ok(validation.rendered.includes("(1)"), `the first marker must be renumbered to 1, got ${JSON.stringify(validation.rendered)}`);
+    assert.ok(validation.rendered.includes("(2)"), `the second marker must be renumbered to 2, got ${JSON.stringify(validation.rendered)}`);
+    assert.ok(!validation.rendered.includes("(18)"), `the old number must not survive in the prose, got ${JSON.stringify(validation.rendered)}`);
+    const lines = list.split("\n");
+    assert.equal(lines[0], "Context Notes:", `the email source list must keep its heading, got ${JSON.stringify(lines[0])}`);
+    assert.ok(!/^\d+\.\s/.test(lines[1]), `the identity line must stay unnumbered, got ${JSON.stringify(lines[1])}`);
+    assert.ok(lines[1].includes(`From ${ORIGINAL_SENDER}`), `the identity line must name the sender, got ${JSON.stringify(lines[1])}`);
+    assert.ok(/^1\. /.test(lines[2]), `the first cited row must be numbered 1, got ${JSON.stringify(lines[2])}`);
+    assert.ok(/^2\. /.test(lines[3]), `the second cited row must be numbered 2, got ${JSON.stringify(lines[3])}`);
+    assert.ok(lines[2].includes(mitacsPath), `the first row must keep its vault path, got ${JSON.stringify(lines[2])}`);
+    assert.ok(lines[3].includes(researchPath), `the second row must keep its vault path, got ${JSON.stringify(lines[3])}`);
+    assert.ok(!list.includes("18"), `the old number must not appear in the list, got ${JSON.stringify(list)}`);
+  });
+
+  check("two sentences citing the same source keep one shared number after compaction", () => {
+    const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT };
+    const mitacsPath = "Projects/Mitacs/November 25, 2025 - Donor Generations Program.md";
+    const researchPath = "Research Team/September 21, 2026.md";
+    const ledger = [
+      { number: 0, evidenceId: "ev-email", sourceId: "src-email", title: "Email", path: "", sourceKind: "current-source" },
+      { number: 1, evidenceId: "ev-note-1", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" },
+      { number: 18, evidenceId: "ev-note-18", sourceId: "src-research", title: "Research Team", path: researchPath, sourceKind: "note" }
+    ];
+    const items = [
+      { evidenceId: "ev-email", sourceKind: "current-source", provenance: { path: "", sourceId: "src-email", title: "Email" } },
+      { evidenceId: "ev-note-1", sourceKind: "note", provenance: { path: mitacsPath, sourceId: "src-mitacs", title: "Donor Generations Program" } },
+      { evidenceId: "ev-note-18", sourceKind: "note", provenance: { path: researchPath, sourceId: "src-research", title: "Research Team" } }
+    ];
+    const { validation, list } = renderEmailSourceList({
+      ledger,
+      sentences: [
+        { text: "The intake form must be submitted.", evidence_ids: ["ev-note-1"] },
+        { text: "The research team confirmed the budget.", evidence_ids: ["ev-note-18"] },
+        { text: "The research team also confirmed the timeline.", evidence_ids: ["ev-note-18"] }
+      ],
+      citedEvidenceIds: ["ev-note-1", "ev-note-18"],
+      items,
+      acceptedEvidenceIds: ["ev-note-1", "ev-note-18"],
+      active
+    });
+    const markers = validation.rendered.match(/\(\d+\)/g) || [];
+    assert.deepEqual(markers, ["(1)", "(2)", "(2)"], `the shared source must keep one number, got ${JSON.stringify(markers)}`);
+    const lines = list.split("\n");
+    assert.equal(lines.length, 4, `the list must hold the heading, the identity line and two rows, got ${JSON.stringify(lines)}`);
+    assert.ok(/^1\. /.test(lines[2]), `the first cited row must be numbered 1, got ${JSON.stringify(lines[2])}`);
+    assert.ok(/^2\. /.test(lines[3]), `the second cited row must be numbered 2, got ${JSON.stringify(lines[3])}`);
+  });
+
+  check("the AI-facing email source text names the original sender and the forwarder", () => {
+    assert.equal(typeof emailSourceTextForModel, "function", "src/main.js must expose emailSourceTextForModel");
+    const forwarded = emailSourceTextForModel(
+      { text: OUTLOOK_FORWARD_BODY, from: FORWARDER },
+      { from: FORWARDER, to: "team@blood.ca" },
+      { subject: FORWARDED_SUBJECT, receivedAt: "Oct 19, 2026, 1:37 PM EDT" }
+    );
+    const forwardedLines = forwarded.split("\n");
+    assert.equal(forwardedLines[0], `From: ${ORIGINAL_SENDER}`, `the source text must name the original sender, got ${JSON.stringify(forwardedLines[0])}`);
+    assert.equal(forwardedLines[1], `Forwarded by: ${FORWARDER}`, `the source text must name the forwarder, got ${JSON.stringify(forwardedLines[1])}`);
+    const plain = emailSourceTextForModel(
+      { text: PLAIN_BODY, from: FORWARDER },
+      { from: FORWARDER, to: "team@blood.ca" },
+      { subject: "Plain subject", receivedAt: "Oct 19, 2026, 1:37 PM EDT" }
+    );
+    const plainLines = plain.split("\n");
+    assert.equal(plainLines[0], `From: ${FORWARDER}`, `a plain email must name the envelope sender, got ${JSON.stringify(plainLines[0])}`);
+    assert.ok(!plain.includes("Forwarded by:"), `a plain email must not carry a Forwarded by line, got ${JSON.stringify(plain)}`);
+    // Production wiring: the workflow must build the AI-facing text with the helper.
+    const methodStart = mainSource.indexOf("async processPendingEmailItem(item) {");
+    assert.ok(methodStart > 0, "src/main.js must still define processPendingEmailItem");
+    const methodEnd = mainSource.indexOf("\n  async ", methodStart + 1);
+    const methodSource = mainSource.slice(methodStart, methodEnd > methodStart ? methodEnd : mainSource.length);
+    assert.ok(methodSource.includes("emailSourceTextForModel("), "processPendingEmailItem must build the source text with emailSourceTextForModel");
   });
 
   check("a cited note row that holds 1 leaves the email identity line unnumbered", () => {

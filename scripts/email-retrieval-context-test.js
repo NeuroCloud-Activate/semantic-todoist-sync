@@ -100,7 +100,9 @@ try {
     `${mainSource}\nmodule.exports.__emailRetrievalContext = {\n` +
       "  DEFAULT_SETTINGS, SEMANTIC_EMBEDDING_CONTENT_VERSION, semanticEmbeddingIdentity,\n" +
       "  buildTaskSourceContract, buildTaskEvidenceCatalog, taskWorkflowEvidenceSourceList,\n" +
-      "  contextNotesForTaskPlan, addContextToTaskDescriptions\n" +
+      "  contextNotesForTaskPlan, addContextToTaskDescriptions,\n" +
+      "  extractForwardedOriginalSender, emailSourceSender, emailSourceIdentityLine,\n" +
+      "  stripForwardSubjectPrefix, splitEmailSourceIdentityLine, normalizeStoredSourceList\n" +
       "};\n",
     mainPath
   );
@@ -118,7 +120,13 @@ const {
   buildTaskEvidenceCatalog,
   taskWorkflowEvidenceSourceList,
   contextNotesForTaskPlan,
-  addContextToTaskDescriptions
+  addContextToTaskDescriptions,
+  extractForwardedOriginalSender,
+  emailSourceSender,
+  emailSourceIdentityLine,
+  stripForwardSubjectPrefix,
+  splitEmailSourceIdentityLine,
+  normalizeStoredSourceList
 } = runtime.__emailRetrievalContext;
 
 // ---------------------------------------------------------------------------
@@ -563,6 +571,140 @@ async function main() {
     assert.ok(!/[\u0393\u00C7\u00F6]/.test(identityLine), `the email identity line must not carry mojibake, got ${JSON.stringify(identityLine)}`);
     assert.ok(description.indexOf(identityLine) > description.indexOf("Context Notes:"), "the email identity line must live in the source block, not in the description open");
   });
+
+  // ---- Forwarded sender, subject prefix and identity-line numbering -------
+  const FORWARDER = "matthew.seegobin@blood.ca";
+  const ORIGINAL_SENDER = "Joanne Tejeda <joanne@mitacs.ca>";
+  const FORWARDED_SUBJECT = "Mitacs Umbrella Intake Form Draft - For Review";
+  const OUTLOOK_FORWARD_BODY = [
+    "Hi,",
+    "",
+    "Please review the intake form below.",
+    "",
+    "-----Original Message-----",
+    `From: ${ORIGINAL_SENDER}`,
+    "Sent: October 19, 2026 1:30 PM",
+    `To: ${FORWARDER}`,
+    `Subject: ${FORWARDED_SUBJECT}`,
+    "",
+    "The Umbrella Intake Form draft is attached for review."
+  ].join("\n");
+  const GMAIL_FORWARD_BODY = [
+    "---------- Forwarded message ---------",
+    `From: ${ORIGINAL_SENDER}`,
+    "Date: Mon, Oct 19, 2026 at 1:30 PM EDT",
+    `Subject: ${FORWARDED_SUBJECT}`,
+    `To: ${FORWARDER}`,
+    "",
+    "The Umbrella Intake Form draft is attached for review."
+  ].join("\n");
+  const APPLE_FORWARD_BODY = [
+    "Begin forwarded message:",
+    "",
+    `From: ${ORIGINAL_SENDER}`,
+    `Subject: ${FORWARDED_SUBJECT}`,
+    "Date: 19 October 2026 at 13:30",
+    "",
+    "The Umbrella Intake Form draft is attached for review."
+  ].join("\n");
+  const PLAIN_BODY = "A plain body with no forwarded header block.";
+
+  check("a forwarded email body yields the original sender, not the forwarder", () => {
+    assert.equal(extractForwardedOriginalSender(OUTLOOK_FORWARD_BODY), ORIGINAL_SENDER, "the Outlook forwarded block must yield the original sender");
+    assert.equal(extractForwardedOriginalSender(GMAIL_FORWARD_BODY), ORIGINAL_SENDER, "the Gmail forwarded block must yield the original sender");
+    assert.equal(extractForwardedOriginalSender(APPLE_FORWARD_BODY), ORIGINAL_SENDER, "the Apple forwarded block must yield the original sender");
+    assert.equal(extractForwardedOriginalSender(PLAIN_BODY), "", "a body without a forwarded header block must yield no sender");
+    assert.equal(emailSourceSender({ text: OUTLOOK_FORWARD_BODY, from: FORWARDER }, FORWARDER), ORIGINAL_SENDER, "the forwarded sender must win over the envelope sender");
+    assert.equal(emailSourceSender({ text: PLAIN_BODY, from: FORWARDER }, FORWARDER), FORWARDER, "without a forwarded block the envelope sender must be used");
+    const identity = emailSourceIdentityLine({ from: emailSourceSender({ text: OUTLOOK_FORWARD_BODY, from: FORWARDER }, FORWARDER), receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT });
+    assert.ok(identity.startsWith(`From ${ORIGINAL_SENDER} on`), `the identity line must name the original sender, got ${JSON.stringify(identity)}`);
+    assert.ok(!identity.includes(FORWARDER), `the identity line must not name the forwarder, got ${JSON.stringify(identity)}`);
+  });
+
+  check("the email identity line strips the Fw:/Fwd: subject prefix", () => {
+    const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: `Fw: ${FORWARDED_SUBJECT}` };
+    const expected = `From ${ORIGINAL_SENDER} on Oct 19, 2026, 1:37 PM EDT \u2014 ${FORWARDED_SUBJECT}`;
+    assert.equal(emailSourceIdentityLine(active), expected, "the Fw: prefix must be stripped from the identity line");
+    assert.equal(emailSourceIdentityLine({ ...active, subject: `Fwd: ${FORWARDED_SUBJECT}` }), expected, "the Fwd: prefix must be stripped from the identity line");
+    assert.equal(emailSourceIdentityLine({ ...active, subject: `FW: ${FORWARDED_SUBJECT}` }), expected, "the FW: prefix must be stripped from the identity line");
+    assert.equal(emailSourceIdentityLine({ ...active, subject: `Fwd: Fw: ${FORWARDED_SUBJECT}` }), expected, "repeated forward prefixes must be stripped from the identity line");
+    assert.equal(emailSourceIdentityLine({ ...active, subject: FORWARDED_SUBJECT }), expected, "a subject without a forward prefix must stay unchanged");
+    assert.equal(stripForwardSubjectPrefix(`  Fwd:   ${FORWARDED_SUBJECT}  `), FORWARDED_SUBJECT, "the prefix strip must trim and collapse the subject");
+  });
+
+  check("the email identity line takes slot 1 when no cited row uses it", () => {
+    // The user's case: the email is not a cited evidence id and note row 1 is
+    // not cited either, so the list would start at "2." without the email's
+    // own "1." line.
+    const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT };
+    const mitacsPath = "Projects/Mitacs/November 25, 2025 - Donor Generations Program.md";
+    const ledger = [
+      { number: 0, evidenceId: "ev-email", sourceId: "src-email", title: "Email", path: "", sourceKind: "current-source" },
+      { number: 1, evidenceId: "ev-note-uncited", sourceId: "src-uncited", title: "Uncited note", path: "Projects/Mitacs/Uncited.md", sourceKind: "note" },
+      { number: 2, evidenceId: "ev-note", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" }
+    ];
+    const items = [
+      { evidenceId: "ev-email", sourceKind: "current-source", provenance: { path: "", sourceId: "src-email", title: "Email" } },
+      { evidenceId: "ev-note", sourceKind: "note", provenance: { path: mitacsPath, sourceId: "src-mitacs", title: "Donor Generations Program" } }
+    ];
+    const task = {
+      descriptionEvidenceBundle: { acceptedEvidenceIds: ["ev-note"], evidenceIds: ["ev-note"], items },
+      descriptionCitedEvidenceIds: ["ev-note"],
+      descriptionCitationLedger: ledger
+    };
+    const lines = taskWorkflowEvidenceSourceList(task, active, "", true, "email").split("\n");
+    assert.equal(lines[0], "Context Notes:", `the email source list must keep its heading, got ${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], `1. From ${ORIGINAL_SENDER} on Oct 19, 2026, 1:37 PM EDT \u2014 ${FORWARDED_SUBJECT}`, `the email identity line must take slot 1, got ${JSON.stringify(lines[1])}`);
+    assert.ok(/^2\. /.test(lines[2]), `the cited note must keep its own number 2, got ${JSON.stringify(lines[2])}`);
+    assert.ok(lines[2].includes(mitacsPath), `the cited note must keep its vault path, got ${JSON.stringify(lines[2])}`);
+    assert.equal(lines.length, 3, `the list must hold only the heading, the identity line and the cited note, got ${JSON.stringify(lines)}`);
+  });
+
+  check("a cited note row that holds 1 leaves the email identity line unnumbered", () => {
+    const active = { from: ORIGINAL_SENDER, receivedAt: "Oct 19, 2026, 1:37 PM EDT", subject: FORWARDED_SUBJECT };
+    const mitacsPath = "Projects/Mitacs/November 25, 2025 - Donor Generations Program.md";
+    const ledger = [
+      { number: 0, evidenceId: "ev-email", sourceId: "src-email", title: "Email", path: "", sourceKind: "current-source" },
+      { number: 1, evidenceId: "ev-note-1", sourceId: "src-acme", title: "Acme Debrief", path: ACME_PATH, sourceKind: "note" },
+      { number: 2, evidenceId: "ev-note-2", sourceId: "src-mitacs", title: "Donor Generations Program", path: mitacsPath, sourceKind: "note" }
+    ];
+    const items = [
+      { evidenceId: "ev-email", sourceKind: "current-source", provenance: { path: "", sourceId: "src-email", title: "Email" } },
+      { evidenceId: "ev-note-1", sourceKind: "note", provenance: { path: ACME_PATH, sourceId: "src-acme", title: "Acme Debrief" } },
+      { evidenceId: "ev-note-2", sourceKind: "note", provenance: { path: mitacsPath, sourceId: "src-mitacs", title: "Donor Generations Program" } }
+    ];
+    const task = {
+      descriptionEvidenceBundle: { acceptedEvidenceIds: ["ev-note-1", "ev-note-2"], evidenceIds: ["ev-note-1", "ev-note-2"], items },
+      descriptionCitedEvidenceIds: ["ev-note-1", "ev-note-2"],
+      descriptionCitationLedger: ledger
+    };
+    const lines = taskWorkflowEvidenceSourceList(task, active, "", true, "email").split("\n");
+    assert.equal(lines[0], "Context Notes:", `the email source list must keep its heading, got ${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], `From ${ORIGINAL_SENDER} on Oct 19, 2026, 1:37 PM EDT \u2014 ${FORWARDED_SUBJECT}`, `the identity line must stay unnumbered when a cited row holds 1, got ${JSON.stringify(lines[1])}`);
+    assert.ok(/^1\. /.test(lines[2]), `the first cited note must keep number 1, got ${JSON.stringify(lines[2])}`);
+    assert.ok(/^2\. /.test(lines[3]), `the second cited note must keep number 2, got ${JSON.stringify(lines[3])}`);
+    assert.ok(lines[2].includes(ACME_PATH), `the first cited note must keep its vault path, got ${JSON.stringify(lines[2])}`);
+    assert.equal(lines.filter((line) => /^1\. /.test(line)).length, 1, `number 1 must appear once, got ${JSON.stringify(lines)}`);
+    const stored = normalizeStoredSourceList(lines.join("\n"));
+    assert.ok(stored.includes(`From ${ORIGINAL_SENDER} on`), `the unnumbered identity line must round-trip through the stored source list, got ${JSON.stringify(stored)}`);
+    assert.ok(!/^\d+\.\s*From/m.test(stored), `the identity line must stay unnumbered in the stored source list, got ${JSON.stringify(stored)}`);
+  });
+
+  check("a numbered citation row is not mistaken for the email identity line", () => {
+    const plainRow = "1. From Bud Light Notes.md";
+    const stored = ["Context Notes:", plainRow, "2. Projects/Mitacs/Other.md"].join("\n");
+    const split = splitEmailSourceIdentityLine(stored);
+    assert.equal(split.identity, "", `a plain numbered row must not be taken as the identity line, got ${JSON.stringify(split.identity)}`);
+    assert.ok(split.body.includes(plainRow), `the plain numbered row must stay in the body, got ${JSON.stringify(split.body)}`);
+    const identity = "1. From A <a@x> on Oct 1, 2026 \u2014 Subj";
+    const numbered = ["Context Notes:", identity, "2. Projects/Mitacs/Other.md"].join("\n");
+    const splitNumbered = splitEmailSourceIdentityLine(numbered);
+    assert.equal(splitNumbered.identity, identity, `a numbered identity line must still be split out, got ${JSON.stringify(splitNumbered.identity)}`);
+    assert.ok(!splitNumbered.body.includes("Subj"), `the identity line must be pulled out of the body, got ${JSON.stringify(splitNumbered.body)}`);
+    const roundTrip = normalizeStoredSourceList(numbered);
+    assert.ok(roundTrip.includes(identity), `the numbered identity line must round-trip through the stored source list, got ${JSON.stringify(roundTrip)}`);
+  });
+
   check("email arm embeds a bounded number of query texts", () => {
     const laneCount = Number(emailArm.result.telemetry?.laneCount || 0);
     assert.ok(emailArm.harness.calls.length > 0, "the email arm must embed at least one runtime query text");

@@ -18733,8 +18733,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         sectionName,
         sourceTitle: subject,
         // Structured email identity (sender/date/subject) so the created task
-        // can cite the primary email as its source.
-        sourceContext: { title: subject, path: "", text: emailSourceText, from: email.from || parsed.from || "", receivedAt: displayedReceivedAt, subject },
+        // can cite the primary email as its source. The user forwards email in,
+        // so the identity line names the ORIGINAL sender from the forwarded
+        // message header block, not the forwarder.
+        sourceContext: { title: subject, path: "", text: emailSourceText, from: emailSourceSender(parsed, email.from), receivedAt: displayedReceivedAt, subject },
         citeContextNotes: this.settings.emailIncludeSourceListInDescriptions !== false,
         prepareTodoistSection: true,
         status: "Preparing descriptions and Todoist section...",
@@ -32868,7 +32870,7 @@ function originalEmailReceivedAt(parsed, fallbackReceivedAt = "") {
 
 function extractForwardedOriginalDate(text) {
   const body = String(text || "").replace(/\r\n/g, "\n");
-  const forwardedIndex = body.search(/(?:^-{2,}\s*forwarded message\s*-{2,}$|^begin forwarded message:|^from:\s.*\n(?:.*\n){0,6}?(?:sent|date):)/im);
+  const forwardedIndex = forwardedEmailBlockIndex(body);
   const forwardedBody = forwardedIndex >= 0 ? body.slice(forwardedIndex) : body;
   const patterns = [
     /^Date:\s*(.+)$/gim,
@@ -32883,6 +32885,31 @@ function extractForwardedOriginalDate(text) {
     }
   }
   return "";
+}
+
+// Locates the forwarded-message block in an email body. Outlook's forwarded
+// block starts at its own "From:" header (followed within a few lines by
+// "Sent:"/"Date:"), Gmail marks it with a "Forwarded message" rule and Apple
+// Mail with "Begin forwarded message:".
+function forwardedEmailBlockIndex(body) {
+  return String(body || "").search(/(?:^-{2,}\s*forwarded message\s*-{2,}$|^begin forwarded message:|^from:\s.*\n(?:.*\n){0,6}?(?:sent|date):)/im);
+}
+
+// The user forwards email in, so the envelope sender is the forwarder. The
+// identity line must name the ORIGINAL sender taken from the forwarded
+// message header block. Returns "" when the body carries no forwarded header.
+function extractForwardedOriginalSender(text) {
+  const body = String(text || "").replace(/\r\n/g, "\n");
+  const forwardedIndex = forwardedEmailBlockIndex(body);
+  if (forwardedIndex < 0) return "";
+  const match = /^from:[ \t]*(.+)$/im.exec(body.slice(forwardedIndex));
+  return singleLine(match?.[1] || "");
+}
+
+// Sender for the email identity line: the original sender of a forwarded
+// message, else the envelope sender.
+function emailSourceSender(parsed = {}, envelopeFrom = "") {
+  return extractForwardedOriginalSender(parsed?.text || "") || singleLine(envelopeFrom || parsed?.from || "");
 }
 
 function normalizeEmailDate(value) {
@@ -42755,8 +42782,6 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     active
   );
   const lines = [workflowSourceType === "email" ? "Context Notes:" : "Sources:"];
-  const emailIdentity = workflowSourceType === "email" ? emailSourceIdentityLine(active) : "";
-  if (emailIdentity) lines.push(emailIdentity);
   const seen = new Set();
   const rendered = [];
   let ledgerRenderedLines = null;
@@ -42816,6 +42841,16 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       }
     }
   }
+  // The email identity line takes the first free slot: it is numbered "1." only
+  // when no displayed row already uses 1, so the visible list never appears to
+  // start at 2. No other row and no inline (N) marker is renumbered.
+  const rowsUseOne = ledgerRenderedLines
+    ? ledgerRenderedLines.some((row) => /^1\.\s/.test(row))
+    : rendered.length > 0;
+  const emailIdentity = workflowSourceType === "email"
+    ? emailSourceIdentityLine(active, rowsUseOne ? 0 : 1)
+    : "";
+  if (emailIdentity) lines.push(emailIdentity);
   if (!rendered.length && !ledgerRenderedLines?.length && !emailIdentity) return "";
   return lines.concat(ledgerRenderedLines || rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n");
 }
@@ -43047,17 +43082,30 @@ function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) 
   return raw === "email" || raw === "email-to-todoist" ? "email" : "note";
 }
 
-// The primary email is cited as ONE unnumbered identity line inside the email
-// source block ("From <sender> on <date> — <subject>"). It is not a citation:
-// it takes no number and never renumbers the inline (N) markers.
-function emailSourceIdentityLine(active = {}) {
+// The primary email is cited as ONE identity line inside the email source
+// block ("From <sender> on <date> — <subject>"). It is not a citation of its
+// own: it never renumbers the inline (N) markers. It takes the number 1 only
+// when no displayed source row already uses 1, so the visible list does not
+// appear to start at 2.
+function emailSourceIdentityLine(active = {}, number = 0) {
   const from = singleLine(active?.from || "");
   const receivedAt = singleLine(active?.receivedAt || "");
-  const subject = singleLine(active?.subject || active?.title || "");
+  const subject = stripForwardSubjectPrefix(singleLine(active?.subject || active?.title || ""));
   if (!from && !receivedAt && !subject) return "";
   const head = `From ${from || "unknown sender"}`;
   const when = receivedAt ? ` on ${receivedAt}` : "";
-  return [head + when, subject ? `\u2014 ${subject}` : ""].filter(Boolean).join(" ");
+  const line = [head + when, subject ? `\u2014 ${subject}` : ""].filter(Boolean).join(" ");
+  const citationNumber = Number(number);
+  return Number.isInteger(citationNumber) && citationNumber > 0 ? `${citationNumber}. ${line}` : line;
+}
+
+// "Fw:"/"Fwd:" prefixes are added by the forwarder, not part of the subject.
+// Only the identity line drops them; the section name, the email log and the
+// note file name keep the subject as written.
+function stripForwardSubjectPrefix(value) {
+  let subject = String(value || "");
+  while (/^\s*(?:fwd|fw)\s*:\s+/i.test(subject)) subject = subject.replace(/^\s*(?:fwd|fw)\s*:\s+/i, "");
+  return subject.trim();
 }
 
 function descriptionSourceList(active, contextNotes, basePath = "", sourceType = "") {
@@ -43441,9 +43489,9 @@ function isRichTodoistDescription(value) {
   return true;
 }
 
-// The email source block carries ONE unnumbered identity line. Pull it out
-// before the numbered-list restore so a subject like "Week 1. Plan" cannot be
-// split into a bogus citation entry.
+// The email source block carries ONE identity line, numbered or not. Pull it
+// out before the numbered-list restore so a subject like "Week 1. Plan" cannot
+// be split into a bogus citation entry.
 function splitEmailSourceIdentityLine(value) {
   const text = String(value || "");
   const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -43452,10 +43500,25 @@ function splitEmailSourceIdentityLine(value) {
   for (let index = headingIndex + 1; index < lines.length; index += 1) {
     const trimmed = lines[index].trim();
     if (!trimmed) continue;
-    if (!/^from\s+\S/i.test(trimmed)) return { identity: "", body: text };
+    if (!emailSourceIdentityRow(trimmed)) return { identity: "", body: text };
     return { identity: trimmed, body: lines.slice(0, index).concat(lines.slice(index + 1)).join("\n") };
   }
   return { identity: "", body: text };
+}
+
+// An unnumbered "From ..." row is always the identity line. A numbered row is
+// only the identity line when it also carries the identity shape (an em dash
+// separator or "on <date>" after the sender), so a citation row such as
+// "1. From Bud Light Notes.md" stays a citation row.
+// shortcut: a citation path containing " on " reads as an identity row,
+// upgrade when such a path shows up in a real vault.
+function emailSourceIdentityRow(line) {
+  const text = String(line || "");
+  if (/^from\s+\S/i.test(text)) return true;
+  const numbered = /^\d+\.\s+(.*)$/.exec(text);
+  if (!numbered || !/^from\s+\S/i.test(numbered[1])) return false;
+  const afterSender = numbered[1].replace(/^from\s+\S+/i, "");
+  return afterSender.includes(" \u2014 ") || /\son\s.+/i.test(afterSender);
 }
 
 function normalizeStoredSourceList(value) {

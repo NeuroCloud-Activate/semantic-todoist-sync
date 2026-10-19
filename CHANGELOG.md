@@ -1,4 +1,17 @@
 # Changelog
+## 0.9.27 - 2026-10-19
+### Added
+- **Rewrite any selection from the right-click menu.** With Collaborate mode on, right-click selected text to get presets: fix spelling and grammar, improve, plain language, make concise, expand, continue writing, a Grant & policy submenu (strengthen for funders, policy wording, numbered steps), change tone (Formal, Neutral, Persuasive, Casual), check against my notes, and rewrite with your own instruction. Every change opens a Before | After preview with an editable After and Apply / Copy / Cancel buttons. Nothing in your note is replaced until you press Apply, and a single undo restores the original text. The sidebar chip pins a selection so you can type an instruction for it.
+- **Citation styles: Footnotes (default), APA 7 and Nature.** References are built from the real source metadata, so no author, year or title is invented, and they are merged into an existing References or Bibliography section of the note.
+- **A Collaborate settings tab.** Durable settings (citation style, context folder plus rescan, describe images) now live in a new Collaborate tab in settings, while the choices you swap per request (draft length, evidence sources) stay in the sidebar Features menu. The context folder keeps the vault-only check introduced in 0.9.25.
+### Fixed
+- **Email tasks now cite the original email.** In Context Notes the email source reads "From <original sender> on <date> — <subject>". For a forwarded email this names the original sender rather than the person who forwarded it, and the "Fw:"/"Fwd:" prefix is dropped. The email text the model receives names the original sender as well, with a "Forwarded by" line for the forwarder.
+- **Email source lists are numbered 1..k per task.** Only the cited sources are listed, so the numbers used to jump (for example (1) and (18)). The rows and the inline markers now both read 1..k from the same list. Note tasks are unchanged.
+- **The email source line no longer shows a broken dash.** A double-encoded em dash appeared in the "From ... on ... — subject" line.
+### Notes
+- `npm test` 48/52. The four failures are equivalence tests whose local baseline files are missing (cleanup-equivalence, exact-search-equivalence, routing-artifact-serialize, task-lexical-fusion), not a code regression.
+- Validated live in an Obsidian test vault: the Collaborate presets, the Before | After preview with apply and undo, the settings tab and the three citation styles; the email changes were checked on a real forwarded email.
+- Built `main.js` SHA-256 `7D1BC76B61AF52CE2164E6C15FA1B34AB3526A776DFEF84C0EBA157E16FC5F23`. The bundle greps clean for `createElement("script")`, `require("fs")` and `sprintf-js` (0 hits each).
 ## 0.9.26 - 2026-10-16
 ### Fixed
 - **Obsidian lint: CSS warnings cleared.** The settings toggle-row layout no longer uses `:has()` or `column-gap`; the rows are tagged with a `semantic-todoist-toggle-setting` class instead, with the same layout.

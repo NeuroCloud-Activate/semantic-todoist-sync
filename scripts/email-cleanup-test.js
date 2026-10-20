@@ -790,6 +790,95 @@ function main() {
     }
   });
 
+  // ---- a content line after a sign-off is real content ---------------------
+  check("a short content line after an inline sign-off survives", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Thanks, Alex", "Meeting is Thursday"].join("\n");
+    assertSurvivesBothLanes(body, REQUEST, "the request");
+    assertSurvivesBothLanes(body, "Meeting is Thursday", "the content line after the inline sign-off");
+  });
+
+  check("a short content line after a sign-off block survives", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Thanks,", "Alex Rivera", "Meeting is Thursday"].join("\n");
+    assertSurvivesBothLanes(body, REQUEST, "the request");
+    assertSurvivesBothLanes(body, "Meeting is Thursday", "the content line after the sign-off block");
+  });
+
+  check("a title-case deadline line after a contact block survives", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Janaka Perera", "613-555-0110", "Stipend Schedule Due Friday"].join("\n");
+    assertSurvivesBothLanes(body, REQUEST, "the request");
+    assertSurvivesBothLanes(body, "Stipend Schedule Due Friday", "the deadline line after the contact block");
+  });
+
+  check("an organisation and a title still count as a trailing contact block", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Janaka Perera", "Research Program Manager", "Canadian Blood Services", "613-555-0110"].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "Janaka Perera", "the contact name");
+      assertMissing(cleaned, "Research Program Manager", "the contact title");
+      assertMissing(cleaned, "Canadian Blood Services", "the organisation");
+      assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+    const director = ["Hi Matt,", "", REQUEST, "", "Janaka Perera", "Director, Programs", "613-555-0110"].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(director, { keepHeaders });
+      assertMissing(cleaned, "Director, Programs", "the contact title");
+      assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
+  // ---- a street address belongs to the signature block --------------------
+  check("a street address after a signature block is removed in both lanes", () => {
+    const request = "Once the adjunct program review is settled I will prepare the invitation list for the 2027 renewals.";
+    const body = [
+      "Hi Matt,",
+      "",
+      request,
+      "",
+      "Thanks,",
+      "Jim Whitfield",
+      "Director, Research Partnerships",
+      "Canadian Blood Services",
+      "Phone: 613-555-0188",
+      "1800 Diefenbaker Boulevard, Ottawa, ON"
+    ].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "Thanks,", "the sign-off");
+      assertMissing(cleaned, "Jim Whitfield", "the signature name");
+      assertMissing(cleaned, "Director, Research Partnerships", "the signature title");
+      assertMissing(cleaned, "Canadian Blood Services", "the organisation");
+      assertMissing(cleaned, "Phone: 613-555-0188", "the phone line");
+      assertMissing(cleaned, "1800 Diefenbaker Boulevard, Ottawa, ON", "the street address");
+      assert.ok(cleaned.includes(request), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
+  // ---- a content line after a sign-off is never a request or an address ---
+  // The sign-off block stops at a request line, and a line that only mentions
+  // a street word is not an address: both must survive in both lanes.
+  check("a content line after a sign-off survives in both lanes", () => {
+    const contentLines = [
+      "Send Report Today",
+      "Action Required",
+      "100 Main Street is where we meet",
+      "5 items, see Main Street",
+      "1 Place your order by Friday"
+    ];
+    for (const line of contentLines) {
+      const body = ["Hi Matt,", "", REQUEST, "", "Thanks,", "Alex", line].join("\n");
+      assertSurvivesBothLanes(body, line, `the content line ${JSON.stringify(line)}`);
+    }
+  });
+
+  check("a street address without a city is removed in both lanes", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Thanks,", "Alex", "45 Rideau Street"].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "45 Rideau Street", "the street address");
+      assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
   check("prose that names a person survives the cleaner", () => {
     assertSurvivesBothLanes("Janaka Perera will review the file.", "Janaka Perera will review the file.", "the prose sentence");
     const attendees = ["Alex Rivera", "Sophie Tremblay", "Janaka Perera"].join("\n");

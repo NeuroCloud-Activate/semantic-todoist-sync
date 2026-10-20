@@ -940,6 +940,12 @@ const PRODUCTION_SEMANTIC_ROUTING_REBUILD_SLICE_MS = 8;
 const PRODUCTION_SEMANTIC_ROUTING_REBUILD_ABORT_CODE = "routing-state-build-aborted";
 const PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_WAIT_MS = 4000;
 const PRODUCTION_SEMANTIC_ROUTING_REBUILD_BUSY_POLL_MS = 100;
+// The email workflow owns its routing readiness: a build that loses the index
+// revision is retried a bounded number of times, and the wait for the pending
+// index work is bounded so a busy index never holds the email.
+const SEMANTIC_ROUTING_READINESS_MAX_ATTEMPTS = 3;
+const SEMANTIC_ROUTING_READINESS_INDEX_WAIT_MS = 30000;
+const SEMANTIC_ROUTING_READINESS_INDEX_POLL_MS = 100;
 
 function productionSemanticRoutingCooperativeSlicer(shouldAbort = null) {
   let lastYieldAt = localSemanticRoutingNow();
@@ -15561,6 +15567,23 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     };
   }
 
+  // Bounded wait for the semantic index work the plugin already queued. Every
+  // index write runs through withSemanticIndexOperation, so an in-flight write
+  // shows up as semanticIndexOperationActive, and the paths a scheduled
+  // incremental flush still has to pick up live in pendingIndexPaths. Waiting
+  // keeps the index revision still while the routing state is built; the wait
+  // never exceeds the budget, so a busy index can never hold the email.
+  async awaitPendingSemanticIndexWork(timeoutMs = SEMANTIC_ROUTING_READINESS_INDEX_WAIT_MS) {
+    const startedAt = Date.now();
+    for (;;) {
+      const remaining = timeoutMs - (Date.now() - startedAt);
+      if (remaining <= 0) return false;
+      const queued = Number(this.pendingIndexPaths?.size || 0) > 0 && Boolean(this.semanticIndexTimer);
+      if (!this.semanticIndexOperationActive && !queued) return true;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(remaining, SEMANTIC_ROUTING_READINESS_INDEX_POLL_MS)));
+    }
+  }
+
   // Owned local activity scope for task generation: the token starts before
   // local preparation and ends in finally after post-response processing
   // settles, so preparation and evidence processing are visible and labelled
@@ -15568,33 +15591,45 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   // Workflow-owned routing readiness for an email task plan. The vault
   // retrieval path only READS the production routing state (allowBuild:false)
   // and degrades to zero vault rows when it is missing, so the email plan
-  // builds it first, with the same options the startup warm-up uses. A null
-  // or failed build is never a hold: the plan continues exactly as before.
+  // builds it first, with the same options the startup warm-up uses.
+  //
+  // An index write that lands while the build runs invalidates it (the
+  // cooperative build is abandoned with routing-state-build-aborted), so the
+  // helper waits for the pending index work first and retries a build that
+  // lost the index revision. A null or failed build is never a hold: the plan
+  // continues exactly as before, with the failure written to the log.
   async ensureEmailSemanticRoutingReadiness() {
-    try {
-      const state = await this.ensureProductionSemanticRoutingState({
-        chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
-        settings: this.settings,
-        revision: Number(this.semanticIndexRevision || 0),
-        storageFingerprint: this.semanticIndexStorageFingerprint || "",
-        allowLoad: true,
-        allowBuild: true,
-        persist: true
-      });
-      if (!state?.routingIndex) {
-        this.logLocal("Email semantic routing state unavailable", {
-          code: String(this.productionSemanticRoutingTelemetry?.reasonCode || "routing-state-unavailable")
+    const deadline = Date.now() + SEMANTIC_ROUTING_READINESS_INDEX_WAIT_MS;
+    let reasonCode = "routing-state-unavailable";
+    let attempts = 0;
+    for (let attempt = 1; attempt <= SEMANTIC_ROUTING_READINESS_MAX_ATTEMPTS; attempt += 1) {
+      attempts = attempt;
+      try {
+        await this.awaitPendingSemanticIndexWork(Math.max(0, deadline - Date.now()));
+        const revisionBefore = Number(this.semanticIndexRevision || 0);
+        const state = await this.ensureProductionSemanticRoutingState({
+          chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
+          settings: this.settings,
+          revision: revisionBefore,
+          storageFingerprint: this.semanticIndexStorageFingerprint || "",
+          allowLoad: true,
+          allowBuild: true,
+          persist: true
         });
-        return false;
+        const revisionAfter = Number(this.semanticIndexRevision || 0);
+        if (state?.routingIndex && revisionAfter === revisionBefore) return true;
+        reasonCode = String(
+          this.productionSemanticRoutingTelemetry?.reasonCode
+          || (state?.routingIndex ? "routing-state-revision-changed" : "routing-state-unavailable")
+        );
+      } catch (error) {
+        reasonCode = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code)
+          ? error.code
+          : "routing-readiness-failed";
       }
-      return true;
-    } catch (error) {
-      const code = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code)
-        ? error.code
-        : "routing-readiness-failed";
-      this.logLocal("Email semantic routing readiness failed", { code });
-      return false;
     }
+    this.logLocal("Email semantic routing readiness failed", { code: reasonCode, attempts });
+    return false;
   }
 
   async createTaskPlanWithLocalActivity(source, options = {}) {
@@ -16487,7 +16522,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // body/provenance recheck and the preserved retrieval bindings the
       // bundle consumes for binding-consistency. Null for non-note legacy
       // (bundle keeps its unchanged compute-then-project path).
-      builderTaskRelevanceSelection: poststructurePassesRankings ? poststructureSelection : null,
+      //
+      // An email with no ranked rows still passes its computed (empty)
+      // selection: the bundle then cuts the catalog to the protected
+      // current-source rows instead of handing the WHOLE vault catalog to the
+      // provider as evidence. The selection is empty, so no corpus/subset/
+      // body gate can fire on it, and the rankings stay null so the bundle
+      // keeps skipping corpus-coverage for that vacuous case.
+      builderTaskRelevanceSelection: poststructureScoredSelection ? poststructureSelection : null,
       rankedRowsByEvidenceId: poststructurePassesRankings ? poststructureRankedRowsByEvidenceId : null,
       retrievalBindingsByEvidenceId: poststructurePassesRankings ? poststructureSupplement.retrievalBindingsByEvidenceId : null,
       eligibleIndexCount: livePostEligibleIndexCount || undefined,
@@ -33208,12 +33250,21 @@ const EMAIL_FOOTER_LINK_RE = /^\s*(?:https?:\/\/|www\.)\S+\s*$/i;
 const EMAIL_FOOTER_PHONE_RE = /^\s*(?:(?:tel(?:ephone)?|fax|phone|mobile|cell|t|f|p)\s*[.:]?\s*)?[+()\d][\d\s().+-]{5,}\d\s*$/i;
 const EMAIL_STREET_RE = /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|court|ct|crescent|place|pl|way|suite|ste|floor|fl|tower|parkway|pkwy|terrace|highway|hwy|square|sq|route|rte)\b/i;
 const EMAIL_POSTAL_CODE_RE = /\b(?:[A-Z]\d[A-Z]\s?\d[A-Z]\d|[A-Z]{1,2}\d{1,2}\s?\d[A-Z]{2}|\d{5}(?:-\d{4})?)\b/;
+// A street address: a house number, the name of the street and the street
+// word, then the end of the line or a comma. A line that only mentions a
+// street word is content, not an address.
+// shortcut: an address with a trailing unit or direction ("1600 Pennsylvania
+// Avenue NW") is not matched; upgrade when a real signature carries one.
+const EMAIL_STREET_ADDRESS_RE = new RegExp(`^\\d+[A-Za-z]?\\s+[A-Z\\u00C0-\\u00DE][^\\d\\s]*\\s+(?:${EMAIL_STREET_RE.source})\\b(?:,|\\.|$)`, "i");
 // A company, a charity or an institution: the organisation half of a contact
 // footer row.
 const EMAIL_ORG_NAME_RE = /\b(?:inc|ltd|llc|llp|corp|corporation|company|group|services|systems|solutions|technologies|bank|university|college|institute|foundation|association|society|charity|hospital|clinic|centre|center|agency|ministry|department|partners|holdings)\b/i;
 const EMAIL_SIGNATURE_STOP_WORDS = new Set(["i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "our", "your", "my", "me", "us", "them", "if", "when", "while", "but", "and", "or", "so", "let", "please", "any", "all", "some", "no", "not", "do", "does", "did", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has", "had", "the", "a", "an", "as", "at", "by", "in", "on", "to", "of", "for", "from", "with", "without", "after", "before", "since", "until", "about", "over", "under", "again", "also", "because", "there", "here", "what", "which", "who", "how", "why", "is", "are", "was", "were", "be", "been", "being", "am", "hi", "hello", "hey", "cheers", "best"]);
 // The title words of a signature title line.
 const EMAIL_SIGNATURE_TITLE_WORD_RE = /\b(?:coordinator|manager|director|officer|professor|scientist|specialist|assistant|lead|analyst|advisor|adviser|president|chair|head|associate|administrator)\b/i;
+// A deadline or a date word: a line that holds one of these is a sentence about
+// the schedule, not the name of a person or an organisation.
+const EMAIL_SIGNATURE_DATE_WORD_RE = /\b(?:due|by|for|re|on|at|to|and|before|after|until|deadline|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|june|july|august|september|october|november|december)\b/i;
 
 // The Gmail quote marker can span two lines: "On <date> <author>" and then
 // "<author@example.com> wrote:". The number of lines it takes, 0 when the
@@ -33259,6 +33310,27 @@ function emailSignatureIdentityLine(value) {
   if (/\b(?:manager|director|officer|consultant|specialist|coordinator|analyst|developer|engineer|designer|architect|accountant|attorney|lawyer|advisor|adviser|assistant|administrator|representative|president|partner|principal|executive|supervisor|team|services|group|corporation|corp|inc|ltd|llc|llp|university|college|institute|foundation|association|society|charity)\b/i.test(text)) return true;
   const words = text.split(/\s+/).filter(Boolean);
   return words.length >= 1 && words.length <= 4 && words.every((word) => /^[A-Z][A-Za-z.'’-]*$/.test(word));
+}
+
+// A line that continues a signature block: a name, a title, an organisation or
+// a contact detail. A short content line after the sign-off is real content,
+// so the block stops there.
+function emailSignatureBlockLine(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  // A request or a legal notice is content, never a signature line.
+  if (EMAIL_ACTION_REQUEST_RE.test(text)) return false;
+  if (EMAIL_DISCLAIMER_RE.test(text)) return false;
+  // A contact detail or a street address continues the signature block: the
+  // province code in an address line ("Ottawa, ON") is not a date word.
+  if (emailContactDetailLine(text)) return true;
+  if (EMAIL_STREET_ADDRESS_RE.test(text)) return true;
+  if (EMAIL_SIGNATURE_DATE_WORD_RE.test(text)) return false;
+  if (emailSignatureIdentityLine(text)) return true;
+  // A name with a trailing qualification: "Janaka Perera, PhD".
+  if (!emailSignatureNameLine(text)) return false;
+  const first = text.split(/\s+/)[0].toLowerCase().replace(/[^a-z]/g, "");
+  return !EMAIL_SIGNATURE_STOP_WORDS.has(first);
 }
 
 function emailSignatureShortLine(value) {
@@ -33310,7 +33382,7 @@ function emailSignatureInlineBlockLength(lines, start) {
     if (line.startsWith(">")) break;
     if (EMAIL_CHAIN_BOUNDARY_RE.test(line)) break;
     if (emailRequestText(line)) break;
-    if (!emailSignatureLine(line)) break;
+    if (!emailSignatureBlockLine(line)) break;
     length += 1;
   }
   return length;
@@ -33320,17 +33392,17 @@ function emailSignatureInlineBlockLength(lines, start) {
 // line plus up to 8 signature lines. 0 when the block is not a signature.
 function emailSignatureBlockLength(lines, start) {
   let length = 1;
-  let identity = false;
   while (length < 9 && start + length < lines.length) {
     const line = String(lines[start + length] || "");
     if (!line.trim()) break;
     if (EMAIL_CHAIN_BOUNDARY_RE.test(line.trim())) break;
-    if (!emailSignatureLine(line)) break;
-    // A single lowercase word right after the sign-off is the name.
-    if (emailSignatureIdentityLine(line.trim()) || (length === 1 && emailSignatureLowercaseName(line.trim()))) identity = true;
+    // Only an identity line continues the signature block: a short content
+    // line after the name is real content, not a signature. A single lowercase
+    // word right after the sign-off is the name.
+    if (!emailSignatureBlockLine(line) && !(length === 1 && emailSignatureLowercaseName(line.trim()))) break;
     length += 1;
   }
-  if (length > 1) return identity ? length : 0;
+  if (length > 1) return length;
   // A lone closing line is noise only when it ends the message.
   for (let index = lines.length - 1; index > start; index -= 1) {
     if (String(lines[index] || "").trim()) return 0;
@@ -33451,6 +33523,9 @@ function emailContactDetailLine(value) {
 function emailSignatureTitleCaseLine(value) {
   const text = String(value || "").trim();
   if (!text || text.length > 120) return false;
+  // A deadline or a date word makes the line a sentence about the schedule,
+  // not the name of a person or an organisation.
+  if (EMAIL_SIGNATURE_DATE_WORD_RE.test(text)) return false;
   const words = text.split(/\s+/).filter(Boolean);
   if (!words.length || words.length > 6) return false;
   return words.every((word) => /^[A-Z][A-Za-z.'’-]*[.,]?$/.test(word) || word === "|" || word === "&");

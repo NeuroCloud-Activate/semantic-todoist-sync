@@ -664,6 +664,76 @@ async function main() {
     }
   }
 
+  // ---- An email whose model response carries no usable task --------------
+  // The model returns NO task at all. The plan must still finish with the
+  // deterministic fallback task (as it does today) and must NOT fail closed,
+  // and the bundle must NOT hand the whole vault catalog to the provider: the
+  // delivered evidence stays inside the protected/current-source rows.
+  const emptyPlugin = (await makePlugin()).plugin;
+  const emptyCalls = [];
+  emptyPlugin.openaiResponse = async (request = {}) => {
+    const prefix = String(request.promptCachePrefix || "");
+    const handles = [...new Set((prefix.match(/^(E\d+) /gm) || []).map((line) => line.trim()))];
+    emptyCalls.push({ operation: String(request.operation || ""), handles });
+    return JSON.stringify({ tasks: [], section_name: "", descriptions: [] });
+  };
+  const emptySource = { type: "email", title: EMAIL_TITLE, text: EMAIL_SUMMARY, sectionName: "2026-10-09 Acme" };
+  const emptyPlan = await emptyPlugin.createTaskPlanWithLocalActivity(emptySource, {});
+  const emptyBundle = bundleOf(emptyPlan);
+  const emptyDeliveredIds = (emptyBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).map(String);
+  const emptyCatalogIds = (emptyBundle?.evidenceCatalog?.items || []).map((item) => String(item.evidenceId || item.id || ""));
+  const emptyContract = emptyPlan?.sourceContract || null;
+  const emptyTask = (emptyPlan?.tasks || [])[0] || null;
+  console.log(
+    `empty email plan: failure=${JSON.stringify(emptyPlan?.workflowContextFailure?.code || "")} ` +
+    `tasks=${Array.isArray(emptyPlan?.tasks) ? emptyPlan.tasks.length : 0} ` +
+    `dispatchAllowed=${JSON.stringify(emptyBundle?.contextBundleValidation?.dispatchAllowed ?? null)} ` +
+    `delivered=${emptyDeliveredIds.length} bundleCatalog=${emptyCatalogIds.length} ` +
+    `primary=${JSON.stringify(String(emptyContract?.primaryEvidenceId || ""))} ` +
+    `taskContent=${JSON.stringify(String(emptyTask?.content || ""))} ` +
+    `taskEvidence=${JSON.stringify((emptyTask?.evidence_ids || []).map(String))} ` +
+    `providerErrors=${JSON.stringify((emptyBundle?.contextBundleValidation?.protectedReferenceErrors || []).slice(0, 8))}`
+  );
+
+  check("an email with no usable model task still completes with the fallback task", () => {
+    assert.equal(emptyPlan?.workflowContextFailure || null, null, `the email plan must not fail, got ${JSON.stringify(emptyPlan?.workflowContextFailure)}`);
+    assert.ok(Array.isArray(emptyPlan?.tasks) && emptyPlan.tasks.length > 0, "the email plan must produce the fallback task");
+    assert.equal(emptyBundle?.contextBundleValidation?.dispatchAllowed, true, `the email context must dispatch, errors: ${JSON.stringify(emptyBundle?.contextBundleValidation?.protectedReferenceErrors)}`);
+    // The deterministic fallback task cites the email's own primary row.
+    assert.deepStrictEqual(
+      (emptyTask?.evidence_ids || []).map(String),
+      [String(emptyContract?.primaryEvidenceId || "")],
+      "the fallback task must cite the email's own primary evidence"
+    );
+  });
+
+  check("an email with no usable model task does not deliver the whole catalog", () => {
+    const corpusSize = buildIndexChunks().length;
+    const primaryId = String(emptyContract?.primaryEvidenceId || "");
+    assert.ok(primaryId, "the email contract must carry its primary evidence id");
+    assert.ok(
+      emptyDeliveredIds.length < corpusSize,
+      `the delivered evidence (${emptyDeliveredIds.length}) must be smaller than the corpus (${corpusSize})`
+    );
+    assert.ok(
+      emptyCatalogIds.length < corpusSize,
+      `the bundle catalog (${emptyCatalogIds.length}) must be smaller than the corpus (${corpusSize})`
+    );
+    // No ranked row survives, so only the protected current-source row may be
+    // delivered: the whole vault catalog must never reach the provider.
+    for (const evidenceId of emptyDeliveredIds) {
+      assert.equal(evidenceId, primaryId, `the delivered evidence must hold only the protected primary row, got ${evidenceId}`);
+    }
+  });
+
+  check("an email with no usable model task still reports its evidence selection", () => {
+    const selection = emptyBundle?.telemetry?.taskRelevanceSelection || null;
+    assert.ok(selection, "the bundle must carry the computed selection telemetry");
+    assert.equal(selection.dispatchAllowed, true, "the selection must stay dispatchable");
+    assert.equal(selection.corpusCoverageError || null, null, `the selection must not fail closed, got ${JSON.stringify(selection.corpusCoverageError)}`);
+    assert.deepStrictEqual(selection.selectedEvidenceIds || [], [], "the selection must be empty");
+  });
+
   // ---- Note arm: the note path must stay byte-identical -------------------
   // The note source runs the same scored selection, so the note arm is the
   // control: the production prestructure retrieval plus the selector must

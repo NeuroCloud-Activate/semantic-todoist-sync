@@ -21,7 +21,11 @@
 //   (b) two emails back to back with an index revision bump between them (the
 //       email log note is indexed) both deliver vault rows,
 //   (c) a routing build that throws or returns null neither throws out of the
-//       email workflow nor creates a durable failure hold.
+//       email workflow nor creates a durable failure hold,
+//   (d) a routing build aborted by an index revision bump is retried, so the
+//       plan still delivers vault rows (before the fix: zero vault rows),
+//   (e) a routing build that never succeeds is bounded at three attempts, the
+//       email plan continues and the failure is logged.
 //
 // The harness is the offline fake app of scripts/email-task-plan-selection-test.js
 // (same module loader, same corpus shape, same stubbed AI provider). The
@@ -538,6 +542,94 @@ async function main() {
   });
   check("a routing build that resolves null creates no durable failure hold", () => {
     assert.equal(nullHolds.length, 0, `the email workflow must not record a failure hold, got ${JSON.stringify(nullHolds)}`);
+  });
+
+  // ---- (d) a routing build aborted by an index revision bump is retried --
+  // Live symptom: an index write lands while the routing build runs, so the
+  // build is abandoned (routing-state-build-aborted), the plan proceeds
+  // without a routing state and the email retrieves zero vault rows.
+  const aborted = await makePlugin();
+  const originalEnsureRoutingState = runtime.prototype.ensureProductionSemanticRoutingState;
+  aborted.plugin.ensureProductionSemanticRoutingState = async function (options = {}) {
+    const revision = Number(options.revision ?? aborted.plugin.semanticIndexRevision ?? 0);
+    if (revision === REVISION) {
+      // The index write lands while this build runs: the revision moves, the
+      // routing state is invalidated and the build is abandoned.
+      aborted.plugin.semanticIndexRevision = REVISION + 1;
+      aborted.plugin.invalidateProductionSemanticRoutingState("semantic-index-revision");
+      aborted.plugin.productionSemanticRoutingTelemetry = {
+        state: "migration-required",
+        reasonCode: "routing-state-build-aborted"
+      };
+      return null;
+    }
+    return originalEnsureRoutingState.call(this, options);
+  };
+  let abortedReadiness = null;
+  const originalReadiness = aborted.plugin.ensureEmailSemanticRoutingReadiness.bind(aborted.plugin);
+  aborted.plugin.ensureEmailSemanticRoutingReadiness = async () => {
+    abortedReadiness = await originalReadiness();
+    return abortedReadiness;
+  };
+  const abortedPlan = await aborted.plugin.createTaskPlanWithLocalActivity(emailSource(), {});
+  const abortedRows = deliveredRows(abortedPlan);
+  console.log(
+    `email 3 (aborted build): delivered=${abortedRows.ids.length} vaultNotes=${abortedRows.vaultPaths.length} ` +
+    `readiness=${abortedReadiness} ` +
+    `routingState=${aborted.plugin.productionSemanticRoutingState?.routingIndex ? "ready" : "missing"}`
+  );
+
+  check("an aborted routing build is retried until the routing state is ready", () => {
+    assert.equal(abortedReadiness, true, "the readiness helper must report ready after the aborted build is retried");
+  });
+
+  check("the email plan delivers vault rows after an aborted routing build", () => {
+    assert.ok(
+      abortedRows.vaultPaths.length > 0,
+      `the email plan must deliver vault note rows after a retried build, got ${JSON.stringify(abortedRows.paths)}`
+    );
+  });
+
+  // ---- (e) a routing build that never succeeds stays bounded and visible --
+  const neverReady = await makePlugin();
+  const neverOriginal = runtime.prototype.ensureProductionSemanticRoutingState;
+  let readinessAttempts = 0;
+  neverReady.plugin.ensureProductionSemanticRoutingState = async function (options = {}) {
+    if (options?.allowBuild !== false) {
+      // Every workflow-owned build attempt is abandoned by an index write.
+      readinessAttempts += 1;
+      neverReady.plugin.semanticIndexRevision = Number(neverReady.plugin.semanticIndexRevision || 0) + 1;
+      neverReady.plugin.invalidateProductionSemanticRoutingState("semantic-index-revision");
+      neverReady.plugin.productionSemanticRoutingTelemetry = {
+        state: "migration-required",
+        reasonCode: "routing-state-build-aborted"
+      };
+      return null;
+    }
+    return neverOriginal.call(this, options);
+  };
+  const neverPlan = await neverReady.plugin.createTaskPlanWithLocalActivity(emailSource(), {});
+  const failureLogs = neverReady.plugin.logs.filter((entry) => /failed/i.test(String(entry?.message || "")));
+  console.log(
+    `email 4 (never ready): attempts=${readinessAttempts} failureLogs=${failureLogs.length} ` +
+    `tasks=${Array.isArray(neverPlan?.tasks) ? neverPlan.tasks.length : -1}`
+  );
+
+  check("a routing build that never succeeds is bounded at three attempts", () => {
+    assert.equal(readinessAttempts, 3, `the readiness helper must stop after three attempts, got ${readinessAttempts}`);
+  });
+
+  check("a routing build that never succeeds logs a visible failure", () => {
+    assert.ok(failureLogs.length > 0, "the readiness helper must log a failure");
+    const entry = failureLogs[failureLogs.length - 1];
+    assert.match(String(entry?.message || ""), /failed/i, "the failure log must name the failure");
+    assert.equal(Number(entry?.details?.attempts || 0), 3, "the failure log must name the attempt count");
+    assert.ok(String(entry?.details?.code || ""), "the failure log must name a reason code");
+  });
+
+  check("the email plan continues when the routing build never succeeds", () => {
+    assert.ok(neverPlan, "the email plan must still return a result");
+    assert.ok(Array.isArray(neverPlan.tasks), "the email plan must still return a task list");
   });
 
   if (failures.length) {

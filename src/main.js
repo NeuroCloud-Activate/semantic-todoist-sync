@@ -15439,6 +15439,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   async retrievePreStructureTaskScopeContexts(source = {}, sourceContract = null, sourceSummary = "", options = {}) {
+    // An email has no marked-action scope: its contract scope action is the
+    // literal "source", so the email's own title is the lexical query.
+    const emailSelectionSource = String(source?.type || "") === "email";
     const scopeRecords = taskWorkflowScopeRecords(source, sourceContract, sourceSummary, this.settings);
     if (!scopeRecords.length) return { scopes: [], byScope: {}, chunks: [], telemetry: { scopeCount: 0, selectedEvidenceByScope: {}, degraded: true, degradedReason: "no-structured-source-scopes" } };
     const scopeTasks = scopeRecords.map((record) => ({
@@ -15510,7 +15513,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           taskKey: key,
           scopeId: record.scopeId,
           queryHandleEvidenceId,
-          actionText: String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(record.scopeId || ""))?.action || ""),
+          // An email's contract scope action is the literal "source", which is
+          // useless as a lexical query, so the email's own title (the subject)
+          // is the prestructure query. A note keeps its marked-action scope text.
+          actionText: emailSelectionSource
+            ? String(source.title || "")
+            : String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(record.scopeId || ""))?.action || ""),
           rows: taskWorkflowAttachTaskRelevanceScores(Array.from(rowById.values()), key, scoreMapForKey(key), { scopeId: record.scopeId })
         }];
       }));
@@ -15630,21 +15638,34 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // cut end to end: it computes no note selection, supplements nothing, and
     // passes no builder selection, so it cannot fail on note-only criteria.
     const retrievalIsNote = String(source?.type || "") === "note";
-    let prestructureRankedRowsByEvidenceId = retrievalIsNote
+    // An email source runs the SAME scored selection as a note source: the
+    // selection, the selected-only catalog supplement and the builder
+    // pass-through are identical, and only the note-only action/self/marker
+    // assertions inside the selector are skipped for email. Any other source
+    // type keeps the unchanged legacy 1100 scored cut end to end.
+    const retrievalScoredSelection = retrievalIsNote || String(source?.type || "") === "email";
+    // The bundle consumes the builder's selection only together with the
+    // rankings it was computed from. Notes always pass their rankings; a
+    // non-note source (an email) with no ranked evidence rows at all has
+    // nothing to select from, so it passes neither and the bundle keeps its
+    // unchanged compute-then-project path.
+    const prestructurePassesRankings = retrievalIsNote
+      || Object.values(preStructureScopes.taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length);
+    let prestructureRankedRowsByEvidenceId = retrievalScoredSelection
       ? prestructureRankedRowChunkIndex(preStructureScopes.taskRelevanceRankings)
       : null;
-    const prestructureSelection = retrievalIsNote
+    const prestructureSelection = retrievalScoredSelection
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         preStructureScopes.taskRelevanceRankings || {},
         { sourceContract, settings: this.settings, coverageIndexRevision: Number(preStructureScopes.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
-    const prestructureSupplement = retrievalIsNote
+    const prestructureSupplement = retrievalScoredSelection
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
         initialSemanticContext,
         prestructureSelection,
         { rankedRowsByEvidenceId: prestructureRankedRowsByEvidenceId })
       : { conflicts: [], missingSupplementalEvidenceIds: [], supplementalEvidenceIds: [], retrievalBindingsByEvidenceId: new Map() };
-    if (retrievalIsNote && (prestructureSupplement.conflicts || []).length) {
+    if (retrievalScoredSelection && (prestructureSupplement.conflicts || []).length) {
       const failure = {
         code: "selected-catalog-supplement-conflict",
         reason: prestructureSupplement.conflicts.slice(),
@@ -15657,7 +15678,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       });
       return this.makeTaskFailureReturn(source, sourceSummary, initialSemanticContext, sourceContract, null, null, failure, prestructureSupplement.conflicts.slice());
     }
-    if (retrievalIsNote && (prestructureSupplement.missingSupplementalEvidenceIds || []).length) {
+    if (retrievalScoredSelection && (prestructureSupplement.missingSupplementalEvidenceIds || []).length) {
       const failure = {
         code: "selected-catalog-supplement-missing",
         reason: prestructureSupplement.missingSupplementalEvidenceIds.map((id) => `selected-supplement-missing:${id}`),
@@ -15672,7 +15693,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     this.setSidebarStatus("Building evidence catalog...");
     let evidenceCatalog = await buildTaskEvidenceCatalogCooperative(sourceContract, initialSemanticContext, this.settings, { source, sourceSummary });
-    if (retrievalIsNote && prestructureSupplement.supplementalEvidenceIds.length) {
+    if (retrievalScoredSelection && prestructureSupplement.supplementalEvidenceIds.length) {
       evidenceCatalog = await buildTaskEvidenceCatalogCooperative(sourceContract, [
         ...(initialSemanticContext || []),
         ...prestructureSupplement.supplementalEvidenceIds.map((id) => prestructureSupplement.supplementalChunkByEvidenceId.get(id)).filter(Boolean)
@@ -15723,15 +15744,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // A non-note source (an email) with no ranked evidence rows at all has nothing to
       // select from: pass no rankings so the bundle skips corpus-coverage instead of
       // failing with "ranked corpus is empty". Notes keep their existing handling.
-      taskRelevanceRankings: (retrievalIsNote || Object.values(preStructureScopes.taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length)) ? (preStructureScopes.taskRelevanceRankings || null) : null,
+      taskRelevanceRankings: prestructurePassesRankings ? (preStructureScopes.taskRelevanceRankings || null) : null,
       // Task 2 first slice: the exact single computed selection for note
       // sources, plus the ranked rows for the bundle's independent selected-ID
       // body/provenance recheck and the preserved retrieval bindings the
       // bundle consumes for binding-consistency. Null for non-note legacy
       // (bundle keeps its unchanged compute-then-project path).
-      builderTaskRelevanceSelection: retrievalIsNote ? prestructureSelection : null,
-      rankedRowsByEvidenceId: retrievalIsNote ? prestructureRankedRowsByEvidenceId : null,
-      retrievalBindingsByEvidenceId: retrievalIsNote ? prestructureSupplement.retrievalBindingsByEvidenceId : null,
+      builderTaskRelevanceSelection: prestructurePassesRankings ? prestructureSelection : null,
+      rankedRowsByEvidenceId: prestructurePassesRankings ? prestructureRankedRowsByEvidenceId : null,
+      retrievalBindingsByEvidenceId: prestructurePassesRankings ? prestructureSupplement.retrievalBindingsByEvidenceId : null,
       eligibleIndexCount: livePreIndexCount || undefined,
       metadataOnlyRejectedCount: livePreMetadataOnly,
       expectedTaskHandleCount: (preStructureScopes.scopes || []).length || undefined,
@@ -16239,6 +16260,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // same admitted rows; the bundle selector cuts top-1100 plus closure.
     // Score handoff at the poststructure builder: same exact-score attach.
     const postScoreMap = taskSemanticRetrieval.taskRelevanceScoreByTaskAndEvidence || null;
+    // An email has no marked-action scope: its contract scope action is the
+    // literal "source", so the generated task's own action text is the lexical
+    // query (the same text buildTaskSemanticQuerySet queries with).
+    const emailSelectionSource = String(source?.type || "") === "email";
     // Cooperative yield budget for the per-task ranking assembly: same ~8 ms
     // pattern as scoreWorkCheckpoint, yielding a real macrotask between tasks
     // without changing any produced value or ordering.
@@ -16269,7 +16294,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         taskKey: key,
         scopeId: String(task?.scope_id || task?.scopeId || local.scopeId || ""),
         queryHandleEvidenceId,
-        actionText: String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(task?.scope_id || task?.scopeId || local.scopeId || ""))?.action || ""),
+        // An email's contract scope action is the literal "source", which is
+        // useless as a lexical query, so the generated task's own action text
+        // is used instead (the same text buildTaskSemanticQuerySet queries
+        // with). A note keeps its marked-action scope text.
+        actionText: emailSelectionSource
+          ? singleLine(task?.semanticQuery || task?.content || task?.title || "")
+          : String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(task?.scope_id || task?.scopeId || local.scopeId || ""))?.action || ""),
         rows: taskWorkflowAttachTaskRelevanceScores(Array.from(rowById.values()), key, postScoreMap, { scopeId: String(task?.scope_id || task?.scopeId || local.scopeId || "") })
       };
       const rankingPause = rankingWorkCheckpoint();
@@ -16290,25 +16321,36 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // selected rows. Non-note legacy keeps the 1100 scored cut and computes no
     // note selection, so it cannot fail on note-only criteria.
     const poststructureIsNote = String(source?.type || "") === "note";
-    let poststructureRankedRowsByEvidenceId = poststructureIsNote
+    // An email source runs the SAME scored selection as a note source here
+    // too (selection, selected-only catalog supplement and builder
+    // pass-through); only the note-only action/self/marker assertions inside
+    // the selector are skipped for email.
+    const poststructureScoredSelection = poststructureIsNote || emailSelectionSource;
+    // The bundle consumes the builder's selection only together with the
+    // rankings it was computed from. Notes always pass their rankings; a
+    // non-note source (an email) with no ranked evidence rows at all has
+    // nothing to select from, so it passes neither.
+    const poststructurePassesRankings = poststructureIsNote
+      || Object.values(taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length);
+    let poststructureRankedRowsByEvidenceId = poststructureScoredSelection
       ? prestructureRankedRowChunkIndex(taskRelevanceRankings)
       : null;
-    const poststructureSelection = poststructureIsNote
+    const poststructureSelection = poststructureScoredSelection
       ? await taskWorkflowSelectTaskRelevantEvidenceCooperative(
         taskRelevanceRankings,
         { sourceContract, settings: this.settings, coverageIndexRevision: Number(taskSemanticRetrieval.telemetry?.indexRevision || this.semanticIndexRevision || 0) })
       : null;
-    const poststructureSupplement = poststructureIsNote
+    const poststructureSupplement = poststructureScoredSelection
       ? await taskWorkflowDeriveSelectedCatalogSupplementCooperative(
         [...(initialSemanticContext || []), ...taskSemanticChunks],
         poststructureSelection,
         { rankedRowsByEvidenceId: poststructureRankedRowsByEvidenceId })
       : { conflicts: [], missingSupplementalEvidenceIds: [], supplementalEvidenceIds: [], supplementalChunkByEvidenceId: new Map() };
-    if (poststructureIsNote && ((poststructureSupplement.conflicts || []).length
+    if (poststructureScoredSelection && ((poststructureSupplement.conflicts || []).length
       || (poststructureSupplement.missingSupplementalEvidenceIds || []).length)) {
       throw taskWorkflowSelectedCatalogSupplementError("poststructure", poststructureSelection, poststructureSupplement);
     }
-    const poststructureSupplementChunks = poststructureIsNote
+    const poststructureSupplementChunks = poststructureScoredSelection
       ? poststructureSupplement.supplementalEvidenceIds.map((id) => poststructureSupplement.supplementalChunkByEvidenceId.get(id)).filter(Boolean)
       : [];
     evidenceCatalog = await buildTaskEvidenceCatalogCooperative(sourceContract, [
@@ -16326,7 +16368,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // 1100-cut selection) so both paths carry the query-local allowed set. The
     // shared producer keeps the scopeId → allowed-ID-array shape the attach
     // consumer normalizes (same shape as the bundle's own map).
-    const poststructureAttachmentSelection = poststructureIsNote
+    const poststructureAttachmentSelection = poststructureScoredSelection
       ? poststructureSelection
       : await taskWorkflowSelectTaskRelevantEvidenceCooperative(taskRelevanceRankings, {
         sourceContract,
@@ -16380,15 +16422,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // A non-note source (an email) with no ranked evidence rows at all has nothing to
       // select from: pass no rankings so the bundle skips corpus-coverage instead of
       // failing with "ranked corpus is empty". Notes keep their existing handling.
-      taskRelevanceRankings: (poststructureIsNote || Object.values(taskRelevanceRankings || {}).some((ranking) => (ranking?.rows || []).length)) ? taskRelevanceRankings : null,
+      taskRelevanceRankings: poststructurePassesRankings ? taskRelevanceRankings : null,
       // Task 2 first slice: the exact single computed selection for note
       // sources, plus the ranked rows for the bundle's independent selected-ID
       // body/provenance recheck and the preserved retrieval bindings the
       // bundle consumes for binding-consistency. Null for non-note legacy
       // (bundle keeps its unchanged compute-then-project path).
-      builderTaskRelevanceSelection: poststructureIsNote ? poststructureSelection : null,
-      rankedRowsByEvidenceId: poststructureIsNote ? poststructureRankedRowsByEvidenceId : null,
-      retrievalBindingsByEvidenceId: poststructureIsNote ? poststructureSupplement.retrievalBindingsByEvidenceId : null,
+      builderTaskRelevanceSelection: poststructurePassesRankings ? poststructureSelection : null,
+      rankedRowsByEvidenceId: poststructurePassesRankings ? poststructureRankedRowsByEvidenceId : null,
+      retrievalBindingsByEvidenceId: poststructurePassesRankings ? poststructureSupplement.retrievalBindingsByEvidenceId : null,
       eligibleIndexCount: livePostEligibleIndexCount || undefined,
       metadataOnlyRejectedCount: livePostMetadataOnly,
       expectedTaskHandleCount: livePostExpectedTaskHandleCount || undefined,
@@ -50569,7 +50611,15 @@ async function taskWorkflowSelectTaskRelevantEvidenceCooperative(perTaskRankings
 
 function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRankings = {}, options = {}) {
   const sourceContract = options.sourceContract || {};
-  const noteActionSelection = String(sourceContract.sourceType || sourceContract.source_type || "note") === "note";
+  const sourceType = String(sourceContract.sourceType || sourceContract.source_type || "note");
+  const noteActionSelection = sourceType === "note";
+  // An email source runs the SAME scored selection as a note source (the
+  // semantic note cap + the lexical window). Only the note-only assertions
+  // below are skipped for email: an email has no indexed source chunk to be
+  // the "self" query handle and no marked-action scope to match a marker
+  // against. Every other source type keeps the unchanged legacy scored cut.
+  const emailActionSelection = sourceType === "email";
+  const scoredSelection = noteActionSelection || emailActionSelection;
   const factsById = new Map();
   for (const fact of sourceContract.facts || []) {
     const factId = String(fact?.factId || fact?.fact_id || "").trim();
@@ -50661,6 +50711,11 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       // A recognized task-reference candidate (validated kind + canonical
       // identity + source surface + body/path, with positions kept exactly as
       // captured) is never dropped for the note line range it does not carry.
+      // The strict body/ordered-position gate is a NOTE-provenance assertion:
+      // a note chunk carries its own line range and the note's own path. An
+      // email corpus row is a foreign row (a note chunk, a Todoist snapshot
+      // reference row) that may legitimately carry no note line range, so the
+      // gate stays note-only and no email row is ever dropped for it.
       const recognizedTaskReference = noteActionSelection ? taskReferenceEvidence(row) : null;
       if (noteActionSelection && !recognizedTaskReference
         && (!text.trim() || !path || !Number.isFinite(lineStart) || !Number.isFinite(lineEnd) || lineStart > lineEnd)) {
@@ -50679,11 +50734,22 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
     rankedIdsByTask.set(taskKey, new Set(ranked.map((entry) => entry.evidenceId)));
     const candidateIds = [];
     let moduleResults = null;
-    if (!noteActionSelection) {
+    if (!scoredSelection) {
       candidateIds.push(...ranked.slice(0, 1100).map((entry) => entry.evidenceId));
     } else {
-    const self = ranked.find((entry) => entry.evidenceId === queryHandleEvidenceId);
     const actionText = String(ranking.actionText || "").trim();
+    if (emailActionSelection) {
+      // Note-only assertions skipped for email: an email has no indexed source
+      // chunk (so there is no "self" query handle whose path must equal the
+      // source path) and no marked-action scope (so there is no marker line to
+      // match the action text against). The email still needs a usable lexical
+      // query, so an empty or non-alphanumeric action text fails closed with
+      // its own code instead of the note's self/marker codes.
+      if (!actionText || !(actionText.toLowerCase().match(/[a-z0-9]+/g) || []).length) {
+        scoreMissingErrors.push(`email-action-text-missing:${taskKey}`);
+      }
+    } else {
+    const self = ranked.find((entry) => entry.evidenceId === queryHandleEvidenceId);
     if (!self || !actionText || !(actionText.toLowerCase().match(/[a-z0-9]+/g) || []).length) {
       scoreMissingErrors.push(`action-or-self-missing:${taskKey}:${queryHandleEvidenceId}`);
     }
@@ -50716,6 +50782,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       else if (String(scopeForAction.action || "").trim() !== actionText) why.push("action-differs");
       if (markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
       scoreMissingErrors.push(`action-source-mismatch:${taskKey}:${queryHandleEvidenceId}:why=${why.join("+")}`);
+    }
     }
     // Protection first, then the score module; a stable union is
     // conservatively deduplicated against this task's original raw rows
@@ -50810,6 +50877,12 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
   // Without the registered proof the strict original equality check is retained.
   const coverageProof = taskWorkflowCoverageProofFor(perTaskRankings, sourceContract, options.coverageIndexRevision);
   for (const taskKey of perTaskOrder) {
+    // Corpus-coverage reconciliation stays NOTE-ONLY. Its strict fallback
+    // assumes a single scope ranking the whole corpus (one note, one scope),
+    // which a multi-task email never satisfies, and the registered producer
+    // proof is a note-ownership artifact. Applying either to an email would
+    // fail closed a correct email selection, so the email relies on the
+    // bundle's own live corpus-coverage contract instead (unchanged).
     if (!noteActionSelection) continue;
     const ids = rankedIdsByTask.get(taskKey);
     if (coverageProof) {
@@ -50842,7 +50915,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
   }
   return {
     version: TASK_WORKFLOW_EVIDENCE_SCHEMA_VERSION,
-    perTaskTopN: noteActionSelection ? null : 1100,
+    perTaskTopN: scoredSelection ? null : 1100,
     perTask,
     selectedEvidenceIds: Array.from(selectedUnion),
     rankedCorpusEvidenceIds: Array.from(rankedCorpus),
@@ -51631,9 +51704,14 @@ function* taskWorkflowContextBundleSteps(options = {}) {
   // selector contract the gates below rely on; a malformed pass-through can
   // never substitute for selection.
   const selectionContractErrors = [];
+  const builderSelectionSourceType = String(sourceContract.sourceType || sourceContract.source_type || "note");
+  // A note OR an email source consumes the passed builder selection: both run
+  // the same scored selection, so both get the same protected-closure, subset
+  // and body/provenance gates over the SAME object the builder computed. Any
+  // other source type keeps the unchanged legacy compute-then-project path.
   const noteBuilderSelection = Object.hasOwn(options, "builderTaskRelevanceSelection")
     && builderTaskRelevanceSelection != null
-    && String(sourceContract.sourceType || sourceContract.source_type || "note") === "note"
+    && (builderSelectionSourceType === "note" || builderSelectionSourceType === "email")
     ? builderTaskRelevanceSelection
     : null;
   if (Object.hasOwn(options, "builderTaskRelevanceSelection") && options.builderTaskRelevanceSelection != null) {
@@ -51827,7 +51905,7 @@ function* taskWorkflowContextBundleSteps(options = {}) {
   const normalizedBody = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   // (d) The whole selected body/source recheck — including the nonempty
   // excerpt and provenance-source presence checks — applies ONLY when the
-  // caller supplied a note builder selection. Legacy non-note callers (and
+  // caller supplied a note or email builder selection. Legacy callers (and
   // the legacy bundle-only path) keep the unchanged behavior with no new
   // gate: the pre-existing independent selected-ID/catalog/corpus checks
   // above still run.
@@ -51840,9 +51918,9 @@ function* taskWorkflowContextBundleSteps(options = {}) {
       }
     }
     const rankedBodyVariantsById = new Map();
-    // (d) The note-only selected body/source recheck runs only when the
-    // caller supplied a note builder selection; legacy non-note callers keep
-    // the unchanged path with no new gate.
+    // (d) The selected body/source recheck runs only when the caller supplied
+    // a note or email builder selection; legacy callers keep the unchanged
+    // path with no new gate.
     const noteBodyRecheckIds = noteBuilderSelection
       ? new Set(noteBuilderSelection.selectedEvidenceIds.map(String))
       : null;

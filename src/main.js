@@ -33170,7 +33170,13 @@ const EMAIL_CHAIN_BOUNDARY_RE = /^(?:-{2,}\s*(?:original message|forwarded messa
 const EMAIL_SIGNATURE_SEPARATOR_RE = /^--\s?$/;
 const EMAIL_SEPARATOR_LINE_RE = /^[\s_\-=*~]{2,}$/;
 const EMAIL_MOBILE_SIGNATURE_RE = /^(?:sent from (?:my )?(?:iphone|ipad|android|phone|mobile|device)\b.*|get outlook for (?:ios|android)\b.*|download the outlook mobile app\b.*)$/i;
-const EMAIL_SIGNOFF_RE = /^(?:thanks?|thank you|many thanks|thank you so much|best(?: wishes)?|kind regards|best regards|warm regards|regards|sincerely|yours(?: sincerely| faithfully)?|cheers|talk soon|appreciate it|cordialement|merci|bien\s+à\s+vous|salutations|saludos|atentamente|mit\s+freundlichen\s+grüßen|viele\s+grüße)\s*[,!.]?$/i;
+const EMAIL_SIGNOFF_RE = /^(?:thanks?(?: again)?|thank you(?: so much)?|many thanks|best(?: wishes)?|kind regards|best regards|warm regards|regards|sincerely|yours(?: sincerely| faithfully)?|cheers|talk soon|appreciate it|cordialement|merci|bien\s+à\s+vous|salutations|saludos|atentamente|mit\s+freundlichen\s+grüßen|viele\s+grüße)\s*[,!.]?$/i;
+// The first word of a sign-off, used as a cheap pre-filter.
+const EMAIL_SIGNOFF_FIRST_WORD_RE = /^(?:thanks?|thank|many|best|kind|warm|regards|sincerely|yours|cheers|talk|appreciate|cordialement|merci|bien|salutations|saludos|atentamente|mit|viele)\b/i;
+// A sign-off and the name on one line: "Thanks, Alex", "Cheers - Alex",
+// "Thanks again, Sophie T.". The name words are capitalised, so a sentence
+// such as "Thanks, Alex will send it tomorrow." never matches.
+const EMAIL_INLINE_SIGNOFF_SPLIT_RE = /^(.+?)\s*([,.\-–—:!]*)\s+([A-Z][A-Za-z.'’-]*(?:\s+[A-Z][A-Za-z.'’-]*){0,2})$/;
 const EMAIL_DISCLAIMER_RE = /\b(?:confidential|legally privileged|privileged and confidential|intended\s+(?:only|solely)\s+for|if\s+you\s+(?:are\s+not\s+the\s+intended|have\s+received\s+this)|disclaimer|unauthori[sz]ed\s+(?:use|disclosure|review|recipient|access)|please\s+notify\s+the\s+sender|virus|this\s+e-?mail\s+and\s+any\s+attachments|think\s+before\s+you\s+print|caution\s*:\s*this\s+email\s+originated\s+from\s+outside)/i;
 const EMAIL_ACTION_REQUEST_RE = /\b(?:please|kindly|need(?:s|ed)?\s+(?:you|us)|must|should|can\s+you|could\s+you|would\s+you|will\s+you|shall|let\s+me\s+know|feel\s+free\s+to|action\s+required|deadline|due\s+by|asap|urgent|review|send|confirm|respond|reply|complete|follow[- ]?up|update|prepare|draft|finali[sz]e|decide|approve|coordinate|sign\s+off|submit|attach|advise)\b/i;
 // A request asks the reader to do something: a question, a polite request or
@@ -33206,6 +33212,8 @@ const EMAIL_POSTAL_CODE_RE = /\b(?:[A-Z]\d[A-Z]\s?\d[A-Z]\d|[A-Z]{1,2}\d{1,2}\s?
 // footer row.
 const EMAIL_ORG_NAME_RE = /\b(?:inc|ltd|llc|llp|corp|corporation|company|group|services|systems|solutions|technologies|bank|university|college|institute|foundation|association|society|charity|hospital|clinic|centre|center|agency|ministry|department|partners|holdings)\b/i;
 const EMAIL_SIGNATURE_STOP_WORDS = new Set(["i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "our", "your", "my", "me", "us", "them", "if", "when", "while", "but", "and", "or", "so", "let", "please", "any", "all", "some", "no", "not", "do", "does", "did", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has", "had", "the", "a", "an", "as", "at", "by", "in", "on", "to", "of", "for", "from", "with", "without", "after", "before", "since", "until", "about", "over", "under", "again", "also", "because", "there", "here", "what", "which", "who", "how", "why", "is", "are", "was", "were", "be", "been", "being", "am", "hi", "hello", "hey", "cheers", "best"]);
+// The title words of a signature title line.
+const EMAIL_SIGNATURE_TITLE_WORD_RE = /\b(?:coordinator|manager|director|officer|professor|scientist|specialist|assistant|lead|analyst|advisor|adviser|president|chair|head|associate|administrator)\b/i;
 
 // The Gmail quote marker can span two lines: "On <date> <author>" and then
 // "<author@example.com> wrote:". The number of lines it takes, 0 when the
@@ -33268,6 +33276,46 @@ function emailSignatureLine(value) {
   return emailSignatureIdentityLine(text) || emailSignatureShortLine(text);
 }
 
+// A single lowercase word that names the sender: the name under a sign-off
+// ("kind regards" / "janaka").
+function emailSignatureLowercaseName(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 40) return false;
+  if (!/^[a-z][a-z'’-]*$/.test(text)) return false;
+  return !EMAIL_SIGNATURE_STOP_WORDS.has(text);
+}
+
+// A sign-off and the name on one line: "Thanks, Alex", "Cheers - Alex",
+// "Thanks again, Sophie T.".
+function emailInlineSignoffLine(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 120) return false;
+  if (!EMAIL_SIGNOFF_FIRST_WORD_RE.test(text)) return false;
+  if (emailRequestText(text)) return false;
+  const match = EMAIL_INLINE_SIGNOFF_SPLIT_RE.exec(text);
+  if (!match) return false;
+  if (!EMAIL_SIGNOFF_RE.test(match[1].trim())) return false;
+  const nameWords = match[3].split(/\s+/).filter(Boolean);
+  return nameWords.every((word) => !EMAIL_SIGNATURE_STOP_WORDS.has(word.toLowerCase().replace(/[^a-z]/g, "")));
+}
+
+// The signature block that starts with a sign-off and the name on one line:
+// the sign-off line plus the signature lines that follow it. The line must
+// already be an inline sign-off.
+function emailSignatureInlineBlockLength(lines, start) {
+  let length = 1;
+  while (length < 9 && start + length < lines.length) {
+    const line = String(lines[start + length] || "").trim();
+    if (!line) break;
+    if (line.startsWith(">")) break;
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(line)) break;
+    if (emailRequestText(line)) break;
+    if (!emailSignatureLine(line)) break;
+    length += 1;
+  }
+  return length;
+}
+
 // Length of the sign-off block that starts at the closing line: the closing
 // line plus up to 8 signature lines. 0 when the block is not a signature.
 function emailSignatureBlockLength(lines, start) {
@@ -33278,7 +33326,8 @@ function emailSignatureBlockLength(lines, start) {
     if (!line.trim()) break;
     if (EMAIL_CHAIN_BOUNDARY_RE.test(line.trim())) break;
     if (!emailSignatureLine(line)) break;
-    if (emailSignatureIdentityLine(line.trim())) identity = true;
+    // A single lowercase word right after the sign-off is the name.
+    if (emailSignatureIdentityLine(line.trim()) || (length === 1 && emailSignatureLowercaseName(line.trim()))) identity = true;
     length += 1;
   }
   if (length > 1) return identity ? length : 0;
@@ -33287,6 +33336,25 @@ function emailSignatureBlockLength(lines, start) {
     if (String(lines[index] || "").trim()) return 0;
   }
   return 1;
+}
+
+// The signature lines that follow a "--" separator: the lines up to a blank
+// line, a quoted line, a request line or a chain boundary. 0 when the block
+// holds no identity line, so no real content is dropped.
+function emailSignatureSeparatorBlockLength(lines, start) {
+  let length = 0;
+  let identity = false;
+  while (length < 9 && start + length < lines.length) {
+    const line = String(lines[start + length] || "").trim();
+    if (!line) break;
+    if (line.startsWith(">")) break;
+    if (emailRequestText(line)) break;
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(line)) break;
+    if (!emailSignatureLine(line)) break;
+    if (emailSignatureIdentityLine(line)) identity = true;
+    length += 1;
+  }
+  return identity ? length : 0;
 }
 
 // A request asks the reader to do something. A prohibition ("do not click
@@ -33361,6 +33429,82 @@ function emailFooterLine(value, nextLine = "") {
   if (EMAIL_STREET_RE.test(text) && EMAIL_POSTAL_CODE_RE.test(text)) return true;
   if (text.includes("|")) return emailFooterPipeLine(text, nextLine);
   return false;
+}
+
+// A contact detail: a phone number, an e-mail address, a web address or a
+// postal address.
+function emailContactDetailLine(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (EMAIL_FOOTER_MAIL_RE.test(text)) return true;
+  if (EMAIL_FOOTER_LINK_RE.test(text)) return true;
+  if (EMAIL_FOOTER_PHONE_RE.test(text)) return true;
+  if (EMAIL_STREET_RE.test(text) && EMAIL_POSTAL_CODE_RE.test(text)) return true;
+  if (text.includes("|") && !emailMarkdownTableRow(text)) {
+    return /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(text) || /\+?\d[\d ().-]{5,}\d/.test(text);
+  }
+  return false;
+}
+
+// A signature line that names a person or an organisation: every word starts
+// with a capital letter. A sentence with a verb never matches.
+function emailSignatureTitleCaseLine(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 120) return false;
+  const words = text.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 6) return false;
+  return words.every((word) => /^[A-Z][A-Za-z.'’-]*[.,]?$/.test(word) || word === "|" || word === "&");
+}
+
+// A name line: one to four capitalised words, with an optional degree.
+function emailSignatureNameLine(value) {
+  const words = String(value || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 4) return false;
+  return words.every((word) => /^[A-Z][A-Za-z.'’-]*[.,]?$/.test(word) || word === "|" || word === "&");
+}
+
+// The contact block at the end of a message: a name, the title or organisation
+// lines and a contact detail, with no sign-off of its own. The index where
+// the block starts, -1 when the segment does not end with such a block.
+function emailTrailingContactBlockStart(lines) {
+  let end = lines.length - 1;
+  while (end >= 0 && !String(lines[end] || "").trim()) end -= 1;
+  if (end < 0) return -1;
+  const block = [];
+  let hasContact = false;
+  let hasTitle = false;
+  let index = end;
+  while (index >= 0) {
+    const text = String(lines[index] || "").trim();
+    if (!text) break;
+    if (text.startsWith(">")) break;
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(text)) break;
+    if (emailRequestText(text)) break;
+    if (emailContactDetailLine(text)) {
+      hasContact = true;
+    } else {
+      if (!emailSignatureTitleCaseLine(text)) break;
+      if (EMAIL_SIGNATURE_TITLE_WORD_RE.test(text)) hasTitle = true;
+    }
+    block.unshift(text);
+    index -= 1;
+  }
+  if (!block.length || (!hasContact && !hasTitle)) return -1;
+  if (!emailSignatureNameLine(block[0])) return -1;
+  // The block must start after a blank line or after a sign-off.
+  if (index >= 0) {
+    const before = String(lines[index] || "").trim();
+    if (!before) return index + 1;
+    if (!EMAIL_SIGNOFF_RE.test(before)) return -1;
+  }
+  return index + 1;
+}
+
+// Drops the contact block at the end of a message.
+function removeEmailTrailingContactBlock(lines) {
+  const start = emailTrailingContactBlockStart(lines);
+  if (start < 0) return lines;
+  return lines.slice(0, start);
 }
 
 // A line that opens an external-sender banner: a bracketed tag, or a lead-in
@@ -33481,7 +33625,13 @@ function cleanEmailChainSegment(lines, keepHeaders) {
   while (cursor < body.length) {
     const line = String(body[cursor] || "");
     const trimmed = line.trim();
-    if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) break;
+    if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) {
+      // The "--" separator opens a signature block, not the end of the message:
+      // the signature lines that follow are dropped and the scan goes on, so a
+      // request in an earlier reply is never lost.
+      cursor += 1 + emailSignatureSeparatorBlockLength(body, cursor + 1);
+      continue;
+    }
     if (EMAIL_MOBILE_SIGNATURE_RE.test(trimmed)) { cursor += 1; continue; }
     if (!keepHeaders && EMAIL_CHAIN_BOUNDARY_RE.test(trimmed)) { cursor += 1; continue; }
     if (!keepHeaders) {
@@ -33492,10 +33642,14 @@ function cleanEmailChainSegment(lines, keepHeaders) {
       const consumed = emailSignatureBlockLength(body, cursor);
       if (consumed > 0) { cursor += consumed; continue; }
     }
+    if (emailInlineSignoffLine(trimmed)) {
+      cursor += emailSignatureInlineBlockLength(body, cursor);
+      continue;
+    }
     kept.push(line);
     cursor += 1;
   }
-  return removeEmailDisclaimerParagraphs(removeEmailNoiseLines(kept));
+  return removeEmailDisclaimerParagraphs(removeEmailNoiseLines(removeEmailTrailingContactBlock(kept)));
 }
 
 // The subject line of an email message, when the text carries one.

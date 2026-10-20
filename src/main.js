@@ -9368,9 +9368,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   // One chunking path for the whole index build: the same source text, the
-  // same unit selection and the same chunk metadata. Email log notes mark
-  // their synced task lines metadata-only, so a past email stays searchable
-  // without its task lines becoming task-generation evidence.
+  // same unit selection and the same chunk metadata. Every unit of an email
+  // log note is metadata-only, so a past email stays searchable in Ask/chat
+  // without any of its units becoming task-generation evidence.
   semanticFileChunks(path, file, text, createdMeta = {}) {
     const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems, emailLog: isEmailLogPath(path, this.settings) });
     return selectedFileChunks
@@ -33617,17 +33617,17 @@ function semanticMarkdownCoherentUnits(text = "", options = {}) {
   let listGroup = 0;
   let sectionGroup = 0;
   let previousKind = "";
-  // Depth of the email log note's "Synced Todoist Tasks" heading, 0 when the
-  // unit is not inside that section. Those units are already synced to
-  // Todoist: they stay searchable, but they must never reach the task
-  // generator as evidence.
-  let emailLogTaskSection = 0;
   const headingContext = () => headings.filter(Boolean).join("\n");
   const appendUnit = (value, lineStart, lineEnd, kind = "paragraph", metadata = {}) => {
     const rawValue = String(value || "");
     const normalized = metadata.preserveExact === true ? rawValue : rawValue.trim();
     if (!normalized) return;
-    units.push(Object.assign({ text: normalized, lineStart, lineEnd, kind, headingContext: headingContext(), mandatory: kind === "action", atomicUnitCount: 1 }, emailLogTaskSection && !metadata.evidenceEligibility ? { evidenceEligibility: "metadata-only" } : {}, metadata));
+    // An email log note is the vault record of a processed email: its
+    // metadata lines, its email summary and its synced task lines all
+    // describe a PAST email. They stay searchable for Ask/chat, but none of
+    // them may become task-generation evidence, or a later email would turn
+    // an earlier email's request into a second, phantom task.
+    units.push(Object.assign({ text: normalized, lineStart, lineEnd, kind, headingContext: headingContext(), mandatory: kind === "action", atomicUnitCount: 1 }, options.emailLog === true ? { evidenceEligibility: "metadata-only" } : {}, metadata));
     previousKind = kind;
   };
   const flushPending = () => {
@@ -33659,8 +33659,6 @@ function semanticMarkdownCoherentUnits(text = "", options = {}) {
       const level = heading[1].length;
       headings.length = level;
       headings[level - 1] = `${heading[1]} ${heading[2]}`;
-      if (options.emailLog === true && /^synced todoist tasks$/i.test(String(heading[2] || "").trim())) emailLogTaskSection = level;
-      else if (emailLogTaskSection && level <= emailLogTaskSection) emailLogTaskSection = 0;
       sectionGroup += 1;
       listGroup += 1;
       blankRun = 0;

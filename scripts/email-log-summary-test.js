@@ -17,6 +17,11 @@
 //      note is written without a summary.
 //   5. isIndexablePath returns true for an email log note and false for other
 //      plugin-data notes and for the writing context folder.
+//   6. EVERY unit of an email log note (metadata lines, email summary, synced
+//      task lines) is metadata-only: it stays searchable for Ask/chat and
+//      never reaches the task-generation lane, so a past email's summary can
+//      never become a phantom task. A note that is not a log note is
+//      unaffected.
 //
 // Read-only and offline: the plugin runs over a fake in-memory vault; the
 // provider call is stubbed. Nothing touches the disk or the network.
@@ -469,9 +474,15 @@ async function testIndexablePath() {
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// 6. The synced task lines stay searchable but never reach the task lane
+// 6. EVERY unit of an email log note is metadata-only
+//
+// A log note is the vault record of a processed email. Its metadata lines,
+// its AI summary and its synced task lines describe a PAST email, so none of
+// them may become task-generation evidence: a later email that retrieved an
+// earlier email's summary would turn that summary's request into a second,
+// phantom task. The log note stays fully searchable for Ask/chat.
 // ---------------------------------------------------------------------------
-async function testSyncedTaskUnitsAreMetadataOnly() {
+async function testLogNoteUnitsAreMetadataOnly() {
   const harness = makePlugin();
   await harness.plugin.appendEmailLog({
     subject: SUBJECT,
@@ -485,26 +496,43 @@ async function testSyncedTaskUnitsAreMetadataOnly() {
   const notePath = Array.from(harness.files.keys())[0];
   const noteFile = harness.files.get(notePath);
   const chunks = harness.plugin.semanticFileChunks(notePath, noteFile, noteFile.content, { createdAt: 0, createdAtSource: "" });
-  const summaryChunk = chunks.find((chunk) => chunk.text.includes("Alex asked Dana"));
-  const taskChunk = chunks.find((chunk) => chunk.text.includes("Submit the Atlas intake form"));
-  assert.ok(summaryChunk, "expected a summary chunk");
-  assert.ok(taskChunk, "expected a synced task chunk");
-  assert.equal(summaryChunk.evidenceEligibility, "evidence", "the summary unit stays task-eligible");
-  assert.equal(taskChunk.evidenceEligibility, "metadata-only", "the synced task unit is metadata-only");
-  // Ask/chat keeps every unit of the log note.
+  assert.ok(chunks.length >= 3, `expected the metadata, summary and task units, got ${chunks.length}`);
+  assert.ok(chunks.some((chunk) => chunk.text.includes("Alex asked Dana")), "expected a summary unit");
+  assert.ok(chunks.some((chunk) => chunk.text.includes("Submit the Atlas intake form")), "expected a synced task unit");
+  assert.ok(chunks.some((chunk) => chunk.text.includes("Email subject:")), "expected a metadata unit");
   for (const chunk of chunks) {
+    // Every unit of a log note is metadata-only: metadata lines, the email
+    // summary and the synced task lines alike.
+    assert.equal(chunk.evidenceEligibility, "metadata-only", `every log-note unit must be metadata-only: ${chunk.text}`);
+    // Ask/chat keeps every unit of the log note.
     assert.equal(semanticRetrievalChunkEligible(chunk, { isIndexablePath: () => true }), true, `the unit must stay Ask-searchable: ${chunk.text}`);
+    const chatLane = semanticExecutionEvidencePartition([chunk], "chat");
+    assert.equal(chatLane.selected.length, 1, `Ask/chat must keep the unit: ${chunk.text}`);
+    // The task lane drops every unit of the log note.
+    const taskLane = semanticExecutionEvidencePartition([chunk], "task-generation");
+    assert.equal(taskLane.selected.length, 0, `a log-note unit must not reach the task lane: ${chunk.text}`);
+    assert.equal(taskLane.rejected.length, 1);
+    assert.equal(taskLane.telemetry.reasonCodes[0], "metadata-only-unit");
   }
-  // The task lane drops the synced task unit and keeps the summary unit.
-  const taskLane = semanticExecutionEvidencePartition([taskChunk], "task-generation");
-  assert.equal(taskLane.selected.length, 0, "the synced task unit must not reach the task lane");
-  assert.equal(taskLane.rejected.length, 1);
-  assert.equal(taskLane.telemetry.reasonCodes[0], "metadata-only-unit");
-  const chatLane = semanticExecutionEvidencePartition([taskChunk], "chat");
-  assert.equal(chatLane.selected.length, 1, "Ask/chat keeps the synced task unit");
-  const summaryLane = semanticExecutionEvidencePartition([summaryChunk], "task-generation");
-  assert.equal(summaryLane.selected.length, 1, "the summary unit stays task-eligible");
-  console.log("PASS the synced task lines are metadata-only and stay Ask-searchable");
+  console.log("PASS every unit of an email log note is metadata-only and stays Ask-searchable");
+}
+
+// ---------------------------------------------------------------------------
+// 6b. A note that is not an email log note stays task-eligible
+// ---------------------------------------------------------------------------
+async function testNonLogNoteUnitsStayEvidence() {
+  const harness = makePlugin();
+  const notePath = "Notes/Regular.md";
+  const noteFile = { basename: "Regular", stat: { mtime: 0 } };
+  const text = "The Acme Atlas intake form is due October 13.\n\nAlex confirmed the deadline.";
+  const chunks = harness.plugin.semanticFileChunks(notePath, noteFile, text, { createdAt: 0, createdAtSource: "" });
+  assert.ok(chunks.length > 0, "expected the plain note units");
+  for (const chunk of chunks) {
+    assert.equal(chunk.evidenceEligibility, "evidence", `a plain note unit must stay task-eligible: ${chunk.text}`);
+    const taskLane = semanticExecutionEvidencePartition([chunk], "task-generation");
+    assert.equal(taskLane.selected.length, 1, `a plain note unit must reach the task lane: ${chunk.text}`);
+  }
+  console.log("PASS a note that is not an email log note stays task-eligible");
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +689,8 @@ async function main() {
   await testSummaryFailureIsContained();
   await testDegradedIndexSkipsSummary();
   await testIndexablePath();
-  await testSyncedTaskUnitsAreMetadataOnly();
+  await testLogNoteUnitsAreMetadataOnly();
+  await testNonLogNoteUnitsStayEvidence();
   await testLogFolderExclusionRule();
   await testSummaryMarkerSanitization();
   await testSummaryRedaction();

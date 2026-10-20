@@ -348,6 +348,47 @@ function buildIndexChunks() {
   return chunks;
 }
 
+// The production chunking of an email log note. The eligibility comes from
+// the real semanticFileChunks, so this arm exercises the shipped rule and not
+// a hand-written flag. The evidence id uses the production identity
+// (semanticIndexChunkDecorationIterator): the ordinal counts the DUPLICATE
+// rows of one content fingerprint, not the position in the note.
+function logNoteIndexChunks(plugin, logNotePath, logNoteText) {
+  const file = { basename: logNotePath.split("/").pop().replace(/\.md$/i, ""), stat: { mtime: 0 } };
+  const duplicateOrdinals = new Map();
+  return plugin.semanticFileChunks(logNotePath, file, logNoteText, { createdAt: 0, createdAtSource: "" })
+    .map((chunk) => {
+      const fingerprint = semanticChunkContentFingerprint(chunk.text);
+      const duplicateKey = `${logNotePath}\u0000${fingerprint}`;
+      const ordinal = duplicateOrdinals.get(duplicateKey) || 0;
+      duplicateOrdinals.set(duplicateKey, ordinal + 1);
+      const evidenceId = semanticChunkEvidenceId(logNotePath, fingerprint, ordinal);
+      return Object.assign({}, chunk, {
+        id: evidenceId,
+        evidenceId,
+        chunkId: evidenceId,
+        embedding: fakeEmbed(chunk.text),
+        sourceKind: "note",
+        embeddingProvider: "customopenai",
+        embeddingModel: "",
+        embeddingDimension: DIM,
+        indexMetadata: {
+          provider: "customopenai",
+          model: "",
+          dimension: DIM,
+          contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+          indexRevision: REVISION,
+          schemaVersion: 2
+        },
+        provenance: { path: logNotePath, sourceId: `src-${logNotePath}`, authority: "authoritative" },
+        retrievalEligible: true,
+        nonEvidence: false,
+        authorityState: "authoritative",
+        current: true
+      });
+    });
+}
+
 function makeFakeApp() {
   const refuse = async () => { throw new Error("email-task-plan-selection-test: read-only adapter"); };
   const adapter = {
@@ -375,8 +416,8 @@ function makeFakeApp() {
   return { vault, metadataCache, workspace };
 }
 
-async function makePlugin() {
-  const chunks = buildIndexChunks();
+async function makePlugin(options = {}) {
+  const chunks = options.chunks || buildIndexChunks();
   const identity = semanticEmbeddingIdentity(DEFAULT_SETTINGS, {});
   const provider = identity.provider;
   const model = identity.model;
@@ -699,6 +740,80 @@ async function main() {
       assert.deepStrictEqual(notePoststructureSnapshot, JSON.parse(fs.readFileSync(notePoststructureBaselinePath, "utf8")));
     });
   }
+
+  // ---- Email log notes are never task evidence ----------------------------
+  // A processed email's log note holds an AI summary of THAT email. If a
+  // later email's plan retrieved the summary as task evidence, the request in
+  // the summary would become a second, phantom task. The log note stays
+  // Ask/chat searchable and must never reach the task lane.
+  const LOG_NOTE_PATH = `${DEFAULT_SETTINGS.emailLogFolder}/2026-10-09 - Acme Atlas intake form.md`;
+  const LOG_NOTE_TEXT = [
+    "Date processed: 2026-10-09 10:00",
+    "Original email received: 2026-10-09 09:30",
+    "Forward received by Cloudflare: 2026-10-09 09:31",
+    "From: Alex Example <alex@example.com>",
+    "Email subject: Acme Atlas intake form",
+    "Todoist section: 2026-10-09 Acme",
+    "",
+    "## Email summary",
+    "",
+    "Alex asked Dana to submit the Acme Atlas intake form by October 13.",
+    "",
+    "## Synced Todoist Tasks",
+    "",
+    "- [ ] Submit the Acme Atlas intake form #STsync"
+  ].join("\n");
+  const logNoteSource = {
+    type: "email",
+    title: "Acme Atlas intake form",
+    text: "Please submit the Acme Atlas intake form by October 13.",
+    sectionName: "2026-10-12 Acme"
+  };
+  const logNoteHarness = await makePlugin();
+  const logNoteChunks = logNoteIndexChunks(logNoteHarness.plugin, LOG_NOTE_PATH, LOG_NOTE_TEXT);
+  const logNoteEvidenceIds = logNoteChunks.map((chunk) => String(chunk.evidenceId || ""));
+  const logNoteSummaryId = String(
+    (logNoteChunks.find((chunk) => chunk.text.includes("Alex asked Dana")) || {}).evidenceId || ""
+  );
+
+  // Control: the same corpus with the log note forced back to task-eligible
+  // must deliver the log note. Without this arm the metadata-only rule could
+  // pass simply because the log note never matched the query.
+  const controlPlugin = (await makePlugin({
+    chunks: buildIndexChunks().concat(logNoteChunks.map((chunk) => Object.assign({}, chunk, { evidenceEligibility: "evidence" })))
+  })).plugin;
+  installAiStub(controlPlugin, []);
+  const controlPlan = await controlPlugin.createTaskPlanWithLocalActivity(logNoteSource, {});
+  const controlDeliveredIds = (bundleOf(controlPlan)?.providerEvidenceProjection?.selectedEvidenceIds || []).map(String);
+
+  // The real run: the log note keeps its production metadata-only eligibility.
+  const logPlugin = (await makePlugin({ chunks: buildIndexChunks().concat(logNoteChunks) })).plugin;
+  installAiStub(logPlugin, []);
+  const logPlan = await logPlugin.createTaskPlanWithLocalActivity(logNoteSource, {});
+  const logBundle = bundleOf(logPlan);
+  const logDeliveredIds = (logBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).map(String);
+
+  check("every unit of an email log note is metadata-only", () => {
+    assert.ok(logNoteChunks.length >= 3, `expected the metadata, summary and task units, got ${logNoteChunks.length}`);
+    for (const chunk of logNoteChunks) {
+      assert.equal(chunk.evidenceEligibility, "metadata-only", `a log-note unit must be metadata-only: ${chunk.text}`);
+    }
+  });
+
+  check("the log note is a real candidate for the email query", () => {
+    assert.ok(logNoteSummaryId, "expected a log-note summary unit");
+    assert.ok(
+      controlDeliveredIds.includes(logNoteSummaryId),
+      `the control run must deliver the log-note summary, got ${JSON.stringify(controlDeliveredIds)}`
+    );
+  });
+
+  check("a log note in the corpus never reaches the email plan's delivered evidence", () => {
+    assert.ok(logDeliveredIds.length > 0, "the email plan must still deliver evidence");
+    for (const evidenceId of logNoteEvidenceIds) {
+      assert.ok(!logDeliveredIds.includes(evidenceId), `a log-note unit must not be delivered: ${evidenceId}`);
+    }
+  });
 
   if (failures.length) {
     console.error(`${failures.length} email-task-plan-selection check(s) failed`);

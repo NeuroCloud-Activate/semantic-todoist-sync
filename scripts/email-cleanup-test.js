@@ -555,6 +555,53 @@ function main() {
     }
   };
 
+  // ---- the RFC 3676 "--" separator opens a signature block ----------------
+  // The "--" line marks the start of a signature, not the end of the message:
+  // a request that follows it must never be lost.
+  check("a '--' separator does not end the message: a quoted request survives", () => {
+    const body = [
+      "Please approve the venue booking.",
+      "--",
+      "Matt SeeGobin",
+      "> Can you also send the invoice to accounting?"
+    ].join("\n");
+    assertSurvivesBothLanes(body, "Please approve the venue booking.", "the request before the signature");
+    assertSurvivesBothLanes(body, "> Can you also send the invoice to accounting?", "the quoted request after the signature");
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assert.ok(retrieval.includes("Can you also send the invoice to accounting?"), `the quoted request must reach the retrieval text, got ${JSON.stringify(retrieval)}`);
+    const summary = compressSourceForTaskPrompt(buildEmailSource(body), DEFAULT_SETTINGS);
+    assert.ok(summary.includes("Can you also send the invoice to accounting?"), `the quoted request must reach the AI summary, got ${JSON.stringify(summary)}`);
+  });
+
+  check("a '--' separator and its signature block are removed", () => {
+    const body = [
+      "Please approve the venue booking.",
+      "--",
+      "Matt SeeGobin",
+      "Director, Programs",
+      "Tel: 613-555-0110"
+    ].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "--", "the signature separator");
+      assertMissing(cleaned, "Matt SeeGobin", "the signature name");
+      assertMissing(cleaned, "Director, Programs", "the signature title");
+      assertMissing(cleaned, "613-555-0110", "the signature phone");
+      assert.ok(cleaned.includes("Please approve the venue booking."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
+  check("a request right after a '--' signature block survives", () => {
+    const body = [
+      "The venue is booked.",
+      "--",
+      "Matt SeeGobin",
+      "Please confirm by Friday."
+    ].join("\n");
+    assertSurvivesBothLanes(body, "The venue is booked.", "the line before the signature");
+    assertSurvivesBothLanes(body, "Please confirm by Friday.", "the request after the signature");
+  });
+
   check("a markdown table row is never a contact footer", () => {
     const body = [
       "Hi Matt,",

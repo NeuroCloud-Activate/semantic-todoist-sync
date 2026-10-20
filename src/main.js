@@ -33289,6 +33289,25 @@ function emailSignatureBlockLength(lines, start) {
   return 1;
 }
 
+// The signature lines that follow a "--" separator: the lines up to a blank
+// line, a quoted line, a request line or a chain boundary. 0 when the block
+// holds no identity line, so no real content is dropped.
+function emailSignatureSeparatorBlockLength(lines, start) {
+  let length = 0;
+  let identity = false;
+  while (length < 9 && start + length < lines.length) {
+    const line = String(lines[start + length] || "").trim();
+    if (!line) break;
+    if (line.startsWith(">")) break;
+    if (emailRequestText(line)) break;
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(line)) break;
+    if (!emailSignatureLine(line)) break;
+    if (emailSignatureIdentityLine(line)) identity = true;
+    length += 1;
+  }
+  return identity ? length : 0;
+}
+
 // A request asks the reader to do something. A prohibition ("do not click
 // links") and a legal notice are not requests.
 function emailRequestText(text) {
@@ -33481,7 +33500,13 @@ function cleanEmailChainSegment(lines, keepHeaders) {
   while (cursor < body.length) {
     const line = String(body[cursor] || "");
     const trimmed = line.trim();
-    if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) break;
+    if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) {
+      // The "--" separator opens a signature block, not the end of the message:
+      // the signature lines that follow are dropped and the scan goes on, so a
+      // request in an earlier reply is never lost.
+      cursor += 1 + emailSignatureSeparatorBlockLength(body, cursor + 1);
+      continue;
+    }
     if (EMAIL_MOBILE_SIGNATURE_RE.test(trimmed)) { cursor += 1; continue; }
     if (!keepHeaders && EMAIL_CHAIN_BOUNDARY_RE.test(trimmed)) { cursor += 1; continue; }
     if (!keepHeaders) {

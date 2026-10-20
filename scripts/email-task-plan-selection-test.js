@@ -8,19 +8,50 @@
 //   - the workflow is not blocked (dispatchAllowed true, no
 //     protected-workflow-evidence-closure-unresolved failure),
 //   - the evidence delivered to the provider is the CAPPED selection (one
-//     semantic chunk per note, lexical window 30), not the legacy 1100 cut.
+//     semantic chunk per note, lexical window 30), not the legacy 1100 cut,
+//   - none of the note-only bundle gates (catalog-selected-missing,
+//     catalog-selected-empty-excerpt/-missing-provenance/-body-conflict,
+//     builder-selection-extra/-unbound) fires for a legitimate email row,
+//   - an email with a punctuation-only subject or task content still gets a
+//     usable lexical query (the action-text fallback chain).
+//
+// The note arm is the control: the note selection, the note poststructure
+// selection and the note bundle are compared against recorded baselines, so
+// this file also proves the note path is byte-identical to the pre-change
+// behaviour.
 //
 // Read-only and offline: nothing touches the vault, the network or Todoist.
+//
+// Usage:
+//   node scripts/email-task-plan-selection-test.js
+//   node scripts/email-task-plan-selection-test.js --record-note-baseline
+//   node scripts/email-task-plan-selection-test.js --record-delivered-baseline
+//   node scripts/email-task-plan-selection-test.js --main-source=<path to src/main.js>
+//
+// The note baselines are recorded from the PRE-CHANGE commit (a6866b4 = 0.9.27)
+// with the same harness, so the note control is a real comparison:
+//   git show a6866b4:src/main.js > %TEMP%/main-a6866b4.js
+//   node scripts/email-task-plan-selection-test.js --record-note-baseline --main-source=%TEMP%/main-a6866b4.js
+// The recorded fixtures are then compared against the current src/main.js on
+// every ordinary run.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const Module = require("node:module");
 const path = require("node:path");
 
-const mainPath = path.join(__dirname, "..", "src/main.js");
+const argv = process.argv.slice(2);
+const recordNoteBaseline = argv.includes("--record-note-baseline");
+const recordDeliveredBaseline = argv.includes("--record-delivered-baseline");
+const mainSourceArg = argv.find((value) => value.startsWith("--main-source="));
+const mainPath = mainSourceArg
+  ? path.resolve(mainSourceArg.slice("--main-source=".length))
+  : path.join(__dirname, "..", "src/main.js");
 const mainSource = fs.readFileSync(mainPath, "utf8");
-const noteBaselinePath = path.join(__dirname, "fixtures", "email-task-plan-note-baseline.json");
-const recordBaseline = process.argv.slice(2).includes("--record-note-baseline");
+const fixturesDir = path.join(__dirname, "fixtures");
+const noteBaselinePath = path.join(fixturesDir, "email-task-plan-note-baseline.json");
+const notePoststructureBaselinePath = path.join(fixturesDir, "email-task-plan-note-poststructure-baseline.json");
+const deliveredBaselinePath = path.join(fixturesDir, "email-task-plan-delivered-evidence.json");
 
 const testModule = new Module(mainPath, module);
 testModule.filename = mainPath;
@@ -81,7 +112,10 @@ try {
   testModule._compile(
     `${mainSource}\nmodule.exports.__emailTaskPlan = {\n` +
       "  DEFAULT_SETTINGS, SEMANTIC_EMBEDDING_CONTENT_VERSION, semanticEmbeddingIdentity,\n" +
-      "  buildTaskSourceContract, taskWorkflowSelectTaskRelevantEvidence\n" +
+      "  buildTaskSourceContract, taskWorkflowSelectTaskRelevantEvidence,\n" +
+      "  semanticChunkEvidenceId, semanticChunkContentFingerprint,\n" +
+      "  taskReferenceSyntheticPath, semanticTaskReferenceSourceId,\n" +
+      "  semanticTaskReferenceEmbeddingProjection\n" +
       "};\n",
     mainPath
   );
@@ -96,7 +130,12 @@ const {
   SEMANTIC_EMBEDDING_CONTENT_VERSION,
   semanticEmbeddingIdentity,
   buildTaskSourceContract,
-  taskWorkflowSelectTaskRelevantEvidence
+  taskWorkflowSelectTaskRelevantEvidence,
+  semanticChunkEvidenceId,
+  semanticChunkContentFingerprint,
+  taskReferenceSyntheticPath,
+  semanticTaskReferenceSourceId,
+  semanticTaskReferenceEmbeddingProjection
 } = runtime.__emailTaskPlan;
 
 // ---------------------------------------------------------------------------
@@ -144,15 +183,17 @@ const NOTE_CHUNK_TEXTS = {
 };
 // Filler notes: enough distinct notes that the per-note semantic cap and the
 // 30-slot lexical window are both visible (the corpus is much larger than the
-// two windows). Every chunk shares the query's content words so the whole
-// corpus is positively scored and admitted.
+// two windows). Every chunk carries the query's topic words, so the corpus is
+// positively scored and admitted, but a Todoist snapshot reference row (a
+// reference row with no note of its own) still outranks the fillers and
+// reaches the selection.
 const FILLER_NOTE_COUNT = 36;
 const FILLER_CHUNKS_PER_NOTE = 3;
 for (let note = 0; note < FILLER_NOTE_COUNT; note += 1) {
   const notePath = `Projects/Filler/Filler ${note}.md`;
   NOTE_PATHS.push(notePath);
   NOTE_CHUNK_TEXTS[notePath] = Array.from({ length: FILLER_CHUNKS_PER_NOTE }, (unused, chunk) =>
-    `Acme atlas filler note ${note} chunk ${chunk}: intake form budget report follow up notes.`
+    `Acme atlas filler note ${note} chunk ${chunk}: budget report follow up notes.`
   );
 }
 
@@ -183,11 +224,95 @@ function fakeEmbed(text) {
   return norm ? vector.map((value) => value / norm) : vector.map(() => 0);
 }
 
+// A Todoist snapshot reference row in the vault index: a real (non-vault)
+// reference row an email corpus can legitimately carry. Its shape is copied
+// from the production builder (scripts/email-todoist-reference-evidence-test.js
+// and semanticTaskReferenceRecords in src/main.js).
+const SNAPSHOT_TODOIST_ID = "1234567890";
+const SNAPSHOT_OID = "ABCDEF1234567890";
+const SNAPSHOT_SOURCE_KIND = "todoist-snapshot-reference-row";
+const SNAPSHOT_TITLE = "File the Acme Atlas intake form";
+function snapshotReferenceChunk() {
+  const task = {
+    id: SNAPSHOT_TODOIST_ID,
+    todoistId: SNAPSHOT_TODOIST_ID,
+    oid: SNAPSHOT_OID,
+    content: SNAPSHOT_TITLE,
+    canonicalTaskId: SNAPSHOT_TODOIST_ID,
+    nonVaultSource: true,
+    sourceSurface: "todoist-snapshot",
+    retrievalEligible: true,
+    isCompleted: false
+  };
+  const sourceId = semanticTaskReferenceSourceId(SNAPSHOT_TODOIST_ID, task, SNAPSHOT_SOURCE_KIND);
+  const path = taskReferenceSyntheticPath(sourceId, SNAPSHOT_SOURCE_KIND);
+  const text = [
+    `Source kind: ${SNAPSHOT_SOURCE_KIND}`,
+    `Source ID: ${sourceId}`,
+    `Todoist task ID: ${SNAPSHOT_TODOIST_ID}`,
+    `oid: ${SNAPSHOT_OID}`,
+    `Title: ${SNAPSHOT_TITLE}`,
+    "State: open",
+    "Current state: open in Todoist snapshot",
+    "Subtask: false"
+  ].join("\n");
+  const evidenceId = semanticChunkEvidenceId(path, semanticChunkContentFingerprint(text), 0);
+  const chunk = {
+    id: `${path}#${SNAPSHOT_SOURCE_KIND}-${SNAPSHOT_TODOIST_ID}`,
+    chunkId: `${path}#${SNAPSHOT_SOURCE_KIND}-${SNAPSHOT_TODOIST_ID}`,
+    evidenceId,
+    path,
+    title: "Todoist task snapshot",
+    text,
+    kind: "todoist-task-reference",
+    source: "local-reference-table",
+    sourceKind: SNAPSHOT_SOURCE_KIND,
+    sourceId,
+    canonicalTaskId: SNAPSHOT_TODOIST_ID,
+    taskId: SNAPSHOT_TODOIST_ID,
+    todoistId: SNAPSHOT_TODOIST_ID,
+    oid: SNAPSHOT_OID,
+    nonVaultSource: true,
+    sourceSurface: "todoist-snapshot",
+    retrievalEligible: true,
+    authority: "authoritative",
+    embeddingProvider: "customopenai",
+    embeddingModel: "",
+    embeddingDimension: DIM,
+    embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+    indexMetadata: {
+      provider: "customopenai",
+      model: "",
+      dimension: DIM,
+      contentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION,
+      indexRevision: REVISION,
+      schemaVersion: 2
+    },
+    provenance: { path, sourceId, authority: "authoritative" },
+    nonEvidence: false,
+    authorityState: "authoritative",
+    current: true,
+    taskReference: Object.assign({}, task, {
+      taskId: SNAPSHOT_TODOIST_ID,
+      todoistId: SNAPSHOT_TODOIST_ID,
+      sourceKind: SNAPSHOT_SOURCE_KIND,
+      path
+    })
+  };
+  // The production index embeds a task-reference row from its embedding
+  // projection, not from the raw snapshot text.
+  chunk.embedding = fakeEmbed(semanticTaskReferenceEmbeddingProjection(chunk));
+  return chunk;
+}
+
 function buildIndexChunks() {
   const chunks = [];
   for (const notePath of NOTE_PATHS) {
     NOTE_CHUNK_TEXTS[notePath].forEach((text, index) => {
-      const evidenceId = `evidence-${notePath.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${index + 1}`;
+      // The production index assigns every chunk the same evidence id shape
+      // (ev:<path hash>:<content hash>:<ordinal>), so the harness rows carry
+      // the same identity the routing state derives.
+      const evidenceId = semanticChunkEvidenceId(notePath, semanticChunkContentFingerprint(text), index);
       chunks.push({
         id: evidenceId,
         evidenceId,
@@ -219,6 +344,7 @@ function buildIndexChunks() {
       });
     });
   }
+  chunks.push(snapshotReferenceChunk());
   return chunks;
 }
 
@@ -298,19 +424,21 @@ async function makePlugin() {
 
 // The stubbed provider: it returns one task that cites the first evidence
 // handles the workflow actually put in front of the model.
-function installAiStub(plugin, calls) {
+function installAiStub(plugin, calls, options = {}) {
+  const scopeId = options.scopeId || "scope-unused";
+  const content = options.content || TASK_CONTENT;
   plugin.openaiResponse = async (request = {}) => {
     const prefix = String(request.promptCachePrefix || "");
     const handles = [...new Set((prefix.match(/^(E\d+) /gm) || []).map((line) => line.trim()))];
     calls.push({ operation: String(request.operation || ""), handles });
     return JSON.stringify({
       tasks: [{
-        content: TASK_CONTENT,
+        content,
         due_date: null,
         deadline_date: null,
         priority: 1,
         labels: [],
-        scope_id: "scope-unused",
+        scope_id: scopeId,
         refs: handles.slice(0, 2),
         subtasks: []
       }],
@@ -331,6 +459,22 @@ function check(name, fn) {
   }
 }
 
+function recordBaselineFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  console.log(`baseline recorded: ${filePath}`);
+}
+
+function bundleOf(plan) {
+  return plan?.taskWorkflowContextBundle || plan?.contextBundle || null;
+}
+
+function validationCodes(bundle) {
+  return ((bundle?.contextBundleValidation?.protectedReferenceErrors || [])
+    .concat(bundle?.contextBundleValidation?.foreignReferenceErrors || [])
+    .map((code) => String(code).split(":")[0]));
+}
+
 async function main() {
   const { plugin } = await makePlugin();
   const calls = [];
@@ -340,7 +484,7 @@ async function main() {
   const plan = await plugin.createTaskPlanWithLocalActivity(source, {});
 
   const failure = plan?.workflowContextFailure || null;
-  const bundle = plan?.taskWorkflowContextBundle || plan?.contextBundle || null;
+  const bundle = bundleOf(plan);
   const validation = bundle?.contextBundleValidation || null;
   const projection = bundle?.providerEvidenceProjection || null;
   const deliveredIds = (projection?.selectedEvidenceIds || []).map(String);
@@ -388,6 +532,84 @@ async function main() {
     assert.ok((calls[0].handles || []).length > 0, "the workflow must put evidence handles in front of the model");
   });
 
+  // ---- Finding 3: the note-only bundle gates must not fire for email -----
+  check("no note-only bundle gate fires for the email plan", () => {
+    const forbidden = [
+      "catalog-selected-missing",
+      "catalog-selected-empty-excerpt",
+      "catalog-selected-missing-provenance",
+      "catalog-selected-body-conflict",
+      "builder-selection-extra",
+      "builder-selection-unbound",
+      "builder-selection-malformed",
+      "selected-catalog-supplement-conflict",
+      "selected-catalog-supplement-missing",
+      "protected-workflow-evidence-closure-unresolved"
+    ];
+    const codes = validationCodes(bundle);
+    for (const code of codes) {
+      assert.ok(!forbidden.includes(code), `the email plan must not report ${code}, got ${JSON.stringify(codes)}`);
+    }
+  });
+
+  check("the Todoist snapshot reference row survives the email plan", () => {
+    const snapshotId = snapshotReferenceChunk().evidenceId;
+    assert.ok(
+      deliveredIds.includes(snapshotId),
+      `the snapshot reference row must reach the provider, got ${JSON.stringify(deliveredIds)}`
+    );
+  });
+
+  // ---- Finding 5(b): the exact delivered evidence ids --------------------
+  if (recordDeliveredBaseline) {
+    recordBaselineFile(deliveredBaselinePath, { deliveredEvidenceIds: deliveredIds });
+  } else if (!fs.existsSync(deliveredBaselinePath)) {
+    failures.push("delivered-evidence baseline fixture is missing");
+    console.error(`FAIL: the delivered-evidence baseline fixture is missing: ${deliveredBaselinePath} (record it with --record-delivered-baseline)`);
+  } else {
+    check("the delivered evidence ids are exactly the recorded baseline", () => {
+      const expected = JSON.parse(fs.readFileSync(deliveredBaselinePath, "utf8"));
+      assert.deepStrictEqual(deliveredIds, expected.deliveredEvidenceIds.map(String));
+    });
+  }
+
+  // ---- Finding 4: the action-text fallback chain --------------------------
+  // A punctuation-only task content falls back to the email subject; a
+  // punctuation-only subject falls back to the first sentence of the
+  // contract's source-summary fact (the cleaned retrieval text). Neither may
+  // fail the email closed with email-action-text-missing.
+  for (const [label, title, content] of [
+    ["a punctuation-only task content falls back to the email subject", EMAIL_TITLE, "..."],
+    ["a punctuation-only subject falls back to the source-summary sentence", "...", "..."]
+  ]) {
+    const fallbackPlugin = (await makePlugin()).plugin;
+    const fallbackCalls = [];
+    installAiStub(fallbackPlugin, fallbackCalls, { content });
+    const fallbackSource = {
+      type: "email",
+      title,
+      text: "Please submit the Acme Atlas intake form before Friday.",
+      sectionName: "2026-10-09 Acme"
+    };
+    const fallbackPlan = await fallbackPlugin.createTaskPlanWithLocalActivity(fallbackSource, {});
+    const fallbackBundle = bundleOf(fallbackPlan);
+    const fallbackCodes = validationCodes(fallbackBundle);
+    check(label, () => {
+      assert.ok(
+        !fallbackCodes.includes("email-action-text-missing"),
+        `the email must not fail closed with email-action-text-missing, got ${JSON.stringify(fallbackCodes)}`
+      );
+      assert.ok(
+        !String(fallbackPlan?.workflowContextFailure?.code || "").includes("email-action-text-missing"),
+        `the email plan must not fail with email-action-text-missing, got ${JSON.stringify(fallbackPlan?.workflowContextFailure || null)}`
+      );
+      assert.ok(
+        (fallbackBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).length > 0,
+        "the fallback email must still deliver evidence"
+      );
+    });
+  }
+
   // ---- Note arm: the note path must stay byte-identical -------------------
   // The note source runs the same scored selection, so the note arm is the
   // control: the production prestructure retrieval plus the selector must
@@ -422,13 +644,46 @@ async function main() {
     }]))
   });
   console.log(`note selection: ${noteSnapshot.slice(0, 240)}`);
-  if (recordBaseline || !fs.existsSync(noteBaselinePath)) {
-    fs.mkdirSync(path.dirname(noteBaselinePath), { recursive: true });
-    fs.writeFileSync(noteBaselinePath, `${noteSnapshot}\n`, "utf8");
-    console.log(`note-arm baseline ${recordBaseline ? "recorded" : "created"}: ${noteBaselinePath}`);
+
+  // The note poststructure + bundle: the full note plan through the real
+  // builder, so the poststructure selection and the bundle gates are covered
+  // by the same byte-identity control as the prestructure selection.
+  const noteMarkedScopeId = String((noteContract.scopes || []).find((scope) => scope.family === "marked-action")?.scopeId || "");
+  installAiStub(noteHarness.plugin, [], { scopeId: noteMarkedScopeId });
+  const notePlan = await noteHarness.plugin.createTaskPlanWithLocalActivity(noteSource, {});
+  const noteBundle = bundleOf(notePlan);
+  const notePoststructureSnapshot = {
+    failure: notePlan?.workflowContextFailure?.code || "",
+    tasks: (notePlan?.tasks || []).map((task) => ({
+      content: String(task?.content || ""),
+      scope_id: String(task?.scope_id || ""),
+      evidence_ids: (task?.evidence_ids || []).map(String)
+    })),
+    dispatchAllowed: noteBundle?.contextBundleValidation?.dispatchAllowed ?? null,
+    protectedReferenceErrors: noteBundle?.contextBundleValidation?.protectedReferenceErrors || [],
+    foreignReferenceErrors: noteBundle?.contextBundleValidation?.foreignReferenceErrors || [],
+    deliveredEvidenceIds: (noteBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).map(String),
+    catalogEvidenceIds: (noteBundle?.evidenceCatalog?.items || []).map((item) => String(item.evidenceId || item.id || "")),
+    catalogHash: String(noteBundle?.evidenceCatalog?.hash || "")
+  };
+  console.log(`note poststructure: ${JSON.stringify(notePoststructureSnapshot).slice(0, 240)}`);
+
+  if (recordNoteBaseline) {
+    recordBaselineFile(noteBaselinePath, JSON.parse(noteSnapshot));
+    recordBaselineFile(notePoststructureBaselinePath, notePoststructureSnapshot);
+  } else if (!fs.existsSync(noteBaselinePath) || !fs.existsSync(notePoststructureBaselinePath)) {
+    const missing = [
+      fs.existsSync(noteBaselinePath) ? "" : noteBaselinePath,
+      fs.existsSync(notePoststructureBaselinePath) ? "" : notePoststructureBaselinePath
+    ].filter(Boolean);
+    failures.push("note baseline fixture is missing");
+    console.error(`FAIL: the note baseline fixture(s) are missing: ${missing.join(", ")} (record them with --record-note-baseline)`);
   } else {
     check("the note selection is byte-identical to the recorded baseline", () => {
       assert.deepStrictEqual(JSON.parse(noteSnapshot), JSON.parse(fs.readFileSync(noteBaselinePath, "utf8")));
+    });
+    check("the note poststructure and bundle are byte-identical to the recorded baseline", () => {
+      assert.deepStrictEqual(notePoststructureSnapshot, JSON.parse(fs.readFileSync(notePoststructureBaselinePath, "utf8")));
     });
   }
 

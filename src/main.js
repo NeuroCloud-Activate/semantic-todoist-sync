@@ -15605,8 +15605,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const sourceSummary = compressSourceForTaskPrompt(source, this.settings);
     const sourceContractText = sourceContractSourceText(source, this.settings);
     const sourceContract = buildTaskSourceContract(source, sourceContractText, this.settings);
-    const taskQuery = `${source.title}\n${sourceSummary}`;
-    const retrievalPrompt = taskGenerationContextQuery(source, sourceSummary, this.settings, sourceContract);
+    // Email retrieval must not see the header lines the AI keeps, so the query
+    // uses the cleaned chain text (the contract text). Notes keep the summary.
+    const retrievalText = String(source?.type || "") === "email" ? sourceContractText : sourceSummary;
+    const taskQuery = `${source.title}\n${retrievalText}`;
+    const retrievalPrompt = taskGenerationContextQuery(source, retrievalText, this.settings, sourceContract);
     this.setAiActivityProgress(activity, { step: 1, steps: 4, label: "retrieving evidence" });
     this.setSidebarStatus("Retrieving task evidence...");
     const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt, { sourceContract, captureContext });
@@ -32996,6 +32999,166 @@ function cleanupEmailText(text) {
   return text.replace(/\u0000/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n{4,}/g, "\n\n\n").trim();
 }
 
+// Per-message email noise. The chain itself (every message) is kept; only the
+// parts that must never reach a semantic retrieval lane are removed: the
+// header blocks, the signatures and the legal/confidentiality disclaimers.
+const EMAIL_HEADER_LINE_RE = /^(?:from|sent|date|to|cc|bcc|reply-to|subject|forwarded by|original email received|forward received by cloudflare)\s*:/i;
+const EMAIL_CHAIN_BOUNDARY_RE = /^(?:-{2,}\s*(?:original message|forwarded message)\s*-{2,}|begin forwarded message:|on\s+.{1,200}\bwrote:)\s*$/i;
+const EMAIL_SIGNATURE_SEPARATOR_RE = /^--\s?$/;
+const EMAIL_MOBILE_SIGNATURE_RE = /^(?:sent from (?:my )?(?:iphone|ipad|android|phone|mobile|device)\b.*|get outlook for (?:ios|android)\b.*|download the outlook mobile app\b.*)$/i;
+const EMAIL_SIGNOFF_RE = /^(?:thanks?|thank you|many thanks|thank you so much|best(?: wishes)?|kind regards|best regards|warm regards|regards|sincerely|yours(?: sincerely| faithfully)?|cheers|talk soon|appreciate it)[,!.]?$/i;
+const EMAIL_DISCLAIMER_RE = /\b(?:confidential|legally privileged|privileged and confidential|intended\s+(?:only|solely)\s+for|if\s+you\s+(?:are\s+not\s+the\s+intended|have\s+received\s+this)|disclaimer|unauthori[sz]ed\s+(?:use|disclosure|review|recipient|access)|please\s+notify\s+the\s+sender|virus|this\s+e-?mail\s+and\s+any\s+attachments|think\s+before\s+you\s+print|caution\s*:\s*this\s+email\s+originated\s+from\s+outside)/i;
+const EMAIL_DISCLAIMER_ACTION_RE = /\b(?:please\s+(?:review|send|confirm|respond|reply|complete|approve|sign|fill|submit|pay|update|prepare)|can\s+you|could\s+you|will\s+you|need\s+you\s+to|you\s+must|we\s+need\s+you|action\s+required|due\s+by|deadline|asap)\b/i;
+const EMAIL_ACTION_REQUEST_RE = /\b(?:please|kindly|need(?:s|ed)?\s+(?:you|us)|must|should|can\s+you|could\s+you|would\s+you|will\s+you|shall|let\s+me\s+know|feel\s+free\s+to|action\s+required|deadline|due\s+by|asap|urgent|review|send|confirm|respond|reply|complete|follow[- ]?up|update|prepare|draft|finali[sz]e|decide|approve|coordinate|sign\s+off|submit|attach|advise)\b/i;
+const EMAIL_SIGNATURE_STOP_WORDS = new Set(["i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "our", "your", "my", "me", "us", "them", "if", "when", "while", "but", "and", "or", "so", "let", "please", "any", "all", "some", "no", "not", "do", "does", "did", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has", "had", "the", "a", "an", "as", "at", "by", "in", "on", "to", "of", "for", "from", "with", "without", "after", "before", "since", "until", "about", "over", "under", "again", "also", "because", "there", "here", "what", "which", "who", "how", "why", "is", "are", "was", "were", "be", "been", "being", "am", "hi", "hello", "hey", "cheers", "best"]);
+
+// Line indexes where a new message starts inside an email chain: a forwarded
+// block rule, an Apple "Begin forwarded message:" rule, a Gmail "On ... wrote:"
+// quote marker, or a per-message header block (a "From:" line followed by a
+// "Sent:"/"Date:" line, as Outlook and Gmail write them).
+function emailChainSegmentStartIndexes(lines) {
+  const starts = [0];
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = String(lines[index] || "");
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(line.trim())) { starts.push(index); continue; }
+    if (/^from:\s*/i.test(line) && /(?:^|\n)(?:sent|date):/i.test(lines.slice(index + 1, index + 8).join("\n"))) starts.push(index);
+  }
+  return starts;
+}
+
+// A signature line names its author: an address, a link, a phone number, a job
+// title or a company, or a short name-like line.
+function emailSignatureIdentityLine(value) {
+  const text = String(value || "");
+  if (/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(text)) return true;
+  if (/https?:\/\/\S+/i.test(text)) return true;
+  if (/(?:\+?\d[\d ().-]{5,}\d)/.test(text)) return true;
+  if (/\b(?:manager|director|officer|consultant|specialist|coordinator|analyst|developer|engineer|designer|architect|accountant|attorney|lawyer|advisor|adviser|assistant|administrator|representative|president|partner|principal|executive|supervisor|team|services|group|corporation|corp|inc|ltd|llc|llp|university|college|institute|foundation|association|society|charity)\b/i.test(text)) return true;
+  const words = text.split(/\s+/).filter(Boolean);
+  return words.length >= 1 && words.length <= 4 && words.every((word) => /^[A-Z][A-Za-z.'’-]*$/.test(word));
+}
+
+function emailSignatureShortLine(value) {
+  const words = String(value || "").split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 6) return false;
+  if (/[.!?]$/.test(value)) return false;
+  return !EMAIL_SIGNATURE_STOP_WORDS.has(words[0].toLowerCase().replace(/[^a-z]/g, ""));
+}
+
+function emailSignatureLine(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 120) return false;
+  if (EMAIL_ACTION_REQUEST_RE.test(text)) return false;
+  if (EMAIL_DISCLAIMER_RE.test(text)) return false;
+  return emailSignatureIdentityLine(text) || emailSignatureShortLine(text);
+}
+
+// Length of the sign-off block that starts at the closing line: the closing
+// line plus up to 8 signature lines. 0 when the block is not a signature.
+function emailSignatureBlockLength(lines, start) {
+  let length = 1;
+  let identity = false;
+  while (length < 9 && start + length < lines.length) {
+    const line = String(lines[start + length] || "");
+    if (!line.trim()) break;
+    if (EMAIL_CHAIN_BOUNDARY_RE.test(line.trim())) break;
+    if (!emailSignatureLine(line)) break;
+    if (emailSignatureIdentityLine(line.trim())) identity = true;
+    length += 1;
+  }
+  if (length > 1) return identity ? length : 0;
+  // A lone closing line is noise only when it ends the message.
+  for (let index = lines.length - 1; index > start; index -= 1) {
+    if (String(lines[index] || "").trim()) return 0;
+  }
+  return 1;
+}
+
+function emailDisclaimerParagraph(paragraph) {
+  const text = paragraph.join("\n");
+  if (!EMAIL_DISCLAIMER_RE.test(text)) return false;
+  if (EMAIL_DISCLAIMER_ACTION_RE.test(text)) return false;
+  const lines = paragraph.map((line) => String(line || "").trim()).filter(Boolean);
+  if (!lines.length) return false;
+  return EMAIL_DISCLAIMER_RE.test(lines[0]) || lines.every((line) => EMAIL_DISCLAIMER_RE.test(line));
+}
+
+// Drops the blank-line-delimited disclaimer paragraphs only; every other
+// paragraph (and every request inside one) survives.
+function removeEmailDisclaimerParagraphs(lines) {
+  const output = [];
+  let index = 0;
+  while (index < lines.length) {
+    const paragraph = [];
+    while (index < lines.length && String(lines[index] || "").trim()) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    const blanks = [];
+    while (index < lines.length && !String(lines[index] || "").trim()) {
+      blanks.push(lines[index]);
+      index += 1;
+    }
+    if (paragraph.length && emailDisclaimerParagraph(paragraph)) {
+      output.push(...blanks);
+      continue;
+    }
+    output.push(...paragraph, ...blanks);
+  }
+  return output;
+}
+
+function cleanEmailChainSegment(lines, keepHeaders) {
+  let index = 0;
+  while (index < lines.length) {
+    const trimmed = String(lines[index] || "").trim();
+    if (!trimmed) { index += 1; continue; }
+    if (!keepHeaders && EMAIL_CHAIN_BOUNDARY_RE.test(trimmed)) { index += 1; continue; }
+    break;
+  }
+  if (!keepHeaders) {
+    while (index < lines.length && EMAIL_HEADER_LINE_RE.test(String(lines[index] || ""))) index += 1;
+  }
+  const body = lines.slice(index);
+  const kept = [];
+  let cursor = 0;
+  while (cursor < body.length) {
+    const line = String(body[cursor] || "");
+    const trimmed = line.trim();
+    if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) break;
+    if (EMAIL_MOBILE_SIGNATURE_RE.test(trimmed)) { cursor += 1; continue; }
+    if (!keepHeaders && EMAIL_CHAIN_BOUNDARY_RE.test(trimmed)) { cursor += 1; continue; }
+    if (EMAIL_SIGNOFF_RE.test(trimmed)) {
+      const consumed = emailSignatureBlockLength(body, cursor);
+      if (consumed > 0) { cursor += consumed; continue; }
+    }
+    kept.push(line);
+    cursor += 1;
+  }
+  return removeEmailDisclaimerParagraphs(kept);
+}
+
+// The one email-specific step of the shared pipeline: clean the chain so the
+// header blocks, the signatures and the disclaimers never become search
+// queries, while every message of the chain still reaches the AI and the
+// retrieval lanes. keepHeaders keeps the per-message header lines for the AI.
+function cleanEmailChainText(text, options = {}) {
+  const keepHeaders = options.keepHeaders !== false;
+  const value = cleanupEmailText(String(text || ""));
+  if (!value) return value;
+  const lines = value.split("\n");
+  const starts = emailChainSegmentStartIndexes(lines);
+  const cleaned = [];
+  for (let index = 0; index < starts.length; index += 1) {
+    const from = starts[index];
+    const to = index + 1 < starts.length ? starts[index + 1] : lines.length;
+    const segment = cleanupEmailText(cleanEmailChainSegment(lines.slice(from, to), keepHeaders).join("\n"));
+    if (segment) cleaned.push(segment);
+  }
+  const result = cleanupEmailText(cleaned.join("\n"));
+  return result || value;
+}
+
 function stripHtml(html) {
   return html.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>/gi, "\n").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
 }
@@ -45513,17 +45676,16 @@ function compressForTaskPrompt(text, settings = DEFAULT_SETTINGS) {
   const cleaned = cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
   const links = extractDescriptionLinkRecords(cleaned, settings).slice(0, 20);
   const thread = splitEmailCurrentAndQuotedHistory(cleaned);
-  const relevantLines = (value, limit) => String(value || "").split("\n").filter((line) => {
-    const l = line.toLowerCase();
-    return /please|action|todo|to do|follow up|review|comment|tracked changes?|verify|verification|accuracy|gap|highlight|draft|document|report|send|confirm|confirmation|complete|deadline|due|urgent|need|waiting|legal|finance|owner|assignee|client|customer|vendor|lawyer|accounting/.test(l);
-  }).slice(0, limit).join("\n");
-  const currentLines = relevantLines(thread.current, 60) || thread.current;
-  const historyLines = relevantLines(thread.history, 60) || thread.history;
+  // The AI gets the whole chain: every message, every request line and each
+  // message's own From/Sent/Date/Subject lines. Only the signatures and the
+  // disclaimers are removed.
+  const currentText = cleanEmailChainText(thread.current, { keepHeaders: true });
+  const historyText = thread.history ? cleanEmailChainText(thread.history, { keepHeaders: true }) : "";
   const compact = [
     "Current/latest email message (primary status and next-action evidence):",
-    currentLines || cleaned,
-    thread.history ? "\nEarlier quoted email thread (background and unresolved context only):" : "",
-    thread.history ? historyLines : "",
+    currentText || cleaned,
+    historyText ? "\nEarlier quoted email thread (background and unresolved context only):" : "",
+    historyText ? historyText : "",
     links.length ? `\nReferenced links:\n${descriptionLinkReferences(links)}` : ""
   ].join("\n").trim();
   return compact || cleaned;
@@ -45559,7 +45721,10 @@ function sourceContractSourceText(source = {}, settings = DEFAULT_SETTINGS) {
     const sourceText = stripExcludedLinks(stripGeneratedActionItemsSection(raw), settings);
     return cleanupEmailText(normalizeDescriptionLinks(sourceText, sourceText, settings));
   }
-  return cleanupEmailText(normalizeDescriptionLinks(stripExcludedLinks(raw, settings), raw, settings));
+  // Email: the contract fact becomes the retrieval lanes, so it must hold the
+  // cleaned chain without any header, signature or disclaimer text.
+  const emailText = cleanupEmailText(normalizeDescriptionLinks(stripExcludedLinks(raw, settings), raw, settings));
+  return cleanEmailChainText(emailText, { keepHeaders: false });
 }
 
 function flattenTaskPlanWithIndexes(tasks = [], prefix = "") {
@@ -56552,6 +56717,9 @@ if (typeof module !== "undefined" && module.exports) {
     // not runtime/plugin API).
     buildTaskSourceContract,
     sourceContractSourceText, // writing-mode: test seam so the heading-strip test exercises the real strip
+    // email-cleanup: test seam so the chain cleaner runs for real
+    cleanEmailChainText,
+    compressSourceForTaskPrompt,
     // writing-mode: task 4 test seam so the editor-menu guard and item order run for real
     rewriteMenuPin,
     addRewritePresetItems,

@@ -16115,7 +16115,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // The email workflow owns the build here, so the first email after plugin
     // load still sees vault rows. A missing or failed build is not a hold:
     // the plan proceeds exactly as it did before.
-    if (String(source?.type || "") === "email") await this.ensureEmailSemanticRoutingReadiness();
+    let emailRoutingReady = false;
+    if (String(source?.type || "") === "email") emailRoutingReady = await this.ensureEmailSemanticRoutingReadiness();
     this.setAiActivityProgress(activity, { step: 1, steps: 4, label: "retrieving evidence" });
     this.setSidebarStatus("Retrieving task evidence...");
     const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt, { sourceContract, captureContext });
@@ -16746,6 +16747,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       delete copy.ownershipStepCount;
       return copy;
     });
+    // An index write that lands during the plan (the previous email's log note
+    // is indexed) invalidates the routing state, so the post-structure
+    // retrieval needs a current one. A plan that never got a routing state is
+    // not retried: the same build would fail the same way.
+    if (String(source?.type || "") === "email" && emailRoutingReady) await this.ensureEmailSemanticRoutingReadiness();
     const taskSemanticRetrieval = await this.retrieveTaskSemanticContexts(limitedTasks, source, sourceContract, {
       limit: this.settings.maxTaskContextChunks,
       mode: "task-generation",
@@ -22444,15 +22450,20 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
     const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
     const summaryText = capEmailLogSummary(sanitizeEmailLogSummary(summary, this.settings));
+    // The email metadata is YAML front matter at the very top of the note, so
+    // Obsidian shows it as note properties instead of body text. The labels,
+    // the order and the "no forward" rule are the ones the body block had.
     const lines = [
-      `Date processed: ${displayedProcessedAt}`,
-      `Original email received: ${displayedReceivedAt}`,
-      displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
-      `From: ${from || ""}`,
-      `Email subject: ${subject || ""}`,
-      `Todoist section: ${sectionName}`
+      "---",
+      `Date processed: ${frontmatterQuotedValue(displayedProcessedAt)}`,
+      `Original email received: ${frontmatterQuotedValue(displayedReceivedAt)}`,
+      displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${frontmatterQuotedValue(displayedCloudflareReceivedAt)}` : "",
+      `From: ${frontmatterQuotedValue(from || "")}`,
+      `Email subject: ${frontmatterQuotedValue(subject || "")}`,
+      `Todoist section: ${frontmatterQuotedValue(sectionName)}`,
+      "---"
     ].filter(Boolean);
-    if (summaryText) lines.push("", "## Email summary", "", summaryText, "");
+    if (summaryText) lines.push("## Email summary", "", summaryText, "");
     lines.push("## Synced Todoist Tasks");
     for (const task of tasks || []) {
       lines.push(parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task), this.settings, task.id));
@@ -27841,9 +27852,13 @@ function parseSimpleFrontmatter(text) {
   const body = value.slice(end + 4).replace(/^\s*\n/, "");
   const meta = {};
   for (const line of raw.split("\n")) {
-    const match = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
+    // A property key may carry spaces ("Date processed", "Email subject"), so
+    // the key runs up to the first colon.
+    const match = /^([A-Za-z0-9_-][A-Za-z0-9_ -]*?)\s*:\s*(.*)$/.exec(line.trim());
     if (!match) continue;
-    meta[match[1]] = match[2].replace(/^["']|["']$/g, "").trim();
+    // A YAML list item ("- Project: #Name") is not a property.
+    if (match[1].startsWith("-")) continue;
+    meta[match[1]] = frontmatterScalarText(match[2]).trim();
   }
   return { meta, body };
 }
@@ -43999,7 +44014,7 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
     sourceType || bundle.sourceContract?.sourceType || bundle.sourceContract?.source_type,
     active
   );
-  const lines = [workflowSourceType === "email" ? "Context Notes:" : "Sources:"];
+  const lines = [];
   const seen = new Set();
   const rendered = [];
   let ledgerRenderedLines = null;
@@ -44059,19 +44074,23 @@ function taskWorkflowEvidenceSourceList(task = {}, active = {}, basePath = "", i
       }
     }
   }
-  // The email identity line takes the first free slot: it is numbered "1." only
-  // when no displayed row uses 1 (with the compacted email citation numbers
-  // that is only the no-rows case), so the visible list never appears to start
-  // at 2. The cited rows themselves are renumbered to 1..k.
-  const rowsUseOne = ledgerRenderedLines
-    ? ledgerRenderedLines.some((row) => /^1\.\s/.test(row))
-    : rendered.length > 0;
-  const emailIdentity = workflowSourceType === "email"
-    ? emailSourceIdentityLine(active, rowsUseOne ? 0 : 1)
-    : "";
-  if (emailIdentity) lines.push(emailIdentity);
-  if (!rendered.length && !ledgerRenderedLines?.length && !emailIdentity) return "";
-  return lines.concat(ledgerRenderedLines || rendered.map((path, index) => `${index + 1}. ${path}`)).join("\n");
+  // The email source sits above the context notes: a bold "**Email Source:**"
+  // block with one labelled identity line per part, a blank line, then the
+  // bold "**Context Notes:**" heading with the cited rows numbered 1..k.
+  // The identity block is never a citation, so it takes no number and the
+  // inline (N) markers keep matching the context-note rows.
+  const rowLines = ledgerRenderedLines || rendered.map((path, index) => `${index + 1}. ${path}`);
+  if (workflowSourceType === "email") {
+    const emailIdentity = emailSourceIdentityLines(active);
+    if (emailIdentity.length) lines.push("**Email Source:**", ...emailIdentity);
+    if (rowLines.length) lines.push(...(emailIdentity.length ? [""] : []), "**Context Notes:**", ...rowLines);
+    return lines.length ? lines.join("\n") : "";
+  }
+  // A note list without rows stays empty: a bare "Sources:" heading would be
+  // read back as a source list that has no sources.
+  if (!rowLines.length) return "";
+  lines.push("Sources:", ...rowLines);
+  return lines.join("\n");
 }
 
 function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFAULT_SETTINGS, basePath = "", includeSourceList = true, sourceType = "") {
@@ -44081,7 +44100,7 @@ function renderStructuredTaskDescription(task = {}, active = {}, settings = DEFA
   const selectedFacts = new Set(bundle.factRefs || bundle.fact_refs || []);
   const linkContext = (bundle.facts || []).filter((fact) => selectedFacts.has(fact.factId) && fact.kind === "source-link").map((fact) => fact.value).join("\n");
   const descriptionText = String(task.description || "").replace(/\r\n/g, "\n");
-  const renderedSourceHeading = descriptionText.match(/(?:^|\n)[ \t]*(?:Sources:|Context Notes:|Source List:)[ \t]*(?:\n|$)/i);
+  const renderedSourceHeading = descriptionText.match(/(?:^|\n)[ \t]*(?:\*\*Email Source:\*\*|\*\*Context Notes:\*\*|Sources:|Context Notes:|Source List:)[ \t]*(?:\n|$)/i);
   const summaryInput = renderedSourceHeading
     ? descriptionText.slice(0, renderedSourceHeading.index).trim()
     : descriptionText.trim();
@@ -44301,22 +44320,20 @@ function normalizeDescriptionWorkflowSourceType(sourceType = "", source = null) 
   return raw === "email" || raw === "email-to-todoist" ? "email" : "note";
 }
 
-// The primary email is cited as ONE identity line inside the email source
-// block ("From <sender> on <date> — <subject>"). It is not a citation of its
-// own: it never renumbers the inline (N) markers. It takes the number 1 only
-// when no displayed source row uses 1 — the compacted email citation numbers
-// give the first cited row 1, so the identity line normally stays unnumbered
-// and the visible list never appears to start at 2.
-function emailSourceIdentityLine(active = {}, number = 0) {
+// The primary email is cited as ONE identity block above the context notes:
+// "From: <sender>", "Subject: <subject>", "Date: <date>". It is not a
+// citation of its own: it never takes a list number and never renumbers the
+// inline (N) markers, so the context-note rows stay numbered 1..k and the
+// prose markers still match them.
+function emailSourceIdentityLines(active = {}) {
   const from = singleLine(active?.from || "");
-  const receivedAt = singleLine(active?.receivedAt || "");
   const subject = stripForwardSubjectPrefix(singleLine(active?.subject || active?.title || ""));
-  if (!from && !receivedAt && !subject) return "";
-  const head = `From ${from || "unknown sender"}`;
-  const when = receivedAt ? ` on ${receivedAt}` : "";
-  const line = [head + when, subject ? `\u2014 ${subject}` : ""].filter(Boolean).join(" ");
-  const citationNumber = Number(number);
-  return Number.isInteger(citationNumber) && citationNumber > 0 ? `${citationNumber}. ${line}` : line;
+  const receivedAt = singleLine(active?.receivedAt || "");
+  return [
+    from ? `From: ${from}` : "",
+    subject ? `Subject: ${subject}` : "",
+    receivedAt ? `Date: ${receivedAt}` : ""
+  ].filter(Boolean);
 }
 
 // "Fw:"/"Fwd:" prefixes are added by the forwarder, not part of the subject.
@@ -44330,7 +44347,6 @@ function stripForwardSubjectPrefix(value) {
 
 function descriptionSourceList(active, contextNotes, basePath = "", sourceType = "") {
   const workflowSourceType = normalizeDescriptionWorkflowSourceType(sourceType, active);
-  const heading = workflowSourceType === "email" ? "Context Notes:" : "Sources:";
   const lines = [];
   const seen = new Set();
   const sourceLines = [];
@@ -44342,17 +44358,26 @@ function descriptionSourceList(active, contextNotes, basePath = "", sourceType =
   };
   if (workflowSourceType !== "email") add(sourceReference(active, basePath));
   for (const note of contextNotes || []) add(sourceReference(note, basePath));
-  const identity = workflowSourceType === "email" ? emailSourceIdentityLine(active) : "";
-  if (!sourceLines.length && !identity) return "";
-  lines.push(heading);
-  if (identity) lines.push(identity);
-  sourceLines.forEach((line, index) => lines.push(`${index + 1}. ${line}`));
+  const rows = sourceLines.map((line, index) => `${index + 1}. ${line}`);
+  if (workflowSourceType === "email") {
+    // The email source sits above the context notes: a bold "**Email Source:**"
+    // block with one labelled identity line per part, a blank line, then the
+    // bold "**Context Notes:**" heading with the rows numbered from 1.
+    const emailIdentity = emailSourceIdentityLines(active);
+    if (emailIdentity.length) lines.push("**Email Source:**", ...emailIdentity);
+    if (rows.length) lines.push(...(emailIdentity.length ? [""] : []), "**Context Notes:**", ...rows);
+    return lines.length ? lines.join("\n") : "";
+  }
+  if (!rows.length) return "";
+  lines.push("Sources:", ...rows);
   return lines.join("\n");
 }
 
 function sourceListStartIndex(value) {
   const text = String(value || "").replace(/\r\n/g, "\n");
-  const match = /(?:^|\n)[ \t]*(?=(?:source list|sources?|context notes?)\s*:)/im.exec(text);
+  // The block headings are written bold, but a markdown writer may strip the
+  // markers or escape them, so all three forms start the source list block.
+  const match = /(?:^|\n)[ \t]*(?=(?:\*\*|\\\*\\\*)?(?:source list|sources?|context notes?|email source)(?:\*\*|\\\*\\\*)?\s*:)/im.exec(text);
   return match ? match.index + match[0].length : -1;
 }
 
@@ -44375,11 +44400,13 @@ function normalizeDescriptionSourceList(value) {
 function restoreSourceListLineBreaks(value) {
   const restored = String(value || "")
     .replace(/\r\n/g, "\n")
+    .replace(/\s*(\*\*email source:\*\*)\s*/i, "\n\n**Email Source:**\n")
+    .replace(/\s*(\*\*context notes:\*\*)\s*/i, "\n\n**Context Notes:**\n")
     .replace(/\s*(source list\s*:)\s*/i, "\nSources:\n")
     .replace(/\s*(sources\s*:)\s*/i, "\nSources:\n")
     .replace(/\s*(^|\n)(context\s*:)\s*/im, "$1\nContext:\n")
     .replace(/\s*(primary note\s*:)\s*/i, "\nPrimary Note: ")
-    .replace(/\s*(context notes?\s*:)\s*/i, "\n\nContext Notes:\n")
+    .replace(/\s*(?<!\*\*)(context notes?\s*:)\s*/i, "\n\nContext Notes:\n")
     .replace(/\s+(\d{1,2}\.\s+)/g, "\n$1")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n[ \t]+/g, "\n")
@@ -44624,8 +44651,22 @@ function stripMetadataSentences(text) {
 }
 
 function isDescriptionMetadataLine(line) {
-  const value = singleLine(line).replace(/^[-*]\s*/, "");
+  // The email source block heads are bold ("**Email Source:**",
+  // "**Context Notes:**"), so the bold markers go before the heading test.
+  const value = singleLine(line).replace(/^\*\*|\*\*$/g, "").replace(/^[-*]\s*/, "");
+  // "Email Source:" is a block heading only when the line holds nothing else:
+  // a prose line such as "Email Source: our weekly newsletter" is vault text.
+  const emailSource = stripDescriptionBlockMarkers(singleLine(line)).replace(/^[-*]\s*/, "");
+  if (/^email source\s*:/i.test(emailSource)) return /^email source\s*:\s*$/i.test(emailSource);
   return /^(summary|source(?:s)?(?:\s+note)?|source list|primary note|context notes?|useful vault context|vault context|note context|document(?: topic)?|project|program|tags?|sub-?tasks?|tasks?)\s*:/i.test(value);
+}
+
+// The bold markers of a block heading may be stripped or backslash-escaped by
+// the markdown writer, so both forms are recognized.
+function stripDescriptionBlockMarkers(value) {
+  return String(value || "")
+    .replace(/^(?:\\\*\\\*|\*\*)+/, "")
+    .replace(/(?:\\\*\\\*|\*\*)+$/, "");
 }
 
 function stripTaskAndMetadataLines(text) {
@@ -44687,7 +44728,7 @@ function isStandaloneActionItemsHeading(line) {
 function sanitizeStoredTodoistDescription(value, settings = DEFAULT_SETTINGS) {
   const text = String(value || "");
   if (!text) return "";
-  const sourceIndex = text.search(/(?:^|\n)\s*(source list|sources?|context notes?)\s*:/i);
+  const sourceIndex = text.search(/(?:^|\n)\s*(?:\*\*|\\\*\\\*)?(?:email source|source list|sources?|context notes?)(?:\*\*|\\\*\\\*)?\s*:/i);
   const sourceBlock = sourceIndex >= 0 ? normalizeStoredSourceList(text.slice(sourceIndex)) : "";
   const summaryText = sourceIndex >= 0 ? text.slice(0, sourceIndex) : text;
   if (sourceBlock && /\(\d+\)/.test(summaryText)) return formatTodoistDescription(text, settings);
@@ -44701,7 +44742,7 @@ function isRichTodoistDescription(value) {
   const withoutLinks = text
     .replace(/\[[^\]]+\]\([^)]+\)/g, "")
     .replace(/obsidian:\/\/\S+/g, "")
-    .replace(/source list|primary note|context notes?/gi, "")
+    .replace(/(?:\*\*)?(?:source list|primary note|email source|context notes?)(?:\*\*)?/gi, "")
     .replace(/[:\s.\n-]+/g, " ")
     .trim();
   if (withoutLinks.length < 40) return false;
@@ -44709,30 +44750,62 @@ function isRichTodoistDescription(value) {
   return true;
 }
 
-// The email source block carries ONE identity line, numbered or not. Pull it
-// out before the numbered-list restore so a subject like "Week 1. Plan" cannot
-// be split into a bogus citation entry.
+// The email source block carries ONE identity block, the labelled lines
+// ("From: ...", "Subject: ...", "Date: ...") under the bold "**Email Source:**"
+// heading. Pull it out before the numbered-list restore so a subject like
+// "Week 1. Plan" cannot be split into a bogus citation entry. Descriptions
+// written before 0.9.30 keep the legacy identity row ("From <sender> on
+// <date> — <subject>") directly under "Context Notes:", so both shapes are
+// recognized.
+// The heading is written bold, but a markdown writer may strip the markers or
+// escape them, so every reader accepts the bold, plain and escaped forms.
 function splitEmailSourceIdentityLine(value) {
   const text = String(value || "");
   const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const headingIndex = lines.findIndex((line) => /^\s*context notes?\s*:/i.test(line));
-  if (headingIndex < 0) return { identity: "", body: text };
+  const emailHeadingIndex = lines.findIndex((line) => /^\s*(?:\*\*|\\\*\\\*)?\s*email source\s*:\s*(?:\*\*|\\\*\\\*)?\s*$/i.test(line));
+  if (emailHeadingIndex >= 0) {
+    const identityLines = [];
+    let index = emailHeadingIndex + 1;
+    for (; index < lines.length; index += 1) {
+      const trimmed = lines[index].trim();
+      if (!trimmed) continue;
+      if (!emailSourceIdentityRow(trimmed)) break;
+      identityLines.push(trimmed);
+    }
+    const body = lines.slice(0, emailHeadingIndex).concat(lines.slice(index)).join("\n");
+    return { identity: identityLines.join("\n"), body, emailBlock: identityLines.length > 0 };
+  }
+  const headingIndex = lines.findIndex((line) => /^\s*(?:\*\*|\\\*\\\*)?\s*context notes?(?:\*\*|\\\*\\\*)?\s*:/i.test(line));
+  if (headingIndex < 0) return { identity: "", body: text, emailBlock: false };
   for (let index = headingIndex + 1; index < lines.length; index += 1) {
     const trimmed = lines[index].trim();
     if (!trimmed) continue;
-    if (!emailSourceIdentityRow(trimmed)) return { identity: "", body: text };
-    return { identity: trimmed, body: lines.slice(0, index).concat(lines.slice(index + 1)).join("\n") };
+    if (!legacyEmailSourceIdentityRow(trimmed)) return { identity: "", body: text, emailBlock: false };
+    return { identity: trimmed, body: lines.slice(0, index).concat(lines.slice(index + 1)).join("\n"), emailBlock: false };
   }
-  return { identity: "", body: text };
+  return { identity: "", body: text, emailBlock: false };
 }
 
-// An unnumbered "From ..." row is always the identity line. A numbered row is
-// only the identity line when it also carries the identity shape (an em dash
-// separator or "on <date>" after the sender), so a citation row such as
-// "1. From Bud Light Notes.md" stays a citation row.
+// An identity row is a labelled line of the email source block ("From: ...",
+// "Subject: ...", "Date: ...") or the legacy unnumbered "From <sender> on
+// <date> — <subject>" row. A numbered row is only the legacy identity when it
+// also carries the identity shape (an em dash separator or "on <date>" after
+// the sender), so a citation row such as "1. From Bud Light Notes.md" stays a
+// citation row.
 // shortcut: a citation path containing " on " reads as an identity row,
 // upgrade when such a path shows up in a real vault.
 function emailSourceIdentityRow(line) {
+  const text = String(line || "");
+  // The labelled lines belong to the email source block only: under the legacy
+  // heading a prose line such as "From: a prose line" stays in the body.
+  if (/^(?:from|subject|date)\s*:\s*\S/i.test(text)) return true;
+  return legacyEmailSourceIdentityRow(text);
+}
+
+// The legacy identity rule (0.9.29 and older): an unnumbered "From ..." row
+// is always the identity line, a numbered row only when it carries the
+// identity shape.
+function legacyEmailSourceIdentityRow(line) {
   const text = String(line || "");
   if (/^from\s+\S/i.test(text)) return true;
   const numbered = /^\d+\.\s+(.*)$/.exec(text);
@@ -44750,11 +44823,13 @@ function normalizeStoredSourceList(value) {
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
     .replace(/obsidian:\/\/\S+/g, "")
     .split("\n")
-    .map((line) => singleLine(line).replace(/^[-*]\s*/, ""))
+    // A bullet is stripped, but a bold marker ("**Context Notes:**") is not.
+    .map((line) => singleLine(line).replace(/^(?!\*\*)[-*]\s*/, ""))
     .filter(Boolean);
   const primary = vaultRelativePath(rawLines.find((line) => /^primary note\s*:/i.test(line))?.replace(/^primary note\s*:\s*/i, "").trim() || "");
   const sourceHeadingIndex = rawLines.findIndex((line) => /^sources?\s*:/i.test(line));
-  const contextHeadingIndex = rawLines.findIndex((line) => /^context notes?\s*:/i.test(line));
+  const contextHeadingIndex = rawLines.findIndex((line) => /^(?:\*\*|\\\*\\\*)?context notes?(?:\*\*|\\\*\\\*)?\s*:/i.test(line));
+  const readContextHeading = contextHeadingIndex >= 0 && /^(?:\*\*|\\\*\\\*)/.test(rawLines[contextHeadingIndex]) ? "**Context Notes:**" : "Context Notes:";
   const numbered = (startIndex, endIndex) => rawLines
     .slice(startIndex >= 0 ? startIndex + 1 : 0, endIndex >= 0 ? endIndex : rawLines.length)
     .filter((line) => /^\d+\.\s*/.test(line))
@@ -44780,8 +44855,14 @@ function normalizeStoredSourceList(value) {
   ]).slice(0, 8);
   if (noteSources.length) return ["Sources:", ...noteSources.map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
   const identity = identitySplit.identity;
-  if (contextItems.length) return ["Context Notes:", ...(identity ? [identity] : []), ...dedupeNumberedSources(contextItems).slice(0, 8).map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
-  if (identity) return ["Context Notes:", identity].join("\n");
+  const emailLines = identitySplit.emailBlock ? ["**Email Source:**", ...identity.split("\n")] : [];
+  const legacyIdentity = emailLines.length || !identity ? [] : [identity];
+  // The email source block always re-renders in the canonical bold form; a
+  // legacy list keeps the heading it was read with.
+  const contextHeading = emailLines.length ? "**Context Notes:**" : readContextHeading;
+  if (contextItems.length) return [...emailLines, ...(emailLines.length ? [""] : []), contextHeading, ...legacyIdentity, ...dedupeNumberedSources(contextItems).slice(0, 8).map((entry) => String(entry.number) + ". " + entry.source)].join("\n");
+  if (emailLines.length) return emailLines.join("\n");
+  if (identity) return [contextHeading, identity].join("\n");
   return "";
 }
 
@@ -52682,34 +52763,42 @@ function* taskWorkflowContextBundleSteps(options = {}) {
     && typeof options.retrievalBindingsByEvidenceId.get === "function"
     ? options.retrievalBindingsByEvidenceId
     : null;
-  if (supplementCarriersById && String(sourceContract.sourceType || sourceContract.source_type || "note") === "note") {
-    for (const item of sourceEvidenceCatalog.items || []) {
+  // An email's selected rows reach the catalog as unannotated chunks and need
+  // the carriers' per-task retrieval bindings; a note's rows are already bound
+  // by their own query stamps, so the note path stays untouched.
+  const supplementCarrierSourceType = String(sourceContract.sourceType || sourceContract.source_type || "note");
+  const carrierJoinedItems = supplementCarriersById && supplementCarrierSourceType === "email"
+    ? (sourceEvidenceCatalog.items || []).map((item) => {
       const evidenceId = String(item?.evidenceId || item?.id || "").trim();
-      if (!evidenceId) continue;
-      const carriers = supplementCarriersById.get(evidenceId);
-      if (!Array.isArray(carriers) || !carriers.length) continue;
-      const carrierBindings = uniqueTaskWorkflowEvidenceBindings(carriers.map((carrier) => ({
-        taskId: String(carrier?.taskKey || ""),
-        scopeId: String(carrier?.rankingScopeId || ""),
-        queryId: "",
-        sourceContractId: String(sourceContract.id || "")
-      })));
-      if (!carrierBindings.length) continue;
+      const carriers = evidenceId ? supplementCarriersById.get(evidenceId) : null;
+      const carrierBindings = Array.isArray(carriers) && carriers.length
+        ? uniqueTaskWorkflowEvidenceBindings(carriers.map((carrier) => ({
+          taskId: String(carrier?.taskKey || ""),
+          scopeId: String(carrier?.rankingScopeId || ""),
+          queryId: "",
+          sourceContractId: String(sourceContract.id || "")
+        })))
+        : [];
+      if (!carrierBindings.length) return item;
       const current = isTaskWorkflowEvidenceAttribution(item.workflowAttribution)
         ? item.workflowAttribution
         : normalizeTaskWorkflowEvidenceAttribution(item, { sourceContractId: String(sourceContract.id || "") });
-      item.workflowAttribution = Object.freeze({
-        nativeOwnerIds: current.nativeOwnerIds,
-        nativeBindings: current.nativeBindings,
-        retrievalBindings: Object.freeze(uniqueTaskWorkflowEvidenceBindings([...current.retrievalBindings, ...carrierBindings])),
-        unresolvedOwnerIds: current.unresolvedOwnerIds
+      // The catalog rows are deep-frozen, so the joined row is a copy: the
+      // carriers add retrieval bindings and never touch native ownership.
+      return Object.assign({}, item, {
+        workflowAttribution: Object.freeze({
+          nativeOwnerIds: current.nativeOwnerIds,
+          nativeBindings: current.nativeBindings,
+          retrievalBindings: Object.freeze(uniqueTaskWorkflowEvidenceBindings([...current.retrievalBindings, ...carrierBindings])),
+          unresolvedOwnerIds: current.unresolvedOwnerIds
+        })
       });
-    }
-  }
+    })
+    : null;
   // This is the sole context-bundle deduplication boundary. At this point the
   // caller has completed retrieval, dimensional selection/fusion, reservation,
   // and materiality; no admission, ranking, or relevance decision is made here.
-  const catalogEvidencePartition = semanticExecutionEvidencePartition(sourceEvidenceCatalog.items || [], "task-generation");
+  const catalogEvidencePartition = semanticExecutionEvidencePartition(carrierJoinedItems || sourceEvidenceCatalog.items || [], "task-generation");
   const metadataOnlyRejectedEvidenceIds = uniqueValues([
     ...(semanticContextPartition.telemetry.metadataOnlyRejectedEvidenceIds || []),
     ...(sourceEvidenceCatalog.telemetry?.metadataOnlyRejectedEvidenceIds || []),
@@ -57587,11 +57676,33 @@ function normalizeTaskSectionTitleMode(value) {
   return String(value || "").toLowerCase() === "ai" ? "ai" : "local";
 }
 
+// A front matter value is written as a YAML double-quoted scalar. JSON string
+// escapes are a subset of YAML's, so Obsidian and the plugin's own front
+// matter readers read the value back exactly, whatever it carries (":", a
+// quote, "#", a backslash or a line break).
+function frontmatterQuotedValue(value) {
+  return JSON.stringify(singleLine(value == null ? "" : String(value)));
+}
+
+// The reader side of the same format: a double-quoted value is decoded, every
+// other form keeps its plain text.
+function frontmatterScalarText(value) {
+  const raw = String(value || "").trim();
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      // Not a JSON scalar: fall through to the plain form.
+    }
+  }
+  return raw.replace(/^["']|["']$/g, "").trim();
+}
+
 function simpleFrontmatterScalar(value) {
   const raw = String(value || "").trim();
   if (!raw || /^[>|{}]/.test(raw)) return "";
   const quoted = raw.match(/^(["'])([\s\S]*)\1$/);
-  if (quoted) return singleLine(quoted[2]).trim();
+  if (quoted) return singleLine(frontmatterScalarText(raw)).trim();
   const inlineArray = raw.match(/^\[\s*(?:(["'])([\s\S]*?)\1|([^\[\]{},]+))\s*\]$/);
   if (inlineArray) return singleLine(inlineArray[2] || inlineArray[3]).trim();
   if (/^\[|^\{|^&|^\*/.test(raw)) return "";

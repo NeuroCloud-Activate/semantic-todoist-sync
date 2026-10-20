@@ -1,3 +1,13 @@
+## 0.9.30 - 2026-10-20
+### Fixed
+- **Emails are no longer blocked when processed back to back.** When one email finished, the plugin added its log note to the vault search index, which briefly reset the search lookup. An email already in progress could search during that reset, find no supporting notes, and be blocked with "protected provider evidence was unresolved". The email now waits for vault search to be ready again before its second search.
+- **Supporting notes found for an email are recorded like a note's.** The step that records which task found which supporting note now runs for emails too, so a note an email's task really found is no longer refused. The safety check is unchanged: a note found by a different task, or for a different email, is still refused.
+### Changed
+- **Email task descriptions show the email first.** The description now ends with a bold **Email Source:** block, with From, Subject and Date each on their own line, then a blank line and a bold **Context Notes:** list numbered from 1. Note tasks keep their plain "Sources:" list. Older descriptions are still read correctly, and the email details survive if Todoist removes the bold marks.
+- **Email log notes keep their details as Obsidian properties.** Date processed, Original email received, Forward received by Cloudflare (when known), From, Email subject and Todoist section are now written as front matter at the top of each new email note, so they show in the Properties panel. Existing notes are not rewritten and still work.
+### Notes
+- New tests cover the back-to-back email case, the email evidence recording (including that a different task's note stays refused), the new description layout and the note properties. `npm test` passes 55/55.
+
 ## 0.9.29 - 2026-10-20
 ### Fixed
 - **The semantic index repairs itself.** If an index file is missing or damaged, the plugin no longer loads an empty index. It keeps every good part, so vault search works at once, and re-indexes in the background only the notes that lost passages, reusing every other embedding. The log reads "Semantic index repaired: kept N of M shards, re-indexing K of A affected notes".

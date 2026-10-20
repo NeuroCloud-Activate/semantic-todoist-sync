@@ -8,9 +8,14 @@
 // and the tasks created from them.
 //
 // Covered here:
-//   1. appendEmailLog writes "## Email summary" between the metadata lines and
+//   1. appendEmailLog writes the email metadata as YAML front matter at the
+//      very top of the note, then "## Email summary" and
 //      "## Synced Todoist Tasks", and leaves the task lines untouched.
-//   2. appendEmailLog without a summary keeps the 0.9.27 note byte-identical.
+//   2. appendEmailLog without a summary writes the same front matter and the
+//      task section, with no blank first line.
+//   2b. The front matter values are double-quoted and escaped, so a subject
+//      with ":", quotes, "#" or a backslash reads back exactly, and the
+//      Cloudflare key stays out when the email carries no forward.
 //   3. A summary that starts with a checkbox, a list marker or a configured
 //      sync/action tag is sanitized so it can never be read back as a task.
 //   4. A summary generation failure is caught: no hold, no throw, and the log
@@ -106,7 +111,8 @@ try {
     `${mainSource}\nmodule.exports.__emailLogSummary = {\n` +
       "  DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp,\n" +
       "  capEmailLogSummary, normalizeLegacySyncTags, hasSubtaskSyncMarker,\n" +
-      "  semanticExecutionEvidencePartition, semanticRetrievalChunkEligible\n" +
+      "  semanticExecutionEvidencePartition, semanticRetrievalChunkEligible,\n" +
+      "  parseSimpleFrontmatter, parsePromptTemplateFile, simpleFrontmatterScalar\n" +
       "};\n",
     mainPath
   );
@@ -116,7 +122,7 @@ try {
   delete require.cache[mainPath];
 }
 
-const { DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp, capEmailLogSummary, normalizeLegacySyncTags, hasSubtaskSyncMarker, semanticExecutionEvidencePartition, semanticRetrievalChunkEligible } = runtime.__emailLogSummary;
+const { DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp, capEmailLogSummary, normalizeLegacySyncTags, hasSubtaskSyncMarker, semanticExecutionEvidencePartition, semanticRetrievalChunkEligible, parseSimpleFrontmatter, parsePromptTemplateFile, simpleFrontmatterScalar } = runtime.__emailLogSummary;
 
 const LOG_FOLDER = DEFAULT_SETTINGS.emailLogFolder;
 const SUBJECT = "Quarterly intake form";
@@ -231,7 +237,7 @@ function noteLines(files) {
 }
 
 // ---------------------------------------------------------------------------
-// 1 + 2. appendEmailLog: summary section placement and the 0.9.27 shape
+// 1 + 2. appendEmailLog: the metadata block is YAML front matter at the top
 // ---------------------------------------------------------------------------
 async function testAppendEmailLogFormat() {
   const withSummary = makePlugin();
@@ -249,17 +255,21 @@ async function testAppendEmailLogFormat() {
   const tasksIndex = withLines.indexOf("## Synced Todoist Tasks");
   assert.ok(summaryIndex > 0, "expected an ## Email summary section");
   assert.ok(tasksIndex > summaryIndex, "expected ## Synced Todoist Tasks after the summary section");
-  assert.equal(withLines[summaryIndex - 1], "", "expected a blank line before the summary section");
   assert.equal(withLines[summaryIndex + 1], "", "expected a blank line after the summary heading");
   assert.equal(withLines[summaryIndex + 2], SUMMARY, "expected the summary text under the heading");
   assert.equal(withLines[tasksIndex - 1], "", "expected a blank line before ## Synced Todoist Tasks");
-  // The metadata block keeps its 0.9.27 order and content.
-  assert.equal(withLines[0].startsWith("Date processed: "), true);
-  assert.equal(withLines[1], `Original email received: ${formatEmailWorkflowTimestamp(RECEIVED_AT)}`);
-  assert.equal(withLines[2], `Forward received by Cloudflare: ${formatEmailWorkflowTimestamp(CLOUDFLARE_RECEIVED_AT)}`);
-  assert.equal(withLines[3], `From: ${FROM}`);
-  assert.equal(withLines[4], `Email subject: ${SUBJECT}`);
-  assert.equal(withLines[5], `Todoist section: ${SECTION}`);
+  // The email metadata is YAML front matter at the very top of the note: the
+  // same labels, the same order, every value double-quoted.
+  assert.equal(withLines[0], "---", "expected the note to open with the front matter fence");
+  assert.ok(/^Date processed: ".+"$/.test(withLines[1]), `unexpected Date processed line: ${withLines[1]}`);
+  assert.equal(withLines[2], `Original email received: "${formatEmailWorkflowTimestamp(RECEIVED_AT)}"`);
+  assert.equal(withLines[3], `Forward received by Cloudflare: "${formatEmailWorkflowTimestamp(CLOUDFLARE_RECEIVED_AT)}"`);
+  assert.equal(withLines[4], `From: "${FROM}"`);
+  assert.equal(withLines[5], `Email subject: "${SUBJECT}"`);
+  assert.equal(withLines[6], `Todoist section: "${SECTION}"`);
+  assert.equal(withLines[7], "---", "expected the front matter to close before the body");
+  // The body starts with the summary section: no blank first line.
+  assert.equal(withLines[summaryIndex - 1], "---", "the body must start right after the front matter");
   assert.equal(withLines.filter((line) => line === "## Email summary").length, 1);
 
   const withoutSummary = makePlugin();
@@ -272,23 +282,25 @@ async function testAppendEmailLogFormat() {
     tasks: makeTasks()
   });
   const plainLines = noteLines(withoutSummary.files);
-  // Byte-identical to the 0.9.27 note: metadata block, then the heading, then
-  // the task lines, with no blank line and no summary section.
-  assert.equal(plainLines.length, 8, "expected the 0.9.27 line count");
-  assert.equal(plainLines[0].startsWith("Date processed: "), true);
-  assert.equal(plainLines[1], `Original email received: ${formatEmailWorkflowTimestamp(RECEIVED_AT)}`);
-  assert.equal(plainLines[2], `Forward received by Cloudflare: ${formatEmailWorkflowTimestamp(CLOUDFLARE_RECEIVED_AT)}`);
-  assert.equal(plainLines[3], `From: ${FROM}`);
-  assert.equal(plainLines[4], `Email subject: ${SUBJECT}`);
-  assert.equal(plainLines[5], `Todoist section: ${SECTION}`);
-  assert.equal(plainLines[6], "## Synced Todoist Tasks");
-  assert.ok(plainLines[7].startsWith("- [ ] Submit the Atlas intake form #STsync"), "unexpected task line");
+  // Front matter, then the heading, then the task lines: no blank line and no
+  // summary section.
+  assert.equal(plainLines.length, 10, "expected the front matter line count");
+  assert.equal(plainLines[0], "---", "expected the note to open with the front matter fence");
+  assert.equal(plainLines[1].startsWith("Date processed: \""), true);
+  assert.equal(plainLines[2], `Original email received: "${formatEmailWorkflowTimestamp(RECEIVED_AT)}"`);
+  assert.equal(plainLines[3], `Forward received by Cloudflare: "${formatEmailWorkflowTimestamp(CLOUDFLARE_RECEIVED_AT)}"`);
+  assert.equal(plainLines[4], `From: "${FROM}"`);
+  assert.equal(plainLines[5], `Email subject: "${SUBJECT}"`);
+  assert.equal(plainLines[6], `Todoist section: "${SECTION}"`);
+  assert.equal(plainLines[7], "---", "expected the front matter to close before the body");
+  assert.equal(plainLines[8], "## Synced Todoist Tasks");
+  assert.ok(plainLines[9].startsWith("- [ ] Submit the Atlas intake form #STsync"), "unexpected task line");
   assert.equal(plainLines.some((line) => line.includes("Email summary")), false);
   assert.equal(plainLines.some((line) => line === ""), false);
 
   // The task lines are identical with and without a summary.
   const withTaskLine = withLines[withLines.indexOf("## Synced Todoist Tasks") + 1];
-  assert.equal(withTaskLine, plainLines[7], "the task line must not change when a summary is added");
+  assert.equal(withTaskLine, plainLines[9], "the task line must not change when a summary is added");
   // The summary is written before the task section and the note sync still runs.
   assert.deepEqual(withSummary.plugin.__synced.length, 1);
   // The log note is queued for indexing so it becomes retrievable evidence.
@@ -296,7 +308,108 @@ async function testAppendEmailLogFormat() {
   assert.equal(withSummary.plugin.__indexed[0].reason, "email-log");
   assert.ok(withSummary.plugin.__indexed[0].path.startsWith(`${LOG_FOLDER}/`));
   if (process.env.EMAIL_LOG_SUMMARY_PRINT) console.log(`--- sample note ---\n${noteContent(withSummary.files)}--- end ---`);
-  console.log("PASS appendEmailLog writes the summary section and keeps the 0.9.27 shape");
+  console.log("PASS appendEmailLog writes the metadata as front matter and keeps the summary and task sections");
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The front matter values are double-quoted, escaped and read back
+// ---------------------------------------------------------------------------
+async function testEmailLogFrontMatterValues() {
+  const awkwardSubject = 'Fw: DRG2025-HM - "Terms of Award" #urgent C:\\reports\\award.md';
+  const awkwardFrom = 'Alex Example <alex@example.com>';
+  const harness = makePlugin();
+  await harness.plugin.appendEmailLog({
+    subject: awkwardSubject,
+    from: awkwardFrom,
+    receivedAt: RECEIVED_AT,
+    sectionName: SECTION,
+    tasks: makeTasks()
+  });
+  const content = noteContent(harness.files);
+  const lines = content.replace(/\n$/, "").split("\n");
+  assert.equal(lines[0], "---");
+  const subjectLine = lines.find((line) => line.startsWith("Email subject: "));
+  assert.equal(subjectLine, `Email subject: ${JSON.stringify(awkwardSubject)}`, "the subject must be a quoted, escaped scalar");
+  // The Cloudflare key stays out when the email carries no forward.
+  assert.equal(lines.some((line) => line.startsWith("Forward received by Cloudflare:")), false, "the Cloudflare key must be omitted when empty");
+  // The plugin's own front matter reader reads the values back exactly.
+  const parsed = parseSimpleFrontmatter(content);
+  assert.equal(parsed.meta["Email subject"], awkwardSubject, "the subject must read back exactly");
+  assert.equal(parsed.meta["From"], awkwardFrom, "the sender must read back exactly");
+  assert.equal(parsed.meta["Todoist section"], SECTION, "the section must read back exactly");
+  assert.ok(/^.+$/.test(parsed.meta["Date processed"] || ""), "the processed date must read back");
+  assert.equal(parsed.meta["Original email received"], formatEmailWorkflowTimestamp(RECEIVED_AT));
+  assert.equal(parsed.meta["Forward received by Cloudflare"], undefined, "the Cloudflare key must stay out");
+  assert.ok(parsed.body.startsWith("## Synced Todoist Tasks"), "the body must start with the task section");
+  console.log("PASS the front matter values are quoted, escaped and read back exactly");
+}
+
+// ---------------------------------------------------------------------------
+// 2d. The front matter reader trims a quoted value and skips YAML list items
+// ---------------------------------------------------------------------------
+async function testFrontMatterReaderTrimsAndSkipsListItems() {
+  const parsed = parseSimpleFrontmatter([
+    "---",
+    'name: "  Padded Template  "',
+    "- Project: #Name",
+    "---",
+    "body"
+  ].join("\n"));
+  assert.equal(parsed.meta.name, "Padded Template", `a quoted value must be trimmed, got ${JSON.stringify(parsed.meta.name)}`);
+  assert.equal(parsed.meta["- Project"], undefined, `a YAML list item must not be read as a property, got ${JSON.stringify(parsed.meta)}`);
+  assert.equal(simpleFrontmatterScalar('"  Padded Template  "'), "Padded Template", `a quoted value must be trimmed, got ${JSON.stringify(simpleFrontmatterScalar('"  Padded Template  "'))}`);
+  // A prompt template reads exactly as it did before the reader changed.
+  const template = parsePromptTemplateFile({ basename: "fallback", path: "Prompts/fallback.md" }, [
+    "---",
+    "name: My template",
+    "action: createTasks",
+    "createTasks: true",
+    "insertResponse: false",
+    "taskHeading: Action items",
+    "---",
+    "",
+    "body"
+  ].join("\n"));
+  assert.equal(template.name, "My template", `the template name must read back, got ${JSON.stringify(template.name)}`);
+  assert.equal(template.action, "createtasks", `the template action must read back, got ${JSON.stringify(template.action)}`);
+  assert.equal(template.createTasks, true, `the template flag must read back, got ${JSON.stringify(template.createTasks)}`);
+  assert.equal(template.insertResponse, false, `the template flag must read back, got ${JSON.stringify(template.insertResponse)}`);
+  assert.equal(template.taskHeading, "Action items", `the template heading must read back, got ${JSON.stringify(template.taskHeading)}`);
+  assert.equal(template.prompt, "body", `the template body must read back, got ${JSON.stringify(template.prompt)}`);
+  console.log("PASS the front matter reader trims quoted values and skips YAML list items");
+}
+
+// ---------------------------------------------------------------------------
+// 2c. A log note written before the change (the metadata in the body) still
+//     behaves the same way
+// ---------------------------------------------------------------------------
+async function testLegacyBodyLogNoteStillWorks() {
+  const harness = makePlugin();
+  const legacyText = [
+    "Date processed: 2026-10-12 10:00",
+    `Original email received: ${formatEmailWorkflowTimestamp(RECEIVED_AT)}`,
+    "From: Alex Example <alex@example.com>",
+    `Email subject: ${SUBJECT}`,
+    `Todoist section: ${SECTION}`,
+    "",
+    "## Email summary",
+    "",
+    SUMMARY,
+    "",
+    "## Synced Todoist Tasks",
+    "",
+    "- [ ] Submit the Atlas intake form #STsync"
+  ].join("\n");
+  const notePath = `${LOG_FOLDER}/2026-10-12 - Quarterly intake form.md`;
+  const noteFile = { basename: "2026-10-12 - Quarterly intake form", stat: { mtime: 0 }, content: legacyText };
+  const chunks = harness.plugin.semanticFileChunks(notePath, noteFile, legacyText, { createdAt: 0, createdAtSource: "" });
+  assert.ok(chunks.length >= 3, `expected the metadata, summary and task units, got ${chunks.length}`);
+  for (const chunk of chunks) {
+    assert.equal(chunk.evidenceEligibility, "metadata-only", `every legacy log-note unit must be metadata-only: ${chunk.text}`);
+    const taskLane = semanticExecutionEvidencePartition([chunk], "task-generation");
+    assert.equal(taskLane.selected.length, 0, `a legacy log-note unit must not reach the task lane: ${chunk.text}`);
+  }
+  console.log("PASS a log note with the metadata in the body still stays metadata-only");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +535,9 @@ async function testSummaryFailureIsContained() {
   assert.equal(completed.length, 1, "the email must still be acked");
   const lines = noteLines(harness.files);
   assert.equal(lines.some((line) => line.includes("Email summary")), false, "the note must be written without a summary");
-  assert.equal(lines[6], "## Synced Todoist Tasks");
-  assert.ok(lines[7].startsWith("- [ ] Submit the Atlas intake form #STsync"));
+  const tasksIndex = lines.indexOf("## Synced Todoist Tasks");
+  assert.ok(tasksIndex > 0, "expected the task section");
+  assert.ok(lines[tasksIndex + 1].startsWith("- [ ] Submit the Atlas intake form #STsync"));
   const failureLog = (plugin.settings.localLog || []).find((entry) => String(entry.message || "").includes("summary failed"));
   assert.ok(failureLog, "expected a summary failure log entry");
   assert.equal(failureLog.data.code, "provider-offline");
@@ -684,6 +798,9 @@ async function testLogNoteSizeIsBounded() {
 
 async function main() {
   await testAppendEmailLogFormat();
+  await testEmailLogFrontMatterValues();
+  await testFrontMatterReaderTrimsAndSkipsListItems();
+  await testLegacyBodyLogNoteStillWorks();
   await testSummarySanitization();
   await testSummaryIsBounded();
   await testSummaryFailureIsContained();

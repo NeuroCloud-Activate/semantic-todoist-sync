@@ -99,6 +99,76 @@ check("email self text is evidence for every scope", () => {
   for (const task of resolved.tasks) assert.ok(task.evidence_ids.includes(contract.primaryEvidenceId), `${task.id} keeps the email primary evidence`);
 });
 
+// 0.9.29: an email's selected catalog row must join the Task 0 supplement
+// carriers exactly like a note's, so the ownership gate sees the per-task
+// retrieval binding instead of denying the row as `unbound`.
+const EMAIL_CARRIER_EVIDENCE_ID = "ev-email-carrier-0";
+function emailCarrierSource() {
+  return { type: "email", title: "Atlas intake form", path: "Email_26_10_20_Atlas.md", sourceId: "src-email-carrier", primaryEvidenceId: "evidence-email-carrier-primary" };
+}
+function emailCarrierScopeId() {
+  return buildTaskSourceContract(emailCarrierSource(), "Please confirm the Atlas intake form before Friday.", settings).defaultScopeId;
+}
+function emailCarrierBundleValidation(carriers) {
+  const text = "Please confirm the Atlas intake form before Friday.";
+  const source = emailCarrierSource();
+  const contract = buildTaskSourceContract(source, text, settings);
+  const scopeId = contract.defaultScopeId;
+  const evidenceId = EMAIL_CARRIER_EVIDENCE_ID;
+  const chunk = {
+    id: evidenceId, evidenceId, chunkId: evidenceId, path: "Notes/Atlas.md", title: "Atlas",
+    text: "Atlas intake form confirmation notes.", sourceKind: "note", sourceId: "src-Notes/Atlas.md",
+    scopeId, provenance: { path: "Notes/Atlas.md", sourceId: "src-Notes/Atlas.md", authority: "authoritative" }
+  };
+  const catalog = buildTaskEvidenceCatalog(contract, [chunk], settings, { source, sourceSummary: text });
+  const task = { id: "task-0", taskId: "task-0", content: "task-0", scope_id: scopeId, evidence_ids: [evidenceId], fact_refs: [], fact_bindings: [], subtasks: [] };
+  const bundle = taskWorkflowContextBundle({
+    source, sourceType: "email", sourceTitle: source.title, sourcePath: source.path,
+    sourceSummary: text, sourceContract: contract, evidenceCatalog: catalog, semanticContext: [],
+    retrievalBindingsByEvidenceId: carriers,
+    tasks: [task], taskEvidenceRefs: { "task-0": [evidenceId] }, taskEvidenceScopes: { "task-0": scopeId }, settings
+  });
+  const validation = bundle.contextBundleValidation;
+  return {
+    validation,
+    ownershipErrors: (validation.foreignReferenceErrors || []).filter((error) => error.includes(":ownership:"))
+  };
+}
+
+check("email catalog row joins the supplement carriers like a note", () => {
+  const scopeId = emailCarrierScopeId();
+  const carriers = new Map([[EMAIL_CARRIER_EVIDENCE_ID, Object.freeze([{ taskKey: "task-0", rankingScopeId: scopeId }])]]);
+  const { validation, ownershipErrors } = emailCarrierBundleValidation(carriers);
+  assert.deepEqual(ownershipErrors, [], "the carrier binds the row for task-0");
+  assert.equal(validation.dispatchAllowed, true, `dispatch allowed (${JSON.stringify(validation.foreignReferenceErrors || [])})`);
+});
+
+check("email catalog row without a carrier stays denied", () => {
+  const { validation, ownershipErrors } = emailCarrierBundleValidation(new Map());
+  assert.ok(ownershipErrors.length, "the row without a carrier is still denied");
+  assert.equal(validation.dispatchAllowed, false, "the gate stays strict");
+});
+
+// 0.9.30: the carrier join must not widen the ownership gate. A carrier bound
+// to another task, to a foreign scope, or to no scope at all still leaves the
+// email row denied as `task:task-0:ownership:<evidenceId>`.
+const FOREIGN_EMAIL_CARRIERS = [
+  ["a foreign task", (scopeId) => ({ taskKey: "task-other", rankingScopeId: scopeId })],
+  ["a foreign scope", () => ({ taskKey: "task-0", rankingScopeId: "scope-other-email" })],
+  ["an empty scope", () => ({ taskKey: "task-0", rankingScopeId: "" })]
+];
+for (const [label, makeCarrier] of FOREIGN_EMAIL_CARRIERS) {
+  check(`email catalog row with ${label} carrier stays denied`, () => {
+    const carriers = new Map([[EMAIL_CARRIER_EVIDENCE_ID, Object.freeze([makeCarrier(emailCarrierScopeId())])]]);
+    const { validation, ownershipErrors } = emailCarrierBundleValidation(carriers);
+    assert.ok(
+      ownershipErrors.includes(`task:task-0:ownership:${EMAIL_CARRIER_EVIDENCE_ID}`),
+      `the carrier is denied as foreign (${JSON.stringify(ownershipErrors)})`
+    );
+    assert.equal(validation.dispatchAllowed, false, "the gate stays strict");
+  });
+}
+
 // 0.9.3: a front-matter/tags-only note yields no protected evidence, no block.
 check("front-matter-only note skipped", () => {
   const fm = ["---", "title: Empty", "tags: [#MeetingNotes]", "---", "rrTags: #MeetingNotes"].join("\n");

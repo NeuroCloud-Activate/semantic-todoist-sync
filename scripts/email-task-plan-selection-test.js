@@ -416,12 +416,33 @@ function makeFakeApp() {
   return { vault, metadataCache, workspace };
 }
 
+// The email workflow persists the routing artifact it builds, so the arm that
+// must build one needs an adapter that accepts the write. Everything else
+// stays read-only.
+function makeWritableFakeApp() {
+  const app = makeFakeApp();
+  const files = new Map();
+  app.vault.adapter.read = async (filePath) => {
+    if (!files.has(String(filePath))) throw new Error(`email-task-plan-selection-test: no such file ${filePath}`);
+    return files.get(String(filePath));
+  };
+  app.vault.adapter.exists = async (filePath) => files.has(String(filePath));
+  app.vault.adapter.write = async (filePath, body) => { files.set(String(filePath), String(body)); };
+  app.vault.adapter.remove = async (filePath) => { files.delete(String(filePath)); };
+  app.vault.adapter.rename = async (from, to) => { files.set(String(to), files.get(String(from))); files.delete(String(from)); };
+  app.vault.adapter.list = async (dir) => ({
+    files: Array.from(files.keys()).filter((filePath) => String(filePath).startsWith(`${dir}/`)),
+    folders: []
+  });
+  return app;
+}
+
 async function makePlugin(options = {}) {
   const chunks = options.chunks || buildIndexChunks();
   const identity = semanticEmbeddingIdentity(DEFAULT_SETTINGS, {});
   const provider = identity.provider;
   const model = identity.model;
-  const plugin = new runtime(makeFakeApp(), { id: "semantic-todoist-sync", dir: ".obsidian/plugins/semantic-todoist-sync" });
+  const plugin = new runtime(options.app || makeFakeApp(), { id: "semantic-todoist-sync", dir: ".obsidian/plugins/semantic-todoist-sync" });
   plugin.settings = Object.assign({}, DEFAULT_SETTINGS);
   plugin.settings.embeddingProvider = provider;
   plugin.settings.embeddingModel = model;
@@ -472,6 +493,7 @@ function installAiStub(plugin, calls, options = {}) {
     const prefix = String(request.promptCachePrefix || "");
     const handles = [...new Set((prefix.match(/^(E\d+) /gm) || []).map((line) => line.trim()))];
     calls.push({ operation: String(request.operation || ""), handles });
+    if (typeof options.onCall === "function") await options.onCall(String(request.operation || ""), calls.length);
     return JSON.stringify({
       tasks: [{
         content,
@@ -732,6 +754,41 @@ async function main() {
     assert.equal(selection.dispatchAllowed, true, "the selection must stay dispatchable");
     assert.equal(selection.corpusCoverageError || null, null, `the selection must not fail closed, got ${JSON.stringify(selection.corpusCoverageError)}`);
     assert.deepStrictEqual(selection.selectedEvidenceIds || [], [], "the selection must be empty");
+  });
+
+  // ---- An index refresh during the email plan -----------------------------
+  // Several emails are processed back to back. When one finishes, its log
+  // note is queued for indexing; that reindex swaps the index, bumps the
+  // index revision and invalidates the production routing state. The NEXT
+  // email's plan has already passed its routing-readiness call by then, so
+  // the post-structure retrieval read a missing routing state, degraded to
+  // the current-source row only and failed the whole email closed with
+  // protected-workflow-evidence-closure-unresolved (0 tasks).
+  const reindexPlugin = (await makePlugin({ app: makeWritableFakeApp() })).plugin;
+  const reindexCalls = [];
+  installAiStub(reindexPlugin, reindexCalls, {
+    onCall: async (operation, count) => {
+      if (operation !== "task-generation" || count !== 1) return;
+      // The reindex that lands while the plan runs: a new index revision and
+      // no production routing state for it.
+      reindexPlugin.semanticIndexRevision = REVISION + 1;
+      reindexPlugin.productionSemanticRoutingState = null;
+      reindexPlugin.productionSemanticRoutingInvalidationSerial = Number(reindexPlugin.productionSemanticRoutingInvalidationSerial || 0) + 1;
+    }
+  });
+  const reindexPlan = await reindexPlugin.createTaskPlanWithLocalActivity(source, {});
+  const reindexBundle = bundleOf(reindexPlan);
+  console.log(
+    `email plan (index refresh during the plan): failure=${JSON.stringify(reindexPlan?.workflowContextFailure?.code || "")} ` +
+    `tasks=${Array.isArray(reindexPlan?.tasks) ? reindexPlan.tasks.length : 0} ` +
+    `dispatchAllowed=${JSON.stringify(reindexBundle?.contextBundleValidation?.dispatchAllowed ?? null)} ` +
+    `providerErrors=${JSON.stringify((reindexBundle?.contextBundleValidation?.protectedReferenceErrors || []).slice(0, 6))}`
+  );
+
+  check("an index refresh during the email plan does not block the email", () => {
+    assert.equal(reindexPlan?.workflowContextFailure || null, null, `the email plan must not fail, got ${JSON.stringify(reindexPlan?.workflowContextFailure)}`);
+    assert.equal(reindexBundle?.contextBundleValidation?.dispatchAllowed, true, `the email context must dispatch, errors: ${JSON.stringify(reindexBundle?.contextBundleValidation?.protectedReferenceErrors)}`);
+    assert.ok(Array.isArray(reindexPlan?.tasks) && reindexPlan.tasks.length > 0, "the email plan must produce tasks");
   });
 
   // ---- Note arm: the note path must stay byte-identical -------------------

@@ -17,20 +17,32 @@
 //
 // Usage:
 //   node scripts/email-evidence-selection-test.js [--record-note-baseline]
+//   node scripts/email-evidence-selection-test.js --main-source=<path to src/main.js>
+//
+// The note baseline is recorded from the PRE-CHANGE commit (a6866b4 = 0.9.27)
+// with the same harness, so the note control is a real comparison:
+//   git show a6866b4:src/main.js > %TEMP%/main-a6866b4.js
+//   node scripts/email-evidence-selection-test.js --record-note-baseline --main-source=%TEMP%/main-a6866b4.js
+// The recorded fixture is then compared against the current src/main.js on
+// every ordinary run.
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const Module = require("node:module");
 const path = require("node:path");
 
+const argv = process.argv.slice(2);
 const rootDir = path.join(__dirname, "..");
-const mainPath = path.join(rootDir, "src/main.js");
+const mainSourceArg = argv.find((value) => value.startsWith("--main-source="));
+const mainPath = mainSourceArg
+  ? path.resolve(mainSourceArg.slice("--main-source=".length))
+  : path.join(rootDir, "src/main.js");
 const baselinePath = path.join(__dirname, "fixtures", "email-evidence-selection-note-baseline.json");
-const recordBaseline = process.argv.slice(2).includes("--record-note-baseline");
+const recordBaseline = argv.includes("--record-note-baseline");
 
 const testModule = new Module(mainPath, module);
 testModule.filename = mainPath;
-testModule.paths = Module._nodeModulePaths(rootDir);
+testModule.paths = Module._nodeModulePaths(path.dirname(mainPath));
 
 const originalLoad = Module._load;
 Module._load = function (request) {
@@ -57,7 +69,8 @@ try {
   testModule._compile(
     `${mainSource}\nmodule.exports.__emailEvidenceSelection = {\n` +
       "  DEFAULT_SETTINGS, buildTaskSourceContract, taskReferenceSyntheticPath,\n" +
-      "  taskWorkflowSelectTaskRelevantEvidence, taskWorkflowSelectScoreEvidence\n" +
+      "  taskWorkflowSelectTaskRelevantEvidence, taskWorkflowSelectScoreEvidence,\n" +
+      "  emailSelectionActionText: typeof emailSelectionActionText === 'function' ? emailSelectionActionText : null\n" +
       "};\n",
     mainPath
   );
@@ -72,7 +85,8 @@ const {
   buildTaskSourceContract,
   taskReferenceSyntheticPath,
   taskWorkflowSelectTaskRelevantEvidence,
-  taskWorkflowSelectScoreEvidence
+  taskWorkflowSelectScoreEvidence,
+  emailSelectionActionText
 } = runtime.__emailEvidenceSelection;
 
 // ---------------------------------------------------------------------------
@@ -202,6 +216,17 @@ function rankedShape(rows) {
     lineStart: Number(row.lineStart),
     lineEnd: Number(row.lineEnd)
   }));
+}
+
+// Rewrite the semantic score of every corpus row. The score module reads the
+// adjusted (or raw) semantic score, so this drives the score-ordered paths.
+function setSemanticScores(rows, scoreFor) {
+  rows.forEach((row, index) => {
+    const score = scoreFor(row, index);
+    row.adjustedSemantic = score;
+    row.rawSemanticScore = score;
+  });
+  return rows;
 }
 
 const failures = [];
@@ -361,25 +386,211 @@ check("an email whose action text shares no token with the corpus still gets the
   assert.equal(selection.dispatchAllowed, true, `the email must dispatch, errors: ${JSON.stringify(selection.protectedReferenceErrors)}`);
 });
 
-check("an email corpus without a positive semantic score still gets the semantic window", () => {
-  const fixture = emailFixture();
-  const taskKey = Object.keys(fixture.rankings)[0];
-  for (const row of fixture.rows) {
-    row.adjustedSemantic = 0;
-    row.rawSemanticScore = 0;
+// ---------------------------------------------------------------------------
+// Semantic-window fallback (email only): the safety net for a corpus with no
+// positively scored row. It serves the TOP-SCORED rows, one per note, so it
+// needs an ordering signal. A corpus whose scores are all tied (a degenerate
+// embedding) carries none: the fallback then selects nothing and the email
+// proceeds exactly as it would without it.
+// ---------------------------------------------------------------------------
+
+function scoredIdsOf(selection, taskKey) {
+  return (selection.perTask[taskKey] || {}).moduleResults?.scores?.evidenceIds || [];
+}
+
+// The fallback rows, computed independently of the implementation: the
+// highest-scored rows, one per note, up to the semantic limit.
+function expectedFallbackIds(fixture, limit) {
+  const pathById = new Map(fixture.rows.map((row) => [row.evidenceId, row.path]));
+  const byScore = fixture.rows.slice().sort((left, right) => (right.adjustedSemantic - left.adjustedSemantic)
+    || (left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : 0));
+  const ids = [];
+  const usedNotes = new Set();
+  for (const row of byScore) {
+    if (ids.length >= limit) break;
+    const note = pathById.get(row.evidenceId) || row.evidenceId;
+    if (usedNotes.has(note)) continue;
+    usedNotes.add(note);
+    ids.push(row.evidenceId);
   }
+  return ids;
+}
+
+check("an email corpus with tied semantic scores gets no fallback rows", () => {
+  const fixture = emailFixture();
+  setSemanticScores(fixture.rows, () => 0);
+  const taskKey = Object.keys(fixture.rankings)[0];
   const selection = taskWorkflowSelectTaskRelevantEvidence(fixture.rankings, {
     sourceContract: fixture.contract,
     settings: DEFAULT_SETTINGS
   });
-  const perTask = selection.perTask[taskKey] || {};
-  const scoredIds = perTask.moduleResults?.scores?.evidenceIds || [];
+  const scoredIds = scoredIdsOf(selection, taskKey);
+  // The fallback must select nothing, so the selection is exactly the
+  // no-fallback selection (the lexical window alone).
+  const withoutFallback = taskWorkflowSelectScoreEvidence(rankedShape(fixture.rows), EMAIL_ACTION_TEXT, {
+    semanticNoteCap: NOTE_SEMANTIC_NOTE_CAP,
+    lexicalLimit: NOTE_LEXICAL_WINDOW
+  });
+  assert.deepStrictEqual(
+    scoredIds,
+    withoutFallback.evidenceIds,
+    "a tied corpus carries no ordering signal, so the fallback must select nothing"
+  );
+  // The guard is not vacuous: those are exactly the rows the fallback would
+  // have served, so a fallback that fired would show up here.
+  const fallbackRows = expectedFallbackIds(fixture, 30);
+  const selected = new Set(scoredIds);
+  assert.ok(
+    !fallbackRows.some((id) => selected.has(id)),
+    `a tied corpus must not be served by the fallback rows, got ${JSON.stringify(fallbackRows.filter((id) => selected.has(id)))}`
+  );
+  assert.equal(selection.dispatchAllowed, true, `the email must dispatch, errors: ${JSON.stringify(selection.protectedReferenceErrors)}`);
+});
+
+check("an email corpus with distinct negative semantic scores gets the top-scored rows, one per note", () => {
+  const fixture = emailFixture();
+  setSemanticScores(fixture.rows, (row, index) => -0.001 * (index + 1));
+  const taskKey = Object.keys(fixture.rankings)[0];
+  const selection = taskWorkflowSelectTaskRelevantEvidence(fixture.rankings, {
+    sourceContract: fixture.contract,
+    settings: DEFAULT_SETTINGS
+  });
+  const scoredIds = scoredIdsOf(selection, taskKey);
+  const expectedIds = expectedFallbackIds(fixture, 30);
+  const bulkIds = new Set(fixture.rows.filter((row) => row.path.startsWith("Notes/Bulk")).map((row) => row.evidenceId));
+  const selectedBulk = scoredIds.filter((id) => bulkIds.has(id)).slice().sort();
+  assert.deepStrictEqual(
+    selectedBulk,
+    expectedIds.slice().sort(),
+    "the fallback must serve exactly the top-scored rows"
+  );
+  assert.equal(expectedIds.length, 30, "the expectation must fill the semantic limit");
+  // One row per note.
+  const pathById = new Map(fixture.rows.map((row) => [row.evidenceId, row.path]));
+  const perNote = new Map();
+  for (const id of selectedBulk) {
+    const note = pathById.get(id);
+    perNote.set(note, (perNote.get(note) || 0) + 1);
+  }
+  for (const [note, count] of perNote) {
+    assert.equal(count, 1, `note ${note} must keep one fallback row, got ${count}`);
+  }
+  // The lowest-scored bulk row is not served: the fallback is score-ordered.
+  const lowest = fixture.rows.filter((row) => bulkIds.has(row.evidenceId)).slice(-1)[0];
+  assert.ok(!scoredIds.includes(lowest.evidenceId), "the lowest-scored row must not be served");
+  assert.equal(selection.dispatchAllowed, true, `the email must dispatch, errors: ${JSON.stringify(selection.protectedReferenceErrors)}`);
+});
+
+check("an email corpus without a positive semantic score still gets the semantic window", () => {
+  const fixture = emailFixture();
+  setSemanticScores(fixture.rows, (row, index) => -0.001 * (index + 1));
+  const taskKey = Object.keys(fixture.rankings)[0];
+  const selection = taskWorkflowSelectTaskRelevantEvidence(fixture.rankings, {
+    sourceContract: fixture.contract,
+    settings: DEFAULT_SETTINGS
+  });
+  const scoredIds = scoredIdsOf(selection, taskKey);
   assert.ok(scoredIds.length > 0, `the email selection must never be empty, got ${JSON.stringify(scoredIds)}`);
   assert.ok(
     scoredIds.length >= 30,
     `the fallback semantic window must keep one chunk per note up to the cap, got ${scoredIds.length}`
   );
   assert.equal(selection.dispatchAllowed, true, `the email must dispatch, errors: ${JSON.stringify(selection.protectedReferenceErrors)}`);
+});
+
+// ---------------------------------------------------------------------------
+// Non-Latin action text: the usable-text check must accept a letter or a
+// number in any script, not only ASCII. A Cyrillic or CJK email must not
+// fail closed with email-action-text-missing.
+// ---------------------------------------------------------------------------
+for (const [label, actionText] of [
+  ["Cyrillic", "Отправить анкету до пятницы"],
+  ["CJK", "完成表格并提交"]
+]) {
+  // A source that predates the helper has no action-text chain to check.
+  if (typeof emailSelectionActionText !== "function") {
+    console.log(`SKIP: a ${label} action text is a usable lexical query (this source has no emailSelectionActionText)`);
+  } else {
+    check(`a ${label} action text is a usable lexical query`, () => {
+      assert.equal(
+        emailSelectionActionText([actionText]),
+        actionText,
+        `the ${label} action text must be accepted as usable`
+      );
+    });
+  }
+
+  check(`an email ranking with a ${label} action text does not fail closed`, () => {
+    const fixture = emailFixture();
+    const taskKey = Object.keys(fixture.rankings)[0];
+    fixture.rankings[taskKey].actionText = actionText;
+    const selection = taskWorkflowSelectTaskRelevantEvidence(fixture.rankings, {
+      sourceContract: fixture.contract,
+      settings: DEFAULT_SETTINGS
+    });
+    const codes = (selection.protectedReferenceErrors || []).map((code) => String(code).split(":")[0]);
+    assert.ok(
+      !codes.includes("email-action-text-missing"),
+      `the ${label} email must not fail closed, got ${JSON.stringify(codes)}`
+    );
+    assert.equal(selection.dispatchAllowed, true, `the ${label} email must dispatch, errors: ${JSON.stringify(selection.protectedReferenceErrors)}`);
+    // The TF-IDF tokenizer yields no ASCII token for non-Latin text, so the
+    // email must still be served by the semantic window.
+    assert.ok(scoredIdsOf(selection, taskKey).length > 0, `the ${label} email must still get evidence`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The semantic-window fallback is email-only: the note selection path must
+// never receive it. A note ranking with no positive semantic score gives the
+// same result as the pre-change behaviour (no fallback rows).
+// ---------------------------------------------------------------------------
+check("the note selection path never receives the semantic-window fallback", () => {
+  const fixture = noteFixture();
+  const taskKey = Object.keys(fixture.rankings)[0];
+  setSemanticScores(fixture.rankings[taskKey].rows, () => 0);
+  const selection = taskWorkflowSelectTaskRelevantEvidence(fixture.rankings, {
+    sourceContract: fixture.contract,
+    settings: DEFAULT_SETTINGS
+  });
+  const withoutFallback = taskWorkflowSelectScoreEvidence(rankedShape(fixture.rankings[taskKey].rows), "Submit the budget report", {
+    semanticNoteCap: NOTE_SEMANTIC_NOTE_CAP,
+    lexicalLimit: NOTE_LEXICAL_WINDOW
+  });
+  assert.deepStrictEqual(
+    scoredIdsOf(selection, taskKey),
+    withoutFallback.evidenceIds,
+    "the note path must not receive the semantic-window fallback"
+  );
+  // The guard is not vacuous: on a corpus with distinct negative scores the
+  // fallback would serve the top-scored rows, so a note that received it
+  // would differ from the no-fallback selection.
+  const negative = noteFixture();
+  const negativeTaskKey = Object.keys(negative.rankings)[0];
+  setSemanticScores(negative.rankings[negativeTaskKey].rows, (row, index) => -0.001 * (index + 1));
+  const negativeSelection = taskWorkflowSelectTaskRelevantEvidence(negative.rankings, {
+    sourceContract: negative.contract,
+    settings: DEFAULT_SETTINGS
+  });
+  const negativeWithoutFallback = taskWorkflowSelectScoreEvidence(rankedShape(negative.rankings[negativeTaskKey].rows), "Submit the budget report", {
+    semanticNoteCap: NOTE_SEMANTIC_NOTE_CAP,
+    lexicalLimit: NOTE_LEXICAL_WINDOW
+  });
+  const negativeWithFallback = taskWorkflowSelectScoreEvidence(rankedShape(negative.rankings[negativeTaskKey].rows), "Submit the budget report", {
+    semanticNoteCap: NOTE_SEMANTIC_NOTE_CAP,
+    lexicalLimit: NOTE_LEXICAL_WINDOW,
+    semanticWindowFallback: true
+  });
+  assert.notDeepStrictEqual(
+    negativeWithFallback.evidenceIds,
+    negativeWithoutFallback.evidenceIds,
+    "the fixture must be sensitive to the fallback, or this check proves nothing"
+  );
+  assert.deepStrictEqual(
+    scoredIdsOf(negativeSelection, negativeTaskKey),
+    negativeWithoutFallback.evidenceIds,
+    "the note path must not receive the semantic-window fallback"
+  );
 });
 
 // ---------------------------------------------------------------------------

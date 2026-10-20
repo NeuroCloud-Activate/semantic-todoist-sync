@@ -47747,17 +47747,26 @@ function taskWorkflowSourceSummarySentence(sourceContract = {}) {
   return sentence.trim() || text;
 }
 
+// A usable action text carries at least one letter or number, in ANY script.
+// The test is Unicode-aware on purpose: an ASCII-only test would fail a
+// Cyrillic, CJK or Arabic action text closed even though the text is
+// perfectly usable.
+const TASK_WORKFLOW_USABLE_ACTION_TEXT_RE = /[\p{L}\p{N}]/u;
+function taskWorkflowUsableActionText(text) {
+  return TASK_WORKFLOW_USABLE_ACTION_TEXT_RE.test(String(text ?? ""));
+}
+
 // The email lexical query text. An email has no marked-action scope, so its
 // query comes from the task's own wording first, then the email subject, then
 // the first sentence of the contract's source-summary fact. A candidate is
-// usable only when it carries at least one alphanumeric token, so a
+// usable only when it carries at least one letter or number, so a
 // punctuation-only task content or subject falls through to the next
 // candidate instead of failing the email closed with email-action-text-missing.
 function emailSelectionActionText(candidates = []) {
   for (const candidate of candidates) {
     const text = singleLine(String(candidate || ""));
     if (!text) continue;
-    if (!(text.toLowerCase().match(/[a-z0-9]+/g) || []).length) continue;
+    if (!taskWorkflowUsableActionText(text)) continue;
     return text;
   }
   return "";
@@ -50499,10 +50508,22 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
   // semantic score the top semantic rows (one per note, up to the same cap)
   // are kept anyway: an empty selection would reach the model with no
   // evidence at all.
-  if (!semanticWindow.length && options?.semanticWindowFallback === true && semantic.length) {
+  // The fallback needs an ORDERING SIGNAL to be meaningful, so it uses only
+  // the rows with a finite score, ordered by score descending, and fires only
+  // when those scores are not all equal. A degenerate corpus (every score
+  // tied, e.g. a zero embedding, or no finite score at all) carries no such
+  // signal: the fallback then selects nothing and the email proceeds exactly
+  // as it would without it (the lexical window still applies, and nothing new
+  // fails closed). Tied rows are never served in an arbitrary order.
+  if (!semanticWindow.length && options?.semanticWindowFallback === true) {
+    const scored = semantic
+      .filter((entry) => Number.isFinite(entry.score))
+      .sort((left, right) => (right.score - left.score)
+        || (left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : 0));
+    const ordered = scored.length && scored[0].score !== scored[scored.length - 1].score ? scored : [];
     const fallback = [];
     const perNote = new Map();
-    for (const entry of semantic) {
+    for (const entry of ordered) {
       if (fallback.length >= semanticLimit) break;
       const note = pathByEvidenceId.get(entry.evidenceId) || entry.evidenceId;
       const used = perNote.get(note) || 0;
@@ -51015,14 +51036,15 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       // chunk (so there is no "self" query handle whose path must equal the
       // source path) and no marked-action scope (so there is no marker line to
       // match the action text against). The email still needs a usable lexical
-      // query, so an empty or non-alphanumeric action text fails closed with
-      // its own code instead of the note's self/marker codes.
-      if (!actionText || !(actionText.toLowerCase().match(/[a-z0-9]+/g) || []).length) {
+      // query, so an empty or letterless action text fails closed with its
+      // own code instead of the note's self/marker codes. The usability test
+      // is Unicode-aware, so a non-Latin action text is usable too.
+      if (!actionText || !taskWorkflowUsableActionText(actionText)) {
         scoreMissingErrors.push(`email-action-text-missing:${taskKey}`);
       }
     } else {
     const self = ranked.find((entry) => entry.evidenceId === queryHandleEvidenceId);
-    if (!self || !actionText || !(actionText.toLowerCase().match(/[a-z0-9]+/g) || []).length) {
+    if (!self || !actionText || !taskWorkflowUsableActionText(actionText)) {
       scoreMissingErrors.push(`action-or-self-missing:${taskKey}:${queryHandleEvidenceId}`);
     }
     const scopeForAction = (sourceContract.scopes || []).find((scope) => String(scope?.scopeId || scope?.id || "") === scopeId);

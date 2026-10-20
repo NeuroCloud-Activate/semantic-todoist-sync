@@ -577,10 +577,14 @@ async function main() {
   // A punctuation-only task content falls back to the email subject; a
   // punctuation-only subject falls back to the first sentence of the
   // contract's source-summary fact (the cleaned retrieval text). Neither may
-  // fail the email closed with email-action-text-missing.
-  for (const [label, title, content] of [
-    ["a punctuation-only task content falls back to the email subject", EMAIL_TITLE, "..."],
-    ["a punctuation-only subject falls back to the source-summary sentence", "...", "..."]
+  // fail the email closed with email-action-text-missing. A non-Latin task
+  // and subject (Cyrillic, CJK) are usable text too: the usable-text check
+  // must accept a letter or a number in any script, not only ASCII.
+  for (const [label, title, content, text, expectsEvidence] of [
+    ["a punctuation-only task content falls back to the email subject", EMAIL_TITLE, "...", "Please submit the Acme Atlas intake form before Friday.", true],
+    ["a punctuation-only subject falls back to the source-summary sentence", "...", "...", "Please submit the Acme Atlas intake form before Friday.", true],
+    ["a Cyrillic task and subject do not fail the email closed", "Отправить анкету до пятницы", "Отправить анкету до пятницы", "Отправить анкету до пятницы", false],
+    ["a CJK task and subject do not fail the email closed", "完成表格并提交", "完成表格并提交", "完成表格并提交", false]
   ]) {
     const fallbackPlugin = (await makePlugin()).plugin;
     const fallbackCalls = [];
@@ -588,7 +592,7 @@ async function main() {
     const fallbackSource = {
       type: "email",
       title,
-      text: "Please submit the Acme Atlas intake form before Friday.",
+      text,
       sectionName: "2026-10-09 Acme"
     };
     const fallbackPlan = await fallbackPlugin.createTaskPlanWithLocalActivity(fallbackSource, {});
@@ -603,11 +607,20 @@ async function main() {
         !String(fallbackPlan?.workflowContextFailure?.code || "").includes("email-action-text-missing"),
         `the email plan must not fail with email-action-text-missing, got ${JSON.stringify(fallbackPlan?.workflowContextFailure || null)}`
       );
-      assert.ok(
-        (fallbackBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).length > 0,
-        "the fallback email must still deliver evidence"
+      assert.equal(
+        fallbackBundle?.contextBundleValidation?.dispatchAllowed,
+        true,
+        `the email must dispatch, errors: ${JSON.stringify(fallbackBundle?.contextBundleValidation?.protectedReferenceErrors || [])}`
       );
     });
+    if (expectsEvidence) {
+      check(`${label} (delivers evidence)`, () => {
+        assert.ok(
+          (fallbackBundle?.providerEvidenceProjection?.selectedEvidenceIds || []).length > 0,
+          "the fallback email must still deliver evidence"
+        );
+      });
+    }
   }
 
   // ---- Note arm: the note path must stay byte-identical -------------------

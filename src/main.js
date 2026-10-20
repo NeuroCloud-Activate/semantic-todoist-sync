@@ -9241,8 +9241,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (writingPathInContextFolder(path, this.settings, vaultBase)) return false; // writing-mode: task 7 context folder excluded from the vault index
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
-    if (isEmailLogPath(path, this.settings)) return false;
-    if (includeFolders.length && !includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
+    const included = !includeFolders.length || includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`));
+    // Email log notes are the vault record of a processed email and its synced
+    // tasks. They live inside the plugin data folder, which excludedFolders
+    // carries by default, so the generic folder exclusion must not hide them.
+    // An explicit include list still applies, as does the context-folder
+    // exclusion above.
+    if (isEmailLogPath(path, this.settings)) return included;
+    if (!included) return false;
     if (this.isExcludedPath(path, excludeFolders)) return false;
     return true;
   }
@@ -18750,6 +18756,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       throw error;
     }
     sectionName = prepared.sectionName || sectionName;
+    // The log-note summary is produced before the Todoist write: any throw from
+    // that write is a reconciliation hold, and a summary must never become one.
+    let emailSummary = "";
+    try {
+      emailSummary = await this.generateEmailLogSummary({
+        subject,
+        sourceSummary: plan.sourceSummary || "",
+        taskTitles: (tasks || []).map((task) => task.content || ""),
+        captureContext
+      });
+    } catch (error) {
+      // A summary failure never blocks or holds the email: the log note is
+      // written without one. Codes only, never email text.
+      const code = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code) ? error.code : "summary-failed";
+      this.logLocal("Email log summary failed; continuing without a summary", { id: item.id, code });
+    }
     this.setSidebarStatus("Syncing Todoist section...");
     // From immediately before the possible Todoist write onward, any throw is a
     // possible partial delivery: hold as reconciliation, never auto-retry and
@@ -18757,7 +18779,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let created;
     try {
       created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
-      await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created });
+      await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created, summary: emailSummary });
       await this.workerJson("/complete", "POST", { id: item.id });
     } catch (error) {
       const code = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code) ? error.code : "todoist-write-failed";
@@ -21830,7 +21852,42 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return cached;
   }
 
-  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks }) {
+  // Concise, plain-language summary of a processed email for its log note.
+  // One small provider call over the email chain text the plan already
+  // compressed; the summary is optional, so a disabled or unavailable
+  // generation path returns "" and the note is written without one.
+  async generateEmailLogSummary({ subject, sourceSummary, taskTitles = [], captureContext = null } = {}) {
+    const sourceText = String(sourceSummary || "").trim();
+    if (!sourceText) return "";
+    if (await this.semanticTaskContextDispatchGate("email-summary")) return "";
+    const modelChoice = this.aiModelForRequest("task-generation", {
+      prompt: [subject, sourceText].filter(Boolean).join("\n"),
+      context: [],
+      taskCount: (taskTitles || []).length
+    });
+    const text = await this.openaiResponse({
+      operation: "email-summary",
+      model: modelChoice.model,
+      system: "You write short, plain-language summaries of email threads for a personal processing log.",
+      reasoningEffort: aiOperationReasoningEffort(this.settings.chatReasoningEffort, "email-summary", this.settings.optimizeStructuredAiUsage !== false),
+      captureContext: providerCaptureAttemptContext(captureContext || null, "email-summary"),
+      user: [
+        "Summarise this email thread for a local processing log.",
+        "Write 2 to 4 plain sentences.",
+        "State who asked for what and by when, and how the request changed across the thread.",
+        "Leave out signatures, legal disclaimers, contact details and long verbatim quotes.",
+        "Return the summary text only.",
+        `Subject: ${subject || ""}`,
+        "Generated task titles:",
+        JSON.stringify((taskTitles || []).map((title) => String(title || "")).filter(Boolean)),
+        "Email thread:",
+        sourceText
+      ].join("\n")
+    });
+    return sanitizeEmailLogSummary(text, this.settings);
+  }
+
+  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks, summary }) {
     const folder = trimSlashes(this.settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder);
     await ensureVaultFolder(this.app, folder);
     const noteTitle = emailTaskNoteTitle(receivedAt, subject);
@@ -21838,16 +21895,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const displayedProcessedAt = formatEmailWorkflowTimestamp(new Date());
     const displayedReceivedAt = formatEmailWorkflowTimestamp(receivedAt);
     const displayedCloudflareReceivedAt = formatEmailWorkflowTimestamp(cloudflareReceivedAt);
+    const summaryText = capEmailLogSummary(sanitizeEmailLogSummary(summary, this.settings));
     const lines = [
       `Date processed: ${displayedProcessedAt}`,
       `Original email received: ${displayedReceivedAt}`,
       displayedCloudflareReceivedAt ? `Forward received by Cloudflare: ${displayedCloudflareReceivedAt}` : "",
       `From: ${from || ""}`,
       `Email subject: ${subject || ""}`,
-      `Todoist section: ${sectionName}`,
-      "",
-      "## Synced Todoist Tasks"
+      `Todoist section: ${sectionName}`
     ].filter(Boolean);
+    if (summaryText) lines.push("", "## Email summary", "", summaryText, "");
+    lines.push("## Synced Todoist Tasks");
     for (const task of tasks || []) {
       lines.push(parsedTaskToLine(Object.assign({ isCompleted: false, isSubtask: false, section: sectionName }, task), this.settings, task.id));
       for (const subtask of task.subtasks || []) {
@@ -21866,6 +21924,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.logLocal("Email task note sync initialization failed", { path, error: error.message || String(error) });
     }
     this.logLocal("Email task note created", { path, tasks: flattenTaskPlan(tasks || []).length, cached, syncStats, syncable: isEmailLogPath(path, this.settings), sectionName });
+    // The log note is written as an internal note write, so the vault "create"
+    // event skips it: queue the note for indexing here so a processed email
+    // becomes retrievable vault evidence. A queue failure must never turn the
+    // email into a reconciliation hold.
+    try {
+      const indexed = this.queueSemanticIndexUpdate(path, "email-log");
+      this.logLocal("Email task note index queued", { path, queued: indexed?.queued || 0, reasonCode: indexed?.reasonCode || "" });
+    } catch (error) {
+      this.logLocal("Email task note index queue failed", { path, error: error.message || String(error) });
+    }
   }
 };
 
@@ -55118,6 +55186,36 @@ function isEmailLogPath(path, settings = DEFAULT_SETTINGS) {
   const folder = trimSlashes(settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder || "");
   const notePath = trimSlashes(path || "");
   return Boolean(folder && (notePath === folder || notePath.startsWith(`${folder}/`)));
+}
+// The log note stores a summary, never the email text: a runaway model
+// response is cut to a bounded length at the last sentence or word boundary.
+const EMAIL_LOG_SUMMARY_MAX_CHARS = 1200;
+function capEmailLogSummary(text, maxChars = EMAIL_LOG_SUMMARY_MAX_CHARS) {
+  const value = String(text || "");
+  if (value.length <= maxChars) return value;
+  const head = value.slice(0, maxChars);
+  const sentenceEnd = Math.max(head.lastIndexOf(". "), head.lastIndexOf(".\n"));
+  const cut = sentenceEnd > 0 ? sentenceEnd + 1 : head.lastIndexOf(" ");
+  return `${(cut > 0 ? head.slice(0, cut) : head).trim()}...`;
+}
+// The log note is a vault note: the note sync and the semantic index read it
+// back. Strip leading list/checkbox markers and every configured sync or
+// action tag so a summary can never be read back as a task line.
+function sanitizeEmailLogSummary(summary, settings = DEFAULT_SETTINGS) {
+  const text = String(summary || "").replace(/\r\n?/g, "\n").trim();
+  if (!text) return "";
+  const markers = [settings?.syncTag, settings?.subtaskSyncTag, ...noteActionMarkerTags(settings)]
+    .map((marker) => String(marker || "").trim())
+    .filter(Boolean);
+  const lines = [];
+  for (const raw of text.split("\n")) {
+    let line = raw.trim().replace(/^(?:[-*+]|\d+[.)])\s*(?:\[[ xX]\]\s*)?/, "");
+    for (const marker of markers) line = line.replace(new RegExp(escapeRegExp(marker), "gi"), "");
+    line = line.trim();
+    if (!line || /^[-*]\s+\[[ xX]\]/.test(line)) continue;
+    lines.push(line);
+  }
+  return lines.join("\n").trim();
 }
 function sectionKey(name) { return singleLine(name).toLowerCase(); }
 

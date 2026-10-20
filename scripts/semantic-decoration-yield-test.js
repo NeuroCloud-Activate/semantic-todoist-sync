@@ -98,7 +98,7 @@ async function main() {
     "cooperative decoration API must exist while preserving the synchronous API");
 
   const gateCallLines = source.split(/\r?\n/).filter((line) => line.includes("this.semanticTaskContextDispatchGate("));
-  assert.strictEqual(gateCallLines.length, 6, "the six approved task-context gate call sites should remain present");
+  assert.strictEqual(gateCallLines.length, 7, "the seven approved task-context gate call sites should remain present");
   assert(gateCallLines.every((line) => line.includes("await this.semanticTaskContextDispatchGate(")),
     "every async task-context gate caller must await the gate");
 
@@ -180,7 +180,7 @@ async function main() {
   console.log("PASS: synchronous decoration output, duplicate ordinals, metadata and task child references");
   console.log("PASS: cooperative decoration yields to a host timer and matches synchronous output");
   console.log("PASS: concurrent invocations isolate state and failed yields expose no partial result");
-  console.log("PASS: all six asynchronous semantic task-context gate call sites await the gate");
+  console.log("PASS: all seven asynchronous semantic task-context gate call sites await the gate");
   if (baselinePath) console.log("PASS: current synchronous decoration matches the supplied before-image");
 }
 

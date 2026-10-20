@@ -15565,6 +15565,38 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   // local preparation and ends in finally after post-response processing
   // settles, so preparation and evidence processing are visible and labelled
   // truthfully while the nested provider activity keeps its own duration.
+  // Workflow-owned routing readiness for an email task plan. The vault
+  // retrieval path only READS the production routing state (allowBuild:false)
+  // and degrades to zero vault rows when it is missing, so the email plan
+  // builds it first, with the same options the startup warm-up uses. A null
+  // or failed build is never a hold: the plan continues exactly as before.
+  async ensureEmailSemanticRoutingReadiness() {
+    try {
+      const state = await this.ensureProductionSemanticRoutingState({
+        chunks: Array.isArray(this.semanticIndex) ? this.semanticIndex : [],
+        settings: this.settings,
+        revision: Number(this.semanticIndexRevision || 0),
+        storageFingerprint: this.semanticIndexStorageFingerprint || "",
+        allowLoad: true,
+        allowBuild: true,
+        persist: true
+      });
+      if (!state?.routingIndex) {
+        this.logLocal("Email semantic routing state unavailable", {
+          code: String(this.productionSemanticRoutingTelemetry?.reasonCode || "routing-state-unavailable")
+        });
+        return false;
+      }
+      return true;
+    } catch (error) {
+      const code = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code)
+        ? error.code
+        : "routing-readiness-failed";
+      this.logLocal("Email semantic routing readiness failed", { code });
+      return false;
+    }
+  }
+
   async createTaskPlanWithLocalActivity(source, options = {}) {
     const activity = this.beginAiActivity("Preparing task generation");
     try {
@@ -15634,6 +15666,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const retrievalText = String(source?.type || "") === "email" ? sourceContractText : sourceSummary;
     const taskQuery = `${source.title}\n${retrievalText}`;
     const retrievalPrompt = taskGenerationContextQuery(source, retrievalText, this.settings, sourceContract);
+    // An email plan must never run vault retrieval without a production
+    // routing state: the retrieval path only reads that state
+    // (allowBuild:false) and degrades to zero vault rows when it is missing.
+    // The email workflow owns the build here, so the first email after plugin
+    // load still sees vault rows. A missing or failed build is not a hold:
+    // the plan proceeds exactly as it did before.
+    if (String(source?.type || "") === "email") await this.ensureEmailSemanticRoutingReadiness();
     this.setAiActivityProgress(activity, { step: 1, steps: 4, label: "retrieving evidence" });
     this.setSidebarStatus("Retrieving task evidence...");
     const context = await this.retrieveAdaptiveSemanticContext(taskQuery, "task-generation", this.settings.maxTaskContextChunks, retrievalPrompt, { sourceContract, captureContext });

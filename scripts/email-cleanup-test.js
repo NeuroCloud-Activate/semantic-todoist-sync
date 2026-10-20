@@ -370,6 +370,192 @@ function main() {
     assert.ok(signal.includes("The intake form draft is ready."), `the signal text must keep the current message, got ${JSON.stringify(signal)}`);
   });
 
+  // ---- a request is never lost (regression: eaeb72b deleted requests) -----
+  check("a request that mentions 'confidential' survives the cleaner", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please keep the budget confidential and send it Friday.",
+      "",
+      "Thanks,",
+      "Matt SeeGobin"
+    ].join("\n");
+    const cleaned = cleanEmailChainText(body, { keepHeaders: true });
+    assert.ok(cleaned.includes("Please keep the budget confidential and send it Friday."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    assertMissing(cleaned, "Matt SeeGobin", "the signature name");
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assert.ok(retrieval.includes("Please keep the budget confidential and send it Friday."), `the request must reach the retrieval text, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a request that mentions a virus scan survives the cleaner", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please delete the virus scan report and confirm receipt.",
+      "",
+      "Thanks,",
+      "Matt SeeGobin"
+    ].join("\n");
+    const cleaned = cleanEmailChainText(body, { keepHeaders: true });
+    assert.ok(cleaned.includes("Please delete the virus scan report and confirm receipt."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assert.ok(retrieval.includes("Please delete the virus scan report and confirm receipt."), `the request must reach the retrieval text, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a disclaimer sentence inside a body paragraph is dropped but the request stays", () => {
+    const body = "Hi Matt, Please review the intake form. This email and any attachments are confidential and may be legally privileged. If you are not the intended recipient, please notify the sender and delete this email.";
+    const cleaned = cleanEmailChainText(body, { keepHeaders: true });
+    assert.ok(cleaned.includes("Hi Matt, Please review the intake form."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    assertMissing(cleaned, "confidential", "the disclaimer sentence");
+    assertMissing(cleaned, "please notify the sender", "the disclaimer notice");
+  });
+
+  check("a legal footer under a rule loses both the rule and the footer", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please review the draft.",
+      "",
+      "---",
+      "This email and any attachments are confidential."
+    ].join("\n");
+    const cleaned = cleanEmailChainText(body, { keepHeaders: false });
+    assertMissing(cleaned, "---", "the rule");
+    assertMissing(cleaned, "confidential", "the legal footer");
+    assert.ok(cleaned.includes("Please review the draft."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+  });
+
+  check("an external-sender banner is removed", () => {
+    const body = [
+      "CAUTION: EXTERNAL EMAIL. Do not click links or open attachments.",
+      "",
+      "Hi Matt,",
+      "",
+      "Please review the draft."
+    ].join("\n");
+    const cleaned = cleanEmailChainText(body, { keepHeaders: false });
+    assertMissing(cleaned, "CAUTION", "the banner lead-in");
+    assertMissing(cleaned, "Do not click links", "the banner advice");
+    assert.ok(cleaned.includes("Please review the draft."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+  });
+
+  check("an [EXTERNAL] prefix is stripped but the request survives", () => {
+    const cleaned = cleanEmailChainText("[EXTERNAL] Please review the draft.", { keepHeaders: false });
+    assertMissing(cleaned, "[EXTERNAL]", "the banner prefix");
+    assert.ok(cleaned.includes("Please review the draft."), `the request must survive, got ${JSON.stringify(cleaned)}`);
+  });
+
+  check("a two-line Gmail quote marker is a boundary and is dropped for retrieval", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Can you send the revised deck?",
+      "",
+      "On Mon, Oct 6, 2026 at 9:14 AM Alex Rivera",
+      "<alex@example.com> wrote:",
+      "> Please review the Q3 variance numbers."
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(body, "Q3 variance review"), DEFAULT_SETTINGS);
+    assertMissing(retrieval, "wrote:", "the quote marker");
+    assertMissing(retrieval, "alex@example.com", "the quote marker address");
+    assert.ok(retrieval.includes("Can you send the revised deck?"), `the newest request must survive, got ${JSON.stringify(retrieval)}`);
+    assert.ok(retrieval.includes("Please review the Q3 variance numbers."), `the quoted request must survive, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a Gmail quote marker with the address on its own line is dropped for retrieval", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Can you send the revised deck?",
+      "",
+      "On Mon, Oct 6, 2026 at 9:14 AM Alex Rivera",
+      "<alex@example.com>",
+      "wrote:",
+      "> Please review the Q3 variance numbers."
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(body, "Q3 variance review"), DEFAULT_SETTINGS);
+    assertMissing(retrieval, "wrote:", "the quote marker");
+    assertMissing(retrieval, "alex@example.com", "the quote marker address");
+    assert.ok(retrieval.includes("Can you send the revised deck?"), `the newest request must survive, got ${JSON.stringify(retrieval)}`);
+    assert.ok(retrieval.includes("Please review the Q3 variance numbers."), `the quoted request must survive, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a company and address footer is dropped from the retrieval text", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please review the draft.",
+      "",
+      "Canadian Blood Services | 1800 Diefenbaker Boulevard, Ottawa, ON K1A 0G1"
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assertMissing(retrieval, "Canadian Blood Services", "the organization footer");
+    assertMissing(retrieval, "Diefenbaker", "the address footer");
+    assert.ok(retrieval.includes("Please review the draft."), `the request must survive, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("separator and contact footer lines are dropped from the retrieval text", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please review the draft.",
+      "",
+      "________________________________",
+      "Hi Alex,",
+      "",
+      "Please confirm the numbers.",
+      "",
+      "Tel: 613-232-5555",
+      "info@blood.ca"
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assertMissing(retrieval, "____", "the separator line");
+    assertMissing(retrieval, "Tel: 613-232-5555", "the phone footer");
+    assertMissing(retrieval, "info@blood.ca", "the e-mail footer");
+    assert.ok(retrieval.includes("Please confirm the numbers."), `the request must survive, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a French, Spanish and German sign-off is removed", () => {
+    const french = ["Bonjour,", "", "Cordialement,", "Alex Rivera"].join("\n");
+    const frenchCleaned = cleanEmailChainText(french, { keepHeaders: true });
+    assertMissing(frenchCleaned, "Cordialement", "the French sign-off");
+    assertMissing(frenchCleaned, "Alex Rivera", "the signature name");
+    const spanish = ["Hola,", "", "Atentamente,", "Alex Rivera"].join("\n");
+    const spanishCleaned = cleanEmailChainText(spanish, { keepHeaders: true });
+    assertMissing(spanishCleaned, "Atentamente", "the Spanish sign-off");
+    const german = ["Hallo,", "", "Mit freundlichen Grüßen", "Alex Rivera"].join("\n");
+    const germanCleaned = cleanEmailChainText(german, { keepHeaders: true });
+    assertMissing(germanCleaned, "Mit freundlichen Grüßen", "the German sign-off");
+    assertMissing(germanCleaned, "Alex Rivera", "the signature name");
+  });
+
+  check("a reply line, a phone request and a list item survive the cleaner", () => {
+    const body = [
+      "Thanks, approved.",
+      "",
+      "Call me at 555-1234 to confirm.",
+      "",
+      "- Review the intake form",
+      "- Send the vendor addendum"
+    ].join("\n");
+    const cleaned = cleanEmailChainText(body, { keepHeaders: false });
+    assert.ok(cleaned.includes("Thanks, approved."), `the reply must survive, got ${JSON.stringify(cleaned)}`);
+    assert.ok(cleaned.includes("Call me at 555-1234 to confirm."), `the phone request must survive, got ${JSON.stringify(cleaned)}`);
+    assert.ok(cleaned.includes("- Review the intake form"), `the list item must survive, got ${JSON.stringify(cleaned)}`);
+    assert.ok(cleaned.includes("- Send the vendor addendum"), `the list item must survive, got ${JSON.stringify(cleaned)}`);
+  });
+
+  check("a four megabyte body cleans in under a second", () => {
+    const unit = "Hi Matt,\n\nPlease review the intake form.\n\nThis email and any attachments are confidential and may be legally privileged.\n\n";
+    let body = "";
+    while (body.length < 4 * 1024 * 1024) body += unit;
+    const started = Date.now();
+    const cleaned = cleanEmailChainText(body, { keepHeaders: false });
+    const elapsed = Date.now() - started;
+    assert.ok(cleaned.length > 0, "the cleaner must not empty a large body");
+    assert.ok(elapsed < 1000, `a 4 MB body must clean in under 1 s, took ${elapsed} ms`);
+  });
+
   // ---- note sources are byte-identical ------------------------------------
   check("a note source is unchanged by the email cleaner", () => {
     assert.equal(compressSourceForTaskPrompt(NOTE_SOURCE, DEFAULT_SETTINGS), NOTE_EXPECTED, "the note summary must stay byte-identical");

@@ -15530,9 +15530,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           queryHandleEvidenceId,
           // An email's contract scope action is the literal "source", which is
           // useless as a lexical query, so the email's own title (the subject)
-          // is the prestructure query. A note keeps its marked-action scope text.
+          // is the prestructure query, with the contract's source-summary
+          // sentence as its fallback. A note keeps its marked-action scope text.
           actionText: emailSelectionSource
-            ? String(source.title || "")
+            ? emailSelectionActionText([source.title, taskWorkflowSourceSummarySentence(sourceContract)])
             : String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(record.scopeId || ""))?.action || ""),
           rows: taskWorkflowAttachTaskRelevanceScores(Array.from(rowById.values()), key, scoreMapForKey(key), { scopeId: record.scopeId })
         }];
@@ -16312,9 +16313,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         // An email's contract scope action is the literal "source", which is
         // useless as a lexical query, so the generated task's own action text
         // is used instead (the same text buildTaskSemanticQuerySet queries
-        // with). A note keeps its marked-action scope text.
+        // with), with the email subject and the contract's source-summary
+        // sentence as its fallbacks. A note keeps its marked-action scope text.
         actionText: emailSelectionSource
-          ? singleLine(task?.semanticQuery || task?.content || task?.title || "")
+          ? emailSelectionActionText([
+            task?.semanticQuery, task?.content, task?.title,
+            source.title, taskWorkflowSourceSummarySentence(sourceContract)
+          ])
           : String(sourceContract.scopes?.find((scope) => String(scope.scopeId || scope.id || "") === String(task?.scope_id || task?.scopeId || local.scopeId || ""))?.action || ""),
         rows: taskWorkflowAttachTaskRelevanceScores(Array.from(rowById.values()), key, postScoreMap, { scopeId: String(task?.scope_id || task?.scopeId || local.scopeId || "") })
       };
@@ -47731,6 +47736,33 @@ function buildTaskSourceContract(source = {}, sourceSummary = "", settings = DEF
   return deepFreezeTaskWorkflow(sourceContract);
 }
 
+// The first sentence of the contract's source-summary fact: the cleaned
+// retrieval text of the source. It is the last lexical-query fallback of an
+// email source, whose contract scope action is the literal "source".
+function taskWorkflowSourceSummarySentence(sourceContract = {}) {
+  const fact = (sourceContract.facts || []).find((entry) => String(entry?.kind || "") === "source-summary");
+  const text = singleLine(String(fact?.value || fact?.sourceSurface || ""));
+  if (!text) return "";
+  const sentence = String(text).split(/(?<=[.!?])\s+/)[0] || "";
+  return sentence.trim() || text;
+}
+
+// The email lexical query text. An email has no marked-action scope, so its
+// query comes from the task's own wording first, then the email subject, then
+// the first sentence of the contract's source-summary fact. A candidate is
+// usable only when it carries at least one alphanumeric token, so a
+// punctuation-only task content or subject falls through to the next
+// candidate instead of failing the email closed with email-action-text-missing.
+function emailSelectionActionText(candidates = []) {
+  for (const candidate of candidates) {
+    const text = singleLine(String(candidate || ""));
+    if (!text) continue;
+    if (!(text.toLowerCase().match(/[a-z0-9]+/g) || []).length) continue;
+    return text;
+  }
+  return "";
+}
+
 function evidenceScopeIdsForChunk(chunk = {}) {
   const values = [
     ...(Array.isArray(chunk.scopeIds) ? chunk.scopeIds : []),
@@ -50442,12 +50474,12 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
     .slice(0, lexicalLimit);
   const semanticPositive = semantic.filter((entry) => Number(entry.score) > 0);
   let semanticWindow = semanticPositive.slice(0, semanticLimit);
+  const pathByEvidenceId = new Map();
+  for (const row of rows) {
+    const id = String(row.evidenceId || "");
+    if (id && !pathByEvidenceId.has(id)) pathByEvidenceId.set(id, String(row.path || ""));
+  }
   if (semanticNoteCap > 0) {
-    const pathByEvidenceId = new Map();
-    for (const row of rows) {
-      const id = String(row.evidenceId || "");
-      if (id && !pathByEvidenceId.has(id)) pathByEvidenceId.set(id, String(row.path || ""));
-    }
     const capped = [];
     const perNote = new Map();
     for (const entry of semanticPositive) {
@@ -50460,6 +50492,26 @@ function* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, o
       if (checkpoint && checkpoint()) yield TASK_WORKFLOW_HASH_YIELD;
     }
     semanticWindow = capped;
+  }
+  // Source fallback: a source with no indexed chunk of its own (an email) must
+  // never be served with an empty selection. The semantic window does not
+  // depend on the lexical overlap, so when no ranked row carries a positive
+  // semantic score the top semantic rows (one per note, up to the same cap)
+  // are kept anyway: an empty selection would reach the model with no
+  // evidence at all.
+  if (!semanticWindow.length && options?.semanticWindowFallback === true && semantic.length) {
+    const fallback = [];
+    const perNote = new Map();
+    for (const entry of semantic) {
+      if (fallback.length >= semanticLimit) break;
+      const note = pathByEvidenceId.get(entry.evidenceId) || entry.evidenceId;
+      const used = perNote.get(note) || 0;
+      if (semanticNoteCap > 0 && used >= semanticNoteCap) continue;
+      perNote.set(note, used + 1);
+      fallback.push(entry);
+      if (checkpoint && checkpoint()) yield TASK_WORKFLOW_HASH_YIELD;
+    }
+    semanticWindow = fallback;
   }
 
   const unionIds = new Set();
@@ -50886,7 +50938,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
   for (const taskKey of perTaskOrder) {
     const ranking = perTaskRankings[taskKey] || {};
     const scopeId = String(ranking.scopeId || taskKey.replace(/^scope:/, ""));
-    const queryHandleEvidenceId = String(ranking.queryHandleEvidenceId || "");
+    let queryHandleEvidenceId = String(ranking.queryHandleEvidenceId || "");
     const rows = (ranking.rows || []).filter((row) => row && typeof row === "object");
     const ranked = [];
     const seenRanked = new Map();
@@ -50937,6 +50989,19 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
     }
     ranked.sort((left, right) => (right.score - left.score)
       || (left.evidenceId < right.evidenceId ? -1 : left.evidenceId > right.evidenceId ? 1 : 0));
+    // A note's query handle is its own source chunk, so the mandatory closure
+    // can always point at it. An email has no indexed source chunk: its
+    // handle is empty (a runtime query handle carries no source evidence) or
+    // a foreign indexed chunk borrowed by a lane. A handle that is not a row
+    // of this task's ranked corpus can be neither selected, nor supplemented,
+    // nor projected, so the closure must not add it: keeping it would fail a
+    // legitimate email closed with selected-catalog-supplement-missing or
+    // catalog-selected-missing. The handle is honored only when it is a real
+    // corpus row.
+    if (emailActionSelection && queryHandleEvidenceId
+      && !ranked.some((entry) => entry.evidenceId === queryHandleEvidenceId)) {
+      queryHandleEvidenceId = "";
+    }
     for (const entry of ranked) rankedCorpus.add(entry.evidenceId);
     rankedIdsByTask.set(taskKey, new Set(ranked.map((entry) => entry.evidenceId)));
     const candidateIds = [];
@@ -51001,7 +51066,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       scopeId,
       queryHandleEvidenceId
     });
-    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, { semanticNoteCap: TASK_EVIDENCE_SEMANTIC_NOTE_CAP, lexicalLimit: TASK_EVIDENCE_LEXICAL_WINDOW });
+    const scoreSelection = yield* taskWorkflowSelectScoreEvidenceSteps(checkpoint, ranked, actionText, { semanticNoteCap: TASK_EVIDENCE_SEMANTIC_NOTE_CAP, lexicalLimit: TASK_EVIDENCE_LEXICAL_WINDOW, semanticWindowFallback: emailActionSelection });
     const unionIds = [];
     const unionSeen = new Set();
     for (const evidenceId of scoreSelection.evidenceIds) {

@@ -186,6 +186,13 @@ function assertMissing(text, needle, what) {
   assert.ok(!text.includes(needle), `${what} must not survive in the cleaned text, got ${JSON.stringify(text)}`);
 }
 
+// The cleaned text must not hold the line at all: a name that also appears in
+// a header or a greeting must not fail the check.
+function assertMissingLine(text, needle, what) {
+  const lines = String(text || "").split("\n").map((line) => line.trim());
+  assert.ok(!lines.includes(needle), `${what} must not survive as a line, got ${JSON.stringify(lines)}`);
+}
+
 function main() {
   check("src/main.js exposes the email chain cleaner", () => {
     assert.equal(typeof cleanEmailChainText, "function", "src/main.js must export cleanEmailChainText");
@@ -728,6 +735,124 @@ function main() {
     const elapsed = Date.now() - started;
     assert.ok(cleaned.length > 0, "the cleaner must not empty a large body");
     assert.ok(elapsed < 1000, `a 4 MB body must clean in under 1 s, took ${elapsed} ms`);
+  });
+
+  // ---- the sign-off is removed however it is written ----------------------
+  // The request line is the same in every case: it must always survive.
+  const REQUEST = "Please send the stipend schedule by Friday.";
+
+  check("a lowercase sign-off and a lowercase name are removed", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "kind regards", "janaka"].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "kind regards", "the lowercase sign-off");
+      assertMissing(cleaned, "janaka", "the lowercase name");
+      assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
+  check("a sign-off and the name on one line are removed", () => {
+    const signoffs = ["Thanks, Alex", "Cheers - Alex", "Thanks again, Sophie T.", "Best, J."];
+    for (const signoff of signoffs) {
+      const body = ["Hi Matt,", "", REQUEST, "", signoff].join("\n");
+      for (const keepHeaders of [true, false]) {
+        const cleaned = cleanEmailChainText(body, { keepHeaders });
+        assertMissing(cleaned, signoff, `the inline sign-off ${JSON.stringify(signoff)}`);
+        assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+      }
+    }
+  });
+
+  check("an inline sign-off with a sentence after the name is kept", () => {
+    const body = ["Hi Matt,", "", REQUEST, "", "Thanks, Alex will send it tomorrow."].join("\n");
+    assertSurvivesBothLanes(body, "Thanks, Alex will send it tomorrow.", "the inline sign-off with a verb");
+    const reply = ["Hi Matt,", "", REQUEST, "", "Thanks, approved."].join("\n");
+    assertSurvivesBothLanes(reply, "Thanks, approved.", "the inline sign-off with a lower-case word");
+  });
+
+  check("a contact block without a sign-off is removed at the end of a message", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      REQUEST,
+      "",
+      "Janaka Perera",
+      "Research Coordinator",
+      "Canadian Blood Services",
+      "613-555-0110"
+    ].join("\n");
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assertMissing(cleaned, "Janaka Perera", "the contact name");
+      assertMissing(cleaned, "Research Coordinator", "the contact title");
+      assertMissing(cleaned, "Canadian Blood Services", "the organisation");
+      assert.ok(cleaned.includes(REQUEST), `the request must survive, got ${JSON.stringify(cleaned)}`);
+    }
+  });
+
+  check("prose that names a person survives the cleaner", () => {
+    assertSurvivesBothLanes("Janaka Perera will review the file.", "Janaka Perera will review the file.", "the prose sentence");
+    const attendees = ["Alex Rivera", "Sophie Tremblay", "Janaka Perera"].join("\n");
+    assertSurvivesBothLanes(attendees, "Sophie Tremblay", "the attendee list");
+    assertSurvivesBothLanes(attendees, "Janaka Perera", "the last attendee");
+  });
+
+  check("a forwarded chain loses every signature and keeps every request", () => {
+    const chain = [
+      "Hi Matt,",
+      "",
+      REQUEST,
+      "",
+      "Thanks,",
+      "Matt",
+      "",
+      "-----Original Message-----",
+      "From: Janaka Perera <janaka.perera@example.org>",
+      "Sent: Thursday, September 18, 2025 4:12 PM",
+      "To: Matt <matt@example.org>",
+      "Subject: Stipend schedule",
+      "",
+      "Hi Matt,",
+      "",
+      "Can you also send the invoice to accounting?",
+      "",
+      "Cheers - Alex",
+      "",
+      "-----Original Message-----",
+      "From: Sophie Tremblay <sophie@example.org>",
+      "Sent: Wednesday, September 17, 2025 9:02 AM",
+      "To: Matt <matt@example.org>",
+      "Subject: Re: Stipend schedule",
+      "",
+      "Hi Matt,",
+      "",
+      "We still owe the payment request reviews for two trainees.",
+      "",
+      "Please confirm by Friday.",
+      "",
+      "Janaka Perera",
+      "Research Coordinator",
+      "Canadian Blood Services",
+      "613-555-0110",
+      "janaka.perera@example.org"
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(chain, "Stipend schedule"), DEFAULT_SETTINGS);
+    for (const line of ["Thanks,", "Matt", "Cheers - Alex", "Janaka Perera", "Research Coordinator", "Canadian Blood Services", "613-555-0110", "janaka.perera@example.org"]) {
+      assertMissingLine(retrieval, line, `the signature line ${JSON.stringify(line)}`);
+    }
+    assert.ok(retrieval.includes(REQUEST), `the first request must survive, got ${JSON.stringify(retrieval)}`);
+    assert.ok(retrieval.includes("Can you also send the invoice to accounting?"), `the second request must survive, got ${JSON.stringify(retrieval)}`);
+    assert.ok(retrieval.includes("Please confirm by Friday."), `the third request must survive, got ${JSON.stringify(retrieval)}`);
+    const summary = compressSourceForTaskPrompt(buildEmailSource(chain, "Stipend schedule"), DEFAULT_SETTINGS);
+    assert.ok(summary.includes("From: Janaka Perera <janaka.perera@example.org>"), `the From header must survive for the AI, got ${JSON.stringify(summary)}`);
+    assert.ok(summary.includes("Sent: Thursday, September 18, 2025 4:12 PM"), `the Sent header must survive for the AI, got ${JSON.stringify(summary)}`);
+    assert.ok(summary.includes("Subject: Stipend schedule"), `the Subject header must survive for the AI, got ${JSON.stringify(summary)}`);
+    for (const line of ["Thanks,", "Matt", "Cheers - Alex", "Janaka Perera", "Research Coordinator", "Canadian Blood Services", "613-555-0110", "janaka.perera@example.org"]) {
+      assertMissingLine(summary, line, `the signature line ${JSON.stringify(line)}`);
+    }
+    assert.ok(summary.includes(REQUEST), `the first request must reach the AI summary, got ${JSON.stringify(summary)}`);
+    assert.ok(summary.includes("Can you also send the invoice to accounting?"), `the second request must reach the AI summary, got ${JSON.stringify(summary)}`);
+    assert.ok(summary.includes("Please confirm by Friday."), `the third request must reach the AI summary, got ${JSON.stringify(summary)}`);
   });
 
   // ---- note sources are byte-identical ------------------------------------

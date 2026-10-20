@@ -100,7 +100,8 @@ try {
   testModule._compile(
     `${mainSource}\nmodule.exports.__emailLogSummary = {\n` +
       "  DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp,\n" +
-      "  capEmailLogSummary\n" +
+      "  capEmailLogSummary, normalizeLegacySyncTags, hasSubtaskSyncMarker,\n" +
+      "  semanticExecutionEvidencePartition, semanticRetrievalChunkEligible\n" +
       "};\n",
     mainPath
   );
@@ -110,7 +111,7 @@ try {
   delete require.cache[mainPath];
 }
 
-const { DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp, capEmailLogSummary } = runtime.__emailLogSummary;
+const { DEFAULT_SETTINGS, sanitizeEmailLogSummary, parseTaskLine, formatEmailWorkflowTimestamp, capEmailLogSummary, normalizeLegacySyncTags, hasSubtaskSyncMarker, semanticExecutionEvidencePartition, semanticRetrievalChunkEligible } = runtime.__emailLogSummary;
 
 const LOG_FOLDER = DEFAULT_SETTINGS.emailLogFolder;
 const SUBJECT = "Quarterly intake form";
@@ -457,9 +458,9 @@ async function testIndexablePath() {
   assert.equal(plugin.isIndexablePath("Notes/Regular.md"), true);
   assert.equal(plugin.isIndexablePath("Semantic Todoist Sync/Prompts/prompt.md"), false);
 
-  // An explicit include list still applies to the log notes.
+  // The log folder is plugin-managed, so an include list never hides it.
   plugin.settings.indexedFolders = "Notes";
-  assert.equal(plugin.isIndexablePath(logNote), false, "an explicit include list still applies");
+  assert.equal(plugin.isIndexablePath(logNote), true, "an include list does not hide the log notes");
   assert.equal(plugin.isIndexablePath("Notes/Regular.md"), true);
   plugin.settings.indexedFolders = "";
   assert.equal(plugin.isIndexablePath(logNote), true);
@@ -467,6 +468,135 @@ async function testIndexablePath() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 6. The synced task lines stay searchable but never reach the task lane
+// ---------------------------------------------------------------------------
+async function testSyncedTaskUnitsAreMetadataOnly() {
+  const harness = makePlugin();
+  await harness.plugin.appendEmailLog({
+    subject: SUBJECT,
+    from: FROM,
+    receivedAt: RECEIVED_AT,
+    cloudflareReceivedAt: CLOUDFLARE_RECEIVED_AT,
+    sectionName: SECTION,
+    tasks: makeTasks(),
+    summary: SUMMARY
+  });
+  const notePath = Array.from(harness.files.keys())[0];
+  const noteFile = harness.files.get(notePath);
+  const chunks = harness.plugin.semanticFileChunks(notePath, noteFile, noteFile.content, { createdAt: 0, createdAtSource: "" });
+  const summaryChunk = chunks.find((chunk) => chunk.text.includes("Alex asked Dana"));
+  const taskChunk = chunks.find((chunk) => chunk.text.includes("Submit the Atlas intake form"));
+  assert.ok(summaryChunk, "expected a summary chunk");
+  assert.ok(taskChunk, "expected a synced task chunk");
+  assert.equal(summaryChunk.evidenceEligibility, "evidence", "the summary unit stays task-eligible");
+  assert.equal(taskChunk.evidenceEligibility, "metadata-only", "the synced task unit is metadata-only");
+  // Ask/chat keeps every unit of the log note.
+  for (const chunk of chunks) {
+    assert.equal(semanticRetrievalChunkEligible(chunk, { isIndexablePath: () => true }), true, `the unit must stay Ask-searchable: ${chunk.text}`);
+  }
+  // The task lane drops the synced task unit and keeps the summary unit.
+  const taskLane = semanticExecutionEvidencePartition([taskChunk], "task-generation");
+  assert.equal(taskLane.selected.length, 0, "the synced task unit must not reach the task lane");
+  assert.equal(taskLane.rejected.length, 1);
+  assert.equal(taskLane.telemetry.reasonCodes[0], "metadata-only-unit");
+  const chatLane = semanticExecutionEvidencePartition([taskChunk], "chat");
+  assert.equal(chatLane.selected.length, 1, "Ask/chat keeps the synced task unit");
+  const summaryLane = semanticExecutionEvidencePartition([summaryChunk], "task-generation");
+  assert.equal(summaryLane.selected.length, 1, "the summary unit stays task-eligible");
+  console.log("PASS the synced task lines are metadata-only and stay Ask-searchable");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Only the log folder itself can exclude the email log notes
+// ---------------------------------------------------------------------------
+async function testLogFolderExclusionRule() {
+  const harness = makePlugin();
+  const plugin = harness.plugin;
+  const logNote = `${LOG_FOLDER}/2026-10-12 - Quarterly intake form.md`;
+  // The default excluded folder is the plugin data folder, which CONTAINS the
+  // log folder: it must not hide the log notes.
+  assert.equal(plugin.settings.excludedFolders, "Semantic Todoist Sync");
+  assert.equal(plugin.isIndexablePath(logNote), true, "the plugin data folder must not hide the log notes");
+  plugin.settings.excludedFolders = "Semantic Todoist Sync, Notes";
+  assert.equal(plugin.isIndexablePath(logNote), true, "a parent folder must not hide the log notes");
+  // Listing the log folder itself hides the log notes.
+  plugin.settings.excludedFolders = LOG_FOLDER;
+  assert.equal(plugin.isIndexablePath(logNote), false, "an excluded log folder hides the log notes");
+  // A folder inside the log folder hides them too.
+  plugin.settings.excludedFolders = `${LOG_FOLDER}/Archive`;
+  assert.equal(plugin.isIndexablePath(logNote), false, "an excluded folder inside the log folder hides the log notes");
+  plugin.settings.excludedFolders = "Notes";
+  assert.equal(plugin.isIndexablePath(logNote), true);
+  plugin.settings.excludedFolders = "";
+  assert.equal(plugin.isIndexablePath(logNote), true);
+  console.log("PASS only the log folder itself can exclude the email log notes");
+}
+
+// ---------------------------------------------------------------------------
+// 8. The sanitizer strips every marker the sync parser accepts
+// ---------------------------------------------------------------------------
+async function testSummaryMarkerSanitization() {
+  const settings = Object.assign({}, DEFAULT_SETTINGS, { syncTag: "#STsync", subtaskSyncTag: "#STSubSync", noteActionMarkerTags: "#todo" });
+  const raw = [
+    "- - [ ] Submit the Atlas intake form #STsync",
+    "1.5 million forms were filed last year",
+    "- [x] Reply to Alex about the legacy tag #tdsync",
+    "Call the vendor about the addendum #tdsyncsub",
+    "Alex asked Dana to send the signed form by October 13."
+  ].join("\n");
+  const sanitized = sanitizeEmailLogSummary(raw, settings);
+  const lines = sanitized.split("\n");
+  for (const [index, line] of lines.entries()) {
+    assert.equal(/^[-*+]\s/.test(line), false, `summary line ${index} must not keep a list marker: ${line}`);
+    assert.equal(/^\[[ xX]\]/.test(line), false, `summary line ${index} must not keep a checkbox: ${line}`);
+    const normalized = normalizeLegacySyncTags(line, settings);
+    assert.equal(normalized.includes(settings.syncTag), false, `summary line ${index} must not keep a sync tag: ${line}`);
+    assert.equal(hasSubtaskSyncMarker(normalized, settings), false, `summary line ${index} must not keep a subtask tag: ${line}`);
+    assert.equal(parseTaskLine(line, index, `${LOG_FOLDER}/note.md`, lines, settings), null, `summary line ${index} must not parse as a task line: ${line}`);
+  }
+  assert.ok(sanitized.includes("1.5 million"), "a decimal number must survive");
+  assert.ok(sanitized.includes("Submit the Atlas intake form"), "the summary text must survive");
+  assert.ok(sanitized.includes("Alex asked Dana"), "the summary text must survive");
+  console.log("PASS the sanitizer strips every marker the sync parser accepts");
+}
+
+// ---------------------------------------------------------------------------
+// 9. The summary carries no contact details
+// ---------------------------------------------------------------------------
+async function testSummaryRedaction() {
+  const raw = "Alex asked Dana to reply, reachable at alex@example.com or +1 555 123 4567; the form is at https://example.com/intake?x=1.";
+  const sanitized = sanitizeEmailLogSummary(raw, DEFAULT_SETTINGS);
+  assert.equal(sanitized.includes("alex@example.com"), false, "the email address must be removed");
+  assert.equal(sanitized.includes("555 123 4567"), false, "the phone number must be removed");
+  assert.equal(sanitized.includes("example.com/intake"), false, "the URL must be removed");
+  assert.ok(sanitized.includes("Alex"), "the name must stay");
+  assert.ok(sanitized.includes("Dana"), "the name must stay");
+  console.log("PASS the summary carries no contact details");
+}
+
+// ---------------------------------------------------------------------------
+// 10. The log note stays small: the startup embed cost is bounded
+// ---------------------------------------------------------------------------
+async function testLogNoteSizeIsBounded() {
+  const harness = makePlugin();
+  await harness.plugin.appendEmailLog({
+    subject: SUBJECT,
+    from: FROM,
+    receivedAt: RECEIVED_AT,
+    cloudflareReceivedAt: CLOUDFLARE_RECEIVED_AT,
+    sectionName: SECTION,
+    tasks: makeTasks(),
+    summary: SUMMARY
+  });
+  const notePath = Array.from(harness.files.keys())[0];
+  const noteFile = harness.files.get(notePath);
+  assert.ok(noteFile.content.length < 4000, `expected a small log note, got ${noteFile.content.length} chars`);
+  const chunks = harness.plugin.semanticFileChunks(notePath, noteFile, noteFile.content, { createdAt: 0, createdAtSource: "" });
+  assert.ok(chunks.length <= 4, `expected a few chunks to embed, got ${chunks.length}`);
+  console.log("PASS the log note stays small enough for the existing embedding batches");
+}
+
 async function main() {
   await testAppendEmailLogFormat();
   await testSummarySanitization();
@@ -474,6 +604,11 @@ async function main() {
   await testSummaryFailureIsContained();
   await testDegradedIndexSkipsSummary();
   await testIndexablePath();
+  await testSyncedTaskUnitsAreMetadataOnly();
+  await testLogFolderExclusionRule();
+  await testSummaryMarkerSanitization();
+  await testSummaryRedaction();
+  await testLogNoteSizeIsBounded();
   console.log("email-log-summary-test: all checks passed");
 }
 

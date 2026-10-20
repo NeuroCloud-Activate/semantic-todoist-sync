@@ -9023,13 +9023,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const text = await this.app.vault.cachedRead(file);
         addTaskReferenceLocationsFromMarkdown(taskReferenceLocationIndex, text, file.path, this.settings, vaultBasePath(this.app), file.stat?.mtime || 0);
         const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-        const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems });
-        const fileChunks = selectedFileChunks.map((chunk, sourceIndex) => ({ chunk, sourceIndex })).filter((item) => !isSemanticNoiseChunk(item.chunk));
-        for (let index = 0; index < fileChunks.length; index += 1) {
-          const item = fileChunks[index];
-          const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
-          chunks.push({ id: `${file.path}#${index}`, path: file.path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", metadataOnly: selectedFileChunks.semanticMetadataOnlyFlags?.[item.sourceIndex] === true, evidenceEligibility: selectedFileChunks.semanticEvidenceEligibilities?.[item.sourceIndex] || "evidence", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION });
-        }
+        for (const chunk of this.semanticFileChunks(file.path, file, text, createdMeta)) chunks.push(chunk);
       }
       
       this.setSidebarStatus("Preparing task reference chunks...");
@@ -9244,10 +9238,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const included = !includeFolders.length || includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`));
     // Email log notes are the vault record of a processed email and its synced
     // tasks. They live inside the plugin data folder, which excludedFolders
-    // carries by default, so the generic folder exclusion must not hide them.
-    // An explicit include list still applies, as does the context-folder
-    // exclusion above.
-    if (isEmailLogPath(path, this.settings)) return included;
+    // carries by default, so the generic folder exclusion must not hide them:
+    // only an excludedFolders entry that names the log folder itself (or a
+    // folder inside it) excludes the log notes. A parent folder such as the
+    // plugin data folder does not. The log folder is plugin-managed, so an
+    // indexedFolders include list does not apply either; the writing
+    // context-folder exclusion above always applies.
+    if (isEmailLogPath(path, this.settings)) {
+      const logFolder = trimSlashes(this.settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder);
+      const excluded = excludeFolders.some((folder) => folder && (folder === logFolder || (logFolder && folder.startsWith(`${logFolder}/`))));
+      return !excluded;
+    }
     if (!included) return false;
     if (this.isExcludedPath(path, excludeFolders)) return false;
     return true;
@@ -9366,6 +9367,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     });
   }
 
+  // One chunking path for the whole index build: the same source text, the
+  // same unit selection and the same chunk metadata. Email log notes mark
+  // their synced task lines metadata-only, so a past email stays searchable
+  // without its task lines becoming task-generation evidence.
+  semanticFileChunks(path, file, text, createdMeta = {}) {
+    const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems, emailLog: isEmailLogPath(path, this.settings) });
+    return selectedFileChunks
+      .map((chunk, sourceIndex) => ({ chunk, sourceIndex }))
+      .filter((item) => !isSemanticNoiseChunk(item.chunk))
+      .map((item, index) => {
+        const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
+        return { id: `${path}#${index}`, path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", metadataOnly: selectedFileChunks.semanticMetadataOnlyFlags?.[item.sourceIndex] === true, evidenceEligibility: selectedFileChunks.semanticEvidenceEligibilities?.[item.sourceIndex] || "evidence", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION };
+      });
+  }
+
   async reindexFile(path, options = {}) {
     return this.withSemanticIndexOperation("reindex-file", async () => {
       const previousIndex = this.semanticIndex;
@@ -9378,14 +9394,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const text = await this.app.vault.cachedRead(file);
         const taskReferenceLocationIndex = options.locationIndex || await this.buildSemanticTaskReferenceLocationIndex();
         const createdMeta = semanticCreatedMetadataForFile(file, text, this.settings);
-        const selectedFileChunks = chunkMarkdown(semanticIndexSourceText(text), this.settings.semanticIndexMaxChunkChars, this.settings.semanticIndexMaxChunksPerNote, { maxListItems: this.settings.semanticIndexListGroupMaxItems });
-        const chunks = selectedFileChunks
-      .map((chunk, sourceIndex) => ({ chunk, sourceIndex }))
-      .filter((item) => !isSemanticNoiseChunk(item.chunk))
-      .map((item, index) => {
-        const sourceRange = selectedFileChunks.sourceLineRanges?.[item.sourceIndex] || { lineStart: 0, lineEnd: 0 };
-        return { id: `${path}#${index}`, path, title: file.basename, text: item.chunk, section: selectedFileChunks.sourceSections?.[item.sourceIndex] || "", semanticUnitKind: selectedFileChunks.semanticUnitKinds?.[item.sourceIndex] || "paragraph", metadataOnly: selectedFileChunks.semanticMetadataOnlyFlags?.[item.sourceIndex] === true, evidenceEligibility: selectedFileChunks.semanticEvidenceEligibilities?.[item.sourceIndex] || "evidence", lineStart: sourceRange.lineStart, lineEnd: sourceRange.lineEnd, modifiedAt: file.stat?.mtime || 0, createdAt: createdMeta.createdAt, createdAtSource: createdMeta.createdAtSource, selectionTelemetry: selectedFileChunks.selectionTelemetry || null, embeddingContentVersion: SEMANTIC_EMBEDDING_CONTENT_VERSION };
-      });
+        const chunks = this.semanticFileChunks(path, file, text, createdMeta);
         const taskReferenceChunks = this.semanticTaskReferenceChunks("", taskReferenceLocationIndex);
         chunks.push(...taskReferenceChunks);
         if (semanticPathChunksMatch(this.semanticIndex, path, chunks, this.settings)) {
@@ -24618,7 +24627,7 @@ const SETTING_DESCRIPTIONS = {
   workerUrl: "Required only for Email-To-Todoist. This is the HTTPS URL of your Cloudflare Worker queue.",
   workerToken: "Required only for Email-To-Todoist. This shared secret authorizes Obsidian to read queued emails from your Worker.",
   indexedFolders: "Optional comma-separated folder list. Leave blank to index the whole vault except excluded folders.",
-  excludedFolders: "Folders ignored by semantic indexing and vault search. Note task sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist.",
+  excludedFolders: "Folders ignored by semantic indexing and vault search. Note task sync also skips these folders except for the Email-To-Todoist log folder, which remains syncable so generated email task notes can update from Todoist. Email log notes stay searchable unless their own folder is listed here: a parent folder such as the plugin data folder does not exclude them.",
   excludedLinkDomains: "Comma-separated web domains omitted from AI prompts and Todoist descriptions.",
   embeddingBatchSize: "How many note chunks are embedded per API batch. Larger values can be faster but heavier.",
   semanticIndexMaxChunkChars: "Approximate size of each note chunk before embedding.",
@@ -33300,7 +33309,7 @@ function semanticIndexSourceText(text = "") {
 }
 
 function chunkMarkdown(text, maxChars = 900, maxChunks = 12, options = {}) {
-  const atomicUnits = semanticMarkdownCoherentUnits(text);
+  const atomicUnits = semanticMarkdownCoherentUnits(text, options);
   const units = coalesceSemanticIndexUnits(atomicUnits, maxChars, options);
   const selectedUnits = selectSemanticIndexUnits(units, maxChunks);
   const chunks = [];
@@ -33339,7 +33348,7 @@ function chunkMarkdown(text, maxChars = 900, maxChunks = 12, options = {}) {
   return chunks;
 }
 
-function semanticMarkdownCoherentUnits(text = "") {
+function semanticMarkdownCoherentUnits(text = "", options = {}) {
   const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
   let frontmatterEnd = -1;
   if (lines[0]?.trim() === "---") {
@@ -33356,12 +33365,17 @@ function semanticMarkdownCoherentUnits(text = "") {
   let listGroup = 0;
   let sectionGroup = 0;
   let previousKind = "";
+  // Depth of the email log note's "Synced Todoist Tasks" heading, 0 when the
+  // unit is not inside that section. Those units are already synced to
+  // Todoist: they stay searchable, but they must never reach the task
+  // generator as evidence.
+  let emailLogTaskSection = 0;
   const headingContext = () => headings.filter(Boolean).join("\n");
   const appendUnit = (value, lineStart, lineEnd, kind = "paragraph", metadata = {}) => {
     const rawValue = String(value || "");
     const normalized = metadata.preserveExact === true ? rawValue : rawValue.trim();
     if (!normalized) return;
-    units.push(Object.assign({ text: normalized, lineStart, lineEnd, kind, headingContext: headingContext(), mandatory: kind === "action", atomicUnitCount: 1 }, metadata));
+    units.push(Object.assign({ text: normalized, lineStart, lineEnd, kind, headingContext: headingContext(), mandatory: kind === "action", atomicUnitCount: 1 }, emailLogTaskSection && !metadata.evidenceEligibility ? { evidenceEligibility: "metadata-only" } : {}, metadata));
     previousKind = kind;
   };
   const flushPending = () => {
@@ -33393,6 +33407,8 @@ function semanticMarkdownCoherentUnits(text = "") {
       const level = heading[1].length;
       headings.length = level;
       headings[level - 1] = `${heading[1]} ${heading[2]}`;
+      if (options.emailLog === true && /^synced todoist tasks$/i.test(String(heading[2] || "").trim())) emailLogTaskSection = level;
+      else if (emailLogTaskSection && level <= emailLogTaskSection) emailLogTaskSection = 0;
       sectionGroup += 1;
       listGroup += 1;
       blankRun = 0;
@@ -55441,24 +55457,59 @@ function capEmailLogSummary(text, maxChars = EMAIL_LOG_SUMMARY_MAX_CHARS) {
   const cut = sentenceEnd > 0 ? sentenceEnd + 1 : head.lastIndexOf(" ");
   return `${(cut > 0 ? head.slice(0, cut) : head).trim()}...`;
 }
+// Every marker the note sync parser accepts: the configured sync tags, the
+// configured note-action tags and the legacy tags that
+// normalizeLegacySyncTags and hasSubtaskSyncMarker still recognise.
+const LEGACY_SYNC_MARKER_TAGS = Object.freeze(["#tdsync", "#tdsyncsub"]);
+function emailLogSummaryMarkerTags(settings = DEFAULT_SETTINGS) {
+  return uniqueValues([settings?.syncTag, settings?.subtaskSyncTag, ...noteActionMarkerTags(settings), ...LEGACY_SYNC_MARKER_TAGS]
+    .map((marker) => String(marker || "").trim())
+    .filter(Boolean));
+}
+// List and checkbox markers can stack ("- - [ ] x"), so they are stripped
+// until the line stops changing. A numbered marker needs its trailing space so
+// "1.5 million" keeps its digits.
+function stripEmailLogSummaryMarkers(line, markers = []) {
+  let next = String(line || "");
+  next = next.replace(/^(?:[-*+]|\d+[.)])\s+/, "");
+  next = next.replace(/^\[[ xX]\]\s*/, "");
+  for (const marker of markers) {
+    next = next.replace(new RegExp(`${escapeRegExp(marker)}(?![\\w/-])`, "gi"), "");
+  }
+  return next.trim();
+}
+// The summary is written from an email, so it can carry contact details the
+// log note must not keep: addresses, phone numbers and links go, names stay.
+function redactEmailLogSummaryContactDetails(text) {
+  let value = String(text || "");
+  value = value.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "");
+  value = value.replace(/\bhttps?:\/\/[^\s<>"]*[^\s<>".,;:!?()[\]]/gi, "");
+  value = value.replace(/\bwww\.[^\s<>"]*[^\s<>".,;:!?()[\]]/gi, "");
+  value = value.replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3,4}[\s.-]?\d{4}\b/g, "");
+  value = value.replace(/\b\d{10}\b/g, "");
+  return value.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([,.;:!?])/g, "$1").trim();
+}
 // The log note is a vault note: the note sync and the semantic index read it
-// back. Strip leading list/checkbox markers and every configured sync or
-// action tag so a summary can never be read back as a task line.
+// back. Strip leading list/checkbox markers and every marker the sync parser
+// accepts so a summary can never be read back as a task line, and drop the
+// contact details an email carries.
 function sanitizeEmailLogSummary(summary, settings = DEFAULT_SETTINGS) {
   const text = String(summary || "").replace(/\r\n?/g, "\n").trim();
   if (!text) return "";
-  const markers = [settings?.syncTag, settings?.subtaskSyncTag, ...noteActionMarkerTags(settings)]
-    .map((marker) => String(marker || "").trim())
-    .filter(Boolean);
+  const markers = emailLogSummaryMarkerTags(settings);
   const lines = [];
   for (const raw of text.split("\n")) {
-    let line = raw.trim().replace(/^(?:[-*+]|\d+[.)])\s*(?:\[[ xX]\]\s*)?/, "");
-    for (const marker of markers) line = line.replace(new RegExp(escapeRegExp(marker), "gi"), "");
+    let line = raw.trim();
+    for (let pass = 0; pass < 6; pass += 1) {
+      const next = stripEmailLogSummaryMarkers(line, markers);
+      if (next === line) break;
+      line = next;
+    }
     line = line.trim();
-    if (!line || /^[-*]\s+\[[ xX]\]/.test(line)) continue;
+    if (!line) continue;
     lines.push(line);
   }
-  return lines.join("\n").trim();
+  return redactEmailLogSummaryContactDetails(lines.join("\n").trim());
 }
 function sectionKey(name) { return singleLine(name).toLowerCase(); }
 

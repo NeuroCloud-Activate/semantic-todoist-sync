@@ -55655,11 +55655,12 @@ function emailLogSummaryMarkerTags(settings = DEFAULT_SETTINGS) {
     .filter(Boolean));
 }
 // List and checkbox markers can stack ("- - [ ] x"), so they are stripped
-// until the line stops changing. A numbered marker needs its trailing space so
+// until the line stops changing. A numbered marker needs one to three digits
+// and its trailing space, so "2026. The budget..." keeps its year and
 // "1.5 million" keeps its digits.
 function stripEmailLogSummaryMarkers(line, markers = []) {
   let next = String(line || "");
-  next = next.replace(/^(?:[-*+]|\d+[.)])\s+/, "");
+  next = next.replace(/^(?:[-*+]|\d{1,3}[.)])\s+/, "");
   next = next.replace(/^\[[ xX]\]\s*/, "");
   for (const marker of markers) {
     next = next.replace(new RegExp(`${escapeRegExp(marker)}(?![\\w/-])`, "gi"), "");
@@ -55668,13 +55669,36 @@ function stripEmailLogSummaryMarkers(line, markers = []) {
 }
 // The summary is written from an email, so it can carry contact details the
 // log note must not keep: addresses, phone numbers and links go, names stay.
+// A phone number is redacted only when it has the shape of one: separated
+// digit groups in a 3-3-4 layout, an optional country code in front of them,
+// or the 2-4-4 layout a country code plus a national number uses. A bare digit
+// run is not a phone number and stays, and the group never starts inside one.
+const EMAIL_LOG_SUMMARY_PHONE_RE = /(?<!\d)(?:\+\d{1,3}[\s.-]?|\d{1,3}[\s.-])?(?:\(\d{3}\)[\s.-]?|\d{3}[\s.-])\d{3}[\s.-]\d{4}/g;
+const EMAIL_LOG_SUMMARY_PHONE_COUNTRY_CODE_RE = /\+\d{1,3}[\s.-]?\d{2}[\s.-]\d{4}[\s.-]\d{4}/g;
+// A candidate inside a word that carries a letter is an identifier, not a
+// phone number, so it stays: NIH-R01-2026-0012345 and x613-555-0110.
+function isEmailLogSummaryPhoneIdentifier(text, start, end) {
+  let from = start;
+  let to = end;
+  while (from > 0 && /[A-Za-z0-9+-]/.test(text[from - 1])) from -= 1;
+  while (to < text.length && /[A-Za-z0-9+-]/.test(text[to])) to += 1;
+  return /[A-Za-z]/.test(text.slice(from, to));
+}
+function redactEmailLogSummaryPhoneNumbers(text) {
+  let value = String(text || "");
+  for (const pattern of [EMAIL_LOG_SUMMARY_PHONE_COUNTRY_CODE_RE, EMAIL_LOG_SUMMARY_PHONE_RE]) {
+    value = value.replace(pattern, (match, offset, whole) => (
+      isEmailLogSummaryPhoneIdentifier(whole, offset, offset + match.length) ? match : ""
+    ));
+  }
+  return value;
+}
 function redactEmailLogSummaryContactDetails(text) {
   let value = String(text || "");
   value = value.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "");
   value = value.replace(/\bhttps?:\/\/[^\s<>"]*[^\s<>".,;:!?()[\]]/gi, "");
   value = value.replace(/\bwww\.[^\s<>"]*[^\s<>".,;:!?()[\]]/gi, "");
-  value = value.replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3,4}[\s.-]?\d{4}\b/g, "");
-  value = value.replace(/\b\d{10}\b/g, "");
+  value = redactEmailLogSummaryPhoneNumbers(value);
   return value.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([,.;:!?])/g, "$1").trim();
 }
 // The log note is a vault note: the note sync and the semantic index read it

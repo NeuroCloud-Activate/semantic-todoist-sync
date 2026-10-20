@@ -576,6 +576,63 @@ async function testSummaryRedaction() {
 }
 
 // ---------------------------------------------------------------------------
+// 9b. A phone number is redacted only when it looks like one
+// ---------------------------------------------------------------------------
+async function testSummaryRedactionOnlyForPhoneShapes() {
+  const redacted = [
+    { raw: "+1 613-555-0110", expected: "" },
+    { raw: "(613) 555-0110", expected: "" },
+    { raw: "613-555-0110", expected: "" },
+    { raw: "613.555.0110", expected: "" },
+    { raw: "1-800-555-0199", expected: "" },
+    { raw: "+44 20 7946 0958", expected: "" },
+    { raw: "Phone: 613 555 0110", expected: "Phone:" }
+  ];
+  for (const { raw, expected } of redacted) {
+    const sanitized = sanitizeEmailLogSummary(raw, DEFAULT_SETTINGS);
+    assert.equal(sanitized, expected, `the phone number must be removed: ${raw} -> ${sanitized}`);
+  }
+  // Numbers that only look like a phone number stay: the summary must not lose
+  // identifiers, amounts, dates and reference numbers.
+  const kept = [
+    "Grant ID NIH-R01-2026-0012345",
+    "NIH-R01-2026-001-2345",
+    "x613-555-0110",
+    "Order 1234 5678 9012",
+    "Invoice 1234567890",
+    "$1,250,000",
+    "$125000",
+    "2026-2027",
+    "2026-07-14",
+    "12/25/2026",
+    "1.5 million"
+  ];
+  for (const raw of kept) {
+    const sanitized = sanitizeEmailLogSummary(raw, DEFAULT_SETTINGS);
+    assert.equal(sanitized, raw, `the number must survive: ${raw} -> ${sanitized}`);
+  }
+  console.log("PASS a phone number is redacted only when it looks like one");
+}
+
+// ---------------------------------------------------------------------------
+// 9c. A four digit prefix is a year, not a list marker
+// ---------------------------------------------------------------------------
+async function testSummaryNumberedMarkerKeepsFourDigitPrefix() {
+  const kept = sanitizeEmailLogSummary("2026. The budget was approved.", DEFAULT_SETTINGS);
+  assert.equal(kept, "2026. The budget was approved.", "a year prefix must survive");
+  const stripped = sanitizeEmailLogSummary("1. Send it", DEFAULT_SETTINGS);
+  assert.equal(stripped, "Send it", "a list marker must be stripped");
+  const decimal = sanitizeEmailLogSummary("1.5 million", DEFAULT_SETTINGS);
+  assert.equal(decimal, "1.5 million", "a decimal number must survive");
+  // A kept prefix must still never read back as a task line.
+  const lines = kept.split("\n");
+  for (const [index, line] of lines.entries()) {
+    assert.equal(parseTaskLine(line, index, `${LOG_FOLDER}/note.md`, lines, DEFAULT_SETTINGS), null, `summary line ${index} must not parse as a task line: ${line}`);
+  }
+  console.log("PASS a four digit prefix is a year, not a list marker");
+}
+
+// ---------------------------------------------------------------------------
 // 10. The log note stays small: the startup embed cost is bounded
 // ---------------------------------------------------------------------------
 async function testLogNoteSizeIsBounded() {
@@ -608,6 +665,8 @@ async function main() {
   await testLogFolderExclusionRule();
   await testSummaryMarkerSanitization();
   await testSummaryRedaction();
+  await testSummaryRedactionOnlyForPhoneShapes();
+  await testSummaryNumberedMarkerKeepsFourDigitPrefix();
   await testLogNoteSizeIsBounded();
   console.log("email-log-summary-test: all checks passed");
 }

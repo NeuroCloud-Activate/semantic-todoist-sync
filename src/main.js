@@ -33115,12 +33115,55 @@ function cleanupEmailText(text) {
 const EMAIL_HEADER_LINE_RE = /^(?:from|sent|date|to|cc|bcc|reply-to|subject|forwarded by|original email received|forward received by cloudflare)\s*:/i;
 const EMAIL_CHAIN_BOUNDARY_RE = /^(?:-{2,}\s*(?:original message|forwarded message)\s*-{2,}|begin forwarded message:|on\s+.{1,200}\bwrote:)\s*$/i;
 const EMAIL_SIGNATURE_SEPARATOR_RE = /^--\s?$/;
+const EMAIL_SEPARATOR_LINE_RE = /^[\s_\-=*~]{2,}$/;
 const EMAIL_MOBILE_SIGNATURE_RE = /^(?:sent from (?:my )?(?:iphone|ipad|android|phone|mobile|device)\b.*|get outlook for (?:ios|android)\b.*|download the outlook mobile app\b.*)$/i;
-const EMAIL_SIGNOFF_RE = /^(?:thanks?|thank you|many thanks|thank you so much|best(?: wishes)?|kind regards|best regards|warm regards|regards|sincerely|yours(?: sincerely| faithfully)?|cheers|talk soon|appreciate it)[,!.]?$/i;
+const EMAIL_SIGNOFF_RE = /^(?:thanks?|thank you|many thanks|thank you so much|best(?: wishes)?|kind regards|best regards|warm regards|regards|sincerely|yours(?: sincerely| faithfully)?|cheers|talk soon|appreciate it|cordialement|merci|bien\s+à\s+vous|salutations|saludos|atentamente|mit\s+freundlichen\s+grüßen|viele\s+grüße)\s*[,!.]?$/i;
 const EMAIL_DISCLAIMER_RE = /\b(?:confidential|legally privileged|privileged and confidential|intended\s+(?:only|solely)\s+for|if\s+you\s+(?:are\s+not\s+the\s+intended|have\s+received\s+this)|disclaimer|unauthori[sz]ed\s+(?:use|disclosure|review|recipient|access)|please\s+notify\s+the\s+sender|virus|this\s+e-?mail\s+and\s+any\s+attachments|think\s+before\s+you\s+print|caution\s*:\s*this\s+email\s+originated\s+from\s+outside)/i;
-const EMAIL_DISCLAIMER_ACTION_RE = /\b(?:please\s+(?:review|send|confirm|respond|reply|complete|approve|sign|fill|submit|pay|update|prepare)|can\s+you|could\s+you|will\s+you|need\s+you\s+to|you\s+must|we\s+need\s+you|action\s+required|due\s+by|deadline|asap)\b/i;
 const EMAIL_ACTION_REQUEST_RE = /\b(?:please|kindly|need(?:s|ed)?\s+(?:you|us)|must|should|can\s+you|could\s+you|would\s+you|will\s+you|shall|let\s+me\s+know|feel\s+free\s+to|action\s+required|deadline|due\s+by|asap|urgent|review|send|confirm|respond|reply|complete|follow[- ]?up|update|prepare|draft|finali[sz]e|decide|approve|coordinate|sign\s+off|submit|attach|advise)\b/i;
+// A request asks the reader to do something: a question, a polite request or
+// an affirmative imperative sentence.
+const EMAIL_IMPERATIVE_RE = /^(?:please\s+|kindly\s+|do\s+not\s+forget\s+to\s+|don't\s+forget\s+to\s+)?(?:delete|disregard|ignore|remove|send|forward|reply|respond|review|confirm|check|verify|ensure|provide|complete|submit|update|prepare|draft|decide|approve|sign|pay|attach|fill|read|download|call|contact|note|remember|consider|arrange|schedule|book|return|keep|share|be\s+sure|make\s+sure)\b/i;
+// A legal notice asks the reader to delete the mail or to notify the sender.
+// It is boilerplate, never a request to act on the task.
+const EMAIL_DISCLAIMER_NOTICE_RE = /^(?:if\s+you\s+(?:are\s+not\s+the\s+intended\s+recipient|have\s+received\s+this\b)[^.]*|please\s+notify\s+the\s+sender\b[^.]*|(?:please\s+)?delete\s+this\s+(?:e-?mail|message)\b[^.]*)/i;
+// A sentence boundary inside a paragraph: the punctuation, the whitespace and
+// the capital letter that starts the next sentence.
+const EMAIL_SENTENCE_SPLIT_RE = /((?<=[.!?])\s+(?=["'(\[]*[A-Z0-9]))/;
+// Gmail writes its quote marker on two lines: "On <date> <author>" and then
+// "<author@example.com> wrote:".
+const EMAIL_GMAIL_QUOTE_HEADER_RE = /^on\s+\S/i;
+const EMAIL_GMAIL_QUOTE_END_RE = /^(?:<[^>]+>|[^\s@]+@[^\s@]+)\s+wrote:?\s*$/i;
+const EMAIL_GMAIL_QUOTE_ADDRESS_RE = /^(?:<[^>]+>|[^\s@]+@[^\s@]+)$/;
+// An external-sender banner: the lead-in marker or the advice line itself.
+const EMAIL_BANNER_MARKER_RE = /^\s*(?:\[\s*(?:external|external\s+sender|caution|warning|spam|phishing|automated|secure|verified|notice|attention|confidential)\s*\]|(?:caution|warning|alert|external\s+sender|external\s+email|attention|notice|important)\s*:)\s*/i;
+const EMAIL_BANNER_BODY_RE = /\b(?:this\s+(?:e-?mail|message)\s+(?:originated\s+(?:from|outside)|was\s+sent\s+from\s+outside)|do\s+not\s+(?:click|open|respond\s+to|reply\s+to)|verify\s+the\s+sender|be\s+wary)\b/i;
+// The contact footer that follows a signature: an address row, a postal
+// address, a phone or fax line and a bare e-mail or web address.
+const EMAIL_FOOTER_MAIL_RE = /^\s*[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\s*$/;
+const EMAIL_FOOTER_LINK_RE = /^\s*(?:https?:\/\/|www\.)\S+\s*$/i;
+const EMAIL_FOOTER_PHONE_RE = /^\s*(?:(?:tel(?:ephone)?|fax|phone|mobile|cell|t|f|p)\s*[.:]?\s*)?[+()\d][\d\s().+-]{5,}\d\s*$/i;
+const EMAIL_STREET_RE = /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|court|ct|crescent|place|pl|way|suite|ste|floor|fl|tower|parkway|pkwy|terrace|highway|hwy|square|sq|route|rte)\b/i;
+const EMAIL_POSTAL_CODE_RE = /\b(?:[A-Z]\d[A-Z]\s?\d[A-Z]\d|[A-Z]{1,2}\d{1,2}\s?\d[A-Z]{2}|\d{5}(?:-\d{4})?)\b/;
 const EMAIL_SIGNATURE_STOP_WORDS = new Set(["i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "our", "your", "my", "me", "us", "them", "if", "when", "while", "but", "and", "or", "so", "let", "please", "any", "all", "some", "no", "not", "do", "does", "did", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has", "had", "the", "a", "an", "as", "at", "by", "in", "on", "to", "of", "for", "from", "with", "without", "after", "before", "since", "until", "about", "over", "under", "again", "also", "because", "there", "here", "what", "which", "who", "how", "why", "is", "are", "was", "were", "be", "been", "being", "am", "hi", "hello", "hey", "cheers", "best"]);
+
+// The Gmail quote marker can span two lines: "On <date> <author>" and then
+// "<author@example.com> wrote:". The number of lines it takes, 0 when the
+// line does not open a quoted message.
+function emailGmailQuoteMarkerLength(lines, index) {
+  const first = String(lines[index] || "").trim();
+  if (!EMAIL_GMAIL_QUOTE_HEADER_RE.test(first)) return 0;
+  if (/wrote:/i.test(first)) return 0;
+  for (let offset = 1; offset <= 2; offset += 1) {
+    const line = String(lines[index + offset] || "").trim();
+    if (!line) continue;
+    if (EMAIL_GMAIL_QUOTE_END_RE.test(line)) return offset + 1;
+    if (/^wrote:?\s*$/i.test(line)) return offset + 1;
+    // The address and the "wrote:" can also sit on two separate lines.
+    if (offset === 1 && EMAIL_GMAIL_QUOTE_ADDRESS_RE.test(line)) continue;
+    return 0;
+  }
+  return 0;
+}
 
 // Line indexes where a new message starts inside an email chain: a forwarded
 // block rule, an Apple "Begin forwarded message:" rule, a Gmail "On ... wrote:"
@@ -33131,6 +33174,7 @@ function emailChainSegmentStartIndexes(lines) {
   for (let index = 1; index < lines.length; index += 1) {
     const line = String(lines[index] || "");
     if (EMAIL_CHAIN_BOUNDARY_RE.test(line.trim())) { starts.push(index); continue; }
+    if (emailGmailQuoteMarkerLength(lines, index)) { starts.push(index); continue; }
     if (/^from:\s*/i.test(line) && /(?:^|\n)(?:sent|date):/i.test(lines.slice(index + 1, index + 8).join("\n"))) starts.push(index);
   }
   return starts;
@@ -33184,17 +33228,90 @@ function emailSignatureBlockLength(lines, start) {
   return 1;
 }
 
-function emailDisclaimerParagraph(paragraph) {
-  const text = paragraph.join("\n");
-  if (!EMAIL_DISCLAIMER_RE.test(text)) return false;
-  if (EMAIL_DISCLAIMER_ACTION_RE.test(text)) return false;
-  const lines = paragraph.map((line) => String(line || "").trim()).filter(Boolean);
-  if (!lines.length) return false;
-  return EMAIL_DISCLAIMER_RE.test(lines[0]) || lines.every((line) => EMAIL_DISCLAIMER_RE.test(line));
+// A request asks the reader to do something. A prohibition ("do not click
+// links") and a legal notice are not requests.
+function emailRequestText(text) {
+  const value = String(text || "");
+  if (!value.trim()) return false;
+  if (EMAIL_ACTION_REQUEST_RE.test(value)) return true;
+  if (EMAIL_IMPERATIVE_RE.test(value.trim())) return true;
+  return value.includes("?");
 }
 
-// Drops the blank-line-delimited disclaimer paragraphs only; every other
-// paragraph (and every request inside one) survives.
+function emailDisclaimerNotice(text) {
+  return EMAIL_DISCLAIMER_NOTICE_RE.test(String(text || "").trim());
+}
+
+// A contact footer: a company/address row, a postal address, a phone or fax
+// line and a bare e-mail or web address.
+function emailFooterLine(value) {
+  const text = String(value || "").trim();
+  if (!text || text.length > 200) return false;
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(text)) return false;
+  if (EMAIL_FOOTER_MAIL_RE.test(text)) return true;
+  if (EMAIL_FOOTER_LINK_RE.test(text)) return true;
+  if (EMAIL_FOOTER_PHONE_RE.test(text)) return true;
+  if (EMAIL_STREET_RE.test(text) && EMAIL_POSTAL_CODE_RE.test(text)) return true;
+  if (text.includes("|") && (text.split("|").length >= 3 || EMAIL_STREET_RE.test(text) || EMAIL_POSTAL_CODE_RE.test(text) || /\d{3}/.test(text))) return true;
+  return false;
+}
+
+// Lines that carry no request and are pure noise: rules, external-sender
+// banners and contact footers. A request always survives.
+function removeEmailNoiseLines(lines) {
+  const output = [];
+  for (const line of lines) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) { output.push(line); continue; }
+    if (EMAIL_SEPARATOR_LINE_RE.test(trimmed)) continue;
+    if (EMAIL_BANNER_MARKER_RE.test(line)) {
+      if (!emailRequestText(trimmed)) continue;
+      output.push(line.replace(EMAIL_BANNER_MARKER_RE, ""));
+      continue;
+    }
+    if (emailRequestText(trimmed)) { output.push(line); continue; }
+    if (EMAIL_BANNER_BODY_RE.test(trimmed)) continue;
+    if (emailFooterLine(trimmed)) continue;
+    output.push(line);
+  }
+  return output;
+}
+
+// Splits a paragraph into sentences. Every sentence keeps the whitespace that
+// follows it so the line structure of the paragraph survives.
+function splitEmailSentences(text) {
+  const parts = String(text || "").split(EMAIL_SENTENCE_SPLIT_RE);
+  const sentences = [];
+  for (let index = 0; index < parts.length; index += 2) {
+    sentences.push({ text: parts[index], separator: parts[index + 1] || "" });
+  }
+  return sentences;
+}
+
+// Drops the disclaimer sentences only. A disclaimer sentence that carries a
+// request survives, so a request is never lost.
+function removeEmailDisclaimerSentences(paragraph) {
+  const text = paragraph.join("\n");
+  if (!EMAIL_DISCLAIMER_RE.test(text)) return paragraph;
+  const kept = [];
+  let dropped = 0;
+  for (const sentence of splitEmailSentences(text)) {
+    const isDisclaimer = EMAIL_DISCLAIMER_RE.test(sentence.text);
+    if (isDisclaimer && (emailDisclaimerNotice(sentence.text) || !emailRequestText(sentence.text))) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(sentence);
+  }
+  if (!dropped) return paragraph;
+  if (!kept.length) return [];
+  const result = kept.map((sentence) => sentence.text + sentence.separator).join("").replace(/\s+$/, "");
+  return result ? result.split("\n") : [];
+}
+
+// Drops the blank-line-delimited disclaimer paragraphs and the disclaimer
+// sentences inside a paragraph that also holds content; every other paragraph
+// (and every request inside one) survives.
 function removeEmailDisclaimerParagraphs(lines) {
   const output = [];
   let index = 0;
@@ -33209,11 +33326,13 @@ function removeEmailDisclaimerParagraphs(lines) {
       blanks.push(lines[index]);
       index += 1;
     }
-    if (paragraph.length && emailDisclaimerParagraph(paragraph)) {
-      output.push(...blanks);
+    if (paragraph.length) {
+      const kept = removeEmailDisclaimerSentences(paragraph);
+      if (kept.length) for (const line of kept) output.push(line);
+      for (const line of blanks) output.push(line);
       continue;
     }
-    output.push(...paragraph, ...blanks);
+    for (const line of blanks) output.push(line);
   }
   return output;
 }
@@ -33238,6 +33357,10 @@ function cleanEmailChainSegment(lines, keepHeaders) {
     if (EMAIL_SIGNATURE_SEPARATOR_RE.test(trimmed)) break;
     if (EMAIL_MOBILE_SIGNATURE_RE.test(trimmed)) { cursor += 1; continue; }
     if (!keepHeaders && EMAIL_CHAIN_BOUNDARY_RE.test(trimmed)) { cursor += 1; continue; }
+    if (!keepHeaders) {
+      const marker = emailGmailQuoteMarkerLength(body, cursor);
+      if (marker) { cursor += marker; continue; }
+    }
     if (EMAIL_SIGNOFF_RE.test(trimmed)) {
       const consumed = emailSignatureBlockLength(body, cursor);
       if (consumed > 0) { cursor += consumed; continue; }
@@ -33245,7 +33368,7 @@ function cleanEmailChainSegment(lines, keepHeaders) {
     kept.push(line);
     cursor += 1;
   }
-  return removeEmailDisclaimerParagraphs(kept);
+  return removeEmailDisclaimerParagraphs(removeEmailNoiseLines(kept));
 }
 
 // The one email-specific step of the shared pipeline: clean the chain so the

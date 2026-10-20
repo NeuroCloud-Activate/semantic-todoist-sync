@@ -545,6 +545,133 @@ function main() {
     assert.ok(cleaned.includes("- Send the vendor addendum"), `the list item must survive, got ${JSON.stringify(cleaned)}`);
   });
 
+  // ---- the line rules must never eat real content -------------------------
+  // Every line of real content must survive BOTH lanes: the AI summary
+  // (keepHeaders: true) and the retrieval text (keepHeaders: false).
+  const assertSurvivesBothLanes = (body, needle, what) => {
+    for (const keepHeaders of [true, false]) {
+      const cleaned = cleanEmailChainText(body, { keepHeaders });
+      assert.ok(cleaned.includes(needle), `${what} must survive with keepHeaders=${keepHeaders}, got ${JSON.stringify(cleaned)}`);
+    }
+  };
+
+  check("a markdown table row is never a contact footer", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "| Book the venue for Friday | Alex |",
+      "| Renegotiate the rate | Alex |",
+      "| Sign the addendum | Alex |",
+      "| Item | Qty |",
+      "Total | 500"
+    ].join("\n");
+    assertSurvivesBothLanes(body, "| Book the venue for Friday | Alex |", "the table row with the venue request");
+    assertSurvivesBothLanes(body, "| Renegotiate the rate | Alex |", "the table row with the rate request");
+    assertSurvivesBothLanes(body, "| Sign the addendum | Alex |", "the table row with the addendum request");
+    assertSurvivesBothLanes(body, "| Item | Qty |", "the table header row");
+    assertSurvivesBothLanes(body, "Total | 500", "the total row");
+  });
+
+  check("a markdown table header row above a table rule is never a contact footer", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Booking Contact | 613-555-0110",
+      "|---|---|"
+    ].join("\n");
+    assertSurvivesBothLanes(body, "Booking Contact | 613-555-0110", "the table header row");
+  });
+
+  check("a pipe footer with an organisation and a contact detail is still dropped", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Please review the draft.",
+      "",
+      "Canadian Blood Services | 613-232-5555"
+    ].join("\n");
+    const retrieval = sourceContractSourceText(buildEmailSource(body), DEFAULT_SETTINGS);
+    assertMissing(retrieval, "Canadian Blood Services", "the organisation footer");
+    assertMissing(retrieval, "613-232-5555", "the phone footer");
+    assert.ok(retrieval.includes("Please review the draft."), `the request must survive, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a plain lead-in line is not an external-sender banner", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Important: the venue changed to 5 PM on Friday.",
+      "Notice: parking is on the third floor.",
+      "Attention: the contract expires on Monday.",
+      "Warning: the file is corrupted.",
+      "Caution: the invoice total differs from the quote."
+    ].join("\n");
+    assertSurvivesBothLanes(body, "Important: the venue changed to 5 PM on Friday.", "the Important lead-in");
+    assertSurvivesBothLanes(body, "Notice: parking is on the third floor.", "the Notice lead-in");
+    assertSurvivesBothLanes(body, "Attention: the contract expires on Monday.", "the Attention lead-in");
+    assertSurvivesBothLanes(body, "Warning: the file is corrupted.", "the Warning lead-in");
+    assertSurvivesBothLanes(body, "Caution: the invoice total differs from the quote.", "the Caution lead-in");
+  });
+
+  check("a banner advice line that stands alone is not a banner", () => {
+    const body = [
+      "Hi Matt,",
+      "",
+      "Do not open the attachment until Friday.",
+      "This message originated from the shared inbox.",
+      "Be wary of the attachment."
+    ].join("\n");
+    assertSurvivesBothLanes(body, "Do not open the attachment until Friday.", "the attachment instruction");
+    assertSurvivesBothLanes(body, "This message originated from the shared inbox.", "the shared-inbox sentence");
+    assertSurvivesBothLanes(body, "Be wary of the attachment.", "the wary sentence");
+  });
+
+  check("a disclaimer-only body leaves the search text without the headers", () => {
+    const source = buildEmailSource("This email and any attachments are confidential and may be legally privileged.");
+    const retrieval = sourceContractSourceText(source, DEFAULT_SETTINGS);
+    assertMissing(retrieval, "confidential", "the disclaimer body");
+    assertMissing(retrieval, "From:", "the From header");
+    assertMissing(retrieval, "Subject:", "the Subject header");
+    assert.equal(retrieval, SUBJECT, "the search text falls back to the subject");
+    const summary = compressSourceForTaskPrompt(source, DEFAULT_SETTINGS);
+    assert.ok(summary.length > 0, "the AI lane must never be empty");
+  });
+
+  check("a signature-only body leaves the search text without the headers", () => {
+    const source = buildEmailSource("Thanks,\nMatt SeeGobin");
+    const retrieval = sourceContractSourceText(source, DEFAULT_SETTINGS);
+    assertMissing(retrieval, "Matt SeeGobin", "the signature name");
+    assertMissing(retrieval, "From:", "the From header");
+    assertMissing(retrieval, "Subject:", "the Subject header");
+    assert.equal(retrieval, SUBJECT, "the search text falls back to the subject");
+  });
+
+  check("a line that starts with 'On' is not a Gmail quote marker", () => {
+    const body = [
+      "On Monday we agreed to send the draft.",
+      "",
+      "The deadline is Friday."
+    ].join("\n");
+    assertSurvivesBothLanes(body, "On Monday we agreed to send the draft.", "the On line");
+  });
+
+  check("a request with a postal address survives the cleaner", () => {
+    const line = "Please courier the forms to 1800 Diefenbaker Blvd, Ottawa ON K1A 0G1 by Friday.";
+    assertSurvivesBothLanes(line, line, "the courier request");
+    const retrieval = sourceContractSourceText(buildEmailSource(line), DEFAULT_SETTINGS);
+    assert.ok(retrieval.includes(line), `the courier request must reach the retrieval text, got ${JSON.stringify(retrieval)}`);
+  });
+
+  check("a phone request survives the cleaner", () => {
+    const line = "Call 613-555-0110 to book the room.";
+    assertSurvivesBothLanes(line, line, "the phone request");
+  });
+
+  check("a French request survives the cleaner", () => {
+    const line = "Merci de confirmer avant vendredi.";
+    assertSurvivesBothLanes(line, line, "the French request");
+  });
+
   check("a four megabyte body cleans in under a second", () => {
     const unit = "Hi Matt,\n\nPlease review the intake form.\n\nThis email and any attachments are confidential and may be legally privileged.\n\n";
     let body = "";

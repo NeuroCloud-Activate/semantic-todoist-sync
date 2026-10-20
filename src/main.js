@@ -33148,8 +33148,13 @@ const EMAIL_SENTENCE_SPLIT_RE = /((?<=[.!?])\s+(?=["'(\[]*[A-Z0-9]))/;
 const EMAIL_GMAIL_QUOTE_HEADER_RE = /^on\s+\S/i;
 const EMAIL_GMAIL_QUOTE_END_RE = /^(?:<[^>]+>|[^\s@]+@[^\s@]+)\s+wrote:?\s*$/i;
 const EMAIL_GMAIL_QUOTE_ADDRESS_RE = /^(?:<[^>]+>|[^\s@]+@[^\s@]+)$/;
-// An external-sender banner: the lead-in marker or the advice line itself.
-const EMAIL_BANNER_MARKER_RE = /^\s*(?:\[\s*(?:external|external\s+sender|caution|warning|spam|phishing|automated|secure|verified|notice|attention|confidential)\s*\]|(?:caution|warning|alert|external\s+sender|external\s+email|attention|notice|important)\s*:)\s*/i;
+// An external-sender banner. The bracketed tag names the banner on its own;
+// a lead-in word needs the external-sender phrase in the same line, so an
+// ordinary "Important: ..." line stays.
+const EMAIL_BANNER_TAG_RE = /^\s*\[\s*(?:external|external\s+sender|caution|warning|spam|phishing|automated|secure|verified|notice|attention|confidential)\s*\]\s*/i;
+const EMAIL_BANNER_LEADIN_RE = /^\s*(?:caution|warning|alert|external\s+sender|external\s+email|attention|notice|important)\s*:\s*/i;
+// The phrase that makes a line part of an external-sender banner.
+const EMAIL_EXTERNAL_SENDER_RE = /\b(?:external\s+(?:e-?mail|sender|message)|originated\s+from\s+outside|outside\s+(?:of\s+)?(?:your|our|the)\s+organi[sz]ation|do\s+not\s+click\s+(?:any\s+)?links?\s+or\s+open\s+(?:any\s+)?attachments?\s+unless\s+you\s+recogni[sz]e\s+the\s+sender)\b/i;
 const EMAIL_BANNER_BODY_RE = /\b(?:this\s+(?:e-?mail|message)\s+(?:originated\s+(?:from|outside)|was\s+sent\s+from\s+outside)|do\s+not\s+(?:click|open|respond\s+to|reply\s+to)|verify\s+the\s+sender|be\s+wary)\b/i;
 // The contact footer that follows a signature: an address row, a postal
 // address, a phone or fax line and a bare e-mail or web address.
@@ -33158,6 +33163,9 @@ const EMAIL_FOOTER_LINK_RE = /^\s*(?:https?:\/\/|www\.)\S+\s*$/i;
 const EMAIL_FOOTER_PHONE_RE = /^\s*(?:(?:tel(?:ephone)?|fax|phone|mobile|cell|t|f|p)\s*[.:]?\s*)?[+()\d][\d\s().+-]{5,}\d\s*$/i;
 const EMAIL_STREET_RE = /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|court|ct|crescent|place|pl|way|suite|ste|floor|fl|tower|parkway|pkwy|terrace|highway|hwy|square|sq|route|rte)\b/i;
 const EMAIL_POSTAL_CODE_RE = /\b(?:[A-Z]\d[A-Z]\s?\d[A-Z]\d|[A-Z]{1,2}\d{1,2}\s?\d[A-Z]{2}|\d{5}(?:-\d{4})?)\b/;
+// A company, a charity or an institution: the organisation half of a contact
+// footer row.
+const EMAIL_ORG_NAME_RE = /\b(?:inc|ltd|llc|llp|corp|corporation|company|group|services|systems|solutions|technologies|bank|university|college|institute|foundation|association|society|charity|hospital|clinic|centre|center|agency|ministry|department|partners|holdings)\b/i;
 const EMAIL_SIGNATURE_STOP_WORDS = new Set(["i", "we", "you", "he", "she", "it", "they", "this", "that", "these", "those", "our", "your", "my", "me", "us", "them", "if", "when", "while", "but", "and", "or", "so", "let", "please", "any", "all", "some", "no", "not", "do", "does", "did", "can", "could", "will", "would", "should", "shall", "may", "might", "must", "have", "has", "had", "the", "a", "an", "as", "at", "by", "in", "on", "to", "of", "for", "from", "with", "without", "after", "before", "since", "until", "about", "over", "under", "again", "also", "because", "there", "here", "what", "which", "who", "how", "why", "is", "are", "was", "were", "be", "been", "being", "am", "hi", "hello", "hey", "cheers", "best"]);
 
 // The Gmail quote marker can span two lines: "On <date> <author>" and then
@@ -33256,9 +33264,55 @@ function emailDisclaimerNotice(text) {
   return EMAIL_DISCLAIMER_NOTICE_RE.test(String(text || "").trim());
 }
 
+// A markdown table row: it starts and ends with a pipe.
+function emailMarkdownTableRow(value) {
+  const text = String(value || "").trim();
+  return text.length > 1 && text.startsWith("|") && text.endsWith("|");
+}
+
+// A markdown table rule: a row of dashes and colons between pipes.
+function emailMarkdownTableRule(value) {
+  const text = String(value || "").trim();
+  if (!text.includes("-") || !text.includes("|")) return false;
+  return /^[|\s:-]+$/.test(text);
+}
+
+// A cell that names an organisation: a company, a charity or an institution.
+function emailFooterOrgCell(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (EMAIL_ORG_NAME_RE.test(text)) return true;
+  const words = text.split(/\s+/).filter(Boolean);
+  return words.length >= 2 && words.length <= 5 && words.every((word) => /^[A-Z][A-Za-z.'’-]*$/.test(word));
+}
+
+// A cell that holds a contact detail: a street address, a postal code, a
+// phone number, an e-mail address or a web address.
+function emailFooterContactCell(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (EMAIL_FOOTER_MAIL_RE.test(text)) return true;
+  if (EMAIL_FOOTER_LINK_RE.test(text)) return true;
+  if (EMAIL_FOOTER_PHONE_RE.test(text)) return true;
+  if (EMAIL_STREET_RE.test(text)) return true;
+  if (EMAIL_POSTAL_CODE_RE.test(text)) return true;
+  return false;
+}
+
+// A pipe line is a contact footer only when its cells hold an organisation
+// name plus a contact detail. A markdown table row is never a footer.
+function emailFooterPipeLine(text, nextLine = "") {
+  if (emailMarkdownTableRow(text)) return false;
+  if (emailMarkdownTableRule(nextLine)) return false;
+  const cells = text.split("|").map((cell) => cell.trim()).filter(Boolean);
+  const orgIndex = cells.findIndex((cell) => emailFooterOrgCell(cell));
+  if (orgIndex < 0) return false;
+  return cells.some((cell, index) => index !== orgIndex && emailFooterContactCell(cell));
+}
+
 // A contact footer: a company/address row, a postal address, a phone or fax
 // line and a bare e-mail or web address.
-function emailFooterLine(value) {
+function emailFooterLine(value, nextLine = "") {
   const text = String(value || "").trim();
   if (!text || text.length > 200) return false;
   if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(text)) return false;
@@ -33266,26 +33320,46 @@ function emailFooterLine(value) {
   if (EMAIL_FOOTER_LINK_RE.test(text)) return true;
   if (EMAIL_FOOTER_PHONE_RE.test(text)) return true;
   if (EMAIL_STREET_RE.test(text) && EMAIL_POSTAL_CODE_RE.test(text)) return true;
-  if (text.includes("|") && (text.split("|").length >= 3 || EMAIL_STREET_RE.test(text) || EMAIL_POSTAL_CODE_RE.test(text) || /\d{3}/.test(text))) return true;
+  if (text.includes("|")) return emailFooterPipeLine(text, nextLine);
   return false;
 }
 
+// A line that opens an external-sender banner: a bracketed tag, or a lead-in
+// word with the external-sender phrase in the same line.
+function emailBannerLeadIn(line) {
+  const text = String(line || "");
+  if (EMAIL_BANNER_TAG_RE.test(text)) return true;
+  if (!EMAIL_BANNER_LEADIN_RE.test(text)) return false;
+  return EMAIL_EXTERNAL_SENDER_RE.test(text);
+}
+
+// The banner prefix of a line, without the banner text.
+function emailBannerPrefixStrip(line) {
+  return String(line || "").replace(EMAIL_BANNER_TAG_RE, "").replace(EMAIL_BANNER_LEADIN_RE, "");
+}
+
 // Lines that carry no request and are pure noise: rules, external-sender
-// banners and contact footers. A request always survives.
+// banners and contact footers. A request always survives. A banner advice
+// line is noise only right after a banner lead-in, or when the line itself
+// carries the external-sender phrase.
 function removeEmailNoiseLines(lines) {
   const output = [];
-  for (const line of lines) {
+  let bannerLeadIn = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     const trimmed = String(line || "").trim();
     if (!trimmed) { output.push(line); continue; }
-    if (EMAIL_SEPARATOR_LINE_RE.test(trimmed)) continue;
-    if (EMAIL_BANNER_MARKER_RE.test(line)) {
+    if (EMAIL_SEPARATOR_LINE_RE.test(trimmed)) { bannerLeadIn = false; continue; }
+    if (emailBannerLeadIn(line)) {
+      bannerLeadIn = true;
       if (!emailRequestText(trimmed)) continue;
-      output.push(line.replace(EMAIL_BANNER_MARKER_RE, ""));
+      output.push(emailBannerPrefixStrip(line));
       continue;
     }
-    if (emailRequestText(trimmed)) { output.push(line); continue; }
-    if (EMAIL_BANNER_BODY_RE.test(trimmed)) continue;
-    if (emailFooterLine(trimmed)) continue;
+    if (emailRequestText(trimmed)) { output.push(line); bannerLeadIn = false; continue; }
+    if (EMAIL_BANNER_BODY_RE.test(trimmed) && (bannerLeadIn || EMAIL_EXTERNAL_SENDER_RE.test(trimmed))) continue;
+    bannerLeadIn = false;
+    if (emailFooterLine(trimmed, String(lines[index + 1] || ""))) continue;
     output.push(line);
   }
   return output;
@@ -33385,6 +33459,12 @@ function cleanEmailChainSegment(lines, keepHeaders) {
   return removeEmailDisclaimerParagraphs(removeEmailNoiseLines(kept));
 }
 
+// The subject line of an email message, when the text carries one.
+function emailSubjectText(value) {
+  const match = /^[ \t]*subject[ \t]*:[ \t]*(.*)$/im.exec(String(value || ""));
+  return match ? String(match[1] || "").trim() : "";
+}
+
 // The one email-specific step of the shared pipeline: clean the chain so the
 // header blocks, the signatures and the disclaimers never become search
 // queries, while every message of the chain still reaches the AI and the
@@ -33403,7 +33483,12 @@ function cleanEmailChainText(text, options = {}) {
     if (segment) cleaned.push(segment);
   }
   const result = cleanupEmailText(cleaned.join("\n"));
-  return result || value;
+  if (result) return result;
+  // The AI lane falls back to the whole message: its headers are wanted.
+  if (keepHeaders) return value;
+  // The search lane never puts the headers and the disclaimer back: it uses
+  // the subject, and an empty string when the message carries no subject.
+  return emailSubjectText(value);
 }
 
 function stripHtml(html) {
@@ -45978,7 +46063,13 @@ function sourceContractSourceText(source = {}, settings = DEFAULT_SETTINGS) {
   // Email: the contract fact becomes the retrieval lanes, so it must hold the
   // cleaned chain without any header, signature or disclaimer text.
   const emailText = cleanupEmailText(normalizeDescriptionLinks(stripExcludedLinks(raw, settings), raw, settings));
-  return cleanEmailChainText(emailText, { keepHeaders: false });
+  // The search text is never empty: the subject of the message stands in for a
+  // body that holds nothing but noise, so the contract keeps a source-summary
+  // fact and the email selection does not fail closed. Only a message with no
+  // subject at all falls back to the raw text.
+  return cleanEmailChainText(emailText, { keepHeaders: false })
+    || String(source?.title || "").trim()
+    || emailText;
 }
 
 function flattenTaskPlanWithIndexes(tasks = [], prefix = "") {

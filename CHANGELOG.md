@@ -1,3 +1,13 @@
+## 0.9.29 - 2026-10-20
+### Fixed
+- **The semantic index repairs itself.** If an index file is missing or damaged, the plugin no longer loads an empty index. It keeps every good part, so vault search works at once, and re-indexes in the background only the notes that lost passages, reusing every other embedding. The log reads "Semantic index repaired: kept N of M shards, re-indexing K of A affected notes".
+- **An unreadable index rebuilds automatically.** If the main index file or its note list cannot be read, the plugin rebuilds the index by itself once Obsidian has finished loading ("Semantic index unreadable; rebuilding automatically").
+- **No repair loops or surprise costs.** Each kind of damage is repaired automatically once. If it comes back, in the same or a later session, the plugin shows one message asking you to run "Rebuild semantic vault index" instead of repairing again. An automatic rebuild only runs when index files exist on disk and automatic indexing is on; otherwise you get the message. A file that is briefly locked (for example by OneDrive or antivirus) is read again before it counts as damaged.
+- **Saves no longer carry a lost file forward.** Before reusing an unchanged index file, the plugin checks it is still on disk and rewrites it from memory if it is missing.
+- **No more false save warning.** A successful save no longer records "Destination file already exists!". A save that really fails is still reported and the previous index is kept.
+### Notes
+- Two new test files cover the load and save repair (19 and 8 cases). `npm test` passes 55/55.
+
 # Changelog
 ## 0.9.28 - 2026-10-20
 ### Changed

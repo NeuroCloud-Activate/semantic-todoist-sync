@@ -136,6 +136,9 @@ const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
 const STARTUP_SEMANTIC_INDEX_RESHARD_DELAY_MS = 120000;
 const STARTUP_SUBTASK_REPAIR_DELAY_MS = 60000;
 const SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS = 0;
+// A shard read can fail transiently (OneDrive/antivirus lock). One retry after a
+// short delay keeps a healthy shard from being dropped as damaged.
+const SEMANTIC_INDEX_SHARD_READ_RETRY_DELAY_MS = 250;
 const MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS = 420;
 // Durable email failure holds: a paused email is skipped on later polls so an
 // unchanged failure is never reprocessed (and never rebilled) automatically.
@@ -3452,6 +3455,9 @@ const DEFAULT_SETTINGS = {
   indexedFolders: "",
   excludedFolders: PLUGIN_DATA_FOLDER,
   semanticIndexMeta: {},
+  // Damage fingerprints of the semantic-index repairs that already ran, so a
+  // persistent fault is not paid for again on every Obsidian start.
+  semanticIndexRepairMarkers: {},
   semanticIndexRebuildProgress: null,
   // Task 9: "exact" (default until Task 10 decides from measurements) keeps
   // today's full exact scan; "routed" scores only the shards the resident
@@ -6391,12 +6397,14 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.semanticChunkTermCache?.clear?.();
       this.invalidateSemanticRetrievalCache();
       this.semanticIndexLoaded = false;
+      this.semanticIndexSalvagePendingPaths = new Set();
       const indexFile = this.semanticIndexFileName();
       let shouldRewriteShardedIndex = false;
       let settingsChanged = false;
       let loadedFromDisk = false;
       let compatibilityRefreshCandidate = null;
       let lastIndexReadError = null;
+      let salvagePlan = null;
       const rememberCompatibilityRefresh = (error) => {
         if (error?.code !== "semantic-index-compatibility-refresh-required") return;
         compatibilityRefreshCandidate = error.compatibilityRefresh || compatibilityRefreshCandidate;
@@ -6433,6 +6441,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         const loaded = await this.readSemanticIndexFile(indexFile);
         await applyLoaded(loaded, indexFile);
         loadedFromDisk = true;
+        if (loaded.failedShards?.length) salvagePlan = this.semanticIndexSalvagePlan(loaded);
       } catch (error) {
         if (error?.code === "semantic-index-read-failed") throw error;
         lastIndexReadError = error;
@@ -6498,6 +6507,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         restorePreviousState();
         this.semanticIndexLoadFailure = "semantic-index-no-validated-generation";
         this.logLocal("Semantic index load preserved last-known-good state", { reason: this.semanticIndexLoadFailure, error: singleLine(lastIndexReadError?.message || "").slice(0, 200) });
+        await this.queueSemanticIndexAutoRebuild(indexFile, lastIndexReadError);
         return semanticOperationResult({ ok: false, reasonCode: this.semanticIndexLoadFailure });
       }
       if (!this.semanticIndex.length) {
@@ -6519,7 +6529,12 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       }
       if (shouldRewriteShardedIndex) this.queueSemanticIndexReshard();
       await this.refreshSemanticIndexPathMetaAsync();
+      if (salvagePlan) this.applySemanticIndexSalvagePathMeta(salvagePlan);
       await this.saveSemanticIndexPathMetaSnapshot();
+      if (salvagePlan) await this.queueSemanticIndexSalvageUpdates(salvagePlan);
+      // A clean load proves the damage is gone: the repair guard is reset so a
+      // later, unrelated damage is repaired again.
+      else await this.clearSemanticIndexRepairMarkers();
       // Prepare the provider-free routing generation before the index becomes
       // observable as warm. Persistence/load may refine this state later, but
       // a missing artifact never authorizes an unbounded retrieval scan.
@@ -6934,9 +6949,15 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       if (!parsed.meta) throw new Error("Semantic-index manifest metadata is missing.");
       const manifestValidation = semanticIndexManifestValidation(parsed, indexFile, this.settings);
       const manifestMeta = manifestValidation.meta;
+      // The path-meta artifact is the per-note chunk census of the generation
+      // the manifest points at. It is the only record of which note owned the
+      // chunks of a shard that cannot be read, so it is kept for the repair.
+      const pathMetaEntries = [];
       if (manifestValidation.pathMetaFile) {
         const pathMetaRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${manifestValidation.pathMetaFile}`);
-        semanticIndexPathMetaArtifactValidation(JSON.parse(pathMetaRaw), manifestMeta, indexFile, this.settings);
+        const pathMetaParsed = JSON.parse(pathMetaRaw);
+        semanticIndexPathMetaArtifactValidation(pathMetaParsed, manifestMeta, indexFile, this.settings);
+        for (const entry of pathMetaParsed.entries || []) pathMetaEntries.push(entry);
       }
       const chunks = [];
       let totalBytes = utf8ByteLength(raw);
@@ -6950,6 +6971,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       });
       const shardReads = [];
       const shardBinFiles = [];
+      const failedShards = [];
+      const declaredShardChunks = new Map();
+      for (const candidate of parsed.shards || []) declaredShardChunks.set(String(candidate?.file || candidate?.path || ""), Number(candidate?.chunks || 0));
+      let loadedShardCount = 0;
       for (let index = 0; index < shardFiles.length; index += 1) {
         const shardFile = shardFiles[index];
         this.setSidebarStatus(`Loading semantic index shard ${index + 1}/${shardFiles.length}...`);
@@ -6957,49 +6982,57 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
         this.updateSemanticIndexLoadTelemetry({ reads: Number(this.semanticIndexLoadTelemetry?.reads || 0) + 1 });
         const shardMeta = parsed.shards.find((candidate) => String(candidate?.file || candidate?.path || "") === shardFile);
-        const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
-        const shardBytes = utf8ByteLength(shardRaw);
-        if (Number(shardMeta?.bytes || 0) > 0 && Number(shardMeta.bytes) !== shardBytes) throw new Error(`Semantic-index shard byte count mismatch: ${shardFile}`);
-        const shardParsed = JSON.parse(shardRaw);
-        semanticIndexShardValidation(shardParsed, manifestMeta, shardMeta);
-        // Task 9: a sidecar with a `vectors` link streams its `.bin` payload
-        // through readBinary straight into typed arrays (one shard live);
-        // legacy JSON shards carry embeddings inline and stay readable until
-        // the next save/rebuild replaces them.
-        let shardBinBytes = 0;
-        let shardBinFile = "";
-        let shardHash = shortHash(shardRaw);
-        if (shardParsed?.vectors?.file) {
-          const binFile = String(shardParsed.vectors.file);
-          shardBinFile = binFile;
-          if (String(shardMeta?.bin || "") !== binFile) throw new Error(`Semantic-index shard binary link mismatch: ${shardFile}`);
-          if (typeof this.app.vault.adapter.readBinary !== "function") throw new Error(`Semantic-index binary shard requires readBinary support: ${binFile}`);
-          const binBuffer = await this.app.vault.adapter.readBinary(`${this.manifest.dir}/${binFile}`);
-          const binBytes = Number(binBuffer?.byteLength || 0);
-          if (Number(shardParsed.vectors.byteLength || 0) > 0 && Number(shardParsed.vectors.byteLength) !== binBytes) throw new Error(`Semantic-index binary shard byte count mismatch: ${binFile}`);
-          shardParsed.chunks = semanticIndexShardBinaryDecodeChunks(shardParsed, binBuffer);
-          shardBinBytes = binBytes;
-          shardHash = shortHash(`${shardHash}|${semanticIndexBinaryShortHash(new Uint8Array(binBuffer))}`);
+        let shard = null;
+        let shardError = null;
+        try {
+          shard = await this.readSemanticIndexShard(shardFile, shardMeta, manifestMeta);
+        } catch (error) {
+          shardError = error;
         }
-        // A recorded content hash (written by the incremental save) must match
-        // the bytes on disk; a mismatch means the referenced shard was altered
-        // after the manifest committed it.
-        if (String(shardMeta?.hash || "") && String(shardMeta.hash) !== shardHash) {
-          throw new Error(`Semantic-index shard hash mismatch: ${shardFile}`);
+        if (!shard) {
+          // A transient read failure (OneDrive/antivirus lock) must not drop a
+          // healthy shard: retry the same read once after a short delay.
+          await delay(SEMANTIC_INDEX_SHARD_READ_RETRY_DELAY_MS);
+          try {
+            shard = await this.readSemanticIndexShard(shardFile, shardMeta, manifestMeta);
+            shardError = null;
+          } catch (retryError) {
+            shardError = retryError;
+          }
         }
-        shardReads[index] = { file: shardFile, hash: shardHash, bytes: shardBytes + shardBinBytes, parsed: shardParsed };
-        shardBinFiles[index] = shardBinFile;
-        const shardTotalBytes = shardBytes + shardBinBytes;
-        this.updateSemanticIndexLoadTelemetry({
-          shardsLoaded: index + 1,
-          totalBytes: Number(this.semanticIndexLoadTelemetry?.totalBytes || 0) + shardTotalBytes,
-          largestBytes: Math.max(Number(this.semanticIndexLoadTelemetry?.largestBytes || 0), shardTotalBytes)
-        });
+        if (shard) {
+          shardReads[index] = { file: shardFile, hash: shard.hash, bytes: shard.bytes + shard.binBytes, parsed: shard.parsed };
+          shardBinFiles[index] = shard.binFile;
+          loadedShardCount += 1;
+          this.updateSemanticIndexLoadTelemetry({
+            shardsLoaded: loadedShardCount,
+            totalBytes: Number(this.semanticIndexLoadTelemetry?.totalBytes || 0) + shard.bytes + shard.binBytes,
+            largestBytes: Math.max(Number(this.semanticIndexLoadTelemetry?.largestBytes || 0), shard.bytes + shard.binBytes)
+          });
+        } else {
+          // One unreadable shard must not blank the whole index: it is recorded
+          // and skipped, the shards that did load are kept and the notes that
+          // lost chunks with it are re-embedded.
+          failedShards.push({ file: shardFile, reason: singleLine(shardError?.message || String(shardError)).slice(0, 200) });
+          shardReads[index] = null;
+          shardBinFiles[index] = "";
+        }
         this.recordSemanticIndexLoadYield();
         await idlePause(SEMANTIC_INDEX_FILE_PAUSE_MS);
       }
+      if (shardFiles.length && failedShards.length === shardFiles.length) {
+        throw new Error(`Semantic-index shards are unreadable: ${failedShards.length} of ${shardFiles.length}.`);
+      }
+      if (failedShards.length && !pathMetaEntries.length) {
+        // Without the per-note chunk census of the generation the manifest
+        // points at, the notes that lost chunks with the unreadable shard are
+        // unknowable. A partial load would drop them silently, so the load
+        // fails closed and the automatic rebuild takes over.
+        throw new Error("Semantic-index shard census is unavailable; the damaged index cannot be repaired safely.");
+      }
       this.semanticIndexShardBinaryFiles = shardBinFiles.length && shardBinFiles.every(Boolean) ? shardBinFiles.slice() : null;
-      for (const shard of shardReads) {
+      const loadedShards = shardReads.filter((shard) => shard);
+      for (const shard of loadedShards) {
         const shardFile = shard.file || shard.path || "";
         if (!shardFile) continue;
         const shardBytes = shard.bytes || 0;
@@ -7011,14 +7044,29 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       semanticIndexChunkIdentityValidation(chunks);
       const integrity = semanticIndexIntegrity(chunks, chunks, integritySettings);
       if (chunks.length && integrity.health.invalidCount) throw new Error(`Semantic-index manifest corpus integrity failed: ${integrity.health.invalidCount}`);
-      if (Number(manifestMeta.chunks) !== chunks.length) throw new Error("Semantic-index manifest chunk count mismatch.");
-      const compatibility = semanticIndexCompatibilityRefreshClassification(this.settings, manifestMeta, semanticIndexStorageFingerprint(raw, shardReads));
-      if (!compatibility.compatible) throw semanticIndexCompatibilityRefreshError(compatibility);
+      if (failedShards.length) {
+        // A salvaged corpus must still hold exactly the chunks the manifest
+        // declares for the shards that did load.
+        const declaredChunks = loadedShards.reduce((sum, shard) => sum + Number(declaredShardChunks.get(shard.file) || 0), 0);
+        if (declaredChunks !== chunks.length) throw new Error("Semantic-index manifest chunk count mismatch.");
+      } else if (Number(manifestMeta.chunks) !== chunks.length) {
+        throw new Error("Semantic-index manifest chunk count mismatch.");
+      }
+      const storageFingerprint = semanticIndexStorageFingerprint(raw, loadedShards);
+      const compatibility = semanticIndexCompatibilityRefreshClassification(this.settings, manifestMeta, storageFingerprint);
+      if (!compatibility.compatible) {
+        // A salvaged load always drifts from the recorded storage fingerprint
+        // (the unreadable shard is not part of it); only that drift may pass.
+        const onlyStorageDrift = compatibility.reasonCodes.length > 0 && compatibility.reasonCodes.every((code) => code === "storage-fingerprint-mismatch");
+        if (!failedShards.length || !onlyStorageDrift) throw semanticIndexCompatibilityRefreshError(compatibility);
+      }
       return {
         parsed,
         chunks,
         shardFiles,
-        storageFingerprint: semanticIndexStorageFingerprint(raw, shardReads),
+        failedShards,
+        pathMetaEntries,
+        storageFingerprint,
         stats: { bytes: largestBytes, totalBytes, path: indexFile, files: shardFiles.length + 1, shards: shardFiles.length }
       };
     }
@@ -7036,9 +7084,321 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       parsed,
       chunks: legacyChunks,
       shardFiles: [],
+      failedShards: [],
+      pathMetaEntries: [],
       storageFingerprint: semanticIndexStorageFingerprint(raw, []),
       stats: { bytes, totalBytes: bytes, path: indexFile, files: 1, shards: 0 }
     };
+  }
+
+  // Reads and validates one shard (sidecar plus its binary payload). Any
+  // damage throws, so the caller can salvage the shards that still load.
+  async readSemanticIndexShard(shardFile, shardMeta, manifestMeta) {
+    const shardRaw = await this.app.vault.adapter.read(`${this.manifest.dir}/${shardFile}`);
+    const shardBytes = utf8ByteLength(shardRaw);
+    if (Number(shardMeta?.bytes || 0) > 0 && Number(shardMeta.bytes) !== shardBytes) throw new Error(`Semantic-index shard byte count mismatch: ${shardFile}`);
+    const shardParsed = JSON.parse(shardRaw);
+    semanticIndexShardValidation(shardParsed, manifestMeta, shardMeta);
+    // Task 9: a sidecar with a `vectors` link streams its `.bin` payload
+    // through readBinary straight into typed arrays (one shard live);
+    // legacy JSON shards carry embeddings inline and stay readable until
+    // the next save/rebuild replaces them.
+    let shardBinBytes = 0;
+    let shardBinFile = "";
+    let shardHash = shortHash(shardRaw);
+    if (shardParsed?.vectors?.file) {
+      const binFile = String(shardParsed.vectors.file);
+      shardBinFile = binFile;
+      if (String(shardMeta?.bin || "") !== binFile) throw new Error(`Semantic-index shard binary link mismatch: ${shardFile}`);
+      if (typeof this.app.vault.adapter.readBinary !== "function") throw new Error(`Semantic-index binary shard requires readBinary support: ${binFile}`);
+      const binBuffer = await this.app.vault.adapter.readBinary(`${this.manifest.dir}/${binFile}`);
+      const binBytes = Number(binBuffer?.byteLength || 0);
+      if (Number(shardParsed.vectors.byteLength || 0) > 0 && Number(shardParsed.vectors.byteLength) !== binBytes) throw new Error(`Semantic-index binary shard byte count mismatch: ${binFile}`);
+      shardParsed.chunks = semanticIndexShardBinaryDecodeChunks(shardParsed, binBuffer);
+      shardBinBytes = binBytes;
+      shardHash = shortHash(`${shardHash}|${semanticIndexBinaryShortHash(new Uint8Array(binBuffer))}`);
+    }
+    // A recorded content hash (written by the incremental save) must match
+    // the bytes on disk; a mismatch means the referenced shard was altered
+    // after the manifest committed it.
+    if (String(shardMeta?.hash || "") && String(shardMeta.hash) !== shardHash) {
+      throw new Error(`Semantic-index shard hash mismatch: ${shardFile}`);
+    }
+    return { parsed: shardParsed, hash: shardHash, bytes: shardBytes, binBytes: shardBinBytes, binFile: shardBinFile };
+  }
+
+  // --- Damaged-index repair -------------------------------------------------
+  // At most one automatic repair per session per failure: a repeat of the
+  // same damage stops the automatic work and asks for a manual rebuild.
+  semanticIndexRepairClaim(key) {
+    this.semanticIndexRepairState = this.semanticIndexRepairState || { attempted: new Set(), notified: new Set() };
+    const state = this.semanticIndexRepairState;
+    if (state.attempted.has(key)) {
+      this.notifySemanticIndexRepairRequired(key);
+      return false;
+    }
+    state.attempted.add(key);
+    return true;
+  }
+
+  // The single notice that tells the user the damage needs the manual rebuild.
+  notifySemanticIndexRepairRequired(fingerprint) {
+    this.semanticIndexRepairState = this.semanticIndexRepairState || { attempted: new Set(), notified: new Set() };
+    const state = this.semanticIndexRepairState;
+    if (state.notified.has(fingerprint)) return false;
+    state.notified.add(fingerprint);
+    new Notice("The semantic vault index is damaged. Run \"Rebuild semantic vault index\" from the command palette.");
+    return true;
+  }
+
+  // The damage fingerprints that were already repaired are remembered in the
+  // plugin settings: a persistent fault must not be paid for again on every
+  // Obsidian start.
+  semanticIndexRepairMarkers() {
+    const markers = this.settings?.semanticIndexRepairMarkers;
+    return markers && typeof markers === "object" && !Array.isArray(markers) ? markers : {};
+  }
+
+  semanticIndexRepairMarkerKey(fingerprint) {
+    return shortHash(String(fingerprint || "")).slice(0, 20);
+  }
+
+  semanticIndexRepairMarker(fingerprint) {
+    const marker = this.semanticIndexRepairMarkers()[this.semanticIndexRepairMarkerKey(fingerprint)];
+    return marker && typeof marker === "object" ? marker : null;
+  }
+
+  async recordSemanticIndexRepairMarker(fingerprint, kind, extra = {}) {
+    const key = this.semanticIndexRepairMarkerKey(fingerprint);
+    const markers = Object.assign({}, this.semanticIndexRepairMarkers());
+    const previous = markers[key] || {};
+    markers[key] = Object.assign({}, previous, {
+      fingerprint: String(fingerprint || ""),
+      kind: String(kind || "repair"),
+      at: deviceTimestamp(),
+      count: Number(previous.count || 0) + 1
+    }, extra && typeof extra === "object" ? extra : {});
+    this.settings.semanticIndexRepairMarkers = markers;
+    // Keep the persisted guard bounded: only the most recent damage
+    // fingerprints are kept.
+    const keys = Object.keys(markers);
+    for (const staleKey of keys.slice(0, Math.max(0, keys.length - 8))) delete markers[staleKey];
+    try {
+      await this.saveSettings();
+    } catch (error) {
+      this.logLocal("Semantic index repair marker could not be persisted", { error: error?.message || String(error) });
+    }
+    return markers[key];
+  }
+
+  async clearSemanticIndexRepairMarkers() {
+    if (!Object.keys(this.semanticIndexRepairMarkers()).length) return false;
+    this.settings.semanticIndexRepairMarkers = {};
+    try {
+      await this.saveSettings();
+    } catch (error) {
+      this.logLocal("Semantic index repair markers could not be cleared", { error: error?.message || String(error) });
+    }
+    return true;
+  }
+
+  // The notes whose path-meta chunk census is above the loaded chunk count are
+  // the ones that lost chunks with an unreadable shard.
+  semanticIndexSalvageAffectedPaths(loaded = {}) {
+    const basePath = vaultBasePath(this.app);
+    const declared = new Map();
+    for (const entry of loaded.pathMetaEntries || []) {
+      const path = vaultRelativePath(entry?.path || "", basePath);
+      if (!path || isNonVaultTaskReferencePath(path)) continue;
+      declared.set(path, Number(entry?.chunks || 0));
+    }
+    if (!declared.size) return [];
+    const loadedCounts = new Map();
+    for (const chunk of loaded.chunks || []) {
+      const path = vaultRelativePath(chunk?.path || "", basePath);
+      if (!path) continue;
+      loadedCounts.set(path, (loadedCounts.get(path) || 0) + 1);
+    }
+    const affected = [];
+    for (const [path, count] of declared) {
+      if ((loadedCounts.get(path) || 0) >= count) continue;
+      if (!(this.app?.vault?.getAbstractFileByPath?.(path) instanceof TFile)) continue;
+      affected.push(path);
+    }
+    return affected.sort();
+  }
+
+  semanticIndexSalvagePlan(loaded = {}) {
+    const failedShards = loaded.failedShards || [];
+    const shardCount = Number(loaded.shardFiles?.length || 0);
+    return {
+      failedShards,
+      shardCount,
+      keptShards: Math.max(0, shardCount - failedShards.length),
+      generation: String(loaded.parsed?.meta?.generation || ""),
+      indexFile: String(loaded.stats?.path || ""),
+      affectedPaths: this.semanticIndexSalvageAffectedPaths(loaded)
+    };
+  }
+
+  // Keep the affected notes listed in the path metadata but mark them as
+  // changed, so the path-meta save at the end of the load cannot forget them
+  // before they are re-indexed and both the queue and the startup reconcile
+  // see them as changed.
+  applySemanticIndexSalvagePathMeta(salvage = {}) {
+    const affected = salvage.affectedPaths || [];
+    if (!affected.length) return;
+    this.semanticIndexSalvagePendingPaths = new Set(affected);
+    for (const path of affected) {
+      const entry = this.semanticIndexPathMeta.get(path) || { path, chunks: 0, modifiedAt: 0 };
+      this.semanticIndexPathMeta.set(path, Object.assign({}, entry, { path, modifiedAt: 0 }));
+    }
+  }
+
+  async queueSemanticIndexSalvageUpdates(salvage = {}) {
+    const failedShards = salvage.failedShards || [];
+    const shardCount = Number(salvage.shardCount || 0);
+    const affectedPaths = salvage.affectedPaths || [];
+    const fingerprint = `salvage:${salvage.generation || salvage.indexFile || ""}:${failedShards.map((shard) => shard.file).sort().join(",")}`;
+    if (this.semanticIndexRepairMarker(fingerprint)) {
+      // The same damage was already handled in an earlier session: do not pay
+      // for the re-index again, ask for the manual rebuild instead.
+      this.logLocal("Semantic index damage was already handled in an earlier session; a manual rebuild is required", { shards: failedShards.length });
+      this.notifySemanticIndexRepairRequired(fingerprint);
+      return 0;
+    }
+    if (!this.semanticIndexRepairClaim(fingerprint)) {
+      this.logLocal("Semantic index repair repeated; a manual rebuild is required", { shards: failedShards.length });
+      return 0;
+    }
+    let queued = 0;
+    for (const path of affectedPaths) {
+      const result = this.queueSemanticIndexUpdate(path, "index-salvage");
+      if (result?.queued) queued += 1;
+    }
+    await this.recordSemanticIndexRepairMarker(fingerprint, "salvage", {
+      shards: failedShards.length,
+      affected: affectedPaths.length,
+      queued
+    });
+    this.logLocal(`Semantic index repaired: kept ${salvage.keptShards} of ${shardCount} shards, re-indexing ${queued} of ${affectedPaths.length} affected notes`, {
+      keptShards: salvage.keptShards,
+      shardCount,
+      failedShards: failedShards.map((shard) => shard.file),
+      reindexing: queued,
+      affected: affectedPaths.length
+    });
+    if (queued < affectedPaths.length) {
+      new Notice("The semantic vault index was repaired, but some notes could not be re-indexed automatically. Run \"Rebuild semantic vault index\" from the command palette.");
+    }
+    return queued;
+  }
+
+  // An automatic rebuild is only justified when the vault shows on disk that an
+  // index existed before; an empty or new vault has nothing to rebuild. The
+  // settings metadata alone is not proof: the index files can be gone.
+  async semanticIndexPersistedIndexExpected(indexFile = "") {
+    const adapter = this.app?.vault?.adapter;
+    if (!adapter || typeof adapter.list !== "function") return false;
+    try {
+      const listed = await adapter.list(this.manifest.dir);
+      const base = String(indexFile || "").replace(/\.json$/i, "");
+      for (const file of listed?.files || []) {
+        const name = String(file).split("/").pop() || "";
+        if (name === indexFile) return true;
+        if (name.startsWith(`${base}.g`)) return true;
+        if (isSemanticIndexPathMetaGenerationFile(name)) return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  // The persisted index is unreadable (manifest or path-meta gone), so the
+  // notes it covered are unknowable: the whole index is rebuilt once.
+  async queueSemanticIndexAutoRebuild(indexFile = "", error = null) {
+    try {
+      if (!await this.semanticIndexPersistedIndexExpected(indexFile)) {
+        this.logLocal("Semantic index unreadable; no automatic rebuild queued", { file: indexFile, reason: "no-persisted-index" });
+        return false;
+      }
+      const fingerprint = `unreadable:${indexFile}:${String(error?.code || "index-unreadable")}`;
+      if (this.settings?.autoUpdateSemanticIndex === false) {
+        // A rebuild is paid work: without the background-index setting the
+        // user decides when it happens. The notice is shown once per session
+        // so a repeated load does not stack them.
+        this.logLocal("Semantic index unreadable; automatic rebuild is disabled", { file: indexFile });
+        const noticeKey = `auto-off:${fingerprint}`;
+        this.semanticIndexRepairState = this.semanticIndexRepairState || { attempted: new Set(), notified: new Set() };
+        if (!this.semanticIndexRepairState.notified.has(noticeKey)) {
+          this.semanticIndexRepairState.notified.add(noticeKey);
+          new Notice("The semantic vault index is damaged and automatic repair is off. Run \"Rebuild semantic vault index\" from the command palette.");
+        }
+        return false;
+      }
+      if (this.semanticIndexRepairState?.attempted?.has(fingerprint)) {
+        // This session already started this rebuild: the automatic work is in
+        // flight, so its persisted marker must not be read as damage that an
+        // earlier session already handled.
+        this.logLocal("Semantic index automatic rebuild already in progress", { file: indexFile });
+        return true;
+      }
+      if (this.semanticIndexRepairMarker(fingerprint)) {
+        this.logLocal("Semantic index rebuild repeated in an earlier session; a manual rebuild is required", { file: indexFile });
+        this.notifySemanticIndexRepairRequired(fingerprint);
+        return false;
+      }
+      if (!this.semanticIndexRepairClaim(fingerprint)) {
+        this.logLocal("Semantic index rebuild repeated; a manual rebuild is required", { file: indexFile });
+        return false;
+      }
+      this.logLocal("Semantic index unreadable; rebuilding automatically", { file: indexFile, error: singleLine(error?.message || "").slice(0, 200) });
+      const start = () => {
+        if (this.isUnloading) return;
+        if (typeof this.canStartBackgroundWork === "function" && !this.canStartBackgroundWork()) {
+          this.semanticIndexAutoRebuildTimer = window.setTimeout(() => {
+            this.semanticIndexAutoRebuildTimer = null;
+            start();
+          }, 30000);
+          return;
+        }
+        // The attempt is what costs: it is recorded when the rebuild starts.
+        Promise.resolve(this.recordSemanticIndexRepairMarker(fingerprint, "rebuild", { file: indexFile })).catch(() => {});
+        Promise.resolve()
+          .then(() => this.withSemanticIndexOperation("rebuild", () => this.rebuildSemanticIndex(false)))
+          .then((result) => {
+            if (result && result.ok === false) throw new Error(String(result.reasonCode || "rebuild-failed"));
+          })
+          .catch((rebuildError) => {
+            // A failed rebuild leaves the damage in place: it must not be
+            // recorded as repaired, and the user has to be told.
+            this.logLocal("Semantic index automatic rebuild failed", { error: rebuildError?.message || String(rebuildError) });
+            Promise.resolve(this.recordSemanticIndexRepairMarker(fingerprint, "rebuild", {
+              file: indexFile,
+              failed: true,
+              error: singleLine(rebuildError?.message || String(rebuildError)).slice(0, 200)
+            })).catch(() => {});
+            new Notice("The semantic vault index could not be repaired automatically. Run \"Rebuild semantic vault index\" from the command palette.");
+          });
+      };
+      // At startup the vault's note list can still be empty, which made this
+      // rebuild fail at once with "No indexable Markdown notes were found" and
+      // then stay suppressed for the session. Wait for the workspace before
+      // the first attempt.
+      const schedule = () => {
+        window.clearTimeout(this.semanticIndexAutoRebuildTimer);
+        this.semanticIndexAutoRebuildTimer = window.setTimeout(() => {
+          this.semanticIndexAutoRebuildTimer = null;
+          start();
+        }, SEMANTIC_INDEX_COMPATIBILITY_REFRESH_DELAY_MS);
+      };
+      const workspace = this.app?.workspace;
+      if (workspace && workspace.layoutReady === false && typeof workspace.onLayoutReady === "function") workspace.onLayoutReady(schedule);
+      else schedule();
+      return true;
+    } catch (queueError) {
+      this.logLocal("Semantic index automatic rebuild could not be queued", { file: indexFile, error: queueError?.message || String(queueError) });
+      return false;
+    }
   }
 
   _setSemanticIndexPersistenceTelemetry(phase, state, startedAt, shardCount, chunkCount, reasonCode) {
@@ -7154,12 +7514,18 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     if (previousManifestBody) {
       try { previousManifest = JSON.parse(previousManifestBody); } catch { previousManifest = null; }
     }
+    // One listing per save: a shard deleted after the last save must be
+    // rewritten, not kept referenced by the new manifest.
+    const existingFiles = await this.semanticIndexShardFileNamesAsync();
     const stablePlan = Array.isArray(options.previousIndex)
-      ? await semanticIndexStableShardPlanAsync(indexFile, generationMeta, options.previousIndex, candidateChunks, previousManifest, generation, semanticIndexShardMaxBytes(this.settings))
+      ? await semanticIndexStableShardPlanAsync(indexFile, generationMeta, options.previousIndex, candidateChunks, previousManifest, generation, semanticIndexShardMaxBytes(this.settings), existingFiles)
       : null;
     const shards = stablePlan
       ? stablePlan.shards
       : await semanticIndexShardBinaryBodiesAsync(indexFile, generationMeta, candidateChunks, semanticIndexShardMaxBytes(this.settings), generation);
+    if (stablePlan?.rewrittenMissingCount) {
+      this.logLocal("Semantic index shard rewritten: file missing", { count: stablePlan.rewrittenMissingCount });
+    }
     if (tracker && typeof tracker === "object") tracker.shardCount = shards.length;
     const shardBytes = shards.reduce((sum, shard) => sum + shard.bytes, 0);
     const shardBinBytes = shards.reduce((sum, shard) => sum + shard.binBytes, 0);
@@ -7229,9 +7595,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       savedAt: deviceTimestamp(),
       entries: pathEntries
     });
-    if (storageFingerprint === this.semanticIndexStorageFingerprint && this.semanticIndexPathMetaSnapshotFingerprint === pathMetaFingerprint) {
+    // A shard file that vanished from disk invalidates the stored fingerprint:
+    // the save has to rewrite it instead of short-circuiting as already
+    // persisted, or the manifest keeps pointing at a file that is gone.
+    const referencedShardFiles = [];
+    for (const shard of shards) referencedShardFiles.push(shard.file, shard.binFile);
+    const shardFilesMissing = existingFiles
+      ? referencedShardFiles.some((name) => !existingFiles.has(name))
+      : true;
+    if (!shardFilesMissing && storageFingerprint === this.semanticIndexStorageFingerprint && this.semanticIndexPathMetaSnapshotFingerprint === pathMetaFingerprint) {
       this.semanticIndexStats = stats;
       this.semanticIndexKnownShardFiles = publishedShardFiles;
+      // The index is on disk and unchanged: a persistence error of an earlier
+      // save is not a current failure.
+      this.lastSemanticIndexPersistenceError = null;
       this._markSemanticIndexPersistencePhase(tracker, "routing-publication", "running", "routing-publication");
       await this.ensureProductionSemanticRoutingState({ chunks: candidateChunks, revision: this.semanticIndexRevision || 0, storageFingerprint, allowLoad: true, persist: true });
       await this.writeExternalMcpExport(false);
@@ -7289,6 +7666,31 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       await stage(stageManifestFile, manifestBody);
       this._markSemanticIndexPersistencePhase(tracker, "publish-manifest", "running", "publish-manifest");
       const stagedManifestPath = `${this.manifest.dir}/${stageManifestFile}`;
+      const dropStagedManifest = () => {
+        const stagedManifestIndex = stagedFiles.indexOf(stagedManifestPath);
+        if (stagedManifestIndex >= 0) stagedFiles.splice(stagedManifestIndex, 1);
+      };
+      // Promotion fallback: Obsidian's adapter refuses to rename over an
+      // existing file, so the verified stable write is the supported path and
+      // not a failure. The previous manifest is restored only when that write
+      // fails too, which is the one case worth reporting.
+      const publishManifestByStableWrite = async () => {
+        try {
+          await adapter.write(manifestPath, manifestBody);
+          if (typeof adapter.read === "function") {
+            const readBack = await adapter.read(manifestPath);
+            if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest fallback verification failed.");
+          }
+        } catch (fallbackError) {
+          this.lastSemanticIndexPersistenceError = { phase: "manifest-fallback", message: fallbackError?.message || String(fallbackError) };
+          try { await restorePreviousManifest(); } catch (restoreError) {
+            this.lastSemanticIndexPersistenceError = { phase: "manifest-restore", message: restoreError?.message || String(restoreError) };
+          }
+          throw fallbackError;
+        }
+        try { await adapter.remove(stagedManifestPath); } catch {}
+        dropStagedManifest();
+      };
       if (typeof adapter.rename === "function") {
         try {
           await adapter.rename(stagedManifestPath, manifestPath);
@@ -7296,34 +7698,20 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
             const readBack = await adapter.read(manifestPath);
             if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest promotion verification failed.");
           }
-        } catch (renameError) {
-          this.lastSemanticIndexPersistenceError = { phase: "manifest-promote-rename", message: renameError?.message || String(renameError) };
-          try {
-            await adapter.write(manifestPath, manifestBody);
-            if (typeof adapter.read === "function") {
-              const readBack = await adapter.read(manifestPath);
-              if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest fallback verification failed.");
-            }
-          } catch (fallbackError) {
-            try { await restorePreviousManifest(); } catch (restoreError) {
-              this.lastSemanticIndexPersistenceError = { phase: "manifest-restore", message: restoreError?.message || String(restoreError) };
-            }
-            throw fallbackError;
-          }
-          try { await adapter.remove(stagedManifestPath); } catch {}
+        } catch {
+          await publishManifestByStableWrite();
         }
-        stagedFiles.splice(stagedFiles.indexOf(stagedManifestPath), 1);
+        dropStagedManifest();
       } else {
-        await adapter.write(manifestPath, manifestBody);
-        if (typeof adapter.read === "function") {
-          const readBack = await adapter.read(manifestPath);
-          if (shortHash(readBack) !== shortHash(manifestBody)) throw new Error("Semantic-index manifest verification failed.");
-        }
+        await publishManifestByStableWrite();
       }
     } catch (error) {
       await cleanupStaged();
       throw error;
     }
+    // The manifest is committed and verified: drop the persistence error of an
+    // earlier save instead of reporting it as a current failure.
+    this.lastSemanticIndexPersistenceError = null;
     this.semanticIndexStats = stats;
     this.semanticIndexKnownShardFiles = publishedShardFiles;
     this.semanticIndexShardBinaryFiles = shardBinFiles.slice();
@@ -8139,6 +8527,19 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     });
   }
 
+  // Basenames of the files currently in the plugin data directory. A reused
+  // shard is only safe to reference by name when both of its files are still
+  // on disk; a failed listing returns null so the caller rewrites every shard
+  // instead of referencing files it cannot confirm.
+  async semanticIndexShardFileNamesAsync() {
+    try {
+      const listed = await this.app.vault.adapter.list(this.manifest.dir);
+      return new Set((listed?.files || []).map((path) => String(path).split("/").pop() || ""));
+    } catch {
+      return null;
+    }
+  }
+
   async removeSemanticIndexShardFiles(indexFile, keepFiles = [], candidateFiles = null) {
     const keep = new Set(keepFiles || []);
     const removeCandidates = Array.isArray(candidateFiles) ? uniqueValues(candidateFiles) : null;
@@ -8619,11 +9020,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let queued = 0;
     for (const file of files || []) {
       if (!(file instanceof TFile) || file.extension !== "md") continue;
-      const indexed = this.semanticIndexPathMeta.get(file.path);
-      const fileModifiedAt = Number(file.stat?.mtime || 0);
-      const indexedModifiedAt = Number(indexed?.modifiedAt || 0);
-      if (indexed && fileModifiedAt && indexedModifiedAt && fileModifiedAt <= indexedModifiedAt + 1000) continue;
-      const result = this.queueSemanticIndexUpdate(file.path, "startup-reconcile");
+      // A note that lost chunks with an unreadable shard is always treated as
+      // changed, even when its recorded mtime still matches the file.
+      const salvage = this.semanticIndexSalvagePendingPaths?.has(file.path) === true;
+      if (!salvage) {
+        const indexed = this.semanticIndexPathMeta.get(file.path);
+        const fileModifiedAt = Number(file.stat?.mtime || 0);
+        const indexedModifiedAt = Number(indexed?.modifiedAt || 0);
+        if (indexed && fileModifiedAt && indexedModifiedAt && fileModifiedAt <= indexedModifiedAt + 1000) continue;
+      }
+      const result = this.queueSemanticIndexUpdate(file.path, salvage ? "index-salvage" : "startup-reconcile");
       if (result?.queued) queued += 1;
     }
     this.logLocal(`Semantic index startup reconciliation: ${queued} of ${(files || []).length} indexable notes queued`, { queued, checked: (files || []).length });
@@ -9121,6 +9527,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // failure (no validated index yet) is resolved even if a later step in
       // this rebuild fails after the commit.
       this.retireSemanticIndexLoadStatus();
+      // The committed index replaces the damaged one: the repair guard is reset.
+      await this.clearSemanticIndexRepairMarkers();
       // Clear the staging record and files only after the new index is committed.
       await this.clearSemanticIndexRebuildStaging();
       try {
@@ -55629,9 +56037,12 @@ function semanticIndexShardBinaryPayloadProof(chunks, fallbackDimension = 0) {
 // chunk ranges, removed chunks leave their shard, appended chunks extend the
 // tail shard(s). A shard whose whole range survived with an identical payload
 // proof is reused by reference (same file, declared per-entry generation);
-// every other shard is rebuilt under the new generation. Returns null whenever
-// the mapping cannot be proven, so the caller falls back to the full repack.
-async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex, candidateChunks, previousManifest, generation = "", maxBytes = 0) {
+// every other shard is rebuilt under the new generation. A shard is reused by
+// reference only when both of its files are still on disk (`existingFiles`,
+// a name set): a shard deleted after the last save is rebuilt instead of
+// staying referenced. Returns null whenever the mapping cannot be proven, so
+// the caller falls back to the full repack.
+async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex, candidateChunks, previousManifest, generation = "", maxBytes = 0, existingFiles = null) {
   const previous = Array.isArray(previousIndex) ? previousIndex : null;
   const candidate = Array.isArray(candidateChunks) ? candidateChunks : [];
   if (!previous || !previous.length || !candidate.length) return null;
@@ -55680,6 +56091,7 @@ async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex,
     if (planned[index] !== candidate[index]) return null;
   }
   const shards = [];
+  let rewrittenMissingCount = 0;
   for (const range of ranges) {
     const entry = range.entry;
     const survivors = range.survivors;
@@ -55689,20 +56101,28 @@ async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex,
     if (allSurvived) {
       const proof = semanticIndexShardBinaryPayloadProof(survivors, meta?.dimension);
       if (proof && proof.payloadHash === String(entry.payloadHash || "")) {
-        const reuseGeneration = String(entry.generation || "") || semanticIndexShardFileGeneration(indexFile, entry.file);
-        shards.push({
-          file: String(entry.file),
-          binFile: String(entry.bin || String(entry.file).replace(/\.json$/i, ".bin")),
-          bytes: Number(entry.bytes || 0),
-          binBytes: Number(entry.binBytes || 0),
-          chunkCount: Number(entry.chunks || 0),
-          hash: String(entry.hash || ""),
-          binHash: String(entry.binHash || ""),
-          payloadHash: String(entry.payloadHash || ""),
-          generation: reuseGeneration,
-          reused: true
-        });
-        continue;
+        const reuseFile = String(entry.file);
+        const reuseBinFile = String(entry.bin || reuseFile.replace(/\.json$/i, ".bin"));
+        // Reuse by reference only when both files are still on disk; a shard
+        // deleted after the last save must be rewritten, not kept referenced.
+        const canConfirm = Boolean(existingFiles && typeof existingFiles.has === "function");
+        if (canConfirm && existingFiles.has(reuseFile) && existingFiles.has(reuseBinFile)) {
+          const reuseGeneration = String(entry.generation || "") || semanticIndexShardFileGeneration(indexFile, entry.file);
+          shards.push({
+            file: reuseFile,
+            binFile: reuseBinFile,
+            bytes: Number(entry.bytes || 0),
+            binBytes: Number(entry.binBytes || 0),
+            chunkCount: Number(entry.chunks || 0),
+            hash: String(entry.hash || ""),
+            binHash: String(entry.binHash || ""),
+            payloadHash: String(entry.payloadHash || ""),
+            generation: reuseGeneration,
+            reused: true
+          });
+          continue;
+        }
+        if (canConfirm) rewrittenMissingCount += 1;
       }
     }
     if (isTail && appended.length) {
@@ -55713,7 +56133,7 @@ async function semanticIndexStableShardPlanAsync(indexFile, meta, previousIndex,
     shards.push(Object.assign({ generation }, semanticIndexShardBinaryFromChunks(indexFile, meta, range.index, survivors, generation)));
   }
   if (!shards.length) return null;
-  return { shards };
+  return { shards, rewrittenMissingCount };
 }
 
 function semanticIndexShardBinaryDecodeChunks(sidecar = {}, binBuffer = null) {

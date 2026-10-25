@@ -76,6 +76,7 @@ test("models see user-facing priorities P1 (highest) to P4, not raw API numbers"
   assert.ok(!/\| p[1-4] \|/.test(text), "no raw pN priority");
   assert.ok(/P1 \(highest\)/.test(text), "header explains P1 highest");
   assert.ok(/API (priority )?4, 3, 2, 1/.test(text) && /P1.*P4|P1, P2, P3, P4/.test(text), "change instruction maps P1..P4 to API 4..1");
+  assert.ok(/name priorities only as P1-P4[^\n]*never mention API numbers/.test(text), "answer must not expose API numbers");
 });
 
 test("vault-only question never fetches snapshot", async () => {

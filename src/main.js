@@ -14367,7 +14367,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         ...(todoistTurn?.shortlist ? [
           "Todoist tasks, projects and sections are listed in the user message; answer questions about them from those lists only.",
           ...(todoistTurn.snapshot && todoistTurn.lookup.kind === "change" ? [
-            "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. In changePlan, priority is Todoist's API number: user P1, P2, P3, P4 = API 4, 3, 2, 1 (so priority 1 or P1 means API 4; P4 or normal means API 1). Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite."
+            "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. In changePlan, priority is Todoist's API number: user P1, P2, P3, P4 = API 4, 3, 2, 1 (so priority 1 or P1 means API 4; P4 or normal means API 1). In your answer to the user, name priorities only as P1-P4 and never mention API numbers. Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite."
           ] : [])
         ] : [])
       ].join(" "),

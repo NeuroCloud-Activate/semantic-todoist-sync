@@ -34,8 +34,11 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
     if ("dueDate" in f) parts.push(`due ${day(task.dueDate)} -> ${day(f.dueDate)}`);
     if ("deadlineDate" in f) parts.push(`deadline ${day(task.deadlineDate)} -> ${day(f.deadlineDate)}`);
   };
+  const PRIO = { 4: "P1", 3: "P2", 2: "P3", 1: "P4" }; // API 4 = highest = Todoist P1
+  const WORD = { content: "title", dueDate: "due date", deadlineDate: "deadline" };
+  const show = (k, v) => (v === undefined || v === null || v === "" ? "(none)" : k === "priority" ? PRIO[v] || String(v) : `"${v}"`);
   const otherParts = (task, f, parts) => {
-    for (const k of otherKeys(f)) parts.push(`${k} ${task[k] === undefined || task[k] === "" ? "(none)" : `"${task[k]}"`} -> "${f[k]}"`);
+    for (const k of otherKeys(f)) parts.push(`${WORD[k] || k} ${show(k, task[k])} -> ${show(k, f[k])}`);
   };
   const make = (row, i) => {
     const task = byId.get(String(row.taskId)) || {};
@@ -100,8 +103,8 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
       }
     } else {
       const keys = Object.keys(f);
-      after = keys.map((k) => `${k}: ${f[k]}`).join(", ");
-      sentence = `Update "${title}" (${keys.join(", ")})`;
+      after = keys.map((k) => `${WORD[k] || k}: ${k === "priority" ? show(k, f[k]) : f[k]}`).join(", ");
+      sentence = `Update "${title}" (${keys.map((k) => WORD[k] || k).join(", ")})`;
     }
     if (row.newLabels && row.newLabels.length) warnings.push(`New label: ${row.newLabels.join(", ")}`);
     if (task.isRecurring) warnings.push("Recurring task");

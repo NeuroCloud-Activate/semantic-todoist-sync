@@ -12,15 +12,15 @@ const LOOKUP_SCHEMA = {
     filters: {
       type: "object",
       additionalProperties: false,
-      required: ["words", "projects", "labels"],
+      required: ["words", "projects", "labels", "dueFrom", "dueTo", "priority", "includeCompleted"],
       properties: {
         words: { type: "array", items: { type: "string" } },
         projects: { type: "array", items: { type: "string" } },
         labels: { type: "array", items: { type: "string" } },
-        dueFrom: { type: "string" },
-        dueTo: { type: "string" },
-        priority: { type: "integer" },
-        includeCompleted: { type: "boolean" }
+        dueFrom: { type: ["string", "null"] },
+        dueTo: { type: ["string", "null"] },
+        priority: { type: ["integer", "null"] },
+        includeCompleted: { type: ["boolean", "null"] }
       }
     },
     refersToLastAnswer: { type: "boolean" }

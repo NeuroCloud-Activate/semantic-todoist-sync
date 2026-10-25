@@ -57,6 +57,22 @@ const cases = {
     assert.ok(shortlistTasks(snapshot, lk(), []).length > 0);
     assert.ok(shortlistTasks(snapshot, lk(), [], NaN).length > 0);
   },
+  "LOOKUP_SCHEMA is strict-mode compliant; null filters = no filter"() {
+    const bad = (s, p = "root") => {
+      const o = [];
+      if ([].concat(s.type).includes("object")) {
+        const k = Object.keys(s.properties);
+        if (s.additionalProperties !== false) o.push(p + " additionalProperties");
+        if (JSON.stringify([...s.required].sort()) !== JSON.stringify(k.sort())) o.push(p + " required");
+        for (const x of k) o.push(...bad(s.properties[x], p + "." + x));
+      }
+      return o;
+    };
+    assert.deepStrictEqual(bad(LOOKUP_SCHEMA), []);
+    for (const k of ["dueFrom", "dueTo", "priority", "includeCompleted"]) assert.ok(LOOKUP_SCHEMA.properties.filters.properties[k].type.includes("null"), k);
+    const nul = { words: [], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)), ["t1", "t2", "t3"]);
+  },
   "prompt and schema"() {
     assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer"]);
     const p = lookupPrompt("move it", "User: hi");

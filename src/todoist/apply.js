@@ -5,6 +5,7 @@
 // that spill into a later batch of >100 commands is not re-sent. Upgrade if one plan nears 100 commands.
 
 const BATCH_SIZE = 100;
+const DESC_LIMIT = 16383; // Todoist description limit
 const asArr = (v) => (Array.isArray(v) ? v : []);
 const tasksOf = (s) => asArr(s && (s.tasks || s.items));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -95,8 +96,77 @@ function buildApplyBatches(rows, previewSnapshot, freshSnapshot, uuid) {
     undo.createdSectionIds.push(tempId);
   }
 
-  for (const row of rows) {
-    if (row.op === "create-section") continue;
+  // Merge rows: row.taskId is merged away into row.fields.targetTaskId (the kept task). Produces no vault-line delete/move;
+  // result.mergedAwayIds lets the caller tick those lines in place.
+  const mergedAwayIds = [];
+  const mergeGroups = new Map();
+  for (const row of rows) if (row.op === "merge") {
+    const keepId = String(row.fields && row.fields.targetTaskId);
+    if (!mergeGroups.has(keepId)) mergeGroups.set(keepId, []);
+    mergeGroups.get(keepId).push(row);
+  }
+  const MERGE_PROPS = ["description", "priority", "labels", "dueDate", "deadlineDate", "isCompleted"];
+  const staleProps = (p, cur) => MERGE_PROPS.filter((k) => !same(p[k], cur[k]));
+  const record = (id, p, fields, extra) => {
+    if (entries.has(id)) { Object.assign(entries.get(id).previous.fields, fields); return; }
+    const entry = { taskId: id, previous: { fields, projectId: p.projectId, sectionId: p.sectionId, parentId: p.parentId, checked: p.isCompleted, ...extra } };
+    entries.set(id, entry);
+    undo.entries.push(entry);
+  };
+  for (const [keepId, group] of mergeGroups) {
+    const kp = pre.get(keepId);
+    const kc = fresh.get(keepId);
+    if (!kp || !kc || kc.isCompleted !== kp.isCompleted || staleProps(kp, kc).length) {
+      for (const row of group) skipped.push({ row, reason: !kc ? "kept task no longer exists in Todoist" : "kept task changed in Todoist since preview" });
+      continue;
+    }
+    const aways = [];
+    for (const row of group) {
+      const id = String(row.taskId);
+      const p = pre.get(id);
+      const cur = fresh.get(id);
+      if (!cur) skipped.push({ row, reason: "task no longer exists in Todoist" });
+      else if (!p) skipped.push({ row, reason: "task was not in preview" });
+      else if (id === keepId) skipped.push({ row, reason: "cannot merge a task into itself" });
+      else if (staleProps(p, cur).length) skipped.push({ row, reason: `changed in Todoist since preview (${staleProps(p, cur).join(", ")})` });
+      else aways.push({ cur, p });
+    }
+    if (!aways.length) continue;
+    const fields = {};
+    let desc = kc.description;
+    for (const { cur } of aways) {
+      const text = cur.description.trim();
+      if (!text || desc.includes(text) || desc.length >= DESC_LIMIT) continue;
+      desc = (desc + `${desc ? "\n\n" : ""}From merged task: ${cur.content}\n${text}`).slice(0, DESC_LIMIT);
+    }
+    const labels = [...kc.labels];
+    for (const { cur } of aways) for (const l of cur.labels) if (!labels.some((x) => x.toLowerCase() === l.toLowerCase())) labels.push(l);
+    const earliest = (prop) => aways.map((x) => x.cur[prop]).filter(Boolean).sort((a, b) => String(a).slice(0, 10).localeCompare(String(b).slice(0, 10)))[0];
+    const args = {};
+    if (desc !== kc.description) args.description = desc;
+    const prio = Math.max(...aways.map((x) => x.cur.priority));
+    if (kc.priority <= 1 && prio > 1) args.priority = prio;
+    if (labels.length !== kc.labels.length) args.labels = labels;
+    if (!kc.dueDate && earliest("dueDate")) args.due = { date: earliest("dueDate") };
+    if (!kc.deadlineDate && earliest("deadlineDate")) args.deadline = { date: earliest("deadlineDate") };
+    for (const k of Object.keys(args)) fields[{ due: "dueDate", deadline: "deadlineDate" }[k] || k] = kc[{ due: "dueDate", deadline: "deadlineDate" }[k] || k];
+    record(keepId, kp, {}, {});
+    if (Object.keys(args).length) { Object.assign(entries.get(keepId).previous.fields, fields); cmds.push({ type: "item_update", uuid: uuid(), args: { id: keepId, ...args } }); }
+    // Away entries precede subtask entries so undo reopens a parent before moving its subtasks back.
+    for (const { cur, p } of aways) record(cur.id, p, { description: p.description }, { completedByChat: true });
+    for (const { cur } of aways) for (const sub of fresh.values()) if (sub.parentId === cur.id) {
+      record(sub.id, pre.get(sub.id) || sub, {}, {});
+      cmds.push({ type: "item_move", uuid: uuid(), args: { id: sub.id, parent_id: keepId } });
+    }
+    for (const { cur } of aways) {
+      const note = `merged into ${kc.content}`;
+      const base = cur.description.slice(0, Math.max(0, DESC_LIMIT - note.length - 2));
+      cmds.push({ type: "item_update", uuid: uuid(), args: { id: cur.id, description: base ? `${base}\n\n${note}` : note } });
+      cmds.push({ type: "item_close", uuid: uuid(), args: { id: cur.id } });
+      mergedAwayIds.push(cur.id);
+    }
+  }  for (const row of rows) {
+    if (row.op === "create-section" || row.op === "merge") continue;
     if (row.op === "create") {
       const f = row.fields || {};
       const tempId = uuid();
@@ -134,7 +204,7 @@ function buildApplyBatches(rows, previewSnapshot, freshSnapshot, uuid) {
       for (const k of touchedProps(row)) if (["content", "description", "priority", "labels", "dueDate", "deadlineDate"].includes(k)) entries.get(id).previous.fields[k] = p[k];
     }
 
-    if (row.op === "update" || row.op === "merge") {
+    if (row.op === "update") {
       const args = updateArgs(row, cur);
       if (Object.keys(args).length) cmds.push({ type: "item_update", uuid: uuid(), args: { id, ...args } });
     } else if (row.op === "move") {
@@ -146,7 +216,7 @@ function buildApplyBatches(rows, previewSnapshot, freshSnapshot, uuid) {
     else if (row.op === "reopen") cmds.push({ type: "item_reopen", uuid: uuid(), args: { id } });
     else if (row.op === "delete") cmds.push({ type: "item_delete", uuid: uuid(), args: { id } });
   }
-  return { batches: chunk([...sectionCmds, ...cmds]), skipped, undo };
+  return { batches: chunk([...sectionCmds, ...cmds]), skipped, undo, mergedAwayIds };
 }
 
 const PROP_ARG = { content: "content", description: "description", priority: "priority", labels: "labels" };
@@ -160,7 +230,7 @@ function buildUndoBatches(undo, freshSnapshot, uuid) {
   for (const e of asArr(undo.entries)) {
     const cur = fresh.get(String(e.taskId));
     // A chat-completed task leaves the active snapshot; reopen it by id.
-    if (!cur && e.previous && e.previous.completedByChat) { cmds.push({ type: "item_reopen", uuid: uuid(), args: { id: String(e.taskId) } }); continue; }
+    if (!cur && e.previous && e.previous.completedByChat) { cmds.push({ type: "item_reopen", uuid: uuid(), args: { id: String(e.taskId) } }); if (e.previous.fields && "description" in e.previous.fields) cmds.push({ type: "item_update", uuid: uuid(), args: { id: String(e.taskId), description: e.previous.fields.description } }); continue; }
     if (!cur) { skipped.push({ entry: e, reason: "task no longer exists in Todoist" }); continue; }
     const prev = e.previous || {};
     const args = {};

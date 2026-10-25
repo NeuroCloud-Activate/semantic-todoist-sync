@@ -7,7 +7,7 @@ const { buildPreview } = require("../src/todoist/preview.js");
 
 const snapshot = {
   tasks: [
-    { id: "t1", content: "Pay rent", projectId: "p1", sectionId: null, labels: ["home"], dueDate: "2026-11-01T10:00:00", isRecurring: true },
+    { id: "t1", content: "Pay rent", priority: 1, projectId: "p1", sectionId: null, labels: ["home"], dueDate: "2026-11-01T10:00:00", isRecurring: true },
     { id: "t2", content: "Write report", projectId: "p2", sectionId: "s9", labels: ["work", "old"], dueDate: "" },
     { id: "t3", content: "Sub task", projectId: "p2", parentId: "t2", labels: [] },
   ],
@@ -101,11 +101,20 @@ test("mixed-category update is one row naming every changed field", () => {
   assert.strictEqual(p.groups[0].kind, "dates");
   assert.strictEqual(p.groups[0].rows.length, 1);
   const s = p.groups[0].rows[0].sentence;
-  assert.ok(s.includes("content") && s.includes('"Sub task" -> "New"') && s.includes("due no date -> 2026-03-03"), s);
+  assert.ok(s.includes("title") && !s.includes("content") && s.includes('"Sub task" -> "New"') && s.includes("due no date -> 2026-03-03"), s);
   const q = first([{ op: "update", taskId: "t1", fields: { dueDate: "2026-02-02", addLabels: ["b"] }, newLabels: [] }]).sentence;
   assert.ok(q.includes("labels from home to home, b") && q.includes("due 2026-11-01 -> 2026-02-02"), q);
 });
 
+test("priority reads as P1-P4 and field keys as words", () => {
+  const e = first([edit]);
+  assert.strictEqual(first([{ op: "update", taskId: "t1", fields: { content: "Pay rent now", description: "d" }, newLabels: [] }]).sentence, 'Update "Pay rent" (title, description)');
+  assert.strictEqual(first([{ op: "update", taskId: "t1", fields: { priority: 1 }, newLabels: [] }]).after, "priority: P4");
+  const s = first([{ op: "update", taskId: "t3", fields: { content: "New", priority: 4, dueDate: "2026-03-03" }, newLabels: [] }]).sentence;
+  assert.ok(s.includes('title "Sub task" -> "New"') && s.includes("priority (none) -> P1") && !s.includes("content"), s);
+  const q = first([{ op: "update", taskId: "t1", fields: { priority: 4, dueDate: "2026-02-02" }, newLabels: [] }]).sentence;
+  assert.ok(q.includes("priority P4 -> P1") && !q.includes('"'.concat("1")), q);
+});
 let failed = 0;
 for (const [n, f] of cases) {
   try { f(); console.log("PASS " + n); } catch (e) { failed++; console.log("FAIL " + n + "\n" + e.stack); }

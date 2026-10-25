@@ -5,41 +5,46 @@
 
 const OPS = ["create", "update", "move", "complete", "reopen", "delete", "create-section", "merge"];
 
+// OpenAI strict mode: every object lists all its properties in `required` and sets additionalProperties:false,
+// so optional fields are nullable (null reads as absent in validateChangePlan).
+const nul = (type, extra = {}) => ({ type: [type, "null"], ...extra });
 const CHANGE_PLAN_SCHEMA = {
-  type: "object",
-  properties: {
-    changes: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          op: { type: "string", enum: OPS },
-          taskId: { type: "string" },
-          targetTaskId: { type: "string" },
-          projectId: { type: "string" },
-          sectionId: { type: "string" },
-          parentId: { type: "string" },
-          content: { type: "string" },
-          description: { type: "string" },
-          priority: { type: "integer", minimum: 1, maximum: 4 },
-          dueDate: { type: "string", description: "YYYY-MM-DD" },
-          deadlineDate: { type: "string", description: "YYYY-MM-DD" },
-          labels: { type: "array", items: { type: "string" } },
-          addLabels: { type: "array", items: { type: "string" } },
-          removeLabels: { type: "array", items: { type: "string" } },
-        placement: {
-          type: "object",
-          properties: { kind: { type: "string", enum: ["active", "named", "none"] }, paths: { type: "array", items: { type: "string" } } },
-          required: ["kind"]
-        }
-        },
-        required: ["op"]
-      }
-    }
-  },
-  required: ["changes"]
+type: "object",
+additionalProperties: false,
+properties: {
+changes: {
+type: "array",
+items: {
+type: "object",
+additionalProperties: false,
+properties: {
+op: { type: "string", enum: OPS },
+taskId: nul("string"),
+targetTaskId: nul("string"),
+projectId: nul("string"),
+sectionId: nul("string"),
+parentId: nul("string"),
+content: nul("string"),
+description: nul("string"),
+priority: nul("integer", { minimum: 1, maximum: 4 }),
+dueDate: nul("string", { description: "YYYY-MM-DD" }),
+deadlineDate: nul("string", { description: "YYYY-MM-DD" }),
+labels: nul("array", { items: { type: "string" } }),
+addLabels: nul("array", { items: { type: "string" } }),
+removeLabels: nul("array", { items: { type: "string" } }),
+placement: {
+type: ["object", "null"],
+additionalProperties: false,
+properties: { kind: { type: "string", enum: ["active", "named", "none"] }, paths: nul("array", { items: { type: "string" } }) },
+required: ["kind", "paths"]
+}
+},
+required: ["op", "taskId", "targetTaskId", "projectId", "sectionId", "parentId", "content", "description", "priority", "dueDate", "deadlineDate", "labels", "addLabels", "removeLabels", "placement"]
+}
+}
+},
+required: ["changes"]
 };
-
 function validDate(value) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value));
   if (!m) return false;
@@ -53,7 +58,7 @@ const day = (x) => String(x ?? "").slice(0, 10);
 const PLACEMENT_KINDS = ["active", "named", "none"];
 function cleanPlacement(p) {
   if (!p || typeof p !== "object" || !PLACEMENT_KINDS.includes(p.kind)) return null;
-  if (p.paths === undefined) return { kind: p.kind };
+  if (p.paths === undefined || p.paths === null) return { kind: p.kind };
   if (!Array.isArray(p.paths) || !p.paths.every((x) => typeof x === "string")) return null;
   return { kind: p.kind, paths: p.paths.slice() };
 }
@@ -71,6 +76,26 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
   const known = new Map();
   for (const l of [...labels, ...(snap.labels || [])]) known.set(cleanLabel(l).toLowerCase(), cleanLabel(l));
 
+  // Merge guards (merge never deletes or loses data; when unsure, leave duplicates): decided per merge row in plan order.
+  const mergeVerdict = new Map();
+  const mergeIds = new Set();
+  const isUnder = (id, ancestorId) => {
+    for (let cur = tasks.get(String(id)), n = 0; cur && cur.parentId && n < 1000; n++) {
+      if (String(cur.parentId) === String(ancestorId)) return true;
+      cur = tasks.get(String(cur.parentId));
+    }
+    return false;
+  };
+  if (allowMerge) for (const c of changes) {
+    if (c?.op !== "merge" || !has(c, "taskId") || !has(c, "targetTaskId") || String(c.taskId) === String(c.targetTaskId)) continue;
+    const away = tasks.get(String(c.taskId));
+    if (!away || !tasks.has(String(c.targetTaskId))) continue;
+    const reason = mergeIds.has(String(c.taskId)) || mergeIds.has(String(c.targetTaskId)) ? "merge-conflict"
+      : away.isRecurring !== false ? "merge-recurring"
+      : isUnder(c.targetTaskId, c.taskId) ? "merge-ancestor" : null;
+    mergeVerdict.set(c, reason);
+    if (!reason) { mergeIds.add(String(c.taskId)); mergeIds.add(String(c.targetTaskId)); }
+  }
   for (const change of changes) {
     const op = change?.op;
     const reject = (reason) => rejected.push({ op: String(op ?? ""), reason, text: String(change?.content ?? change?.taskId ?? "") });
@@ -85,7 +110,11 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
     const needsTask = op !== "create" && op !== "create-section";
     const task = needsTask ? tasks.get(String(change.taskId)) : null;
     if (needsTask && !task) { reject("unknown-id"); continue; }
-    if (op === "merge" && !tasks.has(String(change.targetTaskId))) { reject("unknown-id"); continue; }
+    if (op === "merge" && mergeVerdict.get(change)) { reject(mergeVerdict.get(change)); continue; }
+  if (op !== "merge" && ["taskId", "parentId"].some((k) => has(change, k) && mergeIds.has(String(change[k])))) { reject("merge-conflict"); continue; }
+  // Todoist removes/closes subtasks with their parent, which would lose merged data.
+  if ((op === "delete" || op === "complete") && task && [...mergeIds].some((id) => isUnder(id, task.id))) { reject("merge-conflict"); continue; }
+  if (op === "merge" && !tasks.has(String(change.targetTaskId))) { reject("unknown-id"); continue; }
 
     if (has(change, "priority") && !(Number.isInteger(change.priority) && change.priority >= 1 && change.priority <= 4)) { reject("bad-priority"); continue; }
     if ((has(change, "dueDate") && change.dueDate !== "" && !validDate(change.dueDate)) || (has(change, "deadlineDate") && change.deadlineDate !== "" && !validDate(change.deadlineDate))) { reject("bad-date"); continue; }

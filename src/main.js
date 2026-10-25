@@ -21785,13 +21785,29 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   async deleteTodoistTasksMissingFromFile(path, presentIds) {
     let deleted = 0;
     let forgotCompleted = 0;
+    let warnedMissingMisc = false;
     const deletedSections = new Map();
     const cachedEntries = this.getTaskReferenceIndex().byPath.get(vaultRelativePath(path, vaultBasePath(this.app))) || [];
+    // One vault pass for all missing tasks, not one per task.
+    const movedPaths = await this.findVaultNotesHoldingTasks(cachedEntries.filter(([id, cached]) => !presentIds.has(id) && !cached.isCompleted), path);
     for (const [id, cached] of cachedEntries) {
       if (presentIds.has(id)) continue;
       if (cached.isCompleted) {
         this.forgetCachedTaskReference(id);
         forgotCompleted += 1;
+        continue;
+      }
+      // Move-aware: a line that still sits in another note was moved, not removed.
+      const movedTo = movedPaths.get(id);
+      if (movedTo) {
+        cached.path = movedTo;
+        this.markTaskReferenceStateDirty();
+        continue;
+      }
+      // Only guards a deletion mid-sync: syncFileNotes returns early for a missing file, so this Notice cannot fire through it.
+      if (isMiscTasksPath(path, this.settings) && !(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) {
+        if (!warnedMissingMisc) new Notice(`Monthly task note ${path} is missing; its Todoist tasks were kept.`);
+        warnedMissingMisc = true;
         continue;
       }
       const ok = await this.deleteTodoistTask(id).catch((error) => {
@@ -21813,6 +21829,30 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (forgotCompleted) this.logLocal("Completed note task references forgotten after local line removal", { path, tasks: forgotCompleted });
     if (deletedSections.size) await this.cleanupEmptyTodoistSections(Array.from(deletedSections.values()));
     return { deleted, completedForgotten: forgotCompleted };
+  }
+
+  async findVaultNotesHoldingTasks(entries, excludePath) {
+    const found = new Map();
+    if (!entries.length) return found;
+    const wanted = new Map();
+    for (const [id, cached] of entries) {
+      wanted.set(id, id);
+      // Mirror todoistIdForOid: primary oid and every noteRefs oid, upper-cased.
+      for (const oid of [cached.oid, ...(cached.noteRefs || []).map((ref) => ref?.oid)]) {
+        if (oid) wanted.set(String(oid).toUpperCase(), id);
+      }
+    }
+    for (const candidate of this.app.vault.getMarkdownFiles?.() || []) {
+      if (found.size === entries.length) break;
+      if (candidate.path === excludePath) continue;
+      let text;
+      try { text = String(await this.app.vault.cachedRead(candidate)); } catch (error) { continue; } // unreadable note: skip it, never abort the sync
+      for (const line of text.split("\n")) {
+        const id = wanted.get(String(getTaskOid(line) || "").toUpperCase()) || wanted.get(getLegacyTodoistId(line));
+        if (id && !found.has(id)) found.set(id, candidate.path);
+      }
+    }
+    return found;
   }
 
   async cleanupEmptyTodoistSections(sections) {
@@ -56517,6 +56557,11 @@ function obsidianDescription(path) {
 function sourceReference(source, basePath = "") {
   return vaultRelativePath(source?.path || "", basePath);
 }
+function isMiscTasksPath(path, settings = DEFAULT_SETTINGS) {
+  const folder = trimSlashes(settings.miscTasksFolder || "Semantic Todoist Sync/Miscellaneous Tasks");
+  const notePath = trimSlashes(path || "");
+  return Boolean(folder && (notePath === folder || notePath.startsWith(`${folder}/`)));
+}
 function isEmailLogPath(path, settings = DEFAULT_SETTINGS) {
   const folder = trimSlashes(settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder || "");
   const notePath = trimSlashes(path || "");
@@ -58005,6 +58050,7 @@ if (typeof module !== "undefined" && module.exports) {
     SUPPORTED_AI_PROVIDERS,
     AI_OPERATION_KEYS,
     DEFAULT_SETTINGS,
+    isMiscTasksPath,
     taskDescriptionConcurrencyFor,
     normalizeStableSettings,
     resolveOperationReference,

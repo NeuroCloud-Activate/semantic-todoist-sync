@@ -33,7 +33,7 @@ function lookupPrompt(prompt, historyText) {
     "needsTodoist=false (kind \"none\") when the message is only about vault notes, writing or general chat.",
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
     "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
-    "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = 1-4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
+    "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = Todoist API number, inverted from what users say: user P1 (urgent) = 4, P2 = 3, P3 = 2, P4 (normal) = 1, so \"my P1 tasks\" means priority 4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
     "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\")."
   ].join("\n");
   return { system, user: `Conversation so far:\n${historyText || "(none)"}\n\nLatest message:\n${prompt}` };

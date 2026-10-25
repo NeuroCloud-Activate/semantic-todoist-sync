@@ -62,6 +62,22 @@ function makePlugin({ lookup, answer, token = "tok", snapshot = baseSnapshot([ta
 const lookupOf = (o) => ({ needsTodoist: true, kind: "question", filters: { words: [], projects: [], labels: [] }, refersToLastAnswer: false, ...o });
 const claims = (ids = []) => ({ claims: [{ text: "Compost is on your list.", established: ids.length > 0, evidence_ids: ids, category: ids.length ? "fact" : "unsupported", topic: "Compost" }] });
 
+test("models see user-facing priorities P1 (highest) to P4, not raw API numbers", async () => {
+  let text = "";
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change", filters: { words: ["compost"], projects: [], labels: [] } }),
+    answer: (request) => { text = `${request.system}\n${request.user}`; return claims(); }
+  });
+  p.snapshotNow = null;
+  p.getTodoistSnapshot = async () => ({ tasks: [task({ id: "t1", priority: 4 }), task({ id: "t2", content: "Buy compost 2", priority: 1 })], projects: [], sections: [], fetchedAt: "" });
+  await p.chat("Make the compost task urgent", null, [], "chat-query", { todoist: true });
+  assert.ok(/\| t1 \| Buy compost \|[^\n]*\| P1 \|/.test(text), "API 4 shown as P1");
+  assert.ok(/\| t2 \| Buy compost 2 \|[^\n]*\| P4 \|/.test(text), "API 1 shown as P4");
+  assert.ok(!/\| p[1-4] \|/.test(text), "no raw pN priority");
+  assert.ok(/P1 \(highest\)/.test(text), "header explains P1 highest");
+  assert.ok(/API (priority )?4, 3, 2, 1/.test(text) && /P1.*P4|P1, P2, P3, P4/.test(text), "change instruction maps P1..P4 to API 4..1");
+});
+
 test("vault-only question never fetches snapshot", async () => {
   const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: claims() });
   const r = await p.chat("What did the vendor notes say about invoices?", null, [], "chat-query", { todoist: true });

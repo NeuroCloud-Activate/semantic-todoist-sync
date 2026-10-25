@@ -108,6 +108,7 @@ const cases = {
   "prompt and schema"() {
     assert.ok(/existing tasks/i.test(lookupPrompt("x", "").system) && /not.*new value/i.test(lookupPrompt("x", "").system));
     assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer"]);
+    assert.ok(/P1.*=.*4/s.test(lookupPrompt("x", "").system) && /P4.*=.*1/s.test(lookupPrompt("x", "").system), "priority mapping");
     const p = lookupPrompt("move it", "User: hi");
     assert.ok(p.user.includes("move it") && p.user.includes("User: hi"));
     assert.ok(/needsTodoist.*false/s.test(p.system) && /vault notes/.test(p.system) && /short/i.test(p.system));

@@ -19,6 +19,7 @@ assert.strictEqual(typeof Plugin.providerIndexIdentity, 'function');
 assert.strictEqual(typeof Plugin.semanticIndexCompatibilityStatus, 'function');
 assert.strictEqual(typeof Plugin.semanticIndexCleanupPlan, 'function');
 const settings = {
+  embeddingModel: 'qwen3-embedding-0.6b-8k:latest',
   embeddingDimension: 768,
   embeddingDimensionOverrides: { 'customopenai:qwen3-embedding-0.6b-8k:latest': 768 },
   customOpenAIBaseUrl: 'https://sentinel.invalid/one/',

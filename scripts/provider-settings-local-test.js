@@ -244,6 +244,8 @@ assert.deepStrictEqual(inherited, { provider: 'customopenai', model: 'fictional-
 // 10. Render both owned settings methods with a no-network fake DOM. This
 // exercises the actual disclosures rather than only checking source labels.
 assert.strictEqual(typeof Plugin.SemanticTodoistSettingTab, 'function', 'settings tab is testable without Obsidian');
+assert.strictEqual(Plugin.normalizeStableSettings({}).embeddingModel, 'embeddinggemma-2', 'fresh install default embedding model');
+assert.strictEqual(Plugin.normalizeStableSettings({ embeddingModel: 'qwen3-embedding-0.6b-8k:latest' }).embeddingModel, 'qwen3-embedding-0.6b-8k:latest', 'saved embedding model kept');
 const plugin = Object.assign(Object.create(Plugin.prototype), {
   settings: Plugin.normalizeStableSettings({ enableMultiProviderOperationModels: true, providerGenerationModels: { openrouter: ['openai/gpt-5.6-luna'] }, providerEmbeddingModels: { customopenai: ['qwen3-embedding-0.6b-8k:latest'] } }),
   app: { vault: { getAllLoadedFiles: () => [] } },

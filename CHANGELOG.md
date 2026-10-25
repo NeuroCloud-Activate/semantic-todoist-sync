@@ -1,3 +1,19 @@
+## Unreleased
+### Added
+- **Ask about your Todoist tasks in the sidebar chat.** Questions such as "what is due this week?" are answered from your Todoist tasks, with a link to each task named.
+- **Change Todoist tasks by asking.** In the sidebar chat you can create, edit, move, label, prioritise, complete and delete tasks, and make a task a subtask of another.
+- **Every change is previewed first, and nothing is written until you press Apply.** The preview lists each change as a row you can tick or untick, in plain words, and only ticked rows are applied. Priorities are shown as P1 to P4, the way Todoist shows them, and the chat is told to use the same names in its answers.
+- **Deletes are kept apart and need two steps.** They appear in a separate red section, unticked, and need a second confirmation before they run. A delete cannot be undone, and the chat says so.
+- **One-step Undo of your last Apply.** An "Undo last Todoist change" button appears after an Apply that can be undone, and puts back what that Apply changed. It only appears when there is something to undo, so a delete-only Apply never offers it.
+- **Tasks made in chat that are not tied to a note go into a monthly "Miscellaneous Tasks" note.** Each task is a line under its project's heading. A project heading appears only when it is used, and disappears again when Undo or a task deleted in Todoist leaves it empty. Headings and text you typed yourself are left alone.
+- **Duplicate finding is built but switched off.** Asking for duplicates answers "Duplicate finding isn't turned on yet." and changes nothing, until it has been checked on real data.
+### Changed
+- **New installs default to the embeddinggemma-2 embedding model** for an OpenAI-compatible (LiteLLM) host; you still enter your host's address. A model you have already saved is kept.
+### Notes
+- Tests: `npm test` passes 66/66, including the new Todoist test files for planning, preview, apply, look-up, the monthly note, and the chat and monthly-note wiring.
+- Live check in the dev vault: only the "STS Test" project was changed, and tasks in other projects were left unchanged. A create with a priority and due date, a due-date edit, a move to subtask and a delete each showed a preview first and wrote nothing until Apply. Undo restored the earlier state each time, and in the sidebar the red delete section, the second confirmation and the Undo button were seen working. The chat asked for "priority 1" and the preview showed P1. The repeatable check script (search, create, organize, undo) passed every step.
+- Known limits: Undo covers only the last Apply. A task deleted in Todoist has its monthly-note line removed at the next Todoist check, not at once. Removing a task line while syncing leaves its project heading in place; only Undo and a Todoist delete remove an emptied heading.
+
 ## 0.9.30 - 2026-10-20
 ### Fixed
 - **Emails are no longer blocked when processed back to back.** When one email finished, the plugin added its log note to the vault search index, which briefly reset the search lookup. An email already in progress could search during that reset, find no supporting notes, and be blocked with "protected provider evidence was unresolved". The email now waits for vault search to be ready again before its second search.

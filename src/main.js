@@ -31,7 +31,7 @@ const AI_OPERATION_KEYS = Object.freeze([
 ]);
 const DEFAULT_GENERATION_PRIMARY = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-luna", reasoningEffort: "auto" });
 const DEFAULT_GENERATION_FALLBACK = Object.freeze({ provider: "openrouter", model: "openai/gpt-5.6-terra", reasoningEffort: "auto" });
-const DEFAULT_EMBEDDING_REFERENCE = Object.freeze({ provider: "customopenai", model: "qwen3-embedding-0.6b-8k:latest" });
+const DEFAULT_EMBEDDING_REFERENCE = Object.freeze({ provider: "customopenai", model: "embeddinggemma-2" });
 const STABLE_INDEX_CLEANUP_PATTERNS = Object.freeze([
   /^semantic-index\.(?:openai|gemini|openrouter|openwebui|customopenai)\.g[a-z0-9-]+\.\d{3}\.json$/i,
   /^semantic-index-path-meta\.[a-z0-9-]+\.json$/i,
@@ -3424,7 +3424,7 @@ const DEFAULT_SETTINGS = {
   chatMode: "Vault QA",
   embeddingProvider: "customopenai",
   embeddingModelReference: DEFAULT_EMBEDDING_REFERENCE,
-  embeddingModel: "qwen3-embedding-0.6b-8k:latest",
+  embeddingModel: "embeddinggemma-2",
   embeddingDimension: 0,
   embeddingDimensionOverrides: {},
   // Slice B: per-provider/model reasoning capability records discovered from
@@ -14208,7 +14208,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       }), source || {}, sourceContract, { limit: perScopeLimit, mode: "chat" }));
       const taskSeparatedGroups = requestedTaskScopes.map((record, requestIndex) => {
         const key = taskScopeRetrieval.taskKeyByIndex?.[String(requestIndex)] || record.taskId;
-        return taskScopeRetrieval.byTask?.[key]?.context || [];
+        return dropStaleTodoistIndexRows(taskScopeRetrieval.byTask?.[key]?.context || [], todoistTurn?.snapshot);
       });
       reservedTaskEvidence = buildTaskReservedSemanticEvidenceBundle(requestedTaskScopes, taskSeparatedGroups, source, sourceContract, this.settings);
       assertTaskReservedSemanticEvidenceDelivery(reservedTaskEvidence);
@@ -14248,6 +14248,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.lastSemanticRetrievalTelemetry = context.semanticRetrieval.telemetry;
     } else {
       context = await this.withAiActivity("Finding vault context", () => this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt, { sourceContract }));
+      context = dropStaleTodoistIndexRows(context, todoistTurn?.snapshot);
     }
     if (!reservedTaskEvidence) {
       const rawContext = context || [];
@@ -28854,7 +28855,7 @@ function indexSummary(pluginOrSettings) {
   const chunks = Number(meta.chunks || pluginOrSettings.semanticIndex?.length || 0);
   const contentVersion = Number(meta.embeddingContentVersion || 1);
   const upgrade = chunks && contentVersion < SEMANTIC_EMBEDDING_CONTENT_VERSION
-    ? ` Retrieval metadata upgrade available: rebuild the semantic vault index to embed project paths, note dates, and context headers (note title | date | heading path) in the embedding input. Rebuild re-embeds the vault once; local Qwen3 is free, paid embedding providers will incur one-time cost.`
+    ? ` Retrieval metadata upgrade available: rebuild the semantic vault index to embed project paths, note dates, and context headers (note title | date | heading path) in the embedding input. Rebuild re-embeds the vault once; local embedding models are free, paid embedding providers will incur one-time cost.`
     : "";
   if (chunks && meta.rebuiltAt) return `${chunks} chunks. Model: ${meta.model}. Rebuilt: ${meta.rebuiltAt}.${bytes}${total}${upgrade}`;
   if (chunks) return `${chunks} partial chunks are available, but no completed rebuild is recorded.${bytes}${total} Rebuild the semantic vault index.`;
@@ -35187,6 +35188,21 @@ function rankedContextExcerpt(text, query = "", settings = DEFAULT_SETTINGS, opt
   const cleaned = stripExcludedLinks(stripGeneratedActionItemsSection(String(text || "")), settings);
   // Semantic retrieval already selected this evidence record; only bound/format text here.
   return cleaned;
+}
+
+// Todoist turn only: an index task row whose task is absent from the fresh active-task snapshot was deleted; completed rows stay (snapshot is active-only).
+function dropStaleTodoistIndexRows(rows, snapshot) {
+  if (!snapshot || !Array.isArray(rows)) return rows;
+  const live = new Set((snapshot.tasks || []).map((task) => String(task.id)));
+  const kept = rows.filter((row) => {
+    if (!/^(todoist-snapshot-reference-row|subtask-task-tree-record)$/.test(String(row?.sourceKind || ""))) return true;
+    const ref = row.taskReference || row.task || {};
+    if (ref.isCompleted) return true;
+    const id = String(ref.todoistId || ref.taskId || ref.id || row.todoistId || row.taskId || "");
+    return !id || live.has(id);
+  });
+  if (kept.length === rows.length) return rows;
+  return Object.assign(kept, { semanticRetrieval: rows.semanticRetrieval });
 }
 
 function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTINGS, sourceContract = null) {

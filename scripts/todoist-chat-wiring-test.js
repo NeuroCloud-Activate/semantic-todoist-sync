@@ -465,6 +465,26 @@ test("shortlisted Todoist tasks are citable evidence", async () => {
   assert.equal(r.citationValidation.allowedEvidenceCount >= 1, true);
 });
 
+const indexRow = (id, extra = {}) => ({ evidenceId: `E-${id}`, path: `@todoist/${id}`, title: `Row ${id}`, text: `Indexed row ${id} marker-${id}`, sourceKind: "todoist-snapshot-reference-row", taskReference: { todoistId: id }, ...extra });
+
+test("todoist turn drops index task rows missing from the fresh snapshot", async () => {
+  let userText = "";
+  const context = [indexRow("gone1"), indexRow("t1"), indexRow("done1", { taskReference: { todoistId: "done1", isCompleted: true } })];
+  const p = makePlugin({ lookup: lookupOf({ kind: "question" }), context, answer: (request) => { userText = request.user; return claims(["E-gone1", "E-t1", "E-done1"]); } });
+  const r = await p.chat("Does the compost task exist?", null, [], "chat-query", { todoist: true });
+  assert.ok(!userText.includes("marker-gone1"), "stale row absent from prompt");
+  assert.ok(!r.answer.includes("gone1"), r.answer);
+  assert.ok(userText.includes("marker-t1"), "live row kept");
+  assert.ok(userText.includes("marker-done1"), "completed row kept");
+});
+
+test("vault-only turn still receives index task rows absent from any snapshot", async () => {
+  let userText = "";
+  const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), context: [indexRow("gone1")], answer: (request) => { userText = request.user; return claims(); } });
+  await p.chat("What did the vendor notes say?", null, [], "chat-query", { todoist: true });
+  assert.ok(userText.includes("marker-gone1"), userText);
+});
+
 test("vault-only turn prompt has no Todoist evidence rows", async () => {
   let userText = "";
   const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: (request) => { userText = request.user; return claims(); } });

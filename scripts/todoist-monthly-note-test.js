@@ -77,4 +77,25 @@ test("unrelated empty heading survives a move", () => {
   const out = m.moveTaskBlock(t, "A1", "Work");
   assert.ok(out.startsWith("## Ideas\n\n") && !out.includes("## Home"), out);
 });
-console.log(`${n} passed`);
+test("fenced code is ignored: no headings, no moves, byte-identical", () => {
+  const fence = "```\n## Fake\n- [ ] example in code #sync %%[p:: Home]%% %%[oid:: BBBBB]%%\n```";
+  const t = `Kept in step.\n## Home\n${T("real", "AAAAA", "Work")}\n${fence}\n`;
+  const out = m.reconcileHeadings(t);
+  assert.ok(out.includes(fence), out);
+  assert.ok(out.includes("## Work\n- [ ] real"), out);
+  assert.strictEqual(m.reconcileHeadings(out), out);
+  const tilde = fence.replace(/```/g, "~~~~");
+  assert.ok(m.reconcileHeadings(t.replace(fence, tilde)).includes(tilde));
+});
+test("fenced oid line is not a move target; unclosed fence runs to end", () => {
+  const f = "```\n- [ ] x #sync %%[oid:: BBBBB]%%\n```";
+  const t = `## Home\n${T("a", "A1", "Home")}\n${f}\n`;
+  assert.strictEqual(m.moveTaskBlock(t, "BBBBB", "Work"), t);
+  const open = `## Home\n${T("a", "A1", "Work")}\n\`\`\`\n## Fake\n`;
+  assert.ok(m.reconcileHeadings(open).includes("```\n## Fake\n"), m.reconcileHeadings(open));
+});
+test("pre-heading task line is placed by marker; intro text untouched", () => {
+  const t = `Intro line.\n${T("a", "A1", "Work")}\n`;
+  const out = m.reconcileHeadings(t);
+  assert.ok(out.startsWith("Intro line.\n") && out.includes("## Work\n- [ ] a"), out);
+});console.log(`${n} passed`);

@@ -15,7 +15,24 @@ const isTop = (line) => /^- \[.\] /.test(line) && OID_RE.test(line);
 // One normalizer (same as main.js singleLine: collapse all whitespace incl. U+2028/9, trim) for headings and markers, so they always round-trip.
 const headingName = (name) => String(name || "").replace(/\s+/g, " ").trim() || INBOX;
 const projectOf = (line) => { const m = P_RE.exec(line); return m ? headingName(m[1]) : INBOX; };
-const headingAbove = (lines, i) => { for (; i >= 0; i--) { const m = HEADING_RE.exec(lines[i]); if (m) return m[1]; } return null; };
+// Lines inside (or delimiting) CommonMark fenced code blocks; an unclosed fence runs to the end.
+function fenceMask(lines) {
+  const mask = [];
+  let open = null;
+  for (const line of lines) {
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!open) {
+      open = m && !(m[1][0] === "`" && m[2].includes("`")) ? m[1] : null;
+      mask.push(!!open);
+    } else {
+      mask.push(true);
+      if (m && m[1][0] === open[0] && m[1].length >= open.length && !m[2].trim()) open = null;
+    }
+  }
+  return mask;
+}
+const headingAt = (lines, mask, i) => (mask[i] ? null : HEADING_RE.exec(lines[i]));
+const headingAbove = (lines, i) => { const mask = fenceMask(lines); for (; i >= 0; i--) { const m = headingAt(lines, mask, i); if (m) return m[1]; } return null; };
 
 function monthlyNotePath(folder, date) {
   const d = date || new Date();
@@ -36,10 +53,11 @@ function blockEnd(lines, start) {
 }
 
 function sectionRange(lines, name) {
-  const start = lines.findIndex((l) => { const m = HEADING_RE.exec(l); return m && m[1] === name; });
+  const mask = fenceMask(lines);
+  const start = lines.findIndex((l, i) => { const m = headingAt(lines, mask, i); return m && m[1] === name; });
   if (start < 0) return null;
   let end = start + 1;
-  while (end < lines.length && !HEADING_RE.test(lines[end])) end++;
+  while (end < lines.length && !headingAt(lines, mask, end)) end++;
   return { start, end };
 }
 
@@ -81,7 +99,8 @@ function insertTaskBlock(text, projectName, blockLines) {
 function moveTaskBlock(text, oid, newProjectName) {
   const eol = eolOf(text);
   const lines = split(text);
-  const start = lines.findIndex((l) => isTop(l) && OID_RE.exec(l)[1] === oid);
+  const mask = fenceMask(lines);
+  const start = lines.findIndex((l, i) => !mask[i] && isTop(l) && OID_RE.exec(l)[1] === oid);
   if (start < 0) return text;
   const from = headingAbove(lines, start);
   const block = lines.splice(start, blockEnd(lines, start) - start);
@@ -98,6 +117,8 @@ function reconcileHeadings(text) {
   const left = new Set();
   // Hard bound: each pass moves one block, so more moves than lines means something is wrong; never hang.
   for (let i = 0, moves = 0; i < lines.length && moves <= lines.length; i++) {
+    const mask = fenceMask(lines);
+    if (mask[i]) continue;
     const h = HEADING_RE.exec(lines[i]);
     if (h) { current = h[1]; continue; }
     if (!isTop(lines[i])) continue;

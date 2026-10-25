@@ -205,6 +205,44 @@ test("merge guard: delete/complete of an ancestor of a merge participant rejecte
   assert.deepStrictEqual(ok.rows.map((x) => x.op), ["merge", "delete"]);
   assert.strictEqual(ok.rejected.length, 0);
 });
+test("round 10: removeLabels uses the task's own spelling (case-insensitive match)", () => {
+  const s = { ...snapshot, tasks: [...snapshot.tasks, { id: "c1", content: "Cased", projectId: "p1", parentId: "", labels: ["Errands", "home"], isRecurring: false, isCompleted: false }] };
+  const o = { ...opts, allowedIds: new Set([...opts.allowedIds, "c1"]) };
+  const r = validateChangePlan({ changes: [{ op: "update", taskId: "c1", removeLabels: ["errands", "HOME", "nope"] }] }, s, o);
+  assert.deepStrictEqual(r.rows[0].fields.removeLabels, ["Errands", "home"]);
+});
+test("round 10: update with empty or blank content rejected missing-content", () => {
+  assert.strictEqual(run([{ op: "update", taskId: "t1", content: "" }]).rejected[0].reason, "missing-content");
+  assert.strictEqual(run([{ op: "update", taskId: "t1", content: "  \t" }]).rejected[0].reason, "missing-content");
+  assert.strictEqual(run([{ op: "update", taskId: "t1", content: "Renamed" }]).rows[0].fields.content, "Renamed");
+});
+test("round 10: move parent cycles rejected parent-cycle", () => {
+  assert.strictEqual(mrun([{ op: "move", taskId: "t1", parentId: "t1" }]).rejected[0].reason, "parent-cycle");
+  assert.strictEqual(mrun([{ op: "move", taskId: "t1", parentId: "k1" }]).rejected[0].reason, "parent-cycle");
+  assert.strictEqual(mrun([{ op: "move", taskId: "t1", parentId: "k2" }]).rejected[0].reason, "parent-cycle");
+  const ok = mrun([{ op: "move", taskId: "k2", parentId: "t3" }]);
+  assert.strictEqual(ok.rows[0].target.parentId, "t3");
+});
+test("round 10: move with projectId and parentId in another project rejected parent-project-mismatch", () => {
+  assert.strictEqual(mrun([{ op: "move", taskId: "t3", projectId: "p2", parentId: "k1" }]).rejected[0].reason, "parent-project-mismatch");
+  assert.strictEqual(mrun([{ op: "move", taskId: "t2", projectId: "p1", parentId: "k1" }]).rows.length, 1);
+});
+
+test("round 10c: parent+section in another project than parent rejected; same project accepted", () => {
+  const s = { ...mergeSnap, sections: [...mergeSnap.sections, { id: "s2", name: "Later", projectId: "p2" }] };
+  const o = { ...mo, allowedIds: new Set([...mo.allowedIds, "r1", "k1", "k2", "s2"]) };
+  const m = (c) => validateChangePlan({ changes: [c] }, s, o);
+  assert.strictEqual(m({ op: "move", taskId: "t3", parentId: "k1", sectionId: "s2" }).rejected[0].reason, "parent-project-mismatch");
+  assert.strictEqual(m({ op: "move", taskId: "t3", parentId: "k1", sectionId: "s1" }).rows.length, 1);
+});
+test("round 10c: removeLabels removes every case variant once", () => {
+  const s = { ...snapshot, tasks: [...snapshot.tasks, { id: "c2", content: "Dup", projectId: "p1", parentId: "", labels: ["errands", "ERRANDS", "home"], isRecurring: false, isCompleted: false }] };
+  const o = { ...opts, allowedIds: new Set([...opts.allowedIds, "c2"]) };
+  const r = validateChangePlan({ changes: [{ op: "update", taskId: "c2", removeLabels: ["errands", "Errands"] }] }, s, o);
+  assert.deepStrictEqual(r.rows[0].fields.removeLabels, ["errands", "ERRANDS"]);
+  const one = validateChangePlan({ changes: [{ op: "update", taskId: "c2", removeLabels: ["home"] }] }, s, o);
+  assert.deepStrictEqual(one.rows[0].fields.removeLabels, ["home"]);
+});
 let failed = 0;
 for (const [name, fn] of cases) {
   try { fn(); console.log(`PASS ${name}`); } catch (e) { failed++; console.log(`FAIL ${name}\n${e.stack}`); }

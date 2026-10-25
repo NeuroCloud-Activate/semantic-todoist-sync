@@ -15,7 +15,7 @@ const snapshot = {
     { id: "p1", name: "Home", isInbox: true, isShared: false },
     { id: "p2", name: "Work", isShared: true },
   ],
-  sections: [{ id: "s9", name: "Doing", projectId: "p2" }, { id: "s8", name: "Done", projectId: "p2" }],
+  sections: [{ id: "s9", name: "Doing", projectId: "p2" }, { id: "s8", name: "Done", projectId: "p2" }, { id: "s7", name: "Later", projectId: "p1" }],
   cache: { t2: { path: "Notes/report.md" } },
 };
 const placementFor = () => ({ path: "Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md", heading: "Home" });
@@ -121,6 +121,31 @@ test("priority reads as P1-P4 and field keys as words", () => {
   assert.ok(s.includes('title "Sub task" -> "New"') && s.includes("priority (none) -> P1") && !s.includes("content"), s);
   const q = first([{ op: "update", taskId: "t1", fields: { priority: 4, dueDate: "2026-02-02" }, newLabels: [] }]).sentence;
   assert.ok(q.includes("priority P4 -> P1") && !q.includes('"'.concat("1")), q);
+});
+test("parent-only move names the parent task, never ids", () => {
+  const r = first([{ op: "move", taskId: "t1", fields: {}, target: { parentId: "t2" }, newLabels: [] }]);
+  assert.strictEqual(r.sentence, 'Move "Pay rent" from Home to Work / Doing as a subtask of "Write report"'); // Todoist puts the task in the parent's project
+  assert.strictEqual(r.before, 'Home'); assert.strictEqual(r.after, 'Work / Doing');
+  const same = first([{ op: "move", taskId: "t3", fields: {}, target: { parentId: "t2" }, newLabels: [] }]);
+  assert.strictEqual(same.sentence, 'Move "Sub task" to be a subtask of "Write report"');
+  assert.ok(noIds(r.sentence + r.before + r.after));
+  const m = first([{ op: "move", taskId: "t1", fields: {}, target: { projectId: "p2", parentId: "t2" }, newLabels: [] }]);
+  assert.strictEqual(m.sentence, 'Move "Pay rent" from Home to Work / Doing as a subtask of "Write report"'); // Apply sends only parent_id
+  assert.strictEqual(m.after, 'Work / Doing');
+  const ps = first([{ op: "move", taskId: "t3", fields: {}, target: { parentId: "t1", sectionId: "s7" }, newLabels: [] }]);
+  assert.strictEqual(ps.after, 'Home'); assert.strictEqual(ps.sentence, 'Move "Sub task" from Work to Home as a subtask of "Pay rent"');
+  const ss = first([{ op: "move", taskId: "t3", fields: {}, target: { parentId: "t1", sectionId: "s8" }, newLabels: [] }]);
+  assert.strictEqual(ss.after, 'Home'); assert.ok(!ss.sentence.includes('Done'), ss.sentence);
+});
+test("create row names every field Apply sends", () => {
+  const r = first([{ op: "create", fields: { content: "Plan", priority: 4, dueDate: "2026-12-01T09:00:00", labels: ["a", "b"], description: "details" }, target: { projectId: "p1" }, newLabels: [] }]);
+  assert.ok(r.sentence.startsWith('Add "Plan" to Home (priority P1; due 2026-12-01; labels a, b; description "details")'), r.sentence);
+  assert.ok(/written/.test(r.sentence) && r.writesTo, r.sentence);
+});
+test("create subtask names its parent", () => {
+  const r = first([{ op: "create", fields: { content: "Step" }, target: { projectId: "p2", parentId: "t2" }, newLabels: [] }]);
+  assert.ok(r.sentence.startsWith('Add "Step" to Work (subtask of "Write report")'), r.sentence);
+  assert.ok(noIds(r.sentence));
 });
 let failed = 0;
 for (const [n, f] of cases) {

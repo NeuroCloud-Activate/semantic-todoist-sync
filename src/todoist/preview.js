@@ -52,12 +52,21 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
     let writesTo;
     if (row.op === "move") {
       before = where(task.projectId, task.sectionId);
-      after = where(t.projectId || task.projectId, t.sectionId);
-      sentence = `Move "${title}" from ${before} to ${after}`;
+      const pt = t.parentId ? byId.get(String(t.parentId)) : null; // item_move with parent_id lands in the parent's project
+      after = pt ? where(pt.projectId, pt.sectionId) : where(t.projectId || task.projectId, t.sectionId);
+      const par = t.parentId ? `subtask of "${(byId.get(String(t.parentId)) || {}).content || "task"}"` : "";
+      sentence = t.parentId && (!pt || String(pt.projectId) === String(task.projectId)) ? `Move "${title}" to be a ${par}` : `Move "${title}" from ${before} to ${after}${par ? ` as a ${par}` : ""}`;
     } else if (row.op === "create") {
       const p = placementFor ? placementFor(row) : null;
       after = where(t.projectId, t.sectionId);
-      sentence = `Add "${title}" to ${after}`;
+      const bits = [];
+      if (t.parentId) bits.push(`subtask of "${(byId.get(String(t.parentId)) || {}).content || "task"}"`);
+      if (f.priority) bits.push(`priority ${PRIO[f.priority] || f.priority}`);
+      if (f.dueDate) bits.push(`due ${day(f.dueDate)}`);
+      if (f.deadlineDate) bits.push(`deadline ${day(f.deadlineDate)}`);
+      if (f.labels && f.labels.length) bits.push(`labels ${f.labels.join(", ")}`);
+      if (f.description) bits.push(`description "${f.description}"`);
+      sentence = `Add "${title}" to ${after}${bits.length ? ` (${bits.join("; ")})` : ""}`;
       // p.phrase is the caller's ready plain-language place ("at the end of <note>"); the heading form stays for callers without one.
       if (p) { writesTo = p.path; sentence += p.phrase ? `; a note line will be added ${p.phrase}` : `; a note line will be written to ${p.path} under "${p.heading}"`; }
     } else if (row.op === "create-section") {

@@ -29860,6 +29860,7 @@ const TODOIST_REJECT_TEXT = {
   "no-inbox": "I couldn't find your Inbox to put it in",
   "section-project-mismatch": "that section belongs to a different project",
   "parent-project-mismatch": "the parent task is in a different project",
+  "parent-cycle": "a task can't become a subtask of itself or of its own subtask",
   "merge-conflict": "the same task is involved in another merge or change",
   "merge-recurring": "a repeating task can't be merged",
   "merge-ancestor": "a task can't be merged into its own subtask or parent"

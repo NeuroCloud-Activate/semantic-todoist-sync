@@ -155,11 +155,14 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
       for (const k of ["content", "description", "priority", "dueDate", "deadlineDate"]) {
         if (has(change, k) && (k === "dueDate" || k === "deadlineDate" ? day(change[k]) !== day(task[k]) : change[k] !== (task[k] ?? ""))) fields[k] = change[k];
       }
+      if (has(change, "content") && !String(change.content).trim()) { reject("missing-content"); continue; }
       const cur = (task.labels || []).map((l) => l.toLowerCase());
       const add = resolve(change.addLabels).filter((l) => !cur.includes(l.toLowerCase()));
-      const rem = (Array.isArray(change.removeLabels) ? change.removeLabels : []).map(cleanLabel).filter((l) => cur.includes(l.toLowerCase()));
+      // Apply removes case-sensitively, so send the task's own spelling.
+      const rem = (Array.isArray(change.removeLabels) ? change.removeLabels : []).map(cleanLabel).flatMap((l) => (task.labels || []).filter((t) => t.toLowerCase() === l.toLowerCase()));
+      const remSent = [...new Set(rem)];
       if (add.length) fields.addLabels = add;
-      if (rem.length) fields.removeLabels = rem;
+      if (remSent.length) fields.removeLabels = remSent;
       newLabels.splice(0, newLabels.length, ...newLabels.filter((l) => add.includes(l)));
       if (!Object.keys(fields).length) { reject("no-op"); continue; }
     } else if (op === "move") {
@@ -167,6 +170,9 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
       for (const k of ["projectId", "sectionId", "parentId"]) if (has(change, k)) target[k] = String(change[k]);
       const same = ["projectId", "sectionId", "parentId"].every((k) => target[k] === undefined || target[k] === String(task[k] || ""));
       if (!Object.keys(target).length || same) { reject("no-op"); continue; }
+      if (target.parentId && (target.parentId === row.taskId || isUnder(target.parentId, row.taskId))) { reject("parent-cycle"); continue; }
+      const par = target.parentId ? tasks.get(target.parentId) : null;
+      if (par && (target.projectId || sec) && String(par.projectId) !== (target.projectId || String(sec.projectId))) { reject("parent-project-mismatch"); continue; }
       if (sec && !target.projectId) target.projectId = String(sec.projectId);
       row.target = target;
     } else if (op === "complete" || op === "reopen") {

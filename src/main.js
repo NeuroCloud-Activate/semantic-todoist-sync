@@ -22380,7 +22380,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       }
     }
     if (!removeIndexes.size) return false;
-    const kept = lines.filter((_, index) => !removeIndexes.has(index));
+    // Monthly note: also drop the heading this removal emptied (position-based; never another heading or any user text).
+    const emptied = isMonthlyNotePath(cached.path, this.settings) ? todoistModules().emptiedHeadingIndexes(lines, removeIndexes) : new Set();
+    const kept = lines.filter((_, index) => !removeIndexes.has(index) && !emptied.has(index));
     repairSyncedSubtaskIndentationLines(kept, this.settings);
     this.markInternalNoteWrite(cached.path);
     await this.app.vault.modify(file, kept.join("\n"));
@@ -23260,7 +23262,7 @@ class SemanticTodoistView extends ItemView {
       const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode, todoist: true });
       this.renderRelevantNotes(result.context);
       this.replaceLastAssistantMessage(result.answer);
-      if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary) => { this.addMessage("assistant", summary); this.addMessageAction("Undo last Todoist change", () => this.plugin.undoLastTodoistChanges(true)); }).open(), () => result.todoistChanges.applyState === "applied" || result.todoistChanges.applyState === "applying");
+      if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary, applied) => { this.addMessage("assistant", summary); if (applied?.undoable) this.addMessageAction("Undo last Todoist change", () => this.plugin.undoLastTodoistChanges(true)); }).open(), () => result.todoistChanges.applyState === "applied" || result.todoistChanges.applyState === "applying");
       this.setStatus(webSearchStatusLabel(result));
     } catch (error) {
       console.error(error);

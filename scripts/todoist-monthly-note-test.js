@@ -98,4 +98,20 @@ test("pre-heading task line is placed by marker; intro text untouched", () => {
   const t = `Intro line.\n${T("a", "A1", "Work")}\n`;
   const out = m.reconcileHeadings(t);
   assert.ok(out.startsWith("Intro line.\n") && out.includes("## Work\n- [ ] a"), out);
+});test("emptiedHeadingIndexes: only the heading above the removed line, only if emptied", () => {
+  const L = (s) => s.split("\n");
+  const drop = (s, ...rm) => { const l = L(s); const r = new Set(rm); const x = m.emptiedHeadingIndexes(l, r); return l.filter((_, i) => !r.has(i) && !x.has(i)).join("\n"); };
+  const task = T("a", "A1", "STS Test");
+  assert.strictEqual(drop(`## STS Test\n${task}\n`, 1), "");
+  assert.strictEqual(drop(`## STS Test\n${task}\n\n## STS Test\n`, 1), "## STS Test\n", "same-name user heading below stays");
+  assert.strictEqual(drop(`## STS Test\n${task}\n\n## Ideas\n`, 1), "## Ideas\n", "other empty user heading stays");
+  assert.strictEqual(drop(`## Ideas\n\n## STS Test\n${task}\n`, 3), "## Ideas\n", "empty user heading above stays");
+  assert.strictEqual(drop(`## STS Test\n${task}\nmy note\n`, 1), "## STS Test\nmy note\n");
+  assert.strictEqual(drop(`## STS Test\n${task}\n- note\n`, 1), "## STS Test\n- note\n");
+  assert.strictEqual(drop(`## STS Test\n${task}\n\u00a0\n`, 1), "## STS Test\n\u00a0\n", "nbsp line is user text");
+  assert.strictEqual(drop(`## STS Test\n${task}\n${T("b", "B1", "STS Test")}\n`, 1), `## STS Test\n${T("b", "B1", "STS Test")}\n`);
+  const fenced = `\`\`\`\n## STS Test\n${task}\n\`\`\`\n`;
+  assert.strictEqual(drop(fenced, 2), fenced.replace(`${task}\n`, ""), "fenced heading untouched");
+  assert.strictEqual(drop(`## STS Test\r\n${task}\r\n`, 1), "", "CRLF");
+  assert.strictEqual(drop(`Intro.\r\n## STS Test\r\n${task}\r\nOther\r\n`, 2), "Intro.\r\n## STS Test\r\nOther\r\n", "CRLF: Other is user text under the heading, heading stays");
 });console.log(`${n} passed`);

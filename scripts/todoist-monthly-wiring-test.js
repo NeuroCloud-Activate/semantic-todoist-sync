@@ -475,6 +475,15 @@ test("writeCreatedTaskLines skips a note still being synced after the wait times
   assert.ok(p.fileSyncInProgress.has(NOTE), "someone else's guard left alone");
 });
 
+test("undo of a chat-created monthly task drops its emptied heading, keeps a same-name user heading below; ordinary note byte-identical", async () => {
+  const line = (oid) => `- [ ] Mow #sync !!4 %%[p:: STS Test]%% %%[oid:: ${oid}]%%`;
+  const p = makePlugin({ [OCT]: `Intro.\n\n## STS Test\n${line("M1")}\n\n## STS Test\n\n## Ideas\n` });
+  assert.equal(await p.removeDeletedTodoistTaskFromNote({ path: OCT, oid: "M1" }), true);
+  assert.equal(p.store.get(OCT), "Intro.\n\n## STS Test\n\n## Ideas\n");
+  const q = makePlugin({ [NOTE]: `## Garden\n${line("M1")}\n` });
+  await q.removeDeletedTodoistTaskFromNote({ path: NOTE, oid: "M1" });
+  assert.equal(q.store.get(NOTE), "## Garden\n");
+});
 (async () => {
   let failed = 0;
   for (const [name, fn] of cases) {

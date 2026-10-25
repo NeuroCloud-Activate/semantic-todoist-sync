@@ -13,7 +13,7 @@ let requestHandler = () => { throw new Error("network disabled in test"); };
 const originalLoad = Module._load;
 Module._load = function (request) {
   if (request !== "obsidian") return originalLoad.apply(this, arguments);
-  class Empty {}
+  class Empty { open() { globalThis.__lastOpenedModal = this; } }
   return {
     ItemView: Empty, MarkdownRenderer: {}, MarkdownView: Empty, Modal: Empty, Notice: Empty, Plugin: Empty,
     PluginSettingTab: Empty, Setting: Empty, TFile: Empty, setIcon() {},
@@ -501,6 +501,35 @@ test("change turn with no rows and no model text says none could be prepared", a
   const r = await p.chat("Change the compost task", null, [], "chat-query", { todoist: true });
   assert.ok(r.answer.includes("I couldn't prepare any change"), JSON.stringify(r.answer));
   assert.ok(r.answer.includes("I couldn't do 1 of the proposed changes"), r.answer);
+});
+
+// The sidebar's modal callback decides whether the Undo button appears; drive ask() with a stubbed view.
+async function undoButtonsAfterApply(result) {
+  const view = Object.create(Plugin.SemanticTodoistView.prototype);
+  const actions = [];
+  Object.assign(view, {
+    promptEl: { value: "delete it" }, messages: [], webSearchMode: "off", setStatus() {}, addMessage() {}, renderRelevantNotes() {}, replaceLastAssistantMessage() {},
+    getSelectedActiveContext: async () => null,
+    addMessageAction: (label) => actions.push(label),
+    plugin: { app: {}, chat: async () => ({ answer: "ok", context: [], todoistChanges: { rows: [{}], applyState: "ready", preview: { groups: [] } } }) }
+  });
+  globalThis.__lastOpenedModal = null;
+  view.addMessageAction = (label, fn, disabled) => { actions.push(label); if (label.startsWith("Review")) fn(); };
+  await view.ask();
+  const modal = globalThis.__lastOpenedModal;
+  assert.ok(modal, "modal opened");
+  actions.length = 0;
+  modal.onDone("Applied.", result);
+  return actions;
+}
+
+test("Undo button is added after an undoable Apply", async () => {
+  assert.deepEqual(await undoButtonsAfterApply({ undoable: true }), ["Undo last Todoist change"]);
+});
+
+test("no Undo button after a delete-only Apply that cannot be undone", async () => {
+  assert.deepEqual(await undoButtonsAfterApply({ undoable: false }), []);
+  assert.deepEqual(await undoButtonsAfterApply(undefined), []);
 });
 
 test("change turn with model text keeps it unchanged", async () => {

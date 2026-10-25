@@ -138,4 +138,24 @@ function reconcileHeadings(text) {
   return lines.join(eol);
 }
 
-module.exports = { monthlyNotePath, newMonthlyNote, insertTaskBlock, moveTaskBlock, reconcileHeadings };
+// Extra line indexes to drop with `removed`: the `## ` heading directly above a removed line, but only when this removal leaves its section with nothing but empty lines.
+// Position-based on purpose: no other heading (same name or not) and no non-empty line, nbsp included, is ever touched.
+function emptiedHeadingIndexes(lines, removed) {
+  const mask = fenceMask(lines);
+  const extra = new Set();
+  for (const r of removed) {
+    let h = r - 1;
+    while (h >= 0 && (mask[h] || !HEADING_RE.test(lines[h]))) h--;
+    if (h < 0 || extra.has(h)) continue;
+    let end = h + 1;
+    while (end < lines.length && (mask[end] || !HEADING_RE.test(lines[end]))) end++;
+    const body = [];
+    for (let k = h + 1; k < end; k++) if (!removed.has(k)) body.push(k);
+    if (body.some((k) => !/^[ \t\r]*$/.test(lines[k]))) continue;
+    extra.add(h);
+    body.forEach((k) => extra.add(k));
+  }
+  return extra;
+}
+
+module.exports = { monthlyNotePath, newMonthlyNote, insertTaskBlock, moveTaskBlock, reconcileHeadings, emptiedHeadingIndexes };

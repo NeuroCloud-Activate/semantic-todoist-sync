@@ -2354,3 +2354,13 @@
   padding: 0 14px;
   font-size: var(--font-ui-small);
 }
+
+.semantic-todoist-changes-modal .semantic-todoist-change-row { padding: 6px 0; }
+.semantic-todoist-changes-modal .semantic-todoist-change-row label { display: flex; gap: 8px; align-items: flex-start; }
+.semantic-todoist-changes-modal .semantic-todoist-change-diff,
+.semantic-todoist-changes-modal .semantic-todoist-change-note { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-left: 24px; }
+.semantic-todoist-changes-modal .semantic-todoist-change-warning { color: var(--text-warning); font-size: var(--font-ui-smaller); margin-left: 24px; }
+.semantic-todoist-changes-modal .semantic-todoist-change-deletes { border-left: 3px solid var(--text-error); padding-left: 8px; margin-top: 12px; }
+.semantic-todoist-changes-modal .semantic-todoist-change-deletes h3 { color: var(--text-error); }
+.semantic-todoist-changes-modal .semantic-todoist-change-buttons { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+.semantic-todoist-message-action { margin-top: 6px; }

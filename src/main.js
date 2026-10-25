@@ -15,6 +15,11 @@ const {
 
 const VIEW_TYPE = "semantic-todoist-sync-view";
 const TODOIST_API = "https://api.todoist.com/api/v1";
+// Lazy: tests load a temp copy of this file, where relative requires at load time would not resolve.
+const todoistModules = () => ({
+  ...require("./todoist/plan.js"), ...require("./todoist/preview.js"), ...require("./todoist/apply.js"),
+  ...require("./todoist/lookup.js"), ...require("./todoist/placement.js"), ...require("./todoist/dedupe.js"), ...require("./todoist/monthly-note.js")
+});
 const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
 const GEMINI_SEMANTIC_INDEX_FILE = "semantic-index.gemini.json";
@@ -3532,6 +3537,7 @@ const DEFAULT_SETTINGS = {
   scheduleTodayWeightNoteRecency: "moderate",
   scheduleTodayWeightParentDependency: "moderate",
   scheduleTodayLastUndo: null,
+  todoistChatLastUndo: null,
   enableTaskDeduplication: true,
   taskDeduplicationStrictness: "conservative",
   taskDeduplicationMergeLabelsAdditive: true,
@@ -4585,6 +4591,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.addCommand({ id: "semantic-todoist-note-to-tasks", name: "Create Todoist tasks from active note", callback: () => this.createTasksFromActiveNote() });
     this.addCommand({ id: "semantic-todoist-schedule-today", name: "Schedule today's tasks", callback: () => this.openScheduleTodayPreview() });
     this.addCommand({ id: "semantic-todoist-undo-schedule-today", name: "Undo last schedule today apply", callback: () => this.undoLastScheduleToday(true) });
+    this.addCommand({ id: "undo-last-todoist-change", name: "Undo last Todoist change", callback: () => this.undoLastTodoistChanges(true) });
     this.addCommand({ id: "semantic-todoist-note-task-sync", name: "Sync note tasks with Todoist", callback: () => this.syncNoteTasks() });
     this.addCommand({ id: "semantic-todoist-rebuild-references", name: "Rebuild local Todoist reference table", callback: () => this.rebuildTodoistReferenceTable(true) });
     this.addCommand({ id: "semantic-todoist-repair-subtask-indentation", name: "Repair synced subtask indentation", callback: () => this.repairCachedSubtaskIndentation(true, { force: true, scanAll: true }) });
@@ -14133,6 +14140,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     await this.ensureCompatibleEmbeddingForChatModel();
     this.requireAiAccess();
     const active = activeOverride || (this.settings.autoAddActiveContentToContext ? await this.getActiveMarkdownContext() : null);
+    // Todoist look-up: read-only. Only the chat-query path without web search asks; a chat turn never writes to Todoist.
+    // Only the sidebar chat opts in (options.todoist); prompt templates and other callers behave as before.
+    let todoistTurn = options?.todoist === true && String(modelOperation || "chat-query").trim().toLowerCase() === "chat-query" && webSearchMode === "off"
+      ? await this.todoistChatTurn(prompt, history, captureContext)
+      : null;
+    const duplicatesNotReady = Boolean(todoistTurn?.duplicates);
+    if (duplicatesNotReady) todoistTurn = null; // answer from the vault as usual and add a sentence
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
     const activeText = active?.text ? (active.selection || active.text) : "";
     const source = active?.path ? { type: "note", title: active.title || "", path: active.path, text: activeText } : null;
@@ -14287,7 +14301,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       operation: "chat",
       model: modelChoice.model,
       captureContext,
-      jsonSchema: webSearchMode === "off" ? chatResponseSchema() : webResearchResponseSchema(webSearchMode),
+      jsonSchema: webSearchMode === "off" ? chatResponseSchema(todoistTurn?.snapshot && todoistTurn.lookup.kind === "change" ? todoistModules().CHANGE_PLAN_SCHEMA : null) : webResearchResponseSchema(webSearchMode),
       system: [
         ...(webSearchMode === "off" || !webEvidenceRows.length ? [] : [
           webSearchMode === "deep" ? "Deep Research is enabled. Return two or three concise paragraphs as claims in the research schema." : "Internet Search is enabled. Return one concise useful paragraph as one claim in the research schema; when the answer includes a not-established element, also state the directly relevant established claims about the same topic as additional claims (at most two claims total).",
@@ -14322,7 +14336,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "When referring to an existing task, include its supplied Todoist task link when available after explaining the relevant note-based evidence.",
         "For follow-up, action, or to-do questions: omit items whose evidence shows them completed (checked - [x], marked complete/done) unless the user asks about completed work; for open items whose source date is more than 6 months before today's date, keep them but say they are older than 6 months and may be stale.",
         "Topic labels name the person, project, or item, never the missing fact: all claims about the same person's or item's follow-ups use one identical topic string, and a not-established claim takes the identical topic of the claim it qualifies.",
-        "Avoid long preambles."
+        "Avoid long preambles.",
+        ...(todoistTurn?.shortlist ? [
+          "Todoist tasks, projects and sections are listed in the user message; answer questions about them from those lists only.",
+          ...(todoistTurn.snapshot && todoistTurn.lookup.kind === "change" ? [
+            "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite."
+          ] : [])
+        ] : [])
       ].join(" "),
       user: [
         `Today's date: ${deviceDateString()}`,
@@ -14353,6 +14373,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "Note-first vault context with secondary task pointers:",
         reservedTaskEvidence ? "Reserved lanes above are the complete selected context; no generic shared context was added." : (selectedChatEvidenceText || "No selected vault evidence was retrieved for this request."),
         "",
+        ...(todoistTurn?.shortlist ? [todoistTurn.promptText, ""] : []),
         "User prompt:",
         prompt
       ].join("\n"),
@@ -14396,7 +14417,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
       retrievalTelemetry: context.semanticRetrieval?.telemetry
     });
+    const parsedAnswer = todoistTurn?.snapshot && todoistTurn.lookup.kind === "change" ? parseChatEvidenceResponse(response) : null;
+    const todoistChanges = parsedAnswer ? this.buildTodoistChanges(parsedAnswer.changePlan, todoistTurn, sourceLedger, parsedAnswer.claims, active) : null;
     response = citationResult.answer;
+    if (todoistTurn?.unavailable) response += "\n\nTodoist wasn't available, so this answer comes from your notes only.";
+    if (duplicatesNotReady) response += "\n\nDuplicate finding isn't turned on yet.";
+    if (todoistChanges?.rejected.length) response += `\n\nI couldn't do ${todoistChanges.rejected.length} of the proposed changes: ${todoistChanges.rejected.map((item) => describeTodoistRejected(item, todoistTurn.snapshot)).join("; ")}.`;
     this.lastChatCitationTelemetry = citationResult.telemetry;
     const localChatResult = {
       answer: response,
@@ -14411,6 +14437,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       validatorBundleId: canonicalContextBundleHash,
       contextBundle: canonicalContextBundle
     };
+    if (todoistChanges?.rows.length) localChatResult.todoistChanges = todoistChanges;
     if (requestedWebSearchMode !== "off" && webSearchResult) Object.assign(localChatResult, {
       webSearchStatus: webSearchResult.status || "failed",
       webSearchResult,
@@ -14419,6 +14446,224 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return localChatResult;
   }
 
+  // Todoist chat actions. Look-up is read-only; the only Todoist writes are in applyTodoistChanges/undoLastTodoistChanges.
+  // -> null (vault-only), { duplicates }, { unavailable, lookup } or { lookup, snapshot, shortlist, allowedIds, labels, promptText }
+  async todoistChatTurn(prompt, history, captureContext = null) {
+    let lookup;
+    try {
+      const { LOOKUP_SCHEMA, lookupPrompt } = todoistModules();
+      const { system, user } = lookupPrompt(prompt, formatChatHistory(history));
+      const raw = await this.openaiResponse({ operation: "todoist-lookup", model: this.settings.chatModel, captureContext, jsonSchema: LOOKUP_SCHEMA, system, user, background: false });
+      lookup = JSON.parse(extractJsonPayload(raw));
+    } catch (error) {
+      this.logLocal("Todoist look-up skipped", { error: error.message || String(error) });
+      return null;
+    }
+    if (!lookup?.needsTodoist) return null;
+    if (lookup.kind === "duplicates" && !todoistModules().dedupeAllowed(this.settings).ok) return { duplicates: true, lookup };
+    if (!this.settings.todoistToken) return { unavailable: true, lookup };
+    let snapshot;
+    try {
+      snapshot = await this.getTodoistSnapshot(); // cached; only Apply and undo force a refresh
+    } catch (error) {
+      this.logLocal("Todoist snapshot unavailable for chat", { error: error.message || String(error) });
+      return { unavailable: true, lookup };
+    }
+    const shortlist = todoistModules().shortlistTasks(snapshot, lookup, this.lastTodoistAnswerTaskIds || [], 40);
+    this.lastTodoistAnswerTaskIds = shortlist.map((task) => task.id);
+    const projects = snapshot.projects || [];
+    const sections = snapshot.sections || [];
+    const projectName = new Map(projects.map((project) => [project.id, project.name]));
+    const sectionName = new Map(sections.map((section) => [section.id, section.name]));
+    const promptText = [
+      "Todoist tasks (id | title | project | section | due | priority | labels):",
+      ...(shortlist.length ? shortlist.map((task) => `${task.id} | ${task.content} | ${projectName.get(task.projectId) || ""} | ${sectionName.get(task.sectionId) || ""} | ${String(task.dueDate || "").slice(0, 10)} | p${task.priority} | ${(task.labels || []).join(",")}`) : ["(none matched)"]),
+      "Todoist projects (id | name):",
+      ...projects.map((project) => `${project.id} | ${project.name}${project.isInbox ? " (Inbox)" : ""}`),
+      "Todoist sections (id | name | project id):",
+      ...sections.map((section) => `${section.id} | ${section.name} | ${section.projectId}`)
+    ].join("\n");
+    const allowedIds = new Set([...shortlist.map((task) => String(task.id)), ...projects.map((project) => String(project.id)), ...sections.map((section) => String(section.id))]);
+    const labels = [...new Set((snapshot.tasks || []).flatMap((task) => task.labels || []))];
+    return { lookup, snapshot, shortlist, allowedIds, labels, promptText, prompt };
+  }
+
+  buildTodoistChanges(plan, turn, sourceLedger, claims, active) {
+    const { rows, rejected } = todoistModules().validateChangePlan(plan, turn.snapshot, { allowedIds: turn.allowedIds, labels: turn.labels, allowMerge: todoistModules().dedupeAllowed(this.settings).ok });
+    const cited = new Set((claims || []).flatMap((claim) => claim?.evidence_ids || []).map(String));
+    const notes = (sourceLedger || []).filter((entry) => entry.path && entry.evidenceId && cited.has(String(entry.evidenceId)) && entry.markdown);
+    for (const row of rows) {
+      if (row.op !== "create" || !notes.length) continue;
+      const links = [...new Set(notes.map((entry) => entry.markdown))].map((link) => `- ${link}`).join("\n");
+      row.fields.description = [row.fields.description, `From your notes:\n${links}`].filter(Boolean).join("\n\n");
+    }
+    const prompt = turn.prompt || "";
+    const files = this.app?.vault?.getMarkdownFiles?.() || [];
+    const namedPaths = files.filter((file) => file.basename && file.basename.length > 2 && prompt.toLowerCase().includes(file.basename.toLowerCase())).map((file) => file.path);
+    const phrases = new Map();
+    const placementFor = (row) => {
+      const parentId = row.target?.parentId;
+      const ctx = { activePath: active?.path || "", namedPaths, parentLine: parentId && this.settings.taskCache?.[parentId]?.path ? { path: this.settings.taskCache[parentId].path } : null };
+      const placement = todoistModules().choosePlacement(row, ctx);
+      if (placement.path === "note") { const noteName = String(placement.notePath).split("/").pop().replace(/\.md$/i, ""); phrases.set(row, parentId ? `under its parent task in ${noteName}` : `at the end of ${noteName}`); return { path: placement.notePath, heading: noteName }; }
+      const project = (turn.snapshot.projects || []).find((item) => String(item.id) === String(row.target?.projectId));
+      phrases.set(row, `in the monthly note under ${project?.name || "Inbox"}`);
+      return { path: todoistModules().monthlyNotePath(this.settings.miscTasksFolder || DEFAULT_SETTINGS.miscTasksFolder || "Semantic Todoist Sync/Miscellaneous Tasks", new Date()), heading: project?.name || "Inbox" };
+    };
+    const preview = todoistModules().buildPreview(rows, turn.snapshot, { placementFor });
+    // The preview module quotes the heading; say the placement in plain words instead.
+    for (const previewRow of preview.groups.flatMap((group) => group.rows)) {
+      const phrase = phrases.get(rows[Number(String(previewRow.id).replace("row-", ""))]);
+      if (phrase) previewRow.sentence = previewRow.sentence.replace(/; a? ?note line will be written to .*$/, `; a note line will be added ${phrase}`);
+    }
+    return { rows, rejected, snapshot: turn.snapshot, preview };
+  }
+
+  // Sends one batch. Returns the commands Todoist accepted, even when a later command in the batch failed.
+  async sendTodoistBatch(batch) {
+    try {
+      const response = await this.todoistSync(batch);
+      return { okCommands: batch, mapping: response?.temp_id_mapping || {}, error: "" };
+    } catch (error) {
+      const status = error?.syncResponse?.sync_status;
+      const okCommands = status && typeof status === "object" ? batch.filter((command) => status[command.uuid] === "ok") : [];
+      // rejected = Todoist answered but refused these; empty means it could not be reached.
+      const rejected = status && typeof status === "object" ? batch.filter((command) => status[command.uuid] !== "ok") : [];
+      this.logLocal("Todoist batch failed", { error: error?.message || String(error) });
+      return { okCommands, rejected, mapping: error?.syncResponse?.temp_id_mapping || {}, error: error?.message || String(error) };
+    }
+  }
+
+  // changes = { rows, snapshot, applyState }; tickedIds = preview row ids ("row-<index>") the user left ticked.
+  async applyTodoistChanges(changes, tickedIds) {
+    if (changes.applyState === "applying" || changes.applyState === "applied") return { applied: 0, skipped: [], refused: true, undoable: false };
+    changes.applyState = "applying";
+    const sent = [];
+    try {
+      const ticked = new Set(tickedIds || []);
+      const rows = (changes.rows || []).filter((row, index) => ticked.has(`row-${index}`));
+      this.requireTodoistAccess();
+      const fresh = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+      const plan = todoistModules().buildApplyBatches(rows, changes.snapshot, fresh, uuid);
+      const realIds = new Map();
+      const swapIds = (value) => Array.isArray(value) ? value.map(swapIds) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, swapIds(item)])) : typeof value === "string" && realIds.has(value) ? realIds.get(value) : value;
+      let failedAt;
+      let error = "";
+      let rejected = [];
+      for (let index = 0; index < plan.batches.length; index += 1) {
+        // Temp ids only live inside one request: later batches need the real ids of earlier creates.
+        const batch = realIds.size ? plan.batches[index].map((command) => ({ ...command, args: swapIds(command.args) })) : plan.batches[index];
+        const result = await this.sendTodoistBatch(batch);
+        Object.entries(result.mapping).forEach(([temp, real]) => realIds.set(temp, String(real)));
+        sent.push(...result.okCommands);
+        if (result.error) { failedAt = index; error = result.error; rejected = result.rejected || []; break; }
+      }
+      const failedTitles = [...new Set(rejected.map((command) => command.args?.content || todoistTaskTitle(changes.snapshot, command.args?.id, "")).filter((title) => title && title !== "a change"))];
+      // Undo covers only what was actually accepted: drop entries not sent, swap temp ids for real ones.
+      const touched = new Set(sent.map((command) => String(command.args?.id || "")));
+      const tempsSent = new Set(sent.map((command) => command.temp_id).filter(Boolean));
+      const keep = (temp) => tempsSent.has(temp) && realIds.has(temp);
+      const record = {
+        at: deviceTimestamp(),
+        entries: plan.undo.entries.filter((entry) => touched.has(String(entry.taskId))),
+        createdTaskTempIds: plan.undo.createdTaskTempIds.filter(keep).map((temp) => realIds.get(temp)),
+        createdSectionIds: plan.undo.createdSectionIds.filter(keep).map((temp) => realIds.get(temp))
+      };
+      // A delete-only Apply must not wipe the earlier undo.
+      const undoable = record.entries.length > 0 || record.createdTaskTempIds.length > 0 || record.createdSectionIds.length > 0;
+      let undoSaveFailed = false;
+      if (undoable) {
+        this.settings.todoistChatLastUndo = record;
+        try { await this.saveSettings(); } catch (saveError) { undoSaveFailed = true; this.logLocal("Todoist undo record not saved", { error: saveError.message || String(saveError) }); }
+      }
+      if (sent.length) await this.refreshTodoistLines(rows, fresh, plan.mergedAwayIds || [], sent);
+      const skippedRows = new Set(plan.skipped.map((item) => item.row));
+      const adds = sent.filter((command) => command.type === "item_add" || command.type === "section_add").length;
+      const applied = adds + rows.filter((row) => row.taskId && !skippedRows.has(row) && touched.has(String(row.taskId))).length;
+      return { applied, skipped: plan.skipped, failedAt, error, rejectedCount: rejected.length, failedTitles, mergedAwayIds: plan.mergedAwayIds || [], undoable, undoSaveFailed };
+    } finally {
+      changes.applyState = sent.length ? "applied" : "";
+    }
+  }
+
+  // Best-effort: keep linked note lines in step with what Todoist now holds. Never throws.
+  async refreshTodoistLines(rows, fresh, mergedAwayIds, sent) {
+    const byId = new Map((fresh.tasks || []).map((task) => [String(task.id), task]));
+    const okIds = new Set(sent.map((command) => String(command.args?.id || "")));
+    const closed = new Set(sent.filter((command) => command.type === "item_close").map((command) => String(command.args?.id)));
+    const guard = async (id, work) => { try { await work(); } catch (error) { this.logLocal("Todoist chat line refresh skipped", { id, error: error.message || String(error) }); } };
+    for (const row of rows) {
+      const id = String(row.taskId || "");
+      if (!id || !okIds.has(id) || row.op === "delete" || row.op === "merge" || !this.settings.taskCache?.[id]) continue;
+      if (row.op === "complete" || row.op === "reopen") { await guard(id, () => this.setTaskLineChecked(id, row.op === "complete")); continue; }
+      const cur = byId.get(id);
+      if (!cur) continue;
+      await guard(id, async () => {
+        const f = row.fields || {};
+        const gone = (f.removeLabels || []).map((label) => label.toLowerCase());
+        const labels = ("labels" in f ? f.labels : [...(cur.labels || []), ...(f.addLabels || [])]).filter((label) => !gone.includes(label.toLowerCase()));
+        await this.updateTaskLineFromTodoist(id, Object.assign({}, cur, f, { labels }, row.target || {}));
+      });
+    }
+    // Merge: refresh the kept task from the update actually sent; tick only merged-away tasks whose close went through.
+    const keptIds = new Set();
+    for (const row of rows) if (row.op === "merge" && closed.has(String(row.taskId))) keptIds.add(String(row.fields?.targetTaskId));
+    for (const id of keptIds) {
+      const cur = byId.get(id);
+      if (!cur || !this.settings.taskCache?.[id]) continue;
+      const args = Object.assign({}, ...sent.filter((command) => command.type === "item_update" && String(command.args?.id) === id).map((command) => command.args));
+      const { due, deadline, id: ignored, ...rest } = args;
+      const patch = { ...rest };
+      if ("due" in args) patch.dueDate = due?.date || "";
+      if ("deadline" in args) patch.deadlineDate = deadline?.date || "";
+      await guard(id, () => this.updateTaskLineFromTodoist(id, Object.assign({}, cur, patch)));
+    }
+    for (const id of mergedAwayIds) if (closed.has(String(id))) await guard(String(id), () => this.setTaskLineChecked(String(id), true));
+  }
+
+  async undoLastTodoistChanges(showNotice = true) {
+    const undo = this.settings.todoistChatLastUndo;
+    if (!undo?.entries?.length && !undo?.createdTaskTempIds?.length && !undo?.createdSectionIds?.length) {
+      if (showNotice) new Notice("No Todoist chat changes to undo.");
+      return { restored: 0, skipped: [] };
+    }
+    this.requireTodoistAccess();
+    const fresh = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+    const plan = todoistModules().buildUndoBatches(undo, fresh, uuid);
+    if (!plan.batches.length) {
+      const message = "Nothing could be undone: those tasks have changed or are gone in Todoist. The undo is kept.";
+      if (showNotice) new Notice(message);
+      return { restored: 0, skipped: plan.skipped, message };
+    }
+    const sent = [];
+    let error = "";
+    for (const batch of plan.batches) {
+      const result = await this.sendTodoistBatch(batch);
+      sent.push(...result.okCommands);
+      if (result.error) { error = result.error; this.logLocal("Todoist undo failed", { error }); break; }
+    }
+    const done = new Set(sent.filter((command) => command.type !== "section_delete").map((command) => String(command.args?.id || "")));
+    if (!error) {
+      this.settings.todoistChatLastUndo = null;
+      try { await this.saveSettings(); } catch (saveError) { this.logLocal("Todoist undo slot not cleared", { error: saveError.message || String(saveError) }); }
+    }
+    for (const entry of undo.entries || []) {
+      const id = String(entry.taskId);
+      if (!done.has(id) || !this.settings.taskCache?.[id]) continue;
+      const prev = entry.previous || {};
+      try {
+        if (prev.completedByChat) await this.setTaskLineChecked(id, false);
+        else if (prev.checked === true) await this.setTaskLineChecked(id, true);
+        else {
+          const cur = (fresh.tasks || []).find((task) => String(task.id) === id);
+          if (cur) await this.updateTaskLineFromTodoist(id, Object.assign({}, cur, prev.fields || {}, { projectId: prev.projectId ?? cur.projectId, sectionId: prev.sectionId ?? cur.sectionId, parentId: prev.parentId ?? cur.parentId }));
+        }
+      } catch (lineError) { this.logLocal("Todoist undo line refresh skipped", { id, error: lineError.message || String(lineError) }); }
+    }
+    const restored = done.size;
+    if (showNotice) new Notice(error ? `Undo stopped after ${restored} task${restored === 1 ? "" : "s"}: Todoist rejected a change or couldn't be reached.` : `Undid ${restored} Todoist task${restored === 1 ? "" : "s"}${plan.skipped.length ? `; ${plan.skipped.length} skipped` : ""}.`);
+    return error ? { restored, skipped: plan.skipped, error } : { restored, skipped: plan.skipped };
+  }
   async tryUpdateSchedulerMemoryFromChat(prompt, captureContext = null) {
     let command = parseSchedulerMemoryChatCommand(prompt, this.settings);
     if (!command) return "";
@@ -21750,10 +21995,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       throw: false
     });
     if (response.status < 200 || response.status >= 300) throw new Error(`Todoist sync returned ${response.status}: ${redactSecrets(response.text)}`);
-    const failed = response.json.sync_status && Object.entries(response.json.sync_status).find(([, status]) => status !== "ok");
-    if (failed) throw new Error(`Todoist command failed: ${JSON.stringify(failed)}`);
+    let json = null;
+    try { json = response.json; } catch { json = null; }
+    if (!json || typeof json !== "object") throw new Error("Todoist sync answered with an unreadable response; it may or may not have applied the changes.");
     this.todoistSnapshotCache = null;
-    return response.json;
+    const failed = json.sync_status && Object.entries(json.sync_status).find(([, status]) => status !== "ok");
+    if (failed) { const err = new Error(`Todoist command failed: ${JSON.stringify(failed)}`); err.syncResponse = json; throw err; }
+    return json;
   }
 
   async todoistRequest(path, method = "GET", body) {
@@ -22824,9 +23072,10 @@ class SemanticTodoistView extends ItemView {
       this.addMessage("assistant", "Thinking...");
       const active = await this.getSelectedActiveContext();
       if (this.promptEl) this.promptEl.value = "";
-      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode });
+      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode, todoist: true });
       this.renderRelevantNotes(result.context);
       this.replaceLastAssistantMessage(result.answer);
+      if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary) => { this.addMessage("assistant", summary); this.addMessageAction("Undo last Todoist change", () => this.plugin.undoLastTodoistChanges(true)); }).open(), () => result.todoistChanges.applyState === "applied" || result.todoistChanges.applyState === "applying");
       this.setStatus(webSearchStatusLabel(result));
     } catch (error) {
       console.error(error);
@@ -23592,6 +23841,13 @@ class SemanticTodoistView extends ItemView {
     this.renderMessages();
   }
 
+  addMessageAction(label, onClick, isDisabled = null) {
+    const last = this.messages[this.messages.length - 1];
+    if (!last) return;
+    (last.actions = last.actions || []).push({ label, onClick, isDisabled });
+    this.renderMessages();
+  }
+
   replaceLastAssistantMessage(text) {
     for (let i = this.messages.length - 1; i >= 0; i -= 1) {
       if (this.messages[i].role === "assistant") {
@@ -23614,6 +23870,11 @@ class SemanticTodoistView extends ItemView {
         MarkdownRenderer.renderMarkdown(message.text, textEl, "", this);
       } else {
         textEl.setText(message.text);
+      }
+      for (const action of message.actions || []) {
+        const button = bubble.createEl("button", { text: action.label, cls: "mod-cta semantic-todoist-message-action" });
+        button.onclick = action.onClick;
+        if (action.isDisabled && action.isDisabled()) button.disabled = true;
       }
     }
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
@@ -24067,6 +24328,83 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 }
 
+class TodoistChangesModal extends Modal {
+  constructor(app, plugin, changes, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.changes = changes;
+    this.onDone = onDone;
+    this.ticked = new Set();
+    this.confirmedKey = "";
+    this.busy = false;
+    this.preview = changes.preview;
+    for (const group of this.preview.groups) for (const row of group.rows) if (row.ticked) this.ticked.add(row.id);
+  }
+
+  onOpen() {
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-changes-modal");
+    this.contentEl.addClass("semantic-todoist-modal-content");
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  renderRow(parent, row, isDelete) {
+    const wrap = parent.createDiv({ cls: `semantic-todoist-change-row${isDelete ? " is-delete" : ""}` });
+    const label = wrap.createEl("label");
+    const box = label.createEl("input", { type: "checkbox" });
+    box.checked = this.ticked.has(row.id);
+    box.onchange = () => { if (box.checked) this.ticked.add(row.id); else this.ticked.delete(row.id); this.render(); };
+    label.createSpan({ text: row.sentence });
+    if (row.before || row.after) wrap.createDiv({ cls: "semantic-todoist-change-diff", text: `${row.before || "-"} -> ${row.after || "-"}` });
+    for (const warning of row.warnings || []) wrap.createDiv({ cls: "semantic-todoist-change-warning", text: warning });
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Review Todoist changes" });
+    contentEl.createDiv({ text: this.preview.summary });
+    contentEl.createDiv({ cls: "semantic-todoist-change-note", text: "Nothing changes in Todoist until you press Apply." });
+    for (const group of this.preview.groups) {
+      contentEl.createEl("h3", { text: group.kind.charAt(0).toUpperCase() + group.kind.slice(1) });
+      for (const row of group.rows) this.renderRow(contentEl, row, false);
+    }
+    if (this.preview.deletes.length) {
+      const del = contentEl.createDiv({ cls: "semantic-todoist-change-deletes" });
+      del.createEl("h3", { text: "Deletes (cannot be undone)" });
+      for (const row of this.preview.deletes) this.renderRow(del, row, true);
+    }
+    const ticked = this.ticked.size;
+    const deleteIds = new Set(this.preview.deletes.map((row) => row.id));
+    const deleting = [...this.ticked].some((id) => deleteIds.has(id));
+    // The second confirmation only holds for the exact set of ticked deletes.
+    const confirmDeletes = deleting && this.confirmedKey === todoistDeleteConfirmKey(this.ticked, deleteIds);
+    const buttons = contentEl.createDiv({ cls: "semantic-todoist-change-buttons" });
+    buttons.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const apply = buttons.createEl("button", { text: confirmDeletes ? "Yes, delete and apply" : `Apply ${ticked} change${ticked === 1 ? "" : "s"}`, cls: deleting ? "mod-warning" : "mod-cta" });
+    apply.disabled = !ticked || this.busy;
+    apply.onclick = async () => {
+      if (deleting && !confirmDeletes) { this.confirmedKey = todoistDeleteConfirmKey(this.ticked, deleteIds); this.render(); return; }
+      this.busy = true;
+      apply.disabled = true;
+      try {
+        const rowsById = this.preview.groups.flatMap((group) => group.rows).concat(this.preview.deletes);
+        const result = await this.plugin.applyTodoistChanges(this.changes, [...this.ticked].filter((id) => rowsById.some((row) => row.id === id)));
+        this.close();
+        if (result.refused) { new Notice("These changes were already applied."); return; }
+        if (this.onDone) this.onDone(describeTodoistApplyResult(result, this.changes).join("\n"), result);
+      } catch (error) {
+        this.busy = false;
+        new Notice(`Todoist apply failed: ${error.message || error}`);
+        this.render();
+      }
+    };
+  }
+}
 class ScheduleTodayModal extends Modal {
   constructor(app, plugin, preview) {
     super(app);
@@ -28428,6 +28766,7 @@ const DEVICE_STATE_SETTINGS_KEYS = Object.freeze([
   "taskReferenceSnapshotMeta",
   "taskDeduplicationLastRunSummary",
   "scheduleTodayLastUndo",
+  "todoistChatLastUndo",
   "emailFailureHolds",
   "reasoningAutoCorrections",
   "modelsFetchedAt",
@@ -29322,11 +29661,61 @@ function buildChatResearchMarkdown(options = {}) {
   ].join("\n").trim() + "\n";
 }
 
-function chatResponseSchema() {
+const TODOIST_REJECT_TEXT = {
+  "unknown-op": "that isn't a kind of change I can make",
+  "unknown-id": "I couldn't match it to a task, project or section in Todoist",
+  "project-by-name": "it named a project or section instead of pointing to one in Todoist",
+  "merge-disabled": "merging tasks isn't turned on yet",
+  "bad-priority": "the priority wasn't between 1 and 4",
+  "bad-date": "the date wasn't a valid date",
+  "missing-content": "it had no title",
+  "no-op": "nothing would change",
+  "no-inbox": "I couldn't find your Inbox to put it in",
+  "section-project-mismatch": "that section belongs to a different project",
+  "parent-project-mismatch": "the parent task is in a different project",
+  "merge-conflict": "the same task is involved in another merge or change",
+  "merge-recurring": "a repeating task can't be merged",
+  "merge-ancestor": "a task can't be merged into its own subtask or parent"
+};
+
+function todoistTaskTitle(snapshot, id, fallback = "") {
+  const found = (snapshot?.tasks || snapshot?.items || []).find((task) => String(task.id) === String(id));
+  return found?.content || fallback || "a change";
+}
+
+function describeTodoistRejected(item, snapshot) {
+  const title = todoistTaskTitle(snapshot, item?.text, item?.text);
+  const why = TODOIST_REJECT_TEXT[item?.reason] || "it couldn't be checked";
+  return `"${title}" (${why})`;
+}
+
+function describeTodoistStopped(result) {
+const n = Number(result?.rejectedCount || 0);
+if (!n) return "Todoist couldn't be reached, so it stopped part-way.";
+const names = (result.failedTitles || []).map((title) => `"${title}"`).join(", ");
+return `Todoist stopped part-way: it rejected ${n} change${n === 1 ? "" : "s"}${names ? ` (${names})` : ""}.`;
+}
+function describeTodoistApplyResult(result, changes) {
+  const count = Number(result?.applied || 0);
+  const lines = [`Applied ${count} Todoist change${count === 1 ? "" : "s"}.`];
+  for (const item of result?.skipped || []) lines.push(`Skipped "${todoistTaskTitle(changes?.snapshot, item.row?.taskId, item.row?.fields?.content)}": ${item.reason}.`);
+  if (result?.failedAt !== undefined) lines.push(`${describeTodoistStopped(result)} What was applied before that can be undone.`);
+  if (result?.undoSaveFailed) lines.push("The undo couldn't be saved, so Undo may not work after Obsidian restarts.");
+  else if (count && result?.undoable === false) lines.push("Nothing here can be undone.");
+  return lines;
+}
+
+// Key of the ticked deletes: the second confirmation only holds for the exact set the user confirmed.
+function todoistDeleteConfirmKey(ticked, deleteIds) {
+  return [...ticked].filter((id) => deleteIds.has(id)).sort().join(",");
+}
+
+function chatResponseSchema(changePlanSchema = null) {
   return {
     type: "object",
     additionalProperties: false,
     properties: {
+      ...(changePlanSchema ? { changePlan: { ...changePlanSchema, type: [].concat(changePlanSchema.type, "null") } } : {}),
       claims: {
         type: "array",
         items: {
@@ -29347,7 +29736,7 @@ function chatResponseSchema() {
         }
       }
     },
-    required: ["claims"]
+    required: [...(changePlanSchema ? ["changePlan"] : []), "claims"]
   };
 }
 
@@ -56690,7 +57079,8 @@ function normalizeTodoistProjects(projects) {
     .map((project) => ({
       id: String(project.id || ""),
       name: singleLine(project.name || "Untitled project"),
-      isInbox: Boolean(project.isInbox || project.is_inbox_project || project.inbox_project)
+      isInbox: Boolean(project.isInbox || project.is_inbox_project || project.inbox_project),
+      isShared: Boolean(project.isShared || project.is_shared || project.shared)
     }))
     .filter((project) => project.id)
     .sort((a, b) => (a.isInbox === b.isInbox ? a.name.localeCompare(b.name) : a.isInbox ? -1 : 1));
@@ -56737,6 +57127,7 @@ function normalizeTodoistTask(task) {
     dueDate: task.due?.date || task.due_date || "",
     deadlineDate: task.deadline?.date || task.deadline_date || "",
     duration: normalizeTodoistDuration(task.duration),
+    isRecurring: Boolean(task.isRecurring || task.due?.is_recurring),
     isCompleted: Boolean(task.is_completed || task.checked || task.completed)
   };
 }
@@ -58049,6 +58440,10 @@ if (typeof module !== "undefined" && module.exports) {
   Object.assign(module.exports, {
     SUPPORTED_AI_PROVIDERS,
     AI_OPERATION_KEYS,
+    chatResponseSchema,
+    describeTodoistRejected,
+    describeTodoistApplyResult,
+    todoistDeleteConfirmKey,
     DEFAULT_SETTINGS,
     isMiscTasksPath,
     taskDescriptionConcurrencyFor,

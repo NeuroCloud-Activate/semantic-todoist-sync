@@ -117,6 +117,18 @@ test("create placement carried through; invalid placement dropped", () => {
   assert.ok("placement" in CHANGE_PLAN_SCHEMA.properties.changes.items.properties);
 });
 
+test("move with section only fills the section's project", () => {
+  const r = run([{ op: "move", taskId: "t2", sectionId: "s1" }]);
+  assert.deepStrictEqual(r.rows[0].target, { projectId: "p1", sectionId: "s1" });
+});
+test("create subtask with parent only takes the parent's project", () => {
+  assert.strictEqual(run([{ op: "create", content: "x", parentId: "t2" }]).rows[0].target.projectId, "p2");
+});
+test("create subtask in a different project than its parent is rejected", () => {
+  const r = run([{ op: "create", content: "x", parentId: "t1", projectId: "p2" }]);
+  assert.strictEqual(r.rows.length, 0);
+  assert.strictEqual(r.rejected[0].reason, "parent-project-mismatch");
+});
 let failed = 0;
 for (const [name, fn] of cases) {
   try { fn(); console.log(`PASS ${name}`); } catch (e) { failed++; console.log(`FAIL ${name}\n${e.stack}`); }

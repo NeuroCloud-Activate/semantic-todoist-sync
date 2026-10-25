@@ -112,7 +112,9 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
       } else {
         for (const k of ["description", "priority", "dueDate", "deadlineDate"]) if (has(change, k)) fields[k] = change[k];
         if (has(change, "labels")) fields.labels = resolve(change.labels);
-        const projectId = has(change, "projectId") ? String(change.projectId) : sec ? String(sec.projectId) : inbox?.id;
+        const parent = has(change, "parentId") ? tasks.get(String(change.parentId)) : null;
+        const projectId = has(change, "projectId") ? String(change.projectId) : sec ? String(sec.projectId) : parent ? String(parent.projectId) : inbox?.id;
+        if (parent && projectId && String(parent.projectId) !== String(projectId)) { reject("parent-project-mismatch"); continue; }
         if (!projectId) { reject("no-inbox"); continue; }
         row.target = { projectId: String(projectId) };
         if (has(change, "sectionId")) row.target.sectionId = String(change.sectionId);
@@ -136,6 +138,7 @@ function validateChangePlan(plan, snapshot, { allowedIds = new Set(), labels = [
       for (const k of ["projectId", "sectionId", "parentId"]) if (has(change, k)) target[k] = String(change[k]);
       const same = ["projectId", "sectionId", "parentId"].every((k) => target[k] === undefined || target[k] === String(task[k] || ""));
       if (!Object.keys(target).length || same) { reject("no-op"); continue; }
+      if (sec && !target.projectId) target.projectId = String(sec.projectId);
       row.target = target;
     } else if (op === "complete" || op === "reopen") {
       if (Boolean(task.isCompleted) === (op === "complete")) { reject("no-op"); continue; }

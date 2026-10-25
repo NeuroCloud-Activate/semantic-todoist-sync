@@ -58,7 +58,8 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
       const p = placementFor ? placementFor(row) : null;
       after = where(t.projectId, t.sectionId);
       sentence = `Add "${title}" to ${after}`;
-      if (p) { writesTo = p.path; sentence += `; a note line will be written to ${p.path} under "${p.heading}"`; }
+      // p.phrase is the caller's ready plain-language place ("at the end of <note>"); the heading form stays for callers without one.
+      if (p) { writesTo = p.path; sentence += p.phrase ? `; a note line will be added ${p.phrase}` : `; a note line will be written to ${p.path} under "${p.heading}"`; }
     } else if (row.op === "create-section") {
       after = f.content || "";
       sentence = `Create section "${after}" in ${projName(t.projectId)}`;

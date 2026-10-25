@@ -3579,6 +3579,7 @@ const DEFAULT_SETTINGS = {
   emailIncludeSourceListInDescriptions: true,
   noteIncludeSourceListInDescriptions: true,
   emailLogFolder: "Semantic Todoist Sync/Email-To-Todoist",
+  miscTasksFolder: "Semantic Todoist Sync/Miscellaneous Tasks",
   promptTemplatesFolder: "Semantic Todoist Sync/Prompts",
   taskGenerationPromptTemplate: "Generate Todoist task list",
   taskGenerationPromptProfileMode: "auto",
@@ -4509,6 +4510,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handleMonthlyNoteDeleted(file); // cache marking must also run while startup buffers the semantic index
       if (this.semanticIndexStartupBuffering) {
         bufferStartupSemanticIndexEvent(file.path, "remove", "delete");
         return;
@@ -4517,6 +4519,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handleMonthlyNoteRenamed(file, oldPath);
       if (this.semanticIndexStartupBuffering) {
         if (oldPath && oldPath !== file.path) bufferStartupSemanticIndexEvent(oldPath, "remove", "move");
         bufferStartupSemanticIndexEvent(file.path, "update", "move");
@@ -9298,6 +9301,26 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return Boolean(this.queueSemanticTaskReferenceAlignment(reason));
   }
 
+  // Deleting a monthly note never deletes tasks: Todoist and the task cache stay as they are.
+  handleMonthlyNoteDeleted(file) {
+    if (!isMonthlyNotePath(file?.path, this.settings)) return;
+    // Flag the note's cached tasks so a recreated note's sync never reads their missing lines as user deletions; cacheTask clears it.
+    for (const cached of Object.values(this.settings.taskCache || {})) if (cached?.path === file.path) cached.noteDeleted = true;
+    this.markTaskReferenceStateDirty?.();
+    this.saveSettings?.().catch(() => {});
+    new Notice("Deleting a monthly note doesn't delete its tasks in Todoist.");
+  }
+
+  // Renaming or moving a monthly note re-points its cached tasks so the next sync still finds their lines.
+  handleMonthlyNoteRenamed(file, oldPath) {
+    if (!oldPath || oldPath === file.path || !isMonthlyNotePath(oldPath, this.settings)) return;
+    let moved = false;
+    for (const cached of Object.values(this.settings.taskCache || {})) {
+      if (cached?.path === oldPath) { cached.path = file.path; moved = true; }
+    }
+    if (moved) { this.markTaskReferenceStateDirty?.(); this.saveSettings?.().catch(() => {}); }
+  }
+
   markInternalNoteWrite(path, ms = 5000) {
     if (!path) return;
     this.internalNoteWriteUntil = this.internalNoteWriteUntil || new Map();
@@ -9642,7 +9665,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   isSyncableTaskPath(path, exclude) {
-    if (isEmailLogPath(path, this.settings)) return true;
+    if (isEmailLogPath(path, this.settings) || isMiscTasksPath(path, this.settings)) return true;
     if (this.isExcludedPath(path, exclude)) return false;
     return true;
   }
@@ -9656,6 +9679,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (writingPathInContextFolder(path, this.settings, vaultBase)) return false; // writing-mode: task 7 context folder excluded from the vault index
     const includeFolders = include || splitList(this.settings.indexedFolders).map(trimSlashes);
     const excludeFolders = exclude || splitList(this.settings.excludedFolders).map(trimSlashes);
+    // Chat-created task notes are already searchable as Todoist tasks: synced two-way, never indexed as notes.
+    if (isMiscTasksPath(path, this.settings)) return false;
     const included = !includeFolders.length || includeFolders.some((folder) => path === folder || path.startsWith(`${folder}/`));
     // Email log notes are the vault record of a processed email and its synced
     // tasks. They live inside the plugin data folder, which excludedFolders
@@ -14500,22 +14525,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const prompt = turn.prompt || "";
     const files = this.app?.vault?.getMarkdownFiles?.() || [];
     const namedPaths = files.filter((file) => file.basename && file.basename.length > 2 && prompt.toLowerCase().includes(file.basename.toLowerCase())).map((file) => file.path);
-    const phrases = new Map();
+    // The preview gets a plain phrase; the placement rides on the row so Apply writes the line where the preview said.
     const placementFor = (row) => {
       const parentId = row.target?.parentId;
       const ctx = { activePath: active?.path || "", namedPaths, parentLine: parentId && this.settings.taskCache?.[parentId]?.path ? { path: this.settings.taskCache[parentId].path } : null };
       const placement = todoistModules().choosePlacement(row, ctx);
-      if (placement.path === "note") { const noteName = String(placement.notePath).split("/").pop().replace(/\.md$/i, ""); phrases.set(row, parentId ? `under its parent task in ${noteName}` : `at the end of ${noteName}`); return { path: placement.notePath, heading: noteName }; }
+      // The monthly note is named once, here, so Apply writes to the note the preview showed (not whatever month it is by then).
+      if (placement.path !== "note") placement.monthlyPath = todoistModules().monthlyNotePath(miscTasksFolderOf(this.settings), new Date());
+      row.notePlacement = placement;
+      if (placement.path === "note") {
+        const noteName = String(placement.notePath).split("/").pop().replace(/\.md$/i, "");
+        return { path: placement.notePath, phrase: parentId ? `under its parent task in ${noteName}` : `at the end of ${noteName}` };
+      }
       const project = (turn.snapshot.projects || []).find((item) => String(item.id) === String(row.target?.projectId));
-      phrases.set(row, `in the monthly note under ${project?.name || "Inbox"}`);
-      return { path: todoistModules().monthlyNotePath(this.settings.miscTasksFolder || DEFAULT_SETTINGS.miscTasksFolder || "Semantic Todoist Sync/Miscellaneous Tasks", new Date()), heading: project?.name || "Inbox" };
+      return { path: placement.monthlyPath, phrase: `in the monthly note under ${project?.name || "Inbox"}` };
     };
     const preview = todoistModules().buildPreview(rows, turn.snapshot, { placementFor });
-    // The preview module quotes the heading; say the placement in plain words instead.
-    for (const previewRow of preview.groups.flatMap((group) => group.rows)) {
-      const phrase = phrases.get(rows[Number(String(previewRow.id).replace("row-", ""))]);
-      if (phrase) previewRow.sentence = previewRow.sentence.replace(/; a? ?note line will be written to .*$/, `; a note line will be added ${phrase}`);
-    }
     return { rows, rejected, snapshot: turn.snapshot, preview };
   }
 
@@ -14577,10 +14602,18 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         try { await this.saveSettings(); } catch (saveError) { undoSaveFailed = true; this.logLocal("Todoist undo record not saved", { error: saveError.message || String(saveError) }); }
       }
       if (sent.length) await this.refreshTodoistLines(rows, fresh, plan.mergedAwayIds || [], sent);
+      // Created tasks get their vault line now. Each item_add is paired with the first unused create row of the same title, so a skipped or rejected create can never hand its id to another row.
+      const createRows = rows.filter((row) => row.op === "create");
+      const createdLines = plan.batches.flat().filter((command) => command.type === "item_add" && command.temp_id).map((command) => {
+        const at = createRows.findIndex((row) => row.fields?.content === command.args?.content);
+        return { temp: command.temp_id, row: at >= 0 ? createRows.splice(at, 1)[0] : null };
+      }).filter(({ temp, row }) => row && keep(temp))
+        .map(({ temp, row }) => ({ id: realIds.get(temp), row }));
+      const noteWriteFailed = createdLines.length ? await this.writeCreatedTaskLines(createdLines, { snapshot: fresh }) : [];
       const skippedRows = new Set(plan.skipped.map((item) => item.row));
       const adds = sent.filter((command) => command.type === "item_add" || command.type === "section_add").length;
       const applied = adds + rows.filter((row) => row.taskId && !skippedRows.has(row) && touched.has(String(row.taskId))).length;
-      return { applied, skipped: plan.skipped, failedAt, error, rejectedCount: rejected.length, failedTitles, mergedAwayIds: plan.mergedAwayIds || [], undoable, undoSaveFailed };
+      return { applied, skipped: plan.skipped, failedAt, error, rejectedCount: rejected.length, failedTitles, mergedAwayIds: plan.mergedAwayIds || [], undoable, undoSaveFailed, noteWriteFailed };
     } finally {
       changes.applyState = sent.length ? "applied" : "";
     }
@@ -14621,6 +14654,102 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     for (const id of mergedAwayIds) if (closed.has(String(id))) await guard(String(id), () => this.setTaskLineChecked(String(id), true));
   }
 
+  // Writes the vault line for each task chat just created in Todoist: its note, under its parent task, or this month's note under its project.
+  // results = [{ id, row }]. Returns the titles whose line could not be written; never throws (Todoist keeps the task either way).
+  async writeCreatedTaskLines(results, { snapshot = null, now = new Date() } = {}) {
+    const failed = [];
+    const modules = todoistModules();
+    const groups = new Map();
+    for (const { id, row } of results || []) {
+      const title = String(row?.fields?.content || "").trim() || "a new task";
+      try {
+        const parentId = String(row.target?.parentId || "");
+        const parentCache = parentId ? this.settings.taskCache?.[parentId] : null;
+        const placement = row.notePlacement || modules.choosePlacement(row, { parentLine: parentCache?.path ? { path: parentCache.path } : null });
+        const project = (snapshot?.projects || []).find((item) => String(item.id) === String(row.target?.projectId));
+        const projectName = project?.isInbox ? "Inbox" : project?.name || "Inbox";
+        let target = placement.path === "note" ? placement.notePath : placement.monthlyPath || modules.monthlyNotePath(miscTasksFolderOf(this.settings), now);
+        // A subtask goes under its parent's line only when that line is still in the note; otherwise it is a monthly-note task.
+        const underParent = Boolean(parentCache?.oid && placement.path === "note" && placement.notePath === parentCache.path);
+        const f = row.fields || {};
+        const task = {
+          id, content: f.content, description: f.description || "", labels: f.labels || f.addLabels || [], priority: f.priority || 1,
+          due_date: f.dueDate || null, deadline_date: f.deadlineDate || null, isCompleted: false, isSubtask: underParent,
+          projectId: String(row.target?.projectId || ""), projectName: underParent ? "" : projectName, sectionId: String(row.target?.sectionId || "")
+        };
+        const oid = generateUniqueOid(this.settings);
+        task.oid = oid;
+        let line = parsedTaskToLine(task, this.settings, id);
+        if (!underParent && placement.path !== "note") line = monthlyProjectMarker(line, projectName);
+        else if (!underParent) line = syncProjectMarkerOnTaskLine(line, task, this.settings);
+        const list = groups.get(target) || [];
+        list.push({ id, title, task, oid, line, projectName, parentOid: underParent ? parentCache.oid : "", monthly: placement.path !== "note" });
+        groups.set(target, list);
+      } catch (error) {
+        failed.push(title);
+        this.logLocal("Todoist created task line not prepared", { id, error: error.message || String(error) });
+      }
+    }
+    for (const [target, items] of groups) {
+      // A sync of the same note holds the file; wait so its final write cannot erase the line and the next sync cannot delete the Todoist task.
+      this.fileSyncInProgress = this.fileSyncInProgress || new Set();
+      for (let waited = 0; this.fileSyncInProgress.has(target) && waited < 600; waited += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+      if (this.fileSyncInProgress.has(target)) { // wait timed out: a write now could be erased by that sync's final modify, so skip and report
+        for (const item of items) failed.push(item.title);
+        this.logLocal("Todoist created task line not written: note still syncing", { path: target });
+        continue;
+      }
+      const ownsGuard = true;
+      if (ownsGuard) this.fileSyncInProgress.add(target);
+      try {
+        let file = this.app.vault.getAbstractFileByPath(target);
+        if (!(file instanceof TFile)) {
+          // Only the monthly note is ever created here; a named or parent note that has vanished is a failure to report.
+          if (!isMonthlyNotePath(target, this.settings)) throw new Error(`note ${target} not found`);
+          await ensureVaultFolder(this.app, target.split("/").slice(0, -1).join("/"));
+          this.markInternalNoteWrite(target);
+          await this.app.vault.create(target, modules.newMonthlyNote());
+          file = this.app.vault.getAbstractFileByPath(target);
+        }
+        this.markInternalNoteWrite(target);
+        await this.app.vault.process(file, (text) => items.reduce((current, item) => this.insertCreatedTaskLine(current, item), text));
+        const lines = (await this.app.vault.read(file)).split("\n");
+        for (const item of items) {
+          const lineNumber = lines.findIndex((candidate) => getTaskOid(candidate) === item.oid);
+          if (lineNumber < 0) continue;
+          const parsed = parseTaskLine(lines[lineNumber], lineNumber, target, lines, this.settings) || {};
+          this.cacheTask(item.id, Object.assign({}, parsed, item.task, { id: item.id, oid: item.oid, path: target, lineNumber, allLines: lines,
+            isSubtask: Boolean(item.task.isSubtask), parentOid: parsed.parentOid || "", parentContent: parsed.parentContent || "", projectName: item.projectName }));
+        }
+      } catch (error) {
+        for (const item of items) failed.push(item.title);
+        this.logLocal("Todoist created task line not written", { path: target, error: error.message || String(error) });
+      } finally {
+        if (ownsGuard) this.fileSyncInProgress.delete(target);
+      }
+    }
+    if (results?.length) await this.saveSettings().catch((error) => this.logLocal("Settings not saved after note line write", { error: error.message || String(error) }));
+    return failed;
+  }
+
+  // Pure text step of writeCreatedTaskLines: add one task line to a note's text (under its parent's block, under its project heading, or at the end).
+  insertCreatedTaskLine(text, item) {
+    const eol = /\r\n/.test(text) ? "\r\n" : "\n";
+    if (item.monthly) return todoistModules().insertTaskBlock(text, item.projectName, [item.line]);
+    const lines = String(text).split(/\r?\n/);
+    if (item.parentOid) {
+      const at = lines.findIndex((candidate) => getTaskOid(candidate) === item.parentOid);
+      if (at < 0) throw new Error("parent task line not found");
+      const parentIndent = indentationLevel(lines[at]);
+      let end = at + 1;
+      while (end < lines.length && lines[end].trim() && indentationLevel(lines[end]) > parentIndent) end += 1;
+      lines.splice(end, 0, `${" ".repeat(parentIndent)}${desiredSubtaskIndent(this.settings)}${item.line.trimStart()}`);
+      return lines.join(eol);
+    }
+    const base = !text || /\n$/.test(text) ? text : text + eol;
+    return `${base}${item.line}${eol}`;
+  }
+
   async undoLastTodoistChanges(showNotice = true) {
     const undo = this.settings.todoistChatLastUndo;
     if (!undo?.entries?.length && !undo?.createdTaskTempIds?.length && !undo?.createdSectionIds?.length) {
@@ -14659,6 +14788,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           if (cur) await this.updateTaskLineFromTodoist(id, Object.assign({}, cur, prev.fields || {}, { projectId: prev.projectId ?? cur.projectId, sectionId: prev.sectionId ?? cur.sectionId, parentId: prev.parentId ?? cur.parentId }));
         }
       } catch (lineError) { this.logLocal("Todoist undo line refresh skipped", { id, error: lineError.message || String(lineError) }); }
+    }
+    // A task chat created is deleted in Todoist, so its note line goes too (the removal normal sync does for a task deleted in Todoist).
+    for (const id of (undo.createdTaskTempIds || []).map(String)) {
+      const cached = this.settings.taskCache?.[id];
+      if (!done.has(id) || !cached) continue;
+      try { await this.removeDeletedTodoistTaskFromNote(cached); this.forgetCachedTaskReference(id); } catch (lineError) { this.logLocal("Todoist undo note line not removed", { id, error: lineError.message || String(lineError) }); }
     }
     const restored = done.size;
     if (showNotice) new Notice(error ? `Undo stopped after ${restored} task${restored === 1 ? "" : "s"}: Todoist rejected a change or couldn't be reached.` : `Undid ${restored} Todoist task${restored === 1 ? "" : "s"}${plan.skipped.length ? `; ${plan.skipped.length} skipped` : ""}.`);
@@ -20883,6 +21018,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return stats;
     const original = await this.app.vault.read(file);
+    const knownAtRead = new Set(Object.keys(this.settings.taskCache || {}));
     const lines = original.split("\n");
     const oidAmbiguity = this.checkNoteOidAmbiguity(lines, this.settings, path);
     if (!oidAmbiguity.ok) throw new Error("Sync aborted: ambiguous local task identity in this note.");
@@ -20909,7 +21045,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       }
       const parsed = parseTaskLine(lines[i], i, path, lines, this.settings);
       if (!parsed || !parsed.isSyncTask) continue;
-      if (!parsed.isSubtask && !parsed.section) {
+      // A monthly-note task already in Todoist keeps the section it has (usually none): the note's name is no section.
+      if (!parsed.isSubtask && !parsed.section && !isMonthlyNotePath(path, this.settings)) {
         parsed.section = makeNoteSectionName(file.basename, original, path);
         lines[i] = addSectionToTaskLine(lines[i], parsed.section, this.settings);
         changed = true;
@@ -21036,7 +21173,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       stats.updated += 1;
     }
 
+    const isMonthly = isMonthlyNotePath(path, this.settings);
+    if (isMonthly) {
+      // In a monthly note the marker is the truth for the project; the location sync above drops it for the default project.
+      for (const parsed of existingUpdates) {
+        if (parsed.isSubtask || !parsed.projectName || !lines[parsed.lineNumber]) continue;
+        lines[parsed.lineNumber] = monthlyProjectMarker(lines[parsed.lineNumber], parsed.projectName);
+      }
+    }
     this.setSidebarStatus("Checking removed note tasks...");
+    // A task cached after this note was read (a chat-written line) is not "missing from the file".
+    for (const cachedId of Object.keys(this.settings.taskCache || {})) if (!knownAtRead.has(cachedId)) presentIds.add(cachedId);
     const removalStats = await this.deleteTodoistTasksMissingFromFile(path, presentIds);
     stats.deleted = removalStats.deleted;
     stats.completedForgotten = removalStats.completedForgotten;
@@ -21045,7 +21192,26 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       changed = true;
       stats.normalized += repairedSubtaskIndentation;
     }
-    if (changed) {
+    if (isMonthly) {
+      // Headings follow markers: a hand-edited heading or dragged line goes back. process() never overwrites text typed since the read.
+      const next = todoistModules().reconcileHeadings(lines.join("\n"));
+      if (next !== original) {
+        this.markInternalNoteWrite(path);
+        const before = original.split("\n");
+        const edits = lines.flatMap((line, i) => (line !== before[i] ? [[before[i], line]] : []));
+        await this.app.vault.process(file, (current) => {
+          if (current === original) return next;
+          // Typed since the read: keep it, and re-apply only this sync's own line edits (new ids!) to lines the user left alone.
+          const now = current.split("\n");
+          for (const [from, to] of edits) {
+            const at = now.indexOf(from);
+            if (at >= 0) now[at] = to;
+          }
+          this.logLocal("Monthly note changed during sync; sync edits re-applied to current text", { path });
+          return todoistModules().reconcileHeadings(now.join("\n"));
+        });
+      }
+    } else if (changed) {
       this.markInternalNoteWrite(path);
       await this.app.vault.modify(file, lines.join("\n"));
     }
@@ -22040,6 +22206,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const movedPaths = await this.findVaultNotesHoldingTasks(cachedEntries.filter(([id, cached]) => !presentIds.has(id) && !cached.isCompleted), path);
     for (const [id, cached] of cachedEntries) {
       if (presentIds.has(id)) continue;
+      if (cached.noteDeleted) continue; // its monthly note was deleted: the missing line is not a user's deletion
       if (cached.isCompleted) {
         this.forgetCachedTaskReference(id);
         forgotCompleted += 1;
@@ -22053,7 +22220,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         continue;
       }
       // Only guards a deletion mid-sync: syncFileNotes returns early for a missing file, so this Notice cannot fire through it.
-      if (isMiscTasksPath(path, this.settings) && !(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) {
+      if (isMonthlyNotePath(path, this.settings) && !(this.app.vault.getAbstractFileByPath(path) instanceof TFile)) {
         if (!warnedMissingMisc) new Notice(`Monthly task note ${path} is missing; its Todoist tasks were kept.`);
         warnedMissingMisc = true;
         continue;
@@ -22356,9 +22523,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const savedEvents = new Set(this.settings.processedTodoistEventIds || []);
     const events = (activities.results || []).filter((event) => !savedEvents.has(event.id));
     let snapshotTasksById = null;
+    let snapshotProjectIds = null;
     if (events.some((event) => /updated|added|completed|uncompleted|deleted|removed/i.test(event.event_type || event.eventType || ""))) {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false).catch(() => null);
       if (snapshot?.tasks) snapshotTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
+      if (snapshot?.projects?.length) snapshotProjectIds = new Set(snapshot.projects.map((project) => String(project.id)));
     }
     for (const event of events) {
       const taskId = event.object_id || event.objectId;
@@ -22369,6 +22538,12 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         const movedTask = snapshotTasksById?.get(String(taskId)) || null;
         if (movedTask) {
           await this.updateTaskLineFromTodoist(taskId, movedTask);
+          savedEvents.add(event.id);
+          continue;
+        }
+        // A project archived or deleted in Todoist takes its tasks out of the snapshot: monthly-note lines stay where they are.
+        if (isMonthlyNotePath(cached.path, this.settings) && snapshotProjectIds && cached.projectId && !snapshotProjectIds.has(String(cached.projectId))) {
+          this.logLocal("Todoist removal event kept monthly note task: its project is gone", { id: taskId, path: cached.path });
           savedEvents.add(event.id);
           continue;
         }
@@ -22423,9 +22598,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       parentLineNumber: cached.parentLineNumber ?? null,
       id: taskId
     }), this.settings);
+    const monthly = isMonthlyNotePath(cached.path, this.settings) && !parsed.isSubtask;
     await this.updateCachedLine(taskId, (line) => {
-      return taskLineWithStableIndent(line, parsed, this.settings, taskId);
+      const next = taskLineWithStableIndent(line, parsed, this.settings, taskId);
+      return monthly && parsed.projectName ? monthlyProjectMarker(next, parsed.projectName) : next;
     });
+    // A chat-created task stays in its month's note: only its heading follows the new project marker.
+    if (monthly) {
+      const file = this.app.vault.getAbstractFileByPath(this.settings.taskCache[taskId]?.path || cached.path);
+      if (file instanceof TFile) await this.app.vault.process(file, (text) => todoistModules().reconcileHeadings(text));
+    }
     this.cacheTask(taskId, parsed);
   }
 
@@ -24145,6 +24327,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
     toggleSetting(containerEl, "Automatically process new email", "Poll the Worker queue while Obsidian is open.", this.plugin, "autoProcessEmails");
     numberSetting(containerEl, "Email polling interval seconds", this.plugin, "emailPollIntervalSeconds");
     textSetting(containerEl, "Email log folder", "Vault folder for the plain-language processing log.", this.plugin, "emailLogFolder");
+    textSetting(containerEl, "Miscellaneous Tasks folder", "Vault folder for tasks created from chat when they don't belong to a note. One note per month, synced with Todoist but not searched as notes." + (miscTasksFolderOf(this.plugin.settings) !== trimSlashes(this.plugin.settings.miscTasksFolder || DEFAULT_SETTINGS.miscTasksFolder) ? " Warning: this overlaps the email log folder, so the default folder is used instead." : ""), this.plugin, "miscTasksFolder");
     toggleSetting(containerEl, "Add source citations to email descriptions", "Include source references and context-note citations in email-created Todoist descriptions.", this.plugin, "emailIncludeSourceListInDescriptions");
     new Setting(containerEl).setName("Process pending email tasks").addButton((button) => button.setButtonText("Process").setCta().onClick(() => this.plugin.processPendingEmails()));
     const holdCounts = this.plugin.emailFailureHoldCounts();
@@ -25532,6 +25715,7 @@ const SETTING_DESCRIPTIONS = {
   emailPollIntervalSeconds: "How often Email-To-Todoist checks Cloudflare while automatic processing is enabled. To protect the Cloudflare KV Free list limit, automatic polling is clamped to at least 420 seconds.",
   maxNoteChars: "Maximum characters read from a note as a task source. This is a note-ingestion bound, not a model-context display limit.",
   emailLogFolder: "Folder where plain-language email processing logs are stored.",
+  miscTasksFolder: "Folder for tasks created from chat that don't belong to a note: one note per month, synced with Todoist, not indexed as notes.",
   maxGeneratedMainTasks: "Hard cap on main tasks the AI may create from one note or email.",
   maxGeneratedSubtasksPerMainTask: "Hard cap on subtasks below each AI-created main task.",
   syncTag: "Marker tag used in notes for main tasks that sync with Todoist.",
@@ -29700,6 +29884,7 @@ function describeTodoistApplyResult(result, changes) {
   const lines = [`Applied ${count} Todoist change${count === 1 ? "" : "s"}.`];
   for (const item of result?.skipped || []) lines.push(`Skipped "${todoistTaskTitle(changes?.snapshot, item.row?.taskId, item.row?.fields?.content)}": ${item.reason}.`);
   if (result?.failedAt !== undefined) lines.push(`${describeTodoistStopped(result)} What was applied before that can be undone.`);
+  for (const title of result?.noteWriteFailed || []) lines.push(`Created in Todoist but couldn't write note line "${title}".`);
   if (result?.undoSaveFailed) lines.push("The undo couldn't be saved, so Undo may not work after Obsidian restarts.");
   else if (count && result?.undoable === false) lines.push("Nothing here can be undone.");
   return lines;
@@ -33320,6 +33505,12 @@ function setProjectMarker(line, projectName) {
   const dateIndex = cleaned.search(/\s(?:\{\{\d{4}-\d{2}-\d{2}\}\}|(?:📅|📆|🗓️|🗓|@)\s*\d{2,4}-\d{1,2}-\d{1,2})/);
   if (dateIndex >= 0) return `${cleaned.slice(0, dateIndex)}${marker}${cleaned.slice(dateIndex)}`;
   return `${cleaned}${marker}`;
+}
+
+// Monthly notes list Inbox tasks under an Inbox heading with no marker; every other project keeps its marker.
+function monthlyProjectMarker(line, projectName) {
+  const name = singleLine(projectName);
+  return !name || name === "Inbox" ? removeProjectMarker(line) : setProjectMarker(line, name);
 }
 
 function removeProjectMarker(line) {
@@ -45729,7 +45920,7 @@ function semanticTaskReferenceRecords(settings = DEFAULT_SETTINGS, basePath = ""
       .map((location) => Object.assign({}, location, { path: vaultRelativePath(location?.path || "", basePath) }))
       .filter((location) => {
         const path = String(location.path || "");
-        if (!path || isEmailLogPath(path, settings)) return false;
+        if (!path || isEmailLogPath(path, settings) || isMiscTasksPath(path, settings)) return false;
         if (indexedFolders.length && !indexedFolders.some((folder) => path === folder || path.startsWith(`${folder}/`))) return false;
         return !isFolderExcluded(path, excludedFolders);
       });
@@ -56946,10 +57137,21 @@ function obsidianDescription(path) {
 function sourceReference(source, basePath = "") {
   return vaultRelativePath(source?.path || "", basePath);
 }
+// A misc folder that equals, contains or sits inside the email log folder would give those notes monthly-note treatment: use the default instead.
+function miscTasksFolderOf(settings = DEFAULT_SETTINGS) {
+  const folder = trimSlashes(settings.miscTasksFolder || DEFAULT_SETTINGS.miscTasksFolder);
+  const log = trimSlashes(settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder || "");
+  const clash = !folder || (log && (folder === log || folder.startsWith(`${log}/`) || log.startsWith(`${folder}/`)));
+  return clash ? DEFAULT_SETTINGS.miscTasksFolder : folder;
+}
 function isMiscTasksPath(path, settings = DEFAULT_SETTINGS) {
-  const folder = trimSlashes(settings.miscTasksFolder || "Semantic Todoist Sync/Miscellaneous Tasks");
+  const folder = miscTasksFolderOf(settings);
   const notePath = trimSlashes(path || "");
   return Boolean(folder && (notePath === folder || notePath.startsWith(`${folder}/`)));
+}
+// Monthly-note behaviour (heading reconcile, no auto section, delete guards) applies only to "YYYY-MM Tasks.md" inside the misc folder.
+function isMonthlyNotePath(path, settings = DEFAULT_SETTINGS) {
+  return isMiscTasksPath(path, settings) && /^\d{4}-\d{2} Tasks\.md$/.test(String(path).split("/").pop());
 }
 function isEmailLogPath(path, settings = DEFAULT_SETTINGS) {
   const folder = trimSlashes(settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder || "");
@@ -58446,6 +58648,7 @@ if (typeof module !== "undefined" && module.exports) {
     todoistDeleteConfirmKey,
     DEFAULT_SETTINGS,
     isMiscTasksPath,
+  isMonthlyNotePath,
     taskDescriptionConcurrencyFor,
     normalizeStableSettings,
     resolveOperationReference,

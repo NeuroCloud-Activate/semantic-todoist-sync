@@ -91,6 +91,13 @@ test("create row says note will be written to", () => {
   assert.strictEqual(r.writesTo, placementFor().path);
   assert.ok(/Buy milk/.test(r.sentence) && /written/i.test(r.sentence) && r.sentence.includes("Home"));
 });
+test("create row uses the caller's plain phrase for where the note line goes", () => {
+  const phrase = "in the monthly note under Home";
+  const r = buildPreview([create], snapshot, { placementFor: () => ({ path: placementFor().path, phrase }) }).groups[0].rows[0];
+  assert.ok(r.sentence.endsWith(`; a note line will be added ${phrase}`), r.sentence);
+  assert.ok(!/written|"/.test(r.sentence.split("; a note line")[1]), r.sentence);
+  assert.strictEqual(r.writesTo, placementFor().path);
+});
 test("groups ordered moves, labels, dates, completions, creates, merges, edits last", () => {
   const p = buildPreview([edit, merge, create, done, date, label, move], snapshot, { placementFor });
   assert.deepStrictEqual(p.groups.map((g) => g.kind), ["moves", "labels", "dates", "completions", "creates", "merges", "edits"]);

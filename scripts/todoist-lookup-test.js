@@ -73,7 +73,40 @@ const cases = {
     const nul = { words: [], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
     assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)), ["t1", "t2", "t3"]);
   },
+  "change request: new due date in filters does not drop the named task"() {
+    const sts = { tasks: [
+      task("a", "STS sample: buy printer paper", { projectId: "p9" }),
+      task("b", "STS sample: book dentist appointment", { projectId: "p9", dueDate: "2026-11-02" }),
+      task("c", "STS sample: renew passport", { projectId: "p9", dueDate: "2026-11-03" })
+    ], projects: [{ id: "p9", name: "STS Test" }], sections: [] };
+    const filters = { words: ["STS sample: buy printer paper", "STS sample: order toner"], projects: ["STS Test"], labels: [], dueFrom: null, dueTo: "2026-11-05", priority: 2, includeCompleted: false };
+    assert.ok(ids(shortlistTasks(sts, lk({ kind: "change", filters }), [], 10)).includes("a"));
+    // same filters as a question behave as before: the undated task is excluded
+    assert.deepStrictEqual(ids(shortlistTasks(sts, lk({ kind: "question", filters: { ...filters, priority: null } }), [], 10)), ["b", "c"]);
+    // change with no words still filters by date
+    assert.deepStrictEqual(ids(shortlistTasks(sts, lk({ kind: "change", filters: { words: [], projects: [], labels: [], dueTo: "2026-11-02" } }), [], 10)), ["b"]);
+    // change whose words match nothing finds nothing
+    assert.deepStrictEqual(shortlistTasks(sts, lk({ kind: "change", filters: { ...filters, words: ["zebra"] } }), [], 10), []);
+  },
+  "change request with words: tasks inside the date/priority range rank first"() {
+    const s = { tasks: [
+      task("hi", "alpha beta gamma", { dueDate: "2026-12-30" }),
+      task("lo", "alpha", { dueDate: "2026-11-02" }),
+      task("nodate", "alpha beta")
+    ], projects: [], sections: [] };
+    const f = { words: ["alpha", "beta", "gamma"], projects: [], labels: [], dueTo: "2026-11-05" };
+    const change = (extra, cap) => ids(shortlistTasks(s, lk({ kind: "change", filters: { ...f, ...extra } }), [], cap));
+    assert.deepStrictEqual(change({}, 10), ["lo", "hi", "nodate"]);
+    // the cap applies after the range ordering
+    assert.deepStrictEqual(change({}, 1), ["lo"]);
+    // priority ranks the same way
+    const p = { tasks: [task("x", "alpha beta", { priority: 1 }), task("y", "alpha", { priority: 4 })], projects: [], sections: [] };
+    assert.deepStrictEqual(ids(shortlistTasks(p, lk({ kind: "change", filters: { words: ["alpha", "beta"], projects: [], labels: [], priority: 4 } }), [], 10)), ["y", "x"]);
+    // guard: no in-range task still keeps word matches
+    assert.deepStrictEqual(change({ dueTo: "2026-01-01" }, 10), ["hi", "nodate", "lo"]);
+  },
   "prompt and schema"() {
+    assert.ok(/existing tasks/i.test(lookupPrompt("x", "").system) && /not.*new value/i.test(lookupPrompt("x", "").system));
     assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer"]);
     const p = lookupPrompt("move it", "User: hi");
     assert.ok(p.user.includes("move it") && p.user.includes("User: hi"));

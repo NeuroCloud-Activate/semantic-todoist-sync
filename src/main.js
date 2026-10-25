@@ -14293,6 +14293,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           return `${base} link=${entry.markdown}`;
         }).join("\n")
       : sources;
+    // Shortlisted Todoist tasks are citable evidence; the prompt already lists them (with their evidence_id), so they join the ledger after the prompt source list is built.
+    for (const task of todoistTurn?.shortlist || []) sourceLedger.push({ key: `todoist-${task.id}`, sourceId: "", evidenceId: `todoist-${task.id}`, sourceKind: "todoist-task-reference", taskId: String(task.id), path: "", title: singleLine(task.content), role: "Todoist task", evidenceText: "", url: todoistTaskUrl(task.id, this.settings), markdown: `[${markdownLinkText(singleLine(task.content))}](${todoistTaskUrl(task.id, this.settings)})` });
     // D6: the return metadata comes from the canonical source/selected bundle
     // (its established hash), never from a removed adaptive pack. Reserved task
     // chat uses the reserved bundle; ordinary chat uses the chat evidence bundle.
@@ -14445,6 +14447,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const parsedAnswer = todoistTurn?.snapshot && todoistTurn.lookup.kind === "change" ? parseChatEvidenceResponse(response) : null;
     const todoistChanges = parsedAnswer ? this.buildTodoistChanges(parsedAnswer.changePlan, todoistTurn, sourceLedger, parsedAnswer.claims, active) : null;
     response = citationResult.answer;
+    if (todoistChanges && !response.trim()) response = todoistChanges.rows.length ? `I've prepared ${todoistChanges.preview.summary}. Review ${todoistChanges.rows.length === 1 ? "it" : "them"} before anything changes in Todoist.` : "I couldn't prepare any change.";
     if (todoistTurn?.unavailable) response += "\n\nTodoist wasn't available, so this answer comes from your notes only.";
     if (duplicatesNotReady) response += "\n\nDuplicate finding isn't turned on yet.";
     if (todoistChanges?.rejected.length) response += `\n\nI couldn't do ${todoistChanges.rejected.length} of the proposed changes: ${todoistChanges.rejected.map((item) => describeTodoistRejected(item, todoistTurn.snapshot)).join("; ")}.`;
@@ -14501,8 +14504,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const projectName = new Map(projects.map((project) => [project.id, project.name]));
     const sectionName = new Map(sections.map((section) => [section.id, section.name]));
     const promptText = [
-      "Todoist tasks (id | title | project | section | due | priority | labels):",
-      ...(shortlist.length ? shortlist.map((task) => `${task.id} | ${task.content} | ${projectName.get(task.projectId) || ""} | ${sectionName.get(task.sectionId) || ""} | ${String(task.dueDate || "").slice(0, 10)} | p${task.priority} | ${(task.labels || []).join(",")}`) : ["(none matched)"]),
+      "Todoist tasks (evidence_id | id | title | project | section | due | priority | labels); cite a task by its evidence_id:",
+      ...(shortlist.length ? shortlist.map((task) => `evidence_id=todoist-${task.id} | ${task.id} | ${singleLine(task.content)} | ${projectName.get(task.projectId) || ""} | ${sectionName.get(task.sectionId) || ""} | ${String(task.dueDate || "").slice(0, 10)} | p${task.priority} | ${(task.labels || []).join(",")}`) : ["(none matched)"]),
       "Todoist projects (id | name):",
       ...projects.map((project) => `${project.id} | ${project.name}${project.isInbox ? " (Inbox)" : ""}`),
       "Todoist sections (id | name | project id):",

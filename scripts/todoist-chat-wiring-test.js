@@ -433,6 +433,68 @@ test("placement wording has no quoted internal phrases", async () => {
   assert.ok(!/its parent task"|the end of note"|the end of the note"/.test(sentences), sentences);
   assert.ok(/in the monthly note under|at the end of|under its parent task in/.test(sentences), sentences);
 });
+test("shortlisted Todoist tasks are citable evidence", async () => {
+  let userText = "";
+  const p = makePlugin({
+    lookup: lookupOf({ filters: { words: ["compost"], projects: [], labels: [] } }),
+    answer: (request) => { userText = request.user; return claims(["todoist-t1"]); }
+  });
+  const r = await p.chat("Which Todoist tasks mention compost?", null, [], "chat-query", { todoist: true });
+  assert.ok(userText.includes("evidence_id=todoist-t1"), "prompt carries the task evidence id");
+  assert.equal(userText.split("Buy compost").length - 1, 1, "shortlisted task listed once");
+  assert.ok(r.answer.includes("Compost is on your list"));
+  assert.ok(!/not established/i.test(r.answer), r.answer);
+  assert.ok(r.answer.includes("https://todoist.com/app/task/t1"), r.answer);
+  assert.equal(r.citationValidation.allowedEvidenceCount >= 1, true);
+});
+
+test("vault-only turn prompt has no Todoist evidence rows", async () => {
+  let userText = "";
+  const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: (request) => { userText = request.user; return claims(); } });
+  await p.chat("What did the vendor notes say?", null, [], "chat-query", { todoist: true });
+  assert.ok(!userText.includes("todoist-"), userText);
+});
+
+test("create row note links exclude cited Todoist tasks", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change", filters: { words: ["compost"], projects: [], labels: [] } }),
+    context: [{ evidenceId: "E1", path: "Notes/Garden.md", title: "Garden", text: "Build a compost bin." }],
+    answer: { ...claims(["E1", "todoist-t1"]), changePlan: { changes: [{ op: "create", content: "Build compost bin", description: "Per plan." }] } }
+  });
+  const r = await p.chat("Add a task to build the compost bin", null, [], "chat-query", { todoist: true });
+  const d = r.todoistChanges.rows[0].fields.description;
+  assert.ok(d.includes("obsidian://open?file=Notes%2FGarden.md"), d);
+  assert.ok(!d.includes("todoist.com"), d);
+});
+
+test("change turn with rows and no model text gets a plain sentence", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change" }),
+    answer: { claims: [], changePlan: { changes: [{ op: "update", taskId: "t1", dueDate: "2026-11-05" }, { op: "create", content: "STS sample: order toner" }] } }
+  });
+  const r = await p.chat("Set the task due 2026-11-05 and add a new task", null, [], "chat-query", { todoist: true });
+  assert.equal(r.todoistChanges.rows.length, 2);
+  assert.ok(r.answer.includes("I've prepared 2 changes to 2 tasks. Review them before anything changes in Todoist."), JSON.stringify(r.answer));
+});
+
+test("change turn with no rows and no model text says none could be prepared", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change" }),
+    answer: { claims: [], changePlan: { changes: [{ op: "frobnicate", taskId: "t1" }] } }
+  });
+  const r = await p.chat("Change the compost task", null, [], "chat-query", { todoist: true });
+  assert.ok(r.answer.includes("I couldn't prepare any change"), JSON.stringify(r.answer));
+  assert.ok(r.answer.includes("I couldn't do 1 of the proposed changes"), r.answer);
+});
+
+test("change turn with model text keeps it unchanged", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change" }),
+    answer: { ...claims(), changePlan: { changes: [{ op: "update", taskId: "t1", priority: 4 }] } }
+  });
+  const r = await p.chat("Make compost urgent", null, [], "chat-query", { todoist: true });
+  assert.ok(!r.answer.includes("I've prepared"), r.answer);
+});
 (async () => {
   let failed = 0;
   for (const [name, fn] of cases) {

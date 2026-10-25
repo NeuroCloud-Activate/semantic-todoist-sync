@@ -33,7 +33,7 @@ function lookupPrompt(prompt, historyText) {
     "needsTodoist=false (kind \"none\") when the message is only about vault notes, writing or general chat.",
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
     "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
-    "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = 1-4; includeCompleted only if the user asks about completed tasks.",
+    "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = 1-4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
     "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\")."
   ].join("\n");
   return { system, user: `Conversation so far:\n${historyText || "(none)"}\n\nLatest message:\n${prompt}` };
@@ -58,14 +58,17 @@ function shortlistTasks(snapshot, lookup, lastAnswerTaskIds, cap) {
   const projectIds = names.length ? new Set((snapshot.projects || []).filter((p) => names.includes(norm(p.name))).map((p) => String(p.id))) : null;
   const labels = (f.labels || []).map(norm).filter(Boolean);
   const terms = [...new Set((f.words || []).flatMap(words))];
+  // A change request's dates/priority are usually the NEW values, so with named words they must not exclude the task.
+  const namedChange = lookup.kind === "change" && terms.length > 0;
   const scored = [];
   for (const t of all) {
     if (t.isCompleted && !f.includeCompleted) continue;
     if (projectIds && !projectIds.has(String(t.projectId))) continue;
     if (labels.length && !labels.every((l) => (t.labels || []).some((x) => norm(x) === l))) continue;
-    if (f.priority && t.priority !== f.priority) continue;
-    if (f.dueFrom && !(t.dueDate && day(t.dueDate) >= day(f.dueFrom))) continue;
-    if (f.dueTo && !(t.dueDate && day(t.dueDate) <= day(f.dueTo))) continue;
+    const inRange = !(f.priority && t.priority !== f.priority)
+      && !(f.dueFrom && !(t.dueDate && day(t.dueDate) >= day(f.dueFrom)))
+      && !(f.dueTo && !(t.dueDate && day(t.dueDate) <= day(f.dueTo)));
+    if (!namedChange && !inRange) continue;
     let score = 0;
     if (terms.length) {
       const title = new Set(words(t.content));
@@ -73,9 +76,9 @@ function shortlistTasks(snapshot, lookup, lastAnswerTaskIds, cap) {
       for (const w of terms) score += (title.has(w) ? 2 : 0) + (desc.has(w) ? 1 : 0);
       if (!score) continue;
     }
-    scored.push({ t, score });
+    scored.push({ t, score, inRange });
   }
-  scored.sort((a, b) => b.score - a.score); // stable: ties keep snapshot order
+  scored.sort((a, b) => b.inRange - a.inRange || b.score - a.score); // stable: ties keep snapshot order
   for (const { t } of scored) push(t);
   return out.slice(0, Number.isFinite(cap) ? Math.max(0, cap) : DEFAULT_CAP);
 }

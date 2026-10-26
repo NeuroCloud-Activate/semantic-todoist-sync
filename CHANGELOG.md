@@ -6,12 +6,22 @@
 - **Deletes are kept apart and need two steps.** They appear in a separate red section, unticked, and need a second confirmation before they run. A delete cannot be undone, and the chat says so.
 - **One-step Undo of your last Apply.** An "Undo last Todoist change" button appears after an Apply that can be undone, and puts back what that Apply changed. It only appears when there is something to undo, so a delete-only Apply never offers it.
 - **Tasks made in chat that are not tied to a note go into a monthly "Miscellaneous Tasks" note.** Each task is a line under its project's heading. A project heading appears only when it is used, and disappears again when Undo or a task deleted in Todoist leaves it empty. Headings and text you typed yourself are left alone.
-- **Duplicate finding is built but switched off.** Asking for duplicates answers "Duplicate finding isn't turned on yet." and changes nothing, until it has been checked on real data.
+- **Possible duplicates are held for you to decide.** When a new task (from a note, an email or the sidebar chat) looks like a task you already have open in Todoist, it is held and a box in the sidebar asks Merge or Keep both. Nothing is merged without your click. Other tasks in the same run are created straight away; the check is quick and never holds them up.
+- **Merge updates the existing task instead of making a new one.** The new task is not created. The existing task gains the new labels (labels are only added), any new due date, deadline or priority, the new note or email in its source list, and one short dated sentence saying what changed and why. Nothing already in the task is removed. The note gets a line pointing at the existing task.
+- **Keep both creates the new task as normal.**
+- **An unanswered box is not lost.** A box still unanswered when Obsidian closes is created as a separate task the next time the plugin loads.
+- **A slow or unavailable AI check does not hide the box.** The box still shows, and a one-time notice says the duplicate check is degraded.
+- **New setting "Record duplicate answers" (on by default).** It keeps your Merge and Keep both answers and their context so matching can be tuned later. Turn it off to stop recording.
 ### Changed
+- **The old automatic duplicate merge is gone, along with the separate strictness and AI sensitivity settings.** The existing duplicate AI check is now the stricter check behind the box.
+- **Asking the chat to find duplicates now answers "I can't search existing tasks for duplicates; new tasks are checked when they're created."** This replaces the earlier "switched off" answer.
+- **Fixed: a task generated from a note was never matched against your existing top-level tasks.** It has no id yet, so the check wrongly skipped them.
 - **New installs default to the embeddinggemma-2 embedding model** for an OpenAI-compatible (LiteLLM) host; you still enter your host's address. A model you have already saved is kept.
 ### Notes
-- Tests: `npm test` passes 66/66, including the new Todoist test files for planning, preview, apply, look-up, the monthly note, and the chat and monthly-note wiring.
+- Tests: `npm test` passes 76/76, including the new Todoist test files for planning, preview, apply, look-up, the monthly note, and the chat and monthly-note wiring, and the new duplicate review test files.
 - Live check in the dev vault: only the "STS Test" project was changed, and tasks in other projects were left unchanged. A create with a priority and due date, a due-date edit, a move to subtask and a delete each showed a preview first and wrote nothing until Apply. Undo restored the earlier state each time, and in the sidebar the red delete section, the second confirmation and the Undo button were seen working. The chat asked for "priority 1" and the preview showed P1. The repeatable check script (search, create, organize, undo) passed every step.
+- Live check of the duplicate review box in the dev vault: only STS Test changed. Held duplicates from a note showed the box; Keep both created exactly one task and one note line; Merge updated the existing task in place with no new task; syncs afterwards changed nothing.
+- Known limits of the duplicate box: if Obsidian crashes between Keep both creating the task and saving the answer, the task can be created twice. A box can point at a task deleted in Todoist since the last refresh; Merge then refuses and the box stays.
 - Known limits: Undo covers only the last Apply. A task deleted in Todoist has its monthly-note line removed at the next Todoist check, not at once. Removing a task line while syncing leaves its project heading in place; only Undo and a Todoist delete remove an emptied heading.
 
 ## 0.9.30 - 2026-10-20

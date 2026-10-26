@@ -2364,3 +2364,6 @@
 .semantic-todoist-changes-modal .semantic-todoist-change-deletes h3 { color: var(--text-error); }
 .semantic-todoist-changes-modal .semantic-todoist-change-buttons { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 12px; }
 .semantic-todoist-message-action { margin-top: 6px; }
+.semantic-todoist-duplicate-review { border: 1px solid var(--background-modifier-border); background: var(--background-secondary); border-radius: var(--radius-m, 6px); }
+.semantic-todoist-duplicate-review .semantic-todoist-message-text { color: var(--text-normal); }
+.semantic-todoist-duplicate-review .semantic-todoist-message-action { margin-right: 6px; }

@@ -136,6 +136,36 @@ const LOCAL_SEMANTIC_ROUTING_DEFAULT_QUANTIZATION_SCALE = 127;
 const GEMINI_EMBEDDING_CONCURRENCY = 3;
 const SEMANTIC_EMBEDDING_BATCH_CONCURRENCY = 3;
 const STARTUP_BACKGROUND_TICK_DELAY_MS = 45000;
+const DUPLICATE_REVIEW_FILE = "duplicate-review.json";
+const TASK_TITLE_VECTORS_FILE = "task-title-vectors.json";
+const DUPLICATE_JUDGE_TIMEOUT_MS = 8000;
+const DUPLICATE_CHECK_TIMEOUT_MS = 5000;
+const DUPLICATE_CHECK_PAUSE_MS = 60000;
+// Held/remote task as the merge helper expects it (plan-task field names).
+const duplicateExistingShape = (task = {}) => ({ id: task.id, content: task.content || "", description: task.description || "", labels: [...(task.labels || [])], priority: task.priority || 1, due_date: task.due_date || task.dueDate || "", deadline_date: task.deadline_date || task.deadlineDate || "" });
+function encodeTitleVector(vec) {
+  const bytes = new Uint8Array(Float32Array.from(vec).buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(binary);
+}
+function decodeTitleVector(text) {
+  try {
+    const binary = atob(text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return Array.from(new Float32Array(bytes.buffer, 0, Math.floor(bytes.length / 4)), (value) => Math.round(value * 1e6) / 1e6);
+  } catch { return null; }
+}
+const duplicateTitleKey = (title) => String(title || "").replace(/\s+/g, " ").trim().toLowerCase();
+// Only what the box and the answer log need; avoids copying whole snapshot rows into the store.
+const compactDuplicateCandidate = (task = {}) => ({ id: String(task.id || ""), oid: task.oid || "", content: task.content || "", description: String(task.description || "").slice(0, 2000), labels: task.labels || [], priority: task.priority || 1, dueDate: task.dueDate || task.due_date || "", deadlineDate: task.deadlineDate || task.deadline_date || "", projectId: task.projectId || "", projectName: task.projectName || "", sectionId: task.sectionId || "", sectionName: task.sectionName || task.section || "", parentId: task.parentId || "", parentContent: task.parentContent || "" });
+function duplicateJudgeUserText(record, settings) {
+  const card = (label, t) => `${label}: ${t.content || ""}\nProject: ${t.projectName || t.projectId || ""}; section: ${t.sectionName || t.section || t.sectionId || ""}\nParent: ${t.parentContent || ""}\nDue: ${t.dueDate || t.due_date || ""}\nDescription: ${String(t.description || "").slice(0, 300)}`;
+  const policy = taskDeduplicationPolicyText(settings);
+  const policyText = policy && policy !== DEFAULT_TASK_DEDUPLICATION_POLICY ? `\n\nUser policy:\n${policy}` : "";
+  return `${card("New task", record.task || {})}\n\n${card("Existing task", record.candidate || {})}${policyText}`;
+}
 const STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS = 20000;
 const STARTUP_SEMANTIC_INDEX_LOAD_DELAY_MS = 15000;
 const STARTUP_SEMANTIC_INDEX_RESHARD_DELAY_MS = 120000;
@@ -3544,6 +3574,7 @@ const DEFAULT_SETTINGS = {
   taskDeduplicationAllowExplicitSubtaskRemoval: true,
   enableAiAmbiguousTaskDeduplication: true,
   taskDeduplicationAiReviewSensitivity: "balanced",
+  taskDuplicateReviewRecording: true,
   taskDeduplicationAiModel: "",
   taskDeduplicationAiReasoningEffort: "auto",
   reasoningAutoMigrationVersion: 0,
@@ -4633,6 +4664,8 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.registerInterval(window.setInterval(() => this.backgroundTick(), 30000));
     this.registerInterval(window.setTimeout(() => this.ensurePromptTemplateFolder(false), STARTUP_PROMPT_TEMPLATE_SETUP_DELAY_MS));
     this.registerInterval(window.setTimeout(() => this.backgroundTick(), STARTUP_BACKGROUND_TICK_DELAY_MS));
+    this.duplicateSessionStart = new Date().toISOString();
+    this.scheduleUnansweredDuplicatePass();
     this.registerInterval(window.setTimeout(() => this.repairCachedSubtaskIndentation(false), STARTUP_SUBTASK_REPAIR_DELAY_MS));
     // Semantic cache cleanup interval: sweep expired entries every 60 seconds
     this._semanticCacheCleanupInterval = window.setInterval(() => this.sweepSemanticCaches(), 60000);
@@ -14170,8 +14203,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let todoistTurn = options?.todoist === true && String(modelOperation || "chat-query").trim().toLowerCase() === "chat-query" && webSearchMode === "off"
       ? await this.todoistChatTurn(prompt, history, captureContext)
       : null;
-    const duplicatesNotReady = Boolean(todoistTurn?.duplicates);
-    if (duplicatesNotReady) todoistTurn = null; // answer from the vault as usual and add a sentence
+    const duplicatesNotSearched = Boolean(todoistTurn?.duplicates);
+    if (duplicatesNotSearched) todoistTurn = null; // answer from the vault as usual and add a sentence
     const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
     const activeText = active?.text ? (active.selection || active.text) : "";
     const source = active?.path ? { type: "note", title: active.title || "", path: active.path, text: activeText } : null;
@@ -14450,7 +14483,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     response = citationResult.answer;
     if (todoistChanges && !response.trim()) response = todoistChanges.rows.length ? `I've prepared ${todoistChanges.preview.summary}. Review ${todoistChanges.rows.length === 1 ? "it" : "them"} before anything changes in Todoist.` : "I couldn't prepare any change.";
     if (todoistTurn?.unavailable) response += "\n\nTodoist wasn't available, so this answer comes from your notes only.";
-    if (duplicatesNotReady) response += "\n\nDuplicate finding isn't turned on yet.";
+    if (duplicatesNotSearched) response += "\n\nI can't search existing tasks for duplicates; new tasks are checked when they're created.";
     if (todoistChanges?.rejected.length) response += `\n\nI couldn't do ${todoistChanges.rejected.length} of the proposed changes: ${todoistChanges.rejected.map((item) => describeTodoistRejected(item, todoistTurn.snapshot)).join("; ")}.`;
     this.lastChatCitationTelemetry = citationResult.telemetry;
     const localChatResult = {
@@ -14489,7 +14522,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       return null;
     }
     if (!lookup?.needsTodoist) return null;
-    if (lookup.kind === "duplicates" && !todoistModules().dedupeAllowed(this.settings).ok) return { duplicates: true, lookup };
+    if (lookup.kind === "duplicates") return { duplicates: true, lookup };
     if (!this.settings.todoistToken) return { unavailable: true, lookup };
     let snapshot;
     try {
@@ -14518,7 +14551,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   buildTodoistChanges(plan, turn, sourceLedger, claims, active) {
-    const { rows, rejected } = todoistModules().validateChangePlan(plan, turn.snapshot, { allowedIds: turn.allowedIds, labels: turn.labels, allowMerge: todoistModules().dedupeAllowed(this.settings).ok });
+    const { rows, rejected } = todoistModules().validateChangePlan(plan, turn.snapshot, { allowedIds: turn.allowedIds, labels: turn.labels, allowMerge: false });
     const cited = new Set((claims || []).flatMap((claim) => claim?.evidence_ids || []).map(String));
     const notes = (sourceLedger || []).filter((entry) => entry.path && entry.evidenceId && cited.has(String(entry.evidenceId)) && entry.markdown);
     for (const row of rows) {
@@ -14568,11 +14601,17 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (changes.applyState === "applying" || changes.applyState === "applied") return { applied: 0, skipped: [], refused: true, undoable: false };
     changes.applyState = "applying";
     const sent = [];
+    let heldCount = 0;
+    let heldRows = new Set();
     try {
       const ticked = new Set(tickedIds || []);
-      const rows = (changes.rows || []).filter((row, index) => ticked.has(`row-${index}`));
+      let rows = (changes.rows || []).filter((row, index) => ticked.has(`row-${index}`));
       this.requireTodoistAccess();
       const fresh = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+      // Likely duplicates are held out of the batch (the rest goes ahead) and answered in the sidebar.
+      heldRows = await this.holdChatCreateRows(rows, fresh);
+      heldCount = heldRows.size;
+      if (heldCount) rows = rows.filter((row) => !heldRows.has(row));
       const plan = todoistModules().buildApplyBatches(rows, changes.snapshot, fresh, uuid);
       const realIds = new Map();
       const swapIds = (value) => Array.isArray(value) ? value.map(swapIds) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, swapIds(item)])) : typeof value === "string" && realIds.has(value) ? realIds.get(value) : value;
@@ -14617,10 +14656,87 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const skippedRows = new Set(plan.skipped.map((item) => item.row));
       const adds = sent.filter((command) => command.type === "item_add" || command.type === "section_add").length;
       const applied = adds + rows.filter((row) => row.taskId && !skippedRows.has(row) && touched.has(String(row.taskId))).length;
-      return { applied, skipped: plan.skipped, failedAt, error, rejectedCount: rejected.length, failedTitles, mergedAwayIds: plan.mergedAwayIds || [], undoable, undoSaveFailed, noteWriteFailed };
+      return { applied, skipped: plan.skipped, failedAt, error, rejectedCount: rejected.length, failedTitles, mergedAwayIds: plan.mergedAwayIds || [], undoable, undoSaveFailed, noteWriteFailed, held: heldCount };
+    } catch (error) {
+      // Nothing went out: the preview stays re-applicable, so its held rows must not linger for a later Keep both to create.
+      if (!sent.length && heldRows.size) {
+        try {
+          const store = await this.loadDuplicateStore();
+          const before = store.held.length;
+          const removedRecords = store.held.filter((record) => record.kind === "chat" && (record.status === "checking" || record.status === "waiting") && heldRows.has(record.source?.row));
+          store.held = store.held.filter((record) => !removedRecords.includes(record));
+          const view = this.duplicateReviewView();
+          if (view) for (const record of removedRecords) view.removeDuplicateReviewBox(record.id);
+          this.logLocal("Chat Apply failed; held duplicate rows removed", { removed: before - store.held.length, error: error?.message || String(error) });
+          await this.saveDuplicateStore();
+        } catch (cleanupError) { this.logLocal("Held chat rows not removed after failed Apply", { error: cleanupError?.message || String(cleanupError) }); }
+        heldCount = 0;
+      }
+      throw error;
     } finally {
-      changes.applyState = sent.length ? "applied" : "";
+      changes.applyState = sent.length || heldCount ? "applied" : "";
     }
+  }
+
+  // Create rows only (never update/move/complete). Returns the Set of rows held out; nothing here waits on AI or the user.
+  async holdChatCreateRows(rows, fresh) {
+    const held = new Set();
+    const createRows = (rows || []).filter((row) => row.op === "create" && row.fields?.content);
+    if (!createRows.length || this.settings.enableTaskDeduplication === false) return held;
+    try {
+      const projectName = new Map((fresh?.projects || []).map((project) => [String(project.id), project.name || ""]));
+      const sectionName = new Map((fresh?.sections || []).map((section) => [String(section.id), section.name || ""]));
+      const tasks = createRows.map((row) => {
+        const f = row.fields, t = row.target || {};
+        const isRecurring = /\b(?:every|daily|weekly|monthly|yearly|annually)\b/i.test(String(f.dueString || (typeof f.due === "string" ? f.due : "") || f.dueDate || ""));
+        return { content: f.content, ...(isRecurring ? { isRecurring } : {}), description: f.description || "", labels: [...(f.labels || [])], priority: f.priority || 1, due_date: f.dueDate || "", deadline_date: f.deadlineDate || "", projectId: t.projectId || "", projectName: projectName.get(String(t.projectId || "")) || "", sectionId: t.sectionId || "", section: sectionName.get(String(t.sectionId || "")) || "", parentId: t.parentId || "", subtasks: [] };
+      });
+      const { holds, degraded } = await this.findDuplicateHolds(tasks, { source: "chat", includeLiveTodoistCandidates: true });
+      if (degraded) this.noticeDuplicateCheckOff(degraded);
+      if (!holds.length) return held;
+      const aiOn = this.settings.enableAiAmbiguousTaskDeduplication !== false;
+      const records = holds.map((hold) => {
+        const row = createRows[tasks.indexOf(hold.task)];
+        return { id: uuid(), createdAt: new Date().toISOString(), status: hold.nearIdentical || !aiOn ? "waiting" : "checking", kind: "chat", source: { type: "chat", row }, task: hold.task, candidate: compactDuplicateCandidate(hold.candidate), score: hold.score, nearIdentical: hold.nearIdentical, gate: null, veto: null, ai: null, outcome: "" };
+      });
+      const store = await this.loadDuplicateStore();
+      store.held.push(...records);
+      try { await this.saveDuplicateStore(); }
+      catch (error) {
+        // Not saved means a crash could lose the task: create everything normally.
+        const added = new Set(records.map((record) => record.id));
+        store.held = store.held.filter((record) => !added.has(record.id));
+        this.logLocal("Held chat duplicates not saved; creating normally", { error: error.message || String(error) });
+        return held;
+      }
+      records.forEach((record) => held.add(record.source.row));
+      this.judgeHeldDuplicates(records).catch((error) => this.logLocal("Duplicate judge failed", { error: error.message || String(error) }));
+    } catch (error) {
+      // Precision first: a failed check never blocks the user's Apply.
+      this.logLocal("Chat duplicate check failed; creating normally", { error: error.message || String(error) });
+      held.clear();
+    }
+    return held;
+  }
+
+  // Keep both / unanswered: sends exactly this held row's create (rows have no in-batch parent, so no children travel with it).
+  async createHeldChatRow(record) {
+    const row = record?.source?.row;
+    if (!row) throw new Error("Held chat task has no row to create");
+    const fresh = await this.getTodoistSnapshot(["items", "projects", "sections"], true);
+    const plan = todoistModules().buildApplyBatches([row], fresh, fresh, uuid);
+    const realIds = new Map();
+    let id = "";
+    for (const batch of plan.batches) {
+      const result = await this.sendTodoistBatch(batch);
+      Object.entries(result.mapping).forEach(([temp, real]) => realIds.set(temp, String(real)));
+      const add = result.okCommands.find((command) => command.type === "item_add" && command.temp_id);
+      if (add && realIds.has(add.temp_id)) id = realIds.get(add.temp_id);
+      if (result.error) break;
+    }
+    if (!id) throw new Error("Todoist did not create the held task");
+    // The note line is written once by keepHeldDuplicate (createdLinesForHeldDuplicate).
+    return { id };
   }
 
   // Best-effort: keep linked note lines in step with what Todoist now holds. Never throws.
@@ -19672,6 +19788,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         path: "",
         sectionName,
         sourceTitle: subject,
+        emailSubject: subject,
+        emailFrom: emailSourceSender(parsed, email.from),
         // Structured email identity (sender/date/subject) so the created task
         // can cite the primary email as its source. The user forwards email in,
         // so the identity line names the ORIGINAL sender from the forwarded
@@ -19716,8 +19834,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // never ack.
     let created;
     try {
-      created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId);
-      await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created, summary: emailSummary });
+      try { created = await this.createTodoistTaskBatch(sectionName, tasks, prepared.sectionId); }
+      catch (error) { await this.dropHeldBatch(prepared.batchId, "email write failed").catch(() => {}); throw error; }
+      let emailLogPath;
+      try { emailLogPath = await this.appendEmailLog({ subject, from: email.from || parsed.from, receivedAt, cloudflareReceivedAt, sectionName, tasks: created, summary: emailSummary, heldCount: (this.duplicateStore?.held || []).filter((record) => record.source?.batchId === prepared.batchId).length }); }
+      catch (error) { await this.dropHeldBatch(prepared.batchId, "email write failed").catch(() => {}); throw error; }
+      // The held duplicates are the review box's business: a failure here never turns the email into a reconciliation hold.
+      try { await this.setHeldBatchPath(prepared.batchId, emailLogPath); }
+      catch (error) { this.logLocal("Held duplicates not linked to the email log", { id: item.id, error: error.message || String(error) }); }
+      try { await this.releaseHeldBatch(prepared.batchId); }
+      catch (error) { this.logLocal("Held duplicates not released", { id: item.id, error: error.message || String(error) }); }
       await this.workerJson("/complete", "POST", { id: item.id });
     } catch (error) {
       const code = error && typeof error.code === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/i.test(error.code) ? error.code : "todoist-write-failed";
@@ -20001,17 +20127,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         captureContext
       });
       sectionName = prepared.sectionName || sectionName;
+      let markdown;
+      let inserted = false;
+      try {
       this.savePendingTaskDescriptions(active.path, tasks);
       this.savePendingTaskReferences(active.path, tasks);
       await this.saveSettings();
       const noteLines = taskPlanToMarkdown(tasks, this.settings);
       const contextSummary = renderContextSummary(plan.contextNotes || []);
-      const markdown = `${renderTaskHeading(this.settings, template)}\n\n${noteLines.join("\n")}${contextSummary ? `\n\n${contextSummary}` : ""}`;
+      markdown = `${renderTaskHeading(this.settings, template)}\n\n${noteLines.join("\n")}${contextSummary ? `\n\n${contextSummary}` : ""}`;
       if (shouldInsert) {
         const file = this.app.vault.getAbstractFileByPath(active.path);
         this.cancelQueuedNoteSync(active.path);
         this.markInternalNoteWrite(active.path);
         await appendMarkdownBlock(this.app, file, markdown);
+        inserted = shouldSyncAfterInsert;
         if (shouldSyncAfterInsert) {
           this.cancelQueuedNoteSync(active.path);
           this.setSidebarStatus("Syncing Todoist tasks...");
@@ -20022,7 +20152,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           this.setSidebarStatus("Syncing Todoist tasks...");
           await delay(1000);
           await this.syncFileNotes(active.path, false);
+          await this.releaseHeldBatch(prepared.batchId).catch((error) => this.logLocal("Held duplicates not released", { error: error.message || String(error) }));
         }
+      }
+      // Anything still pending (insert-only, or release failed) was not written to Todoist: drop it.
+      await this.dropHeldBatch(prepared.batchId, "template write did not finish").catch(() => {});
+      } catch (error) {
+        // Note lines already hold the tasks: keep the records pending so the next load makes them unanswered keeps.
+        if (inserted) this.logLocal("held duplicates kept for next load", { error: error.message || String(error) });
+        else await this.dropHeldBatch(prepared.batchId, "template write failed").catch(() => {});
+        throw error;
       }
       if (options.showNotice) {
         const action = shouldInsert ? (shouldSyncAfterInsert ? "inserted and synced" : "inserted") : "shown in chat only";
@@ -20362,27 +20501,16 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       contextNotes: options.contextNotes || plan.contextNotes || [],
       semanticContext: options.semanticContext || plan.semanticContext || [],
       includeLiveTodoistCandidates: todoistBound,
+      holdDuplicates: todoistBound,
+      projectId,
+      projectName,
+      batchId: uuid(),
+      emailSubject: options.emailSubject || "",
+      emailFrom: options.emailFrom || "",
       // The deduplication descendants (AI decision / task-generation update)
       // inherit the parent workflow root rather than starting a new one.
       captureContext: options.captureContext || null
     };
-    const preDedupeStructure = taskStructureSafetySnapshot(tasks);
-    this.setSidebarStatus("Checking for duplicate tasks...");
-    const dedupeStats = await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
-    const restoredDedupeStructures = restoreTaskStructureAfterDedupeRegression(tasks, preDedupeStructure);
-    if (restoredDedupeStructures > 0) this.logLocal("Restored validated task structure after deduplication regression", { source: options.source || "", tasks: restoredDedupeStructures });
-    if (options.citeContextNotes !== false && (dedupeStats.generatedDuplicates > 0 || dedupeStats.merged > 0)) {
-      addContextToTaskDescriptions(
-        tasks,
-        plan.contextNotes || [],
-        Object.assign({}, options.sourceContext || {}, { sourceSummary: plan.sourceSummary || "" }),
-        this.settings,
-        plan.semanticContext || [],
-        vaultBasePath(this.app),
-        true,
-        options.source || plan.taskWorkflowContextBundle?.sourceType || "note"
-      );
-    }
     const finalTaskQualityCorrections = applyLocalGeneratedTaskQualityCorrections(tasks, {
       labelInstructions: plan.labelInstructions || "",
       priorityInstructions: plan.priorityInstructions || "",
@@ -20420,7 +20548,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       throw new Error(`Generated tasks failed ${fatalIssues.length} blocking local quality check${fatalIssues.length === 1 ? "" : "s"}: ${details}.`);
     }
     if (todoistBound) sectionId = await this.ensureTodoistSectionId(projectId, plan.sectionName);
-    return { projectId, projectName, sectionId, sectionName: plan.sectionName, quality, requestRepair };
+    // Last step: only a batch that passed the quality gate is checked; held tasks are saved "pending" until the caller releases or drops the batch.
+    this.setSidebarStatus("Checking for duplicate tasks...");
+    await this.applyTaskDeduplicationPlan(tasks, dedupeOptions);
+    return { projectId, projectName, sectionId, sectionName: plan.sectionName, quality, requestRepair, batchId: dedupeOptions.batchId };
   }
 
   async runPromptTemplate(template, options = {}) {
@@ -20951,6 +21082,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       .filter((task) => task.id && task.content);
     const snapshot = { tasks, projects, sections, fetchedAt: deviceTimestamp() };
     this.todoistSnapshotCache = { key, fetchedAt: deviceTimestamp(), snapshot };
+    this.lastTodoistSnapshot = { key, snapshot, fetchedAt: deviceTimestamp() }; // never nulled by writes; duplicate check reads it
     if (projects.length) {
       this.settings.availableTodoistProjects = projects;
       this.settings.todoistProjectsFetchedAt = deviceTimestamp();
@@ -21384,167 +21516,694 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return tasks;
   }
 
+  // Duplicate hold (replaces the old serial dedupe): one embedding request, local cosine, matching tasks are
+  // held out of the batch and reviewed in the background. Nothing here waits on the AI or the user.
   async applyTaskDeduplicationPlan(tasks, options = {}) {
     const stats = emptyTaskDeduplicationStats();
     const flat = flattenTaskPlan(tasks || []);
     stats.checked = flat.length;
-    if (!tasks?.length || this.settings.enableTaskDeduplication === false) return stats;
-    this.setSidebarStatus("Checking for existing tasks...");
-    const candidates = await this.taskDeduplicationCandidates(options);
-    const semanticDedupeState = await this.prepareSemanticTaskDeduplicationState(tasks, candidates, options);
-    const matchingOptions = Object.assign({}, options, {
-      semanticDedupeState,
-      dedupeStats: stats,
-      semanticIndexRevision: this.semanticIndexRevision || 0
-    });
-    stats.semanticTelemetry = semanticDedupeState.telemetry;
-    stats.degradedState = semanticDedupeState.degraded ? "degraded" : (semanticDedupeState.enabled ? "ready" : "legacy");
-    stats.degradedReason = semanticDedupeState.reason || "";
-    const generatedDedupe = await deduplicateGeneratedTaskBatch(
-      tasks,
-      this.settings,
-      matchingOptions,
-      (task, decision, detectionOptions) => this.aiTaskDeduplicationDecision(task, decision, detectionOptions),
-      (task, decision, generationOptions) => this.taskGenerationUpdateForDuplicate(task, decision, generationOptions)
-    );
-    stats.generatedDuplicates += generatedDedupe.merged;
-    stats.localConfirmed += generatedDedupe.localConfirmed || 0;
-    stats.aiUsed += generatedDedupe.aiUsed || 0;
-    stats.taskGenerationUsed += generatedDedupe.taskGenerationUsed || 0;
-    stats.ambiguous += generatedDedupe.ambiguous || 0;
-    stats.candidateFlags.push(...(generatedDedupe.candidateFlags || []));
-    stats.matches.push(...generatedDedupe.matches);
-    if (!candidates.length) {
-      stats.created = flattenTaskPlan(tasks).length;
-      this.settings.taskDeduplicationLastRunSummary = taskDeduplicationRunSummary(stats);
-      if (stats.generatedDuplicates) {
-        this.logLocal("Task deduplication complete", {
-          source: options.source || "",
-          checked: stats.checked,
-          merged: stats.merged,
-          created: stats.created,
-          ambiguous: stats.ambiguous,
-          copiedSubtasks: stats.copiedSubtasks,
-          generatedDuplicates: stats.generatedDuplicates,
-          localConfirmed: stats.localConfirmed,
-          aiUsed: stats.aiUsed,
-          taskGenerationUsed: stats.taskGenerationUsed
-        });
-      }
-      await this.postTaskDeduplicationCandidateFlags(stats, options);
-      return stats;
-    }
-    for (const task of tasks) {
-      const mainDecision = await this.taskDeduplicationDecision(task, candidates, Object.assign({}, matchingOptions, { isSubtask: false }));
-      stats.candidateOutcomes.push({
-        taskId: String(task?.id || task?.oid || ""),
-        outcome: mainDecision.outcome || (mainDecision.decision === "merge" ? "merge" : mainDecision.decision === "ambiguous" ? "ambiguous-ai" : "create"),
-        candidateId: mainDecision.candidateId || mainDecision.id || mainDecision.candidate?.taskId || "",
-        confidence: Number(mainDecision.confidence || 0),
-        semanticScore: Number(mainDecision.semanticScore || 0),
-        basis: (mainDecision.basis || mainDecision.reasons || []).slice(0, 8),
-        evidence_ids: (mainDecision.evidence_ids || []).slice(0, 12),
-        fact_refs: (mainDecision.fact_refs || []).slice(0, 12),
-        telemetry: mainDecision.telemetry || null
-      });
-      if (isAiMediatedTaskDeduplicationCandidate(mainDecision)) {
-        const resolution = taskDeduplicationResolution(mainDecision, this.settings, matchingOptions);
-        if (resolution === "none") {
-          if (mainDecision.candidate && (mainDecision.outcome === "ambiguous-ai" || mainDecision.decision === "ambiguous")) {
-            flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
-          }
-          stats.created += 1;
-          for (const subtask of task.subtasks || []) stats.created += 1;
-          continue;
-        }
-        if (resolution === "manual") {
-          flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
-          stats.created += 1;
-          for (const subtask of task.subtasks || []) stats.created += 1;
-          continue;
-        }
-        if (resolution === "local") {
-          stats.localConfirmed += 1;
-        } else {
-          const aiDecision = await this.aiTaskDeduplicationDecision(task, mainDecision, matchingOptions);
-          if (aiDecision?.used) stats.aiUsed += 1;
-          if (aiDecision?.telemetry) {
-            stats.semanticTelemetry = Object.assign({}, stats.semanticTelemetry, {
-              providerCalls: Number(stats.semanticTelemetry.providerCalls || 0) + Number(aiDecision.telemetry.providerCalls || 0),
-              escalation: true
-            });
-          }
-          const outcomeRecord = stats.candidateOutcomes[stats.candidateOutcomes.length - 1];
-          if (outcomeRecord && aiDecision) {
-            outcomeRecord.outcome = aiDecision.match === true ? "merge" : "create";
-            outcomeRecord.basis = uniqueValues([...(outcomeRecord.basis || []), ...(aiDecision.basis || [])]);
-            outcomeRecord.telemetry = aiDecision.telemetry || outcomeRecord.telemetry;
-          }
-          if (aiDecision?.match !== true) {
-            stats.created += 1;
-            for (const subtask of task.subtasks || []) stats.created += 1;
-            continue;
-          }
-        }
-        const generatedUpdate = matchingOptions.semanticDedupeState?.enabled
-          ? { used: false, task }
-          : await this.taskGenerationUpdateForDuplicate(task, mainDecision, matchingOptions);
-        if (!generatedUpdate?.task) {
-          flagPossibleDuplicateTask(stats, task, mainDecision, this.settings, matchingOptions);
-          countCreatedTaskTree(stats, task);
-          continue;
-        }
-        if (generatedUpdate.used) {
-          stats.taskGenerationUsed += 1;
-          applyTaskGenerationDuplicateUpdate(task, generatedUpdate.task, this.settings);
-        }
-        applyTaskDeduplicationMatch(task, mainDecision, this.settings, matchingOptions);
-        stats.merged += 1;
-        stats.matches.push(taskDeduplicationMatchSummary(task, mainDecision));
-        await this.mergeDeduplicatedSubtasks(task, candidates, stats, matchingOptions);
-      } else {
-        stats.created += 1;
-      }
-      for (const subtask of task.subtasks || []) {
-        if (subtask.id) stats.merged += 1;
-        else stats.created += 1;
-      }
-    }
+    stats.held = 0;
+    // Insert-only runs write nothing to Todoist, so there is nothing to hold.
+    if (!tasks?.length || this.settings.enableTaskDeduplication === false || options.holdDuplicates === false) return stats;
+    this.setSidebarStatus("Checking existing tasks...");
+    const records = await this.holdDuplicateTasks(tasks, options);
+    stats.held = records.length;
+    stats.created = flat.length - flattenTaskPlan(records.map((record) => record.task)).length;
+    stats.degradedState = records.degraded ? "degraded" : "ready";
+    stats.degradedReason = records.degraded || "";
     this.settings.taskDeduplicationLastRunSummary = taskDeduplicationRunSummary(stats);
-    this.logLocal("Task deduplication complete", {
-      source: options.source || "",
-      checked: stats.checked,
-      merged: stats.merged,
-      created: stats.created,
-      ambiguous: stats.ambiguous,
-      copiedSubtasks: stats.copiedSubtasks,
-      generatedDuplicates: stats.generatedDuplicates,
-      localConfirmed: stats.localConfirmed,
-      aiUsed: stats.aiUsed,
-      taskGenerationUsed: stats.taskGenerationUsed
-    });
-    await this.postTaskDeduplicationCandidateFlags(stats, options);
+    this.logLocal("Task deduplication run", { source: options.source || "", path: options.path || "", checked: stats.checked, held: stats.held, degraded: stats.degradedReason });
+    if (records.degraded) this.noticeDuplicateCheckOff(records.degraded);
     return stats;
   }
 
-  async postTaskDeduplicationCandidateFlags(stats = emptyTaskDeduplicationStats(), options = {}) {
-    const flags = (stats.candidateFlags || []).filter(Boolean);
-    if (!flags.length) return;
-    const message = taskDeduplicationCandidateChatMessage(flags, options);
-    this.settings.taskDeduplicationLastRunSummary = `${this.settings.taskDeduplicationLastRunSummary || taskDeduplicationRunSummary(stats)} Local-only candidate details were posted to chat.`;
-    this.logLocal("Task deduplication local-only candidates flagged", {
-      source: options.source || "",
-      path: options.path || "",
-      candidates: flags.length
-    });
+  noticeDuplicateCheckOff(reason) {
+    if (this._duplicateCheckOffNoticed || this.pendingDuplicateNotice) return;
+    this.logLocal("Duplicate check is off", { reason });
+    this.pendingDuplicateNotice = `Duplicate check is off for new tasks: ${reason}`;
+    this.flushPendingDuplicateNotice();
+  }
+
+  // Posts the notice that was held back while the sidebar was closed (once per session).
+  flushPendingDuplicateNotice(openedView) {
+    const text = this.pendingDuplicateNotice;
+    const view = openedView || this.openSidebarView();
+    if (!text || !view) return;
+    this.pendingDuplicateNotice = "";
+    this._duplicateCheckOffNoticed = true;
+    try { view.addMessage("assistant", text); } catch (error) { this.logLocal("Sidebar message skipped", { error: error.message || String(error) }); }
+  }
+
+  openSidebarView() {
     try {
-      if (!this.app?.workspace?.getLeavesOfType) return;
-      await this.openSidebar();
-      const view = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
-      if (view && view instanceof SemanticTodoistView) view.addMessage("assistant", message);
+      const view = this.app?.workspace?.getLeavesOfType?.(VIEW_TYPE)?.[0]?.view;
+      return view && view instanceof SemanticTodoistView ? view : null;
+    } catch { return null; }
+  }
+
+  addAssistantMessageIfViewOpen(text) {
+    try {
+      this.openSidebarView()?.addMessage("assistant", text);
     } catch (error) {
-      this.logLocal("Task deduplication chat flag skipped", { error: error.message || String(error), candidates: flags.length });
+      this.logLocal("Sidebar message skipped", { error: error.message || String(error) });
     }
+  }
+
+  duplicateStorePath(file) { return `${this.manifest.dir}/${file}`; }
+
+  async readDuplicateJson(file, fallback) {
+    try {
+      const parsed = JSON.parse(await this.app.vault.adapter.read(this.duplicateStorePath(file)));
+      return parsed && typeof parsed === "object" ? parsed : fallback;
+    } catch { return fallback; }
+  }
+  // Held store (plugin folder, not vault): { version: 1, held: HeldRecord[], answers: Answer[] }.
+  // Memoised: concurrent first callers share one store object.
+  loadDuplicateStore() {
+    if (this.duplicateStore) return Promise.resolve(this.duplicateStore);
+    if (!this.duplicateStorePromise) this.duplicateStorePromise = this.readDuplicateStoreFromDisk().then((store) => (this.duplicateStore = store));
+    return this.duplicateStorePromise;
+  }
+  async readDuplicateStoreFromDisk() {
+    const adapter = this.app.vault.adapter;
+    const path = this.duplicateStorePath(DUPLICATE_REVIEW_FILE);
+    const empty = () => ({ version: 1, held: [], answers: [] });
+    let text = null, failure = null, readError = false;
+    try {
+      if (typeof adapter.exists === "function" && !(await adapter.exists(path))) {
+        // A save that died between remove and rename leaves only the .tmp copy.
+        if (!(await adapter.exists(`${path}.tmp`))) return empty();
+        text = await adapter.read(`${path}.tmp`);
+      } else text = await adapter.read(path);
+    } catch (error) {
+      // Without exists(), only a "not found" read counts as a missing file.
+      if (typeof adapter.exists !== "function" && /ENOENT|not exist|no such|not found/i.test(String(error?.message || error))) return empty();
+      failure = error;
+      readError = true;
+    }
+    if (readError) {
+      // The file may be fine; only a read that succeeded and then failed to parse is corruption. Keep it on disk, never overwrite it this session.
+      this.duplicateSaveBlocked = true;
+      this.logLocal("Held duplicates file could not be read; left on disk and saving disabled this session", { error: failure.message || String(failure) });
+      this.addAssistantMessageIfViewOpen("Held duplicate tasks could not be read; they are kept on disk and will load next time.");
+      return empty();
+    }
+    if (!failure) {
+      try {
+        const raw = JSON.parse(text);
+        if (raw && typeof raw === "object" && !Array.isArray(raw) && (raw.held === undefined || Array.isArray(raw.held)) && (raw.answers === undefined || Array.isArray(raw.answers)))
+          return { version: 1, held: raw.held || [], answers: raw.answers || [] };
+        failure = new Error("unexpected shape");
+      } catch (error) { failure = error; }
+    }
+    // Present but unreadable: never overwrite it. Keep the bad file under a new name and start empty.
+    const kept = `${path.replace(/\.json$/, "")}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    try { await adapter.rename(path, kept); this.logLocal("Held duplicates file unreadable; kept as a .corrupt copy and started empty", { error: failure.message || String(failure) }); }
+    catch (error) {
+      this.duplicateSaveBlocked = true;
+      this.logLocal("Held duplicates file unreadable and could not be set aside; saving disabled this session", { error: error.message || String(error) });
+    }
+    return empty();
+  }
+  // One save in flight; calls made meanwhile share one follow-up save that writes the final state.
+  saveDuplicateStore() {
+    if (this.duplicateSaveQueued) return this.duplicateSaveQueued;
+    const start = () => {
+      const run = this.writeDuplicateStore().finally(() => { if (this.duplicateSaveInFlight === run) this.duplicateSaveInFlight = null; });
+      this.duplicateSaveInFlight = run;
+      return run;
+    };
+    if (!this.duplicateSaveInFlight) return start();
+    const queued = this.duplicateSaveInFlight.catch(() => {}).then(() => { this.duplicateSaveQueued = null; return start(); });
+    this.duplicateSaveQueued = queued;
+    return queued;
+  }
+  async writeDuplicateStore() {
+    const store = await this.loadDuplicateStore();
+    if (this.duplicateSaveBlocked) throw new Error("held duplicates file could not be set aside; not overwriting it");
+    const adapter = this.app.vault.adapter;
+    const path = this.duplicateStorePath(DUPLICATE_REVIEW_FILE);
+    const body = JSON.stringify(store);
+    if (typeof adapter.rename !== "function") return adapter.write(path, body);
+    await adapter.write(`${path}.tmp`, body);
+    if (typeof adapter.exists === "function" && typeof adapter.remove === "function" && await adapter.exists(path)) await adapter.remove(path);
+    await adapter.rename(`${path}.tmp`, path);
+  }  // Title-only vectors keyed by lower-cased title; the semantic index embeds full task projections, not bare titles.
+  async embedDuplicateTitles(titles) {
+    const model = String(this.settings.embeddingModel || "");
+    if (!this.titleVectorCache || this.titleVectorCache.model !== model) {
+      const raw = await this.readDuplicateJson(TASK_TITLE_VECTORS_FILE, null);
+      const loaded = [];
+      if (raw && raw.model === model && raw.vectors && typeof raw.vectors === "object") {
+        for (const [key, value] of Object.entries(raw.vectors)) {
+          const enc = value && typeof value.v === "string" ? value.v : "";
+          const vec = Array.isArray(value) ? value : enc ? decodeTitleVector(enc) : null;
+          if (vec && vec.length) loaded.push([key, { vec, enc, usedAt: (value && value.usedAt) || "" }]);
+        }
+        loaded.sort((a, b) => String(a[1].usedAt).localeCompare(String(b[1].usedAt))); // oldest first; stable
+      }
+      if (!this.titleVectorCache || this.titleVectorCache.model !== model) this.titleVectorCache = { model, entries: new Map(loaded) }; // overlapping first calls share one cache
+    }
+    const cache = this.titleVectorCache;
+    const today = formatLocalDate(new Date());
+    const current = new Set();
+    const missing = new Map();
+    let dirty = false;
+    for (const title of titles) {
+      const key = duplicateTitleKey(title);
+      if (!key) continue;
+      current.add(key);
+      const entry = cache.entries.get(key);
+      if (entry) {
+        if (entry.usedAt !== today) { entry.usedAt = today; dirty = true; }
+        cache.entries.delete(key); cache.entries.set(key, entry); // most recently used last
+      } else if (!missing.has(key)) missing.set(key, String(title).trim());
+    }
+    const texts = Array.from(missing.values()), keys = Array.from(missing.keys());
+    let failure = null;
+    // Shared in-flight requests: a call that timed out may still be embedding; later calls wait on it instead of re-requesting.
+    const inFlight = this.titleEmbedInFlight || (this.titleEmbedInFlight = new Map());
+    const waits = new Map();
+    let chain = Promise.resolve();
+    for (let start = 0; start < texts.length; start += 100) {
+      const slice = [];
+      keys.slice(start, start + 100).forEach((key, i) => { const pending = inFlight.get(model + "\n" + key); if (pending) waits.set(key, pending); else slice.push([key, texts[start + i]]); });
+      if (!slice.length) continue;
+      const run = chain.then(() => this.embedTexts(slice.map((item) => item[1]), "document"));
+      chain = run.catch(() => {});
+      slice.forEach(([key], index) => {
+        const flightKey = model + "\n" + key;
+        const promise = run.then((rows) => Array.from(rows[index], (value) => Math.round(value * 1e6) / 1e6));
+        promise.then(() => inFlight.delete(flightKey), () => inFlight.delete(flightKey));
+        inFlight.set(flightKey, promise);
+        waits.set(key, promise);
+      });
+    }
+    try {
+      for (const [key, promise] of waits) {
+        const vec = await promise;
+        const entry = { vec, enc: encodeTitleVector(vec), usedAt: today };
+        cache.entries.set(key, entry); dirty = true;
+      }
+    } catch (error) { failure = error; }
+    if (dirty) {
+      // Least recently used out first; never a title used in this call.
+      for (const key of Array.from(cache.entries.keys())) {
+        if (cache.entries.size <= 2000) break;
+        if (!current.has(key)) cache.entries.delete(key);
+      }
+      const vectors = {};
+      for (const [key, entry] of cache.entries) vectors[key] = { v: entry.enc || (entry.enc = encodeTitleVector(entry.vec)), usedAt: entry.usedAt }; // encoded once per entry
+      // Not awaited: the cache is rebuildable and must not slow the batch.
+      Promise.resolve().then(() => this.app.vault.adapter.write(this.duplicateStorePath(TASK_TITLE_VECTORS_FILE), JSON.stringify({ model, version: 2, vectors })))
+        .catch((error) => this.logLocal("Title vector cache not saved", { error: error.message || String(error) }));
+    }
+    if (failure) throw failure;
+    return (title) => cache.entries.get(duplicateTitleKey(title))?.vec || null;
+  }
+  // Light candidates: open top-level tasks from the cached Todoist snapshot (it carries isRecurring, so due-dated tasks can match).
+  // Without a snapshot the local task cache stands in; its recurrence is unknown, so ruleGate rejects those with a due date.
+  async duplicateCandidates() {
+    const cache = this.settings.taskCache || {};
+    try {
+      const types = ["items", "projects", "sections"];
+      const key = Array.from(new Set(types)).sort().join(",");
+      let snapshot, stale = false;
+      if (this.hasFreshTodoistSnapshot(types)) snapshot = this.todoistSnapshotCache.snapshot;
+      else if (this.lastTodoistSnapshot?.key === key) {
+        // Never wait on the network when any snapshot was seen: use it, refresh once in the background.
+        snapshot = this.lastTodoistSnapshot.snapshot; stale = true;
+        if (!this.duplicateSnapshotRefresh) {
+          const refresh = Promise.resolve().then(() => this.getTodoistSnapshot(types, false)).catch(() => {}).finally(() => { if (this.duplicateSnapshotRefresh === refresh) this.duplicateSnapshotRefresh = null; });
+          this.duplicateSnapshotRefresh = refresh;
+        }
+      } else snapshot = await this.getTodoistSnapshot(types, false);
+      const fromSnapshot = enrichTodoistTasksWithSnapshot(snapshot)
+        .filter((task) => !task.isCompleted && !task.parentId)
+        .map((task) => ({ id: task.id, task: Object.assign({}, task, { oid: cache[task.id]?.oid || "" }) }));
+      if (!stale) return fromSnapshot;
+      // Tasks created since the stale snapshot are only in the local cache (recurrence unknown).
+      const seen = new Set((snapshot.tasks || []).map((task) => String(task.id)));
+      const added = Object.entries(cache)
+        .filter(([id, task]) => task && task.content && !task.isCompleted && !task.parentId && !seen.has(String(id)))
+        .map(([id, task]) => ({ id, task: Object.assign({}, task, { id }) }));
+      return fromSnapshot.concat(added);
+    } catch (error) {
+      if (!this._recurrenceUnknownLogged) { this._recurrenceUnknownLogged = true; this.logLocal("Duplicate check: recurrence unknown without a Todoist snapshot", { error: error.message || String(error) }); }
+      return Object.entries(cache)
+        .filter(([, task]) => task && task.content && !task.isCompleted && !task.parentId)
+        .map(([id, task]) => ({ id, task: Object.assign({}, task, { id }) }));
+    }
+  }
+
+  // Bounded: a slow or failing check never holds up the write; after one, the check is skipped for 60 s.
+  async findDuplicateHolds(tasks, options = {}) {
+    const { CALIBRATED_EMBEDDING_MODELS } = todoistModules();
+    if (!CALIBRATED_EMBEDDING_MODELS.includes(this.settings.embeddingModel)) {
+      return { holds: [], degraded: `the embedding model ${this.settings.embeddingModel || "(none)"} is not calibrated for it (use ${CALIBRATED_EMBEDDING_MODELS.join(", ")})` };
+    }
+    if (Date.now() < (this.duplicateCheckPausedUntil || 0)) {
+      this.logLocal("Duplicate check skipped (paused after a failure)", { source: options.source || "" });
+      return { holds: [], degraded: this.duplicateCheckPausedReason };
+    }
+    let timer;
+    try {
+      const work = this.computeDuplicateHolds(tasks);
+      work.catch(() => {}); // a late failure after the timeout must not go unhandled
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("the duplicate check took too long")), this.duplicateCheckTimeoutMs || DUPLICATE_CHECK_TIMEOUT_MS); });
+      return { holds: await Promise.race([work, timeout]), degraded: "" };
+    } catch (error) {
+      this.duplicateCheckPausedUntil = Date.now() + DUPLICATE_CHECK_PAUSE_MS;
+      this.duplicateCheckPausedReason = /took too long/.test(error?.message || "") ? "the duplicate check took too long" : `the embedding check failed (${error.message || error})`;
+      this.logLocal("Duplicate check failed; skipped for a minute", { error: error.message || String(error) });
+      return { holds: [], degraded: this.duplicateCheckPausedReason };
+    } finally { clearTimeout(timer); }
+  }
+
+  async computeDuplicateHolds(tasks) {
+    const holds = [];
+    const { bestDuplicateCandidate } = todoistModules();
+    const candidates = await this.duplicateCandidates();
+    const vectorOf = await this.embedDuplicateTitles([...(tasks || []).map((task) => task.content), ...candidates.map((candidate) => candidate.task?.content)]);
+    const pool = candidates.map((candidate) => ({ task: candidate.task, vec: vectorOf(candidate.task?.content) })).filter((entry) => entry.vec);
+    // Main tasks only: subtasks travel with their parent. An earlier task of the same batch that is not held becomes a candidate.
+    for (const task of tasks || []) {
+      const vec = vectorOf(task.content);
+      const best = vec && bestDuplicateCandidate(task, vec, pool);
+      if (best) holds.push({ task, candidate: best.candidate, score: best.score, nearIdentical: best.nearIdentical });
+      else if (vec && task.oid) pool.push({ task: typeof task.isRecurring === "boolean" ? task : Object.assign({}, task, { isRecurring: false }), vec }); // plan tasks are one-off
+    }
+    return holds;
+  }
+
+  async holdDuplicateTasks(tasks, options = {}) {
+    const result = [];
+    const { holds, degraded } = await this.findDuplicateHolds(tasks, options);
+    result.degraded = degraded;
+    if (!holds.length) return result;
+    const aiOn = this.settings.enableAiAmbiguousTaskDeduplication !== false;
+    // Kept in memory so release can fill in the Todoist id of a same-batch candidate once it is created.
+    if (options.batchId) (this.heldBatchTasks || (this.heldBatchTasks = new Map())).set(options.batchId, new Map((tasks || []).filter((task) => task.oid).map((task) => [String(task.oid), task])));
+    const source = {
+      type: options.source === "email" ? "email" : options.source === "template" ? "template" : "note",
+      path: options.path || "", sectionName: options.sectionName || "", projectId: options.projectId || "",
+      projectName: options.projectName || "", batchId: options.batchId || "",
+      emailSubject: options.emailSubject || "", emailFrom: options.emailFrom || ""
+    };
+    const records = holds.map((hold) => ({
+      id: uuid(), createdAt: new Date().toISOString(), status: "pending", kind: "plan",
+      source: Object.assign({}, source), task: hold.task, candidate: compactDuplicateCandidate(hold.candidate),
+      score: hold.score, nearIdentical: hold.nearIdentical, gate: null, veto: null, ai: null, outcome: ""
+    }));
+    const store = await this.loadDuplicateStore();
+    store.held.push(...records);
+    try { await this.saveDuplicateStore(); }
+    catch (error) {
+      // Not saved means a crash could lose the task: leave the batch alone and create it normally.
+      const added = new Set(records.map((record) => record.id));
+      store.held = store.held.filter((record) => !added.has(record.id));
+      this.heldBatchTasks?.delete(options.batchId);
+      this.logLocal("Held duplicates not saved; creating normally", { error: error.message || String(error) });
+      result.degraded = "held tasks could not be saved";
+      return result;
+    }
+    for (const record of records) tasks.splice(tasks.indexOf(record.task), 1);
+    result.push(...records);
+    return result;
+  }
+
+  // The batch is fully written: same-batch candidates get their Todoist id, then pending records are judged / boxed.
+  async releaseHeldBatch(batchId) {
+    if (!batchId) return;
+    const store = await this.loadDuplicateStore();
+    const pending = store.held.filter((record) => record.kind === "plan" && record.status === "pending" && record.source?.batchId === batchId);
+    const batchTasks = this.heldBatchTasks?.get(batchId);
+    this.heldBatchTasks?.delete(batchId);
+    if (!pending.length) return;
+    const aiOn = this.settings.enableAiAmbiguousTaskDeduplication !== false;
+    const cacheEntries = Object.entries(this.settings.taskCache || {});
+    const keeps = [];
+    for (const record of pending) {
+      const candidate = record.candidate || (record.candidate = {});
+      if (!candidate.id && candidate.oid) {
+        const oid = String(candidate.oid);
+        candidate.id = String(batchTasks?.get(oid)?.id || cacheEntries.find(([, entry]) => entry?.oid === oid)?.[0] || "");
+        if (!candidate.id) { this.logLocal("Same-batch candidate not created; keeping both", { id: record.id }); keeps.push(record); }
+      }
+      record.status = record.nearIdentical || !aiOn ? "waiting" : "checking";
+      record.source.released = true; // the batch was created: a restart must not drop this record
+    }
+    const live = pending.filter((record) => !keeps.includes(record));
+    for (const record of keeps) record.status = "waiting";
+    // One retry; if it still fails the in-memory state stands and the next successful save persists it.
+    try { await this.saveDuplicateStore(); }
+    catch (first) {
+      try { await this.saveDuplicateStore(); }
+      catch (error) { this.logLocal("Released held duplicates not saved; kept in memory", { error: error.message || String(error) }); }
+    }
+    for (const record of keeps) this.resolveHeldDuplicate(record.id, "keep", { by: "system" }).catch((error) => this.logLocal("Same-batch keep failed", { id: record.id, error: error.message || String(error) }));
+    this.judgeHeldDuplicates(live).catch((error) => this.logLocal("Duplicate judge failed", { error: error.message || String(error) }));
+  }
+
+  // The batch failed before or during its write: nothing was applied, so its pending records go (a rerun holds again).
+  async dropHeldBatch(batchId, reason) {
+    if (!batchId) return;
+    this.heldBatchTasks?.delete(batchId);
+    const store = await this.loadDuplicateStore();
+    const before = store.held.length;
+    store.held = store.held.filter((record) => !(record.kind === "plan" && record.status === "pending" && record.source?.batchId === batchId));
+    if (store.held.length === before) return;
+    this.logLocal("Dropped pending held duplicates", { count: before - store.held.length, reason });
+    await this.saveDuplicateStore();
+  }
+
+  async setHeldBatchPath(batchId, path) {
+    if (!batchId || !path) return;
+    const store = await this.loadDuplicateStore();
+    let changed = false;
+    for (const record of store.held) if (record.kind === "plan" && record.source?.batchId === batchId) { record.source.path = path; changed = true; }
+    if (changed) await this.saveDuplicateStore();
+  }
+
+  // All "checking" records are judged in parallel; the box (or an AI-decided keep) follows each verdict.
+  async judgeHeldDuplicates(records) {
+    await Promise.all((records || []).map(async (record) => {
+      try { await this.judgeHeldDuplicate(record); }
+      catch (error) { this.logLocal("Duplicate judge step failed", { id: record.id, error: error.message || String(error) }); }
+    }));
+  }
+
+  async judgeHeldDuplicate(record) {
+    const { boxesOnVerdict, STRICT_JUDGE_PROMPT, STRICT_VERDICT_SCHEMA } = todoistModules();
+    if (record.status === "checking") {
+      let ai;
+      let timer;
+      try {
+        const call = Promise.resolve(this.openaiResponse({
+          operation: "deduplication",
+          model: taskDeduplicationAiModel(this.settings),
+          reasoningEffort: this.settings.taskDeduplicationAiReasoningEffort,
+          jsonSchema: STRICT_VERDICT_SCHEMA,
+          system: STRICT_JUDGE_PROMPT,
+          user: duplicateJudgeUserText(record, this.settings)
+        }));
+        call.catch(() => {}); // a late failure after the timeout must not surface
+        const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("AI check timed out")), this.duplicateJudgeTimeoutMs || DUPLICATE_JUDGE_TIMEOUT_MS); });
+        const parsed = JSON.parse(await Promise.race([call, timeout]));
+        if (!["duplicate", "unsure", "not-duplicate"].includes(parsed?.verdict)) throw new Error("AI check gave no verdict");
+        ai = { verdict: parsed.verdict, confidence: Number(parsed.confidence) || 0, reason: String(parsed.reason || "") };
+      } catch (error) {
+        ai = { error: String(error.message || error).slice(0, 200) };
+      } finally { clearTimeout(timer); }
+      if (record.status !== "checking" || !(await this.loadDuplicateStore()).held.includes(record)) return; // answered or retired while the AI was thinking
+      record.ai = ai;
+      if (boxesOnVerdict(ai.error ? null : ai)) record.status = "waiting";
+      await this.saveDuplicateStore().catch((error) => this.logLocal("Held duplicates not saved", { error: error.message || String(error) }));
+      if (record.status !== "waiting") return this.resolveHeldDuplicate(record.id, "keep", { by: "ai" });
+    }
+    if (record.status === "waiting") await this.postDuplicateReviewBox(record);
+  }
+
+  duplicateReviewView() {
+    try {
+      const view = this.app?.workspace?.getLeavesOfType?.(VIEW_TYPE)?.[0]?.view;
+      return view && view instanceof SemanticTodoistView ? view : null;
+    } catch { return null; }
+  }
+
+  duplicateSourceName(record) {
+    const source = record.source || {};
+    if (source.type === "email") {
+      const from = String(source.emailFrom || "").replace(/<[^>]*>/g, "").trim();
+      if (from) return `the email from ${from}`;
+      return source.emailSubject ? `the email "${source.emailSubject}"` : "the email";
+    }
+    const base = String(source.path || "").split("/").pop().replace(/\.md$/i, "");
+    return source.type === "chat" ? "the chat request" : base || "the note";
+  }
+
+  // What Merge would do, in the words shown on the box; the same helper does the real merge.
+  duplicateMergePreview(record) {
+    const { mergeDuplicateIntoExisting } = todoistModules();
+    const existing = duplicateExistingShape(record.candidate);
+    const merged = mergeDuplicateIntoExisting(existing, record.task || {}, { sourceName: this.duplicateSourceName(record), today: formatLocalDate(new Date()) });
+    const have = new Set(existing.labels.map((label) => String(label).toLowerCase()));
+    const added = merged.labels.filter((label) => !have.has(String(label).toLowerCase()));
+    const parts = [];
+    if (added.length) parts.push(`add label${added.length > 1 ? "s" : ""} ${added.join(", ")}`);
+    for (const change of merged.changes) parts.push(`${change.field} ${change.from ? `${change.from} to ${change.to}` : `set to ${change.to}`}`);
+    // Source entries are the list lines of the description; the block layout is dedupe.js's business, so compare entries only.
+    const sourceLines = (text) => new Set(String(text || "").split(/\r?\n/).filter((line) => /^\s*(?:-|\d+[.)])\s/.test(line)).map((line) => line.trim().replace(/^\d+[.)]\s*/, "- ")));
+    const haveSources = sourceLines(existing.description);
+    const gainedSource = record.source?.type !== "chat" && [...sourceLines(merged.description)].some((line) => !haveSources.has(line));
+    if (gainedSource) parts.push(`add this ${record.source?.type === "email" ? "email" : "note"} to its sources`);
+    else if (merged.description !== existing.description) parts.push("add its details to the description");
+    const fresh = this.newMergeSubtasks(record, this.todoistSnapshotCache?.snapshot?.tasks);
+    if (fresh.length) parts.push(`add ${fresh.length} subtask${fresh.length === 1 ? "" : "s"}`);
+    return { merged, parts };
+  }
+
+  duplicateReviewText(record) {
+    const esc = (text) => String(text || "").replace(/([\\`*_{}\[\]()#+!|<>])/g, "\\$1");
+    const subtasks = (record.task?.subtasks || []).length;
+    const project = record.candidate?.projectName ? ` (${esc(record.candidate.projectName)})` : "";
+    const lines = ["**Possible duplicate**", `New: ${esc(record.task?.content)}${subtasks ? ` (with ${subtasks} subtask${subtasks === 1 ? "" : "s"})` : ""}`, `Existing: ${esc(record.candidate?.content)}${project}`];
+    if (record.outcome && record.status !== "waiting" && record.status !== "resolving") lines.push(record.outcome + (record.status === "merged" && record.outcomeNote ? ` ${record.outcomeNote}` : ""));
+    else {
+      const { parts } = this.duplicateMergePreview(record);
+      lines.push(parts.length ? `Merge would: ${parts.join("; ")}.` : "Merge would not change the existing task; it adds a note line for it.");
+      if (record.status === "resolving") lines.push("Working on it...");
+      else if (record.failed) lines.push("That did not finish. You can try again.");
+    }
+    return lines.join("\n\n");
+  }
+
+  // Shows the box in the open sidebar (never opens it); with the sidebar closed it waits for onOpen, and one notice per batch tells the user.
+  async postDuplicateReviewBox(record) {
+    const view = this.duplicateReviewView();
+    if (view) { view.upsertDuplicateReviewBox(record, this.duplicateReviewText(record)); return; }
+    this._duplicateNoticed = this._duplicateNoticed || new Set();
+    const key = record.source?.batchId || record.id;
+    if (this._duplicateNoticed.has(key)) return;
+    this._duplicateNoticed.add(key);
+    new Notice("A possible duplicate task is waiting for your answer in the Semantic Todoist Sync sidebar.");
+  }
+
+  refreshDuplicateReviewBox(record) {
+    const view = this.duplicateReviewView();
+    if (view && (record.status === "waiting" || view.hasDuplicateReviewBox(record.id))) view.upsertDuplicateReviewBox(record, this.duplicateReviewText(record));
+  }
+
+  async restoreDuplicateReviewBoxes(view) {
+    const store = await this.loadDuplicateStore();
+    for (const record of store.held) {
+      const show = record.status === "waiting" || record.status === "resolving" || (this.duplicateSessionResolved?.has(record.id) && record.outcome);
+      if (show && !view.hasDuplicateReviewBox(record.id)) view.upsertDuplicateReviewBox(record, this.duplicateReviewText(record));
+    }
+  }
+
+  async recordDuplicateAnswer(record, answer, by) {
+    if (this.settings.taskDuplicateReviewRecording === false) return;
+    const store = await this.loadDuplicateStore();
+    store.answers.push({
+      at: new Date().toISOString(), heldId: record.id, answer, by, newTitle: record.task?.content || "", existingTitle: record.candidate?.content || "",
+      existingId: record.candidate?.id || "", projectId: record.source?.projectId || record.candidate?.projectId || "", sourceType: record.source?.type || "",
+      sourcePath: record.source?.path || "", score: record.score, nearIdentical: Boolean(record.nearIdentical), ai: record.ai || null
+    });
+    // shortcut: keep the newest 2000 answers, upgrade when tuning needs a longer history.
+    if (store.answers.length > 2000) store.answers.splice(0, store.answers.length - 2000);
+  }
+
+  async createdLinesForHeldDuplicate(record, entries, snapshot) {
+    record.written = record.written || [];
+    const todo = entries.filter((entry) => !record.written.includes(entry.id));
+    if (!todo.length) return;
+    const failed = await this.writeCreatedTaskLines(todo, { snapshot });
+    if (failed.length) throw new Error("the note line could not be written");
+    record.written.push(...todo.map((entry) => entry.id));
+    await this.saveDuplicateStore().catch((error) => this.logLocal("Held duplicates not saved", { error: error.message || String(error) }));
+  }
+
+  async keepHeldDuplicate(record, snapshot) {
+    const source = record.source || {};
+    if (record.kind === "chat") {
+      if (!record.createdId) {
+        const made = await this.createHeldChatRow(record);
+        if (!made?.id) throw new Error("Todoist did not return the new task");
+        record.createdId = String(made.id);
+        await this.saveDuplicateStore().catch(() => {});
+      }
+      await this.createdLinesForHeldDuplicate(record, [{ id: record.createdId, row: source.row }], snapshot);
+      return;
+    }
+    const task = record.task;
+    if (!task.id) {
+      const projectId = source.projectId || await this.getTaskProjectId();
+      const sectionId = source.sectionName ? await this.ensureTodoistSectionId(projectId, source.sectionName) : "";
+      await this.createTodoistTaskBatch(source.sectionName || "", [task], sectionId);
+      if (!task.id) throw new Error("Todoist did not return the new task");
+      await this.saveDuplicateStore().catch(() => {});
+    }
+    const rowOf = (item, parentId) => ({
+      fields: { content: item.content, description: item.description || "", labels: item.labels || [], priority: item.priority || 1, dueDate: item.due_date || null, deadlineDate: item.deadline_date || null },
+      target: { projectId: String(item.projectId || source.projectId || ""), sectionId: String(item.sectionId || ""), parentId },
+      notePlacement: source.path ? { path: "note", notePath: source.path } : undefined
+    });
+    await this.createdLinesForHeldDuplicate(record, [{ id: String(task.id), row: rowOf(task, "") }], snapshot);
+    const subtasks = (task.subtasks || []).filter((item) => item.id).map((item) => ({ id: String(item.id), row: rowOf(item, String(task.id)) }));
+    await this.createdLinesForHeldDuplicate(record, subtasks, snapshot);
+  }
+
+  // Incoming subtasks Merge still has to create: not yet made, and no open subtask of the existing task has the same canonical title.
+  newMergeSubtasks(record, tasks) {
+    const id = String(record.candidate?.id || "");
+    const have = new Set((tasks || []).filter((task) => String(task.parentId || task.parent_id || "") === id && !task.isCompleted && !task.checked).map((task) => canonicalTaskMatchTitle(task.content)));
+    const seen = new Set();
+    return (record.task?.subtasks || []).map((subtask, index) => ({ subtask, index })).filter(({ subtask, index }) => {
+      const key = canonicalTaskMatchTitle(subtask.content);
+      if (!key || record.mergeSubtaskIds?.[index] || have.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  // Merge: update the existing Todoist task once (no item_add for the parent), add the incoming subtasks under it, then give it a second note line with its own oid and the existing title.
+  async mergeHeldDuplicate(record, snapshot) {
+    const id = String(record.candidate?.id || "");
+    const remote = enrichTodoistTasksWithSnapshot(snapshot || {}).find((task) => String(task.id) === id);
+    if (!remote || remote.isCompleted) throw new Error("the existing task is not open in Todoist");
+    if (remote.parentId) throw new Error("the existing task is now a subtask");
+    const { mergeDuplicateIntoExisting } = todoistModules();
+    const merged = mergeDuplicateIntoExisting(duplicateExistingShape(remote), record.task || {}, { sourceName: this.duplicateSourceName(record), today: formatLocalDate(new Date()) });
+    if (!record.mergeSent) {
+      // The merged description is sent whenever it changed, however short, but never cut short: too long means it stays as it was.
+      const max = Math.min(TODOIST_DESCRIPTION_LIMIT, Math.max(1, parseInt(this.settings.todoistDescriptionMaxChars, 10) || DEFAULT_SETTINGS.todoistDescriptionMaxChars));
+      const changed = String(merged.description || "").trim() !== String(remote.description || "").trim();
+      const fits = (text) => formatTodoistDescription(text, { ...this.settings, todoistDescriptionMaxChars: TODOIST_DESCRIPTION_LIMIT }, "", true).length <= max;
+      let sendDescription = merged.description;
+      let tooLong = changed && !fits(sendDescription);
+      // Too long for the full merge: still record the change by appending just the sentence, if that fits.
+      const appended = tooLong && merged.sentence ? `${String(remote.description || "").trim()}\n\n${merged.sentence}` : "";
+      if (appended && fits(appended)) { sendDescription = appended; tooLong = false; }
+      if (tooLong) { record.outcomeNote = "The description was too long to add to."; this.logLocal("Merge description too long; left unchanged", { id, max }); }
+      const parsed = Object.assign(todoistTaskToParsedTask(remote, {}, this.settings), {
+        isSubtask: false, content: merged.content, description: tooLong ? remote.description || "" : sendDescription, descriptionShouldSync: changed && !tooLong, descriptionForceSync: true, descriptionVerbatimSources: true, labels: merged.labels,
+        priority: merged.priority, due_date: merged.due_date || null, deadline_date: merged.deadline_date || null, id
+      });
+      if (await this.updateTodoistFromParsedTask(parsed, remote) === false) throw new Error("Todoist did not accept the update");
+      record.mergeSent = true;
+      await this.saveDuplicateStore().catch(() => {});
+    }
+    const todo = this.newMergeSubtasks(record, snapshot?.tasks);
+    if (todo.length) {
+      const commands = todo.map(({ subtask }) => ({ type: "item_add", temp_id: uuid(), uuid: uuid(), args: todoistTaskArgs(subtask, { parent_id: id }, this.settings) }));
+      const response = await this.todoistSync(commands);
+      record.mergeSubtaskIds = record.mergeSubtaskIds || {};
+      todo.forEach(({ index }, at) => { const real = response?.temp_id_mapping?.[commands[at].temp_id]; if (real) record.mergeSubtaskIds[index] = String(real); });
+      await this.saveDuplicateStore().catch(() => {});
+      if (todo.some(({ index }) => !record.mergeSubtaskIds[index])) throw new Error("Todoist did not return the new subtask");
+    }
+    const previous = this.settings.taskCache?.[id] ? Object.assign({}, this.settings.taskCache[id]) : null;
+    const row = {
+      fields: { content: merged.content, description: merged.description, labels: merged.labels, priority: merged.priority || 1, dueDate: merged.due_date || null, deadlineDate: merged.deadline_date || null },
+      target: { projectId: String(remote.projectId || ""), sectionId: String(remote.sectionId || ""), parentId: "" },
+      notePlacement: record.source?.path ? { path: "note", notePath: record.source.path } : record.source?.row?.notePlacement
+    };
+    await this.createdLinesForHeldDuplicate(record, [{ id, row }], snapshot);
+    const subRow = (item) => ({
+      fields: { content: item.content, description: item.description || "", labels: item.labels || [], priority: item.priority || 1, dueDate: item.due_date || null, deadlineDate: item.deadline_date || null },
+      target: { projectId: String(remote.projectId || ""), sectionId: String(remote.sectionId || ""), parentId: id },
+      notePlacement: row.notePlacement
+    });
+    const subLines = Object.entries(record.mergeSubtaskIds || {}).map(([index, sid]) => ({ id: String(sid), row: subRow(record.task.subtasks[index]) }));
+    if (subLines.length) await this.createdLinesForHeldDuplicate(record, subLines, snapshot);
+    // cacheTask points the entry at the newest line; the original line stays the entry's home and the new one is kept as a noteRef,
+    // the same way the existing task-reference dedupe keeps a second line (note sync then treats a moved or removed line as the other one).
+    const after = this.settings.taskCache?.[id];
+    if (previous && after) {
+      const home = ["path", "lineNumber", "oid", "isSubtask", "parentId", "parentOid", "parentContent", "parentLineNumber", "section", "sectionId", "projectId", "projectName"];
+      this.settings.taskCache[id] = Object.assign({}, after, Object.fromEntries(home.map((key) => [key, previous[key]])));
+      this.markTaskReferenceStateDirty();
+      await this.saveSettings().catch((error) => this.logLocal("Settings not saved after merge", { error: error.message || String(error) }));
+    }
+  }
+
+  // Keep both / Merge / AI-cleared / unanswered. The status flips to "resolving" synchronously so a second click does nothing.
+  async resolveHeldDuplicate(id, answer, { by = "user" } = {}) {
+    const store = this.duplicateStore || await this.loadDuplicateStore();
+    const record = store.held.find((item) => item.id === id);
+    if (!record || (record.status !== "checking" && record.status !== "waiting")) return false;
+    record.status = "resolving";
+    // Saved first so a restart can finish the same answer.
+    record.answer = answer;
+    record.answerBy = by;
+    (this.duplicateInFlight || (this.duplicateInFlight = new Set())).add(record.id);
+    await this.saveDuplicateStore().catch((error) => this.logLocal("Held duplicates not saved", { error: error.message || String(error) }));
+    this.refreshDuplicateReviewBox(record);
+    try {
+      let snapshot = null;
+      // Merge acts on a fresh Todoist snapshot; Keep may use the cached one.
+      try { snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], answer === "merge"); }
+      catch (error) { if (answer === "merge") throw error; }
+      if (answer === "merge") await this.mergeHeldDuplicate(record, snapshot);
+      else {
+        // A plan task whose note was deleted: lines go to the monthly note instead of failing.
+        if (record.kind === "plan" && record.source?.path && !this.app.vault.getAbstractFileByPath(record.source.path)) {
+          this.logLocal("Held duplicate source note is gone; task lines go to the monthly note", { id, path: record.source.path });
+          record.source.path = "";
+        }
+        await this.keepHeldDuplicate(record, snapshot);
+      }
+    } catch (error) {
+      record.status = "waiting";
+      record.failed = true;
+      this.logLocal("Held duplicate resolution failed", { id, answer, by, error: error.message || String(error) });
+      await this.saveDuplicateStore().catch(() => {});
+      this.refreshDuplicateReviewBox(record);
+      this.duplicateInFlight.delete(record.id);
+      return false;
+    }
+    this.duplicateInFlight.delete(record.id);
+    const recorded = by === "ai" ? "cleared" : by === "startup" ? "unanswered" : answer; // "resume" keeps the saved answer
+    record.status = { cleared: "cleared", unanswered: "unanswered", merge: "merged", keep: "kept" }[recorded];
+    record.failed = false;
+    record.outcome = { cleared: "The AI check said they differ, so it was created.", unanswered: "Created separate task (no answer before Obsidian closed).", merge: "Merged into existing task.", keep: "Created separate task." }[recorded];
+    if (by !== "ai") (this.duplicateSessionResolved = this.duplicateSessionResolved || new Set()).add(record.id);
+    await this.recordDuplicateAnswer(record, recorded, by);
+    await this.saveDuplicateStore().catch((error) => this.logLocal("Held duplicates not saved", { error: error.message || String(error) }));
+    this.refreshDuplicateReviewBox(record);
+    return true;
+  }
+
+  scheduleUnansweredDuplicatePass() {
+    if (!this.settings.todoistToken) return false;
+    this.registerInterval(window.setTimeout(() => this.resolveUnansweredHeldDuplicates().catch((error) => this.logLocal("Unanswered duplicates not resolved", { error: error.message || String(error) })), STARTUP_BACKGROUND_TICK_DELAY_MS));
+    return true;
+  }
+
+  // At load: whatever was still held when Obsidian last closed is created as a separate task.
+  async resolveUnansweredHeldDuplicates() {
+    const store = await this.loadDuplicateStore();
+    const before = this.duplicateSessionStart || "9999";
+    const open = ["checking", "waiting", "resolving"];
+    const old = store.held.filter((record) => String(record.createdAt || "") < before);
+    const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+    store.held = store.held.filter((record) => open.includes(record.status) || String(record.createdAt || "") >= cutoff); // finished records older than 30 days are dropped; answers keep the evidence
+    for (const record of old.filter((item) => open.includes(item.status) || item.status === "pending")) {
+      // The list was built before earlier iterations awaited: a click may have answered this record since.
+      if (!["checking", "waiting", "resolving", "pending"].includes(record.status) || this.duplicateInFlight?.has(record.id)) continue;
+      // Never committed: an email was not acknowledged and is processed again; note/template tasks become separate tasks. A released batch was created, so its records stay.
+      if (record.status === "pending" && record.source?.type === "email" && !record.source.released) {
+        store.held = store.held.filter((item) => item !== record);
+        this.logLocal("Dropped held email task from an earlier session (the email will be processed again)", { id: record.id });
+        continue;
+      }
+      // An answer already given resumes (a Merge that fails goes back to waiting for the user); otherwise the unanswered default.
+      const resumed = record.status === "resolving" && (record.answer === "keep" || record.answer === "merge");
+      record.status = "waiting";
+      await this.resolveHeldDuplicate(record.id, resumed ? record.answer : "keep", { by: resumed ? "resume" : "startup" });
+    }
+    await this.saveDuplicateStore().catch(() => {});
   }
 
   async postTaskDescriptionFailureReport(report = emptyTaskDescriptionFailureReport(), tasks = [], options = {}) {
@@ -21876,220 +22535,6 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       });
       return [];
     }
-  }
-
-  async taskDeduplicationDecision(task, candidates, options = {}) {
-    return bestTaskDeduplicationMatch(task, candidates, this.settings, options);
-  }
-
-  async aiTaskDeduplicationDecision(task, localDecision, options = {}) {
-    const candidate = localDecision.candidate;
-    if (!candidate?.task) return null;
-    if (localDecision.hardConflict) return { used: false, match: false, outcome: "create", decision: "create", candidateId: localDecision.candidateId || localDecision.id || "", reason: "structured conflict gate" };
-    const model = taskDeduplicationAiModel(this.settings);
-    if (!hasChatCredentialForModel(this.settings, model)) return null;
-    try {
-      const json = await this.withAiActivity("Confirming possible duplicate task", () => this.openaiResponse({
-        operation: "deduplication",
-        model,
-        reasoningEffort: this.settings.taskDeduplicationAiReasoningEffort,
-        jsonSchema: taskDeduplicationAiDecisionSchema(),
-        captureContext: providerCaptureAttemptContext(options.captureContext || null, "deduplication"),
-        system: [
-          "Decide only whether the two task records are the same actionable work item using the source/context notes and Todoist context.",
-          "Ignore email routing, reply-to aliases, mailbox-copy instructions, and ticket-tracking boilerplate unless that routing work is the actual requested action.",
-          "Treat richer/poorer same-action records as duplicates when one record would be satisfied by completing the other.",
-          "Treat parent/subtask pairs as duplicates when one merely restates the other or adds context around the same single next action.",
-          "Use only the supplied semantic evidence, structured action/deliverable/ownership/progress identity, and explicit hierarchy relationships to decide whether records represent the same actionable outcome. Wording similarity alone is not duplicate evidence.",
-          "Treat different concrete non-Inbox Todoist projects as separate work contexts. Do not merge similar tasks across different named projects unless the source explicitly says the task moved or spans both projects.",
-          "Return match false when one task is only a distinct component of a broader parent task with multiple decisions, questions, recipients, documents, or steps.",
-          "Return match false when a newer task reflects specific progress, such as reviewing a named person's edits, approvals, returned comments, or a current status update, and the older task is a broader project/status task.",
-          "Return only match, confidence, and reason. Do not rewrite, merge, summarize, or propose any task title, description, date, priority, label, or subtask.",
-          options.semanticDedupeState?.enabled ? "This is a bounded semantic-index review. Never infer a merge across a structured conflict gate." : ""
-        ].join(" "),
-        user: options.semanticDedupeState?.enabled ? [
-          "Bounded candidate card (exactly one candidate):",
-          JSON.stringify({
-            generated: taskTreeRepresentation(task),
-            candidate: taskTreeRepresentation(candidate.task),
-            candidateId: localDecision.candidateId || localDecision.id || candidate.taskId || candidate.id || "",
-            sourceId: candidate.sourceId || "",
-            semanticScore: localDecision.semanticScore || candidate.semanticScore || 0,
-            evidence_ids: localDecision.evidence_ids || candidate.evidence_ids || [],
-            fact_refs: localDecision.fact_refs || candidate.fact_refs || [],
-            basis: localDecision.basis || localDecision.reasons || []
-          })
-        ].join("\n") : [
-          "Deduplication policy:",
-          taskDeduplicationPolicyText(this.settings),
-          "",
-          taskDeduplicationSourceContextText(options),
-          "",
-          options.intraBatch ? "Later generated task likely duplicating an earlier generated task:" : "New generated task likely duplicating an existing Todoist task:",
-          taskDeduplicationAiTaskCard(task),
-          "",
-          options.intraBatch ? "Earlier generated task candidate:" : "Existing open Todoist task candidate:",
-          taskDeduplicationAiTaskCard(candidate.task),
-          "",
-          `Local candidate score: ${localDecision.confidence || 0}`,
-          `Local candidate reasons: ${(localDecision.reasons || []).join("; ")}`,
-          `Workflow source: ${options.source || "task generation"}`
-        ].filter(Boolean).join("\n")
-      }));
-      const parsed = JSON.parse(json);
-      const confidence = Number(parsed?.confidence || 0);
-      return {
-        used: true,
-        match: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD,
-        confidence,
-        reason: truncateAtWord(singleLine(parsed?.reason || ""), 160),
-        outcome: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD ? "merge" : "create",
-        decision: parsed?.match === true && confidence >= TASK_DEDUPLICATION_AI_CONFIDENCE_THRESHOLD ? "merge" : "create",
-        candidateId: localDecision.candidateId || localDecision.id || candidate.taskId || candidate.id || "",
-        sourceId: candidate.sourceId || "",
-        evidence_ids: localDecision.evidence_ids || candidate.evidence_ids || [],
-        fact_refs: localDecision.fact_refs || candidate.fact_refs || [],
-        basis: uniqueValues(["bounded AI review", ...(localDecision.basis || [])]),
-        telemetry: Object.assign({}, localDecision.telemetry || {}, { providerCalls: 1, escalation: true })
-      };
-    } catch (error) {
-      this.logLocal("Task deduplication AI duplicate detection skipped", { error: error.message || String(error) });
-      return null;
-    }
-  }
-
-  async taskGenerationUpdateForDuplicate(task, localDecision, options = {}) {
-    const existing = localDecision.candidate?.task;
-    if (!existing) return null;
-    if (!duplicatePairNeedsTaskGeneration(task, existing, options)) return { used: false, task };
-    const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
-    const instructions = taskGenerationRequirements(this.taskInstructionsForSource(sourceType), this.settings);
-    const prompt = [taskDeduplicationAiTaskCard(task), taskDeduplicationAiTaskCard(existing), taskDeduplicationSourceContextText(options)].join("\n\n");
-    const modelChoice = this.aiModelForRequest("task-generation", {
-      prompt,
-      context: options.semanticContext || [],
-      taskCount: 1 + generationSubtaskLimit(this.settings)
-    });
-    try {
-      const json = await this.withAiActivity("Updating confirmed duplicate through task generation", () => this.openaiResponse({
-        operation: "task-generation",
-        model: modelChoice.model,
-        jsonSchema: taskCreationSchema(1, generationSubtaskLimit(this.settings)),
-        captureContext: providerCaptureAttemptContext(options.captureContext || null, "task-generation"),
-        system: [
-          "Use the regular task-generation workflow to produce exactly one canonical task from two records already confirmed as duplicates.",
-          "This is not a duplicate-detection decision. Preserve the most accurate title, actionable description, dates, priority, labels, and supported subtasks from the provided records and source context.",
-          "Do not invent people, documents, dates, links, dependencies, or status details.",
-          "Return only JSON matching the standard task-generation schema with exactly one main task; return section_name as an empty string and descriptions as an empty array."
-        ].join(" "),
-        user: [
-          "Task generation instructions:",
-          instructions,
-          "",
-          taskDeduplicationSourceContextText(options),
-          "",
-          "Current generated task:",
-          taskDeduplicationAiTaskCard(task),
-          "",
-          options.intraBatch ? "Other generated duplicate:" : "Existing Todoist duplicate:",
-          taskDeduplicationAiTaskCard(existing)
-        ].join("\n")
-      }));
-      const parsed = JSON.parse(json);
-      const allowedLabels = new Set(uniqueValues([...(task.labels || []), ...(existing.labels || [])]).map((label) => cleanLabel(label).toLowerCase()).filter(Boolean));
-      const generated = cleanTask(parsed?.tasks?.[0] || {}, allowedLabels, this.settings);
-      if (options.intraBatch) {
-        const sourceSubtasks = [...(task.subtasks || []), ...(existing.subtasks || [])].filter((subtask) => subtask?.content);
-        const mergedSubtasks = [];
-        const seenSubtaskIdentities = new Set();
-        for (const subtask of [...sourceSubtasks, ...(generated.subtasks || [])]) {
-          const identity = stableTaskTreeIdentity(subtask);
-          if (identity && seenSubtaskIdentities.has(identity)) continue;
-          if (identity) seenSubtaskIdentities.add(identity);
-          mergedSubtasks.push(subtask);
-        }
-        generated.subtasks = mergedSubtasks;
-      }
-      const hierarchyIssues = taskPlanRepairableHierarchyIssues([generated]);
-      const sourceType = /^email$/i.test(String(options.source || "")) ? "email" : "note";
-      const priorityEvidence = [taskDeduplicationSourceContextText(options), taskDeduplicationContextText(task), taskDeduplicationContextText(existing)].filter(Boolean).join("\n\n");
-      const priorityValidationTask = Number(generated.priority || 1) === Number(existing.priority || 1)
-        ? Object.assign({}, generated, { id: existing.id || "existing-priority" })
-        : generated;
-      const priorityIssues = generatedTaskPriorityIssues([priorityValidationTask], priorityEvidence, this.taskInstructionsForSource(sourceType).priorities || "", this.settings);
-      if (!duplicateTaskGenerationPreservesEvidence(generated, task, existing, this.settings) || hierarchyIssues.length || priorityIssues.length) {
-        this.logLocal("Confirmed duplicate task generation update rejected", {
-          source: options.source || "",
-          task: truncateAtWord(task.content || "", 100),
-          candidate: truncateAtWord(existing.content || "", 100),
-          hierarchyIssues: hierarchyIssues.concat(priorityIssues).map((issue) => issue.code)
-        });
-        return null;
-      }
-      return { used: true, task: generated };
-    } catch (error) {
-      this.logLocal("Confirmed duplicate task generation update skipped", { error: error.message || String(error) });
-      return null;
-    }
-  }
-
-  async mergeDeduplicatedSubtasks(parentTask, candidates, stats, options = {}) {
-    if (!parentTask?.id) return;
-    const existingChildren = candidates.filter((candidate) => {
-      const task = candidate.task || {};
-      return task.isSubtask && (String(task.parentId || "") === String(parentTask.id) || (task.parentOid && String(task.parentOid).toUpperCase() === String(parentTask.oid || "").toUpperCase()));
-    });
-    if (!existingChildren.length) return;
-    const nextSubtasks = [];
-    const usedExistingIds = new Set();
-    for (const subtask of parentTask.subtasks || []) {
-      const decision = await this.taskDeduplicationDecision(subtask, existingChildren, Object.assign({}, options, {
-        isSubtask: true,
-        parentId: parentTask.id,
-        parentContent: parentTask.content
-      }));
-      if (isAiMediatedTaskDeduplicationCandidate(decision)) {
-        const subtaskOptions = Object.assign({}, options, {
-          isSubtask: true,
-          parentContent: parentTask.content
-        });
-        const resolution = taskDeduplicationResolution(decision, this.settings, subtaskOptions);
-        if (resolution === "none") {
-          nextSubtasks.push(subtask);
-          continue;
-        }
-        if (resolution === "manual") {
-          flagPossibleDuplicateTask(stats, subtask, decision, this.settings, subtaskOptions);
-          nextSubtasks.push(subtask);
-          continue;
-        }
-        if (resolution === "local") {
-          stats.localConfirmed += 1;
-        } else {
-          const aiDecision = await this.aiTaskDeduplicationDecision(subtask, decision, Object.assign({}, subtaskOptions, {
-            parentId: parentTask.id
-          }));
-          if (aiDecision?.used) stats.aiUsed += 1;
-          if (aiDecision?.match !== true) {
-            nextSubtasks.push(subtask);
-            continue;
-          }
-        }
-        applyTaskDeduplicationMatch(subtask, decision, this.settings, Object.assign({}, options, { parentTask }));
-        subtask.isSubtask = true;
-        subtask.parentId = parentTask.id;
-        subtask.parentOid = parentTask.oid || "";
-        subtask.parentContent = parentTask.content || "";
-        usedExistingIds.add(decision.id);
-        stats.matches.push(taskDeduplicationMatchSummary(subtask, decision));
-      }
-      if (subtask.id && this.settings.taskDeduplicationAllowExplicitSubtaskRemoval !== false && isExplicitSubtaskRemovalInstruction(subtask)) {
-        stats.removedSubtasks += 1;
-        continue;
-      }
-      nextSubtasks.push(subtask);
-    }
-    parentTask.subtasks = nextSubtasks;
   }
 
   async ensureTodoistSectionId(projectId, sectionName) {
@@ -22917,7 +23362,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return sanitizeEmailLogSummary(text, this.settings);
   }
 
-  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks, summary }) {
+  async appendEmailLog({ subject, from, receivedAt, cloudflareReceivedAt, sectionName, tasks, summary, heldCount = 0 }) {
     const folder = trimSlashes(this.settings.emailLogFolder || DEFAULT_SETTINGS.emailLogFolder);
     await ensureVaultFolder(this.app, folder);
     const noteTitle = emailTaskNoteTitle(receivedAt, subject);
@@ -22948,7 +23393,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         lines.push(`${desiredSubtaskIndent(this.settings)}${line.trimStart()}`);
       }
     }
-    if (!tasks?.length) lines.push("- No actionable tasks were found.");
+    if (!tasks?.length) lines.push(heldCount > 0 ? `- ${heldCount} task(s) are waiting for a duplicate answer in the sidebar.` : "- No actionable tasks were found.");
     this.markInternalNoteWrite(path);
     await this.app.vault.create(path, `${lines.join("\n")}\n`);
     const cached = await this.cacheLoggedTasks(path, tasks || [], sectionName);
@@ -22969,6 +23414,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     } catch (error) {
       this.logLocal("Email task note index queue failed", { path, error: error.message || String(error) });
     }
+    return path;
   }
 };
 
@@ -23001,6 +23447,9 @@ class SemanticTodoistView extends ItemView {
 
   async onOpen() {
     this.render();
+    this.plugin.flushPendingDuplicateNotice?.(this);
+    // Boxes posted while the sidebar was closed appear now.
+    await this.plugin.restoreDuplicateReviewBoxes?.(this).catch((error) => this.plugin.logLocal?.("Duplicate boxes not restored", { error: error.message || String(error) }));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.handleActiveNoteChanged()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.handleActiveNoteChanged()));
   }
@@ -23812,6 +24261,7 @@ class SemanticTodoistView extends ItemView {
   newChat() {
     this.messages = [];
     this.renderMessages();
+    this.plugin.restoreDuplicateReviewBoxes?.(this).catch((error) => this.plugin.logLocal?.("Duplicate boxes not restored", { error: error.message || String(error) }));
     this.renderRelevantNotes([]);
     this.setStatus("Ready");
   }
@@ -24029,6 +24479,30 @@ class SemanticTodoistView extends ItemView {
     this.renderMessages();
   }
 
+  hasDuplicateReviewBox(heldId) {
+    return this.messages.some((message) => message.kind === "duplicate-review" && message.heldId === heldId);
+  }
+
+  removeDuplicateReviewBox(heldId) {
+    const before = this.messages.length;
+    this.messages = this.messages.filter((message) => !(message.kind === "duplicate-review" && message.heldId === heldId));
+    if (this.messages.length !== before) this.renderMessages();
+  }
+
+  // One box per held task: add it, or update its text and buttons in place after a click.
+  upsertDuplicateReviewBox(record, text) {
+    const plugin = this.plugin;
+    const existing = this.messages.find((message) => message.kind === "duplicate-review" && message.heldId === record.id);
+    const open = () => record.status === "waiting";
+    const actions = [
+      { label: "Merge", onClick: () => plugin.resolveHeldDuplicate(record.id, "merge", { by: "user" }), isDisabled: () => !open() },
+      { label: "Keep both", onClick: () => plugin.resolveHeldDuplicate(record.id, "keep", { by: "user" }), isDisabled: () => !open() }
+    ];
+    if (existing) { existing.text = text; existing.actions = actions; }
+    else this.messages.push({ role: "assistant", kind: "duplicate-review", heldId: record.id, text, actions });
+    this.renderMessages();
+  }
+
   addMessageAction(label, onClick, isDisabled = null) {
     const last = this.messages[this.messages.length - 1];
     if (!last) return;
@@ -24051,7 +24525,7 @@ class SemanticTodoistView extends ItemView {
     if (!this.messagesEl) return;
     this.messagesEl.empty();
     for (const message of this.messages) {
-      const bubble = this.messagesEl.createDiv({ cls: `semantic-todoist-message semantic-todoist-message-${message.role}` });
+      const bubble = this.messagesEl.createDiv({ cls: `semantic-todoist-message semantic-todoist-message-${message.role}${message.kind === "duplicate-review" ? " semantic-todoist-duplicate-review" : ""}` });
       bubble.createDiv({ cls: "semantic-todoist-message-role", text: message.role === "user" ? "You" : "AI" });
       const textEl = bubble.createDiv({ cls: "semantic-todoist-message-text" });
       if (message.role === "assistant") {
@@ -24431,11 +24905,10 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   renderTaskIntegrity(containerEl) {
     settingsHeading(containerEl, "Task deduplication", "Check generated tasks against open local references before creating anything new.");
     toggleSetting(containerEl, "Enable task deduplication", "Use conservative local matching and keep ambiguous candidates for review. Also controls linking note tasks to existing Todoist tasks by exact title.", this.plugin, "enableTaskDeduplication");
-    taskDeduplicationStrictnessSetting(containerEl, this.plugin);
     toggleSetting(containerEl, "Merge labels additively", "Keep existing labels and add new labels.", this.plugin, "taskDeduplicationMergeLabelsAdditive");
     toggleSetting(containerEl, "Allow explicit obsolete subtask removal", "Remove a linked subtask only when newer source text clearly says it is obsolete.", this.plugin, "taskDeduplicationAllowExplicitSubtaskRemoval");
-    toggleSetting(containerEl, "Use AI for unresolved duplicates", "Ask the selected dedupe model only about strong unresolved candidates; it never rewrites task fields.", this.plugin, "enableAiAmbiguousTaskDeduplication");
-    taskDeduplicationAiReviewSensitivitySetting(containerEl, this.plugin);
+    toggleSetting(containerEl, "Use AI for unresolved duplicates", "Ask the dedupe model about likely duplicates before showing the box; when off, every likely duplicate gets a box.", this.plugin, "enableAiAmbiguousTaskDeduplication");
+    toggleSetting(containerEl, "Record duplicate answers", "Your answers and source names are kept in plugin data to tune matching later.", this.plugin, "taskDuplicateReviewRecording");
     taskDeduplicationAiModelSetting(containerEl, this.plugin);
     reasoningEffortSetting(containerEl, "Deduplication reasoning", "Reasoning used only for AI duplicate verdicts.", this.plugin, "taskDeduplicationAiReasoningEffort", taskDeduplicationAiModel(this.plugin.settings));
     textAreaSetting(containerEl, "Deduplication policy", this.plugin, "taskDeduplicationPolicy", { compact: true });
@@ -29889,6 +30362,8 @@ return `Todoist stopped part-way: it rejected ${n} change${n === 1 ? "" : "s"}${
 function describeTodoistApplyResult(result, changes) {
   const count = Number(result?.applied || 0);
   const lines = [`Applied ${count} Todoist change${count === 1 ? "" : "s"}.`];
+  const held = Number(result?.held || 0);
+  if (held) lines.push(`${held} task${held === 1 ? " is" : "s are"} waiting for a duplicate answer in the sidebar.`);
   for (const item of result?.skipped || []) lines.push(`Skipped "${todoistTaskTitle(changes?.snapshot, item.row?.taskId, item.row?.fields?.content)}": ${item.reason}.`);
   if (result?.failedAt !== undefined) lines.push(`${describeTodoistStopped(result)} What was applied before that can be undone.`);
   for (const title of result?.noteWriteFailed || []) lines.push(`Created in Todoist but couldn't write note line "${title}".`);
@@ -33162,8 +33637,8 @@ function taskDeadlineForTodoist(task, settings = DEFAULT_SETTINGS) {
 }
 
 function taskDescriptionForTodoist(task, settings = DEFAULT_SETTINGS) {
-  if (task?.isSubtask || !task?.descriptionShouldSync || !isRichTodoistDescription(task.description)) return "";
-  return formatTodoistDescription(task.description, settings);
+  if (task?.isSubtask || !task?.descriptionShouldSync || (!task.descriptionForceSync && !isRichTodoistDescription(task.description))) return "";
+  return formatTodoistDescription(task.description, settings, "", Boolean(task.descriptionVerbatimSources));
 }
 
 function todoistRemoteDueDate(remote = {}, base = {}) {
@@ -43665,65 +44140,6 @@ function mainTaskClarityReason(task = {}) {
   if (text.length > 250) return "main task title exceeded 250 characters";
   if (/^(?:ignore|disregard)\s+(?:all\s+)?(?:previous|prior)\s+instructions?\b/i.test(text)) return "main task title contained prompt-injection text";
   return "passed";
-}
-
-function taskStructureSafetySnapshot(tasks = []) {
-  const initialIssues = new Set(taskPlanRepairableHierarchyIssues(tasks).map((issue) => `${issue.taskIndex}:${issue.code}`));
-  return (tasks || []).map((task, index) => ({
-    key: task.oid ? `oid:${task.oid}` : `index:${index}`,
-    index,
-    content: task.content || "",
-    subtasks: (task.subtasks || []).map((subtask) => Object.assign({}, subtask)),
-    initialIssueCodes: Array.from(initialIssues).filter((value) => value.startsWith(`${index}:`)).map((value) => value.split(":")[1])
-  }));
-}
-
-function restoreTaskStructureAfterDedupeRegression(tasks = [], snapshot = []) {
-  const issues = taskPlanRepairableHierarchyIssues(tasks);
-  const snapshotByKey = new Map((snapshot || []).map((item) => [item.key, item]));
-  for (let taskIndex = 0; taskIndex < (tasks || []).length; taskIndex += 1) {
-    const task = tasks[taskIndex] || {};
-    const key = task.oid ? `oid:${task.oid}` : `index:${taskIndex}`;
-    const previous = snapshotByKey.get(key);
-    if (!previous) continue;
-    const previousSubtasks = previous.subtasks || [];
-    const currentSubtasks = task.subtasks || [];
-    const regressed = currentSubtasks.some((currentSubtask, index) => {
-      const previousSubtask = (currentSubtask?.oid
-        ? previousSubtasks.find((candidate) => candidate?.oid === currentSubtask.oid)
-        : null) || previousSubtasks[index];
-      return Boolean(previousSubtask?.content)
-        && singleLine(previousSubtask.content) !== singleLine(previous.content)
-        && singleLine(currentSubtask?.content || "") === singleLine(task.content || "")
-        && singleLine(currentSubtask?.content || "") !== singleLine(previousSubtask.content);
-    });
-    if (regressed) issues.push({ code: "dedupe-content-regression", taskIndex, blocking: false });
-  }
-  const restored = new Set();
-  for (const issue of issues) {
-    const task = tasks[issue.taskIndex];
-    if (!task) continue;
-    const key = task.oid ? `oid:${task.oid}` : `index:${issue.taskIndex}`;
-    const previous = snapshotByKey.get(key);
-    if (!previous || previous.initialIssueCodes.includes(issue.code) || restored.has(key)) continue;
-      const currentSubtasks = task.subtasks || [];
-      task.content = previous.content;
-      task.subtasks = previous.subtasks.map((subtask, index) => {
-        const current = currentSubtasks.find((candidate) => candidate.oid && subtask.oid && candidate.oid === subtask.oid)
-        || currentSubtasks[index]
-        || {};
-      return Object.assign({}, subtask, {
-        id: current.id || subtask.id || "",
-        oid: current.oid || subtask.oid || "",
-        deduplication: current.deduplication || subtask.deduplication,
-        parentId: task.id || current.parentId || subtask.parentId || "",
-        parentOid: task.oid || current.parentOid || subtask.parentOid || "",
-        parentContent: previous.content
-      });
-    });
-    restored.add(key);
-  }
-  return restored.size;
 }
 
 function taskPlanRepairableHierarchyIssues(tasks = [], options = {}) {
@@ -57018,7 +57434,7 @@ function truncateMarkdownAtWord(value, max) {
   const boundary = Math.max(sliced.lastIndexOf(" "), sliced.lastIndexOf("\n"));
   return sliced.slice(0, boundary > Math.floor(max * 0.75) ? boundary : max).trim();
 }
-function formatTodoistDescription(value, settings = DEFAULT_SETTINGS, sourceText = "") {
+function formatTodoistDescription(value, settings = DEFAULT_SETTINGS, sourceText = "", verbatimSources = false) {
   const max = Math.min(TODOIST_DESCRIPTION_LIMIT, Math.max(1, parseInt(settings.todoistDescriptionMaxChars, 10) || DEFAULT_SETTINGS.todoistDescriptionMaxChars));
   const cleaned = String(value || "")
     .replace(/\r\n/g, "\n")
@@ -57026,7 +57442,9 @@ function formatTodoistDescription(value, settings = DEFAULT_SETTINGS, sourceText
     .replace(/\n[ \t]+/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  const normalized = normalizeTodoistDescriptionSourceList(normalizeDescriptionLinks(cleaned, sourceText, settings));
+  const linked = normalizeDescriptionLinks(cleaned, sourceText, settings);
+  // Merge sends carry dedupe.js's own source blocks (note and email kinds); re-normalising would drop one kind.
+  const normalized = verbatimSources ? linked : normalizeTodoistDescriptionSourceList(linked);
   return normalized.length <= max ? normalized : truncateMarkdownAtWord(normalized, max);
 }
 
@@ -57479,64 +57897,6 @@ function liveTodoistTaskDeduplicationCandidates(tasks = [], settings = DEFAULT_S
     });
 }
 
-async function deduplicateGeneratedTaskBatch(tasks = [], settings = DEFAULT_SETTINGS, options = {}, aiDecisionFn = null, taskGenerationFn = null) {
-  const stats = { merged: 0, matches: [], localConfirmed: 0, aiUsed: 0, taskGenerationUsed: 0, ambiguous: 0, candidateFlags: [] };
-  if (!Array.isArray(tasks) || tasks.length < 2) return stats;
-  for (let i = 0; i < tasks.length; i += 1) {
-    const task = tasks[i];
-    if (!task || task.id || task.isSubtask) continue;
-    const candidates = generatedTaskBatchCandidates(tasks, i);
-    const decision = bestTaskDeduplicationMatch(task, candidates, settings, Object.assign({}, options, { isSubtask: false, intraBatch: true }));
-    if (!decision.candidate?.generatedTask) continue;
-    if (!isAiMediatedTaskDeduplicationCandidate(decision)) continue;
-    const resolutionOptions = Object.assign({}, options, { intraBatch: true, dedupeStats: stats });
-    const resolution = taskDeduplicationResolution(decision, settings, resolutionOptions);
-    if (resolution === "none") {
-      if (decision.candidate && (decision.outcome === "ambiguous-ai" || decision.decision === "ambiguous")) {
-        flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
-      }
-      continue;
-    }
-    if (resolution === "manual") {
-      flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
-      continue;
-    }
-    if (resolution === "local") {
-      stats.localConfirmed += 1;
-    } else {
-      const aiDecision = typeof aiDecisionFn === "function" ? await aiDecisionFn(task, decision, resolutionOptions) : null;
-      if (aiDecision?.used) stats.aiUsed += 1;
-      if (aiDecision?.match !== true) {
-        if (aiDecision?.used) flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
-        continue;
-      }
-    }
-    const generatedUpdate = options.semanticDedupeState?.enabled
-      ? { used: false, task }
-      : (typeof taskGenerationFn === "function" ? await taskGenerationFn(task, decision, resolutionOptions) : null);
-    if (!generatedUpdate?.task) {
-      flagPossibleDuplicateTask(stats, task, decision, settings, resolutionOptions);
-      continue;
-    }
-    const target = decision.candidate.generatedTask;
-    if (generatedUpdate.used) {
-      stats.taskGenerationUsed += 1;
-      applyTaskGenerationDuplicateUpdate(target, generatedUpdate.task, settings);
-    } else {
-      mergeConfirmedGeneratedTaskTree(target, task, settings);
-    }
-    markGeneratedDuplicateTask(target, decision, settings);
-    stats.merged += 1;
-    stats.matches.push(taskDeduplicationMatchSummary(task, Object.assign({}, decision, {
-      id: "",
-      reasons: uniqueValues(["merged with generated task"].concat(decision.reasons || []))
-    })));
-    tasks.splice(i, 1);
-    i -= 1;
-  }
-  return stats;
-}
-
 function mergeConfirmedGeneratedTaskTree(target = {}, duplicate = {}, settings = DEFAULT_SETTINGS) {
   if (!target || !duplicate) return target;
   if ((!target.description || target.description.length < (duplicate.description || "").length) && duplicate.description) target.description = duplicate.description;
@@ -57624,47 +57984,6 @@ function stableTaskTreeIdentity(task = {}) {
   return Object.keys(structured).length ? `structured:${JSON.stringify(structured)}` : "";
 }
 
-function applyTaskGenerationDuplicateUpdate(target = {}, generated = {}, settings = DEFAULT_SETTINGS) {
-  const previousSubtasks = target.subtasks || [];
-  target.content = singleLine(generated.content || target.content || "");
-  target.description = generated.description || target.description || "";
-  target.due_date = generated.due_date || target.due_date || "";
-  target.deadline_date = generated.deadline_date || target.deadline_date || "";
-  target.priority = normalizePriority(generated.priority || target.priority || 1);
-  target.labels = mergedTaskLabelsForDeduplication(generated.labels || [], target.labels || [], settings);
-  if (!target.isSubtask) {
-    const mergedSubtasks = [];
-    const seenSubtaskIdentities = new Set();
-    for (const subtask of [...previousSubtasks, ...(generated.subtasks || [])]) {
-      const identity = stableTaskTreeIdentity(subtask);
-      if (identity && seenSubtaskIdentities.has(identity)) continue;
-      if (identity) seenSubtaskIdentities.add(identity);
-      const previous = identity ? previousSubtasks.find((candidate) => stableTaskTreeIdentity(candidate) === identity) || {} : {};
-      const next = Object.assign({}, previous, subtask);
-      for (const field of TASK_SUBTASK_STABLE_IDENTITY_FIELDS) {
-        if (Object.prototype.hasOwnProperty.call(previous, field) && previous[field] !== undefined) next[field] = previous[field];
-      }
-      Object.assign(next, {
-        oid: previous.oid || subtask.oid || generateUniqueOid(settings),
-        isSubtask: true,
-        parentId: target.id || previous.parentId || "",
-        parentOid: target.oid || previous.parentOid || "",
-        parentContent: target.content || "",
-        projectId: target.projectId || previous.projectId || "",
-        projectName: target.projectName || previous.projectName || "",
-        section: target.section || previous.section || "",
-        sectionId: target.sectionId || previous.sectionId || ""
-      });
-      next.knowledge = taskKnowledgeSnapshot(next, settings, "", previous.knowledge || null);
-      mergedSubtasks.push(next);
-    }
-    target.subtasks = mergedSubtasks;
-  }
-  target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
-  target.descriptionShouldSync = true;
-  return target;
-}
-
 function markGeneratedDuplicateTask(target, decision = {}, settings = DEFAULT_SETTINGS) {
   if (!target) return target;
   target.knowledge = taskKnowledgeSnapshot(target, settings, taskDeduplicationSubtaskText(target), target.knowledge || null);
@@ -57682,20 +58001,6 @@ function taskDeduplicationThreshold(settings = DEFAULT_SETTINGS) {
   if (strictness === "strict") return 90;
   if (strictness === "permissive") return 78;
   return 84;
-}
-
-function isAiMediatedTaskDeduplicationCandidate(decision = {}) {
-  return Boolean(decision?.candidate && (decision.decision === "merge" || decision.decision === "ambiguous" || decision.outcome === "merge" || decision.outcome === "ambiguous-ai"));
-}
-
-function taskDeduplicationResolution(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
-  if (!isAiMediatedTaskDeduplicationCandidate(decision)) return "none";
-  if (decision.hardConflict) return "none";
-  if (decision.outcome === "merge" && decision.decision === "merge") return "local";
-  if (decision.outcome === "ambiguous-ai") return settings.enableAiAmbiguousTaskDeduplication === true ? "ai" : "none";
-  if (decision.decision === "ambiguous") return isCredibleLocalAmbiguousTaskCandidate(decision, settings, options) ? "manual" : "none";
-  if (settings.enableAiAmbiguousTaskDeduplication !== true) return "local";
-  return isLocallyConclusiveTaskDuplicate(decision, settings, options) ? "local" : "ai";
 }
 
 function isCredibleLocalAmbiguousTaskCandidate(decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
@@ -58066,41 +58371,6 @@ function semanticTaskReferenceCandidateRanks(context = []) {
   return ranks;
 }
 
-function applyTaskDeduplicationMatch(task, decision, settings = DEFAULT_SETTINGS, options = {}) {
-  const existing = decision.task || decision.candidate?.task || {};
-  task.id = decision.id || existing.id || task.id || "";
-  task.oid = task.oid || generateUniqueOid(settings);
-  task.labels = mergedTaskLabelsForDeduplication(task.labels || [], existing.labels || [], settings);
-  task.priority = normalizePriority(task.priority || existing.priority || 1);
-  task.due_date = task.due_date || existing.due_date || "";
-  task.deadline_date = task.deadline_date || existing.deadline_date || "";
-  task.duration = normalizeTodoistDuration(task.duration) || normalizeTodoistDuration(existing.duration);
-  task.description = task.description || existing.description || "";
-  task.section = task.section || existing.section || "";
-  task.sectionId = task.sectionId || existing.sectionId || "";
-  task.projectId = task.projectId || existing.projectId || "";
-  task.projectName = task.projectName || existing.projectName || "";
-  task.parentId = options.parentTask?.id || task.parentId || existing.parentId || "";
-  task.parentOid = options.parentTask?.oid || task.parentOid || existing.parentOid || "";
-  task.parentContent = options.parentTask?.content || task.parentContent || existing.parentContent || "";
-  task.knowledge = taskKnowledgeSnapshot(task, settings, "", task.knowledge || existing.knowledge || null);
-  task.descriptionShouldSync = true;
-  task.deduplication = {
-    todoistId: task.id,
-    confidence: decision.confidence || 0,
-    reasons: decision.reasons || []
-  };
-}
-
-function taskDeduplicationMatchSummary(task, decision) {
-  return {
-    task: truncateAtWord(singleLine(task?.content || ""), 90),
-    todoistId: decision.id || "",
-    confidence: decision.confidence || 0,
-    reasons: (decision.reasons || []).slice(0, 3)
-  };
-}
-
 function taskDeduplicationCandidateFlag(task = {}, decision = {}, settings = DEFAULT_SETTINGS, options = {}) {
   const existing = decision.task || decision.candidate?.task || {};
   const isGenerated = Boolean(options.intraBatch || decision.candidate?.generatedTask);
@@ -58127,28 +58397,6 @@ function flagPossibleDuplicateTask(stats = emptyTaskDeduplicationStats(), task =
     reasons: (decision.reasons || []).slice(0, 3)
   };
   return task;
-}
-
-function taskDeduplicationCandidateChatMessage(flags = [], options = {}) {
-  const source = options.source ? ` from ${options.source}` : "";
-  const path = options.path ? `\nSource: ${options.path}` : "";
-  const lines = [
-    `${TASK_DUPLICATE_CANDIDATE_MARKER} Possible duplicate task${flags.length === 1 ? "" : "s"} found locally${source}.`,
-    "No automatic merge was applied, and the marker is shown only in chat; it is never added to Todoist.",
-    path,
-    ""
-  ].filter((line) => line !== "");
-  flags.slice(0, 8).forEach((flag, index) => {
-    const where = [flag.projectName ? `Project: ${flag.projectName}` : "", flag.section ? `Section: ${flag.section}` : "", flag.parentContent ? `Parent: ${truncateAtWord(flag.parentContent, 80)}` : ""].filter(Boolean).join(" | ");
-    lines.push(`${index + 1}. ${TASK_DUPLICATE_CANDIDATE_MARKER} Generated task: ${flag.task || "Untitled task"}`);
-    lines.push(`   Possible duplicate: ${flag.link || flag.candidate || "Earlier generated task"} (${flag.candidateType}, local score ${flag.confidence || 0})`);
-    if (where) lines.push(`   Context: ${where}`);
-    if (flag.reasons?.length) lines.push(`   Local evidence: ${flag.reasons.join("; ")}`);
-  });
-  if (flags.length > 8) lines.push(`...and ${flags.length - 8} more possible duplicate${flags.length - 8 === 1 ? "" : "s"}.`);
-  lines.push("");
-  lines.push("Review the generated task and likely match in Todoist.");
-  return lines.join("\n");
 }
 
 function mergedTaskLabelsForDeduplication(generated = [], existing = [], settings = DEFAULT_SETTINGS) {

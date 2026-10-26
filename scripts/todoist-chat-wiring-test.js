@@ -165,7 +165,7 @@ test("duplicates request in phase 1 keeps the vault answer and proposes nothing"
   const p = makePlugin({ lookup: lookupOf({ kind: "duplicates" }), answer: claims() });
   const r = await p.chat("Find my duplicate tasks", null, [], "chat-query", { todoist: true });
   assert.ok(r.answer.includes("Compost is on your list"));
-  assert.ok(r.answer.includes("Duplicate finding isn't turned on yet"));
+  assert.ok(r.answer.includes("I can't search existing tasks for duplicates; new tasks are checked when they're created."));
   assert.equal(r.todoistChanges, undefined);
   assert.equal(p.calls.snapshot.length, 0);
   assert.equal(p.calls.ops.includes("chat"), true);

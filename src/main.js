@@ -12726,6 +12726,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // t43: tasks whose marked-action lines have NO overlapping chunk of the
     // active source in the built index (marked-source-line-mismatch).
     const markedLineMismatchKeys = new Set();
+    // The same fallback for an unmarked note (whole-note "source" scope) that is not in
+    // the routing state yet: no seed lane finds a chunk of the note's own path.
+    const sourceIndexedKeys = new Set();
+    const sourceUnindexedKeys = new Set();
     for (const [indexValue, task] of flattened) {
       const key = makeTaskKey(task, indexValue);
       taskKeyByIndex[String(indexValue)] = key;
@@ -12778,6 +12782,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         lane.lineScopeDegradedReason = scopeResolver.degradedReason;
         if (scopeResolver.degradedReason === "marked-source-line-mismatch" && markedActionScope) markedLineMismatchKeys.add(key);
         const seedLane = ["action", "source-statement", "terminology", "current-vault"].some((origin) => String(lane.origin || lane.name || "").toLowerCase() === origin || String(lane.origin || lane.name || "").toLowerCase().startsWith(`${origin}-`));
+        if (!markedActionScope && seedLane && localCurrentSourceRow) {
+          const ownChunk = boundedResolverIndex.some((chunk) => vaultRelativePath(chunk?.path || chunk?.provenance?.path || "") === activeSourcePath);
+          (ownChunk ? sourceIndexedKeys : sourceUnindexedKeys).add(key);
+        }
         let resolved = null;
         if (markedActionScope && !seedLane) {
           const seedHandles = taskSeedHandlesByKey.get(key) || [];
@@ -12808,6 +12816,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // the background. Healthy indexed notes never take this path (the lane
     // resolver reports no mismatch), so their retrieval stays byte-identical.
     if (localCurrentSourceRow && markedLineMismatchKeys.size) return degraded("marked-source-line-mismatch");
+    if (localCurrentSourceRow && [...sourceUnindexedKeys].some((key) => !sourceIndexedKeys.has(key))) return degraded("source-not-indexed");
     // Runtime query fallback for lanes with no indexed handle. Every lane above
     // borrows its query vector from an indexed chunk of the source
     // (lane.embedding = lane.queryHandles[0]?.vector); an email source - or any
@@ -47379,7 +47388,6 @@ function taskWorkflowLocalCurrentSourceEvidenceRow(source = {}, sourceContract =
   if (sourceType !== "note") return null;
   const evidenceId = String(contract.primaryEvidenceId || contract.primary_evidence_id || "");
   if (!evidenceId) return null;
-  if (!Array.isArray(contract.explicitMarkers) || !contract.explicitMarkers.length) return null;
   const text = String(sourceSummary || "").trim();
   if (!text) return null;
   const path = String(contract.path || source?.path || "");
@@ -51911,8 +51919,11 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
         && (marker.action === actionText || (marker.action.startsWith(actionText) && /^\s/.test(marker.action.slice(actionText.length))))));
     // writing-mode: single-match rule keeps governing the chunk-local path; the contract-marker
     // fallback above only satisfies it when scopeForAction.action already equals actionText.
+    // Markers only confirm tasks: the marker match applies to a marked-action scope, never to
+    // the whole-note "source" scope an unmarked note falls back to.
+    const markerRequired = scopeForAction?.family === "marked-action";
     if (!self || !sourcePath || self.path !== sourcePath || !scopeForAction
-      || String(scopeForAction.action || "").trim() !== actionText || (markerMatches.length !== 1 && !scopeMarkerOk)) {
+      || String(scopeForAction.action || "").trim() !== actionText || (markerRequired && markerMatches.length !== 1 && !scopeMarkerOk)) {
       // Say which sub-check failed (counts and flags only, never note text).
       const why = [];
       if (!self) why.push("self-missing");
@@ -51920,7 +51931,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       else if (self && self.path !== sourcePath) why.push("path-differs");
       if (!scopeForAction) why.push("scope-missing");
       else if (String(scopeForAction.action || "").trim() !== actionText) why.push("action-differs");
-      if (markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
+      if (markerRequired && markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
       scoreMissingErrors.push(`action-source-mismatch:${taskKey}:${queryHandleEvidenceId}:why=${why.join("+")}`);
     }
     }

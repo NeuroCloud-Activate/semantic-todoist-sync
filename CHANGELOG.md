@@ -1,3 +1,9 @@
+## 0.9.31 - 2026-10-26
+### Fixed
+- **Notes without a #todo marker get tasks again.** Creating tasks from a note that has no marked line stopped with "Task creation blocked before the AI step: protected-workflow-evidence-closure-unresolved (action-source-mismatch ... why=markers=0)". A safety check expected exactly one marked line, which can never be found in an unmarked note. Markers now only confirm tasks; the whole note is read for actions and questions whether or not it has a marker. The other safety checks are unchanged: the evidence must still come from the note itself.
+- **A new or just-edited unmarked note is no longer blocked while it is being indexed.** A marked note already fell back to its own text when the search index did not have it yet; an unmarked note now does the same instead of stopping with "action-or-self-missing" or "ranked corpus is empty".
+### Notes
+- New tests cover an unmarked note, an unmarked note not yet in the index, and that evidence from a different note is still refused. Marked-note results are unchanged. `npm test` passes 55/55. Checked live in Obsidian on real meeting notes before and after the fix.
 ## 0.9.30 - 2026-10-20
 ### Fixed
 - **Emails are no longer blocked when processed back to back.** When one email finished, the plugin added its log note to the vault search index, which briefly reset the search lookup. An email already in progress could search during that reset, find no supporting notes, and be blocked with "protected provider evidence was unresolved". The email now waits for vault search to be ready again before its second search.

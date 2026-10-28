@@ -90,10 +90,32 @@ assert.strictEqual(singleText.indexOf("**Topic:"), -1, "single topic must have n
 assert.strictEqual(singleText.includes("Item A."), true);
 console.log("PASS (c): single topic flat equals old format (no headings)");
 
-// Verify 0-1 topics produces same flat string as old format
-const flatOld = ["- Item A. [e1](http://example.com/e1)", "- Item B."].join("\n");
-assert.strictEqual(singleText.trim(), flatOld.trim(), "0-1 topic output must match old joined format");
-console.log("PASS (c-extra): single topic flat string equals old renderedClaims.join('\\n')");
+// 0-1 topics read as one prose paragraph: no bullets, link after the sentence that cites it
+assert.strictEqual(singleText.trim(), "Item A. [e1](http://example.com/e1) Item B.", "0-1 topic output is one prose paragraph");
+console.log("PASS (c-extra): single topic reads as one prose paragraph");
+
+// (c-links) A source cited by several sentences shows its link once, after the first sentence that cites it
+const repeatResponse = JSON.stringify({
+  claims: [
+    { text: "The project has three tasks.", established: true, evidence_ids: ["e1", "e2"], category: "fact", topic: "Project" },
+    { text: "One is to buy paper.", established: true, evidence_ids: ["e1"], category: "fact", topic: "Project" },
+    { text: "Another is due Nov 2.", established: true, evidence_ids: ["e2", "e3"], category: "timing", topic: "Project" },
+  ]
+});
+const repeatLedger = ["e1", "e2", "e3"].map((id) => ({ evidenceId: id, url: `http://example.com/${id}`, markdown: `[${id}](http://example.com/${id})` }));
+const repeatText = (renderResponse(repeatResponse, repeatLedger).answer || "").trim();
+assert.strictEqual(repeatText, "The project has three tasks. [e1](http://example.com/e1) [e2](http://example.com/e2) One is to buy paper. Another is due Nov 2. [e3](http://example.com/e3)", repeatText);
+console.log("PASS (c-links): each source link shows once");
+
+// (c-heads) With headings, each topic is one paragraph and a link shown under one topic is not repeated under another
+const twoTopicText = (renderResponse(JSON.stringify({ claims: [
+  { text: "Alpha is active.", established: true, evidence_ids: ["e1"], category: "fact", topic: "Project Alpha" },
+  { text: "Alpha ships Friday.", established: true, evidence_ids: ["e1"], category: "timing", topic: "Project Alpha" },
+  { text: "The meeting is set.", established: true, evidence_ids: ["e1", "e2"], category: "fact", topic: "Meeting" },
+] }), repeatLedger).answer || "").trim();
+assert.strictEqual(twoTopicText, "**Topic: Project Alpha**\nAlpha is active. [e1](http://example.com/e1) Alpha ships Friday.\n\n**Topic: Meeting**\nThe meeting is set. [e2](http://example.com/e2)", twoTopicText);
+assert.ok(!/^- /m.test(twoTopicText), "no bullets");
+console.log("PASS (c-heads): one paragraph per topic, links not repeated");
 
 // (d) Prompt sentences check (source-text check)
 const srcPath = path.join(__dirname, "..", "src", "main.js");
@@ -105,6 +127,13 @@ assert.ok(srcText.includes(topicIdentitySentence), "prompt must include topic-id
 assert.ok(srcText.includes(completedSentence), "prompt must include completed-item sentence");
 assert.ok(srcText.includes(sixMonthSentence), "prompt must include 6-month sentence");
 console.log("PASS (d): prompt contains topic-identity + completed-item + 6-month sentences");
+// (d-tone) Helpful, natural prose instead of a robotic list; still concise and grounded
+assert.ok(srcText.includes("You are a helpful Obsidian sidebar assistant."), "helpful role sentence");
+assert.ok(srcText.includes("read together as one short, connected answer"), "claims read as connected prose");
+assert.ok(srcText.includes("vary how sentences begin"), "no repetitive sentence openings");
+assert.ok(!srcText.includes("\"You are a concise Obsidian sidebar assistant.\""), "old robotic role sentence removed");
+assert.ok(srcText.includes("Each claim must be one clear, factual sentence."), "claims stay factual");
+console.log("PASS (d-tone): prompt asks for helpful, natural, concise prose");
 
 // (e) Subset merge: related topic labels reunite under one heading
 const subsetResponse = JSON.stringify({

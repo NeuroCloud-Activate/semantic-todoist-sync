@@ -328,7 +328,7 @@ function testClosedNoteShowsDraftAndInsertButton() {
   // and replaceRange is never called by the main insertion path.
   const fs = require('fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
-  assert(src.includes('renderDraftForInsert(result, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
+  assert(src.includes('renderDraftForInsert({ markdown: draftText }, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
   assert(src.includes('Insert at current cursor'), 'Insert button present in draft UI');
   console.log('PASS closed-note-shows-draft-and-button (fallback path verified)');
 }
@@ -599,9 +599,16 @@ async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   const view = makeWriteView(plugin, [leaf], leaf);
   await view.write();
   assert.strictEqual(plugin.writeCallCount(), 1, 'model called once for the visible note');
-  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor');
-  assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT\n\nSources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched', 'draft plus Sources searched block inserted');
-  assert(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === calls.replaceRange[0].draft), 'sidebar shows exactly what was inserted');
+  const draft = 'DRAFT\n\nSources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched';
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'the review modal opened');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'review draft title');
+  assert.strictEqual(view.rewriteModal.after, draft, 'modal holds draft plus Sources searched block');
+  assert(!view.rewriteModal.before, 'no Before text for a fresh draft');
+  assert(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === draft), 'sidebar shows the draft');
+  await view.rewriteModal.onApply('EDITED draft');
+  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor on Apply');
+  assert.strictEqual(calls.replaceRange[0].draft, 'EDITED draft', 'the edited text is inserted');
   assert.strictEqual(view.writing, false, 'writing flag restored');
   assert.strictEqual(view.collaborateButton.disabled, false, 'button re-enabled');
   assert(!view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'no open-a-note message');
@@ -616,6 +623,7 @@ async function testWritePrefersMostRecentLeaf() {
   const view = makeWriteView(plugin, [first.leaf, recent.leaf], recent.leaf);
   await view.write();
   assert.strictEqual(plugin.writeCallCount(), 1, 'model called once');
+  await view.rewriteModal.onApply('D');
   assert.strictEqual(first.calls.replaceRange.length, 0, 'older leaf untouched');
   assert.strictEqual(recent.calls.replaceRange.length, 1, 'most-recent leaf receives the draft');
   console.log('PASS write-prefers-most-recent-leaf');
@@ -948,6 +956,8 @@ async function testChipClearsPin() {
   const args = plugin.lastWriteArgs();
   assert.strictEqual(args.opts.mode, 'draft', 'a sidebar write without a pin stays a draft');
   assert.strictEqual(args.opts.length, 'standard', 'the insert path sends the draft length');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  await view.rewriteModal.onApply(view.rewriteModal.after);
   assert.strictEqual(calls.replaceRange.length, 1, 'the draft is inserted into the note');
   assert.ok(calls.replaceRange[0].draft.includes('DRAFT'), 'the draft text is what got inserted');
   console.log('PASS chip-clears-pin');
@@ -1382,6 +1392,9 @@ async function testInsertAtCursorApa() {
   const view = makeWriteView(plugin, [leaf], leaf);
   view.plugin.settings.writingCitationStyle = 'apa';
   await view.write();
+  assert.strictEqual(calls.transaction.length, 0, 'nothing inserted before Apply');
+  assert.ok(view.rewriteModal.references.some((r) => r.includes('Schott')), 'modal lists the references to be added');
+  await view.rewriteModal.onApply('Draft with a citation (Schott, 2002).');
   assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange for the apa insert');
   assert.strictEqual(calls.transaction.length, 1, 'one transaction');
   assert.strictEqual(calls.transaction[0].length, 2, 'two changes: draft + references');
@@ -1392,7 +1405,40 @@ async function testInsertAtCursorApa() {
   console.log('PASS insert-at-cursor-apa');
 }
 
+async function testDraftReviewCancelClosedAndCheck() {
+  // Cancel writes nothing; Apply with the note closed falls back to the sidebar draft; check mode opens no modal.
+  const a = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const viewA = makeWriteView(makeWritePlugin(), [a.leaf], a.leaf);
+  await viewA.write();
+  assert.ok(viewA.rewriteModal.opened, 'modal open');
+  assert.ok(!findByClass(viewA.rewriteModal.contentEl, 'semantic-todoist-rewrite-before'), 'no Before pane for a fresh draft');
+  assert.ok(findByClass(viewA.rewriteModal.contentEl, 'semantic-todoist-rewrite-after'), 'After pane present');
+  viewA.rewriteModal.close();
+  assert.strictEqual(a.calls.replaceRange.length + a.calls.transaction.length, 0, 'Cancel inserts nothing');
+
+  const b = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const leaves = [b.leaf];
+  const viewB = makeWriteView(makeWritePlugin(), leaves, b.leaf);
+  viewB.messagesEl = null;
+  await viewB.write();
+  leaves.length = 0; // note closed while the modal is open
+  viewB.statusLog.length = 0;
+  await viewB.rewriteModal.onApply('EDITED');
+  assert.strictEqual(b.calls.replaceRange.length, 0, 'closed note: nothing inserted');
+  assert(viewB.messageLog.some((m) => m.role === 'assistant' && m.text === 'EDITED'), 'closed note: edited draft shown in sidebar');
+  assert(viewB.statusLog.includes('Collaboration complete (draft shown).'), 'closed note status');
+
+  const c = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const viewC = makeWriteView(makeWritePlugin(), [c.leaf], c.leaf);
+  const before = (require('obsidian').modalInstances || []).length;
+  viewC.pinSelection(makePinEditor('Claim here.', 'Notes/Visible.md', { line: 0, ch: 0 }, { line: 0, ch: 5 }).view.editor, 'Notes/Visible.md');
+  await viewC.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: viewC.pinned });
+  assert.strictEqual((require('obsidian').modalInstances || []).length, before, 'check mode opens no modal');
+  console.log('PASS draft-review-cancel-closed-check');
+}
+
 async function runTests() {
+  await testDraftReviewCancelClosedAndCheck();
   testDefaultChat();
   testNormalizeInvalidSettings();
   testSettingsMigrationStillPasses();

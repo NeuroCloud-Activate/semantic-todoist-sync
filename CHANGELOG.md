@@ -1,3 +1,9 @@
+## 0.9.36 - 2026-10-28
+### Fixed
+- **Collaborate drafts are reviewed before they go into your note.** A draft written without a selected passage used to be inserted at the cursor straight away. It now opens in a Review draft window where you can read and edit it, see the references it will add, and then Apply, Copy or Cancel. Apply inserts your edited version where your cursor was; Cancel writes nothing and leaves the draft in the sidebar. Rewrites of a selected passage and Check against my notes are unchanged.
+- Live check (Oct 28, 2026): the window opened with the draft, the note stayed unchanged while it was open, Cancel wrote nothing, and Apply inserted the edited text.
+- Tests: `npm test` passes 79/79, including draft review Apply, Cancel, closed-note fallback and check mode.
+
 ## 0.9.35 - 2026-10-28
 ### Fixed
 - **Follow-up questions keep the conversation's scope.** After "what tasks do I have to do today?", asking "what's specific to Jim?" now answers with Jim's tasks due today instead of starting a fresh search of your notes. The Todoist look-up narrows the previous answer to the tasks that match the new words, and the chat is told to read a short follow-up in the light of the previous question.

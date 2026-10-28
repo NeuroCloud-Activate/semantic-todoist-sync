@@ -24029,8 +24029,10 @@ class SemanticTodoistView extends ItemView {
         // ---- no pin: existing insert-at-cursor / visible-note path ----
         const { planInsertion, insertDraft, composeDraft } = require("./writing/insert.js");
         // writing-mode: sources searched block inserted with the draft so the note honestly shows searched sources
-        const draftText = composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock);
+        const initialDraft = composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock);
         const currentPath = filePath;
+        // writing-mode: every draft is reviewed in RewritePreviewModal first; Apply inserts the edited text via this
+        const insertEdited = (draftText) => {
         // writing-mode: post-await insertion uses shared leaf lookup (prefers captured view, falls back to any open markdown leaf with filePath)
         const preferredView = (this.plugin && this.plugin.app ? this.plugin.app.workspace.getActiveViewOfType(typeof MarkdownView !== "undefined" ? MarkdownView : null) : null);
         const currentEditor = findMarkdownEditorForPath(this.plugin && this.plugin.app ? this.plugin.app : null, currentPath, preferredView);
@@ -24065,16 +24067,34 @@ class SemanticTodoistView extends ItemView {
               new Notice(plan.notice);
             }
           } else if (plan.mode === "closed") {
-            this.renderDraftForInsert(result, filePath, null);
-            this.setStatus("Collaboration complete (draft shown).");            return;
+            this.renderDraftForInsert({ markdown: draftText }, filePath, null);
+            this.setStatus("Collaboration complete (draft shown).");
+            return;
           }
         } else {
-          this.renderDraftForInsert(result, filePath, null);
-          this.setStatus("Collaboration complete (draft shown).");          return;
+          this.renderDraftForInsert({ markdown: draftText }, filePath, null);
+          this.setStatus("Collaboration complete (draft shown).");
+          return;
         }
+        this.setStatus("Collaboration complete.");
+        };
         this.renderRelevantNotes(result.sources ? result.sources : []);
-        // writing-mode: sources searched block shown in the sidebar message exactly as inserted into the note
-        this.replaceLastAssistantMessage(composeDraft(result.markdown || "", result.footnotes || "", result.sourcesBlock));
+        // writing-mode: sources searched block shown in the sidebar message exactly as proposed for the note
+        this.replaceLastAssistantMessage(initialDraft);
+        let draftRefs = [];
+        if (citationStyle !== "footnotes") {
+          const { planReferences: planDraftRefs } = require("./writing/styles.js");
+          const refEditor = findMarkdownEditorForPath(this.plugin.app, currentPath, null);
+          draftRefs = (planDraftRefs(refEditor && refEditor.getValue ? refEditor.getValue() : "", citationStyle, result.cited || []) || {}).added || [];
+        }
+        const draftModal = new RewritePreviewModal(this.app, {
+          title: "Review draft",
+          after: initialDraft,
+          references: draftRefs,
+          onApply: (text) => { insertEdited(text); },
+        });
+        this.rewriteModal = draftModal;
+        draftModal.open();
         if (result.notice) {
           new Notice(result.notice);
         }
@@ -24085,7 +24105,8 @@ class SemanticTodoistView extends ItemView {
         if (result.searched && result.searched.vault === false && result.searched.vaultWanted !== false) {
           new Notice("Vault index isn't ready, so only the context folder was searched. Rebuild the index for full evidence.");
         }
-        this.setStatus("Collaboration complete.");      } catch (error) {
+        this.setStatus("Draft ready — review it in the dialog.");
+      } catch (error) {
         console.error(error);
         if (error && error.code === "empty-instruction") {
           this.replaceLastAssistantMessage(`Error: Instruction cannot be empty.`);
@@ -25914,13 +25935,16 @@ class RewritePreviewModal extends Modal {
 
     const grid = contentEl.createEl("div", { cls: "semantic-todoist-rewrite-grid" });
 
-    const beforePanel = grid.createEl("div", { cls: "semantic-todoist-rewrite-pane" });
-    beforePanel.createEl("div", { text: "Before" });
-    const beforeEl = beforePanel.createEl("div", { cls: "semantic-todoist-rewrite-before" });
-    beforeEl.setText(this.before || "");
+    // no Before pane for a fresh draft (nothing to compare against)
+    if (this.before) {
+      const beforePanel = grid.createEl("div", { cls: "semantic-todoist-rewrite-pane" });
+      beforePanel.createEl("div", { text: "Before" });
+      const beforeEl = beforePanel.createEl("div", { cls: "semantic-todoist-rewrite-before" });
+      beforeEl.setText(this.before);
+    }
 
     const afterPanel = grid.createEl("div", { cls: "semantic-todoist-rewrite-pane" });
-    afterPanel.createEl("div", { text: "After" });
+    afterPanel.createEl("div", { text: this.before ? "After" : "Draft" });
     // writing-mode: task 4 fix — Obsidian's createEl ignores { value } on a textarea, so the pane opened empty
     const afterEl = afterPanel.createEl("textarea");
     afterEl.value = this.after || "";

@@ -2294,6 +2294,9 @@
     grid-template-columns: 1fr;
   }
 }
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-pane:only-child {
+  grid-column: 1 / -1;
+}
 .semantic-todoist-rewrite-modal .semantic-todoist-rewrite-pane > div:first-child {
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);

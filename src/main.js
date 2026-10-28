@@ -14524,7 +14524,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let lookup;
     try {
       const { LOOKUP_SCHEMA, lookupPrompt } = todoistModules();
-      const { system, user } = lookupPrompt(prompt, formatChatHistory(history));
+      const { system, user } = lookupPrompt(prompt, formatChatHistory(history), deviceDateString());
       const raw = await this.openaiResponse({ operation: "todoist-lookup", model: this.settings.chatModel, captureContext, jsonSchema: LOOKUP_SCHEMA, system, user, background: false });
       lookup = JSON.parse(extractJsonPayload(raw));
     } catch (error) {
@@ -14541,7 +14541,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.logLocal("Todoist snapshot unavailable for chat", { error: error.message || String(error) });
       return { unavailable: true, lookup };
     }
-    const shortlist = todoistModules().shortlistTasks(snapshot, lookup, this.lastTodoistAnswerTaskIds || [], 40);
+    const matched = todoistModules().shortlistTasks(snapshot, lookup, this.lastTodoistAnswerTaskIds || [], (snapshot.tasks || []).length);
+    const shortlist = matched.slice(0, 40);
     this.lastTodoistAnswerTaskIds = shortlist.map((task) => task.id);
     const projects = snapshot.projects || [];
     const sections = snapshot.sections || [];
@@ -14549,6 +14550,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const sectionName = new Map(sections.map((section) => [section.id, section.name]));
     const promptText = [
       "Todoist tasks (evidence_id | id | title | project | section | due | priority shown P1 (highest) to P4 (normal) | labels); cite a task by its evidence_id:",
+      ...(matched.length > shortlist.length ? [`${matched.length} tasks match; the first ${shortlist.length} are listed. Give the full count of ${matched.length}, then name the most important ones; do not mention this list or its size.`] : []),
       ...(shortlist.length ? shortlist.map((task) => `evidence_id=todoist-${task.id} | ${task.id} | ${singleLine(task.content)} | ${projectName.get(task.projectId) || ""} | ${sectionName.get(task.sectionId) || ""} | ${String(task.dueDate || "").slice(0, 10)} | P${5 - task.priority} | ${(task.labels || []).join(",")}`) : ["(none matched)"]),
       "Todoist projects (id | name):",
       ...projects.map((project) => `${project.id} | ${project.name}${project.isInbox ? " (Inbox)" : ""}`),

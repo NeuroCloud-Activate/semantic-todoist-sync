@@ -71,7 +71,7 @@ const cases = {
     assert.deepStrictEqual(bad(LOOKUP_SCHEMA), []);
     for (const k of ["dueFrom", "dueTo", "priority", "includeCompleted"]) assert.ok(LOOKUP_SCHEMA.properties.filters.properties[k].type.includes("null"), k);
     const nul = { words: [], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
-    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)), ["t1", "t2", "t3"]);
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)).sort(), ["t1", "t2", "t3"]);
   },
   "change request: new due date in filters does not drop the named task"() {
     const sts = { tasks: [
@@ -112,6 +112,28 @@ const cases = {
     const p = lookupPrompt("move it", "User: hi");
     assert.ok(p.user.includes("move it") && p.user.includes("User: hi"));
     assert.ok(/needsTodoist.*false/s.test(p.system) && /vault notes/.test(p.system) && /short/i.test(p.system));
+  },
+  "ties rank by priority, then earliest due date (overdue first), undated last"() {
+    const s = { tasks: [
+      task("p4near", "a", { priority: 1, dueDate: "2026-10-28" }),
+      task("p1none", "b", { priority: 4 }),
+      task("p1far", "c", { priority: 4, dueDate: "2026-12-30" }),
+      task("p1near", "d", { priority: 4, dueDate: "2026-10-29" }),
+      task("p1over", "e", { priority: 4, dueDate: "2026-10-27T09:00:00" }),
+      task("p2today", "f", { priority: 3, dueDate: "2026-10-28" })
+    ], projects: [], sections: [] };
+    assert.deepStrictEqual(ids(shortlistTasks(s, lk(), [], 10)), ["p1over", "p1near", "p1far", "p1none", "p2today", "p4near"]);
+    // word relevance still comes first; priority/date only break its ties
+    const w = { tasks: [task("lowHit", "budget report", { priority: 1 }), task("hiTie", "budget", { priority: 4 }), task("loTie", "budget", { priority: 2 })], projects: [], sections: [] };
+    assert.deepStrictEqual(ids(shortlistTasks(w, lk({ filters: { words: ["budget", "report"], projects: [], labels: [] } }), [], 10)), ["lowHit", "hiTie", "loTie"]);
+    // a capped list keeps the most important
+    assert.deepStrictEqual(ids(shortlistTasks(s, lk(), [], 2)), ["p1over", "p1near"]);
+  },
+  "look-up is told today's date so 'today' becomes a due filter"() {
+    const p = lookupPrompt("what tasks do I have to do today", "", "2026-10-28");
+    assert.ok(p.system.includes("Today's date is 2026-10-28 (Wednesday)"), p.system);
+    assert.ok(/"today" means dueFrom and dueTo are both today's date/.test(p.system), "today mapping");
+    assert.ok(!/Today's date/.test(lookupPrompt("x", "").system), "no date line without a date");
   }
 };
 let failed = 0;

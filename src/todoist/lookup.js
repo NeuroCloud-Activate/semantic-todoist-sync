@@ -27,9 +27,11 @@ const LOOKUP_SCHEMA = {
   }
 };
 
-function lookupPrompt(prompt, historyText) {
+function lookupPrompt(prompt, historyText, today = "") {
+  const weekday = today ? new Date(`${today}T12:00:00`).toLocaleDateString("en-US", { weekday: "long" }) : "";
   const system = [
     "You classify a chat message for a Todoist-aware assistant. Reply with JSON only, matching the schema. Keep it short.",
+    ...(today ? [`Today's date is ${today} (${weekday}). Turn relative dates into dueFrom/dueTo: "today" means dueFrom and dueTo are both today's date; "tomorrow", "this week" and similar map to their date range; "overdue" means dueTo is yesterday.`] : []),
     "needsTodoist=false (kind \"none\") when the message is only about vault notes, writing or general chat.",
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
     "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
@@ -78,7 +80,9 @@ function shortlistTasks(snapshot, lookup, lastAnswerTaskIds, cap) {
     }
     scored.push({ t, score, inRange });
   }
-  scored.sort((a, b) => b.inRange - a.inRange || b.score - a.score); // stable: ties keep snapshot order
+  // Ties on words fall back to importance: higher priority, then earliest due date (overdue first), undated last.
+  const due = (t) => (t.dueDate ? day(t.dueDate) : "9999");
+  scored.sort((a, b) => b.inRange - a.inRange || b.score - a.score || (b.t.priority || 1) - (a.t.priority || 1) || due(a.t).localeCompare(due(b.t)));
   for (const { t } of scored) push(t);
   return out.slice(0, Number.isFinite(cap) ? Math.max(0, cap) : DEFAULT_CAP);
 }

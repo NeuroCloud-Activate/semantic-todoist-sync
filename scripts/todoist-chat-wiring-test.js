@@ -450,6 +450,25 @@ test("placement wording has no quoted internal phrases", async () => {
   assert.ok(!/its parent task"|the end of note"|the end of the note"/.test(sentences), sentences);
   assert.ok(/in the monthly note under|at the end of|under its parent task in/.test(sentences), sentences);
 });
+test("look-up step is told today's device date", async () => {
+  let lookupSystem = "";
+  const p = makePlugin({ lookup: lookupOf({}), answer: claims() });
+  const inner = p.openaiResponse;
+  p.openaiResponse = async (request) => { if (request.operation === "todoist-lookup") lookupSystem = request.system; return inner(request); };
+  await p.chat("What tasks do I have to do today?", null, [], "chat-query", { todoist: true });
+  const d = new Date(); const pad = (n) => String(n).padStart(2, "0");
+  assert.ok(lookupSystem.includes(`Today's date is ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`), lookupSystem);
+});
+
+test("when more tasks match than are listed, the model is told the true total", async () => {
+  let userText = "";
+  const many = Array.from({ length: 45 }, (_, i) => task({ id: `m${i}`, content: `Due task ${i}`, dueDate: "2026-10-28" }));
+  const p = makePlugin({ lookup: lookupOf({ filters: { words: [], projects: [], labels: [], dueFrom: "2026-10-28", dueTo: "2026-10-28" } }), answer: (request) => { userText = request.user; return claims(); }, snapshot: baseSnapshot([...many, task({ id: "other", dueDate: "2026-11-01" })]) });
+  await p.chat("What is due today?", null, [], "chat-query", { todoist: true });
+  assert.ok(userText.includes("45 tasks match; the first 40 are listed"), userText.slice(0, 400));
+  assert.equal(userText.split("evidence_id=todoist-m").length - 1, 40, "still at most 40 listed");
+});
+
 test("shortlisted Todoist tasks are citable evidence", async () => {
   let userText = "";
   const p = makePlugin({

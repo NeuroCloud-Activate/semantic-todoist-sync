@@ -1,3 +1,10 @@
+## 0.9.34 - 2026-10-28
+### Fixed
+- **Asking what is due today (or tomorrow, this week, overdue) now finds those Todoist tasks.** The chat's Todoist look-up was never told today's date, so it ignored the date and showed 40 tasks picked regardless of their due date. It now gets the date, and when more tasks match than fit in the answer it is told the real total.
+- Live check (Oct 28, 2026): "what tasks do I have to do today" went from 1 of 40 tasks due today (answer said nothing was due) to 40 of 40, and the answer gave the real total of 62.
+- **When many tasks match equally, the most important come first.** If the words in a question don't separate the tasks (as with "what's due today"), they are ranked by priority, then by earliest due date (overdue first), before the answer's 40-task limit. Before, the order was whatever Todoist returned. In the live check, all 15 P1 tasks due today made the list (4 were left out before) and no P3 task displaced a P1 or P2.
+- Tests: `npm test` passes 77/77, including tests that the look-up gets today's date, the real total is passed on, and ties rank by priority then due date.
+
 ## 0.9.33 - 2026-10-28
 ### Changed
 - **Tasks and notes named in a chat answer are linked right where they are named.** The answer no longer lists a task as a link and then names it again in the next sentence. Sources used only for background still appear once, as a link after the sentence that used them.

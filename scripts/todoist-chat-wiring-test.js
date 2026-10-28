@@ -614,6 +614,141 @@ test("change turn with model text keeps it unchanged", async () => {
   const r = await p.chat("Make compost urgent", null, [], "chat-query", { todoist: true });
   assert.ok(!r.answer.includes("I've prepared"), r.answer);
 });
+// Turn-by-turn follow-ups: the look-up supplies a standalone vault query and says when the last evidence is reused.
+const withRetrievalLog = (p) => { p.queries = []; p.retrieveAdaptiveSemanticContext = async (query) => { p.queries.push(query); return [indexRow("fresh")]; }; return p; };
+const prevRows = () => [{ evidenceId: "E-prev", path: "Notes/Jim.md", title: "Jim note", text: "Previous evidence marker-prev", sourceKind: "note" }];
+
+test("follow-up searches the vault with the look-up's standalone query", async () => {
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ searchQuery: "Jim tasks due today", reuseEvidence: false }), answer: claims() }));
+  await p.chat("what's specific to Jim?", null, [], "chat-query", { todoist: true, previousContext: prevRows() });
+  assert.equal(p.queries.length, 1);
+  assert.ok(p.queries[0].includes("Jim tasks due today"), p.queries[0]);
+  assert.ok(!p.queries[0].includes("specific to Jim"), "raw follow-up replaced");
+});
+
+test("blank searchQuery falls back to the prompt", async () => {
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ searchQuery: "  ", reuseEvidence: false }), answer: claims() }));
+  await p.chat("what's specific to Jim?", null, [], "chat-query", { todoist: true });
+  assert.ok(p.queries[0].includes("specific to Jim"), p.queries[0]);
+});
+
+test("reuseEvidence with previous context skips retrieval and reuses it", async () => {
+  let userText = "";
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ searchQuery: "", reuseEvidence: true }), answer: (request) => { userText = request.user; return claims(["E-prev"]); } }));
+  const prev = prevRows();
+  const r = await p.chat("make that shorter", null, [], "chat-query", { todoist: true, previousContext: prev });
+  assert.equal(p.queries.length, 0, "no new search");
+  assert.ok(userText.includes("marker-prev"), "previous evidence reaches the model");
+  assert.ok(!userText.includes("marker-fresh"));
+  assert.ok(r.context.some((row) => row.evidenceId === "E-prev"), "result context is the reused evidence");
+});
+
+test("reuseEvidence without previous context still searches", async () => {
+  for (const previousContext of [undefined, null, []]) {
+    const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ searchQuery: "", reuseEvidence: true }), answer: claims() }));
+    await p.chat("make that shorter", null, [], "chat-query", { todoist: true, previousContext });
+    assert.equal(p.queries.length, 1, String(previousContext));
+    assert.ok(p.queries[0].includes("make that shorter"));
+  }
+});
+
+test("previous context is ignored when the look-up does not ask to reuse it", async () => {
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ searchQuery: "Jim", reuseEvidence: false }), answer: claims() }));
+  await p.chat("and Jim?", null, [], "chat-query", { todoist: true, previousContext: prevRows() });
+  assert.equal(p.queries.length, 1);
+});
+
+test("no-Todoist look-up still returns { lookup } and the answer uses its search query", async () => {
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none", searchQuery: "vendor invoices policy", reuseEvidence: false }), answer: claims() }));
+  const turn = await p.todoistChatTurn("and the policy?", [], null);
+  assert.deepEqual(Object.keys(turn), ["lookup"]);
+  assert.equal(p.calls.snapshot.length, 0);
+  const r = await p.chat("and the policy?", null, [], "chat-query", { todoist: true });
+  assert.ok(r.answer.includes("Compost is on your list"));
+  assert.ok(p.queries[0].includes("vendor invoices policy"), p.queries[0]);
+  assert.ok(!r.answer.includes("Todoist wasn't available"));
+});
+
+test("a failed look-up returns null and retrieval falls back to the prompt", async () => {
+  const p = withRetrievalLog(makePlugin({ lookup: lookupOf(), answer: claims() }));
+  const original = p.openaiResponse;
+  p.openaiResponse = async (request) => { if (request.operation === "todoist-lookup") throw new Error("down"); return original(request); };
+  assert.equal(await p.todoistChatTurn("anything", [], null), null);
+  const r = await p.chat("what's specific to Jim?", null, [], "chat-query", { todoist: true, previousContext: prevRows() });
+  assert.ok(r.answer);
+  assert.ok(p.queries[0].includes("specific to Jim"), p.queries[0]);
+});
+
+test("view keeps the last answer's context for follow-ups and New chat clears it", async () => {
+  const view = Object.create(Plugin.SemanticTodoistView.prototype);
+  const seen = [];
+  const ctx = [{ evidenceId: "E1" }];
+  Object.assign(view, {
+    promptEl: { value: "q" }, messages: [], webSearchMode: "off", setStatus() {}, addMessage() {}, renderRelevantNotes() {}, replaceLastAssistantMessage() {}, addMessageAction() {},
+    renderMessages() {}, getSelectedActiveContext: async () => null, lastContext: null, lastWriteEvidence: { stale: true },
+    plugin: { chat: async (prompt, active, history, op, options) => { seen.push(options.previousContext); return { answer: "ok", context: ctx }; }, restoreDuplicateReviewBoxes: async () => {} }
+  });
+  await view.ask();
+  assert.equal(seen[0], null);
+  assert.equal(view.lastContext, ctx);
+  view.promptEl.value = "q2";
+  await view.ask();
+  assert.equal(seen[1], ctx);
+  view.newChat();
+  assert.equal(view.lastContext, null);
+  assert.equal(view.lastWriteEvidence, null);
+});
+const jimTasks = () => baseSnapshot([
+  task({ id: "j1", content: "Call Jim about roof", priority: 4, dueDate: "2026-10-28" }),
+  task({ id: "a1", content: "Buy compost", priority: 4, dueDate: "2026-10-28" }),
+  task({ id: "j2", content: "Jim invoice", priority: 1, dueDate: "2026-10-28" }),
+  task({ id: "x1", content: "Jim old thing", priority: 4, dueDate: "2026-09-01" })
+]);
+const todayQ = () => lookupOf({ filters: { words: [], projects: [], labels: [], dueFrom: "2026-10-28", dueTo: "2026-10-28" } });
+const turnIds = (turn) => turn.shortlist.map((t) => t.id).sort();
+const followUp = (p, lookup) => { p.openaiResponse = async () => JSON.stringify(lookup); return p.todoistChatTurn("and Jim?", [], null); };
+const noDates = { projects: [], labels: [], dueFrom: null, dueTo: null };
+
+test("follow-up with needsTodoist false and refersToLastAnswer re-filters the previous answer's tasks", async () => {
+  const p = makePlugin({ lookup: todayQ(), snapshot: jimTasks() });
+  await p.todoistChatTurn("tasks today", [], null);
+  const turn = await followUp(p, lookupOf({ needsTodoist: false, kind: "none", refersToLastAnswer: true, filters: { words: ["Jim"], ...noDates } }));
+  assert.deepEqual(turnIds(turn), ["j1", "j2"]);
+});
+
+test("needsTodoist false and refersToLastAnswer false stays { lookup }", async () => {
+  const p = makePlugin({ lookup: todayQ(), snapshot: jimTasks() });
+  await p.todoistChatTurn("tasks today", [], null);
+  const turn = await followUp(p, lookupOf({ needsTodoist: false, kind: "none", refersToLastAnswer: false }));
+  assert.deepEqual(Object.keys(turn), ["lookup"]);
+});
+
+test("follow-up inherits the due range and words union across turns", async () => {
+  const p = makePlugin({ lookup: todayQ(), snapshot: jimTasks() });
+  await p.todoistChatTurn("tasks today", [], null);
+  await followUp(p, lookupOf({ refersToLastAnswer: true, filters: { words: ["Jim"], ...noDates } }));
+  const turn = await followUp(p, lookupOf({ refersToLastAnswer: true, filters: { words: [], ...noDates, priority: 4 } }));
+  assert.deepEqual(turn.lookup.filters.words, ["Jim"]);
+  assert.equal(turn.lookup.filters.dueFrom, "2026-10-28");
+  assert.deepEqual(turnIds(turn), ["j1"]);
+});
+
+test("change requests do not inherit dates", async () => {
+  const p = makePlugin({ lookup: todayQ(), snapshot: jimTasks() });
+  await p.todoistChatTurn("tasks today", [], null);
+  const turn = await followUp(p, lookupOf({ kind: "change", refersToLastAnswer: true, filters: { words: ["Jim"], ...noDates } }));
+  assert.equal(turn.lookup.filters.dueFrom, null);
+  assert.equal(turn.lookup.filters.dueTo, null);
+});
+
+test("New chat clears the remembered Todoist answer and filters", async () => {
+  const view = Object.create(Plugin.SemanticTodoistView.prototype);
+  Object.assign(view, { messages: [], renderMessages() {}, renderRelevantNotes() {}, setStatus() {}, plugin: { lastTodoistAnswerTaskIds: ["t1"], lastTodoistFilters: { words: ["Jim"] }, restoreDuplicateReviewBoxes: async () => {} } });
+  view.newChat();
+  assert.deepEqual(view.plugin.lastTodoistAnswerTaskIds, []);
+  assert.equal(view.plugin.lastTodoistFilters, null);
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of cases) {

@@ -119,6 +119,103 @@ async function main() {
     console.log("PASS merges 4 research + 8 vault + 8 context as E1..E20 with sync before retrieval");
   }
 
+  // 1b. the conversation so far reaches the model, and follow-ups search with it.
+  {
+    const plugin = makeStub({ research: null });
+    await writeWithEvidence(plugin, { instruction: "Now make it shorter", length: "standard", active: ACTIVE, history: "User: Draft a note about the IRGP review\nAssistant: The IRGP review starts in May." });
+    assert.ok(plugin.captured.request.user.includes("refers to):\nUser: Draft a note about the IRGP review"), plugin.captured.request.user.slice(0, 300));
+    assert.ok(plugin.captured.query.includes("Draft a note about the IRGP review") && plugin.captured.query.includes("Now make it shorter"), "follow-up search includes the earlier request: " + plugin.captured.query);
+    const fresh = makeStub({ research: null });
+    await writeWithEvidence(fresh, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.ok(!fresh.captured.request.user.includes("Conversation so far"), "no conversation block on a new chat");
+    assert.strictEqual(fresh.captured.query, "Draft it", "first request searches as before");
+    console.log("PASS conversation history reaches collaborate prompt and search");
+  }
+
+  // 1c. searchQuery drives retrieval; absent it nothing changes.
+  {
+    const plugin = makeStub({ research: null });
+    await writeWithEvidence(plugin, { instruction: "what's specific to Jim?", searchQuery: "Jim tasks due today", length: "standard", active: ACTIVE, history: "User: what tasks do I have today" });
+    assert.strictEqual(plugin.captured.query, "Jim tasks due today", "searchQuery replaces the instruction-based query: " + plugin.captured.query);
+    assert.ok(plugin.captured.request.user.includes("Instruction: what's specific to Jim?"), "the model still sees the real instruction");
+    const blank = makeStub({ research: null });
+    await writeWithEvidence(blank, { instruction: "Draft it", searchQuery: "   ", length: "standard", active: ACTIVE });
+    assert.strictEqual(blank.captured.query, "Draft it", "blank searchQuery falls back");
+    console.log("PASS searchQuery drives retrieval");
+  }
+
+  // 1d. reuseEvidence skips retrieval and keeps the previous evidence; without previous evidence it searches normally.
+  {
+    const first = makeStub({ research: null, modelText: "a [E1] b [E2]" });
+    const r1 = await writeWithEvidence(first, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.ok(Array.isArray(r1.evidence) && r1.evidence.length === r1.evidenceCount, "result carries its evidence");
+    const plugin = makeStub({ research: null, modelText: "shorter [E2]" });
+    const r2 = await writeWithEvidence(plugin, { instruction: "make it shorter", reuseEvidence: true, previousEvidence: r1.evidence, length: "standard", active: ACTIVE });
+    for (const call of ["retrieve", "embed", "search", "sync", "getContextStore", "getResearchStore"]) assert.ok(!plugin.calls.includes(call), `reuse skipped ${call}: ` + JSON.stringify(plugin.calls));
+    assert.strictEqual(r2.evidenceCount, r1.evidenceCount, "previous evidence kept");
+    assert.ok(plugin.captured.request.user.includes('<evidence id="E2"'), "previous evidence reaches the prompt");
+    assert.ok(r2.markdown.includes("[^1]"), "citations resolve against the reused evidence: " + r2.markdown);
+    const none = makeStub({ research: null });
+    await writeWithEvidence(none, { instruction: "make it shorter", reuseEvidence: true, previousEvidence: [], length: "standard", active: ACTIVE });
+    assert.ok(none.calls.includes("retrieve"), "empty previous evidence searches normally");
+    console.log("PASS reuseEvidence skips retrieval and keeps previous evidence");
+  }
+
+  // 1e. task source notes join the vault evidence once, as ordinary vault notes; tasks never become evidence.
+  {
+    const plugin = makeStub({ vault: 2, context: 0, research: null, modelText: "x [E3]" });
+    const notes = { "Projects/Jim.md": "Jim note body", "Notes/vault-1.md": "vault one full" };
+    plugin.readNoteText = async (p) => (p in notes ? notes[p] : "text of " + p);
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", taskSourcePaths: ["Projects/Jim.md", "Notes/vault-1.md", "Notes/active.md"], length: "standard", active: ACTIVE });
+    assert.deepStrictEqual(result.sources.map((s) => s.path), ["Notes/vault-1.md", "Notes/vault-2.md", "Projects/Jim.md"], "task note added after retrieved evidence, duplicates and the active note skipped");
+    assert.ok(plugin.captured.request.user.includes("Jim note body"), "task note text reaches the prompt");
+    assert.ok(result.footnotes.includes("[[Projects/Jim]]"), "cited like a vault note: " + result.footnotes);
+    assert.ok(!/todoist/i.test(plugin.captured.request.user.split("Evidence (cite by id):")[1] || ""), "no todoist wording in evidence or sources searched");
+    const off = makeStub({ vault: 0, context: 0, research: null });
+    off.readNoteText = async () => "body";
+    const offResult = await writeWithEvidence(off, { instruction: "Draft it", useVault: false, taskSourcePaths: ["Projects/Jim.md"], length: "standard", active: ACTIVE });
+    assert.strictEqual(offResult.evidenceCount, 0, "vault off: task notes not added");
+    const unreadable = makeStub({ vault: 0, context: 0, research: null });
+    const unreadableResult = await writeWithEvidence(unreadable, { instruction: "Draft it", taskSourcePaths: ["Gone.md"], length: "standard", active: ACTIVE });
+    assert.strictEqual(unreadableResult.evidenceCount, 0, "unreadable task note skipped");
+    const reuse = makeStub({ research: null });
+    reuse.readNoteText = async () => "body";
+    await writeWithEvidence(reuse, { instruction: "shorter", reuseEvidence: true, previousEvidence: result.evidence, taskSourcePaths: ["Projects/Other.md"], length: "standard", active: ACTIVE });
+    assert.ok(!reuse.captured.request.user.includes("Projects/Other.md"), "reuse mode does not add task notes");
+    console.log("PASS task source notes join vault evidence once");
+  }
+
+  // 1f. Todoist task references never become evidence; filtered rows do not shrink the vault limit; long search queries are capped.
+  {
+    const plugin = makeStub({ vault: 0, context: 0, research: null, modelText: "x" });
+    const real = Array.from({ length: 8 }, (_, i) => ({ path: `Notes/real-${i + 1}.md`, section: "S", text: `real ${i + 1}` }));
+    plugin.retrieveSemanticContext = async () => [
+      { path: "@todoist/task/1c2k8e7", text: "task row" },
+      { chunk: { path: "Notes/kind.md", sourceKind: "todoist-snapshot-reference-row", text: "k" } },
+      { chunk: { path: "Notes/tree.md", sourceKind: "subtask-task-tree-record", text: "k" } },
+      ...real,
+    ];
+    plugin.readNoteText = async (p) => "body of " + p;
+    const result = await writeWithEvidence(plugin, { instruction: "Draft it", length: "standard", active: ACTIVE });
+    assert.deepStrictEqual(result.sources.map((s) => s.path), real.map((r) => r.path), "no task rows, and real notes still fill the limit");
+    const dropped = makeStub({ vault: 0, context: 0, research: null });
+    dropped.readNoteText = async (p) => "body of " + p;
+    const prevEv = [
+      { eid: "E1", text: "t1", source: { kind: "vault", path: "@todoist/task/abc" } },
+      { eid: "E2", text: "t2", source: { kind: "vault", path: "Notes/keep.md" } },
+    ];
+    const reused = await writeWithEvidence(dropped, { instruction: "shorter", reuseEvidence: true, previousEvidence: prevEv, taskSourcePaths: ["@todoist/task/zzz"], length: "standard", active: ACTIVE });
+    assert.deepStrictEqual(reused.evidence.map((e) => e.source.path), ["Notes/keep.md"], "task paths dropped from reused and task-source evidence");
+    const mixed = makeStub({ vault: 0, context: 0, research: null });
+    mixed.readNoteText = async (p) => "body of " + p;
+    const mixedResult = await writeWithEvidence(mixed, { instruction: "Draft it", taskSourcePaths: ["@todoist/task/zzz", "Projects/Jim.md"], length: "standard", active: ACTIVE });
+    assert.deepStrictEqual(mixedResult.sources.map((s) => s.path), ["Projects/Jim.md"], "@todoist path dropped from taskSourcePaths");
+    const long = makeStub({ vault: 1, context: 0, research: null });
+    await writeWithEvidence(long, { instruction: "Draft it", searchQuery: "q".repeat(500), length: "standard", active: ACTIVE });
+    assert.ok(long.captured.query.length <= 300, "search query capped at 300, got " + long.captured.query.length);
+    console.log("PASS task references never become evidence; search query capped");
+  }
+
   // 2. vault-only when the context store is empty and research is off.
   {
     const plugin = makeStub({ context: 0, research: null });
@@ -895,6 +992,7 @@ async function main() {
     plugin.aiModelForRequest = () => ({ model: "fictional-write-model" });
     plugin.openaiResponse = async (request) => { captured.request = request; return "Text [E1]."; };
     const result = await plugin.writeWithEvidence("Fix this", {
+      history: "User: earlier ask",
       mode: "rewrite",
       citationStyle: "apa",
       active: { path: "Notes/active.md", text: "active note body", selection: "selected passage", cursorOffset: 5 },
@@ -906,6 +1004,7 @@ async function main() {
     assert.strictEqual(captured.request.system, REWRITE_SYSTEM_PROMPT, "the real wrapper forwards the collaborate mode (rewrite prompt), got: " + String(captured.request.system).slice(0, 60));
     assert.ok(result.markdown.includes("(Schott, 2002)"), "the real wrapper forwards the citation style (apa in-text), got: " + result.markdown);
     assert.ok(!result.markdown.includes("[^1]"), "no footnote marker for apa, got: " + result.markdown);
+    assert.ok(captured.request.user.includes("refers to):\nUser: earlier ask"), "the real wrapper forwards the conversation history");
     console.log("PASS real wrapper forwards mode and citationStyle");
   }
 

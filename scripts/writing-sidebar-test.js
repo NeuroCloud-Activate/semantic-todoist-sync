@@ -483,6 +483,113 @@ function makeWritePlugin(leafEntries, writeWithEvidenceImpl) {
   return plugin;
 }
 
+async function testCollaborateSendsConversation() {
+  // Collaborate continues the sidebar conversation: earlier turns go with the request; a new chat sends none.
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messages = [{ role: 'user', text: 'what is due today' }, { role: 'assistant', text: 'You have 62 tasks due today.' }];
+  view.promptEl.value = 'draft a short note about those';
+  await view.write();
+  assert.ok(String(plugin.lastWriteArgs().opts.history || '').includes('User: what is due today\nAssistant: You have 62 tasks due today.'), 'history sent: ' + plugin.lastWriteArgs().opts.history);
+  assert.ok(!String(plugin.lastWriteArgs().opts.history).includes('draft a short note about those'), 'current request is not repeated as history');
+  view.messages = [{ role: 'user', text: 'first ask' }, { role: 'assistant', text: 'Collaborating\u2026' }, { role: 'assistant', text: 'Thinking...' }];
+  view.promptEl.value = 'next';
+  await view.write();
+  assert.strictEqual(plugin.lastWriteArgs().opts.history, 'User: first ask', 'in-flight placeholders never enter history: ' + plugin.lastWriteArgs().opts.history);
+  view.messages = [];
+  view.promptEl.value = 'draft again';
+  await view.write();
+  assert.ok(!plugin.lastWriteArgs().opts.history, 'new chat sends no history');
+  console.log('PASS collaborate-sends-conversation');
+}
+
+async function testCollaborateUsesTodoistLookup() {
+  // The look-up step supplies the search query / reuse flag / task source notes; tasks themselves never become evidence.
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const files = { 'Projects/Jim.md': 1, 'Notes/B.md': 1, 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md': 1 };
+  const plugin = makeWritePlugin();
+  plugin.settings.taskCache = {
+    t1: { path: 'Projects/Jim.md' },
+    t2: { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' },
+    t3: { path: 'Gone/Missing.md' },
+    t4: {},
+    t6: { path: 'Projects/Jim.md' },
+    t7: { path: 'Notes/B.md' },
+  };
+  let lookupArgs = null;
+  const turn = { lookup: { searchQuery: 'Jim tasks due today', reuseEvidence: false }, shortlist: [{ id: 't1' }, { id: 't2' }, { id: 't3' }, { id: 't4' }, { id: 't5' }, { id: 't6' }, { id: 't7' }] };
+  plugin.todoistChatTurn = async (...args) => { lookupArgs = args; return turn; };
+  const view = makeWriteView(plugin, [leaf], leaf);
+  plugin.app.vault = { getAbstractFileByPath: (p) => (files[p] ? { path: p, extension: 'md' } : null) };
+  view.messages = [{ role: 'user', text: 'what tasks do I have today' }, { role: 'assistant', text: 'You have 62 tasks.' }];
+  view.promptEl.value = "what's specific to Jim?";
+  await view.write();
+  assert.ok(lookupArgs, 'look-up ran');
+  assert.strictEqual(lookupArgs[0], "what's specific to Jim?", 'look-up gets the request');
+  assert.ok(Array.isArray(lookupArgs[1]) && lookupArgs[1].length === 2 && !lookupArgs[1].some((m) => m.text === "what's specific to Jim?"), 'history excludes the current message: ' + JSON.stringify(lookupArgs[1]));
+  const opts = plugin.lastWriteArgs().opts;
+  assert.strictEqual(opts.searchQuery, 'Jim tasks due today', 'searchQuery forwarded');
+  assert.ok(!opts.reuseEvidence, 'no reuse without earlier evidence');
+  assert.deepStrictEqual(opts.taskSourcePaths, ['Projects/Jim.md', 'Notes/B.md'], 'uncached, missing, monthly and duplicate sources skipped, order kept');
+  assert.ok(!('todoistTasks' in opts), 'tasks themselves are never forwarded');
+  // evidence is stored, then a reuse-only follow-up forwards it
+  const stored = [{ eid: 'E1', text: 't', source: { kind: 'vault', path: 'Notes/B.md' } }];
+  const plugin2 = makeWritePlugin(null, async () => ({ markdown: 'D', footnotes: '', sources: [], dropped: 0, evidence: stored }));
+  plugin2.settings.taskCache = {};
+  plugin2.todoistChatTurn = async () => ({ lookup: { searchQuery: '', reuseEvidence: true }, shortlist: [] });
+  const view2 = makeWriteView(plugin2, [leaf], leaf);
+  plugin2.app.vault = { getAbstractFileByPath: () => null };
+  view2.promptEl.value = 'first';
+  await view2.write();
+  assert.deepStrictEqual(view2.lastWriteEvidence, stored, 'lastWriteEvidence stored');
+  assert.ok(!plugin2.lastWriteArgs().opts.reuseEvidence, 'first write has nothing to reuse');
+  view2.promptEl.value = 'shorter';
+  await view2.write();
+  const o2 = plugin2.lastWriteArgs().opts;
+  assert.strictEqual(o2.reuseEvidence, true, 'reuse forwarded');
+  assert.deepStrictEqual(o2.previousEvidence, stored, 'previous evidence forwarded');
+  assert.strictEqual(o2.searchQuery, undefined, 'blank searchQuery not forwarded');
+  assert.deepStrictEqual(o2.taskSourcePaths, [], 'no task notes');
+  // follow-up on a previous Ask answer: its task notes and evidence notes join the sources (never tasks); neither flag = not added
+  const askFiles = { 'Projects/Jim.md': 1, 'Notes/Ev1.md': 1, 'Notes/Ev2.md': 1, 'Notes/N3.md': 1, 'Notes/N4.md': 1, 'Notes/N5.md': 1, 'Notes/N6.md': 1, 'Notes/N7.md': 1, 'Notes/N8.md': 1, 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md': 1 };
+  const makeAskView = (lookup) => {
+    const p = makeWritePlugin();
+    p.settings.taskCache = { a1: { path: 'Projects/Jim.md' }, a2: { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' }, a3: { path: 'Notes/Ev1.md' } };
+    p.lastTodoistAnswerTaskIds = ['a1', 'a2', 'a3'];
+    p.todoistChatTurn = async () => ({ lookup, shortlist: [] });
+    const v = makeWriteView(p, [leaf], leaf);
+    p.app.vault = { getAbstractFileByPath: (x) => (askFiles[x] ? { path: x, extension: 'md' } : null) };
+    v.lastContext = [{ path: '@todoist/task/x' }, { path: '' }, { path: 'Notes/Ev1.md' }, { path: 'Notes/Ev2.md' }, { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' },
+      ...['N3', 'N4', 'N5', 'N6', 'N7', 'N8'].map((n) => ({ path: `Notes/${n}.md` }))];
+    v.promptEl.value = 'Draft a short status note on the Jim items above';
+    return { p, v };
+  };
+  const ask1 = makeAskView({ needsTodoist: false, refersToLastAnswer: true, reuseEvidence: true, searchQuery: 'Jim tasks due today' });
+  await ask1.v.write();
+  const o4 = ask1.p.lastWriteArgs().opts;
+  assert.deepStrictEqual(o4.taskSourcePaths, ['Projects/Jim.md', 'Notes/Ev1.md', 'Notes/Ev2.md', 'Notes/N3.md', 'Notes/N4.md', 'Notes/N5.md', 'Notes/N6.md', 'Notes/N7.md'], 'previous answer notes: task sources first, then evidence notes, no @todoist, no monthly, deduped, cap 8: ' + JSON.stringify(o4.taskSourcePaths));
+  assert.strictEqual(o4.searchQuery, 'Jim tasks due today', 'searchQuery forwarded');
+  const ask2 = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: false, searchQuery: 'vendor policy' });
+  await ask2.v.write();
+  assert.deepStrictEqual(ask2.p.lastWriteArgs().opts.taskSourcePaths, [], 'previous answer notes not added without refersToLastAnswer/reuseEvidence');
+  const ask3 = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: true, searchQuery: 'x' });
+  await ask3.v.write();
+  assert.ok(ask3.p.lastWriteArgs().opts.taskSourcePaths.includes('Notes/Ev2.md'), 'reuseEvidence alone also adds previous answer notes');
+  const longQ = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: false, searchQuery: 'q'.repeat(500) });
+  await longQ.v.write();
+  assert.strictEqual(longQ.p.lastWriteArgs().opts.searchQuery.length, 300, 'searchQuery capped at 300');
+  // a look-up that throws still writes
+  const plugin3 = makeWritePlugin();
+  plugin3.todoistChatTurn = async () => { throw new Error('boom'); };
+  const view3 = makeWriteView(plugin3, [leaf], leaf);
+  view3.promptEl.value = 'draft';
+  await view3.write();
+  assert.strictEqual(plugin3.writeCallCount(), 1, 'look-up failure still writes');
+  assert.ok(!plugin3.lastWriteArgs().opts.reuseEvidence && !plugin3.lastWriteArgs().opts.searchQuery, 'no look-up data forwarded');
+  console.log('PASS collaborate-uses-todoist-lookup');
+}
+
 async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   // (1) Active view null AND lastActiveMarkdownLeaf null, one markdown leaf open
   // → write proceeds against THAT note: position captured pre-await,
@@ -1307,6 +1414,8 @@ async function runTests() {
   testClosedNoteShowsDraftAndInsertButton();
   testInsertButtonUsesLeafLookup();
   testInsertButtonClosedNoteNotice();
+  await testCollaborateSendsConversation();
+  await testCollaborateUsesTodoistLookup();
   await testWriteProceedsWithVisibleLeafAndNoLastActive();
   await testWritePrefersMostRecentLeaf();
   await testWriteWithNoMarkdownLeafKeepsMessage();

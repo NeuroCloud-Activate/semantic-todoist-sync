@@ -18,7 +18,7 @@ const TODOIST_API = "https://api.todoist.com/api/v1";
 // Lazy: tests load a temp copy of this file, where relative requires at load time would not resolve.
 const todoistModules = () => ({
   ...require("./todoist/plan.js"), ...require("./todoist/preview.js"), ...require("./todoist/apply.js"),
-  ...require("./todoist/lookup.js"), ...require("./todoist/placement.js"), ...require("./todoist/dedupe.js"), ...require("./todoist/monthly-note.js")
+  ...require("./todoist/lookup.js"), ...require("./todoist/placement.js"), ...require("./todoist/dedupe.js"), ...require("./todoist/monthly-note.js"), ...require("./todoist/snapshot-delta.js")
 });
 const SEMANTIC_INDEX_FILE = "semantic-index.json";
 const OPENAI_SEMANTIC_INDEX_FILE = "semantic-index.openai.json";
@@ -9115,6 +9115,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   backgroundTick() {
     const now = Date.now();
     if (!this.canStartBackgroundWork()) return;
+    if (this.settings.todoistToken && !this.todoistBackgroundRefresh && !this.hasFreshTodoistSnapshot()
+      && elapsedMs(this.todoistBackgroundFailedAt) >= Math.max(1, Number(this.settings.todoistSnapshotCacheMinutes || 5)) * 60 * 1000) {
+      // Single-flight keep-warm: after the first full download this is a small changes-only request.
+      this.todoistBackgroundRefresh = this.getTodoistSnapshot(["items", "projects", "sections"], true)
+        .catch((error) => { this.todoistBackgroundFailedAt = Date.now(); this.logLocal("Todoist background snapshot refresh failed", { error: String(error?.message || error) }); })
+        .finally(() => { this.todoistBackgroundRefresh = null; });
+    }
     if (this.settings.autoProcessEmails && this.settings.workerUrl && this.settings.workerToken && elapsedMs(this.settings.lastEmailPollAt) >= emailAutoPollIntervalSeconds(this.settings) * 1000) {
       this.processPendingEmails(false, { automatic: true });
     }
@@ -14214,7 +14221,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       : null;
     const duplicatesNotSearched = Boolean(todoistTurn?.duplicates);
     if (duplicatesNotSearched) todoistTurn = null; // answer from the vault as usual and add a sentence
-    const query = [prompt, active?.title, active?.selection].filter(Boolean).join("\n");
+    // Look-up rewrites the message into a standalone query carrying the conversation's subject; blank or failed look-up keeps the raw prompt.
+    const lookupQuery = typeof todoistTurn?.lookup?.searchQuery === "string" ? todoistTurn.lookup.searchQuery.trim().slice(0, 300) : "";
+    const query = [lookupQuery || prompt, active?.title, active?.selection].filter(Boolean).join("\n");
+    // Message only reworks the previous answer: reuse its evidence instead of searching again.
+    const reuseContext = todoistTurn?.lookup?.reuseEvidence === true && Array.isArray(options?.previousContext) && options.previousContext.length > 0;
     const activeText = active?.text ? (active.selection || active.text) : "";
     const source = active?.path ? { type: "note", title: active.title || "", path: active.path, text: activeText } : null;
     const sourceContract = source ? buildTaskSourceContract(source, activeText, this.settings) : null;
@@ -14222,7 +14233,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let context;
     let reservedTaskEvidence = null;
     let chatContextBundle = null;
-    if (requestedTaskScopes.length) {
+    if (reuseContext) {
+      context = options.previousContext;
+    } else if (requestedTaskScopes.length) {
       const perScopeLimit = Math.max(1, Math.min(5, Math.floor(Math.max(1, Number(this.settings.maxChatContextChunks || 8)) / requestedTaskScopes.length)));
       const taskScopeRetrieval = await this.withAiActivity("Finding vault context", () => this.retrieveTaskSemanticContexts(requestedTaskScopes.map((record) => {
         const taskRequestPlan = contextQueryPlan(record.requestText || "", "chat", record.queryPlan || record);
@@ -14292,7 +14305,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       context = await this.withAiActivity("Finding vault context", () => this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt, { sourceContract }));
       context = dropStaleTodoistIndexRows(context, todoistTurn?.snapshot);
     }
-    if (!reservedTaskEvidence) {
+    if (!reservedTaskEvidence && !reuseContext) {
       const rawContext = context || [];
       const retrievalTelemetry = rawContext.semanticRetrieval?.telemetry || {};
       chatContextBundle = buildChatContextBundle({
@@ -14386,6 +14399,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "When an answer states that an element is not established from the supplied evidence, also check the supplied evidence for established facts that are directly relevant to the asked topic: when such facts exist, state them as separate established claims with their exact evidence_ids, placed first or immediately after the not-established claim; a related established claim must state only what its cited evidence actually says about the asked topic, never the missing element, and must not upgrade any epistemic state; include related claims only when they are directly relevant to the asked topic; when no supplied evidence relates to the asked topic, briefly say so in the not-established claim instead of adding related claims.",
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
+        "Read the recent chat first. A short follow-up continues the previous question: keep its subject and scope (for example, after a question about today's Todoist tasks, \"what's specific to Jim?\" means Jim's tasks due today) unless the user clearly changes topic, and lead with the evidence that fits that scope.",
         "Treat the active note as the primary supplied evidence. Set established=true only when the claim is supported by one or more supplied evidence_ids; otherwise set established=false and say that the element is not established.",
         "For every supported claim, return the exact supplied evidence_ids. When a sentence names a specific task or note directly, write its name once as a Markdown link to its exact evidence_id, like [name](evidence_id), inside the sentence instead of naming it again elsewhere; never write URLs. Evidence used only as background stays in evidence_ids, and the plugin adds it as a source link. Do not write numbered citations or a source list yourself.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
@@ -14519,7 +14533,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   // Todoist chat actions. Look-up is read-only; the only Todoist writes are in applyTodoistChanges/undoLastTodoistChanges.
-  // -> null (vault-only), { duplicates }, { unavailable, lookup } or { lookup, snapshot, shortlist, allowedIds, labels, promptText }
+  // -> null (look-up failed), { lookup } (vault-only), { duplicates }, { unavailable, lookup } or { lookup, snapshot, shortlist, allowedIds, labels, promptText }
   async todoistChatTurn(prompt, history, captureContext = null) {
     let lookup;
     try {
@@ -14531,7 +14545,18 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       this.logLocal("Todoist look-up skipped", { error: error.message || String(error) });
       return null;
     }
-    if (!lookup?.needsTodoist) return null;
+    if (lookup?.refersToLastAnswer === true && lookup.kind !== "change" && lookup.kind !== "duplicates") {
+      const prev = this.lastTodoistFilters;
+      if (!lookup.needsTodoist && (this.lastTodoistAnswerTaskIds || []).length) lookup = { ...lookup, needsTodoist: true, kind: "question" };
+      if (lookup.needsTodoist && prev) {
+        const f = { ...(lookup.filters || {}) };
+        const none = !f.dueFrom && !f.dueTo && !(f.projects || []).length && !(f.labels || []).length;
+        if (none) Object.assign(f, { dueFrom: prev.dueFrom ?? null, dueTo: prev.dueTo ?? null, projects: prev.projects || [], labels: prev.labels || [] });
+        f.words = [...new Set([...(prev.words || []), ...(f.words || [])])];
+        lookup = { ...lookup, filters: f };
+      }
+    }
+    if (!lookup?.needsTodoist) return { lookup };
     if (lookup.kind === "duplicates") return { duplicates: true, lookup };
     if (!this.settings.todoistToken) return { unavailable: true, lookup };
     let snapshot;
@@ -14544,6 +14569,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const matched = todoistModules().shortlistTasks(snapshot, lookup, this.lastTodoistAnswerTaskIds || [], (snapshot.tasks || []).length);
     const shortlist = matched.slice(0, 40);
     this.lastTodoistAnswerTaskIds = shortlist.map((task) => task.id);
+    if (lookup.kind === "question") this.lastTodoistFilters = lookup.filters || null;
     const projects = snapshot.projects || [];
     const sections = snapshot.sections || [];
     const projectName = new Map(projects.map((project) => [project.id, project.name]));
@@ -15229,6 +15255,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const active = options && options.active ? options.active : await this.getActiveMarkdownContext();
     return writeWithEvidence(this, {
       instruction,
+      history: options ? options.history : undefined,
       length: options ? options.length : undefined,
       active,
       webSearchMode: options ? options.webSearchMode : undefined,
@@ -15240,6 +15267,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       // writing-mode: fix 3 forward the collaborate mode and the citation style; without them a pinned rewrite ran as a plain draft with footnote citations
       mode: options && Object.prototype.hasOwnProperty.call(options, "mode") ? options.mode : undefined,
       citationStyle: options && Object.prototype.hasOwnProperty.call(options, "citationStyle") ? options.citationStyle : undefined,
+      searchQuery: options ? options.searchQuery : undefined,
+      reuseEvidence: options ? options.reuseEvidence : undefined,
+      previousEvidence: options ? options.previousEvidence : undefined,
+      taskSourcePaths: options ? options.taskSourcePaths : undefined,
     });
   }
 
@@ -21094,21 +21125,39 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const cached = this.todoistSnapshotCache;
     const ttlMs = Math.max(1, Number(this.settings.todoistSnapshotCacheMinutes || 5)) * 60 * 1000;
     if (!force && cached?.key === key && elapsedMs(cached.fetchedAt) < ttlMs) return cached.snapshot;
-    const body = new URLSearchParams();
-    body.set("sync_token", "*");
-    body.set("resource_types", JSON.stringify(requested));
-    const response = await requestUrl({
-      url: `${TODOIST_API}/sync`,
-      method: "POST",
-      headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      throw: false
-    });
-    if (response.status < 200 || response.status >= 300) throw new Error(`Todoist snapshot returned ${response.status}: ${redactSecrets(response.text)}`);
+    // Sync state lives apart from todoistSnapshotCache so write-time invalidation keeps the token: the next fetch stays changes-only.
+    this.todoistSyncState = this.todoistSyncState || {};
+    // Non-reversible fingerprint ties stored sync state to the account's API token.
+    const tokenText = String(this.settings.todoistToken || "");
+    let tokenHash = 5381;
+    for (let i = 0; i < tokenText.length; i++) tokenHash = ((tokenHash * 33) ^ tokenText.charCodeAt(i)) >>> 0;
+    const fingerprint = `${tokenText.length}:${tokenHash}`;
+    let prior = this.todoistSyncState[key];
+    if (prior && prior.fingerprint !== fingerprint) prior = null;
+    const post = (syncToken) => {
+      const body = new URLSearchParams();
+      body.set("sync_token", syncToken);
+      body.set("resource_types", JSON.stringify(requested));
+      return requestUrl({
+        url: `${TODOIST_API}/sync`,
+        method: "POST",
+        headers: { authorization: `Bearer ${this.settings.todoistToken}`, "content-type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        throw: false
+      });
+    };
+    const failed = (r) => r.status < 200 || r.status >= 300;
+    let response = await post(prior?.token || "*");
+    let base = prior?.raw;
+    // Only 400/410 mean the sync token is invalid/expired; 429/5xx/401/403 would fail again and add load.
+    if (prior?.token && (response.status === 400 || response.status === 410)) { response = await post("*"); base = null; }
+    if (failed(response)) throw new Error(`Todoist snapshot returned ${response.status}: ${redactSecrets(response.text)}`);
     const json = response.json || {};
-    const projects = normalizeTodoistProjects(json.projects || []);
-    const sections = normalizeTodoistSections(json.sections || [], "");
-    const tasks = (json.items || [])
+    const merged = todoistModules().mergeSyncResponse(base, json);
+    this.todoistSyncState[key] = { token: json.sync_token || "", raw: merged.raw, fingerprint };
+    const projects = normalizeTodoistProjects(merged.raw.projects);
+    const sections = normalizeTodoistSections(merged.raw.sections, "");
+    const tasks = merged.raw.items
       .filter((task) => !task.is_deleted)
       .map(normalizeTodoistTask)
       .filter((task) => task.id && task.content);
@@ -23465,6 +23514,8 @@ class SemanticTodoistView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.messages = [];
+    this.lastContext = null; // evidence the last Ask answer used; reused by follow-ups that only rework it
+    this.lastWriteEvidence = null;
     this.selectedPath = "";
     this.includeActiveNote = plugin.settings.searchIncludeActiveNote !== false;
     this.statusDisplayEntries = new Map();
@@ -23741,7 +23792,8 @@ class SemanticTodoistView extends ItemView {
       this.addMessage("assistant", "Thinking...");
       const active = await this.getSelectedActiveContext();
       if (this.promptEl) this.promptEl.value = "";
-      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode, todoist: true });
+      const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode, todoist: true, previousContext: this.lastContext });
+      this.lastContext = result.context;
       this.renderRelevantNotes(result.context);
       this.replaceLastAssistantMessage(result.answer);
       if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary, applied) => {
@@ -23876,14 +23928,48 @@ class SemanticTodoistView extends ItemView {
       }
 
       this.setStatus("Collaborating…");
+      // Collaborate continues the sidebar conversation (Ask and Collaborate turns alike) until New chat or reload.
+      const previousMessages = this.messages.slice(-8);
+      const history = this.messages.length ? formatChatHistory(previousMessages) : "";
       // writing-mode: task 4 the sidebar message shows the resolved instruction (preset or typed), not the raw prompt
       this.addMessage("user", instruction);
       this.addMessage("assistant", "Collaborating…");
       if (this.promptEl) this.promptEl.value = "";
 
       try {
+        // Same per-message look-up as Ask: a standalone search query, whether the last evidence can be reused, and the notes the matched tasks came from (never the tasks).
+        let lookup = null;
+        let taskSourcePaths = [];
+        try {
+          const turn = typeof this.plugin.todoistChatTurn === "function" ? await this.plugin.todoistChatTurn(instruction, previousMessages) : null;
+          lookup = turn?.lookup || null;
+          const seenPaths = new Set();
+          const addSource = (notePath) => {
+            if (taskSourcePaths.length >= 8 || !notePath || String(notePath).startsWith("@todoist/") || seenPaths.has(notePath) || isMonthlyNotePath(notePath, this.plugin.settings)) return;
+            const file = this.plugin.app.vault.getAbstractFileByPath(notePath);
+            if (!file || file.children) return;
+            seenPaths.add(notePath);
+            taskSourcePaths.push(notePath);
+          };
+          for (const task of turn?.shortlist || []) addSource(this.plugin.settings.taskCache?.[task.id]?.path);
+          // Follow-up on the previous Ask answer: its task notes and evidence notes (never tasks) join the sources.
+          if (lookup?.refersToLastAnswer === true || lookup?.reuseEvidence === true) {
+            for (const id of this.plugin.lastTodoistAnswerTaskIds || []) addSource(this.plugin.settings.taskCache?.[id]?.path);
+            for (const row of this.lastContext || []) addSource(row?.path);
+          }
+        } catch (error) {
+          this.plugin.logLocal?.("Collaborate look-up skipped", { error: error.message || String(error) });
+          lookup = null;
+          taskSourcePaths = [];
+        }
+        const searchQuery = typeof lookup?.searchQuery === "string" ? lookup.searchQuery.trim().slice(0, 300) : "";
+        const reuse = lookup?.reuseEvidence === true && Array.isArray(this.lastWriteEvidence) && this.lastWriteEvidence.length > 0;
         // writing-mode: task 4 the request carries the resolved instruction and the citation style
         const result = await this.plugin.writeWithEvidence(instruction, {
+          history,
+          ...(searchQuery ? { searchQuery } : {}),
+          ...(reuse ? { reuseEvidence: true, previousEvidence: this.lastWriteEvidence } : {}),
+          ...(lookup ? { taskSourcePaths } : {}),
           mode,
           citationStyle,
           active,
@@ -23894,6 +23980,7 @@ class SemanticTodoistView extends ItemView {
           // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
           ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
         });
+        if (Array.isArray(result?.evidence)) this.lastWriteEvidence = result.evidence;
 
         // writing-mode: task 4 a pinned range drives the rewrite/check path: preview modal, chat answer, or continuation
         // ---- pinned selection: collaborate rewrite/check path ----
@@ -24298,6 +24385,10 @@ class SemanticTodoistView extends ItemView {
 
   newChat() {
     this.messages = [];
+    this.lastContext = null;
+    this.lastWriteEvidence = null;
+    this.plugin.lastTodoistAnswerTaskIds = [];
+    this.plugin.lastTodoistFilters = null;
     this.renderMessages();
     this.plugin.restoreDuplicateReviewBoxes?.(this).catch((error) => this.plugin.logLocal?.("Duplicate boxes not restored", { error: error.message || String(error) }));
     this.renderRelevantNotes([]);
@@ -36129,9 +36220,10 @@ function chatSentenceAlreadyEndsWithAllowedLink(sentence = "", allowed = new Map
 
 function formatChatHistory(messages) {
   const lines = (messages || [])
-    .filter((message) => message.role !== "assistant" || message.text !== "Thinking...")
+    .filter((message) => message.role !== "assistant" || (message.text !== "Thinking..." && message.text !== "Collaborating\u2026"))
     .slice(-8)
-    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${singleLine(message.text)}`);
+    // Long drafts and source lists are trimmed so eight turns stay a small part of the prompt.
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${singleLine(message.text).slice(0, 1500)}`);
   return lines.length ? lines.join("\n") : "No recent chat.";
 }
 

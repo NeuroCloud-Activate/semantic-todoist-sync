@@ -111,6 +111,15 @@ function noteContextSlice(text, selection, cursorOffset) {
   return full.slice(start, start + NOTE_CONTEXT_MAX_CHARS);
 }
 
+// Todoist task references are never evidence; mirrors src/main.js task-row classification (@todoist/ paths and task source kinds).
+const TASK_REFERENCE_SOURCE_KINDS = new Set(["todoist-task-reference", "todoist-snapshot-reference-row", "subtask-task-tree-record", "local-reference-table", "task-reference-parent-stub"]);
+function isTaskReferencePath(path) {
+  return String(path || "").startsWith("@todoist/");
+}
+function isTaskReferenceChunk(chunk) {
+  const row = (chunk && chunk.chunk) || chunk || {};
+  return isTaskReferencePath(row.path) || TASK_REFERENCE_SOURCE_KINDS.has(String(row.sourceKind || row.source_kind || ""));
+}
 function vaultEvidenceSource(chunk) {
   const row = (chunk && chunk.chunk) || chunk || {};
   const path = String(row.path || "");
@@ -351,12 +360,20 @@ async function writeWithEvidence(plugin, options) {
   // writing-mode: task 2 citation style defaults to footnotes
   const citationStyle = args.citationStyle === "apa" || args.citationStyle === "nature" ? args.citationStyle : "footnotes";
 
-  const query = retrievalQuery(instruction, active.selection);
+  // Earlier turns in this sidebar chat; a follow-up ("make it shorter", "what about Jim?") searches with the last request too.
+  const history = typeof args.history === "string" ? args.history.trim() : "";
+  const lastUserTurn = (history.match(/^User: .*$/gm) || []).pop() || "";
+  // The look-up step may supply a standalone query; otherwise the last request plus this one.
+  const searchQuery = typeof args.searchQuery === "string" ? args.searchQuery.trim().slice(0, 300) : "";
+  const query = retrievalQuery(searchQuery || [lastUserTurn.slice(6), instruction].filter(Boolean).join("\n"), active.selection);
+  // A follow-up that only reworks the previous answer reuses its evidence and searches nothing.
+  const previousEvidence = Array.isArray(args.previousEvidence) ? args.previousEvidence.filter((e) => e && typeof e.eid === "string" && e.source && !isTaskReferencePath(e.source.path)) : [];
+  const reuse = args.reuseEvidence === true && previousEvidence.length > 0;
 
   // writing-mode: task 11 saved research notes are its own store; skipped entirely when off or empty
   let researchStore = null;
   let researchRootInfo = null;
-  if (useResearch && typeof plugin.getResearchStore === "function") {
+  if (!reuse && useResearch && typeof plugin.getResearchStore === "function") {
     const research = await plugin.getResearchStore();
     if (research && research.store) {
       researchStore = research.store;
@@ -370,7 +387,7 @@ async function writeWithEvidence(plugin, options) {
   // writing-mode: task 10 skip the context store entirely when context evidence is off
   let contextStore = null;
   let rootInfo = { kind: "vault", root: "Semantic Todoist Sync/Context" };
-  if (useContext) {
+  if (!reuse && useContext) {
     const context = await plugin.getContextStore();
     contextStore = context && context.store ? context.store : context;
     rootInfo = (context && context.rootInfo) || { kind: "vault", root: "Semantic Todoist Sync/Context" };
@@ -391,10 +408,10 @@ async function writeWithEvidence(plugin, options) {
   const vaultReason = vaultReady || !useVault ? "" : String(vaultStatus.reason || "unavailable");
   const vaultWanted = useVault;
   // ponytail: quota merge because the two score scales differ; calibrate if one source keeps crowding out the other.
-  const vaultChunks = vaultReady ? ((await plugin.retrieveSemanticContext(query, VAULT_EVIDENCE_LIMIT)) || []) : [];
+  const vaultChunks = vaultReady && !reuse ? ((await plugin.retrieveSemanticContext(query, VAULT_EVIDENCE_LIMIT)) || []).filter((c) => !isTaskReferenceChunk(c)) : [];
   // writing-mode: task 10 context embedding and search keep their original position (after vault retrieval)
   let contextHitsReady = [];
-  if (useContext && contextStore) {
+  if (!reuse && useContext && contextStore) {
     const embedded = await plugin.embedTexts([query], "query");
     const queryVector = Array.isArray(embedded) ? embedded[0] : [];
     contextHitsReady = (await contextStore.search(queryVector, CONTEXT_EVIDENCE_LIMIT)) || [];
@@ -412,7 +429,7 @@ async function writeWithEvidence(plugin, options) {
     }
   }
 
-  const evidence = [];
+  const evidence = reuse ? previousEvidence.map((e) => ({ ...e })) : [];
   const researchExternal = researchRootInfo && researchRootInfo.kind === "external";
   for (const hit of researchHits.slice(0, RESEARCH_EVIDENCE_LIMIT)) {
     const locator = String((hit && hit.locator) || "");
@@ -428,6 +445,26 @@ async function writeWithEvidence(plugin, options) {
   }
   for (const item of await vaultEvidenceItems(plugin, vaultChunks.slice(0, VAULT_EVIDENCE_LIMIT), active.path)) {
     evidence.push({ eid: `E${evidence.length + 1}`, text: item.text, source: item.source });
+  }
+  // Notes the matched Todoist tasks came from join the vault evidence (never the tasks themselves), once each.
+  if (!reuse && vaultReady && Array.isArray(args.taskSourcePaths)) {
+    const seen = new Set(evidence.map((e) => e.source && e.source.kind === "vault" ? normaliseVaultPath(e.source.path) : "").filter(Boolean));
+    if (active.path) seen.add(normaliseVaultPath(active.path));
+    for (const raw of args.taskSourcePaths) {
+      if (isTaskReferencePath(raw)) continue;
+      const path = String(raw || "");
+      const key = normaliseVaultPath(path);
+      if (!path || seen.has(key)) continue;
+      seen.add(key);
+      const note = await readVaultNoteText(plugin, path);
+      if (note == null) continue;
+      const expanded = expandVaultNote(note, "", "");
+      const text = expanded ? expanded.text : stripYamlFrontMatter(note).trim().slice(0, VAULT_SECTION_MAX_CHARS);
+      if (!text.trim()) continue;
+      const source = { kind: "vault", path, meta: vaultMeta(plugin, path) };
+      if (expanded && expanded.heading) source.heading = expanded.heading;
+      evidence.push({ eid: `E${evidence.length + 1}`, text, source });
+    }
   }
   const external = rootInfo && rootInfo.kind === "external";
   for (const hit of contextHitsReady.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
@@ -445,7 +482,7 @@ async function writeWithEvidence(plugin, options) {
 
   // writing-mode: fix round 1 — web search when mode is not off; failure returns [] (no throw); up to 6 rows appended as web evidence
   const webSearchMode = args.webSearchMode;
-  if (webSearchMode && webSearchMode !== "off" && typeof plugin.searchWebForWriting === "function") {
+  if (!reuse && webSearchMode && webSearchMode !== "off" && typeof plugin.searchWebForWriting === "function") {
     try {
       const webResults = await plugin.searchWebForWriting(String(instruction || ""), webSearchMode, active);
       for (const row of (Array.isArray(webResults) ? webResults : []).slice(0, 6)) {
@@ -476,7 +513,7 @@ async function writeWithEvidence(plugin, options) {
       : "- web: not searched (turned off)";
   const sourcesBlock = mode === "rewrite"
     ? ""
-    : `Sources searched:\n${researchLine}\n${vaultLine}\n${contextLine}\n${webLine}`;
+    : reuse ? "Sources searched:\n- evidence reused from the previous answer; nothing new was searched" : `Sources searched:\n${researchLine}\n${vaultLine}\n${contextLine}\n${webLine}`;
   const evidenceBlock = evidence.length
     ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${escapeSourceAttribute(evidenceLabel(entry))}">\n${neutraliseEvidenceTags(entry.text)}\n</evidence>`).join("\n\n")
     : (searchedSources.length ? `No evidence was found in the ${searchedSources.join(" or ")}.` : "No evidence was searched: deep research, vault and context folder are all turned off.");
@@ -487,6 +524,7 @@ async function writeWithEvidence(plugin, options) {
   const contextSlice = noteContextSlice(active.text, active.selection, active.cursorOffset) || "(none)";
   const userLines = mode === "draft"
     ? [
+      ...(history ? ["Conversation so far (earlier turns in this sidebar chat; use them to understand what the instruction refers to):", history, ""] : []),
       `Instruction: ${instruction}`,
       "",
       `Target length: ${lengthTargetWords(length)} (${length}).`,
@@ -505,6 +543,7 @@ async function writeWithEvidence(plugin, options) {
       "Draft the passage now, citing every factual claim with its [En] id.",
     ]
     : [
+      ...(history ? ["Conversation so far (earlier turns in this sidebar chat; use them to understand what the instruction refers to):", history, ""] : []),
       `Instruction: ${instruction}`,
       "",
       `Selected passage: ${selectedText}`,
@@ -545,6 +584,7 @@ async function writeWithEvidence(plugin, options) {
     searched: { research: !!researchStore, researchWanted: useResearch, vault: vaultReady, context: useContext, vaultReason, vaultWanted, contextWanted: useContext },
     // writing-mode: task 2 citation style used, cited sources (with meta) and reference numbers
     citationStyle,
+    evidence: evidence.map((e) => ({ ...e })),
     cited: rewritten.cited,
     numbers: rewritten.numbers,
   };

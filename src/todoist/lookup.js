@@ -5,7 +5,7 @@
 const LOOKUP_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["needsTodoist", "kind", "filters", "refersToLastAnswer"],
+  required: ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence"],
   properties: {
     needsTodoist: { type: "boolean" },
     kind: { type: "string", enum: ["none", "question", "change", "duplicates"] },
@@ -23,7 +23,9 @@ const LOOKUP_SCHEMA = {
         includeCompleted: { type: ["boolean", "null"] }
       }
     },
-    refersToLastAnswer: { type: "boolean" }
+    refersToLastAnswer: { type: "boolean" },
+    searchQuery: { type: "string" },
+    reuseEvidence: { type: "boolean" }
   }
 };
 
@@ -36,7 +38,10 @@ function lookupPrompt(prompt, historyText, today = "") {
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
     "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
     "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = Todoist API number, inverted from what users say: user P1 (urgent) = 4, P2 = 3, P3 = 2, P4 (normal) = 1, so \"my P1 tasks\" means priority 4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
-    "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\")."
+    "Follow-up: when the message follows up on a previous answer that was about Todoist tasks (the conversation shows it), set needsTodoist=true and kind \"question\" (\"change\" if it asks to change them), and carry over that question's filters (dueFrom/dueTo, projects, labels and words such as a person's name) unless the user changes them; add the new words (e.g. \"Jim\") to the carried-over ones.",
+"refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\").",
+    "searchQuery: a standalone search query for the user's notes that carries the conversation's subject and scope, rewritten so it makes sense without the conversation (e.g. after \"what tasks do I have today\", the message \"what's specific to Jim?\" becomes \"Jim tasks due today\"). Always filled with a useful query, never empty, also when reuseEvidence is true.",
+    "reuseEvidence=true only when the message just works on the previous answer (shorten it, reformat it, filter its items) and needs no new notes or tasks; otherwise false."
   ].join("\n");
   return { system, user: `Conversation so far:\n${historyText || "(none)"}\n\nLatest message:\n${prompt}` };
 }
@@ -54,12 +59,16 @@ function shortlistTasks(snapshot, lookup, lastAnswerTaskIds, cap) {
   const out = [];
   const seen = new Set();
   const push = (t) => { if (t && !seen.has(String(t.id))) { seen.add(String(t.id)); out.push(t); } };
-  if (lookup.refersToLastAnswer) for (const id of lastAnswerTaskIds || []) push(byId.get(String(id)));
+  const terms = [...new Set((f.words || []).flatMap(words))];
+  // A follow-up question with new words narrows the last answer: its matching tasks rank first instead of all of it filling the list.
+  // A change ("move those") keeps every last-answer task, since its words may be the new values.
+  const narrow = lookup.refersToLastAnswer && terms.length > 0 && lookup.kind !== "change";
+  const lastIds = new Set(narrow ? (lastAnswerTaskIds || []).map(String) : []);
+  if (lookup.refersToLastAnswer && !narrow) for (const id of lastAnswerTaskIds || []) push(byId.get(String(id)));
 
   const names = (f.projects || []).map(norm).filter(Boolean);
   const projectIds = names.length ? new Set((snapshot.projects || []).filter((p) => names.includes(norm(p.name))).map((p) => String(p.id))) : null;
   const labels = (f.labels || []).map(norm).filter(Boolean);
-  const terms = [...new Set((f.words || []).flatMap(words))];
   // A change request's dates/priority are usually the NEW values, so with named words they must not exclude the task.
   const namedChange = lookup.kind === "change" && terms.length > 0;
   const scored = [];
@@ -82,7 +91,8 @@ function shortlistTasks(snapshot, lookup, lastAnswerTaskIds, cap) {
   }
   // Ties on words fall back to importance: higher priority, then earliest due date (overdue first), undated last.
   const due = (t) => (t.dueDate ? day(t.dueDate) : "9999");
-  scored.sort((a, b) => b.inRange - a.inRange || b.score - a.score || (b.t.priority || 1) - (a.t.priority || 1) || due(a.t).localeCompare(due(b.t)));
+  const fromLast = (t) => (lastIds.has(String(t.id)) ? 1 : 0);
+  scored.sort((a, b) => fromLast(b.t) - fromLast(a.t) || b.inRange - a.inRange || b.score - a.score || (b.t.priority || 1) - (a.t.priority || 1) || due(a.t).localeCompare(due(b.t)));
   for (const { t } of scored) push(t);
   return out.slice(0, Number.isFinite(cap) ? Math.max(0, cap) : DEFAULT_CAP);
 }

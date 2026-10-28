@@ -30,8 +30,8 @@ const cases = {
     assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: { words: [], projects: [], labels: [], priority: 4 } }), [], 10)), ["t2"]);
     assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: { words: [], projects: [], labels: [], dueFrom: "2026-10-30", dueTo: "2026-11-02" } }), [], 10)), ["t1"]);
   },
-  "refersToLastAnswer returns those ids first"() {
-    const out = shortlistTasks(snapshot, lk({ refersToLastAnswer: true, filters: { words: ["compost"], projects: [], labels: [] } }), ["t2", "gone"], 10);
+  "change request on those tasks keeps every last-answer task first"() {
+    const out = shortlistTasks(snapshot, lk({ kind: "change", refersToLastAnswer: true, filters: { words: ["compost"], projects: [], labels: [] } }), ["t2", "gone"], 10);
     assert.deepStrictEqual(ids(out), ["t2", "t1", "t3"]);
   },
   "cap is respected"() {
@@ -107,7 +107,13 @@ const cases = {
   },
   "prompt and schema"() {
     assert.ok(/existing tasks/i.test(lookupPrompt("x", "").system) && /not.*new value/i.test(lookupPrompt("x", "").system));
-    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer"]);
+    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence"]);
+    assert.strictEqual(LOOKUP_SCHEMA.properties.searchQuery.type, "string");
+    assert.strictEqual(LOOKUP_SCHEMA.properties.reuseEvidence.type, "boolean");
+    const sys = lookupPrompt("x", "").system;
+    assert.ok(/searchQuery/.test(sys) && /standalone/i.test(sys) && /Jim tasks due today/.test(sys), "searchQuery explained with example");
+    assert.ok(/always (a )?(useful|filled)|never empty/i.test(sys) && !/Empty string when reuseEvidence/i.test(sys), "searchQuery is always filled, also when reusing");
+    assert.ok(/reuseEvidence=true/.test(sys) && /previous answer/i.test(sys), "reuseEvidence explained");
     assert.ok(/P1.*=.*4/s.test(lookupPrompt("x", "").system) && /P4.*=.*1/s.test(lookupPrompt("x", "").system), "priority mapping");
     const p = lookupPrompt("move it", "User: hi");
     assert.ok(p.user.includes("move it") && p.user.includes("User: hi"));
@@ -128,6 +134,20 @@ const cases = {
     assert.deepStrictEqual(ids(shortlistTasks(w, lk({ filters: { words: ["budget", "report"], projects: [], labels: [] } }), [], 10)), ["lowHit", "hiTie", "loTie"]);
     // a capped list keeps the most important
     assert.deepStrictEqual(ids(shortlistTasks(s, lk(), [], 2)), ["p1over", "p1near"]);
+  },
+  "follow-up narrowing the last answer keeps only its tasks that match the new words, first"() {
+    const s = { tasks: [
+      task("a", "Email Sophie", { priority: 4 }),
+      task("b", "Book meeting with Jim", { priority: 2 }),
+      task("c", "Call Jim about IRGP", { priority: 3 }),
+      task("d", "Jim budget review (not in last answer)", { priority: 4 })
+    ], projects: [], sections: [] };
+    const out = ids(shortlistTasks(s, lk({ refersToLastAnswer: true, filters: { words: ["Jim"], projects: [], labels: [] } }), ["a", "b", "c"], 10));
+    assert.deepStrictEqual(out, ["c", "b", "d"], "last-answer tasks naming Jim lead (ranked), other matches next; unmatched last-answer tasks dropped");
+  },
+  "look-up prompt tells the model to carry over a Todoist follow-up's filters"() {
+    const s = lookupPrompt("what's specific to Jim?", "User: tasks today").system;
+    assert.ok(/follow[- ]?up/i.test(s) && /carr(y|ied) over/i.test(s) && /needsTodoist=true/.test(s), s);
   },
   "look-up is told today's date so 'today' becomes a due filter"() {
     const p = lookupPrompt("what tasks do I have to do today", "", "2026-10-28");

@@ -162,6 +162,8 @@ console.log("PASS (d-tone): prompt asks for helpful, natural, concise prose");
 assert.ok(srcText.includes("write its name once as a Markdown link to its exact evidence_id, like [name](evidence_id)"), "prompt asks for inline links to directly named tasks/notes");
 assert.ok(!srcText.includes("do not write Markdown links, numbered citations, or a source list yourself"), "old no-links rule replaced");
 console.log("PASS (d-inline): prompt asks for inline links to items named directly");
+assert.ok(srcText.includes("A short follow-up continues the previous question"), "prompt keeps follow-ups in the previous question's scope");
+console.log("PASS (d-followup): follow-ups keep the earlier scope");
 
 // (e) Subset merge: related topic labels reunite under one heading
 const subsetResponse = JSON.stringify({

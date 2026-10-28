@@ -1,3 +1,13 @@
+## 0.9.35 - 2026-10-28
+### Fixed
+- **Follow-up questions keep the conversation's scope.** After "what tasks do I have to do today?", asking "what's specific to Jim?" now answers with Jim's tasks due today instead of starting a fresh search of your notes. The Todoist look-up narrows the previous answer to the tasks that match the new words, and the chat is told to read a short follow-up in the light of the previous question.
+- **Collaborate now continues the sidebar conversation.** Earlier questions and answers in the same sidebar chat (from Ask or Collaborate) go with each Collaborate request and help its search, so "which of those involve Jim?" works. The conversation resets on New chat or when Obsidian reloads.
+- **Every message is checked on its own, with the conversation in view.** For each Ask or Collaborate message the look-up writes a notes search that carries the conversation's subject (for example "Jim tasks due today"), reuses the previous answer's evidence when the message only reworks that answer, and keeps the previous Todoist scope (dates, words such as a name) on a follow-up even when the model forgets it.
+- **Collaborate builds on notes, never on tasks.** When a message needs your tasks, Collaborate uses the note each task was written from (skipping the monthly task list and missing notes) and, on a follow-up, the notes behind the previous answer. Stored task copies are filtered out of its evidence.
+- **Todoist stays current in the background with small downloads.** After the first full download, the plugin fetches only what changed every 5 minutes, whether or not the sidebar is open. A failed refresh (such as a rate limit) waits 5 minutes before retrying, and changing the Todoist token starts fresh. Live check: a changes-only refresh was about 0.2 KB against about 257 KB for a full download of 230 tasks, with the same task list.
+- Live check (Oct 28, 2026): the Jim follow-up linked 6 of Jim's tasks due today (before: no tasks, only older note excerpts); a Collaborate follow-up listed the Jim tasks from the earlier answer; after New chat no earlier turns were sent.
+- Tests: `npm test` passes 79/79, including tests for changes-only Todoist updates and backoff, per-message search and reuse, task source notes as Collaborate evidence, and the follow-up scope guard.
+
 ## 0.9.34 - 2026-10-28
 ### Fixed
 - **Asking what is due today (or tomorrow, this week, overdue) now finds those Todoist tasks.** The chat's Todoist look-up was never told today's date, so it ignored the date and showed 40 tasks picked regardless of their due date. It now gets the date, and when more tasks match than fit in the answer it is told the real total.

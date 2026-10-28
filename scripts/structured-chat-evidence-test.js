@@ -117,6 +117,31 @@ assert.strictEqual(twoTopicText, "**Topic: Project Alpha**\nAlpha is active. [e1
 assert.ok(!/^- /m.test(twoTopicText), "no bullets");
 console.log("PASS (c-heads): one paragraph per topic, links not repeated");
 
+// (c-inline) A task or note named directly is linked in the sentence; evidence used only for context stays a source link after it
+const inlineText = (renderResponse(JSON.stringify({ claims: [
+  { text: "You have [buy printer paper](e1) and [email Alex](e2) open.", established: true, evidence_ids: ["e1", "e3"], category: "fact", topic: "Project" },
+  { text: "The paper task came from a team note.", established: true, evidence_ids: ["e1", "e3"], category: "history", topic: "Project" },
+  { text: "Ignore [ghost](e9) and [this](https://evil.example/x).", established: true, evidence_ids: [], category: "fact", topic: "Project" },
+] }), repeatLedger).answer || "").trim();
+assert.strictEqual(inlineText, "You have [buy printer paper](http://example.com/e1) and [email Alex](http://example.com/e2) open. [e3](http://example.com/e3) The paper task came from a team note. Ignore ghost and this.", inlineText);
+console.log("PASS (c-inline): directly named items link inline, context stays a source, unknown ids and URLs stay plain text");
+// (c-inline-later) A source linked inline later is not also shown as a source link on an earlier sentence
+const laterText = (renderResponse(JSON.stringify({ claims: [
+  { text: "The project lists two tasks.", established: true, evidence_ids: ["e1", "e2", "e3"], category: "fact", topic: "Project" },
+  { text: "[Buy paper](e1) has no due date.", established: true, evidence_ids: ["e1"], category: "timing", topic: "Project" },
+  { text: "[Email Alex](e2) is due Nov 2.", established: true, evidence_ids: ["e2"], category: "timing", topic: "Project" },
+] }), repeatLedger).answer || "").trim();
+assert.strictEqual(laterText, "The project lists two tasks. [e3](http://example.com/e3) [Buy paper](http://example.com/e1) has no due date. [Email Alex](http://example.com/e2) is due Nov 2.", laterText);
+console.log("PASS (c-inline-later): inline-linked items are never repeated as source links");
+// (c-inline-inject) Model text that mimics the internal link marker cannot break the answer or borrow a link
+const injectText = (renderResponse(JSON.stringify({ claims: [
+  { text: "See [\u00017] and [\u00010] and [Buy paper](e1).", established: true, evidence_ids: ["e1"], category: "fact", topic: "Project" },
+] }), repeatLedger).answer || "").trim();
+assert.ok(injectText.includes("[Buy paper](http://example.com/e1)"), injectText);
+assert.strictEqual((injectText.match(/\]\(/g) || []).length, 1, injectText);
+assert.ok(!injectText.includes("\u0001"), injectText);
+console.log("PASS (c-inline-inject): fake link markers are ignored");
+
 // (d) Prompt sentences check (source-text check)
 const srcPath = path.join(__dirname, "..", "src", "main.js");
 const srcText = fs.readFileSync(srcPath, "utf8");
@@ -134,6 +159,9 @@ assert.ok(srcText.includes("vary how sentences begin"), "no repetitive sentence 
 assert.ok(!srcText.includes("\"You are a concise Obsidian sidebar assistant.\""), "old robotic role sentence removed");
 assert.ok(srcText.includes("Each claim must be one clear, factual sentence."), "claims stay factual");
 console.log("PASS (d-tone): prompt asks for helpful, natural, concise prose");
+assert.ok(srcText.includes("write its name once as a Markdown link to its exact evidence_id, like [name](evidence_id)"), "prompt asks for inline links to directly named tasks/notes");
+assert.ok(!srcText.includes("do not write Markdown links, numbered citations, or a source list yourself"), "old no-links rule replaced");
+console.log("PASS (d-inline): prompt asks for inline links to items named directly");
 
 // (e) Subset merge: related topic labels reunite under one heading
 const subsetResponse = JSON.stringify({

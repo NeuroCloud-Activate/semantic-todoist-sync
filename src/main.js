@@ -14387,7 +14387,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "Use note evidence as the backbone of the answer: active note and ranked vault context first, then project context, then existing Todoist task references only as supporting pointers.",
         "Do not structure a vault answer around existing tasks unless the user asks about tasks, schedules, due dates, Todoist, or what to do next.",
         "Treat the active note as the primary supplied evidence. Set established=true only when the claim is supported by one or more supplied evidence_ids; otherwise set established=false and say that the element is not established.",
-        "For every supported claim, return the exact supplied evidence_ids. The plugin will render the allowed source-title hyperlinks deterministically; do not write Markdown links, numbered citations, or a source list yourself.",
+        "For every supported claim, return the exact supplied evidence_ids. When a sentence names a specific task or note directly, write its name once as a Markdown link to its exact evidence_id, like [name](evidence_id), inside the sentence instead of naming it again elsewhere; never write URLs. Evidence used only as background stays in evidence_ids, and the plugin adds it as a source link. Do not write numbered citations or a source list yourself.",
         "Support each factual claim with one specific supplied note or task record. Never fuse unrelated details from different notes into one event, decision, task, or explanation.",
         "For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject even if it is semantically similar.",
         "Preserve exact proper names and quoted terms from the evidence. For every supported claim, faithfully state the predicate or relation attached to each exact term, with the current source authoritative.",
@@ -35905,8 +35905,16 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     return validateChatEvidenceCitations(value, ledger, options);
   }
   const groupMap = new Map();
+  // Items named directly are linked inline as [name](evidence_id); only ledger ids become links, anything else stays plain text.
+  const inlineLinks = [];
   for (const claim of parsed.claims) {
-    const sentences = chatClaimSentences(claim?.text);
+    const claimText = String(claim?.text || "").replace(/\u0001/g, "").replace(/\[([^\]\n]+)\]\(\s*([^)\s]+)\s*\)/g, (whole, label, id) => {
+      const entry = byEvidenceId.get(id);
+      if (!entry) return whole;
+      inlineLinks.push({ markdown: `[${markdownLinkText(label)}](${entry.url})`, source: entry.markdown, url: entry.url });
+      return `[\u0001${inlineLinks.length - 1}]`;
+    });
+    const sentences = chatClaimSentences(claimText);
     if (!sentences.length) continue;
     const evidenceIds = uniqueValues((Array.isArray(claim?.evidence_ids) ? claim.evidence_ids : []).map(String).filter(Boolean));
     const validEntries = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
@@ -35930,7 +35938,9 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
     for (const sentence of sentences) {
       const clean = finalizeStructuredChatSentence(sentence);
       if (!clean) continue;
-      const sentenceItem = { text: clean, links, claimIndex: parsed.claims.indexOf(claim) };
+      const inline = [];
+      const text = clean.replace(/\[\u0001(\d+)\]/g, (whole, i) => { const link = inlineLinks[Number(i)]; inline.push(link.source); sourceUrlsUsed.add(link.url); return link.markdown; });
+      const sentenceItem = { text, links, inline, claimIndex: parsed.claims.indexOf(claim) };
       renderedClaims.push(sentenceItem);
       currentGroup.bullets.push(sentenceItem);
     }
@@ -36016,7 +36026,8 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const nonEmptyTopicKeys = new Set(groupEntries.filter(([k, g]) => g.firstText && g.firstText.trim()).map(([k, g]) => k));
   const showHeadings = nonEmptyTopicKeys.size >= 2;
   // Sentences read as prose paragraphs; each source link shows once, after the first sentence that cites it.
-  const shownLinks = new Set();
+  // Items linked inline anywhere are never repeated as source links.
+  const shownLinks = new Set(renderedClaims.flatMap((item) => item.inline));
   const paragraph = (items) => items.map((item) => {
     const fresh = item.links.filter((link) => !shownLinks.has(link));
     fresh.forEach((link) => shownLinks.add(link));

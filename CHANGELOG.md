@@ -1,3 +1,9 @@
+## 0.9.33 - 2026-10-28
+### Changed
+- **Tasks and notes named in a chat answer are linked right where they are named.** The answer no longer lists a task as a link and then names it again in the next sentence. Sources used only for background still appear once, as a link after the sentence that used them.
+- Live check (Oct 28, 2026): a Todoist question named each STS Test task once, as a link inside its sentence; a notes question linked the notes it named inline; a change request still opened its preview, which was cancelled.
+- Tests: `npm test` passes 77/77, including tests that a link the model invents, or a fake internal link marker, stays plain text.
+
 ## 0.9.32 - 2026-10-27
 ### Added
 - **Ask about your Todoist tasks in the sidebar chat.** Questions such as "what is due this week?" are answered from your Todoist tasks, with a link to each task named.

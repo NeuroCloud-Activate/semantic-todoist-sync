@@ -769,7 +769,9 @@
 
 .semantic-todoist-status {
   flex: 0 0 auto;
-  max-height: 30vh;
+  /* Fixed three-line height so the box never jumps as messages change; longer text scrolls. */
+  box-sizing: content-box;
+  height: calc(3em * 1.25);
   overflow: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--background-modifier-border);

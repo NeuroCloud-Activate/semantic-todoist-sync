@@ -12791,6 +12791,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // t43: tasks whose marked-action lines have NO overlapping chunk of the
     // active source in the built index (marked-source-line-mismatch).
     const markedLineMismatchKeys = new Set();
+    // The same fallback for an unmarked note (whole-note "source" scope) that is not in
+    // the routing state yet: no seed lane finds a chunk of the note's own path.
+    const sourceIndexedKeys = new Set();
+    const sourceUnindexedKeys = new Set();
     for (const [indexValue, task] of flattened) {
       const key = makeTaskKey(task, indexValue);
       taskKeyByIndex[String(indexValue)] = key;
@@ -12843,6 +12847,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         lane.lineScopeDegradedReason = scopeResolver.degradedReason;
         if (scopeResolver.degradedReason === "marked-source-line-mismatch" && markedActionScope) markedLineMismatchKeys.add(key);
         const seedLane = ["action", "source-statement", "terminology", "current-vault"].some((origin) => String(lane.origin || lane.name || "").toLowerCase() === origin || String(lane.origin || lane.name || "").toLowerCase().startsWith(`${origin}-`));
+        if (!markedActionScope && seedLane && localCurrentSourceRow) {
+          const ownChunk = boundedResolverIndex.some((chunk) => vaultRelativePath(chunk?.path || chunk?.provenance?.path || "") === activeSourcePath);
+          (ownChunk ? sourceIndexedKeys : sourceUnindexedKeys).add(key);
+        }
         let resolved = null;
         if (markedActionScope && !seedLane) {
           const seedHandles = taskSeedHandlesByKey.get(key) || [];
@@ -12873,6 +12881,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // the background. Healthy indexed notes never take this path (the lane
     // resolver reports no mismatch), so their retrieval stays byte-identical.
     if (localCurrentSourceRow && markedLineMismatchKeys.size) return degraded("marked-source-line-mismatch");
+    if (localCurrentSourceRow && [...sourceUnindexedKeys].some((key) => !sourceIndexedKeys.has(key))) return degraded("source-not-indexed");
     // Runtime query fallback for lanes with no indexed handle. Every lane above
     // borrows its query vector from an indexed chunk of the source
     // (lane.embedding = lane.queryHandles[0]?.vector); an email source - or any
@@ -14832,7 +14841,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           file = this.app.vault.getAbstractFileByPath(target);
         }
         this.markInternalNoteWrite(target);
-        await this.app.vault.process(file, (text) => items.reduce((current, item) => this.insertCreatedTaskLine(current, item), text));
+        await this.app.vault.process(file, (text) => this.normalizeCreatedNoteLines(items.reduce((current, item) => this.insertCreatedTaskLine(current, item), text), items, target, file.basename, snapshot));
         const lines = (await this.app.vault.read(file)).split("\n");
         for (const item of items) {
           const lineNumber = lines.findIndex((candidate) => getTaskOid(candidate) === item.oid);
@@ -14850,6 +14859,26 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     if (results?.length) await this.saveSettings().catch((error) => this.logLocal("Settings not saved after note line write", { error: error.message || String(error) }));
     return failed;
+  }
+
+  // A top-level line written into an ordinary note gets the section and marker order that note's next sync would give it
+  // (its Todoist section, else the note's default section), so that sync leaves the line alone.
+  normalizeCreatedNoteLines(text, items, path, basename, snapshot = null) {
+    if (isMonthlyNotePath(path, this.settings)) return text;
+    const eol = /\r\n/.test(text) ? "\r\n" : "\n";
+    const lines = String(text).split(/\r?\n/);
+    let changed = false;
+    for (const item of items) {
+      if (item.monthly || item.parentOid) continue;
+      const at = lines.findIndex((candidate) => getTaskOid(candidate) === item.oid);
+      if (at < 0) continue;
+      const sectionName = (snapshot?.sections || []).find((section) => String(section.id) === String(item.task.sectionId || ""))?.name || "";
+      // Kept as Todoist names it, the way sync caches it; the line marker writes spaces as "_".
+      item.task.section = singleLine(sectionName || extractSection(lines[at]) || makeNoteSectionName(basename, text, path));
+      lines[at] = syncLocationMarkersOnTaskLine(lines[at], item.task, this.settings);
+      changed = true;
+    }
+    return changed ? lines.join(eol) : text;
   }
 
   // Pure text step of writeCreatedTaskLines: add one task line to a note's text (under its parent's block, under its project heading, or at the end).
@@ -23712,7 +23741,13 @@ class SemanticTodoistView extends ItemView {
       const result = await this.plugin.chat(prompt, active, history, "chat-query", { webSearchMode: this.webSearchMode, todoist: true });
       this.renderRelevantNotes(result.context);
       this.replaceLastAssistantMessage(result.answer);
-      if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary, applied) => { this.addMessage("assistant", summary); if (applied?.undoable) this.addMessageAction("Undo last Todoist change", () => this.plugin.undoLastTodoistChanges(true)); }).open(), () => result.todoistChanges.applyState === "applied" || result.todoistChanges.applyState === "applying");
+      if (result.todoistChanges) this.addMessageAction(`Review ${result.todoistChanges.rows.length} change${result.todoistChanges.rows.length === 1 ? "" : "s"}`, () => result.todoistChanges.applyState === "applied" ? new Notice("These changes were already applied.") : new TodoistChangesModal(this.plugin.app, this.plugin, result.todoistChanges, (summary, applied) => {
+        this.addMessage("assistant", summary);
+        if (!applied?.undoable) return;
+        // Each Undo button belongs to its own Apply: off once undone or once a later Apply replaced the undo record.
+        const record = this.plugin.settings?.todoistChatLastUndo;
+        this.addMessageAction("Undo last Todoist change", async () => { if (this.plugin.settings?.todoistChatLastUndo !== record) return; await this.plugin.undoLastTodoistChanges(true); this.renderMessages(); }, () => !record || this.plugin.settings?.todoistChatLastUndo !== record);
+      }).open(), () => result.todoistChanges.applyState === "applied" || result.todoistChanges.applyState === "applying");
       this.setStatus(webSearchStatusLabel(result));
     } catch (error) {
       console.error(error);
@@ -48437,7 +48472,6 @@ function taskWorkflowLocalCurrentSourceEvidenceRow(source = {}, sourceContract =
   if (sourceType !== "note") return null;
   const evidenceId = String(contract.primaryEvidenceId || contract.primary_evidence_id || "");
   if (!evidenceId) return null;
-  if (!Array.isArray(contract.explicitMarkers) || !contract.explicitMarkers.length) return null;
   const text = String(sourceSummary || "").trim();
   if (!text) return null;
   const path = String(contract.path || source?.path || "");
@@ -52969,8 +53003,11 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
         && (marker.action === actionText || (marker.action.startsWith(actionText) && /^\s/.test(marker.action.slice(actionText.length))))));
     // writing-mode: single-match rule keeps governing the chunk-local path; the contract-marker
     // fallback above only satisfies it when scopeForAction.action already equals actionText.
+    // Markers only confirm tasks: the marker match applies to a marked-action scope, never to
+    // the whole-note "source" scope an unmarked note falls back to.
+    const markerRequired = scopeForAction?.family === "marked-action";
     if (!self || !sourcePath || self.path !== sourcePath || !scopeForAction
-      || String(scopeForAction.action || "").trim() !== actionText || (markerMatches.length !== 1 && !scopeMarkerOk)) {
+      || String(scopeForAction.action || "").trim() !== actionText || (markerRequired && markerMatches.length !== 1 && !scopeMarkerOk)) {
       // Say which sub-check failed (counts and flags only, never note text).
       const why = [];
       if (!self) why.push("self-missing");
@@ -52978,7 +53015,7 @@ function* taskWorkflowSelectTaskRelevantEvidenceSteps(checkpoint, perTaskRanking
       else if (self && self.path !== sourcePath) why.push("path-differs");
       if (!scopeForAction) why.push("scope-missing");
       else if (String(scopeForAction.action || "").trim() !== actionText) why.push("action-differs");
-      if (markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
+      if (markerRequired && markerMatches.length !== 1) why.push(`markers=${markerMatches.length}`);
       scoreMissingErrors.push(`action-source-mismatch:${taskKey}:${queryHandleEvidenceId}:why=${why.join("+")}`);
     }
     }

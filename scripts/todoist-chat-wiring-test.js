@@ -553,6 +553,40 @@ test("no Undo button after a delete-only Apply that cannot be undone", async () 
   assert.deepEqual(await undoButtonsAfterApply(undefined), []);
 });
 
+test("an Undo button turns off once its Apply was undone or a later Apply replaced it", async () => {
+  const view = Object.create(Plugin.SemanticTodoistView.prototype);
+  const actions = [];
+  let renders = 0;
+  const settings = { todoistChatLastUndo: null };
+  let undone = 0;
+  Object.assign(view, {
+    promptEl: { value: "move it" }, messages: [], webSearchMode: "off", setStatus() {}, addMessage() {}, renderRelevantNotes() {}, replaceLastAssistantMessage() {},
+    renderMessages: () => { renders += 1; },
+    getSelectedActiveContext: async () => null,
+    plugin: { app: {}, settings, undoLastTodoistChanges: async () => { undone += 1; settings.todoistChatLastUndo = null; }, chat: async () => ({ answer: "ok", context: [], todoistChanges: { rows: [{}], applyState: "ready", preview: { groups: [] } } }) }
+  });
+  view.addMessageAction = (label, fn, disabled) => { actions.push({ label, fn, disabled }); if (label.startsWith("Review")) fn(); };
+  globalThis.__lastOpenedModal = null;
+  await view.ask();
+  const first = { at: "first" };
+  settings.todoistChatLastUndo = first;
+  globalThis.__lastOpenedModal.onDone("Applied.", { undoable: true });
+  const undo = actions.find((a) => a.label === "Undo last Todoist change");
+  assert.ok(undo && typeof undo.disabled === "function", "Undo has a disabled check");
+  assert.equal(undo.disabled(), false, "live while its Apply is the last one");
+  settings.todoistChatLastUndo = { at: "second" };
+  assert.equal(undo.disabled(), true, "a later Apply replaced it");
+  await undo.fn();
+  assert.equal(undone, 0, "a replaced Undo does nothing");
+  settings.todoistChatLastUndo = first;
+  assert.equal(undo.disabled(), false);
+  const before = renders;
+  await undo.fn();
+  assert.equal(undone, 1);
+  assert.equal(undo.disabled(), true, "used up after Undo");
+  assert.ok(renders > before, "buttons redrawn after Undo");
+});
+
 test("change turn with model text keeps it unchanged", async () => {
   const p = makePlugin({
     lookup: lookupOf({ kind: "change" }),

@@ -17,6 +17,10 @@
 
 const { rewriteCitations } = require("./citations.js");
 const { metaFromFrontmatter } = require("./styles.js");
+const { budgetRecords, taskEvidenceText } = require("./todoist-evidence.js");
+
+const TODOIST_COMPLETED_DAYS = 14;
+const TODOIST_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const WRITE_SYSTEM_PROMPT = [
   "You are drafting evidence-based prose inside an Obsidian note.",
@@ -329,6 +333,7 @@ function evidenceLabel(entry) {
   if (source.kind === "research-vault") return source.locator ? `${source.path}, ${source.locator}` : source.path;
   if (source.kind === "research-external") return source.locator ? `${source.name}, ${source.locator}` : source.name;
   if (source.kind === "context-external") return source.locator ? `${source.name}, ${source.locator}` : source.name;
+  if (source.kind === "todoist") return source.project ? `Todoist: ${source.title} (${source.project})` : `Todoist: ${source.title}`;
   if (source.kind === "web") {
     const url = String(source.url || "").trim();
     let title = String(source.title || "").trim();
@@ -480,6 +485,37 @@ async function writeWithEvidence(plugin, options) {
     });
   }
 
+  // meeting-prep: Todoist task rows sit after context rows, before web rows; only when the switch is on
+  let todoistLine = "";
+  if (!reuse && args.useTodoist === true) {
+    try {
+      const data = args.todoistEvidence || (await plugin.getMeetingTodoistData({ completedDays: TODOIST_COMPLETED_DAYS, projects: [] }));
+      if (!data) throw new Error("no data");
+      const records = Array.isArray(data.records) ? data.records : [];
+      const { kept, dropped } = budgetRecords(records, instruction);
+      const rows = [];
+      for (const r of kept) {
+        const at = String(r.completedAt || "");
+        const when = (v) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v || "")); return m ? `${TODOIST_MONTHS[Number(m[2]) - 1]} ${Number(m[3])}` : ""; };
+        const state = r.completedAt ? `completed ${when(at)}` : r.due ? `due ${when(r.due)}` : "open";
+        const year = (/^(\d{4})/.exec(at || String(r.due || "")) || [])[1] || "";
+        const title = String(r.title || "");
+        rows.push({
+          eid: `E${evidence.length + rows.length + 1}`,
+          text: taskEvidenceText(r),
+          source: { kind: "todoist", title, project: r.projectName || "", url: r.url || "", state, meta: { title, site: "Todoist", url: r.url || "", year } },
+        });
+      }
+      evidence.push(...rows);
+      const openCount = Number.isFinite(data.openCount) ? data.openCount : records.filter((r) => r.status !== "done").length;
+      const completedCount = Number.isFinite(data.completedCount) ? data.completedCount : records.filter((r) => r.status === "done").length;
+      todoistLine = `- Todoist: ${openCount} open, ${completedCount} completed in last ${TODOIST_COMPLETED_DAYS} days`;
+      if (dropped > 0) todoistLine += ` (${kept.length} of ${records.length} tasks included)`;
+    } catch (err) {
+      todoistLine = `- Todoist: NOT searched (Todoist unavailable: ${err && err.message ? err.message : String(err)})`;
+    }
+  }
+
   // writing-mode: fix round 1 — web search when mode is not off; failure returns [] (no throw); up to 6 rows appended as web evidence
   const webSearchMode = args.webSearchMode;
   if (!reuse && webSearchMode && webSearchMode !== "off" && typeof plugin.searchWebForWriting === "function") {
@@ -513,7 +549,7 @@ async function writeWithEvidence(plugin, options) {
       : "- web: not searched (turned off)";
   const sourcesBlock = mode === "rewrite"
     ? ""
-    : reuse ? "Sources searched:\n- evidence reused from the previous answer; nothing new was searched" : `Sources searched:\n${researchLine}\n${vaultLine}\n${contextLine}\n${webLine}`;
+    : reuse ? "Sources searched:\n- evidence reused from the previous answer; nothing new was searched" : `Sources searched:\n${researchLine}\n${vaultLine}\n${contextLine}\n${webLine}${todoistLine ? `\n${todoistLine}` : ""}`;
   const evidenceBlock = evidence.length
     ? evidence.map((entry) => `<evidence id="${entry.eid}" source="${escapeSourceAttribute(evidenceLabel(entry))}">\n${neutraliseEvidenceTags(entry.text)}\n</evidence>`).join("\n\n")
     : (searchedSources.length ? `No evidence was found in the ${searchedSources.join(" or ")}.` : "No evidence was searched: deep research, vault and context folder are all turned off.");
@@ -590,4 +626,4 @@ async function writeWithEvidence(plugin, options) {
   };
 }
 
-module.exports = { writeWithEvidence, WRITE_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT, CHECK_SYSTEM_PROMPT };
+module.exports = { isTaskReferenceChunk, writeWithEvidence, WRITE_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT, CHECK_SYSTEM_PROMPT, evidenceLabel, escapeSourceAttribute, neutraliseEvidenceTags, vaultEvidenceItems, readVaultNoteText };

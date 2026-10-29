@@ -204,4 +204,11 @@ const webMeta = { title: "Sloth squeak", url: WEB_URL, site: "blogs.scientificam
   console.log("PASS rewriteCitations apa/nature");
 }
 
-process.stdout.write(JSON.stringify({ passed: 15, failed: 0 }, null, 2) + "\n");
+{
+  const meta = { title: "Draft ethics amendment", url: "https://todoist.com/app/task/1", site: "Todoist", year: 2026 };
+  for (const style of ["apa", "nature"]) {
+    assert.strictEqual(formatReference(style, { kind: "todoist", meta }), formatReference(style, { kind: "web", meta }), "todoist formats as web (" + style + ")");
+  }
+  console.log("PASS todoist as web");
+}
+process.stdout.write(JSON.stringify({ passed: 16, failed: 0 }, null, 2) + "\n");

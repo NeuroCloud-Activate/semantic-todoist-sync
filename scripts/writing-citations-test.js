@@ -329,4 +329,12 @@ function ev(eid, source) {
   console.log("PASS evidence id ranges");
 }
 
-process.stdout.write(JSON.stringify({ passed: 19, failed: 0 }, null, 2) + "\n");
+{
+  const src = { kind: "todoist", title: "Draft [ethics] amendment", project: "Thesis", url: "https://todoist.com/app/task/1", state: "due Nov 2", meta: { title: "x", site: "Todoist", url: "https://todoist.com/app/task/1", year: 2026 } };
+  const r = rewriteCitations("a [E1] b", [{ eid: "E1", source: src }], "");
+  assert.ok(r.footnotes.includes("[^1]: [Draft \\[ethics\\] amendment](https://todoist.com/app/task/1), Todoist task, Thesis, due Nov 2"), "todoist label: " + r.footnotes);
+  const bad = rewriteCitations("a [E1] b", [{ eid: "E1", source: { kind: "todoist", title: "T", project: "P", url: "javascript:x", state: "open" } }], "");
+  assert.ok(bad.footnotes.includes("[^1]: T, Todoist task, P, open"), "non-http url is plain: " + bad.footnotes);
+  console.log("PASS todoist label");
+}
+process.stdout.write(JSON.stringify({ passed: 20, failed: 0 }, null, 2) + "\n");

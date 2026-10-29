@@ -274,6 +274,16 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     prompt: DEFAULT_SCHEDULE_TODAY_PROMPT
   },
   {
+    filename: "Prepare for meeting \u2013 Supervisor.md",
+    action: "meeting-prep",
+    createTasks: false,
+    insertResponse: true,
+    syncTasks: false,
+    completedDays: 14,
+    projects: [],
+    prompt: "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting."
+  },
+  {
     filename: "Summarize active note.md",
     createTasks: false,
     insertResponse: true,
@@ -2874,6 +2884,7 @@ function normalizeStableSettings(input = {}) {
       : "footnotes";
   result.writingUseVault = source.writingUseVault !== false;
   result.writingUseContext = source.writingUseContext !== false;
+  result.writingUseTodoist = source.writingUseTodoist === true; // meeting-prep: Todoist evidence toggle (default off)
   result.writingUseResearch = source.writingUseResearch !== false; // writing-mode: task 11 deep-research evidence toggle (default on)
   result.showRelevantNotes = source.showRelevantNotes !== false; // writing-mode: relevant-notes panel defaults on
   return result;
@@ -3576,6 +3587,7 @@ const DEFAULT_SETTINGS = {
   taskDeduplicationAiReviewSensitivity: "balanced",
   taskDuplicateReviewRecording: true,
   taskDeduplicationAiModel: "",
+  taskDeduplicationAiModelProvider: "",
   taskDeduplicationAiReasoningEffort: "auto",
   reasoningAutoMigrationVersion: 0,
   reasoningAutoCorrections: {},
@@ -3593,6 +3605,7 @@ const DEFAULT_SETTINGS = {
   subtaskIncludeDeadline: false,
   taskCache: {},
   pendingTaskDescriptions: {},
+  pendingTodoistCreateCommands: {},
   processedTodoistEventIds: [],
   autoProcessEmails: false,
   emailPollIntervalSeconds: MIN_EMAIL_AUTO_POLL_INTERVAL_SECONDS,
@@ -3624,6 +3637,7 @@ const DEFAULT_SETTINGS = {
   writingDraftLength: "standard", // writing-mode: task 10 draft length default
   writingUseVault: true, // writing-mode: task 10 vault evidence default
   writingUseContext: true, // writing-mode: task 10 context-folder evidence default
+  writingUseTodoist: false, // meeting-prep: Todoist evidence default off
   writingUseResearch: true, // writing-mode: task 11 deep-research evidence default
   showRelevantNotes: true, // writing-mode: relevant-notes panel enabled by default
   taskContextSummaryMaxNotes: 5,
@@ -5967,6 +5981,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       enableAiAmbiguousTaskDeduplication: DEFAULT_SETTINGS.enableAiAmbiguousTaskDeduplication,
       taskDeduplicationAiReviewSensitivity: DEFAULT_SETTINGS.taskDeduplicationAiReviewSensitivity,
       taskDeduplicationAiModel: DEFAULT_SETTINGS.taskDeduplicationAiModel,
+      taskDeduplicationAiModelProvider: DEFAULT_SETTINGS.taskDeduplicationAiModelProvider,
       taskDeduplicationPolicy: DEFAULT_SETTINGS.taskDeduplicationPolicy,
       taskDeduplicationPolicyUpdates: DEFAULT_SETTINGS.taskDeduplicationPolicyUpdates,
       taskDeduplicationLastRunSummary: DEFAULT_SETTINGS.taskDeduplicationLastRunSummary
@@ -6007,8 +6022,10 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
       this.settings.chatFallbackModel = preferredFallbackModelForProvider(this.settings, preferredProvider, this.settings.chatModel);
       changed = true;
     }
-    if (this.settings.taskDeduplicationAiModel && aiProviderForModel(this.settings.taskDeduplicationAiModel) !== preferredProvider) {
+    // Clear only a pick that cannot run on the active provider (Gemini-form id vs non-Gemini provider, or the reverse).
+    if (this.settings.taskDeduplicationAiModel && (dedupPickProviderStale(this.settings) || usesGeminiChatModel(this.settings.taskDeduplicationAiModel) !== (preferredProvider === "gemini"))) {
       this.settings.taskDeduplicationAiModel = "";
+      this.settings.taskDeduplicationAiModelProvider = "";
       changed = true;
     }
     // Legacy chat-model-driven embedding inference removed: embedding identity is
@@ -9258,7 +9275,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   async runTaskTemplateFromCommandPalette() {
-    const templates = await this.getPromptTemplates();
+    const templates = (await this.getPromptTemplates()).filter((template) => !isMeetingPrepTemplate(template));
     new TaskTemplateModal(this.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
       await this.runPromptTemplate(template, { insertIntoNote, syncAfterInsert, showNotice: true });
     }).open();
@@ -15081,7 +15098,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     let nextPolicy = appendTaskDeduplicationPolicyInstruction(currentPolicy, command.updateText || prompt);
     let impact = taskDeduplicationPolicyImpactText(this.settings, nextPolicy);
     const model = taskDeduplicationAiModel(this.settings);
-    if (command.updateText && hasChatCredentialForModel(this.settings, model)) {
+    if (command.updateText && hasChatCredentialForModel(this.settings, model, this)) {
       try {
         const interpreted = await this.interpretTaskDeduplicationPolicyCommand(prompt, currentPolicy, captureContext);
         if (interpreted.policyText) nextPolicy = interpreted.policyText;
@@ -15271,7 +15288,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       reuseEvidence: options ? options.reuseEvidence : undefined,
       previousEvidence: options ? options.previousEvidence : undefined,
       taskSourcePaths: options ? options.taskSourcePaths : undefined,
+      useTodoist: !!options && options.useTodoist === true,
     });
+  }
+
+  // Meeting prep: raw Todoist reads -> grouped task records (open/completed counts feed the Sources line).
+  async getMeetingTodoistData({ completedDays = 14, projects = [] } = {}) {
+    const { buildTaskRecords } = require("./writing/todoist-evidence.js");
+    const { snapshot, completed } = await this.getMeetingTodoistRaw({ completedDays });
+    const { records, unknownProjects } = buildTaskRecords({ snapshot, completed, completedDays, projects, now: new Date(), taskUrl: (id) => todoistTaskUrl(id, this.settings) });
+    return { records, unknownProjects, openCount: records.filter((r) => r.status !== "done").length, completedCount: records.filter((r) => r.status === "done").length };
+  }
+
+  async prepareMeeting(options = {}) {
+    const { prepareMeeting } = require("./writing/meeting.js");
+    const active = options.active || await this.getActiveMarkdownContext();
+    return prepareMeeting(this, Object.assign({}, options, { active }));
   }
 
   async searchWebForWriting(instruction, mode, active) { // writing-mode: fix round 1 — expose plugin web-search for write mode; returns [{title, url, text}] or [] on failure; no throw
@@ -20618,6 +20650,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   async runPromptTemplate(template, options = {}) {
+    if (isMeetingPrepTemplate(template)) throw new Error("Meeting templates run from Collaborate: pick it in the meeting preset list.");
     if (isScheduleTodayTemplate(template)) {
       await this.openScheduleTodayPreview(template);
       return { action: "schedule-today", tasks: [], markdown: "", contextNotes: [], semanticContext: [] };
@@ -21119,6 +21152,52 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return { tasks: [...tasksById.values()], projects: [...projectsById.values()], sections: [...sectionsById.values()], pages, requestCount };
   }
 
+  // meeting-prep: completed tasks from the last `days` days, read-only GETs, normalized with completedAt.
+  async fetchRecentCompletedTodoistTasks(days) {
+    const cutoff = Date.now() - parseMeetingCompletedDays(days) * 86400000;
+    const toTask = (item) => Object.assign(normalizeTodoistTask(Object.assign({}, item, { id: item.task_id || item.id })), { completedAt: item.completed_at || item.completedAt || "" });
+    const maxPages = 10; // shortcut: 10 pages (2000 tasks) cap, raise if users complete more per window
+    const out = [];
+    try {
+      let cursor = "";
+      for (let page = 0; page < maxPages; page += 1) {
+        const query = `since=${encodeURIComponent(new Date(cutoff).toISOString())}&until=${encodeURIComponent(new Date().toISOString())}&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+        const json = await this.todoistRequest(`/tasks/completed/by_completion_date?${query}`);
+        out.push(...(json.items || []).map(toTask));
+        cursor = json.next_cursor || "";
+        if (!cursor) break;
+      }
+    } catch (error) {
+      if (!/Todoist returned (404|400)/.test(error.message || "")) throw error;
+      out.length = 0;
+      for (let page = 0; page < maxPages; page += 1) {
+        const json = await this.todoistRequest(`/tasks/completed?limit=200&offset=${page * 200}`);
+        const items = json.items || [];
+        out.push(...items.filter((item) => Date.parse(item.completed_at) >= cutoff).map(toTask));
+        const oldest = Math.min(...items.map((item) => Date.parse(item.completed_at) || Infinity));
+        if (items.length < 200 || oldest < cutoff) break;
+      }
+    }
+    return out.filter((task) => task.id);
+  }
+
+  // Task 6 wraps this with buildTaskRecords (kept out of here so main.js does not depend on todoist-evidence.js).
+  async getMeetingTodoistRaw({ completedDays = 14 } = {}) {
+    const unavailable = (cause) => Object.assign(new Error(`Todoist is unavailable${cause ? `: ${cause.message || cause}` : ""}`), { code: "todoist-unavailable" });
+    if (!this.settings.todoistToken) throw unavailable();
+    let snapshot;
+    let completed;
+    try {
+      [snapshot, completed] = await Promise.all([
+        this.getTodoistSnapshot(["items", "projects", "sections"], false),
+        this.fetchRecentCompletedTodoistTasks(completedDays)
+      ]);
+    } catch (error) {
+      throw unavailable(error);
+    }
+    return { snapshot, completed };
+  }
+
   async getTodoistSnapshot(resourceTypes = ["items", "projects", "sections"], force = false) {
     const requested = Array.from(new Set(resourceTypes)).sort();
     const key = requested.join(",");
@@ -21246,12 +21325,18 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const relinked = [];
     let changed = false;
     let remoteTasksById = new Map();
+    let snapshotLoaded = false;
+    let snapshotProjects = [];
+    const createKeyCounts = new Map();
     try {
       const snapshot = await this.getTodoistSnapshot(["items", "projects", "sections"], false);
       remoteTasksById = new Map(enrichTodoistTasksWithSnapshot(snapshot).map((task) => [task.id, task]));
+      snapshotProjects = snapshot.projects || [];
+      snapshotLoaded = true;
     } catch (error) {
       this.logLocal("Todoist snapshot unavailable for file sync compare", { path, error: error.message || String(error) });
     }
+    const recreatedOldIds = new Map(); // line index -> Todoist id that was deleted remotely; its cache entry is dropped only after the new task is created
 
     for (let i = 0; i < lines.length; i += 1) {
       const preflightLine = preflightTaskLine(lines[i], this.settings);
@@ -21279,6 +21364,35 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         }
         presentIds.add(parsed.id);
         Object.assign(parsed, this.descriptionStateForParsedTask(parsed));
+        // Unchecked line whose task was completed in Todoist and has since been deleted there: create it again (keeps the oid).
+        // A completed (not deleted) task stays in existingUpdates and is reopened. Never decided without a loaded snapshot.
+        // Probe with POST /reopen (404 = deleted): GET /tasks/{id} only returns active tasks, so it cannot tell completed from deleted.
+        let deletedRemotely = false;
+        const completedEntry = this.settings.taskCache?.[parsed.id];
+        if (snapshotLoaded && !parsed.isCompleted && completedEntry?.isCompleted && !remoteTasksById.has(parsed.id)) {
+          if (await this.setTodoistTaskCompletionState(parsed.id, false)) {
+            completedEntry.isCompleted = false;
+            completedEntry.signature = parsedTaskSignature(completedEntry);
+            completedEntry.cachedAt = deviceTimestamp();
+            this.markTaskReferenceStateDirty();
+          } else deletedRemotely = true;
+        }
+        if (deletedRemotely) {
+          recreatedOldIds.set(i, parsed.id);
+          // Recreate in the old task's project when it still exists (its section by name); else default project.
+          const oldProject = snapshotProjects.find((project) => project.id && project.id === completedEntry?.projectId);
+          if (oldProject) { parsed.recreateProjectId = oldProject.id; parsed.recreateProjectName = oldProject.name || completedEntry.projectName || ""; }
+          parsed.id = "";
+          if (!parsed.isSubtask && !parsed.description && completedEntry?.description) parsed.description = completedEntry.description;
+          this.assignCreateIds(parsed, createKeyCounts);
+          parsed.sectionId = parsed.recreateProjectId ? "" : this.pendingSectionIdForParsedTask(parsed);
+          if (!parsed.isSubtask && parsed.section && !parsed.sectionId) {
+            parsed.sectionId = await this.ensureTodoistSectionId(parsed.recreateProjectId || await this.getTaskProjectId(), parsed.section);
+          }
+          creations.push(parsed);
+          lineToTemp.set(i, parsed.tempId);
+          continue;
+        }
         existingUpdates.push(parsed);
       } else {
         const cachedId = this.findCachedTaskIdForParsedTask(parsed);
@@ -21296,9 +21410,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           relinked.push(parsed);
           continue;
         }
-        const tempId = uuid();
-        parsed.tempId = tempId;
-        parsed.oid = parsed.oid || generateUniqueOid(this.settings);
+        this.assignCreateIds(parsed, createKeyCounts);
+        const pendingOid = this.settings.pendingTodoistCreateCommands[parsed.createKey];
+        parsed.oid = parsed.oid || pendingOid.oid || (pendingOid.oid = generateUniqueOid(this.settings));
+        const tempId = parsed.tempId;
         parsed.sectionId = this.pendingSectionIdForParsedTask(parsed);
         if (!parsed.isSubtask && parsed.section && !parsed.sectionId) {
           parsed.sectionId = await this.ensureTodoistSectionId(await this.getTaskProjectId(), parsed.section);
@@ -21317,7 +21432,22 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
 
     if (creations.length) this.setSidebarStatus(`Creating ${creations.length} Todoist task${creations.length === 1 ? "" : "s"}...`);
-    const tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp);
+    // Forget the deleted ids first so the oid/subtask-parent lookups use the new temp ids; put them back if the create throws (retry later, no duplicate).
+    const forgotten = [...recreatedOldIds.values()].filter((id) => this.settings.taskCache?.[id]).map((id) => [id, this.settings.taskCache[id]]);
+    for (const [id] of forgotten) this.forgetCachedTaskReference(id);
+    let tempToReal;
+    try {
+      tempToReal = await this.createTodoistTasksFromNote(creations, lineToTemp);
+    } catch (error) {
+      this.restoreForgottenTaskEntries(forgotten);
+      throw error;
+    }
+    // Recreated lines that got no new id keep their old entry, otherwise the next sync would POST to the deleted id.
+    const unmapped = forgotten.filter(([id]) => {
+      const line = [...recreatedOldIds].find(([, oldId]) => oldId === id)?.[0];
+      return !tempToReal?.[lineToTemp.get(line)];
+    });
+    this.restoreForgottenTaskEntries(unmapped);
     for (const parsed of relinked) {
       lines[parsed.lineNumber] = syncLocationMarkersOnTaskLine(addTodoistLink(lines[parsed.lineNumber], parsed.id, this.settings, parsed.oid), parsed, this.settings);
       changed = true;
@@ -21331,6 +21461,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       presentIds.add(id);
       lines[parsed.lineNumber] = ensureSubtaskIndent(addTodoistLink(lines[parsed.lineNumber], id, this.settings, parsed.oid), parsed, this.settings);
       this.cacheTask(id, parsed);
+      // Recreated line: keep what the old entry knew (knowledge, extra note references) on the new entry.
+      const oldEntry = forgotten.find(([oldId]) => oldId === recreatedOldIds.get(parsed.lineNumber))?.[1];
+      const fresh = this.settings.taskCache[id];
+      if (oldEntry && fresh) {
+        if (oldEntry.knowledge?.fingerprint && oldEntry.knowledge.fingerprint === fresh.knowledge?.fingerprint) fresh.knowledge = oldEntry.knowledge;
+        fresh.noteRefs = mergeNoteReferences(fresh.noteRefs, oldEntry.noteRefs);
+        fresh.description = fresh.description || oldEntry.description || "";
+      }
       changed = true;
       stats.created += 1;
     }
@@ -21441,29 +21579,51 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
   }
 
+  // Stable per-oid command uuid/temp_id so a retry after a lost create response (or the same pasted oid in two notes) is deduped by Todoist.
+  // Synchronous get-or-create (no await) so concurrent per-file workers share one entry. Tasks without an oid get fresh ids.
+  // A line without an oid yet (note not written before a failure) is keyed by note path + content and keeps the oid it was given.
+  assignCreateIds(task, seen = new Map()) {
+    const store = this.settings.pendingTodoistCreateCommands = this.settings.pendingTodoistCreateCommands || {};
+    let key = task.oid ? String(task.oid).toUpperCase() : `${task.path}::${singleLine(task.content || "").toLowerCase()}`;
+    if (!task.oid) { const n = (seen.get(key) || 0) + 1; seen.set(key, n); if (n > 1) key += "#" + n; } // identical oid-less lines in one note stay distinct
+    const entry = store[key];
+    if (!entry || !(Date.now() - Date.parse(entry.at) < 7 * 24 * 3600 * 1000)) store[key] = { uuid: uuid(), tempId: uuid(), at: new Date().toISOString() };
+    task.tempId = store[key].tempId;
+    task.uuid = store[key].uuid;
+    task.createKey = key;
+  }
+
+  dropStalePendingCreateCommands() {
+    const store = this.settings.pendingTodoistCreateCommands;
+    for (const [key, entry] of Object.entries(store || {})) if (!(Date.now() - Date.parse(entry?.at) < 7 * 24 * 3600 * 1000)) delete store[key];
+  }
+
   async createTodoistTasksFromNote(tasks, lineToTemp) {
     if (!tasks.length) return {};
     const projectId = await this.getTaskProjectId();
     const projectName = await this.todoistProjectNameForId(projectId);
     const commands = [];
     const sectionRefs = new Map();
+    // A recreated task goes to its old project (recreateProjectId); everything else to the default project.
+    const projectOf = (task) => task.recreateProjectId || projectId;
     for (const task of tasks) {
-      task.projectId = task.projectId || projectId;
-      task.projectName = task.projectName || projectName;
+      task.projectId = task.recreateProjectId || task.projectId || projectId;
+      task.projectName = task.recreateProjectId ? (task.recreateProjectName || task.projectName) : (task.projectName || projectName);
       if (task.isSubtask || !task.section) continue;
-      if (sectionRefs.has(task.section)) continue;
-      sectionRefs.set(task.section, task.sectionId || this.pendingSectionIdForParsedTask(task) || await this.ensureTodoistSectionId(projectId, task.section));
+      const sectionKey = `${projectOf(task)}::${task.section}`;
+      if (sectionRefs.has(sectionKey)) continue;
+      sectionRefs.set(sectionKey, task.sectionId || (task.recreateProjectId ? "" : this.pendingSectionIdForParsedTask(task)) || await this.ensureTodoistSectionId(projectOf(task), task.section));
     }
     for (const task of tasks) {
       const parent = findParentForTask(task, lineToTemp, this.settings);
-      if (!parent && !task.isSubtask && task.section && !sectionRefs.get(task.section)) {
+      if (!parent && !task.isSubtask && task.section && !sectionRefs.get(`${projectOf(task)}::${task.section}`)) {
         throw new Error(`Todoist section was not available for ${task.section}.`);
       }
       commands.push({
         type: "item_add",
         temp_id: task.tempId,
-        uuid: uuid(),
-        args: todoistArgsFromParsedTask(task, projectId, parent, sectionRefs.get(task.section), this.settings)
+        uuid: task.uuid || uuid(),
+        args: todoistArgsFromParsedTask(task, projectOf(task), parent, sectionRefs.get(`${projectOf(task)}::${task.section}`), this.settings)
       });
     }
     const batchTempIds = new Set(tasks.map((task) => String(task.tempId || "")));
@@ -21483,10 +21643,15 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       rootTasks: tasks.filter((task) => !task.isSubtask).length,
       sections: Array.from(sectionRefs.entries()).map(([name, id]) => ({ name, id }))
     });
+    this.dropStalePendingCreateCommands();
+    await this.saveSettings(); // persist the pending command ids before sending, so a retry reuses them
     const response = await this.todoistSync(commands);
     const mapping = response.temp_id_mapping || {};
     for (const parsed of tasks) {
-      if (mapping[parsed.tempId]) parsed.id = mapping[parsed.tempId];
+      if (mapping[parsed.tempId]) {
+        parsed.id = mapping[parsed.tempId];
+        if (parsed.createKey) delete this.settings.pendingTodoistCreateCommands?.[parsed.createKey];
+      }
     }
     return mapping;
   }
@@ -21522,6 +21687,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         lineToTemp.set(ownLine, match.id);
       }
       relinked.push(task);
+      if (task.createKey) delete this.settings.pendingTodoistCreateCommands?.[task.createKey];
       creations.splice(i, 1);
     }
     return relinked.reverse();
@@ -22858,7 +23024,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     }
     for (const [id, cached] of entries) {
       checked += 1;
-      if (!activeTodoistIds && cached.isCompleted) continue;
+      // Cached completed = already preserved: line checked, missing or unchecked by the user (file sync reopens/recreates) all need nothing here.
+      if (cached.isCompleted) continue;
       const exists = activeTodoistIds ? activeTodoistIds.has(id) : await this.todoistTaskExists(id);
       if (exists) continue;
       const noteTouched = await this.preserveMissingTodoistTaskInNote(id, cached, "missing from active Todoist snapshot");
@@ -22917,15 +23084,18 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   async cachedTaskLineIsChecked(taskId, cached) {
-    if (!cached?.path) return false;
+    return (await this.cachedTaskLineState(taskId, cached)) === "checked";
+  }
+
+  // "checked" | "unchecked" | "missing" (note or line not found).
+  async cachedTaskLineState(taskId, cached) {
+    if (!cached?.path) return "missing";
     const file = this.app.vault.getAbstractFileByPath(cached.path);
-    if (!(file instanceof TFile)) return false;
+    if (!(file instanceof TFile)) return "missing";
     const lines = (await this.app.vault.read(file)).split("\n");
-    return lines.some((line) => {
-      if (taskId && getTodoistId(line, this.settings) === String(taskId)) return /^\s*[-*]\s+\[[xX]\]/.test(line);
-      if (cached.oid && getTaskOid(line) === cached.oid) return /^\s*[-*]\s+\[[xX]\]/.test(line);
-      return false;
-    });
+    const line = lines.find((l) => (taskId && getTodoistId(l, this.settings) === String(taskId)) || (cached.oid && getTaskOid(l) === cached.oid));
+    if (line === undefined) return "missing";
+    return /^\s*[-*]\s+\[[xX]\]/.test(line) ? "checked" : "unchecked";
   }
 
   async preserveMissingTodoistTaskInNote(taskId, cached, reason = "") {
@@ -23085,7 +23255,13 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           savedEvents.add(event.id);
           continue;
         }
-        if (cached.isCompleted || await this.cachedTaskLineIsChecked(taskId, cached)) {
+        const lineState = await this.cachedTaskLineState(taskId, cached);
+        if (cached.isCompleted && lineState === "unchecked") {
+          this.logLocal("Todoist removal event left reopened task for file sync", { id: taskId, path: cached.path || "" });
+          savedEvents.add(event.id);
+          continue;
+        }
+        if (cached.isCompleted || lineState === "checked") {
           await this.preserveMissingTodoistTaskInNote(taskId, cached, "Todoist removal event for completed local task");
           this.logLocal("Todoist removal event preserved completed task in note", { id: taskId, path: cached.path || "" });
           savedEvents.add(event.id);
@@ -23097,7 +23273,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         continue;
       }
       if (/uncompleted/i.test(eventType)) await this.setTaskLineChecked(taskId, false);
-      else if (/completed/i.test(eventType)) await this.setTaskLineChecked(taskId, true);
+      else if (/completed/i.test(eventType)) {
+        const cachedNow = this.settings.taskCache[taskId];
+        // A task preserved as completed whose line the user unchecked is handled by file sync (reopen/recreate), not re-checked here.
+        if (!(cachedNow.isCompleted && await this.cachedTaskLineState(taskId, cachedNow) === "unchecked")) await this.setTaskLineChecked(taskId, true);
+      }
       if (/updated|added/i.test(eventType)) {
         const task = snapshotTasksById?.get(String(taskId)) || null;
         if (task) await this.updateTaskLineFromTodoist(taskId, task);
@@ -23238,6 +23418,14 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     this.markTaskReferenceStateDirty();
     this.queueTaskReferenceIndexUpdate(path);
     this.observeSchedulerMemoryForTask(id, this.settings.taskCache[id], "task-cache");
+  }
+
+  restoreForgottenTaskEntries(entries) {
+    for (const [id, entry] of entries) {
+      this.settings.taskCache[id] = entry;
+      this.markTaskReferenceStateDirty();
+      this.queueTaskReferenceIndexUpdate(entry.path || "");
+    }
   }
 
   forgetCachedTaskReference(id) {
@@ -23674,6 +23862,10 @@ class SemanticTodoistView extends ItemView {
     this.collaborateFeaturesButton.onclick = (event) => {
       this.openCollaborateFeaturesMenu(event);
     };
+    // Meeting prep preset: only meeting templates, Collaborate mode only (see populateMeetingPresetOptions).
+    this.meetingPresetEl = actionRow.createEl("select", { cls: "semantic-todoist-meeting-preset", attr: { title: "Meeting prep preset", "aria-label": "Meeting prep preset" } });
+    this.meetingPresetEl.onchange = () => this.selectMeetingPreset();
+    this.populateMeetingPresetOptions();
     const runButton = topRow.createEl("button", { cls: "semantic-todoist-run-action", attr: { title: "Run the selected scheduler action or prompt" }, text: "Run" });
     this.runButton = runButton; // writing-mode: task 10 Run button relabelled Write in collaborate mode
     runButton.onclick = async () => {
@@ -23706,6 +23898,7 @@ class SemanticTodoistView extends ItemView {
     }
     if (this.actionLabelEl) this.actionLabelEl.textContent = on ? "Collaborate:" : "Run:";
     if (this.actionSelectEl) this.actionSelectEl.style.display = on ? "none" : "";
+    if (this.meetingPresetEl) this.meetingPresetEl.style.display = on ? "" : "none";
     if (this.collaborateFeaturesButton) {
       this.collaborateFeaturesButton.style.display = on ? "" : "none";
       this.updateCollaborateFeaturesLabel();
@@ -23722,6 +23915,7 @@ class SemanticTodoistView extends ItemView {
     if (this.plugin.settings.writingUseResearch !== false) parts.push("Research");
     if (this.plugin.settings.writingUseVault !== false) parts.push("Vault");
     if (this.plugin.settings.writingUseContext !== false) parts.push("Context");
+    if (this.plugin.settings.writingUseTodoist === true) parts.push("Todoist");
     this.collaborateFeaturesButton.textContent = parts.length ? `${length} · ${parts.join(" + ")}` : length;
   }
 
@@ -23774,6 +23968,15 @@ class SemanticTodoistView extends ItemView {
           this.updateCollaborateFeaturesLabel();
         });
       });
+      sub.addItem((choice) => {
+        choice.setTitle("Todoist tasks");
+        choice.setChecked(this.plugin.settings.writingUseTodoist === true);
+        choice.onClick(async () => {
+          this.plugin.settings.writingUseTodoist = this.plugin.settings.writingUseTodoist !== true;
+          await this.plugin.saveSettings();
+          this.updateCollaborateFeaturesLabel();
+        });
+      });
     });
     // writing-mode: Describe images moved to the Collaborate settings tab
     // writing-mode: open at the button's left edge so a click near its right end never clips the menu
@@ -23817,7 +24020,9 @@ class SemanticTodoistView extends ItemView {
   async write(override = {}) {
     try {
       const { instruction: overrideInstruction, evidence, apply = "replace", pinned: overridePinned } = override;
-      const pinned = overridePinned !== undefined ? overridePinned : this.pinned;
+      // Meeting preset (sidebar only; editor presets pass an override): ignores any pinned selection.
+      const meetingTemplate = !overrideInstruction && this.meetingTemplate ? this.meetingTemplate : null;
+      const pinned = meetingTemplate ? null : (overridePinned !== undefined ? overridePinned : this.pinned);
       const citationStyle = this.plugin.settings.writingCitationStyle;
       const { typedRewriteInstruction } = require("./writing/rewrite.js");
 
@@ -23941,7 +24146,8 @@ class SemanticTodoistView extends ItemView {
         let lookup = null;
         let taskSourcePaths = [];
         try {
-          const turn = typeof this.plugin.todoistChatTurn === "function" ? await this.plugin.todoistChatTurn(instruction, previousMessages) : null;
+          // Meeting runs skip the look-up entirely.
+          const turn = !meetingTemplate && typeof this.plugin.todoistChatTurn === "function" ? await this.plugin.todoistChatTurn(instruction, previousMessages) : null;
           lookup = turn?.lookup || null;
           const seenPaths = new Set();
           const addSource = (notePath) => {
@@ -23965,7 +24171,17 @@ class SemanticTodoistView extends ItemView {
         const searchQuery = typeof lookup?.searchQuery === "string" ? lookup.searchQuery.trim().slice(0, 300) : "";
         const reuse = lookup?.reuseEvidence === true && Array.isArray(this.lastWriteEvidence) && this.lastWriteEvidence.length > 0;
         // writing-mode: task 4 the request carries the resolved instruction and the citation style
-        const result = await this.plugin.writeWithEvidence(instruction, {
+        const result = meetingTemplate ? await this.plugin.prepareMeeting({
+          instruction,
+          template: meetingTemplate,
+          active,
+          citationStyle,
+          webSearchMode,
+          useVault,
+          useContext,
+          useResearch,
+          onProgress: (k, n) => this.setStatus(`Preparing meeting doc\u2026 ${k} of ${n} projects`),
+        }) : await this.plugin.writeWithEvidence(instruction, {
           history,
           ...(searchQuery ? { searchQuery } : {}),
           ...(reuse ? { reuseEvidence: true, previousEvidence: this.lastWriteEvidence } : {}),
@@ -23977,12 +24193,18 @@ class SemanticTodoistView extends ItemView {
           useVault,
           useContext,
           useResearch,
+          useTodoist: evidence === "off" || pinned || isChat ? false : this.plugin.settings.writingUseTodoist === true,
           // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
           ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
         });
         if (Array.isArray(result?.evidence)) this.lastWriteEvidence = result.evidence;
 
         // writing-mode: task 4 a pinned range drives the rewrite/check path: preview modal, chat answer, or continuation
+        // Project notices first so the note-closed early returns below still show them.
+        if (meetingTemplate) {
+          if (result.unknownProjects && result.unknownProjects.length) new Notice(`Unknown project(s) in template: ${result.unknownProjects.join(", ")}`);
+          if (result.failedProjects && result.failedProjects.length) new Notice(`Couldn't write these projects: ${result.failedProjects.join(", ")}`);
+        }
         // ---- pinned selection: collaborate rewrite/check path ----
         if (pinned) {
           if (!result.markdown || !String(result.markdown).trim()) {
@@ -24108,7 +24330,11 @@ class SemanticTodoistView extends ItemView {
         this.setStatus("Draft ready — review it in the dialog.");
       } catch (error) {
         console.error(error);
-        if (error && error.code === "empty-instruction") {
+        const meetingMessage = meetingTemplate ? this.meetingErrorMessage(error) : null;
+        if (meetingMessage) {
+          this.replaceLastAssistantMessage(meetingMessage);
+          this.setStatus(meetingMessage);
+        } else if (error && error.code === "empty-instruction") {
           this.replaceLastAssistantMessage(`Error: Instruction cannot be empty.`);
           this.setStatus("Writing failed: empty instruction.");
         } else {
@@ -24118,10 +24344,13 @@ class SemanticTodoistView extends ItemView {
       } finally {
         // writing-mode: restore Collaborate button after write finishes (success or error)
         this.writing = false;
+        if (meetingTemplate) this.resetMeetingPreset();
         if (this.collaborateButton) {
           this.collaborateButton.disabled = false;
           this.collaborateButton.textContent = "Collaborate";
         }
+        // A meeting run returns no evidence list, so the previous run's evidence would be stale for a follow-up.
+        if (meetingTemplate) this.lastWriteEvidence = null;
       }
     } catch (error) {
       console.error(error);
@@ -24322,6 +24551,7 @@ class SemanticTodoistView extends ItemView {
       this.sidebarActionTemplates = templates || [];
       this.sidebarActionTemplates.forEach((template, index) => {
         const name = singleLine(template.name || template.path || `Prompt ${index + 1}`);
+        if (isMeetingPrepTemplate(template)) return;
         const option = { value: `prompt:${index}`, label: shortTitle(name, 56) };
         if (isScheduleTodayTemplate(template)) {
           if (!scheduleOption) scheduleOption = option;
@@ -24339,6 +24569,48 @@ class SemanticTodoistView extends ItemView {
     for (const option of options) this.actionSelectEl.createEl("option", { text: option.label, value: option.value });
     const values = new Set(options.map((option) => option.value));
     this.actionSelectEl.value = values.has(previous) ? previous : options[0].value;
+    await this.populateMeetingPresetOptions();
+  }
+
+  async populateMeetingPresetOptions() {
+    const el = this.meetingPresetEl;
+    if (!el) return;
+    const generation = (this.meetingPopulateGeneration = (this.meetingPopulateGeneration || 0) + 1);
+    const previous = this.meetingTemplate;
+    let templates = [];
+    try {
+      templates = ((await this.plugin.getPromptTemplates()) || []).filter(isMeetingPrepTemplate);
+    } catch (error) {
+      console.error(error);
+    }
+    if (generation !== this.meetingPopulateGeneration) return; // a newer refresh owns the list
+    const sameTemplate = (a, b) => (a.path && b.path ? a.path === b.path : a.name === b.name);
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.createEl("option", { text: "None", value: "" });
+    templates.forEach((template, index) => el.createEl("option", { text: shortTitle(singleLine(template.name || template.path || "Meeting"), 56), value: String(index) }));
+    this.meetingTemplates = templates;
+    const index = previous ? templates.findIndex((t) => sameTemplate(t, previous)) : -1;
+    el.value = index >= 0 ? String(index) : "";
+    this.meetingTemplate = index >= 0 ? templates[index] : null;
+  }
+
+  selectMeetingPreset() {
+    const template = this.meetingTemplates && this.meetingTemplates[Number(this.meetingPresetEl.value)];
+    this.meetingTemplate = this.meetingPresetEl.value !== "" && template ? template : null;
+    if (this.meetingTemplate && this.promptEl) this.promptEl.value = String(this.meetingTemplate.prompt || "");
+  }
+
+  resetMeetingPreset() {
+    this.meetingTemplate = null;
+    if (this.meetingPresetEl) this.meetingPresetEl.value = "";
+  }
+
+  meetingErrorMessage(error) {
+    const names = error && error.unknownProjects || [];
+    if (error && error.code === "meeting-empty") return names.length ? `Unknown project(s) in template: ${names.join(", ")}` : "No Todoist tasks in scope for this template.";
+    if (error && error.code === "todoist-unavailable") return `Todoist unavailable: ${String(error.message || error).replace(/^Todoist (is )?unavailable:?\s*/i, "") || "no token or request failed"}`;
+    if (error && error.code === "meeting-failed") return `Couldn't write any project: ${String(error.message || error).replace(/^Every project failed:\s*/i, "")}`;
+    return null;
   }
 
   sidebarTemplateChoices(template = {}) {
@@ -24387,7 +24659,7 @@ class SemanticTodoistView extends ItemView {
   }
 
   async openPromptTemplates() {
-    const templates = await this.plugin.getPromptTemplates();
+    const templates = (await this.plugin.getPromptTemplates()).filter((template) => !isMeetingPrepTemplate(template));
     new TaskTemplateModal(this.plugin.app, templates, async ({ template, insertIntoNote, syncAfterInsert }) => {
       try {
         this.setStatus(template.createTasks === false ? "Running prompt..." : "Creating tasks...");
@@ -26397,7 +26669,7 @@ const SETTING_DESCRIPTIONS = {
   taskDeduplicationAllowExplicitSubtaskRemoval: "When enabled, an existing linked subtask is omitted from the merge only when newer source text clearly says it is obsolete or should be removed.",
   enableAiAmbiguousTaskDeduplication: "When enabled, conclusive duplicates are confirmed locally, credible ambiguous pairs are posted to chat, and the selected dedupe model reviews only strong unresolved matches. When disabled, local merge decisions still proceed through regular task generation and ambiguous candidates remain manual. The dedupe model never rewrites task fields.",
   taskDeduplicationAiReviewSensitivity: "Controls how broadly same-batch and unresolved local candidates are considered. Matching strictness controls nomination, local confirmation, and manual-review thresholds.",
-  taskDeduplicationAiModel: "Model used only to confirm whether duplicate candidates match. Automatic uses the configured chat fallback model unless you choose a specific deduplication model; task updates use the regular task-generation model.",
+  taskDeduplicationAiModel: "Model used only to confirm whether duplicate candidates match. Automatic uses the shared fallback model when it uses the same provider as the primary model, otherwise the primary model (OpenAI and Gemini keep their fallback ranking); task updates use the regular task-generation model.",
   taskDeduplicationAiReasoningEffort: "Reasoning effort used only for AI duplicate verdicts. It is independent of primary and fallback reasoning settings and defaults to Medium; descriptions and confirmed-task updates retain primary-model reasoning.",
   taskDeduplicationPolicy: "Editable duplicate policy used by local candidate matching and AI-mediated duplicate confirmation.",
   emailMainTaskInstructions: "Plain-language rules for deciding which email items become main tasks.",
@@ -27852,6 +28124,8 @@ async function saveSharedReferenceField(plugin, role, field, value) {
     plugin.settings.chatFallbackModel = next.model;
     plugin.settings.chatFallbackReasoningEffort = next.reasoningEffort;
   } else {
+    // A dedup pick belongs to the old primary provider; drop it when the provider changes.
+    if (current.provider !== next.provider) { plugin.settings.taskDeduplicationAiModel = ""; plugin.settings.taskDeduplicationAiModelProvider = ""; }
     plugin.settings.sharedGenerationPrimary = next;
     plugin.settings.aiModelProvider = next.provider;
     plugin.settings.chatModel = next.model;
@@ -27956,6 +28230,7 @@ async function saveSharedModelReference(plugin, role, provider, model) {
     plugin.settings.chatFallbackModel = next.model;
     plugin.settings.chatFallbackReasoningEffort = next.reasoningEffort;
   } else {
+    if (current.provider !== next.provider) { plugin.settings.taskDeduplicationAiModel = ""; plugin.settings.taskDeduplicationAiModelProvider = ""; }
     plugin.settings.sharedGenerationPrimary = next;
     plugin.settings.aiModelProvider = next.provider;
     plugin.settings.chatModel = next.model;
@@ -28867,9 +29142,9 @@ function taskDeduplicationAiReviewSensitivitySetting(containerEl, plugin) {
 }
 
 function taskDeduplicationAiModelSetting(containerEl, plugin) {
-  const current = plugin.settings.taskDeduplicationAiModel || "";
+  const current = dedupPickProviderStale(plugin.settings) ? "" : plugin.settings.taskDeduplicationAiModel || "";
   const automatic = taskDeduplicationAiModel(plugin.settings);
-  const options = [{ value: "", label: `Automatic chat fallback: ${modelDisplayName(automatic)}` }];
+  const options = [{ value: "", label: `Automatic (fallback or primary): ${taskDeduplicationModelLabel(plugin.settings, automatic)}` }];
   const provider = normalizeAiProvider(plugin.settings.aiModelProvider, aiProviderForModel(plugin.settings.chatModel));
   if (provider === "gemini") {
     const geminiModels = plugin.settings.availableGeminiModels?.length ? plugin.settings.availableGeminiModels : DEFAULT_SETTINGS.availableGeminiModels;
@@ -28878,11 +29153,14 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
       if (id && isUsableGeminiChatModel(id)) options.push({ value: `gemini/${id}`, label: `Gemini: ${id}` });
     }
   } else {
-    for (const model of plugin.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels) {
-      const id = normalizeOpenAIModelId(model);
-      if (id) options.push({ value: id, label: `OpenAI: ${id}` });
+    const catalog = provider === "openai" ? (plugin.settings.availableChatModels || DEFAULT_SETTINGS.availableChatModels) : providerCatalogModels(plugin.settings, provider, false);
+    for (const model of catalog) {
+      const id = provider === "openai" ? normalizeOpenAIModelId(model) : String(model || "").trim();
+      if (id) options.push({ value: id, label: `${stableProviderLabel(provider)}: ${id}` });
     }
   }
+  // Keep a saved pick visible even when the catalog does not list it.
+  if (current && !options.some((option) => option.value === current)) options.push({ value: current, label: `${taskDeduplicationModelLabel(plugin.settings, current)} (saved)` });
   const selected = options.some((option) => option.value === current) ? current : "";
   new Setting(containerEl)
     .setName("AI duplicate detection model")
@@ -28892,6 +29170,7 @@ function taskDeduplicationAiModelSetting(containerEl, plugin) {
       dropdown.setValue(selected);
       dropdown.onChange(async (value) => {
         plugin.settings.taskDeduplicationAiModel = value;
+        plugin.settings.taskDeduplicationAiModelProvider = value ? dedupRuntimeProvider(plugin.settings, value) : "";
         await plugin.saveSettings();
       });
     });
@@ -29033,7 +29312,9 @@ function parsePromptTemplateFile(file, text) {
       insertResponse: parseTemplateBoolean(parsed.meta.insertResponse ?? parsed.meta.insert_response, true),
       syncAfterInsert: parseTemplateBoolean(parsed.meta.syncTasks ?? parsed.meta.sync_tasks ?? parsed.meta.syncAfterInsert ?? parsed.meta.sync_after_insert, false),
       taskHeading: parsed.meta.taskHeading || parsed.meta.task_heading || parsed.meta.heading || "",
-      taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only)
+      taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only),
+      completedDays: parseMeetingCompletedDays(parsed.meta.completedDays),
+      projects: parseMeetingProjects(parsed.meta.projects)
     };
 }
 
@@ -29068,6 +29349,7 @@ function parseOptionalTemplateBoolean(value) {
 }
 
 function isTaskGenerationTemplate(template = {}) {
+  if (isMeetingPrepTemplate(template)) return false;
   if (template.taskGenerationTemplate != null) return Boolean(template.taskGenerationTemplate);
   const text = `${template.name || ""}\n${template.prompt || ""}`;
   if (!template.createTasks) return false;
@@ -29078,6 +29360,7 @@ function isTaskGenerationTemplate(template = {}) {
 function normalizePromptTemplateAction(value) {
   const action = String(value || "").trim().toLowerCase().replace(/['’]/g, "").replace(/[\s_]+/g, "-");
   if (/^(schedule|schedule-today|schedule-todays-tasks|schedule-today-tasks|schedule-day|plan-today)$/.test(action)) return "schedule-today";
+  if (/^(meeting-prep|meeting|prepare-meeting)$/.test(action)) return "meeting-prep";
   return action;
 }
 
@@ -29085,10 +29368,24 @@ function isScheduleTodayTemplate(template = {}) {
   return normalizePromptTemplateAction(template.action) === "schedule-today";
 }
 
+function isMeetingPrepTemplate(template = {}) {
+  return normalizePromptTemplateAction(template.action) === "meeting-prep";
+}
+
+function parseMeetingCompletedDays(value) {
+  const days = value == null || String(value).trim() === "" ? NaN : Math.trunc(Number(value));
+  return Number.isFinite(days) ? Math.min(90, Math.max(1, days)) : 14;
+}
+
+function parseMeetingProjects(value) {
+  return String(value || "").trim().replace(/^\[([\s\S]*)\]$/, "$1").split(",").map((name) => name.trim()).filter(Boolean);
+}
+
 function promptTemplateFileText(template) {
   return [
     "---",
     ...(template.action ? [`action: ${normalizePromptTemplateAction(template.action)}`] : []),
+    ...(isMeetingPrepTemplate(template) ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`] : []),
     `createTasks: ${Boolean(template.createTasks)}`,
     `insertResponse: ${template.insertResponse !== false}`,
     `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
@@ -31356,7 +31653,7 @@ function appendTaskDeduplicationPolicyInstruction(currentPolicy = "", instructio
 
 function taskDeduplicationPolicyImpactText(settings = DEFAULT_SETTINGS, policyText = "") {
   const strictness = settings.taskDeduplicationStrictness || DEFAULT_SETTINGS.taskDeduplicationStrictness;
-  const ai = modelDisplayName(taskDeduplicationAiModel(settings));
+  const ai = taskDeduplicationModelLabel(settings, taskDeduplicationAiModel(settings));
   const labels = settings.taskDeduplicationMergeLabelsAdditive === false ? "replacement" : "additive";
   const removal = settings.taskDeduplicationAllowExplicitSubtaskRemoval === false ? "explicit subtask removal disabled" : "explicit obsolete subtasks can be omitted";
   const policy = policyText || taskDeduplicationPolicyText(settings);
@@ -31374,19 +31671,45 @@ function taskDeduplicationPolicySettingsSummary(settings = DEFAULT_SETTINGS) {
   ].join("\n");
 }
 
+function taskDeduplicationModelLabel(settings, model) {
+  if (usesGeminiChatModel(model)) return modelDisplayName(model);
+  return `${stableProviderLabel(dedupRuntimeProvider(settings, model))}: ${String(model || "").trim()}`;
+}
+// Same provider resolution as generationProviderForModel at call time.
+function dedupRuntimeProvider(settings, model) {
+  return usesGeminiChatModel(model) ? "gemini" : stableSupportedProvider(settings.aiModelProvider, "openrouter");
+}
+// A pick saved under a different provider than runtime now is stale; legacy picks (no saved provider) are not.
+function dedupPickProviderStale(settings) {
+  const saved = settings.taskDeduplicationAiModelProvider || "";
+  return Boolean(settings.taskDeduplicationAiModel && saved && saved !== dedupRuntimeProvider(settings, settings.taskDeduplicationAiModel));
+}
 function taskDeduplicationAiModel(settings = DEFAULT_SETTINGS) {
-  const selected = settings.taskDeduplicationAiModel || "";
+  const selected = dedupPickProviderStale(settings) ? "" : settings.taskDeduplicationAiModel || "";
   if (selected) return selected;
   const primary = settings.chatModel || DEFAULT_SETTINGS.chatModel;
-  const provider = normalizeAiProvider(settings.aiModelProvider, aiProviderForModel(primary));
+  const provider = dedupRuntimeProvider(settings, primary);
+  if (provider !== "openai" && provider !== "gemini") {
+    // Other providers: shared fallback when it belongs to this provider, else the primary (no cross-provider routing).
+    const shared = settings.sharedGenerationFallback;
+    const sharedModel = shared?.provider === provider ? String(shared.model || "").trim() : "";
+    return sharedModel && sharedModel.toLowerCase() !== String(primary).trim().toLowerCase() ? sharedModel : primary;
+  }
   const fallback = preferredFallbackModelForProvider(settings, provider, primary) || "";
   if (usesGeminiChatModel(fallback)) return `gemini/${normalizeGeminiModelId(fallback)}`;
   if (usesOpenAIChatModel(fallback)) return normalizeOpenAIModelId(fallback);
   return fallback || primary;
 }
 
-function hasChatCredentialForModel(settings = DEFAULT_SETTINGS, model = "") {
-  return usesGeminiChatModel(model) ? Boolean(settings.googleApiKey) : Boolean(settings.openaiApiKey);
+function hasChatCredentialForModel(settings = DEFAULT_SETTINGS, model = "", plugin = null) {
+  // Same provider the call is sent to (generationProviderForModel) and the same per-provider rules as aiAccessConfigured.
+  const provider = dedupRuntimeProvider(settings, model);
+  return provider === "openai" ? Boolean(settings.openaiApiKey)
+    : provider === "gemini" ? Boolean(settings.googleApiKey)
+    : provider === "openrouter" ? Boolean(settings.openrouterApiKey)
+    : provider === "anthropic" ? Boolean(settings.anthropicApiKey)
+    : provider === "openwebui" ? Boolean(settings.openwebuiBaseUrl && (settings.openwebuiApiKey || settings.openwebuiJwt || (settings.openwebuiAuthMode === "login" && plugin?.openwebuiLoginPassword)))
+    : Boolean(settings.customOpenAIBaseUrl);
 }
 
 function mergeSchedulerMemoryChatCommands(local = {}, ai = {}) {
@@ -59108,6 +59431,13 @@ if (typeof module !== "undefined" && module.exports) {
     MODEL_COMBOBOX_PROVIDER_ORDER,
     modelComboboxGroups,
     aiAccessConfigured,
+    taskDeduplicationAiModel,
+    hasChatCredentialForModel,
+    saveSharedModelReference,
+    saveSharedReferenceField,
+    taskDeduplicationModelLabel,
+    taskDeduplicationAiModelSetting,
+    taskDeduplicationPolicyImpactText,
     aiSetupSummary,
     providerConnectionDisclosure,
     providerDisplayName,
@@ -59151,6 +59481,13 @@ if (typeof module !== "undefined" && module.exports) {
     // writing-mode: task 4 test seam so the editor-menu guard and item order run for real
     rewriteMenuPin,
     addRewritePresetItems,
+    // meeting-prep: test seams for prompt-template parsing and filters
+    isMeetingPrepTemplate,
+    parsePromptTemplateFile,
+    promptTemplateFileText,
+    DEFAULT_PROMPT_TEMPLATE_FILES,
+    isTaskGenerationTemplate,
+    isScheduleTodayTemplate,
     buildTaskEvidenceCatalog,
     attachTaskWorkflowSemanticEvidence,
     resolveTaskWorkflowReferences,

@@ -95,7 +95,7 @@ function mockObsidian() {
       },
       TFile: Empty,
       Menu: class {
-        constructor() { this.items = []; }
+        constructor() { this.items = []; obsidianMock.lastMenu = this; }
         addItem(fn) {
           const item = {
             title: "",
@@ -1437,6 +1437,251 @@ async function testDraftReviewCancelClosedAndCheck() {
   console.log('PASS draft-review-cancel-closed-check');
 }
 
+// ---- meeting prep wiring ----
+function makeSelectStub() {
+  const el = {
+    children: [], style: {}, _value: '', onchange: null,
+    get firstChild() { return this.children[0] || null; },
+    removeChild(c) { this.children.splice(this.children.indexOf(c), 1); },
+    createEl(tag, o = {}) { const c = { text: o.text, value: o.value }; this.children.push(c); return c; },
+    get value() { return this._value; },
+    set value(v) { this._value = String(v); },
+  };
+  return el;
+}
+
+const MEETING_TEMPLATES = [
+  { name: 'Chat prompt', prompt: 'chat', action: '' },
+  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'] },
+];
+
+function makeMeetingView(prepareImpl, notePath = 'Notes/Meet.md') {
+  const { view: leafView, leaf, calls } = makePinEditor('Hello world.', notePath, { line: 0, ch: 0 }, { line: 0, ch: 5 });
+  const prepCalls = [];
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }));
+  plugin.getPromptTemplates = async () => MEETING_TEMPLATES;
+  plugin.prepareMeeting = async (o) => { prepCalls.push(o); return prepareImpl(o); };
+  const view = makeWriteView(plugin, [leaf], leaf, SourcePlugin);
+  view.meetingPresetEl = makeSelectStub();
+  return { view, plugin, calls, prepCalls, leafView };
+}
+
+async function testMeetingEvidenceMenuAndLabel() {
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  view.collaborateFeaturesButton = { textContent: '' };
+  view.openCollaborateFeaturesMenu({});
+  // last constructed Menu is not exposed; read via the source instead of the mock
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const body = srcClassMethodBody(src, 'openCollaborateFeaturesMenu');
+  assert(body.includes('choice.setTitle("Todoist tasks")'), 'Todoist tasks menu item');
+  assert(body.includes('writingUseTodoist === true'), 'unchecked unless on');
+  plugin.settings.writingUseTodoist = false;
+  view.updateCollaborateFeaturesLabel();
+  assert(!view.collaborateFeaturesButton.textContent.includes('Todoist'), 'label omits Todoist when off');
+  plugin.settings.writingUseTodoist = true;
+  view.updateCollaborateFeaturesLabel();
+  assert(view.collaborateFeaturesButton.textContent.endsWith('Todoist'), 'label shows Todoist when on');
+  console.log('PASS meeting-evidence-menu');
+}
+
+async function testMeetingPresetDropdown() {
+  const { view } = makeMeetingView(async () => ({}));
+  await view.populateMeetingPresetOptions();
+  assert.deepStrictEqual(view.meetingPresetEl.children.map((c) => c.text), ['None', 'Weekly sync'], 'None + meeting templates only');
+  view.promptEl = { value: 'x' };
+  view.meetingPresetEl.value = '0';
+  view.selectMeetingPreset();
+  assert.strictEqual(view.promptEl.value, 'Prep the weekly sync');
+  assert.strictEqual(view.meetingTemplate, MEETING_TEMPLATES[1]);
+  view.meetingPresetEl.value = '';
+  view.selectMeetingPreset();
+  assert.strictEqual(view.meetingTemplate, null, 'None clears the preset');
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('semantic-todoist-meeting-preset'), 'select class present');
+  assert(src.indexOf('semantic-todoist-collaborate-features') < src.indexOf('semantic-todoist-meeting-preset'), 'preset sits after Features button');
+  assert(srcClassMethodBody(src, 'applyCollaborateMode').includes('meetingPresetEl'), 'shown only in Collaborate mode');
+  const popStart = src.indexOf('async populateSidebarActionOptions()');
+  assert(src.slice(popStart, src.indexOf('async populateMeetingPresetOptions()')).includes('populateMeetingPresetOptions'), 'refreshed with action options');
+  console.log('PASS meeting-preset-dropdown');
+}
+
+async function testMeetingRouting() {
+  const { view, plugin, calls, prepCalls } = makeMeetingView(async () => ({ markdown: 'MEET', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: 'Sources searched:\n- Todoist: 1 open, 0 completed in last 7 days', failedProjects: [], unknownProjects: [] }));
+  view.pinned = { path: 'Notes/Meet.md', from: { line: 0, ch: 0 }, to: { line: 0, ch: 5 }, original: 'Hello' };
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  view.meetingPresetEl.value = '0';
+  view.promptEl.value = 'edited meeting prompt';
+  view.webSearchMode = 'concise';
+  await view.write();
+  assert.strictEqual(plugin.writeCallCount(), 0, 'writeWithEvidence not called');
+  assert.strictEqual(prepCalls.length, 1);
+  assert.strictEqual(prepCalls[0].instruction, 'edited meeting prompt');
+  assert.strictEqual(prepCalls[0].template, MEETING_TEMPLATES[1]);
+  assert.strictEqual(prepCalls[0].webSearchMode, 'concise');
+  assert.strictEqual(prepCalls[0].citationStyle, 'footnotes');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'Review draft window opened');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'draft review, not pinned rewrite preview');
+  assert.strictEqual(view.rewriteModal.before, undefined, 'pinned rewrite ignored (no before pane)');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  await view.rewriteModal.onApply(view.rewriteModal.after);
+  assert.strictEqual(calls.replaceRange.length, 1, 'inserted like a draft on Apply');
+  assert.strictEqual(calls.replaceRange[0].draft, 'MEET\n\nSources searched:\n- Todoist: 1 open, 0 completed in last 7 days');
+  assert.strictEqual(view.meetingTemplate, null, 'preset reset after run');
+  assert.strictEqual(view.meetingPresetEl.value, '', 'dropdown back to None');
+
+  // no preset: useTodoist follows the setting
+  for (const on of [true, false]) {
+    plugin.settings.writingUseTodoist = on;
+    view.pinned = null;
+    view.promptEl.value = 'plain draft';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, on, `useTodoist ${on}`);
+  }
+  console.log('PASS meeting-routing');
+}
+
+async function testMeetingMessagesAndReset() {
+  const cases = [
+    [Object.assign(new Error('x'), { code: 'meeting-empty', unknownProjects: [] }), 'No Todoist tasks in scope for this template.'],
+    [Object.assign(new Error('x'), { code: 'meeting-empty', unknownProjects: ['Foo', 'Bar'] }), 'Unknown project(s) in template: Foo, Bar'],
+    [Object.assign(new Error('Todoist unavailable: no token'), { code: 'todoist-unavailable' }), 'Todoist unavailable: no token'],
+    [Object.assign(new Error('Todoist is unavailable: HTTP 401'), { code: 'todoist-unavailable' }), 'Todoist unavailable: HTTP 401'],
+    [Object.assign(new Error('Todoist is unavailable'), { code: 'todoist-unavailable' }), 'Todoist unavailable: no token or request failed'],
+    [Object.assign(new Error('Every project failed: boom'), { code: 'meeting-failed' }), "Couldn't write any project: boom"],
+  ];
+  for (const [err, expected] of cases) {
+    const { view, calls } = makeMeetingView(async () => { throw err; });
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    view.meetingPresetEl.value = '0';
+    await view.write();
+    assert(view.statusLog.includes(expected), `status: ${expected}`);
+    assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted');
+    assert.strictEqual(view.meetingTemplate, null, 'reset after failure');
+    assert.strictEqual(view.meetingPresetEl.value, '');
+  }
+  const obs = require('obsidian');
+  obs.notices = [];
+  const { view } = makeMeetingView(async (o) => {
+    o.onProgress(1, 2);
+    return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: ['Beta'], unknownProjects: ['Ghost'] };
+  });
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  await view.write();
+  assert(view.statusLog.includes('Preparing meeting doc\u2026 1 of 2 projects'), 'progress status');
+  assert(obs.notices.some((n) => n.includes('Beta')), 'failed project notice');
+  assert(obs.notices.includes('Unknown project(s) in template: Ghost'), 'unknown project notice');
+  console.log('PASS meeting-messages-and-reset');
+}
+
+async function testMeetingClearsStaleEvidence() {
+  for (const fail of [false, true]) {
+    const { view, plugin } = makeMeetingView(async () => { if (fail) throw new Error('boom'); return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '' }; });
+    view.lastWriteEvidence = [{ id: 'E1', path: 'Old/Unrelated.md' }];
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    await view.write();
+    assert.strictEqual(view.lastWriteEvidence, null, `meeting run clears stale evidence (fail=${fail})`);
+    plugin.todoistChatTurn = async () => ({ lookup: { searchQuery: '', reuseEvidence: true }, shortlist: [] });
+    view.promptEl.value = 'shorten that';
+    await view.write();
+    const o = plugin.lastWriteArgs().opts;
+    assert.ok(!o.reuseEvidence && !o.previousEvidence, 'follow-up after meeting searches fresh');
+  }
+  console.log('PASS meeting-clears-stale-evidence');
+}
+
+async function testMeetingNoticesWhenNoteClosed() {
+  const obs = require('obsidian');
+  obs.notices = [];
+  let view;
+  ({ view } = makeMeetingView(async () => {
+    view.plugin.app.workspace.getLeavesOfType = () => [];
+    view.plugin.app.workspace.getMostRecentLeaf = undefined;
+    return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: ['Beta'], unknownProjects: ['Ghost'] };
+  }));
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  await view.write();
+  assert(obs.notices.some((n) => n.includes('Beta')), 'failed notice survives closed note');
+  assert(obs.notices.some((n) => n.includes('Ghost')), 'unknown notice survives closed note');
+  console.log('PASS meeting-notices-note-closed');
+}
+
+async function testMeetingPresetRefresh() {
+  const names = (v) => v.meetingPresetEl.children.map((c) => c.text);
+  const mk = (n) => ({ name: n, path: `T/${n}.md`, prompt: n, action: 'meeting-prep' });
+  // overlapping populate calls: older (slow) result must not append
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  const gates = [];
+  plugin.getPromptTemplates = () => new Promise((resolve) => gates.push(resolve));
+  const p1 = view.populateMeetingPresetOptions();
+  const p2 = view.populateMeetingPresetOptions();
+  gates[1]([mk('A'), mk('B')]);
+  await p2;
+  gates[0]([mk('A'), mk('B')]);
+  await p1;
+  assert.deepStrictEqual(names(view), ['None', 'A', 'B'], 'no duplicate options');
+  // stale index: selected B, a new template inserted first
+  plugin.getPromptTemplates = async () => [mk('A'), mk('B')];
+  await view.populateMeetingPresetOptions();
+  view.meetingPresetEl.value = '1';
+  view.promptEl = { value: '' };
+  view.selectMeetingPreset();
+  const freshB = mk('B');
+  plugin.getPromptTemplates = async () => [mk('N'), mk('A'), freshB];
+  await view.populateMeetingPresetOptions();
+  assert.deepStrictEqual(names(view), ['None', 'N', 'A', 'B']);
+  assert.strictEqual(view.meetingPresetEl.value, '2', 'dropdown still shows B');
+  assert.strictEqual(view.meetingTemplate, freshB, 'meetingTemplate refreshed to fresh B');
+  // selected template disappears
+  plugin.getPromptTemplates = async () => [mk('N')];
+  await view.populateMeetingPresetOptions();
+  assert.strictEqual(view.meetingTemplate, null);
+  assert.strictEqual(view.meetingPresetEl.value, '');
+  console.log('PASS meeting-preset-refresh');
+}
+
+async function testMeetingTodoistPinnedAndMenuAndOverride() {
+  const obs = require('obsidian');
+  // Evidence submenu "Todoist tasks" item flips setting and saves
+  {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.writingUseTodoist = false;
+    let saved = 0;
+    plugin.saveSettings = async () => { saved += 1; };
+    view.collaborateFeaturesButton = null;
+    view.openCollaborateFeaturesMenu({});
+    const evidence = obs.lastMenu.items.find((i) => i.title === 'Evidence');
+    const todoist = evidence.submenu.items.find((i) => i.title === 'Todoist tasks');
+    assert(todoist, 'Todoist tasks item present');
+    await todoist.handler();
+    assert.strictEqual(plugin.settings.writingUseTodoist, true);
+    assert.strictEqual(saved, 1);
+  }
+  // pinned rewrite / chat check never pull Todoist; plain write does
+  {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.writingUseTodoist = true;
+    view.pinned = { path: 'Notes/Meet.md', from: { line: 0, ch: 0 }, to: { line: 0, ch: 5 }, original: 'Hello' };
+    view.promptEl.value = 'make it better';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, false, 'pinned rewrite');
+    view.pinned = null;
+    await view.write({ instruction: 'q', apply: 'chat' });
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, false, 'chat check');
+    view.promptEl.value = 'plain';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'plain write follows setting');
+  }
+  // editor preset override ignores a selected meeting preset
+  {
+    const { view, plugin, prepCalls } = makeMeetingView(async () => ({}));
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    await view.write({ instruction: 'Fix grammar', evidence: 'off' });
+    assert.strictEqual(prepCalls.length, 0, 'prepareMeeting not called');
+    assert.strictEqual(plugin.writeCallCount(), 1);
+  }
+  console.log('PASS meeting-todoist-pinned-menu-override');
+}
+
 async function runTests() {
   await testDraftReviewCancelClosedAndCheck();
   testDefaultChat();
@@ -1505,6 +1750,14 @@ async function runTests() {
   await testEvidenceOff();
   await testEmptyModelOutput();
   await testInsertAtCursorApa();
+  await testMeetingEvidenceMenuAndLabel();
+  await testMeetingPresetDropdown();
+  await testMeetingRouting();
+  await testMeetingMessagesAndReset();
+  await testMeetingClearsStaleEvidence();
+  await testMeetingNoticesWhenNoteClosed();
+  await testMeetingPresetRefresh();
+  await testMeetingTodoistPinnedAndMenuAndOverride();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

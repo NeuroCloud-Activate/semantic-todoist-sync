@@ -97,7 +97,7 @@ function formatReference(style, source) {
   const year = meta.year !== undefined && meta.year !== null && String(meta.year) !== "" ? String(meta.year) : null;
   const title = typeof meta.title === "string" ? meta.title : "";
   const path = source && typeof source.path === "string" && source.path ? stripMdExtension(source.path) : "";
-  const isWeb = source && source.kind === "web";
+  const isWeb = source && (source.kind === "web" || source.kind === "todoist");
 
   if (style === "apa") {
     const yr = year || "n.d.";

@@ -946,6 +946,133 @@ async function main() {
     console.log("PASS apa style end to end");
   }
 
+// Meeting prep Task 4 - Todoist evidence in plain Collaborate Write.
+{
+const { budgetRecords } = require("../src/writing/todoist-evidence.js");
+const { evidenceLabel } = require("../src/writing/write.js");
+const mkRec = (i, extra = {}) => ({ id: String(i), title: `Task ${i}`, projectId: "p1", projectName: "Grant", sectionName: "", parentId: "", parentTitle: "", status: "open", due: "", deadline: "", priority: 1, labels: [], completedAt: "", description: "", notePaths: [], url: `https://app.todoist.com/app/task/${i}`, ...extra });
+const withTodoist = (plugin, records, rejectWith) => {
+plugin.todoistCalls = [];
+plugin.getMeetingTodoistData = async (opts) => {
+plugin.todoistCalls.push(opts);
+if (rejectWith) throw rejectWith;
+return { records, unknownProjects: [], openCount: records.filter((r) => r.status !== "done").length, completedCount: records.filter((r) => r.status === "done").length };
+};
+return plugin;
+};
+// Recorded from HEAD (git show HEAD:src/writing/write.js) with makeStub({ vault: 2, context: 1, modelText: "draft [E1]", research: null }).
+const HEAD_USER = "Instruction: Draft it\n\nTarget length: 400-700 words (standard).\n\nSelected text (may be empty):\n(none)\n\nSurrounding note context (may be truncated to 6,000 characters):\nactive note body\n\nEvidence (cite by id):\n<evidence id=\"E1\" source=\"Notes/vault-1.md#H1\">\nvault text 1\n</evidence>\n\n<evidence id=\"E2\" source=\"Notes/vault-2.md#H2\">\nvault text 2\n</evidence>\n\n<evidence id=\"E3\" source=\"Writing Context/c-1.md, p. 1\">\ncontext text 1\n</evidence>\n\nSources searched:\n- deep research: not searched (no saved research notes)\n- vault: searched\n- context folder: searched\n- web: not searched (turned off)\n\nDraft the passage now, citing every factual claim with its [En] id.";
+const base = { instruction: "Draft it", length: "standard", active: ACTIVE };
+const stub = () => makeStub({ vault: 2, context: 1, modelText: "draft [E1]", research: null });
+
+// todoist off byte-identical
+{
+const a = withTodoist(stub(), [mkRec(1)]);
+const b = withTodoist(stub(), [mkRec(1)]);
+const c = withTodoist(stub(), [mkRec(1)]);
+await writeWithEvidence(a, base);
+await writeWithEvidence(b, { ...base, useTodoist: false });
+await writeWithEvidence(c, { ...base, todoistEvidence: { records: [mkRec(1)], openCount: 1, completedCount: 0 } });
+for (const p of [a, b, c]) {
+assert.strictEqual(p.captured.request.user, HEAD_USER, "user prompt byte-identical to HEAD");
+assert.strictEqual(p.captured.request.system, require("../src/writing/write.js").WRITE_SYSTEM_PROMPT);
+assert.ok(!p.captured.request.user.includes("Todoist"), "no Todoist text when off");
+assert.strictEqual(p.todoistCalls.length, 0, "stub not called when off");
+}
+console.log("PASS todoist off byte-identical");
+}
+
+// todoist on
+{
+const records = [
+mkRec(1, { status: "open", title: "Open one" }),
+mkRec(2, { status: "due-soon", due: "2026-11-02", title: "Due one" }),
+mkRec(3, { status: "done", completedAt: "2026-10-20T12:00:00Z", title: "Done one" }),
+];
+const plugin = withTodoist(makeStub({ vault: 1, context: 1, modelText: "x [E3] y [E4]", research: null }), records);
+plugin.searchWebForWriting = async () => [{ title: "Web", url: "https://example.org/w", text: "web text" }];
+const result = await writeWithEvidence(plugin, { ...base, useTodoist: true, webSearchMode: "on" });
+const user = plugin.captured.request.user;
+assert.deepStrictEqual(plugin.todoistCalls, [{ completedDays: 14, projects: [] }]);
+const ids = [...user.matchAll(/<evidence id="(E\d+)" source="([^"]*)"/g)].map((m) => m[2]);
+assert.deepStrictEqual(ids.slice(2), ["Todoist: Due one (Grant)", "Todoist: Done one (Grant)", "Todoist: Open one (Grant)", "[Web](https://example.org/w)"], "todoist (budget-ranked) after context, before web: " + JSON.stringify(ids));
+assert.ok(user.includes("- Todoist: 2 open, 1 completed in last 14 days"), "sources line");
+assert.ok(!/\(\d+ of \d+ tasks included\)/.test(user), "no budget suffix when nothing dropped");
+assert.strictEqual(result.sources[2].label, "Todoist: Due one (Grant)");
+assert.ok(result.footnotes.includes("[Done one](https://app.todoist.com/app/task/3), Todoist task, Grant, completed Oct 20"), "todoist footnote, got " + result.footnotes);
+const cited = result.cited.find((s) => s.kind === "todoist");
+assert.strictEqual(cited.meta.year, "2026");
+assert.strictEqual(evidenceLabel({ source: { kind: "todoist", title: "T", project: "" } }), "Todoist: T");
+// pre-fetched evidence skips the fetch
+const pre = makeStub({ vault: 0, context: 0, research: null });
+withTodoist(pre, []);
+await writeWithEvidence(pre, { ...base, useTodoist: true, todoistEvidence: { records, openCount: 2, completedCount: 1 } });
+assert.strictEqual(pre.todoistCalls.length, 0, "pre-fetched evidence not refetched");
+assert.ok(pre.captured.request.user.includes("- Todoist: 2 open, 1 completed in last 14 days"));
+console.log("PASS todoist on");
+}
+
+// todoist budget
+{
+const records = Array.from({ length: 400 }, (_, i) => mkRec(i + 1, { title: `Quarterly planning follow up ${i + 1}`, description: "Detailed description of the task that makes each row longer." }));
+const expected = budgetRecords(records, "Draft it");
+assert.ok(expected.dropped > 0 && expected.kept.length < 400, "budget drops some");
+const off = stub();
+await writeWithEvidence(off, base);
+const plugin = withTodoist(makeStub({ vault: 2, context: 1, modelText: "draft [E1]", research: null }), records);
+await writeWithEvidence(plugin, { ...base, useTodoist: true });
+const user = plugin.captured.request.user;
+assert.ok(user.split("\n").some((l) => l.startsWith("- Todoist") && l.endsWith(`(${expected.kept.length} of 400 tasks included)`)), "budget suffix line");
+assert.ok(user.length - off.captured.request.user.length <= 6000 + expected.kept.length * 120 + 300, "prompt growth bounded");
+console.log("PASS todoist budget");
+}
+
+// todoist unavailable
+{
+const err = new Error("no token");
+err.code = "todoist-unavailable";
+const plugin = withTodoist(stub(), [], err);
+const result = await writeWithEvidence(plugin, { ...base, useTodoist: true });
+const user = plugin.captured.request.user;
+assert.ok(user.includes("- Todoist: NOT searched (Todoist unavailable: no token)"), "unavailable line");
+assert.strictEqual(result.evidenceCount, 3, "run still succeeds with other evidence");
+console.log("PASS todoist unavailable");
+}
+
+// pre-fetched evidence with only records: counts fall back to records
+{
+const records = [mkRec(1), mkRec(2, { status: "done", completedAt: "2026-10-20T12:00:00Z" }), mkRec(3, { status: "done", completedAt: "2026-10-21T12:00:00Z" })];
+const plugin = withTodoist(makeStub({ vault: 1, context: 1, modelText: "x", research: null }), []);
+await writeWithEvidence(plugin, { ...base, useTodoist: true, todoistEvidence: { records } });
+const user = plugin.captured.request.user;
+assert.ok(user.includes("- Todoist: 1 open, 2 completed in last 14 days"), "counts from records: " + user);
+assert.ok(!user.includes("undefined"), "no undefined");
+console.log("PASS todoist counts fallback");
+}
+
+// provider resolving no data
+for (const nothing of [undefined, null]) {
+const plugin = makeStub({ vault: 1, context: 1, modelText: "x", research: null });
+plugin.getMeetingTodoistData = async () => nothing;
+await writeWithEvidence(plugin, { ...base, useTodoist: true });
+assert.ok(plugin.captured.request.user.includes("- Todoist: NOT searched (Todoist unavailable: no data)"), "no data line for " + nothing);
+console.log("PASS todoist no data " + nothing);
+}
+
+// a throw while building rows leaves no partial rows
+{
+const bad = mkRec(2);
+Object.defineProperty(bad, "url", { get() { throw new Error("row boom"); } });
+const plugin = withTodoist(makeStub({ vault: 1, context: 1, modelText: "x", research: null }), [mkRec(1), bad]);
+const result = await writeWithEvidence(plugin, { ...base, useTodoist: true });
+const user = plugin.captured.request.user;
+assert.ok(user.includes("- Todoist: NOT searched (Todoist unavailable: row boom)"), "error line: " + user);
+assert.ok(!user.includes("Todoist: Task"), "no partial rows");
+assert.strictEqual(result.evidenceCount, 2, "only non-todoist evidence remains");
+console.log("PASS todoist partial rows");
+}
+}
+
   // Fix 3 — the REAL plugin wrapper (src/main.js) must forward the collaborate mode
   // and the citation style. Live defect: it forwarded neither, so every pinned
   // rewrite ran as a plain draft with footnote citations.

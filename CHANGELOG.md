@@ -1,3 +1,17 @@
+## 0.9.37 - 2026-10-29
+### Added
+- **Prepare for a meeting from your Todoist tasks.** In Collaborate, a new preset list next to Features offers meeting templates. The built-in "Prepare for meeting – Supervisor" fills the prompt box; edit it if you like, then press Write. The draft covers every open task and tasks completed in the last 14 days, grouped by project and then by theme, each theme with short prose and a short task list. Follow-ups of recently completed tasks are highlighted. Each task title links to the task in Todoist. Task lines are plain list lines, never checkboxes, so they never create or duplicate synced tasks. The draft reuses what is already written on the tasks: their descriptions and the notes they link to. It opens in the Review draft window like other drafts.
+- **Your own meeting templates.** Templates are notes in the Prompts folder (`Semantic Todoist Sync/Prompts`). Duplicate the Supervisor template, edit it, and your copy appears in the preset list automatically.
+- **Todoist tasks evidence switch.** Collaborate's Evidence menu has a new "Todoist tasks" switch, off by default. With it off, Collaborate works exactly as before. Privacy: with it on, the titles and descriptions of your Todoist tasks (open, and completed in the last 14 days, across all projects) are sent to your AI provider with each Collaborate request.
+
+### Fixed
+- **Duplicate detection uses your AI provider's models.** With LiteLLM, duplicate detection asked for a model LiteLLM doesn't offer; it now uses your LiteLLM model. The model menu lists your provider's models and remembers your choice with the provider. A saved model that no longer matches your provider (for example, settings synced from another device) is ignored, shown as "Automatic", and cleared on reload. Open WebUI password sign-in is no longer treated as "no key". The model setting's help text is corrected.
+- **Unchecking a task that changed in Todoist.** A task deleted in Todoist and then unchecked in the note is re-created once, in its original project, keeping its details and its link to the note. A task completed in Todoist and then unchecked is reopened. Neither is re-checked any more.
+- **No duplicate task when Todoist's reply is lost.** If Todoist creates a task but the reply never arrives, the retry no longer creates a second one, and no leftover record can relink a retyped line to an old task.
+- **Sync no longer redoes finished work.** A second sync with nothing new does nothing.
+- Live check (Oct 29, 2026, test vault, real Todoist): meeting prep for 21 projects took 51–77 s on the first run and 7 s within 5 minutes; Cancel wrote nothing; the draft had no checkboxes or sync markers; a follow-up after a meeting run searched fresh; Todoist and notes were unchanged afterwards. The sync fixes passed against a scratch Todoist project, which was cleaned up.
+- Tests: `npm test` passes 85/85.
+
 ## 0.9.36 - 2026-10-28
 ### Fixed
 - **Collaborate drafts are reviewed before they go into your note.** A draft written without a selected passage used to be inserted at the cursor straight away. It now opens in a Review draft window where you can read and edit it, see the references it will add, and then Apply, Copy or Cancel. Apply inserts your edited version where your cursor was; Cancel writes nothing and leaves the draft in the sidebar. Rewrites of a selected passage and Check against my notes are unchanged.

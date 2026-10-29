@@ -90,6 +90,12 @@ function labelFor(source) {
     if (url && /^https?:\/\//i.test(url)) return `[${title}](${url})`;
     return title || url;
   }
+  if (source.kind === "todoist") {
+    const title = String(source.title || "").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+    const url = String(source.url || "").trim();
+    const head = url && /^(https?|todoist):\/\//i.test(url) ? `[${title}](${url})` : title || url;
+    return [head, "Todoist task", source.project, source.state].filter(Boolean).join(", ");
+  }
   return "";
 }
 

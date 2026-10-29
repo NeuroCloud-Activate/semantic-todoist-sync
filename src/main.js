@@ -246,6 +246,13 @@ const WEB_SEARCH_MODE_PROFILES = Object.freeze({
   concise: Object.freeze({ maxOutputTokens: 8000, maxResults: 10, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 3, openrouter: Object.freeze({ max_results: 6, max_total_results: 12, max_uses: 3, max_characters: 4000 }), anthropic: Object.freeze({ max_uses: 3 }) }),
   deep: Object.freeze({ maxOutputTokens: 8000, maxResults: 12, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 4, openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 }), anthropic: Object.freeze({ max_uses: 8 }) })
 });
+const COLLABORATE_SUBFOLDER = "Collaborate"; // every note in <prompt folder>/Collaborate is a Collaborate (meeting prep) template
+const MEETING_PREP_HEADINGS = ["Meeting", "For each project", "Task list", "Rules"];
+// The 0.9.37 Supervisor text, kept only to recognise an unedited old file when moving it into the subfolder.
+const OLD_SUPERVISOR_PROMPT = "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting.";
+const SUPERVISOR_PROMPT = OLD_SUPERVISOR_PROMPT.split("\n\n").map((paragraph, index) => `## ${MEETING_PREP_HEADINGS[index]}\n\n${paragraph}`).join("\n\n");
+const OLD_SUPERVISOR_FILE_TEXT = promptTemplateFileText({ action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], prompt: OLD_SUPERVISOR_PROMPT });
+const MEETING_PREP_FOLDER_REFRESH_MS = 400;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
     filename: "Generate Todoist task list.md",
@@ -274,14 +281,14 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     prompt: DEFAULT_SCHEDULE_TODAY_PROMPT
   },
   {
-    filename: "Prepare for meeting \u2013 Supervisor.md",
+    filename: "Collaborate/Prepare for meeting \u2013 Supervisor.md",
     action: "meeting-prep",
     createTasks: false,
     insertResponse: true,
     syncTasks: false,
     completedDays: 14,
     projects: [],
-    prompt: "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting."
+    prompt: SUPERVISOR_PROMPT
   },
   {
     filename: "Summarize active note.md",
@@ -4536,6 +4543,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("file-open", () => this.notifySidebarActiveNoteChanged()));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handlePromptFolderEvent(file.path);
       if (this.isInternalNoteWrite(file.path)) return;
       if (this.semanticIndexStartupBuffering) {
         bufferStartupSemanticIndexEvent(file.path, "update", "modify");
@@ -4546,6 +4554,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handlePromptFolderEvent(file.path);
       if (this.isInternalNoteWrite(file.path)) return;
       if (this.semanticIndexStartupBuffering) {
         bufferStartupSemanticIndexEvent(file.path, "update", "create");
@@ -4555,6 +4564,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handlePromptFolderEvent(file.path);
       this.handleMonthlyNoteDeleted(file); // cache marking must also run while startup buffers the semantic index
       if (this.semanticIndexStartupBuffering) {
         bufferStartupSemanticIndexEvent(file.path, "remove", "delete");
@@ -4564,6 +4574,7 @@ module.exports = class SemanticTodoistSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.handlePromptFolderEvent(file.path, oldPath);
       this.handleMonthlyNoteRenamed(file, oldPath);
       if (this.semanticIndexStartupBuffering) {
         if (oldPath && oldPath !== file.path) bufferStartupSemanticIndexEvent(oldPath, "remove", "move");
@@ -20723,30 +20734,87 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     };
   }
 
-  async getPromptTemplates() {
-    await this.ensurePromptTemplateFolder(false);
+  async getPromptTemplates({ ensure = true } = {}) {
+    if (ensure) await this.ensurePromptTemplateFolder(false);
     const templates = [];
     const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
     if (!folder) return [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in", createTasks: true }, template));
     const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${folder}/`));
     for (const file of files) {
       const text = await this.app.vault.cachedRead(file);
-      templates.push(parsePromptTemplateFile(file, text));
+      templates.push(parsePromptTemplateFile(file, text, file.path.startsWith(`${folder}/${COLLABORATE_SUBFOLDER}/`)));
     }
     if (templates.length) return templates;
     return [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in", createTasks: true }, template));
   }
 
-  async ensurePromptTemplateFolder(showNotice = false) {
+  // Sidebar meeting list follows the Prompts folder: any add, move, edit or delete under it refreshes the lists (debounced).
+  handlePromptFolderEvent(...paths) {
+    const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
+    if (!folder || !paths.some((path) => String(path || "").startsWith(`${folder}/`))) return;
+    window.clearTimeout(this.promptFolderRefreshTimer);
+    this.promptFolderRefreshTimer = window.setTimeout(() => {
+      for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+        const view = leaf.view;
+        if (view && typeof view.populateSidebarActionOptions === "function") Promise.resolve(view.populateSidebarActionOptions()).catch((error) => this.logLocal("Prompt list refresh failed", { error: error.message || String(error) }));
+      }
+    }, MEETING_PREP_FOLDER_REFRESH_MS);
+  }
+
+  async createMeetingPrepTemplate() {
+    const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
+    if (!folder) throw new Error("Set the Prompt folder in Settings first.");
+    const dir = `${folder}/${COLLABORATE_SUBFOLDER}`;
+    await ensureVaultFolder(this.app, dir);
+    let number = 1;
+    let path;
+    do {
+      path = `${dir}/New meeting template${number > 1 ? ` ${number}` : ""}.md`;
+      number += 1;
+    } while (this.app.vault.getAbstractFileByPath(path));
+    const file = await this.app.vault.create(path, meetingPrepTemplateSkeleton());
+    await this.app.workspace.getLeaf("tab").openFile(file);
+    new Notice(`Meeting template created: ${path}`);
+    return file;
+  }
+
+  // 0.9.37 kept the Supervisor template at the top of the folder; move it into the subfolder without losing edits.
+  async migrateSupervisorTemplate(folder) {
+    const oldPath = `${folder}/Prepare for meeting \u2013 Supervisor.md`;
+    const newPath = `${folder}/${DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep").filename}`;
+    const oldFile = this.app.vault.getAbstractFileByPath(oldPath);
+    if (!(oldFile instanceof TFile) || this.app.vault.getAbstractFileByPath(newPath)) return;
+    const normalize = (text) => String(text).replace(/\r\n/g, "\n").trim();
+    const unedited = normalize(await this.app.vault.read(oldFile)) === normalize(OLD_SUPERVISOR_FILE_TEXT);
+    await ensureVaultFolder(this.app, `${folder}/${COLLABORATE_SUBFOLDER}`);
+    await this.app.fileManager.renameFile(oldFile, newPath);
+    if (unedited) await this.app.vault.modify(oldFile, promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep")));
+  }
+
+  // Concurrent callers (sidebar, presets, startup, folder events) share one run: interleaved migrate/create steps duplicated or clobbered the Supervisor file.
+  ensurePromptTemplateFolder(showNotice = false) {
+    if (this.promptFolderEnsureRun) return this.promptFolderEnsureRun;
+    const run = this.runEnsurePromptTemplateFolder(showNotice).finally(() => { if (this.promptFolderEnsureRun === run) this.promptFolderEnsureRun = null; });
+    this.promptFolderEnsureRun = run;
+    return run;
+  }
+
+  async runEnsurePromptTemplateFolder(showNotice) {
     const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
     if (!folder) return;
     try {
       await ensureVaultFolder(this.app, folder);
+      try {
+        await this.migrateSupervisorTemplate(folder);
+      } catch (error) {
+        this.logLocal("Supervisor template move failed", { error: error.message || String(error) });
+      }
       let created = 0;
       for (const template of DEFAULT_PROMPT_TEMPLATE_FILES) {
         const path = `${folder}/${template.filename}`;
         const existingTemplate = this.app.vault.getAbstractFileByPath(path);
         if (existingTemplate instanceof TFile) continue;
+        await ensureVaultFolder(this.app, path.split("/").slice(0, -1).join("/"));
         await this.app.vault.create(path, promptTemplateFileText(template));
         created += 1;
       }
@@ -23870,7 +23938,14 @@ class SemanticTodoistView extends ItemView {
     this.runButton = runButton; // writing-mode: task 10 Run button relabelled Write in collaborate mode
     runButton.onclick = async () => {
       if (this.plugin.settings.writingCollaborateMode === true) await this.write();
-      else await this.runSelectedSidebarAction();
+      else {
+        try {
+          await this.runSelectedSidebarAction();
+        } catch (error) {
+          new Notice(error.message || String(error));
+          this.setStatus(error.message || String(error));
+        }
+      }
     };
     // writing-mode: task 10 apply persisted collaborate mode on every render
     this.applyCollaborateMode();
@@ -24021,7 +24096,17 @@ class SemanticTodoistView extends ItemView {
     try {
       const { instruction: overrideInstruction, evidence, apply = "replace", pinned: overridePinned } = override;
       // Meeting preset (sidebar only; editor presets pass an override): ignores any pinned selection.
-      const meetingTemplate = !overrideInstruction && this.meetingTemplate ? this.meetingTemplate : null;
+      let meetingTemplate = !overrideInstruction && this.meetingTemplate ? this.meetingTemplate : null;
+      // Quick refresh: a preset renamed/removed since it was picked is not run (rare; the list normally auto-updates).
+      if (meetingTemplate) {
+        try {
+          meetingTemplate = await this.freshTemplateOrThrow(meetingTemplate, () => this.populateMeetingPresetOptions());
+        } catch (error) {
+          new Notice(error.message);
+          this.setStatus(error.message);
+          return;
+        }
+      }
       const pinned = meetingTemplate ? null : (overridePinned !== undefined ? overridePinned : this.pinned);
       const citationStyle = this.plugin.settings.writingCitationStyle;
       const { typedRewriteInstruction } = require("./writing/rewrite.js");
@@ -24540,19 +24625,21 @@ class SemanticTodoistView extends ItemView {
 
   async populateSidebarActionOptions() {
     if (!this.actionSelectEl) return;
+    const generation = (this.sidebarPopulateGeneration = (this.sidebarPopulateGeneration || 0) + 1);
     const previous = this.actionSelectEl.value || "";
-    this.sidebarActionTemplates = [];
-    while (this.actionSelectEl.firstChild) this.actionSelectEl.removeChild(this.actionSelectEl.firstChild);
+    // prompt:N is an index that shifts when templates change, so remember the template itself
+    const previousTemplate = previous.startsWith("prompt:") ? (this.sidebarActionTemplates || [])[Number(previous.slice(7))] : null;
+    const sameTemplate = sameTemplateIdentity;
     const options = [];
     let scheduleOption = null;
     const promptOptions = [];
+    let loaded = [];
     try {
-      const templates = await this.plugin.getPromptTemplates();
-      this.sidebarActionTemplates = templates || [];
-      this.sidebarActionTemplates.forEach((template, index) => {
+      loaded = (await this.plugin.getPromptTemplates()) || [];
+      loaded.forEach((template, index) => {
         const name = singleLine(template.name || template.path || `Prompt ${index + 1}`);
         if (isMeetingPrepTemplate(template)) return;
-        const option = { value: `prompt:${index}`, label: shortTitle(name, 56) };
+        const option = { value: `prompt:${index}`, label: shortTitle(name, 56), template };
         if (isScheduleTodayTemplate(template)) {
           if (!scheduleOption) scheduleOption = option;
           return;
@@ -24563,12 +24650,15 @@ class SemanticTodoistView extends ItemView {
       console.error(error);
       options.push({ value: "prompts", label: "Prompts..." });
     }
+    if (generation !== this.sidebarPopulateGeneration) return; // a newer refresh owns the list
+    this.sidebarActionTemplates = loaded;
+    while (this.actionSelectEl.firstChild) this.actionSelectEl.removeChild(this.actionSelectEl.firstChild);
     if (this.plugin.settings.scheduleTodayEnabled !== false) options.unshift(scheduleOption || { value: "schedule", label: "Schedule today" });
     options.push(...promptOptions);
     if (!options.length) options.push({ value: "", label: "No actions available" });
     for (const option of options) this.actionSelectEl.createEl("option", { text: option.label, value: option.value });
-    const values = new Set(options.map((option) => option.value));
-    this.actionSelectEl.value = values.has(previous) ? previous : options[0].value;
+    const kept = previousTemplate ? options.find((option) => option.template && sameTemplate(option.template, previousTemplate)) : options.find((option) => option.value === previous);
+    this.actionSelectEl.value = kept ? kept.value : options[0].value;
     await this.populateMeetingPresetOptions();
   }
 
@@ -24584,7 +24674,7 @@ class SemanticTodoistView extends ItemView {
       console.error(error);
     }
     if (generation !== this.meetingPopulateGeneration) return; // a newer refresh owns the list
-    const sameTemplate = (a, b) => (a.path && b.path ? a.path === b.path : a.name === b.name);
+    const sameTemplate = sameTemplateIdentity;
     while (el.firstChild) el.removeChild(el.firstChild);
     el.createEl("option", { text: "None", value: "" });
     templates.forEach((template, index) => el.createEl("option", { text: shortTitle(singleLine(template.name || template.path || "Meeting"), 56), value: String(index) }));
@@ -24620,6 +24710,16 @@ class SemanticTodoistView extends ItemView {
     return { insertIntoNote, syncAfterInsert };
   }
 
+  // Re-reads templates at run time; returns the fresh one, or refreshes the lists and throws if it was renamed/removed.
+  async freshTemplateOrThrow(old, refresh) {
+    // ensure:false -> read only; folder setup would re-create a renamed/deleted default and hide the change.
+    const list = (await this.plugin.getPromptTemplates({ ensure: false })) || [];
+    const fresh = list.find((t) => sameTemplateIdentity(old, t));
+    if (fresh && fresh.name === old.name) return fresh;
+    await refresh();
+    throw new Error(`The prompt "${old.name}" has changed: ${fresh ? `it is now "${fresh.name}"` : "it was renamed or removed"}. Pick it again and run.`);
+  }
+
   async runSelectedSidebarAction() {
     const action = this.actionSelectEl?.value || (this.plugin.settings.scheduleTodayEnabled !== false ? "schedule" : "prompts");
     if (action === "schedule") {
@@ -24632,11 +24732,12 @@ class SemanticTodoistView extends ItemView {
     }
     if (action.startsWith("prompt:")) {
       const index = Number(action.split(":")[1]);
-      const template = this.sidebarActionTemplates?.[index];
+      let template = this.sidebarActionTemplates?.[index];
       if (!template) {
         await this.populateSidebarActionOptions();
         throw new Error("Select a prompt and try again.");
       }
+      template = await this.freshTemplateOrThrow(template, () => this.populateSidebarActionOptions());
       if (isScheduleTodayTemplate(template)) {
         await this.plugin.openScheduleTodayPreview(template);
         return;
@@ -25397,6 +25498,16 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
+    new Setting(containerEl)
+      .setName("Generate meeting prep template")
+      .setDesc("Creates a ready-to-fill meeting template in the Prompts folder's Collaborate subfolder and opens it. It then appears in the sidebar's meeting list.")
+      .addButton((button) => button.setButtonText("Generate").onClick(async () => {
+        try {
+          await this.plugin.createMeetingPrepTemplate();
+        } catch (error) {
+          new Notice(`Couldn't create the meeting template: ${error.message || error}`);
+        }
+      }));
     new Setting(containerEl).setName("Context folder").setDesc("Folder inside the vault used for writing context files (default 'Semantic Todoist Sync/Context')").addText((text) => text.setValue(String(this.plugin.settings.writingContextFolder || "")).onChange(async (value) => {
       if (writingIsAbsoluteContextPath(String(value || "").trim())) {
         new Notice("Context folder must be a path inside the vault.");
@@ -29301,21 +29412,23 @@ function setupStatusSetting(containerEl, name, desc, buttons = []) {
   }
 }
 
-function parsePromptTemplateFile(file, text) {
+// `inMeetingFolder`: notes in the Collaborate subfolder are meeting templates whatever their frontmatter says.
+function parsePromptTemplateFile(file, text, inMeetingFolder = false) {
   const parsed = parseSimpleFrontmatter(text);
-    return {
-      name: parsed.meta.name || file.basename,
-      prompt: parsed.body.trim(),
-      source: file.path,
-      action: normalizePromptTemplateAction(parsed.meta.action ?? parsed.meta.actionType ?? parsed.meta.action_type ?? parsed.meta.templateAction ?? parsed.meta.template_action),
-      createTasks: parseTemplateBoolean(parsed.meta.createTasks ?? parsed.meta.create_tasks ?? parsed.meta.makeTasks ?? parsed.meta.make_tasks, false),
-      insertResponse: parseTemplateBoolean(parsed.meta.insertResponse ?? parsed.meta.insert_response, true),
-      syncAfterInsert: parseTemplateBoolean(parsed.meta.syncTasks ?? parsed.meta.sync_tasks ?? parsed.meta.syncAfterInsert ?? parsed.meta.sync_after_insert, false),
-      taskHeading: parsed.meta.taskHeading || parsed.meta.task_heading || parsed.meta.heading || "",
-      taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only),
-      completedDays: parseMeetingCompletedDays(parsed.meta.completedDays),
-      projects: parseMeetingProjects(parsed.meta.projects)
-    };
+  const action = inMeetingFolder ? "meeting-prep" : normalizePromptTemplateAction(parsed.meta.action ?? parsed.meta.actionType ?? parsed.meta.action_type ?? parsed.meta.templateAction ?? parsed.meta.template_action);
+  return {
+    name: parsed.meta.name || file.basename,
+    prompt: action === "meeting-prep" ? stripObsidianComments(parsed.body) : parsed.body.trim(),
+    source: file.path,
+    action,
+    createTasks: parseTemplateBoolean(parsed.meta.createTasks ?? parsed.meta.create_tasks ?? parsed.meta.makeTasks ?? parsed.meta.make_tasks, false),
+    insertResponse: parseTemplateBoolean(parsed.meta.insertResponse ?? parsed.meta.insert_response, true),
+    syncAfterInsert: parseTemplateBoolean(parsed.meta.syncTasks ?? parsed.meta.sync_tasks ?? parsed.meta.syncAfterInsert ?? parsed.meta.sync_after_insert, false),
+    taskHeading: parsed.meta.taskHeading || parsed.meta.task_heading || parsed.meta.heading || "",
+    taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only),
+    completedDays: parseMeetingCompletedDays(parsed.meta.completedDays),
+    projects: parseMeetingProjects(parsed.meta.projects)
+  };
 }
 
 function parseSimpleFrontmatter(text) {
@@ -29366,6 +29479,34 @@ function normalizePromptTemplateAction(value) {
 
 function isScheduleTodayTemplate(template = {}) {
   return normalizePromptTemplateAction(template.action) === "schedule-today";
+}
+
+// Obsidian %% comments %% are instructions to the template author; remove them before the prompt is used.
+// shortcut: a stray %% pairs with the next %% (Obsidian does the same); upgrade if users report lost text
+function stripObsidianComments(text) {
+  return String(text).replace(/\r\n/g, "\n").replace(/%%[\s\S]*?%%/g, "").replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, "\n\n").trim();
+}
+
+function meetingPrepTemplateSkeleton() {
+  const sections = [
+    ["Meeting", "Say who the meeting is with and what it is for."],
+    ["For each project", "Say what to cover for each project or theme, for example where things stand, what was finished recently and what is coming up."],
+    ["Task list", "Say which tasks to list under each project, for example only the ones worth discussing. The plugin builds the project headings and the linked task list itself, so do not ask for checkboxes."],
+    ["Rules", "Say how the result should read: tone, length, whether to cite sources, and what belongs under questions to raise."],
+  ];
+  const intro = "%% How to use this template\n- completedDays: how many days of completed tasks to include (1 to 90).\n- projects: Todoist project names separated by commas. Leave blank to use all projects.\n- Leave createTasks, insertResponse and syncTasks as they are.\nAnything between double percent signs, like this note, is an instruction for you. It is removed before the template is used. %%";
+  return promptTemplateFileText({
+    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [],
+    prompt: [intro, ...sections.map(([heading, hint]) => `## ${heading}\n\n%% ${hint} %%\n`)].join("\n\n") + "\n",
+  });
+}
+
+// Same template across a re-read: same file (or same built-in) and name; a real file path alone also matches (renamed note);
+// built-ins all share source "Built in", so they are told apart by name.
+function sameTemplateIdentity(a, b) {
+  const isFile = (t) => t.source && t.source !== "Built in";
+  if (isFile(a) && isFile(b)) return a.source === b.source;
+  return a.name === b.name;
 }
 
 function isMeetingPrepTemplate(template = {}) {
@@ -59486,6 +59627,7 @@ if (typeof module !== "undefined" && module.exports) {
     parsePromptTemplateFile,
     promptTemplateFileText,
     DEFAULT_PROMPT_TEMPLATE_FILES,
+  meetingPrepTemplateSkeleton,
     isTaskGenerationTemplate,
     isScheduleTodayTemplate,
     buildTaskEvidenceCatalog,

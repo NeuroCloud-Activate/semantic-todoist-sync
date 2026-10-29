@@ -1,3 +1,18 @@
+## 0.9.38 - 2026-10-29
+### Added
+- **A Collaborate folder for Collaborate prompts.** Every note in `Semantic Todoist Sync/Prompts/Collaborate` is a Collaborate prompt: it appears in Collaborate's preset list and never in the Run menu, with no settings needed in the note. The list updates within about half a second when you add, rename, edit or delete a note there.
+- **Generate meeting prep template.** Settings → Collaborate has a new Generate button. It creates "New meeting template" (then "New meeting template 2", and so on) in the Collaborate folder and opens it. The note has the scope settings at the top (days of completed tasks, which Todoist projects) and four sections (Meeting, For each project, Task list, Rules), each with a short instruction saying what to write. Instructions written as Obsidian comments (`%% … %%`) are removed before the prompt is used.
+
+### Changed
+- **The Supervisor meeting template moved into the Collaborate folder.** "Prepare for meeting – Supervisor" now lives in `Prompts/Collaborate` and is laid out in the same four sections as a generated template, with the same wording. On first load it is moved there from the top of the Prompts folder; if you had edited it, your edits are kept.
+
+### Fixed
+- **A prompt renamed or removed just before you run it is not run.** Run and Write first check the selected prompt. If it was renamed or removed, a message names it and asks you to pick it again; if it was only edited, the latest version runs.
+- **The Run menu keeps your selection when the prompt list changes.** Adding or renaming a prompt no longer switches the selected prompt or shows it twice.
+- Error messages from the Run button now show as a notice.
+- Live check (Oct 29, 2026, test vault, real Todoist read-only): the Supervisor moved into the Collaborate folder on 8 of 8 fresh starts with exactly one copy; Generate, auto-refresh, the renamed-prompt check and a one-project meeting run all passed; Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
 ## 0.9.37 - 2026-10-29
 ### Added
 - **Prepare for a meeting from your Todoist tasks.** In Collaborate, a new preset list next to Features offers meeting templates. The built-in "Prepare for meeting – Supervisor" fills the prompt box; edit it if you like, then press Write. The draft covers every open task and tasks completed in the last 14 days, grouped by project and then by theme, each theme with short prose and a short task list. Follow-ups of recently completed tasks are highlighted. Each task title links to the task in Todoist. Task lines are plain list lines, never checkboxes, so they never create or duplicate synced tasks. The draft reuses what is already written on the tasks: their descriptions and the notes they link to. It opens in the Review draft window like other drafts.

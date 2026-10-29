@@ -303,7 +303,7 @@ tab.renderCollaborate(collaborateRoot);
 const collaborateSettings = renderedSettings.slice(collaborateSettingsStart);
 assert.deepStrictEqual(
   collaborateSettings.map((setting) => setting.name).filter(Boolean),
-  ['Citation style', 'Context folder', 'Rescan context folder', 'Describe images'],
+  ['Citation style', 'Generate meeting prep template', 'Context folder', 'Rescan context folder', 'Describe images'],
   'Collaborate tab renders citation style, context folder, rescan and describe images in order'
 );
 const citationStyleSetting = collaborateSettings.find((setting) => setting.name === 'Citation style');

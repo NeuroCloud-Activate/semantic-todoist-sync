@@ -1605,9 +1605,55 @@ async function testMeetingNoticesWhenNoteClosed() {
   console.log('PASS meeting-notices-note-closed');
 }
 
+async function testSidebarActionRefresh() {
+  const mk = (n) => ({ name: n, source: `P/${n}.md`, prompt: n, action: '' });
+  const selectedName = (view) => view.sidebarActionTemplates[Number(view.actionSelectEl.value.split(':')[1])].name;
+  const labels = (view) => view.actionSelectEl.children.map((c) => c.text);
+  const setup = (templates) => {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.scheduleTodayEnabled = false;
+    view.actionSelectEl = makeSelectStub();
+    plugin.getPromptTemplates = async () => templates;
+    return { view, plugin };
+  };
+  // selected prompt B stays B when a new prompt sorts before it
+  {
+    const { view, plugin } = setup([mk('A'), mk('B')]);
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    assert.strictEqual(selectedName(view), 'B');
+    plugin.getPromptTemplates = async () => [mk('N'), mk('A'), mk('B')];
+    await view.populateSidebarActionOptions();
+    assert.strictEqual(selectedName(view), 'B', 'selection follows the template, not its index');
+    plugin.getPromptTemplates = async () => [mk('N'), mk('A')];
+    await view.populateSidebarActionOptions();
+    assert.strictEqual(labels(view)[0], 'N', 'deleted selection falls back to first option');
+    assert.strictEqual(selectedName(view), 'N');
+  }
+  // overlapping calls: no duplicate options, selection survives
+  {
+    const { view, plugin } = setup([]);
+    plugin.getPromptTemplates = async () => [mk('A'), mk('B')];
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    const gates = [];
+    let n = 0;
+    plugin.getPromptTemplates = () => (n++ < 2 ? new Promise((resolve) => gates.push(resolve)) : Promise.resolve([mk('A'), mk('B')]));
+    const p1 = view.populateSidebarActionOptions();
+    const p2 = view.populateSidebarActionOptions();
+    gates[1]([mk('A'), mk('B')]);
+    await p2;
+    gates[0]([mk('A'), mk('B')]);
+    await p1;
+    assert.deepStrictEqual(labels(view), ['A', 'B'], 'no duplicate options');
+    assert.strictEqual(selectedName(view), 'B', 'overlap keeps selection');
+  }
+  console.log('PASS sidebar-action-refresh');
+}
+
 async function testMeetingPresetRefresh() {
   const names = (v) => v.meetingPresetEl.children.map((c) => c.text);
-  const mk = (n) => ({ name: n, path: `T/${n}.md`, prompt: n, action: 'meeting-prep' });
+  const mk = (n) => ({ name: n, source: `T/${n}.md`, prompt: n, action: 'meeting-prep' });
   // overlapping populate calls: older (slow) result must not append
   const { view, plugin } = makeMeetingView(async () => ({}));
   const gates = [];
@@ -1637,6 +1683,140 @@ async function testMeetingPresetRefresh() {
   assert.strictEqual(view.meetingTemplate, null);
   assert.strictEqual(view.meetingPresetEl.value, '');
   console.log('PASS meeting-preset-refresh');
+}
+
+async function testRunRefreshesRenamedPrompt() {
+  const mk = (n, extra = {}) => ({ name: n, source: `P/${n}.md`, prompt: n, action: '', ...extra });
+  const setup = async (templates) => {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.scheduleTodayEnabled = false;
+    view.actionSelectEl = makeSelectStub();
+    view.getSelectedActiveContext = async () => ({});
+    const ran = [];
+    plugin.runPromptTemplate = async (t) => { ran.push(t); return { markdown: 'ok' }; };
+    plugin.getPromptTemplates = async () => templates;
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    return { view, plugin, ran };
+  };
+  // renamed (same file, new name)
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    plugin.getPromptTemplates = async () => [mk('A'), { ...mk('B2'), source: 'P/B.md' }];
+    await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && e.message.includes('"B2"') && /changed/.test(e.message));
+    assert.strictEqual(ran.length, 0, 'renamed prompt not run');
+    assert.strictEqual(view.sidebarActionTemplates[1].name, 'B2', 'list refreshed');
+  }
+  // removed
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    plugin.getPromptTemplates = async () => [mk('A')];
+    await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && /removed/.test(e.message));
+    assert.strictEqual(ran.length, 0);
+    assert.strictEqual(view.sidebarActionTemplates.length, 1, 'list refreshed');
+  }
+  // edited content, same name: runs the fresh object
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    const fresh = mk('B', { prompt: 'edited' });
+    plugin.getPromptTemplates = async () => [mk('A'), fresh];
+    await view.runSelectedSidebarAction();
+    assert.strictEqual(ran.length, 1);
+    assert.strictEqual(ran[0], fresh, 'fresh template used');
+  }
+  // meeting preset
+  const mt = (n, extra = {}) => ({ name: n, source: `T/${n}.md`, prompt: n, action: 'meeting-prep', ...extra });
+  const meetingSetup = async (templates) => {
+    const { view, plugin, prepCalls } = makeMeetingView(async () => ({ markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: [], unknownProjects: [] }));
+    plugin.getPromptTemplates = async () => templates;
+    await view.populateMeetingPresetOptions();
+    view.meetingPresetEl.value = '0';
+    view.meetingTemplate = view.meetingTemplates[0];
+    view.promptEl.value = 'typed instruction';
+    return { view, plugin, prepCalls };
+  };
+  const obs = require('obsidian');
+  for (const [label, after, expect] of [
+    ['renamed', (o) => [{ ...mt('S2'), source: o.source }], '"S2"'],
+    ['removed', () => [], 'removed'],
+  ]) {
+    const { view, plugin, prepCalls } = await meetingSetup([mt('S')]);
+    plugin.getPromptTemplates = async () => after(mt('S'));
+    obs.notices = [];
+    const notices = obs.notices;
+    await view.write();
+    assert.strictEqual(prepCalls.length, 0, `meeting ${label}: prepareMeeting not called`);
+    assert(notices.some((m) => String(m).includes('"S"') && String(m).includes(expect)), `meeting ${label}: notice shown: ${notices}`);
+  }
+  {
+    const fresh = mt('S', { completedDays: 30 });
+    const { view, plugin, prepCalls } = await meetingSetup([mt('S')]);
+    plugin.getPromptTemplates = async () => [fresh];
+    await view.write();
+    assert.strictEqual(prepCalls.length, 1);
+    assert.strictEqual(prepCalls[0].template, fresh, 'fresh meeting template');
+    assert.strictEqual(prepCalls[0].instruction, 'typed instruction');
+  }
+  console.log('PASS run-refreshes-renamed-prompt');
+}
+
+// Built-in fallback templates all carry source "Built in" (same shape getPromptTemplates returns when the folder is empty).
+async function testBuiltInTemplatesKeepIdentity() {
+  const builtIn = (n) => ({ source: 'Built in', createTasks: true, name: n, prompt: n, action: '' });
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  plugin.settings.scheduleTodayEnabled = false;
+  view.actionSelectEl = makeSelectStub();
+  view.getSelectedActiveContext = async () => ({});
+  const ran = [];
+  plugin.runPromptTemplate = async (t) => { ran.push(t); return { markdown: 'ok' }; };
+  plugin.getPromptTemplates = async () => [builtIn('A'), builtIn('B'), builtIn('C')];
+  await view.populateSidebarActionOptions();
+  view.actionSelectEl.value = 'prompt:1';
+  await view.populateSidebarActionOptions();
+  assert.strictEqual(view.actionSelectEl.value, 'prompt:1', 'selection survives refresh');
+  await view.runSelectedSidebarAction();
+  assert.deepStrictEqual(ran.map((t) => t.name), ['B'], 'second built-in runs, no false changed error');
+  // a built-in that disappears is still reported, not swapped for another built-in
+  plugin.getPromptTemplates = async () => [builtIn('A'), builtIn('C')];
+  await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && /removed/.test(e.message));
+  assert.strictEqual(ran.length, 1);
+  console.log('PASS builtin-templates-keep-identity');
+}
+
+// The run-time check must not use the folder-setup path of getPromptTemplates: that would re-create a renamed default.
+async function testRuntimeCheckDoesNotRecreateDefaults() {
+  const obs = require('obsidian');
+  const { view, plugin, prepCalls } = makeMeetingView(async () => ({}));
+  const sup = { name: 'Prepare for meeting \u2013 Supervisor', source: 'P/Collaborate/Prepare for meeting \u2013 Supervisor.md', prompt: 'x', action: 'meeting-prep' };
+  let recreated = 0;
+  const firstCall = [];
+  let current = [sup];
+  plugin.getPromptTemplates = async (opts = {}) => {
+    firstCall.push(opts.ensure);
+    if (opts.ensure !== false) { recreated += 1; return [sup]; } // folder setup brings the default back
+    return current;
+  };
+  await view.populateMeetingPresetOptions();
+  view.meetingPresetEl.value = '0';
+  view.meetingTemplate = view.meetingTemplates[0];
+  view.promptEl.value = 'typed';
+  firstCall.length = 0;
+  current = [{ ...sup, name: 'Weekly sync', source: 'P/Collaborate/Weekly sync.md' }];
+  obs.notices = [];
+  await view.write();
+  assert.strictEqual(prepCalls.length, 0, 'renamed Supervisor is not prepared');
+  assert(obs.notices.some((m) => String(m).includes('Supervisor') && /renamed or removed|changed/.test(m)), 'notice shown');
+  assert.strictEqual(firstCall[0], false, 'check itself never runs folder setup (first read is ensure:false)');
+  assert(view.statusLog.some((s) => /Supervisor/.test(s)), 'status line set too');
+  console.log('PASS runtime-check-no-recreate');
+}
+
+function testRunStaleErrorSetsStatus() {
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const i = src.indexOf('runButton.onclick = async () => {');
+  const body = src.slice(i, src.indexOf('};', i));
+  assert(/await this\.runSelectedSidebarAction\(\);\s*\} catch \(error\) \{\s*new Notice\(error\.message \|\| String\(error\)\);\s*this\.setStatus\(error\.message \|\| String\(error\)\);/.test(body), 'Run click: Notice + setStatus on stale error');
+  console.log('PASS run-stale-error-status');
 }
 
 async function testMeetingTodoistPinnedAndMenuAndOverride() {
@@ -1751,12 +1931,17 @@ async function runTests() {
   await testEmptyModelOutput();
   await testInsertAtCursorApa();
   await testMeetingEvidenceMenuAndLabel();
+  await testSidebarActionRefresh();
   await testMeetingPresetDropdown();
   await testMeetingRouting();
   await testMeetingMessagesAndReset();
   await testMeetingClearsStaleEvidence();
   await testMeetingNoticesWhenNoteClosed();
   await testMeetingPresetRefresh();
+  await testRunRefreshesRenamedPrompt();
+  await testBuiltInTemplatesKeepIdentity();
+  await testRuntimeCheckDoesNotRecreateDefaults();
+  testRunStaleErrorSetsStatus();
   await testMeetingTodoistPinnedAndMenuAndOverride();
   console.log('writing-sidebar-test: PASS (expanded)');
 }

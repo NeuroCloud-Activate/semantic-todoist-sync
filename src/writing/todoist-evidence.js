@@ -55,11 +55,22 @@ function stripSources(text) {
   return (i < 0 ? s : s.slice(0, i)).trim();
 }
 
-function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projects = [], now = new Date(), taskUrl }) {
+function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projects = [], now = new Date(), taskUrl, subprojects = "merge" }) {
   completedDays = Number.isFinite(Number(completedDays)) ? Math.min(90, Math.max(1, Number(completedDays))) : 14;
   const snap = snapshot || {};
   const projectNames = new Map((snap.projects || []).map((p) => [String(p.id), p.name]));
+  const projectParent = new Map((snap.projects || []).map((p) => [String(p.id), String(p.parentId ?? p.parent_id ?? "")]));
   const sectionNames = new Map((snap.sections || []).map((s) => [String(s.id), s.name]));
+  const topOf = (id) => {
+    let cur = String(id || ""); const seen = new Set();
+    while (projectParent.has(cur) && projectParent.get(cur) && !seen.has(cur)) { seen.add(cur); cur = projectParent.get(cur); }
+    return cur;
+  };
+  const pathOf = (id) => {
+    let cur = String(id || ""); const parts = []; const seen = new Set();
+    while (cur && projectNames.has(cur) && !seen.has(cur)) { seen.add(cur); parts.push(projectNames.get(cur)); cur = projectParent.get(cur) || ""; }
+    return parts.reverse().join(" › ");
+  };
   const all = [...(snap.tasks || []), ...completed];
   const titles = new Map(all.map((t) => [String(t.id), singleLine(t.content)]));
   const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - completedDays);
@@ -99,14 +110,43 @@ function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projec
     seen.add(String(t.id));
     records.push(mk(t));
   }
+  const merge = String(subprojects || "").toLowerCase() !== "separate";
+  // Preserve each record's original project id before merge remaps it.
+  const origOf = new WeakMap(records.map((r) => [r, r.projectId]));
+  if (merge) {
+    for (const r of records) {
+      r.projectPath = pathOf(r.projectId);
+      const top = topOf(r.projectId);
+      if (top !== r.projectId) { r.projectId = top; r.projectName = projectNames.get(top) || r.projectName; }
+    }
+  }
   const unknownProjects = [];
   const wanted = (projects || []).map((p) => singleLine(p)).filter(Boolean);
   if (wanted.length) {
-    const names = new Set(records.map((r) => r.projectName.toLowerCase()));
-    for (const n of [...projectNames.values()]) names.add(String(n).toLowerCase());
-    const keep = new Set(wanted.map((w) => w.toLowerCase()));
+    // Every project name at any depth is known (0.9.38 accepted any project name).
+    const names = new Set([...projectNames.values()].map((n) => String(n).toLowerCase()));
+    const wantedLower = wanted.map((w) => w.toLowerCase());
     for (const w of wanted) if (!names.has(w.toLowerCase())) unknownProjects.push(w);
-    records = records.filter((r) => keep.has(r.projectName.toLowerCase()));
+    // A named project includes itself plus all of its descendants.
+    const namedIds = new Set();
+    for (const [id, name] of projectNames) {
+      if (wantedLower.includes(String(name).toLowerCase())) namedIds.add(String(id));
+    }
+    const isUnder = (candidateId, namedId) => {
+      let cur = String(candidateId || ""); const seen = new Set();
+      while (cur && projectNames.has(cur) && !seen.has(cur)) {
+        if (cur === namedId) return true;
+        seen.add(cur); cur = projectParent.get(cur) || "";
+      }
+      return false;
+    };
+    const closureIds = new Set();
+    for (const nid of namedIds) {
+      for (const [cid] of projectNames) {
+        if (isUnder(cid, nid)) closureIds.add(String(cid));
+      }
+    }
+    records = records.filter((r) => closureIds.has(String(origOf.get(r) || r.projectId)));
   }
   return { records, unknownProjects };
 }
@@ -146,7 +186,7 @@ function groupByProject(records) {
 function taskEvidenceText(r) {
   const head = [
     r.title,
-    `${r.projectName}${r.sectionName ? " › " + r.sectionName : ""}`,
+    `${r.projectPath || r.projectName}${r.sectionName ? " › " + r.sectionName : ""}`,
     r.parentTitle ? `parent: ${r.parentTitle}` : "",
     r.status,
     r.due ? `due ${datePart(r.due)}` : "",

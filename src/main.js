@@ -247,11 +247,18 @@ const WEB_SEARCH_MODE_PROFILES = Object.freeze({
   deep: Object.freeze({ maxOutputTokens: 8000, maxResults: 12, maxEvidenceChars: 1400, maxQueryChars: 1800, maxRequestChars: 16000, maxLocalEvidenceRows: 8, maxActiveChars: 3600, searchContextSize: "high", thinkingEffort: "high", maxQueries: 4, openrouter: Object.freeze({ max_results: 8, max_total_results: 12, max_uses: 4, max_characters: 4000 }), anthropic: Object.freeze({ max_uses: 8 }) })
 });
 const COLLABORATE_SUBFOLDER = "Collaborate"; // every note in <prompt folder>/Collaborate is a Collaborate (meeting prep) template
-const MEETING_PREP_HEADINGS = ["Meeting", "For each project", "Task list", "Rules"];
+const MEETING_PREP_HEADINGS = ["Meeting", "Overview", "For each project", "Rules"];
 // The 0.9.37 Supervisor text, kept only to recognise an unedited old file when moving it into the subfolder.
 const OLD_SUPERVISOR_PROMPT = "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting.";
-const SUPERVISOR_PROMPT = OLD_SUPERVISOR_PROMPT.split("\n\n").map((paragraph, index) => `## ${MEETING_PREP_HEADINGS[index]}\n\n${paragraph}`).join("\n\n");
-const OLD_SUPERVISOR_FILE_TEXT = promptTemplateFileText({ action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], prompt: OLD_SUPERVISOR_PROMPT });
+// The 0.9.38 built-in supervisor body (four sections), kept only so an unedited 0.9.38 file can be upgraded to the template-driven body.
+const SUPERVISOR_PROMPT_0_9_38 = OLD_SUPERVISOR_PROMPT.split("\n\n").map((paragraph, index) => `## ${["Meeting", "For each project", "Task list", "Rules"][index]}\n\n${paragraph}`).join("\n\n");
+const SUPERVISOR_PROMPT = [
+  "## Meeting\n\nPrepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
+  "## Overview\n\nStart with an overview of at most 3 sentences on the most time-sensitive items across projects.",
+  "## For each project\n\nWrite one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.",
+  "## Rules\n\nUse only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project."
+].join("\n\n");
+const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
 const MEETING_PREP_FOLDER_REFRESH_MS = 400;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
@@ -288,6 +295,10 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     syncTasks: false,
     completedDays: 14,
     projects: [],
+    subprojects: "merge",
+    taskList: "cited",
+    maxTasks: 5,
+    overview: true,
     prompt: SUPERVISOR_PROMPT
   },
   {
@@ -15304,10 +15315,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   // Meeting prep: raw Todoist reads -> grouped task records (open/completed counts feed the Sources line).
-  async getMeetingTodoistData({ completedDays = 14, projects = [] } = {}) {
+  async getMeetingTodoistData({ completedDays = 14, projects = [], subprojects = "merge" } = {}) {
     const { buildTaskRecords } = require("./writing/todoist-evidence.js");
     const { snapshot, completed } = await this.getMeetingTodoistRaw({ completedDays });
-    const { records, unknownProjects } = buildTaskRecords({ snapshot, completed, completedDays, projects, now: new Date(), taskUrl: (id) => todoistTaskUrl(id, this.settings) });
+    const { records, unknownProjects } = buildTaskRecords({ snapshot, completed, completedDays, projects, subprojects, now: new Date(), taskUrl: (id) => todoistTaskUrl(id, this.settings) });
     return { records, unknownProjects, openCount: records.filter((r) => r.status !== "done").length, completedCount: records.filter((r) => r.status === "done").length };
   }
 
@@ -20781,14 +20792,24 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   // 0.9.37 kept the Supervisor template at the top of the folder; move it into the subfolder without losing edits.
   async migrateSupervisorTemplate(folder) {
     const oldPath = `${folder}/Prepare for meeting \u2013 Supervisor.md`;
-    const newPath = `${folder}/${DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep").filename}`;
-    const oldFile = this.app.vault.getAbstractFileByPath(oldPath);
-    if (!(oldFile instanceof TFile) || this.app.vault.getAbstractFileByPath(newPath)) return;
+    const entry = DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep");
+    const newPath = `${folder}/${entry.filename}`;
+    const newText = promptTemplateFileText(entry);
     const normalize = (text) => String(text).replace(/\r\n/g, "\n").trim();
+    // An unedited 0.9.38 Collaborate Supervisor file (or a fresh default carrying the old four-section body) is upgraded to the template-driven text; edited files are never touched.
+    const newFile = this.app.vault.getAbstractFileByPath(newPath);
+    if (newFile instanceof TFile) {
+      if (normalize(await this.app.vault.read(newFile)) === normalize(MEETING_PREP_0_9_38_FILE_TEXT)) {
+        await this.app.vault.modify(newFile, newText);
+      }
+      return;
+    }
+    const oldFile = this.app.vault.getAbstractFileByPath(oldPath);
+    if (!(oldFile instanceof TFile)) return;
     const unedited = normalize(await this.app.vault.read(oldFile)) === normalize(OLD_SUPERVISOR_FILE_TEXT);
     await ensureVaultFolder(this.app, `${folder}/${COLLABORATE_SUBFOLDER}`);
     await this.app.fileManager.renameFile(oldFile, newPath);
-    if (unedited) await this.app.vault.modify(oldFile, promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep")));
+    if (unedited) await this.app.vault.modify(oldFile, newText);
   }
 
   // Concurrent callers (sidebar, presets, startup, folder events) share one run: interleaved migrate/create steps duplicated or clobbered the Supervisor file.
@@ -29427,7 +29448,11 @@ function parsePromptTemplateFile(file, text, inMeetingFolder = false) {
     taskHeading: parsed.meta.taskHeading || parsed.meta.task_heading || parsed.meta.heading || "",
     taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only),
     completedDays: parseMeetingCompletedDays(parsed.meta.completedDays),
-    projects: parseMeetingProjects(parsed.meta.projects)
+    projects: parseMeetingProjects(parsed.meta.projects),
+    subprojects: parseMeetingSubprojects(parsed.meta.subprojects),
+    taskList: parseMeetingTaskList(parsed.meta.taskList ?? parsed.meta.task_list),
+    maxTasks: parseMeetingMaxTasks(parsed.meta.maxTasks ?? parsed.meta.max_tasks),
+    overview: parseTemplateBoolean(parsed.meta.overview, true)
   };
 }
 
@@ -29490,14 +29515,13 @@ function stripObsidianComments(text) {
 function meetingPrepTemplateSkeleton() {
   const sections = [
     ["Meeting", "Say who the meeting is with and what it is for."],
-    ["For each project", "Say what to cover for each project or theme, for example where things stand, what was finished recently and what is coming up."],
-    ["Task list", "Say which tasks to list under each project, for example only the ones worth discussing. The plugin builds the project headings and the linked task list itself, so do not ask for checkboxes."],
-    ["Rules", "Say how the result should read: tone, length, whether to cite sources, and what belongs under questions to raise."],
+    ["Overview", "Say how long the overview should be, or delete this section and set overview: no."],
+    ["For each project", "Say the paragraph length, what to cover, and how many questions to raise."],
+    ["Rules", "Say the tone and what to leave out."],
   ];
-  const intro = "%% How to use this template\n- completedDays: how many days of completed tasks to include (1 to 90).\n- projects: Todoist project names separated by commas. Leave blank to use all projects.\n- Leave createTasks, insertResponse and syncTasks as they are.\nAnything between double percent signs, like this note, is an instruction for you. It is removed before the template is used. %%";
   return promptTemplateFileText({
-    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [],
-    prompt: [intro, ...sections.map(([heading, hint]) => `## ${heading}\n\n%% ${hint} %%\n`)].join("\n\n") + "\n",
+    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], subprojects: "merge", taskList: "cited", maxTasks: 5, overview: true,
+    prompt: sections.map(([heading, hint]) => `## ${heading}\n\n%% ${hint} %%\n`).join("\n\n") + "\n",
   });
 }
 
@@ -29522,11 +29546,26 @@ function parseMeetingProjects(value) {
   return String(value || "").trim().replace(/^\[([\s\S]*)\]$/, "$1").split(",").map((name) => name.trim()).filter(Boolean);
 }
 
+function parseMeetingSubprojects(value) {
+  return String(value || "").trim().toLowerCase() === "separate" ? "separate" : "merge";
+}
+
+function parseMeetingTaskList(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return text === "all" || text === "none" ? text : "cited";
+}
+
+function parseMeetingMaxTasks(value) {
+  const count = value == null || String(value).trim() === "" ? NaN : Math.trunc(Number(value));
+  return Number.isFinite(count) ? Math.min(50, Math.max(1, count)) : 5;
+}
+
 function promptTemplateFileText(template) {
+  const meeting = isMeetingPrepTemplate(template);
   return [
     "---",
     ...(template.action ? [`action: ${normalizePromptTemplateAction(template.action)}`] : []),
-    ...(isMeetingPrepTemplate(template) ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`] : []),
+    ...(meeting ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`, `subprojects: ${parseMeetingSubprojects(template.subprojects)}`, `taskList: ${parseMeetingTaskList(template.taskList)}`, `maxTasks: ${parseMeetingMaxTasks(template.maxTasks)}`, `overview: ${parseTemplateBoolean(template.overview, true) ? "yes" : "no"}`] : []),
     `createTasks: ${Boolean(template.createTasks)}`,
     `insertResponse: ${template.insertResponse !== false}`,
     `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
@@ -29534,9 +29573,15 @@ function promptTemplateFileText(template) {
     ...(template.createTasks ? [`taskHeading: '${template.taskHeading || DEFAULT_TASK_HEADING}'`] : []),
     "---",
     "",
+    ...(meeting ? [MEETING_PREP_SETTINGS_COMMENT, ""] : []),
     template.prompt || ""
   ].join("\n");
 }
+
+// Exact bytes the 0.9.37/0.9.38 serializer wrote (no subprojects/taskList/maxTasks/overview keys, no settings comment); comparison-only.
+const oldMeetingFileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${prompt}`;
+const OLD_SUPERVISOR_FILE_TEXT = oldMeetingFileText(OLD_SUPERVISOR_PROMPT);
+const MEETING_PREP_0_9_38_FILE_TEXT = oldMeetingFileText(SUPERVISOR_PROMPT_0_9_38);
 
 function yesNo(value) {
   return value ? "Yes" : "No";
@@ -58351,7 +58396,8 @@ function normalizeTodoistProjects(projects) {
       id: String(project.id || ""),
       name: singleLine(project.name || "Untitled project"),
       isInbox: Boolean(project.isInbox || project.is_inbox_project || project.inbox_project),
-      isShared: Boolean(project.isShared || project.is_shared || project.shared)
+      isShared: Boolean(project.isShared || project.is_shared || project.shared),
+      parentId: String(project.parent_id ?? project.parentId ?? "")
     }))
     .filter((project) => project.id)
     .sort((a, b) => (a.isInbox === b.isInbox ? a.name.localeCompare(b.name) : a.isInbox ? -1 : 1));

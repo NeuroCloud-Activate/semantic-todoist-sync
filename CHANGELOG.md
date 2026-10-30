@@ -1,3 +1,16 @@
+## 0.9.39 - 2026-10-30
+### Changed
+- **Meeting prep documents are much shorter, and the template note decides the layout.** The plugin no longer forces a heading and paragraph per theme or a questions list for every project, so the wording in your Collaborate template (paragraph length, number of questions, overview length) now takes effect. The plugin keeps only its safety rules: use only the evidence and cite it, never invent anything, and never write checkboxes.
+- **New template settings for the Todoist task list.** A Collaborate template's front matter can set `subprojects` (`merge` folds sub-projects into their main project, `separate` keeps them as their own sections), `taskList` (`cited` lists only the tasks the text mentions, or `all`, or `none`), `maxTasks` (most tasks listed per project) and `overview` (`yes` or `no`), alongside `completedDays` and `projects`. A short comment under the settings explains each one. Vault, context folder, research and web sources still follow the sidebar's Evidence menu.
+- **Shorter Supervisor template.** "Prepare for meeting – Supervisor" now asks for an overview of at most 3 sentences and one paragraph of at most 5 sentences per project with at most 3 questions, and to skip a project when nothing in it needs discussion. An unedited 0.9.37 or 0.9.38 copy is upgraded automatically; an edited copy is never changed. The Generate button's template uses the same settings and sections (Meeting, Overview, For each project, Rules).
+- **Projects with nothing to discuss can be skipped.** When the template asks for it, a project the AI judges quiet is left out entirely: no heading, task list or footnotes.
+
+### Fixed
+- Naming a project in `projects:` includes its sub-projects, and naming a sub-project directly works too.
+- Each project's paragraph no longer repeats its own overview and heading.
+- Live check (Oct 30, 2026, test vault, real Todoist read-only): the Supervisor run went from 117 KB with 23+ sections and 269 references to 57 KB with 18 sections and 180 references, with at most 3 questions and 5 listed tasks per project and no checkboxes; the unedited Supervisor upgraded on load; merge, separate and single sub-project templates all ran; Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
 ## 0.9.38 - 2026-10-29
 ### Added
 - **A Collaborate folder for Collaborate prompts.** Every note in `Semantic Todoist Sync/Prompts/Collaborate` is a Collaborate prompt: it appears in Collaborate's preset list and never in the Run menu, with no settings needed in the note. The list updates within about half a second when you add, rename, edit or delete a note there.

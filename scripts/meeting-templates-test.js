@@ -53,6 +53,24 @@ async function main() {
   assert.strictEqual(tpl('completedDays: 500').completedDays, 90);
   assert.deepStrictEqual(tpl('projects:').projects, []);
   assert.strictEqual(parsePromptTemplateFile(file, '---\naction: prepare-meeting\n---\nx').action, 'meeting-prep');
+  // template-driven layout: new frontmatter keys, defaults, invalid fallbacks, yes/no
+  const d = tpl('');
+  assert.deepStrictEqual({ subprojects: d.subprojects, taskList: d.taskList, maxTasks: d.maxTasks, overview: d.overview }, { subprojects: 'merge', taskList: 'cited', maxTasks: 5, overview: true });
+  const custom = tpl('subprojects: Separate\ntaskList: All\nmaxTasks: 7\noverview: no');
+  assert.strictEqual(custom.subprojects, 'separate', 'case-insensitive accept');
+  assert.strictEqual(custom.taskList, 'all');
+  assert.strictEqual(custom.maxTasks, 7);
+  assert.strictEqual(custom.overview, false);
+  const yes = tpl('overview: yes\nsubprojects: separate\ntaskList: none');
+  assert.strictEqual(yes.overview, true, 'overview: yes');
+  assert.strictEqual(yes.taskList, 'none');
+  const bad = tpl('subprojects: bogus\ntaskList: bogus\nmaxTasks: bogus');
+  assert.strictEqual(bad.subprojects, 'merge', 'invalid subprojects -> default');
+  assert.strictEqual(bad.taskList, 'cited', 'invalid taskList -> default');
+  assert.strictEqual(bad.maxTasks, 5, 'invalid maxTasks -> default');
+  assert.strictEqual(tpl('maxTasks: 0').maxTasks, 1);
+  assert.strictEqual(tpl('maxTasks: 500').maxTasks, 50);
+  assert.strictEqual(tpl('maxTasks: 4.7').maxTasks, 4);
   console.log('PASS parse');
 
   // built-in
@@ -131,19 +149,34 @@ async function main() {
   responder = null;
   await assert.rejects(makePlugin({ todoistToken: '' }).getMeetingTodoistRaw({ completedDays: 14 }), (e) => e.code === 'todoist-unavailable');
   console.log('PASS unavailable');
+
+  // meeting snapshot projects carry parentId for meeting prep
+  responder = (o) => {
+    if (o.url.includes('/sync')) return page(200, { full_sync: true, projects: [{ id: 'p1', name: 'Top' }, { id: 'p2', name: 'Sub', parent_id: 'p1' }], items: [], sections: [] });
+    return page(200, { items: [], next_cursor: null });
+  };
+  const snapPlugin = makePlugin();
+  snapPlugin.saveSettings = async () => {};
+  const raw = await snapPlugin.getMeetingTodoistRaw({ completedDays: 14 });
+  assert.strictEqual(raw.snapshot.projects.find((p) => p.id === 'p1').parentId, '', 'top-level parentId empty');
+  assert.strictEqual(raw.snapshot.projects.find((p) => p.id === 'p2').parentId, 'p1', 'sub-project keeps parent_id');
+  console.log('PASS meeting snapshot parentId');
 }
 
-function specBody() {
+function specFileText() {
   const L = require('fs').readFileSync(path.join(__dirname, '..', 'docs/superpowers/specs/2026-10-29-meeting-prep-design.md'), 'utf8').split(/\r?\n/);
   const h = L.findIndex((l) => l.startsWith('## The built-in template'));
-  const dashes = []; let end = -1;
-  for (let i = h + 1; i < L.length && end < 0; i++) { if (L[i] === '---') dashes.push(i); else if (dashes.length >= 2 && L[i].startsWith('```')) end = i; }
-  return L.slice(dashes[1] + 1, end).join('\n').trim();
+  let start = -1, end = -1;
+  for (let i = h + 1; i < L.length; i++) {
+    if (start < 0 && L[i].startsWith('```')) { start = i + 1; continue; }
+    if (start >= 0 && L[i].startsWith('```')) { end = i; break; }
+  }
+  return L.slice(start, end).join('\n').trim();
 }
 {
   const e = DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep');
   assert.strictEqual(e.filename, 'Collaborate/Prepare for meeting \u2013 Supervisor.md');
-  assert.strictEqual(e.prompt, specBody());
+  assert.strictEqual(e.prompt, specFileText());
   console.log('PASS built-in verbatim');
 }
 main().catch((e) => { console.error(e); process.exit(1); });
@@ -151,13 +184,53 @@ main().catch((e) => { console.error(e); process.exit(1); });
 // ---- Meeting prep folder & template generator (addendum 2026-10-29) ----
 const TFile = SharedTFile;
 const OLD_SUPERVISOR_PROMPT = "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting.";
-const HEADINGS = ['Meeting', 'For each project', 'Task list', 'Rules'];
+const OLD_HEADINGS = ['Meeting', 'For each project', 'Task list', 'Rules'];
+const HEADINGS = ['Meeting', 'Overview', 'For each project', 'Rules'];
 const SUB = 'Collaborate';
 const FOLDER = 'Semantic Todoist Sync/Prompts';
 const OLD_PATH = `${FOLDER}/Prepare for meeting \u2013 Supervisor.md`;
 const NEW_PATH = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor.md`;
 const norm = (s) => String(s).replace(/\r\n/g, '\n').trim();
-const oldFileText = () => promptTemplateFileText({ action: 'meeting-prep', createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], prompt: OLD_SUPERVISOR_PROMPT });
+const oldFileText = () => `---
+action: meeting-prep
+completedDays: 14
+projects: 
+createTasks: false
+insertResponse: true
+syncTasks: false
+---
+
+Prepare me for a meeting with my supervisor.
+
+For each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.
+
+Below the paragraphs for each project, list only the tasks worth discussing.
+
+Use only facts from the evidence and cite them. If something is unclear or missing, put it under "Questions to raise" rather than guessing. Keep it easy to follow in a meeting.`;
+const oldSupervisor09038Text = () => `---
+action: meeting-prep
+completedDays: 14
+projects: 
+createTasks: false
+insertResponse: true
+syncTasks: false
+---
+
+## Meeting
+
+Prepare me for a meeting with my supervisor.
+
+## For each project
+
+For each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.
+
+## Task list
+
+Below the paragraphs for each project, list only the tasks worth discussing.
+
+## Rules
+
+Use only facts from the evidence and cite them. If something is unclear or missing, put it under "Questions to raise" rather than guessing. Keep it easy to follow in a meeting.`;
 
 function fakeApp(initial = {}) {
   const files = new Map(Object.entries(initial));
@@ -209,7 +282,7 @@ async function folderTests() {
     assert(!t.filter(isTaskGenerationTemplate).some(isMeetingPrepTemplate));
     console.log('PASS folder-implied meeting templates');
   }
-  // 4/5: built-in entry, headings, verbatim paragraphs
+  // 4/5: built-in entry, headings, verbatim sections
   {
     const e = DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep');
     assert.strictEqual(e.filename, `${SUB}/Prepare for meeting \u2013 Supervisor.md`);
@@ -217,35 +290,71 @@ async function folderTests() {
     const heads = (s) => s.split('\n').filter((l) => l.startsWith('## '));
     assert.deepStrictEqual(heads(skeleton), HEADINGS.map((h) => '## ' + h));
     assert.deepStrictEqual(heads(e.prompt), HEADINGS.map((h) => '## ' + h));
-    const paras = OLD_SUPERVISOR_PROMPT.split('\n\n');
-    assert.strictEqual(paras.length, 4);
+    const paras = [ 'Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.', 'Start with an overview of at most 3 sentences on the most time-sensitive items across projects.', 'Write one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.', 'Use only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project.' ];
     const secs = e.prompt.split(/^## .*$/m).slice(1).map((s) => s.trim());
     assert.deepStrictEqual(secs, paras);
     assert(!e.prompt.includes('%%'), 'no instruction comments in Supervisor');
-    const fm = (s) => s.split('\n---')[0].split('\n').map((l) => l.split(':')[0]);
-    assert.deepStrictEqual(fm(promptTemplateFileText(e)), fm(skeleton));
+    const fm = (s) => s.split('\n---')[0].split('\n').map((l) => l.split(':')[0].trim()).filter((k) => k && k !== '---');
+    const expectedKeys = ['action', 'completedDays', 'projects', 'subprojects', 'taskList', 'maxTasks', 'overview', 'createTasks', 'insertResponse', 'syncTasks'];
+    assert.deepStrictEqual(fm(promptTemplateFileText(e)), expectedKeys);
+    assert.deepStrictEqual(fm(skeleton), expectedKeys);
     const sk = parsePromptTemplateFile(file, skeleton, true);
     assert.strictEqual(sk.action, 'meeting-prep'); assert.strictEqual(sk.completedDays, 14);
     assert.deepStrictEqual(sk.projects, []); assert.strictEqual(sk.createTasks, false);
     assert.strictEqual(sk.insertResponse, true); assert.strictEqual(sk.syncAfterInsert, false);
+    assert.strictEqual(sk.subprojects, 'merge'); assert.strictEqual(sk.taskList, 'cited');
+    assert.strictEqual(sk.maxTasks, 5); assert.strictEqual(sk.overview, true);
     console.log('PASS built-in subfolder, shared headings, verbatim sections');
   }
   // 4: migration
   {
     const newText = promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep'));
+    const old09038 = oldSupervisor09038Text();
+    // 0.9.37 top-level unedited -> moved + NEW text
     let p = appPlugin({ [OLD_PATH]: oldFileText().replace(/\n/g, '\r\n') });
     await p.ensurePromptTemplateFolder(false);
     assert(!p.app.files.has(OLD_PATH)); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    // edited -> moved unchanged
     p = appPlugin({ [OLD_PATH]: oldFileText() + '\nMy edit' });
     await p.ensurePromptTemplateFolder(false);
     assert(!p.app.files.has(OLD_PATH)); assert.strictEqual(p.app.files.get(NEW_PATH), oldFileText() + '\nMy edit');
+    // both locations -> untouched
     p = appPlugin({ [OLD_PATH]: 'OLD', [NEW_PATH]: 'NEW' });
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(OLD_PATH), 'OLD'); assert.strictEqual(p.app.files.get(NEW_PATH), 'NEW');
+    // neither -> new default created
     p = appPlugin({});
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(NEW_PATH), newText); assert(!p.app.files.has(OLD_PATH));
     assert(p.app.folders.has(`${FOLDER}/${SUB}`));
+    // 0.9.38 unedited Collaborate file -> replaced with NEW text, edited untouched
+    p = appPlugin({ [NEW_PATH]: old09038 });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    p = appPlugin({ [NEW_PATH]: old09038 + '\nMy edit' });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(NEW_PATH), old09038 + '\nMy edit');
+// one changed word in a real old file (0.9.38 in Collaborate, 0.9.37 top-level) is never touched/overwritten
+const oneWord = old09038.replace('Rules', 'Rule');
+assert.notStrictEqual(oneWord, old09038);
+p = appPlugin({ [NEW_PATH]: oneWord });
+await p.ensurePromptTemplateFolder(false);
+assert.strictEqual(p.app.files.get(NEW_PATH), oneWord);
+const oneWord37 = oldFileText().replace('supervisor', 'boss');
+assert.notStrictEqual(oneWord37, oldFileText());
+p = appPlugin({ [OLD_PATH]: oneWord37 });
+await p.ensurePromptTemplateFolder(false);
+assert.strictEqual(p.app.files.get(NEW_PATH), oneWord37, 'edited 0.9.37 moved, content kept');
+// new built-in text is not re-migrated (idempotent)
+p = appPlugin({ [NEW_PATH]: old09038 });
+await p.ensurePromptTemplateFolder(false);
+const once = p.app.files.get(NEW_PATH);
+assert.strictEqual(norm(once), norm(newText));
+let modifies = 0; const origModify = p.app.vault.modify;
+p.app.vault.modify = async (...a) => { modifies++; return origModify(...a); };
+await p.ensurePromptTemplateFolder(false);
+assert.strictEqual(modifies, 0, 'second run does not rewrite');
+assert.strictEqual(p.app.files.get(NEW_PATH), once);
     console.log('PASS migration (unedited, edited, both, neither)');
   }
   // concurrent ensure calls (sidebar, meeting presets, startup, folder events all load together) must not duplicate or clobber

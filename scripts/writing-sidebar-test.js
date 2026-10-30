@@ -1452,7 +1452,7 @@ function makeSelectStub() {
 
 const MEETING_TEMPLATES = [
   { name: 'Chat prompt', prompt: 'chat', action: '' },
-  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'] },
+  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, overview: false },
 ];
 
 function makeMeetingView(prepareImpl, notePath = 'Notes/Meet.md') {
@@ -1517,6 +1517,10 @@ async function testMeetingRouting() {
   assert.strictEqual(prepCalls.length, 1);
   assert.strictEqual(prepCalls[0].instruction, 'edited meeting prompt');
   assert.strictEqual(prepCalls[0].template, MEETING_TEMPLATES[1]);
+  assert.strictEqual(prepCalls[0].template.subprojects, 'separate');
+  assert.strictEqual(prepCalls[0].template.taskList, 'all');
+  assert.strictEqual(prepCalls[0].template.maxTasks, 9);
+  assert.strictEqual(prepCalls[0].template.overview, false);
   assert.strictEqual(prepCalls[0].webSearchMode, 'concise');
   assert.strictEqual(prepCalls[0].citationStyle, 'footnotes');
   assert.ok(view.rewriteModal && view.rewriteModal.opened, 'Review draft window opened');

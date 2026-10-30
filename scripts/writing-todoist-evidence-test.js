@@ -169,3 +169,75 @@ console.log("PASS status");
   assert.ok(E.renderTaskList([rec("Q", { title: " " })], new Map()).includes("(untitled task)"));
   console.log("PASS checkbox-like titles are escaped");
 }
+// subprojects merge / separate
+{
+  const projects = [{ id: "pa", name: "Admin" }, { id: "pb", name: "Performance", parentId: "pa" }, { id: "pc", name: "Perf child", parentId: "pb" }, { id: "pd", name: "Other" }];
+  const snap2 = { tasks: [T("a", { projectId: "pc" }), T("b", { projectId: "pb" }), T("c", { projectId: "pd" })], projects, sections: [] };
+  const merge = E.buildTaskRecords({ snapshot: snap2, now: NOW, taskUrl, subprojects: "merge" });
+  const byId = Object.fromEntries(merge.records.map((r) => [r.id, r]));
+  assert.strictEqual(byId.a.projectId, "pa");
+  assert.strictEqual(byId.a.projectName, "Admin");
+  assert.strictEqual(byId.a.projectPath, "Admin › Performance › Perf child");
+  assert.strictEqual(byId.b.projectPath, "Admin › Performance");
+  assert.strictEqual(byId.c.projectName, "Other");
+  const g = E.groupByProject(merge.records);
+  const admin = g.find((x) => x.projectId === "pa");
+  assert.deepStrictEqual(admin.records.map((r) => r.id), ["a", "b"]);
+  assert.ok(E.taskEvidenceText(byId.a).includes("Admin › Performance › Perf child"));
+  const separate = E.buildTaskRecords({ snapshot: snap2, now: NOW, taskUrl, subprojects: "separate" });
+  const sepG = E.groupByProject(separate.records);
+  assert.ok(sepG.some((x) => x.projectId === "pb" && x.projectName === "Performance"));
+  assert.ok(!separate.records.some((r) => r.projectPath !== undefined));
+  // parent_id fallback
+  const pidSnap = { tasks: [T("a", { projectId: "pb" })], projects: [{ id: "pa", name: "Admin" }, { id: "pb", name: "Performance", parent_id: "pa" }], sections: [] };
+  const pid = E.buildTaskRecords({ snapshot: pidSnap, now: NOW, taskUrl });
+  assert.strictEqual(pid.records[0].projectName, "Admin");
+  console.log("PASS subprojects merge and separate");
+}
+{
+  const projects = [{ id: "pa", name: "Admin" }, { id: "pb", name: "Performance", parent_id: "pa" }, { id: "pc", name: "Perf child", parentId: "pb" }, { id: "pz", name: "Other" }];
+  const snap3 = { tasks: [T("a", { projectId: "pc" }), T("b", { projectId: "pz" })], projects, sections: [] };
+  // parent name under merge includes descendants
+  const merged = E.buildTaskRecords({ snapshot: snap3, now: NOW, taskUrl, projects: ["Admin"], subprojects: "merge" });
+  assert.deepStrictEqual(merged.records.map((r) => r.id), ["a"]);
+  assert.deepStrictEqual(merged.unknownProjects, []);
+  // parent name under separate -> descendant sections present
+  const sep = E.buildTaskRecords({ snapshot: snap3, now: NOW, taskUrl, projects: ["Admin"], subprojects: "separate" });
+  assert.deepStrictEqual(sep.records.map((r) => r.id), ["a"]);
+  assert.deepStrictEqual(sep.unknownProjects, []);
+  const sepG = E.groupByProject(sep.records);
+  assert.ok(sepG.some((x) => x.projectId === "pc" && x.projectName === "Perf child"), JSON.stringify(sepG));
+  // sub-project name under merge -> tasks present under parent section, not unknown
+  const subMerge = E.buildTaskRecords({ snapshot: snap3, now: NOW, taskUrl, projects: ["Performance"], subprojects: "merge" });
+  assert.deepStrictEqual(subMerge.records.map((r) => r.id), ["a"]);
+  assert.deepStrictEqual(subMerge.unknownProjects, []);
+  const subMergeG = E.groupByProject(subMerge.records);
+  assert.ok(subMergeG.some((x) => x.projectId === "pa" && x.projectName === "Admin"), JSON.stringify(subMergeG));
+  // sub-project name under separate -> its own section
+  const subSep = E.buildTaskRecords({ snapshot: snap3, now: NOW, taskUrl, projects: ["Performance"], subprojects: "separate" });
+  assert.deepStrictEqual(subSep.records.map((r) => r.id), ["a"]);
+  assert.deepStrictEqual(subSep.unknownProjects, []);
+  const subSepG = E.groupByProject(subSep.records);
+  assert.ok(subSepG.some((x) => x.projectId === "pc" && x.projectName === "Perf child"), JSON.stringify(subSepG));
+  // unknown name still reported unknown
+  const unk = E.buildTaskRecords({ snapshot: snap3, now: NOW, taskUrl, projects: ["Nope"], subprojects: "merge" });
+  assert.deepStrictEqual(unk.records, []);
+  assert.deepStrictEqual(unk.unknownProjects, ["Nope"]);
+  // cycle guard
+  const cyc = E.buildTaskRecords({ snapshot: { tasks: [T("a", { projectId: "px" })], projects: [{ id: "px", name: "Loop", parentId: "px" }], sections: [] }, now: NOW, taskUrl });
+  assert.strictEqual(cyc.records[0].projectName, "Loop");
+  console.log("PASS projects filter includes descendants (merge and separate)");
+}
+
+// orphan follow-up renders as normal top-level task line (no broken indent)
+{
+  const C = rec("C", { status: "done", completedAt: "2026-10-20T10:00:00" });
+  const F = rec("F", { parentId: "C", labels: ["FollowUp"], status: "open" });
+  const FU = E.followUpMap([C, F]);
+  const out = E.renderTaskList([F], FU);
+  const lines = out.split("\n");
+  assert.strictEqual(lines.length, 1, out);
+  assert.ok(lines[0].startsWith("- "), lines[0]);
+  assert.ok(!lines[0].startsWith("  "), lines[0]);
+  console.log("PASS orphan follow-up renders top-level");
+}

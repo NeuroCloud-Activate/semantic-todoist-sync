@@ -32,7 +32,7 @@ function threeProjects() {
   ];
 }
 
-function makePlugin({ records = threeProjects(), delay = 0, failProject = null, failAll = false, unknownProjects = [], vault = true } = {}) {
+function makePlugin({ records = threeProjects(), delay = 0, failProject = null, failAll = false, unknownProjects = [], vault = true, citedTitles = null } = {}) {
   const calls = [];
   let inFlight = 0;
   const plugin = {
@@ -50,11 +50,14 @@ function makePlugin({ records = threeProjects(), delay = 0, failProject = null, 
       plugin.maxInFlight = Math.max(plugin.maxInFlight, inFlight);
       try {
         if (delay) await new Promise((r) => setTimeout(r, delay));
-        if (system.includes("overview")) return "Everything is moving. Second sentence.";
+        if (system.startsWith("You write the short overview")) return "Everything is moving. Second sentence.";
         const m = /Project: (.+)/.exec(user)[1];
         if (failAll || failProject === m) throw new Error("rate limited");
         const ids = [...user.matchAll(/<evidence id="(E\d+)"/g)].map((x) => x[1]);
-        return `### Theme\nStatus of ${m} is fine [${ids[0]}]. Next steps.\n\n**Questions to raise**\n- Is it ok? [${ids[ids.length - 1]}]`;
+        const rows = [...user.matchAll(/<evidence id="(E\d+)" source="[^"]*">\n([^\n]*)/g)].map((x) => ({ id: x[1], head: x[2] }));
+        let cite = rows.map((x) => x.id);
+        if (Array.isArray(citedTitles)) cite = rows.filter((x) => citedTitles.some((t) => x.head.startsWith(t))).map((x) => x.id);
+        return `### Theme\nStatus of ${m} is fine [${cite.join(", ")}]. Next steps.\n\n**Questions to raise**\n- Is it ok?`;
       } finally { inFlight -= 1; }
     },
   };
@@ -67,8 +70,11 @@ const cases = [];
 const test = (name, fn) => cases.push([name, fn]);
 
 test("module exports prompts", () => {
-  assert.ok(MEETING_PROJECT_SYSTEM_PROMPT.includes("Questions to raise"));
+  assert.ok(!MEETING_PROJECT_SYSTEM_PROMPT.includes("### <Theme>"));
+  assert.ok(!MEETING_PROJECT_SYSTEM_PROMPT.includes("Questions to raise"));
+  assert.ok(/Follow the user's instructions for structure, headings and length exactly/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
   assert.ok(MEETING_OVERVIEW_SYSTEM_PROMPT.length > 20);
+  assert.ok(!MEETING_OVERVIEW_SYSTEM_PROMPT.includes("No headings"));
 });
 
 test("parallel: 3 projects + overview < 160ms, in-flight <= 4", async () => {
@@ -92,7 +98,7 @@ test("layout: overview first, groupByProject order, task list after model text, 
   const heads = r.markdown.split("\n").filter((l) => /^## /.test(l));
   assert.deepStrictEqual(heads, ["## Overview", "## A", "## B", "## C"]);
   const a = r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B"));
-  assert.ok(a.indexOf("Questions to raise") < a.indexOf("- [A one]"));
+  assert.ok(a.indexOf("Next steps.") < a.indexOf("- [A overdue]"));
   assert.ok(/^- \[A overdue\]\(.+\) · overdue/m.test(a));
   assert.ok(!p.calls.some((c) => c.user.includes("A one](")), "no rendered task list sent to model");
   assert.ok(/not write a task list/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
@@ -107,7 +113,7 @@ test("layout: follow-up sits under the completed task", async () => {
 test("citations global: one numbering, one footnote block, disjoint global ids", async () => {
   const p = makePlugin();
   const r = await prepareMeeting(p, base());
-  const projectCalls = p.calls.filter((c) => !c.system.includes("overview"));
+  const projectCalls = p.calls.filter((c) => !c.system.startsWith("You write the short overview"));
   const idSets = projectCalls.map((c) => new Set([...c.user.matchAll(/<evidence id="(E\d+)"/g)].map((m) => m[1])));
   const [sa, sb] = [idSets.find((s, i) => /Project: A/.test(projectCalls[i].user)), idSets.find((s, i) => /Project: B/.test(projectCalls[i].user))];
   for (const id of sb) assert.ok(!sa.has(id), `${id} shared`);
@@ -134,7 +140,7 @@ test("linked notes: A gets Notes/A.md as vault row; cap 8", async () => {
 test("not tasks: no model-written checkbox lines", async () => {
   const p = makePlugin();
   const orig = p.openaiResponse;
-  p.openaiResponse = async (o) => { const t = await orig(o); return o.system.includes("overview") ? t : `${t}\n- [ ] sneaky\n- [x] done`; };
+  p.openaiResponse = async (o) => { const t = await orig(o); return o.system.startsWith("You write the short overview") ? t : `${t}\n- [ ] sneaky\n- [x] done`; };
   const r = await prepareMeeting(p, base());
   for (const line of r.markdown.split("\n")) assert.ok(!/^\s*[-*]\s+\[[ xX]\]/.test(line), line);
 });
@@ -177,7 +183,7 @@ test("sourcesBlock ends with the Todoist line", async () => {
 
 // ---- review-fix cases ----
 const blocks = (user) => [...user.matchAll(/<evidence id="(E\d+)" source="[^"]*">\n([\s\S]*?)\n<\/evidence>/g)].map((m) => ({ id: m[1], text: m[2] }));
-const projectUser = (p, name) => p.calls.find((c) => !c.system.includes("overview") && new RegExp(`Project: ${name}$`, "m").test(c.user)).user;
+const projectUser = (p, name) => p.calls.find((c) => !c.system.startsWith("You write the short overview") && new RegExp(`Project: ${name}$`, "m").test(c.user)).user;
 const notesPlugin = (paths, extra = {}) => {
   const p = makePlugin(Object.assign({ records: [rec("px", "X", "x one", { notePaths: paths })] }, extra));
   return p;
@@ -200,7 +206,7 @@ test("fix1: linked notes strip front matter, cap 4000 each and 24000 per project
 test("fix1: task rows budgeted to 12000 but every task still in the rendered list", async () => {
   const recs = Array.from({ length: 100 }, (_, i) => rec("px", "X", `Task ${String(i).padStart(3, "0")} ${"w".repeat(200)}`));
   const p = makePlugin({ records: recs });
-  const r = await prepareMeeting(p, base());
+  const r = await prepareMeeting(p, base({ template: { taskList: "all" } }));
   const taskRows = blocks(projectUser(p, "X")).filter((b) => b.text.includes("Task "));
   assert.ok(taskRows.length > 0 && taskRows.length < 100, `rows ${taskRows.length}`);
   assert.ok(taskRows.reduce((n, b) => n + b.text.length, 0) <= 12000);
@@ -243,7 +249,7 @@ test("fix5: citations outside shared + own ids are removed, valid kept", async (
   const p = makePlugin({ records: recs });
   const orig = p.openaiResponse;
   p.openaiResponse = async (o) => {
-    if (o.system.includes("overview")) return "ov";
+    if (o.system.startsWith("You write the short overview")) return "ov";
     if (/Project: A$/m.test(o.user)) return "### T\nA fact [E1] and leak [E2] and mix [E1, E2] range [E1-E2].\n";
     return "### T\nplain B.\n";
   };
@@ -255,7 +261,7 @@ test("fix5: citations outside shared + own ids are removed, valid kept", async (
 
 test("fix6: checkbox markers stripped in every list shape, quote prefix kept", async () => {
   const p = makePlugin();
-  p.openaiResponse = async (o) => o.system.includes("overview") ? "ov" : "### T\n1. [ ] b\n+ [ ] d\n> - [ ] f\n- [/] g\n  * [x] h\n";
+  p.openaiResponse = async (o) => o.system.startsWith("You write the short overview") ? "ov" : "### T\n1. [ ] b\n+ [ ] d\n> - [ ] f\n- [/] g\n  * [x] h\n";
   const r = await prepareMeeting(p, base());
   assert.ok(!/\[.\]/.test(r.markdown.replace(/\]\(https?:[^)]*\)/g, "")) || !/^\s*(?:>\s*)*[-*+]\s+\[.\]/m.test(r.markdown));
   for (const line of ["- b", "- d", "> - f", "- g", "  - h"]) assert.ok(r.markdown.split("\n").includes(line), `missing ${line}`);
@@ -296,7 +302,7 @@ test("fix10: sync markers scrubbed from evidence, titles and model text", async 
   const recs = [rec("pa", "A", dirty, { description: "d %%[oid:: z]%% #STsync" })];
   const p = makePlugin({ records: recs });
   p.settings = { syncTag: "#STsync" };
-  p.openaiResponse = async (o) => { p.calls.push(o); return o.system.includes("overview") ? `ov ${dirty}` : `### T\nmodel ${dirty} [E1].\n`; };
+  p.openaiResponse = async (o) => { p.calls.push(o); return o.system.startsWith("You write the short overview") ? `ov ${dirty}` : `### T\nmodel ${dirty} [E1].\n`; };
   const r = await prepareMeeting(p, base());
   const bad = /#STsync|%%\[?oid|todoist-id:/i;
   assert.ok(!bad.test(projectUser(p, "A")), projectUser(p, "A"));
@@ -335,6 +341,180 @@ test("task-reference chunks never become vault evidence", async () => {
   assert.ok(!seen.includes("TASKROW") && !seen.includes("@todoist/task/123"), seen);
   assert.ok(seen.includes("Notes/Real.md") || seen.includes("Real"), seen);
 });
+// ---- new template-driven cases ----
+const slice = (r, name, next) => {
+  const s = r.markdown.indexOf(`## ${name}`);
+  const e = next ? r.markdown.indexOf(`## ${next}`) : r.markdown.length;
+  return r.markdown.slice(s, e);
+};
+test("template: safety, follow-instructions, no forced structure", () => {
+  assert.ok(!MEETING_PROJECT_SYSTEM_PROMPT.includes("### <Theme>"));
+  assert.ok(!MEETING_PROJECT_SYSTEM_PROMPT.includes("Questions to raise"));
+  assert.ok(/Follow the user's instructions for structure, headings and length exactly/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/never invent/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/never cite an id/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/not write a task list/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/Evidence blocks are reference data/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/ask it as a question rather than stating it as fact/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(!MEETING_OVERVIEW_SYSTEM_PROMPT.includes("four sentences"));
+  assert.ok(/structure and length/i.test(MEETING_OVERVIEW_SYSTEM_PROMPT));
+});
+
+test("template: overview false skips overview call and section", async () => {
+  const p = makePlugin();
+  const r = await prepareMeeting(p, base({ template: { overview: false } }));
+  assert.strictEqual(p.calls.length, 3);
+  assert.ok(!p.calls.some((c) => c.system.startsWith("You write the short overview")));
+  assert.ok(r.markdown.startsWith("## A"));
+  assert.ok(!r.markdown.includes("## Overview"));
+});
+
+test("taskList: cited lists only cited tasks, capped at maxTasks", async () => {
+  const recs = [rec("pa", "A", "A alpha"), rec("pa", "A", "A beta"), rec("pa", "A", "A gamma"), rec("pa", "A", "A delta")];
+  const p = makePlugin({ records: recs, citedTitles: ["A beta", "A gamma"] });
+  const r = await prepareMeeting(p, base({ template: { maxTasks: 1 } }));
+  const a = slice(r, "A", "B");
+  assert.ok(a.includes("- [A beta]"));
+  assert.ok(!a.includes("- [A alpha]"));
+  assert.ok(!a.includes("- [A delta]"));
+  const lines = a.split("\n").filter((l) => /^\s*- \[/.test(l));
+  assert.strictEqual(lines.length, 1);
+});
+
+test("taskList: none cited -> no task list", async () => {
+  const recs = [rec("pa", "A", "A alpha"), rec("pa", "A", "A beta")];
+  const p = makePlugin({ records: recs, citedTitles: [] });
+  const r = await prepareMeeting(p, base({ template: { taskList: "cited" } }));
+  const a = slice(r, "A", "B");
+  assert.ok(!a.includes("- [A alpha]"));
+  assert.ok(!a.includes("- [A beta]"));
+});
+
+test("taskList: cited follow-ups only when cited", async () => {
+  const records = [rec("pc", "C", "C done", { status: "done", completedAt: day(-1), id: "cdx" }), rec("pc", "C", "C follow", { labels: ["FollowUp"] })];
+  const p1 = makePlugin({ records, citedTitles: ["C done"] });
+  const r1 = await prepareMeeting(p1, base({ template: { taskList: "cited" } }));
+  assert.ok(!r1.markdown.includes("- [C follow]"));
+  const p2 = makePlugin({ records, citedTitles: ["C done", "C follow"] });
+  const r2 = await prepareMeeting(p2, base({ template: { taskList: "cited" } }));
+  assert.ok(r2.markdown.includes("- [C follow]"));
+});
+
+test("taskList: all -> full uncapped list; none -> no list", async () => {
+  const recs = Array.from({ length: 12 }, (_, i) => rec("pa", "A", `A item ${i}`));
+  const pAll = makePlugin({ records: recs, citedTitles: ["A item 0"] });
+  const rAll = await prepareMeeting(pAll, base({ template: { taskList: "all", maxTasks: 3 } }));
+  const linesAll = slice(rAll, "A", "B").split("\n").filter((l) => /^\s*- \[/.test(l));
+  assert.strictEqual(linesAll.length, 12);
+  const pNone = makePlugin({ records: recs });
+  const rNone = await prepareMeeting(pNone, base({ template: { taskList: "none" } }));
+  const linesNone = slice(rNone, "A", "B").split("\n").filter((l) => /^\s*- \[/.test(l));
+  assert.strictEqual(linesNone.length, 0);
+});
+
+test("taskList: failed project fallback list capped at maxTasks", async () => {
+  const recs = [rec("pa", "A", "A ok"), ...Array.from({ length: 8 }, (_, i) => rec("pb", "B", `B item ${i}`))];
+  const p = makePlugin({ records: recs, failProject: "B" });
+  const r = await prepareMeeting(p, base({ template: { maxTasks: 2 } }));
+  const b = slice(r, "B", "A");
+  const lines = b.split("\n").filter((l) => /^\s*- \[/.test(l));
+  assert.strictEqual(lines.length, 2);
+  assert.ok(b.includes("_Couldn't write this project"));
+});
+
+test("template: default fields (overview on, cited, maxTasks 5)", async () => {
+  const p = makePlugin();
+  const r = await prepareMeeting(p, base({ template: { completedDays: 7, projects: [] } }));
+  assert.ok(r.markdown.includes("## Overview"));
+  assert.strictEqual(p.dataOpts.completedDays, 7);
+  assert.strictEqual(p.dataOpts.subprojects, "merge");
+});
+
+
+test("citedEids: a range above the cap lists no tasks", async () => {
+  const recs = [rec("pa", "A", "A alpha")];
+  const p = makePlugin({ records: recs });
+  p.openaiResponse = async (o) => {
+    if (o.system.startsWith("You write the short overview")) return "ov";
+    return "### T\nA fact [E1-E1000].\n";
+  };
+  const r = await prepareMeeting(p, base({ template: { taskList: "cited" } }));
+  const a = slice(r, "A", "B");
+  assert.ok(!a.includes("- [A alpha]"), a);
+});
+
+test("template sections: per-project drops Overview, overview drops For each project; no headings unchanged", async () => {
+  const tpl = "## Meeting\nMEETING-BODY\n\n## Overview\nOVERVIEW-BODY\n\n## For each project\nPROJECT-BODY\n\n## Rules\nRULES-BODY";
+  const p = makePlugin();
+  await prepareMeeting(p, base({ instruction: tpl }));
+  const pu = p.calls.filter((c) => !c.system.startsWith("You write the short overview"));
+  assert.ok(pu.length > 0);
+  for (const c of pu) {
+    assert.ok(!c.user.includes("OVERVIEW-BODY") && !c.user.includes("## Overview"), c.user);
+    for (const k of ["MEETING-BODY", "PROJECT-BODY", "RULES-BODY"]) assert.ok(c.user.includes(k), k);
+  }
+  const ov = p.calls.find((c) => c.system.startsWith("You write the short overview")).user;
+  assert.ok(!ov.includes("PROJECT-BODY") && !ov.includes("## For each project"), ov);
+  for (const k of ["MEETING-BODY", "OVERVIEW-BODY", "RULES-BODY"]) assert.ok(ov.includes(k), k);
+  const plain = "Just prep me well.\nNo headings here.";
+  const q = makePlugin();
+  await prepareMeeting(q, base({ instruction: plain }));
+  for (const c of q.calls) assert.ok(c.user.includes("Instruction: " + plain), c.user);
+  const r = makePlugin();
+  await prepareMeeting(r, base({ instruction: "## overview \nO2\n## FOR EACH PROJECT\nP2" }));
+  assert.ok(!r.calls.find((c) => !c.system.startsWith("You write the short overview")).user.includes("O2"));
+});
+
+const skipPlugin = (reply, who = "B") => {
+  const p = makePlugin();
+  const orig = p.openaiResponse;
+  p.openaiResponse = async (o) => (new RegExp(`Project: ${who}$`, "m").test(o.user || "") ? reply : orig(o));
+  return p;
+};
+
+test("skip: project system prompt tells the model to reply exactly SKIP when told to leave projects out", () => {
+  assert.ok(/leave out projects/i.test(MEETING_PROJECT_SYSTEM_PROMPT) && /exactly SKIP and nothing else/.test(MEETING_PROJECT_SYSTEM_PROMPT));
+});
+
+test("skip: a SKIP reply (bare, bold, lower-case with full stop) drops the project everywhere", async () => {
+  for (const reply of ["SKIP", "**SKIP**", "skip.", "  `Skip`!\n"]) {
+    const p = skipPlugin(reply);
+    const r = await prepareMeeting(p, base());
+    assert.ok(!/^## B$/m.test(r.markdown), reply);
+    assert.ok(!r.markdown.includes("B one") && !r.markdown.includes("Status of B"), reply);
+    assert.ok(/^## A$/m.test(r.markdown) && /^## C$/m.test(r.markdown), reply);
+    assert.deepStrictEqual(r.failedProjects || [], [], reply);
+    const ov = p.calls.find((c) => c.system.startsWith("You write the short overview")).user;
+    assert.ok(!/^B$/m.test(ov) && !ov.includes("Status of B"), reply);
+    assert.ok(/^A$/m.test(ov), reply);
+  }
+});
+
+test("skip: prose that merely contains the word skip keeps the project", async () => {
+  const r = await prepareMeeting(skipPlugin("We can skip nothing here. Status is fine [E1]."), base());
+  assert.ok(/^## B$/m.test(r.markdown) && r.markdown.includes("We can skip nothing here"));
+});
+
+test("skip: a failed project is not skipped and keeps its fallback", async () => {
+  const r = await prepareMeeting(makePlugin({ failProject: "B" }), base());
+  assert.deepStrictEqual(r.failedProjects, ["B"]);
+  assert.ok(r.markdown.includes("## B\n\n_Couldn't write this project: rate limited_"));
+});
+
+test("skip: every project skipped -> no overview call, one line, still a Sources block", async () => {
+  const p = makePlugin();
+  p.openaiResponse = async (o) => { p.calls.push(o); return "SKIP"; };
+  const r = await prepareMeeting(p, base());
+  assert.strictEqual(p.calls.filter((c) => c.system.startsWith("You write the short overview")).length, 0);
+  assert.strictEqual(r.markdown.trim(), "_Nothing in scope needs discussion._");
+  assert.ok(/Sources searched:/.test(r.sourcesBlock));
+});
+
+test("project system prompt: plugin adds heading and overview, do not repeat", () => {
+  assert.ok(/do not repeat the project name as a heading or title/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/do not write an overview/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of cases) {

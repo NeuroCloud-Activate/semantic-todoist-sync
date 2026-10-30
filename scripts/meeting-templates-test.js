@@ -6,6 +6,7 @@ const path = require('path');
 
 class SharedTFile {} // same class for the plugin's instanceof checks and the fake vault
 const calls = [];
+const notices = [];
 let responder = null;
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
@@ -13,7 +14,7 @@ Module._load = function (request, parent, isMain) {
   class Empty {}
   return {
     ItemView: Empty, MarkdownRenderer: {}, MarkdownView: Empty, Modal: Empty,
-    Notice: Empty, Plugin: Empty, PluginSettingTab: Empty, Setting: Empty,
+    Notice: class { constructor(m) { notices.push(m); } }, Plugin: Empty, PluginSettingTab: Empty, Setting: Empty,
     TFile: SharedTFile, Menu: Empty, setIcon() {},
     requestUrl: async (options) => {
       calls.push(options.url);
@@ -35,6 +36,7 @@ function makePlugin(settings = {}) {
   const plugin = Object.create(Plugin.prototype);
   plugin.settings = Object.assign({}, Plugin.DEFAULT_SETTINGS, { todoistToken: 'FICTIONAL_TOKEN' }, settings);
   plugin.logLocal = () => {};
+  plugin.saveCount = 0; plugin.saveSettings = async () => { plugin.saveCount++; };
   return plugin;
 }
 const file = { basename: 'Meet', path: 'P/Meet.md' };
@@ -190,6 +192,7 @@ const SUB = 'Collaborate';
 const FOLDER = 'Semantic Todoist Sync/Prompts';
 const OLD_PATH = `${FOLDER}/Prepare for meeting \u2013 Supervisor.md`;
 const NEW_PATH = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor.md`;
+const BACKUP = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor (before 0.9.40).md`;
 const norm = (s) => String(s).replace(/\r\n/g, '\n').trim();
 const oldFileText = () => `---
 action: meeting-prep
@@ -314,14 +317,16 @@ async function folderTests() {
     let p = appPlugin({ [OLD_PATH]: oldFileText().replace(/\n/g, '\r\n') });
     await p.ensurePromptTemplateFolder(false);
     assert(!p.app.files.has(OLD_PATH)); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
-    // edited -> moved unchanged
+    // edited 0.9.37 top-level -> moved, replaced by NEW text, edit kept in backup
     p = appPlugin({ [OLD_PATH]: oldFileText() + '\nMy edit' });
     await p.ensurePromptTemplateFolder(false);
-    assert(!p.app.files.has(OLD_PATH)); assert.strictEqual(p.app.files.get(NEW_PATH), oldFileText() + '\nMy edit');
-    // both locations -> untouched
+    assert(!p.app.files.has(OLD_PATH)); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    assert.strictEqual(p.app.files.get(BACKUP), oldFileText() + '\nMy edit');
+    // both locations -> top-level untouched; edited Collaborate copy replaced and backed up
     p = appPlugin({ [OLD_PATH]: 'OLD', [NEW_PATH]: 'NEW' });
     await p.ensurePromptTemplateFolder(false);
-    assert.strictEqual(p.app.files.get(OLD_PATH), 'OLD'); assert.strictEqual(p.app.files.get(NEW_PATH), 'NEW');
+    assert.strictEqual(p.app.files.get(OLD_PATH), 'OLD'); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    assert.strictEqual(p.app.files.get(BACKUP), 'NEW');
     // neither -> new default created
     p = appPlugin({});
     await p.ensurePromptTemplateFolder(false);
@@ -333,18 +338,18 @@ async function folderTests() {
     assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
     p = appPlugin({ [NEW_PATH]: old09038 + '\nMy edit' });
     await p.ensurePromptTemplateFolder(false);
-    assert.strictEqual(p.app.files.get(NEW_PATH), old09038 + '\nMy edit');
-// one changed word in a real old file (0.9.38 in Collaborate, 0.9.37 top-level) is never touched/overwritten
+    assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.strictEqual(p.app.files.get(BACKUP), old09038 + '\nMy edit');
+// one changed word in a real old file counts as edited: replaced, old bytes backed up
 const oneWord = old09038.replace('Rules', 'Rule');
 assert.notStrictEqual(oneWord, old09038);
 p = appPlugin({ [NEW_PATH]: oneWord });
 await p.ensurePromptTemplateFolder(false);
-assert.strictEqual(p.app.files.get(NEW_PATH), oneWord);
+assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.strictEqual(p.app.files.get(BACKUP), oneWord);
 const oneWord37 = oldFileText().replace('supervisor', 'boss');
 assert.notStrictEqual(oneWord37, oldFileText());
 p = appPlugin({ [OLD_PATH]: oneWord37 });
 await p.ensurePromptTemplateFolder(false);
-assert.strictEqual(p.app.files.get(NEW_PATH), oneWord37, 'edited 0.9.37 moved, content kept');
+assert.strictEqual(p.app.files.get(BACKUP), oneWord37, 'edited 0.9.37 content kept in backup'); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
 // new built-in text is not re-migrated (idempotent)
 p = appPlugin({ [NEW_PATH]: old09038 });
 await p.ensurePromptTemplateFolder(false);
@@ -356,6 +361,59 @@ await p.ensurePromptTemplateFolder(false);
 assert.strictEqual(modifies, 0, 'second run does not rewrite');
 assert.strictEqual(p.app.files.get(NEW_PATH), once);
     console.log('PASS migration (unedited, edited, both, neither)');
+  }
+  // 0.9.40 one-time Supervisor upgrade: marker, backup of edited copies, never overwrite
+  {
+    const V = '0.9.40';
+    const newText = promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep'));
+    const old09038 = oldSupervisor09038Text();
+    assert.strictEqual(Plugin.DEFAULT_SETTINGS.supervisorTemplateVersion, '');
+    assert.strictEqual(Plugin.SUPERVISOR_TEMPLATE_VERSION, V);
+    // missing -> created, marker set + saved
+    let p = appPlugin({});
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.saveCount, 1);
+    // marker already current: no reads, no writes, even for an edited file
+    p = appPlugin({ [NEW_PATH]: 'MY EDIT' }, { supervisorTemplateVersion: V });
+    let reads = 0; const rd = p.app.vault.read; p.app.vault.read = async (f) => { reads++; return rd(f); };
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(reads, 0, 'no reads once marker is current'); assert.strictEqual(p.app.files.get(NEW_PATH), 'MY EDIT');
+    assert.strictEqual(p.saveCount, 0);
+    // current built-in (CRLF) -> marker only
+    p = appPlugin({ [NEW_PATH]: newText.replace(/\n/g, '\r\n') });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.app.files.size, DEFAULT_PROMPT_TEMPLATE_FILES.length);
+    assert.strictEqual(p.app.files.get(NEW_PATH), newText.replace(/\n/g, '\r\n'), 'current text left as is');
+    // released unedited 0.9.38 -> replaced, no backup
+    p = appPlugin({ [NEW_PATH]: old09038 });
+    await p.ensurePromptTemplateFolder(false);
+    assert(!p.app.files.has(BACKUP)); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+    // edited -> backup exact bytes, replaced, one Notice, marker
+    notices.length = 0;
+    p = appPlugin({ [NEW_PATH]: 'MY\r\nEDIT ' });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    assert.deepStrictEqual(notices, ['Updated Supervisor meeting template. Previous version saved \u201cPrepare for meeting \u2013 Supervisor (before 0.9.40)\u201d.']);
+    assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.saveCount, 1);
+    // second run is a no-op
+    await p.ensurePromptTemplateFolder(false); assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(p.saveCount, 1);
+    // existing backups never overwritten
+    p = appPlugin({ [NEW_PATH]: 'EDIT3', [BACKUP]: 'B1', [BACKUP.replace('.md', ' 2.md')]: 'B2' });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), 'B1'); assert.strictEqual(p.app.files.get(BACKUP.replace('.md', ' 2.md')), 'B2');
+    assert.strictEqual(p.app.files.get(BACKUP.replace('.md', ' 3.md')), 'EDIT3'); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
+    // backup fails -> original untouched, marker unset, retried next load
+    p = appPlugin({ [NEW_PATH]: 'EDIT4' });
+    const cr = p.app.vault.create; p.app.vault.create = async (pth, t) => { if (pth.includes('(before')) throw new Error('boom'); return cr(pth, t); };
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(NEW_PATH), 'EDIT4'); assert.strictEqual(p.settings.supervisorTemplateVersion, ''); assert.strictEqual(p.saveCount, 0);
+    p.app.vault.create = cr;
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), 'EDIT4'); assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+    // backups are ordinary meeting templates with distinct identities
+    const names = (await p.getPromptTemplates()).filter(isMeetingPrepTemplate).map((t) => t.source);
+    assert(names.includes(BACKUP) && names.includes(NEW_PATH) && new Set(names).size === names.length);
+    console.log('PASS 0.9.40 supervisor one-time upgrade');
   }
   // concurrent ensure calls (sidebar, meeting presets, startup, folder events all load together) must not duplicate or clobber
   {
@@ -379,8 +437,9 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     }
     let p = slow(appPlugin({ [OLD_PATH]: oldFileText() + '\nMy edit' }));
     await Promise.all([p.ensurePromptTemplateFolder(false), p.ensurePromptTemplateFolder(false)]);
-    assert.deepStrictEqual([...p.app.files.keys()].filter((k) => k.includes('Supervisor')), [NEW_PATH]);
-    assert.strictEqual(p.app.files.get(NEW_PATH), oldFileText() + '\nMy edit', 'edited file moved unchanged');
+    assert.strictEqual(p.app.files.get(BACKUP), oldFileText() + '\nMy edit', 'edited file backed up once');
+    assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText), 'edited file replaced by NEW text');
+    assert.deepStrictEqual([...p.app.files.keys()].filter((k) => k.includes('Supervisor')).sort(), [BACKUP, NEW_PATH].sort());
     p = slow(appPlugin({ [OLD_PATH]: 'MY OLD' }));
     p.app.fileManager.renameFile = async () => { throw new Error('rename boom'); };
     await Promise.all([p.ensurePromptTemplateFolder(false), p.ensurePromptTemplateFolder(false)]);

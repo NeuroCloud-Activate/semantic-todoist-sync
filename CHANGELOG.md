@@ -1,3 +1,9 @@
+## 0.9.40 - 2026-10-30
+### Fixed
+- **An edited "Prepare for meeting – Supervisor" template now gets the new shorter layout too.** 0.9.39 only upgraded unedited copies, so an edited one kept the old long layout. On first load, an edited copy is saved exactly as it was as "Prepare for meeting – Supervisor (before 0.9.40)" in the Collaborate folder (numbered " 2", " 3" if that name exists), then replaced with the new template, and a notice names the backup. The backup stays in the meeting preset list, so the old version can still be run. If the backup can't be saved, the template is left untouched and the upgrade is tried again on the next load. This happens once; later edits are never changed.
+- Live check (Oct 30, 2026, test vault): an already-current template was left alone; an edited copy was backed up byte-for-byte and replaced with one notice, and further reloads changed nothing; a second upgrade with an existing backup saved " 2". Notes, Todoist and settings were otherwise unchanged.
+- Tests: `npm test` passes 85/85.
+
 ## 0.9.39 - 2026-10-30
 ### Changed
 - **Meeting prep documents are much shorter, and the template note decides the layout.** The plugin no longer forces a heading and paragraph per theme or a questions list for every project, so the wording in your Collaborate template (paragraph length, number of questions, overview length) now takes effect. The plugin keeps only its safety rules: use only the evidence and cite it, never invent anything, and never write checkboxes.

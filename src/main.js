@@ -3561,6 +3561,7 @@ const DEFAULT_SETTINGS = {
   excludeSyncTagsFromLabels: true,
   legacyTodoistIdMode: "preserve",
   notesAutoSync: false,
+  supervisorTemplateVersion: "",
   syncIntervalSeconds: 60,
   syncWorkerCount: 2,
   lastNoteAutoSyncAt: "",
@@ -20789,27 +20790,38 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return file;
   }
 
-  // 0.9.37 kept the Supervisor template at the top of the folder; move it into the subfolder without losing edits.
+  // One-time upgrade (SUPERVISOR_TEMPLATE_VERSION): 0.9.37 kept the Supervisor at the folder top; move it into the subfolder, then swap any older default for the current text. An edited copy is saved byte-for-byte as a "(before x)" note first and never overwritten.
   async migrateSupervisorTemplate(folder) {
+    if (this.settings.supervisorTemplateVersion === SUPERVISOR_TEMPLATE_VERSION) return;
     const oldPath = `${folder}/Prepare for meeting \u2013 Supervisor.md`;
     const entry = DEFAULT_PROMPT_TEMPLATE_FILES.find((template) => template.action === "meeting-prep");
     const newPath = `${folder}/${entry.filename}`;
     const newText = promptTemplateFileText(entry);
     const normalize = (text) => String(text).replace(/\r\n/g, "\n").trim();
-    // An unedited 0.9.38 Collaborate Supervisor file (or a fresh default carrying the old four-section body) is upgraded to the template-driven text; edited files are never touched.
-    const newFile = this.app.vault.getAbstractFileByPath(newPath);
-    if (newFile instanceof TFile) {
-      if (normalize(await this.app.vault.read(newFile)) === normalize(MEETING_PREP_0_9_38_FILE_TEXT)) {
-        await this.app.vault.modify(newFile, newText);
+    let file = this.app.vault.getAbstractFileByPath(newPath);
+    if (!(file instanceof TFile)) {
+      const oldFile = this.app.vault.getAbstractFileByPath(oldPath);
+      if (oldFile instanceof TFile) {
+        await ensureVaultFolder(this.app, `${folder}/${COLLABORATE_SUBFOLDER}`);
+        await this.app.fileManager.renameFile(oldFile, newPath);
+        file = oldFile;
       }
-      return;
     }
-    const oldFile = this.app.vault.getAbstractFileByPath(oldPath);
-    if (!(oldFile instanceof TFile)) return;
-    const unedited = normalize(await this.app.vault.read(oldFile)) === normalize(OLD_SUPERVISOR_FILE_TEXT);
-    await ensureVaultFolder(this.app, `${folder}/${COLLABORATE_SUBFOLDER}`);
-    await this.app.fileManager.renameFile(oldFile, newPath);
-    if (unedited) await this.app.vault.modify(oldFile, newText);
+    if (file instanceof TFile) {
+      const current = await this.app.vault.read(file);
+      const seen = normalize(current);
+      if (seen !== normalize(newText)) {
+        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT].some((text) => seen === normalize(text))) {
+          let backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}).md`);
+          for (let n = 2; this.app.vault.getAbstractFileByPath(backupPath); n += 1) backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}) ${n}.md`);
+          await this.app.vault.create(backupPath, current);
+          new Notice(`Updated Supervisor meeting template. Previous version saved \u201c${backupPath.split("/").pop().replace(/\.md$/, "")}\u201d.`);
+        }
+        await this.app.vault.modify(file, newText);
+      }
+    }
+    this.settings.supervisorTemplateVersion = SUPERVISOR_TEMPLATE_VERSION;
+    await this.saveSettings();
   }
 
   // Concurrent callers (sidebar, presets, startup, folder events) share one run: interleaved migrate/create steps duplicated or clobbered the Supervisor file.
@@ -29582,6 +29594,7 @@ function promptTemplateFileText(template) {
 const oldMeetingFileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${prompt}`;
 const OLD_SUPERVISOR_FILE_TEXT = oldMeetingFileText(OLD_SUPERVISOR_PROMPT);
 const MEETING_PREP_0_9_38_FILE_TEXT = oldMeetingFileText(SUPERVISOR_PROMPT_0_9_38);
+const SUPERVISOR_TEMPLATE_VERSION = "0.9.40";
 
 function yesNo(value) {
   return value ? "Yes" : "No";
@@ -59673,6 +59686,7 @@ if (typeof module !== "undefined" && module.exports) {
     parsePromptTemplateFile,
     promptTemplateFileText,
     DEFAULT_PROMPT_TEMPLATE_FILES,
+  SUPERVISOR_TEMPLATE_VERSION,
   meetingPrepTemplateSkeleton,
     isTaskGenerationTemplate,
     isScheduleTodayTemplate,

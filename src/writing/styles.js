@@ -97,7 +97,8 @@ function formatReference(style, source) {
   const year = meta.year !== undefined && meta.year !== null && String(meta.year) !== "" ? String(meta.year) : null;
   const title = typeof meta.title === "string" ? meta.title : "";
   const path = source && typeof source.path === "string" && source.path ? stripMdExtension(source.path) : "";
-  const isWeb = source && (source.kind === "web" || source.kind === "todoist");
+  if (source && source.kind === "todoist") return ""; // tasks are cited by inline link, never listed as references
+  const isWeb = source && source.kind === "web";
 
   if (style === "apa") {
     const yr = year || "n.d.";
@@ -155,8 +156,11 @@ function formatReference(style, source) {
   return out;
 }
 
+// Todoist tasks are cited by an inline link, never by an in-text marker or a reference entry.
+const isTodoist = (source) => !!source && source.kind === "todoist";
+
 function formatInText(style, items) {
-  const list = Array.isArray(items) ? items : [];
+  const list = (Array.isArray(items) ? items : []).filter((it) => !isTodoist(it && it.source));
   if (style === "apa") {
     // writing-mode: task 4 fix — several sources share ONE bracket: (A, 2020; B, n.d.)
     const parts = list.map((it) => {
@@ -176,12 +180,12 @@ function formatInText(style, items) {
   }
   // writing-mode: task 4 fix — Nature numbers read ascending and are de-duplicated: [1,3]
   const numbers = Array.from(new Set(list.map((it) => (it && it.number) || 0))).sort((a, b) => a - b);
-  return "[" + numbers.join(",") + "]";
+  return numbers.length ? "[" + numbers.join(",") + "]" : "";
 }
 
 function planReferences(noteText, style, sources) {
   const text = typeof noteText === "string" ? noteText : "";
-  const srcs = Array.isArray(sources) ? sources : [];
+  const srcs = (Array.isArray(sources) ? sources : []).filter((s) => !isTodoist(s));
   const isNature = style === "nature";
   const numbers = {};
   const added = [];

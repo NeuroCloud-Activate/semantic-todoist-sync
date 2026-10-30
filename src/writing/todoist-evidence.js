@@ -55,9 +55,9 @@ function stripSources(text) {
   return (i < 0 ? s : s.slice(0, i)).trim();
 }
 
-function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projects = [], now = new Date(), taskUrl, subprojects = "merge" }) {
+function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projects = [], now = new Date(), taskUrl, subprojects = "merge", ignoreLabels = [], ignoreProjects = [] }) {
   completedDays = Number.isFinite(Number(completedDays)) ? Math.min(90, Math.max(1, Number(completedDays))) : 14;
-  const snap = snapshot || {};
+  let snap = snapshot || {};
   const projectNames = new Map((snap.projects || []).map((p) => [String(p.id), p.name]));
   const projectParent = new Map((snap.projects || []).map((p) => [String(p.id), String(p.parentId ?? p.parent_id ?? "")]));
   const sectionNames = new Map((snap.sections || []).map((s) => [String(s.id), s.name]));
@@ -71,7 +71,25 @@ function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projec
     while (cur && projectNames.has(cur) && !seen.has(cur)) { seen.add(cur); parts.push(projectNames.get(cur)); cur = projectParent.get(cur) || ""; }
     return parts.reverse().join(" › ");
   };
-  const all = [...(snap.tasks || []), ...completed];
+  // Ignored tasks are dropped first, so they never group, link as follow-ups or name a parent.
+  const unknownIgnored = [];
+  const ignoreLabelSet = new Set((ignoreLabels || []).map(cleanLabel).filter(Boolean));
+  const ignoreWanted = (ignoreProjects || []).map((p) => singleLine(p)).filter(Boolean);
+  const ignoreNames = ignoreWanted.map((n) => n.toLowerCase());
+  const knownNames = new Set([...projectNames.values()].map((n) => String(n).toLowerCase()));
+  for (const n of ignoreWanted) if (!knownNames.has(n.toLowerCase())) unknownIgnored.push(n);
+  const ignoredProject = (id) => {
+    let cur = String(id || ""); const seen = new Set();
+    while (cur && projectNames.has(cur) && !seen.has(cur)) {
+      if (ignoreNames.includes(String(projectNames.get(cur)).toLowerCase())) return true;
+      seen.add(cur); cur = projectParent.get(cur) || "";
+    }
+    return false;
+  };
+  const keep = (t) => !(t.labels || []).some((l) => ignoreLabelSet.has(cleanLabel(l))) && !ignoredProject(t.projectId);
+  snap = { ...snap, tasks: (snap.tasks || []).filter(keep) };
+  completed = completed.filter(keep);
+  const all = [...snap.tasks, ...completed];
   const titles = new Map(all.map((t) => [String(t.id), singleLine(t.content)]));
   const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - completedDays);
   const seen = new Set();
@@ -120,7 +138,7 @@ function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projec
       if (top !== r.projectId) { r.projectId = top; r.projectName = projectNames.get(top) || r.projectName; }
     }
   }
-  const unknownProjects = [];
+  const unknownProjects = [...unknownIgnored];
   const wanted = (projects || []).map((p) => singleLine(p)).filter(Boolean);
   if (wanted.length) {
     // Every project name at any depth is known (0.9.38 accepted any project name).

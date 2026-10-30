@@ -241,3 +241,39 @@ console.log("PASS status");
   assert.ok(!lines[0].startsWith("  "), lines[0]);
   console.log("PASS orphan follow-up renders top-level");
 }
+// ignoreLabels / ignoreProjects
+{
+  const ids = (r) => r.records.map((x) => x.id);
+  const tasks = [T("a", { labels: ["Notes"] }), T("b", { labels: ["notebook"] }), T("c", { labels: ["FollowUp"] }), T("d", { content: "talk #Notes" }), T("e")];
+  assert.deepStrictEqual(ids(build(tasks, [], { ignoreLabels: ["notes"] })), ["b", "c", "d", "e"], "case-insensitive label");
+  assert.deepStrictEqual(ids(build(tasks, [], { ignoreLabels: ["#NOTES"] })), ["b", "c", "d", "e"], "leading # on ignore side");
+  assert.deepStrictEqual(ids(build([T("a", { labels: ["@Notes"] }), T("b", { labels: ["#notes"] })], [], { ignoreLabels: ["@notes"] })), [], "leading @/# on task side");
+  assert.deepStrictEqual(ids(build(tasks, [], { ignoreLabels: ["Notes", "followup"] })), ["b", "d", "e"], "several labels");
+  assert.deepStrictEqual(ids(build(tasks, [], { ignoreLabels: ["note"] })), ["a", "b", "c", "d", "e"], "no partial-word match");
+  assert.deepStrictEqual(ids(build(tasks, [], { ignoreLabels: [" ", ""] })), ["a", "b", "c", "d", "e"], "blank entries ignored");
+  assert.deepStrictEqual(ids(build(tasks)), ids(build(tasks, [], { ignoreLabels: [], ignoreProjects: [] })), "empty lists = current behaviour");
+  const done = { ...T("x", { labels: ["Notes"] }), completedAt: "2026-10-20T10:00:00" };
+  assert.deepStrictEqual(ids(build([], [done], { ignoreLabels: ["Notes"] })), [], "completed tasks too");
+
+  const projects = [{ id: "pa", name: "Admin" }, { id: "pb", name: "Performance", parentId: "pa" }, { id: "pc", name: "Perf child", parentId: "pb" }, { id: "pd", name: "Other" }];
+  const mk = (ts) => ({ tasks: ts, projects, sections: [] });
+  const pt = [T("a", { projectId: "pa" }), T("b", { projectId: "pb" }), T("c", { projectId: "pc" }), T("d", { projectId: "pd" })];
+  for (const subprojects of ["merge", "separate"]) {
+    const o = E.buildTaskRecords({ snapshot: mk(pt), now: NOW, taskUrl, subprojects, ignoreProjects: ["admin"] });
+    assert.deepStrictEqual(ids(o), ["d"], `ignoreProjects drops parent + descendants (${subprojects})`);
+    assert.deepStrictEqual(o.unknownProjects, []);
+    const sub = E.buildTaskRecords({ snapshot: mk(pt), now: NOW, taskUrl, subprojects, ignoreProjects: ["Performance"] });
+    assert.deepStrictEqual(ids(sub), ["a", "d"], `ignoring a sub-project keeps the parent (${subprojects})`);
+  }
+  const typo = E.buildTaskRecords({ snapshot: mk(pt), now: NOW, taskUrl, ignoreProjects: ["Nope"] });
+  assert.deepStrictEqual(ids(typo), ["a", "b", "c", "d"]);
+  assert.deepStrictEqual(typo.unknownProjects, ["Nope"], "unknown ignore project reported");
+  const both = E.buildTaskRecords({ snapshot: mk(pt), now: NOW, taskUrl, projects: ["Admin"], ignoreProjects: ["Other", "Nope"] });
+  assert.deepStrictEqual(both.unknownProjects, ["Nope"], "no duplicates, only the ignore typo");
+
+  // ignored tasks vanish before follow-up linking and the projects filter
+  const fu = E.buildTaskRecords({ snapshot: mk([T("o", { parentId: "c", labels: ["Notes"] })]), completed: [{ ...T("c", { projectId: "pd" }), completedAt: "2026-10-20T10:00:00" }], now: NOW, taskUrl, ignoreLabels: ["Notes"] });
+  assert.deepStrictEqual(E.followUpMap(fu.records).size, 0, "ignored task is not a follow-up");
+  assert.ok(!E.renderTaskList(fu.records, E.followUpMap(fu.records)).includes("/o)"));
+  console.log("PASS ignoreLabels and ignoreProjects");
+}

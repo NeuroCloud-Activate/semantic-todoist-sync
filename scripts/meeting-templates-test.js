@@ -73,6 +73,18 @@ async function main() {
   assert.strictEqual(tpl('maxTasks: 0').maxTasks, 1);
   assert.strictEqual(tpl('maxTasks: 500').maxTasks, 50);
   assert.strictEqual(tpl('maxTasks: 4.7').maxTasks, 4);
+  // ignoreLabels / ignoreProjects: Todoist tags and projects to leave out
+  assert.deepStrictEqual({ l: d.ignoreLabels, p: d.ignoreProjects }, { l: [], p: [] }, 'ignore lists default to empty');
+  assert.deepStrictEqual(tpl('ignoreLabels:\nignoreProjects:').ignoreLabels, [], 'blank ignoreLabels');
+  assert.deepStrictEqual(tpl('ignoreLabels:\nignoreProjects:').ignoreProjects, [], 'blank ignoreProjects');
+  assert.deepStrictEqual(tpl('ignoreLabels: Notes, Someday').ignoreLabels, ['Notes', 'Someday']);
+  assert.deepStrictEqual(tpl('ignoreProjects: Inbox ,  Personal ,, ').ignoreProjects, ['Inbox', 'Personal'], 'trimmed, blanks dropped');
+  assert.deepStrictEqual(tpl('ignoreLabels: [Notes, Someday]').ignoreLabels, ['Notes', 'Someday'], 'bracket list');
+  assert.deepStrictEqual(tpl('ignoreProjects: [Inbox, Personal]').ignoreProjects, ['Inbox', 'Personal'], 'bracket list');
+  assert.deepStrictEqual(tpl('ignoreLabels: #Notes, @Someday, Plain').ignoreLabels, ['Notes', 'Someday', 'Plain'], 'leading # or @ stripped from labels');
+  assert.deepStrictEqual(tpl('ignoreLabels: ##Notes, @#Odd').ignoreLabels, ['#Notes', '#Odd'], 'only one leading marker stripped per label');
+  assert.deepStrictEqual(tpl('ignoreLabels: #, @').ignoreLabels, [], 'marker-only items are blank');
+  assert.deepStrictEqual(tpl('ignoreProjects: #Hash').ignoreProjects, ['#Hash'], 'project names are not marker-stripped');
   console.log('PASS parse');
 
   // built-in
@@ -192,7 +204,7 @@ const SUB = 'Collaborate';
 const FOLDER = 'Semantic Todoist Sync/Prompts';
 const OLD_PATH = `${FOLDER}/Prepare for meeting \u2013 Supervisor.md`;
 const NEW_PATH = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor.md`;
-const BACKUP = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor (before 0.9.40).md`;
+const BACKUP = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor (before 0.9.41).md`;
 const norm = (s) => String(s).replace(/\r\n/g, '\n').trim();
 const oldFileText = () => `---
 action: meeting-prep
@@ -234,6 +246,41 @@ Below the paragraphs for each project, list only the tasks worth discussing.
 ## Rules
 
 Use only facts from the evidence and cite them. If something is unclear or missing, put it under "Questions to raise" rather than guessing. Keep it easy to follow in a meeting.`;
+
+// Released 0.9.40 (== 0.9.39) built-in Supervisor, byte-exact (1525 bytes, sha256 BFEA741A3702...) from the test-vault copy.
+const V0940 = [
+  "---",
+  "action: meeting-prep",
+  "completedDays: 14",
+  "projects: ",
+  "subprojects: merge",
+  "taskList: cited",
+  "maxTasks: 5",
+  "overview: yes",
+  "createTasks: false",
+  "insertResponse: true",
+  "syncTasks: false",
+  "---",
+  "",
+  "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%",
+  "",
+  "## Meeting",
+  "",
+  "Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
+  "",
+  "## Overview",
+  "",
+  "Start with an overview of at most 3 sentences on the most time-sensitive items across projects.",
+  "",
+  "## For each project",
+  "",
+  "Write one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.",
+  "",
+  "## Rules",
+  "",
+  "Use only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project."
+].join("\n");
+const oldSupervisor09040Text = () => V0940;
 
 function fakeApp(initial = {}) {
   const files = new Map(Object.entries(initial));
@@ -298,9 +345,19 @@ async function folderTests() {
     assert.deepStrictEqual(secs, paras);
     assert(!e.prompt.includes('%%'), 'no instruction comments in Supervisor');
     const fm = (s) => s.split('\n---')[0].split('\n').map((l) => l.split(':')[0].trim()).filter((k) => k && k !== '---');
-    const expectedKeys = ['action', 'completedDays', 'projects', 'subprojects', 'taskList', 'maxTasks', 'overview', 'createTasks', 'insertResponse', 'syncTasks'];
+    const expectedKeys = ['action', 'completedDays', 'projects', 'ignoreProjects', 'ignoreLabels', 'subprojects', 'taskList', 'maxTasks', 'overview', 'createTasks', 'insertResponse', 'syncTasks'];
     assert.deepStrictEqual(fm(promptTemplateFileText(e)), expectedKeys);
     assert.deepStrictEqual(fm(skeleton), expectedKeys);
+    // blank values, and the settings comment explains both new keys
+    for (const text of [promptTemplateFileText(e), skeleton]) {
+      assert(/\nignoreProjects:[ \t]*\nignoreLabels:[ \t]*\n/.test(text), 'ignore keys written blank');
+      assert(text.includes('ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes'), 'comment explains ignore keys');
+    }
+    // lists written out and read back
+    const withIgnore = promptTemplateFileText(Object.assign({}, e, { ignoreProjects: ['A', 'B'], ignoreLabels: ['Notes'] }));
+    assert(withIgnore.includes('\nignoreProjects: A, B\nignoreLabels: Notes\n'));
+    const back = parsePromptTemplateFile(file, withIgnore, true);
+    assert.deepStrictEqual([back.ignoreProjects, back.ignoreLabels], [['A', 'B'], ['Notes']]);
     const sk = parsePromptTemplateFile(file, skeleton, true);
     assert.strictEqual(sk.action, 'meeting-prep'); assert.strictEqual(sk.completedDays, 14);
     assert.deepStrictEqual(sk.projects, []); assert.strictEqual(sk.createTasks, false);
@@ -362,9 +419,9 @@ assert.strictEqual(modifies, 0, 'second run does not rewrite');
 assert.strictEqual(p.app.files.get(NEW_PATH), once);
     console.log('PASS migration (unedited, edited, both, neither)');
   }
-  // 0.9.40 one-time Supervisor upgrade: marker, backup of edited copies, never overwrite
+  // 0.9.41 one-time Supervisor upgrade: marker, backup of edited copies, never overwrite
   {
-    const V = '0.9.40';
+    const V = '0.9.41';
     const newText = promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep'));
     const old09038 = oldSupervisor09038Text();
     assert.strictEqual(Plugin.DEFAULT_SETTINGS.supervisorTemplateVersion, '');
@@ -384,6 +441,26 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.app.files.size, DEFAULT_PROMPT_TEMPLATE_FILES.length);
     assert.strictEqual(p.app.files.get(NEW_PATH), newText.replace(/\n/g, '\r\n'), 'current text left as is');
+    // released unedited 0.9.40 (real 1525-byte file) -> replaced, no backup, marker 0.9.41, even with the 0.9.40 marker set
+    const old09040 = oldSupervisor09040Text();
+    assert.strictEqual(Buffer.byteLength(old09040, 'utf8'), 1525, 'real 0.9.40 file size');
+    assert.strictEqual(require('crypto').createHash('sha256').update(old09040).digest('hex').slice(0, 12).toUpperCase(), 'BFEA741A3702', 'real 0.9.40 file hash');
+    for (const marker of ['', '0.9.40']) {
+      for (const eol of ['\n', '\r\n']) {
+        notices.length = 0;
+        p = appPlugin({ [NEW_PATH]: old09040.replace(/\n/g, eol) }, { supervisorTemplateVersion: marker });
+        await p.ensurePromptTemplateFolder(false);
+        assert(!p.app.files.has(BACKUP), 'unedited 0.9.40 is not backed up');
+        assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.notStrictEqual(norm(p.app.files.get(NEW_PATH)), norm(old09040));
+        assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+        assert.deepStrictEqual(notices, [], 'no backup notice for unedited default');
+      }
+    }
+    // edited 0.9.40 with the old marker -> backup '(before 0.9.41)' then replace
+    p = appPlugin({ [NEW_PATH]: old09040 + '\nMy edit' }, { supervisorTemplateVersion: '0.9.40' });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), old09040 + '\nMy edit'); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+    assert(BACKUP.endsWith('(before 0.9.41).md'));
     // released unedited 0.9.38 -> replaced, no backup
     p = appPlugin({ [NEW_PATH]: old09038 });
     await p.ensurePromptTemplateFolder(false);
@@ -393,7 +470,7 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     p = appPlugin({ [NEW_PATH]: 'MY\r\nEDIT ' });
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
-    assert.deepStrictEqual(notices, ['Updated Supervisor meeting template. Previous version saved \u201cPrepare for meeting \u2013 Supervisor (before 0.9.40)\u201d.']);
+    assert.deepStrictEqual(notices, ['Updated Supervisor meeting template. Previous version saved \u201cPrepare for meeting \u2013 Supervisor (before 0.9.41)\u201d.']);
     assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.saveCount, 1);
     // second run is a no-op
     await p.ensurePromptTemplateFolder(false); assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(p.saveCount, 1);
@@ -413,7 +490,24 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     // backups are ordinary meeting templates with distinct identities
     const names = (await p.getPromptTemplates()).filter(isMeetingPrepTemplate).map((t) => t.source);
     assert(names.includes(BACKUP) && names.includes(NEW_PATH) && new Set(names).size === names.length);
-    console.log('PASS 0.9.40 supervisor one-time upgrade');
+    console.log('PASS 0.9.41 supervisor one-time upgrade');
+  }
+  // getMeetingTodoistData forwards ignoreLabels / ignoreProjects to buildTaskRecords
+  {
+    const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+    const at = src.indexOf('async getMeetingTodoistData(');
+    const body = src.slice(at, src.indexOf('async prepareMeeting(', at));
+    assert(/async getMeetingTodoistData\(\{[^}]*ignoreLabels[^}]*ignoreProjects[^}]*\}/.test(body), 'signature takes both');
+    assert(/buildTaskRecords\(\{[^}]*ignoreLabels[^}]*\}\)/.test(body) && /buildTaskRecords\(\{[^}]*ignoreProjects[^}]*\}\)/.test(body), 'both passed to buildTaskRecords');
+    // end to end through the real task builder: a task labelled Notes and a task in an ignored project drop out
+    const mkTask = (id, extra) => Object.assign({ id, content: 'Task ' + id, projectId: 'p1', labels: [], priority: 1, description: '', dueDate: '' }, extra);
+    const plugin = makePlugin();
+    plugin.getMeetingTodoistRaw = async () => ({ snapshot: { projects: [{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }], sections: [], tasks: [mkTask('a'), mkTask('b', { labels: ['Notes'] }), mkTask('c', { projectId: 'p2' })] }, completed: [] });
+    const ids = async (extra) => (await plugin.getMeetingTodoistData(Object.assign({ completedDays: 14 }, extra))).records.map((r) => r.id).sort();
+    assert.deepStrictEqual(await ids({}), ['a', 'b', 'c']);
+    assert.deepStrictEqual(await ids({ ignoreLabels: ['Notes'] }), ['a', 'c'], 'ignoreLabels drops tagged task');
+    assert.deepStrictEqual(await ids({ ignoreProjects: ['Beta'] }), ['a', 'b'], 'ignoreProjects drops project task');
+    console.log('PASS getMeetingTodoistData ignore forwarding');
   }
   // concurrent ensure calls (sidebar, meeting presets, startup, folder events all load together) must not duplicate or clobber
   {

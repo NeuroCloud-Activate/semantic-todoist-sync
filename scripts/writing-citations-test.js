@@ -2,7 +2,7 @@
 
 const assert = require("assert");
 
-const { rewriteCitations } = require("../src/writing/citations");
+const { rewriteCitations, normalizeBareCitations } = require("../src/writing/citations");
 const { planInsertion, insertDraft, composeDraft } = require("../src/writing/insert");
 
 function makeEditor(text, cursor) {
@@ -329,12 +329,100 @@ function ev(eid, source) {
   console.log("PASS evidence id ranges");
 }
 
+// 16: bare evidence ids in prose become citations (the model sometimes drops the brackets)
 {
-  const src = { kind: "todoist", title: "Draft [ethics] amendment", project: "Thesis", url: "https://todoist.com/app/task/1", state: "due Nov 2", meta: { title: "x", site: "Todoist", url: "https://todoist.com/app/task/1", year: 2026 } };
-  const r = rewriteCitations("a [E1] b", [{ eid: "E1", source: src }], "");
-  assert.ok(r.footnotes.includes("[^1]: [Draft \\[ethics\\] amendment](https://todoist.com/app/task/1), Todoist task, Thesis, due Nov 2"), "todoist label: " + r.footnotes);
-  const bad = rewriteCitations("a [E1] b", [{ eid: "E1", source: { kind: "todoist", title: "T", project: "P", url: "javascript:x", state: "open" } }], "");
-  assert.ok(bad.footnotes.includes("[^1]: T, Todoist task, P, open"), "non-http url is plain: " + bad.footnotes);
-  console.log("PASS todoist label");
+  const note = (n) => ev("E" + n, { kind: "vault", path: "N" + n + ".md" });
+  const evs = [229, 230, 232, 16, 17, 18, 19].map(note);
+  const one = rewriteCitations("E232 shows the guidelines.", evs, "");
+  assert.strictEqual(one.markdown, "[^1] shows the guidelines.", "bare id at the start: " + one.markdown);
+  assert.deepStrictEqual(one.used, ["E232"], "bare id counted as used");
+  const two = rewriteCitations("but E229 and E230 still list it.", evs, "");
+  assert.strictEqual(two.markdown, "but [^1][^2] still list it.", "bare list: " + two.markdown);
+  assert.deepStrictEqual(two.used, ["E229", "E230"], "both ids of a bare list cited");
+  const comma = rewriteCitations("see E229, E230.", evs, "");
+  assert.deepStrictEqual(comma.used, ["E229", "E230"], "comma list cited");
+  for (const input of ["E16–E19", "E16-E19"]) {
+    const r = rewriteCitations("x " + input + " y", evs, "");
+    assert.deepStrictEqual(r.used, ["E16", "E17", "E18", "E19"], "bare range: " + input);
+    assert.ok(!/E\d/.test(r.markdown), "no raw id left: " + r.markdown);
+  }
+  const mixedUnknown = rewriteCitations("E10 and E232 agree.", evs, "");
+  assert.strictEqual(mixedUnknown.markdown, "E10 and [^1] agree.", "unknown id in a bare list stays, known one cited: " + mixedUnknown.markdown);
+  console.log("PASS bare evidence ids become citations");
 }
-process.stdout.write(JSON.stringify({ passed: 20, failed: 0 }, null, 2) + "\n");
+
+// 17: normalizeBareCitations tidy-up and protected text
+{
+  const sets = (allowed, known) => ({ allowed: new Set(allowed), known: new Set(known) });
+  assert.strictEqual(typeof normalizeBareCitations, "function", "normalizeBareCitations exported");
+  const n = (text, a, k) => normalizeBareCitations(text, sets(a, k || a));
+  assert.strictEqual(n("The E5 note says X.", ["E1"], ["E1", "E5"]), "The note says X.", "known-not-allowed id removed, one space left");
+  assert.strictEqual(n("See E5.", ["E1"], ["E1", "E5"]), "See.", "no space before punctuation");
+  assert.strictEqual(n("Two (E5) here.", ["E1"], ["E1", "E5"]), "Two here.", "empty parentheses removed");
+  assert.strictEqual(n("but E5 and E6 still list", ["E1"], ["E1", "E5", "E6"]), "but still list", "removed list leaves one space");
+  assert.strictEqual(n("E5 first", ["E1"], ["E1", "E5"]), "first", "removed at line start");
+  assert.strictEqual(n("A form named E10 and E2E tests.", ["E1"], ["E1"]), "A form named E10 and E2E tests.", "unknown id and E2E untouched");
+  assert.strictEqual(n("Model E1.5 is v2.", ["E1"], ["E1"]), "Model E1.5 is v2.", "E1.5 is not an id");
+  assert.strictEqual(n("x E1 y", ["E1"]), "x [E1] y", "allowed bare id becomes a marker");
+  const protectedText = "[E1] [E1](https://x.test/E1) `E1` [[Note E1]] https://x.test/E1 ```\nE1\n```";
+  assert.strictEqual(n(protectedText, ["E1"]), protectedText, "markers, link text and urls, code and wikilinks untouched");
+  assert.strictEqual(n("a [E1](https://x.test/E1) b E1", ["E1"]), "a [E1](https://x.test/E1) b [E1]", "text after a link is still converted");
+  console.log("PASS normalizeBareCitations");
+}
+
+// 17b: removal never leaves broken punctuation or an empty bullet
+{
+  const s = { allowed: new Set(["E1"]), known: new Set(["E1", "E4"]) };
+  const n = (t) => normalizeBareCitations(t, s);
+  assert.strictEqual(n("(see E4)."), "(see).", "no space before closing bracket: " + n("(see E4)."));
+  assert.strictEqual(n("(E4)."), ".", "empty parens with trailing dot");
+  assert.strictEqual(n("a, E4, b"), "a, b", "no doubled comma: " + n("a, E4, b"));
+  assert.strictEqual(n("- E4\n- keep"), "- keep", "empty bullet dropped: " + JSON.stringify(n("- E4\n- keep")));
+  assert.strictEqual(n("1. E4\ntext"), "text", "empty numbered item dropped");
+  assert.strictEqual(n("x (a, E4) y"), "x (a) y", "no comma before closing bracket: " + n("x (a, E4) y"));
+  assert.strictEqual(n("x ( E4 ) y"), "x y", "empty parens removed");
+  assert.strictEqual(n("- E1 ok"), "- [E1] ok", "allowed ids still converted");
+  console.log("PASS bare removal tidy");
+}
+
+// 18: todoist citations are inline links, never footnotes or reference entries
+{
+  const task = (n, extra) => ({ kind: "todoist", title: "Task " + n, project: "Thesis", url: "https://app.todoist.com/app/task/" + n, state: "open", meta: { title: "Task " + n, site: "Todoist", url: "https://app.todoist.com/app/task/" + n, year: 2026 }, ...extra });
+  const evs = [ev("E1", { kind: "vault", path: "A.md" }), ev("E2", task(2)), ev("E3", task(3)), ev("E4", { kind: "vault", path: "B.md" })];
+  const link = (n) => "[↗](<https://app.todoist.com/app/task/" + n + ">)";
+
+  const only = rewriteCitations("a [E2] b", evs, "");
+  assert.strictEqual(only.markdown, "a " + link(2) + " b", "todoist marker becomes an inline link: " + only.markdown);
+  assert.strictEqual(only.footnotes, "", "todoist adds no footnote: " + only.footnotes);
+  assert.deepStrictEqual(only.used, ["E2"], "todoist id still reported as used");
+  assert.strictEqual(only.cited.length, 1, "todoist source still reported as cited");
+
+  const first = rewriteCitations("x [E2] y [E1] z [E4]", evs, "");
+  assert.strictEqual(first.markdown, "x " + link(2) + " y [^1] z [^2]", "todoist consumes no footnote number: " + first.markdown);
+  assert.deepStrictEqual(first.footnotes.split("\n"), ["[^1]: [[A]]", "[^2]: [[B]]"], "footnotes numbered from 1: " + first.footnotes);
+  assert.deepStrictEqual(first.used, ["E2", "E1", "E4"], "used keeps first-seen order");
+
+  const continued = rewriteCitations("x [E2] y [E1]", evs, "[^3] old");
+  assert.strictEqual(continued.markdown, "x " + link(2) + " y [^4]", "numbering still continues the note: " + continued.markdown);
+
+  const mixed = rewriteCitations("a [E2, E1] b", evs, "");
+  assert.strictEqual(mixed.markdown, "a [^1] " + link(2) + " b", "mixed group: footnote then inline link: " + mixed.markdown);
+  assert.strictEqual(mixed.footnotes, "[^1]: [[A]]", "mixed group footnotes only the note");
+
+  const many = rewriteCitations("a [E2, E3] b", evs, "");
+  assert.strictEqual(many.markdown, "a " + link(2) + " " + link(3) + " b", "several tasks: space-separated links: " + many.markdown);
+
+  const bare = rewriteCitations("E2 and E3 agree.", evs, "");
+  assert.strictEqual(bare.markdown, link(2) + " " + link(3) + " agree.", "bare task ids become links too: " + bare.markdown);
+
+  for (const url of ["", "javascript:x", "not a url", "https://x.test/a b"]) {
+    const bad = rewriteCitations("a [E2] b", [ev("E2", task(2, { url }))], "");
+    assert.strictEqual(bad.markdown, "a b", "invalid url '" + url + "' renders nothing: " + bad.markdown);
+    assert.strictEqual(bad.footnotes, "", "invalid url adds no footnote");
+  }
+  const todoistScheme = rewriteCitations("a [E2] b", [ev("E2", task(2, { url: "todoist://task?id=6gjvC96xxWrjG2PH" }))], "");
+  assert.strictEqual(todoistScheme.markdown, "a [↗](<todoist://task?id=6gjvC96xxWrjG2PH>) b", "todoist:// urls are links: " + todoistScheme.markdown);
+  console.log("PASS todoist inline links");
+}
+process.stdout.write(JSON.stringify({ passed: 22, failed: 0 }, null, 2) + "\n");
+

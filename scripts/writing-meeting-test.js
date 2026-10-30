@@ -118,9 +118,10 @@ test("citations global: one numbering, one footnote block, disjoint global ids",
   const [sa, sb] = [idSets.find((s, i) => /Project: A/.test(projectCalls[i].user)), idSets.find((s, i) => /Project: B/.test(projectCalls[i].user))];
   for (const id of sb) assert.ok(!sa.has(id), `${id} shared`);
   assert.strictEqual((r.footnotes.match(/^\[\^1\]:/gm) || []).length, 1);
-  assert.ok(/\[\^1\]/.test(r.markdown) && /\[\^2\]/.test(r.markdown));
+  assert.ok(/\[\^1\]/.test(r.markdown) && !/\[\^2\]/.test(r.markdown));
   assert.ok(!/\[E\d+\]/.test(r.markdown));
-  assert.ok(r.footnotes.includes("Todoist task"));
+  assert.ok(/\[↗\]\(<https:\/\/todoist\.com\/app\/task\/t\d+>\)/.test(r.markdown), "task citations are links");
+  assert.ok(!r.footnotes.includes("Todoist task"), "tasks stay out of the reference list");
 });
 
 test("linked notes: A gets Notes/A.md as vault row; cap 8", async () => {
@@ -148,7 +149,7 @@ test("not tasks: no model-written checkbox lines", async () => {
 test("partial failure: failed project line + task list; all fail rejects", async () => {
   const r = await prepareMeeting(makePlugin({ failProject: "B" }), base());
   assert.deepStrictEqual(r.failedProjects, ["B"]);
-  assert.ok(r.markdown.includes("## B\n\n_Couldn't write this project: rate limited_\n\n- [B one]"));
+  assert.ok(r.markdown.includes("## B\n\n_Couldn't write this project: rate limited_\n\n**Tasks**\n\n- [B one]"));
   await assert.rejects(prepareMeeting(makePlugin({ failAll: true }), base()), (e) => e && e.message.includes("rate limited") && Array.isArray(e.failedProjects));
 });
 
@@ -254,8 +255,8 @@ test("fix5: citations outside shared + own ids are removed, valid kept", async (
     return "### T\nplain B.\n";
   };
   const r = await prepareMeeting(p, base());
-  assert.ok(!r.footnotes.includes("B only"), r.footnotes);
-  assert.ok(r.footnotes.includes("A only"));
+  assert.ok(r.markdown.includes(`[↗](<${recs[0].url}>)`), r.markdown);
+  assert.ok(!r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B")).includes(`[↗](<${recs[1].url}>)`), "B's task never cited in A");
   void orig;
 });
 
@@ -513,6 +514,81 @@ test("skip: every project skipped -> no overview call, one line, still a Sources
 test("project system prompt: plugin adds heading and overview, do not repeat", () => {
   assert.ok(/do not repeat the project name as a heading or title/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
   assert.ok(/do not write an overview/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+});
+
+// ---- 0.9.41: plain-words prose, most-recent-wins, note dates, Tasks label, ignore settings ----
+test("prompts: plain words with marker after, most recent evidence wins, no id in sentence", () => {
+  assert.ok(/plain words/i.test(MEETING_PROJECT_SYSTEM_PROMPT) && /never make an evidence id part of the sentence/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/most recent one by its date/i.test(MEETING_PROJECT_SYSTEM_PROMPT) && /only raise a question when the evidence cannot settle it/i.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/exactly SKIP and nothing else/.test(MEETING_PROJECT_SYSTEM_PROMPT));
+  assert.ok(/never make an evidence id part of the sentence/i.test(MEETING_OVERVIEW_SYSTEM_PROMPT));
+});
+
+const recs = [rec("pa", "A", "A one"), rec("pa", "A", "A two"), rec("pa", "A", "A three"), rec("pb", "B", "B only")];
+const proseRun = async (reply) => {
+  const p = makePlugin({ records: recs });
+  p.openaiResponse = async (o) => o.system.startsWith("You write the short overview") ? "ov" : (/Project: A$/m.test(o.user) ? reply : "### T\nplain B.\n");
+  return prepareMeeting(p, base());
+};
+
+test("bare ids: own-project ids in prose become citations, other project's id removed, [74] removed", async () => {
+  const r = await proseRun("### T\nE1 shows X, but E2 and E3 say Y. B says E4 too. Odd [74] and [12, 13] marks.\n");
+  assert.ok(!/\bE\d+\b/.test(r.markdown), r.markdown);
+  assert.ok(!/\[\d+(?:, ?\d+)*\](?!\()/.test(r.markdown.replace(/\[\^\d+\]/g, "")), r.markdown);
+  assert.ok(!r.markdown.includes("[74]") && !r.markdown.includes("[12, 13]"), r.markdown);
+  const a = r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B"));
+  for (const t of recs.slice(0, 3)) assert.ok(a.includes(`[↗](<${t.url}>)`), `${t.title} cited: ${a}`);
+  assert.ok(!r.markdown.includes(`[↗](<${recs[3].url}>)`), "other project's id removed, not cited");
+});
+
+test("note dates: vault evidence starts with Note modified (local date); missing stat is silent", async () => {
+  const p = notesPlugin(["Notes/A.md"]);
+  p.app = { vault: { getAbstractFileByPath: (path) => path === "Notes/A.md" ? { stat: { mtime: new Date(2026, 9, 29, 12).getTime() } } : null } };
+  await prepareMeeting(p, base());
+  const b = blocks(projectUser(p, "X")).find((x) => x.text.includes("Linked note A body."));
+  assert.ok(b && b.text.startsWith("Note modified: 2026-10-29\n"), JSON.stringify(b));
+  const q = notesPlugin(["Notes/A.md"]);
+  q.app = { vault: { getAbstractFileByPath: () => ({}) } };
+  await prepareMeeting(q, base());
+  const c = blocks(projectUser(q, "X")).find((x) => x.text.includes("Linked note A body."));
+  assert.ok(c && !c.text.includes("Note modified"), JSON.stringify(c));
+});
+
+test("task list: **Tasks** label above list (cited, all, failed fallback); none and nothing cited have no label", async () => {
+  const rc = await prepareMeeting(makePlugin(), base());
+  assert.ok(/Next steps\.[\s\S]*\n\n\*\*Tasks\*\*\n\n- \[A one\]/.test(slice(rc, "A", "B")), rc.markdown);
+  const ra = await prepareMeeting(makePlugin(), base({ template: { taskList: "all" } }));
+  assert.ok(slice(ra, "B", "C").includes("**Tasks**\n\n- [B one]"), ra.markdown);
+  const rf = await prepareMeeting(makePlugin({ failProject: "B" }), base());
+  assert.ok(slice(rf, "B", "C").includes("**Tasks**\n\n- [B one]"), rf.markdown);
+  const rn = await prepareMeeting(makePlugin(), base({ template: { taskList: "none" } }));
+  assert.ok(!rn.markdown.includes("**Tasks**"), rn.markdown);
+  const rz = await prepareMeeting(makePlugin({ citedTitles: [] }), base({ template: { taskList: "cited" } }));
+  assert.ok(!rz.markdown.includes("**Tasks**"), rz.markdown);
+});
+
+test("ignoreLabels and ignoreProjects are forwarded to getMeetingTodoistData (default [])", async () => {
+  const p = makePlugin();
+  await prepareMeeting(p, base({ template: { ignoreLabels: ["Notes"], ignoreProjects: ["Old"] } }));
+  assert.deepStrictEqual(p.dataOpts.ignoreLabels, ["Notes"]);
+  assert.deepStrictEqual(p.dataOpts.ignoreProjects, ["Old"]);
+  const q = makePlugin();
+  await prepareMeeting(q, base({ template: { ignoreLabels: "x" } }));
+  assert.deepStrictEqual(q.dataOpts.ignoreLabels, []);
+  assert.deepStrictEqual(q.dataOpts.ignoreProjects, []);
+});
+
+test("dropNumericMarkers removes only stray [n] markers", () => {
+  const { dropNumericMarkers: d } = require("../src/writing/meeting.js");
+  assert.strictEqual(typeof d, "function", "dropNumericMarkers exported");
+  assert.strictEqual(d("See [1] in the doc."), "See in the doc.");
+  assert.strictEqual(d("Done [74]."), "Done.");
+  assert.strictEqual(d("Both [12, 13] agree."), "Both agree.");
+  assert.strictEqual(d("[3] starts the line"), "starts the line");
+  for (const keep of ["arr[0] is set", "Use `x[1]` here", "Year [1999].", "[1]: http://x", "- [ ] a and [x] b", "[2026](u)", "[2026][ref]", "a[^1] b", "```\nsee [1] here\n```"]) {
+    assert.strictEqual(d(keep), keep, "untouched: " + keep);
+  }
+  assert.strictEqual(d("Use `x[1]` and [2] now"), "Use `x[1]` and now");
 });
 
 (async () => {

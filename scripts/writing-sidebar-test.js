@@ -1323,6 +1323,24 @@ async function testCheckGoesToSidebar() {
   console.log('PASS check-goes-to-sidebar');
 }
 
+async function testCheckChatOmitsTodoistReferences() {
+  for (const style of ['apa', 'nature']) {
+    const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+    const task = { kind: 'todoist', title: 'Secret task', url: 'https://app.todoist.com/app/task/9', meta: { title: 'Secret task', url: 'https://app.todoist.com/app/task/9', site: 'Todoist', year: 2026 } };
+    const note = { meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X' }, path: 'Notes/Passage.md' };
+    const plugin = makeWritePlugin(null, async () => ({ markdown: 'Checked.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: style, cited: [task, note], numbers: {} }));
+    const view = makeWriteView(plugin, [leaf], leaf);
+    view.plugin.settings.writingCitationStyle = style;
+    view.pinSelection(leafView.editor, 'Notes/Passage.md');
+    await view.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: view.pinned });
+    const text = view.messageLog[view.messageLog.length - 1].text;
+    assert.ok(text.includes('Schott'), style + ' keeps the note reference');
+    assert.ok(!text.includes('Secret task') && !text.includes('todoist.com'), style + ' leaks no task reference: ' + text);
+    assert.ok(!/\n\n\n/.test(text) && !/\n\s*\n\s*\n/.test(text), style + ' no blank reference lines');
+  }
+  console.log('PASS check-chat-omits-todoist-references');
+}
+
 async function testVaultEvidenceForcesVault() {
   // "vault" evidence forces the vault on even when the vault toggle is off; the other toggles keep their state.
   const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
@@ -1452,7 +1470,7 @@ function makeSelectStub() {
 
 const MEETING_TEMPLATES = [
   { name: 'Chat prompt', prompt: 'chat', action: '' },
-  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, overview: false },
+  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, overview: false, ignoreLabels: ['Notes'], ignoreProjects: ['Inbox', 'Personal'] },
 ];
 
 function makeMeetingView(prepareImpl, notePath = 'Notes/Meet.md') {
@@ -1521,6 +1539,8 @@ async function testMeetingRouting() {
   assert.strictEqual(prepCalls[0].template.taskList, 'all');
   assert.strictEqual(prepCalls[0].template.maxTasks, 9);
   assert.strictEqual(prepCalls[0].template.overview, false);
+  assert.deepStrictEqual(prepCalls[0].template.ignoreLabels, ['Notes'], 'ignoreLabels reach prepareMeeting');
+  assert.deepStrictEqual(prepCalls[0].template.ignoreProjects, ['Inbox', 'Personal'], 'ignoreProjects reach prepareMeeting');
   assert.strictEqual(prepCalls[0].webSearchMode, 'concise');
   assert.strictEqual(prepCalls[0].citationStyle, 'footnotes');
   assert.ok(view.rewriteModal && view.rewriteModal.opened, 'Review draft window opened');
@@ -1930,6 +1950,7 @@ async function runTests() {
   await testApplyButtonUsesTextareaValue();
   await testEmptyAfterPaneRefusesApply();
   await testCheckGoesToSidebar();
+  await testCheckChatOmitsTodoistReferences();
   await testVaultEvidenceForcesVault();
   await testEvidenceOff();
   await testEmptyModelOutput();

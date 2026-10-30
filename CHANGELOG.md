@@ -1,3 +1,17 @@
+## 0.9.41 - 2026-10-30
+### Added
+- **Leave out Todoist tasks by label or project.** Collaborate templates can set `ignoreLabels` (for example `ignoreLabels: Notes`) and `ignoreProjects` (a project also leaves out its sub-projects). Matching tasks, open or completed, are dropped before anything is written, so they never appear in the text, the task list or the citations. Both settings are explained in the template's settings comment; the Supervisor template gets them blank. An unedited 0.9.40 Supervisor is upgraded automatically; an edited one is first saved as "Prepare for meeting – Supervisor (before 0.9.41)".
+- **A Tasks heading** above each project's task list in meeting prep.
+
+### Changed
+- **Todoist task citations are links in the text.** A cited task shows as a small ↗ link that opens it in Todoist, in every citation style and in normal Collaborate drafts. Tasks no longer fill the footnotes or the References list; notes and other sources stay there.
+- **Conflicting evidence is settled, not asked about.** When notes or tasks disagree, meeting prep goes with the most recent one and says so; it only raises a question when the evidence can't settle it. Notes now carry their last-modified date so the newest can be told apart.
+
+### Fixed
+- **No raw evidence numbers in the text.** Phrases like "E232 shows…" or a stray "[74]" no longer reach the page: a bare evidence number becomes a proper citation, or is removed when it doesn't belong to that section.
+- Live check (Oct 30, 2026, test vault, real Todoist read-only): the Supervisor document went from 57 KB with 180 footnotes (121 of them tasks) to 40 KB with 23 note footnotes and tasks linked inline; no raw evidence numbers; every task list headed; tasks labelled Notes left out; "Check against my notes" with APA listed no tasks. Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
 ## 0.9.40 - 2026-10-30
 ### Fixed
 - **An edited "Prepare for meeting – Supervisor" template now gets the new shorter layout too.** 0.9.39 only upgraded unedited copies, so an edited one kept the old long layout. On first load, an edited copy is saved exactly as it was as "Prepare for meeting – Supervisor (before 0.9.40)" in the Collaborate folder (numbered " 2", " 3" if that name exists), then replaced with the new template, and a notice names the backup. The backup stays in the meeting preset list, so the old version can still be run. If the backup can't be saved, the template is left untouched and the upgrade is tried again on the next load. This happens once; later edits are never changed.

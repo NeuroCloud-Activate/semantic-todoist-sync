@@ -258,7 +258,9 @@ const SUPERVISOR_PROMPT = [
   "## For each project\n\nWrite one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.",
   "## Rules\n\nUse only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project."
 ].join("\n\n");
-const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+// Settings comment as released in 0.9.39/0.9.40 (before ignore keys); comparison-only for recognising an unedited old Supervisor.
+const MEETING_PREP_SETTINGS_COMMENT_0_9_40 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
 const MEETING_PREP_FOLDER_REFRESH_MS = 400;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
@@ -295,6 +297,8 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     syncTasks: false,
     completedDays: 14,
     projects: [],
+    ignoreProjects: [],
+    ignoreLabels: [],
     subprojects: "merge",
     taskList: "cited",
     maxTasks: 5,
@@ -15316,10 +15320,10 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
   }
 
   // Meeting prep: raw Todoist reads -> grouped task records (open/completed counts feed the Sources line).
-  async getMeetingTodoistData({ completedDays = 14, projects = [], subprojects = "merge" } = {}) {
+  async getMeetingTodoistData({ completedDays = 14, projects = [], subprojects = "merge", ignoreLabels = [], ignoreProjects = [] } = {}) {
     const { buildTaskRecords } = require("./writing/todoist-evidence.js");
     const { snapshot, completed } = await this.getMeetingTodoistRaw({ completedDays });
-    const { records, unknownProjects } = buildTaskRecords({ snapshot, completed, completedDays, projects, subprojects, now: new Date(), taskUrl: (id) => todoistTaskUrl(id, this.settings) });
+    const { records, unknownProjects } = buildTaskRecords({ snapshot, completed, completedDays, projects, subprojects, ignoreLabels, ignoreProjects, now: new Date(), taskUrl: (id) => todoistTaskUrl(id, this.settings) });
     return { records, unknownProjects, openCount: records.filter((r) => r.status !== "done").length, completedCount: records.filter((r) => r.status === "done").length };
   }
 
@@ -20811,7 +20815,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const current = await this.app.vault.read(file);
       const seen = normalize(current);
       if (seen !== normalize(newText)) {
-        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT].some((text) => seen === normalize(text))) {
+        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT, MEETING_PREP_0_9_40_FILE_TEXT].some((text) => seen === normalize(text))) {
           let backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}).md`);
           for (let n = 2; this.app.vault.getAbstractFileByPath(backupPath); n += 1) backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}) ${n}.md`);
           await this.app.vault.create(backupPath, current);
@@ -24335,7 +24339,7 @@ class SemanticTodoistView extends ItemView {
             const { formatReference } = require("./writing/styles.js");
             const refs = citationStyle === "footnotes"
               ? (result.footnotes || "")
-              : ((result.cited || []).map((s) => formatReference(citationStyle, s)).join("\n"));
+              : ((result.cited || []).map((s) => formatReference(citationStyle, s)).filter(Boolean).join("\n"));
             const parts = [result.markdown || "", refs, result.sourcesBlock || ""].filter(Boolean);
             this.replaceLastAssistantMessage(parts.join("\n\n"));
             this.renderRelevantNotes(result.sources || []);
@@ -29461,6 +29465,8 @@ function parsePromptTemplateFile(file, text, inMeetingFolder = false) {
     taskGenerationTemplate: parseOptionalTemplateBoolean(parsed.meta.taskGenerationTemplate ?? parsed.meta.task_generation_template ?? parsed.meta.taskTemplate ?? parsed.meta.task_template ?? parsed.meta.taskOnly ?? parsed.meta.task_only),
     completedDays: parseMeetingCompletedDays(parsed.meta.completedDays),
     projects: parseMeetingProjects(parsed.meta.projects),
+    ignoreProjects: parseMeetingProjects(parsed.meta.ignoreProjects),
+    ignoreLabels: parseMeetingLabels(parsed.meta.ignoreLabels),
     subprojects: parseMeetingSubprojects(parsed.meta.subprojects),
     taskList: parseMeetingTaskList(parsed.meta.taskList ?? parsed.meta.task_list),
     maxTasks: parseMeetingMaxTasks(parsed.meta.maxTasks ?? parsed.meta.max_tasks),
@@ -29532,7 +29538,7 @@ function meetingPrepTemplateSkeleton() {
     ["Rules", "Say the tone and what to leave out."],
   ];
   return promptTemplateFileText({
-    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], subprojects: "merge", taskList: "cited", maxTasks: 5, overview: true,
+    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], ignoreProjects: [], ignoreLabels: [], subprojects: "merge", taskList: "cited", maxTasks: 5, overview: true,
     prompt: sections.map(([heading, hint]) => `## ${heading}\n\n%% ${hint} %%\n`).join("\n\n") + "\n",
   });
 }
@@ -29558,6 +29564,11 @@ function parseMeetingProjects(value) {
   return String(value || "").trim().replace(/^\[([\s\S]*)\]$/, "$1").split(",").map((name) => name.trim()).filter(Boolean);
 }
 
+// Todoist labels: one leading "#" or "@" per item is dropped (users type #Notes).
+function parseMeetingLabels(value) {
+  return parseMeetingProjects(value).map((name) => name.replace(/^[#@]/, "").trim()).filter(Boolean);
+}
+
 function parseMeetingSubprojects(value) {
   return String(value || "").trim().toLowerCase() === "separate" ? "separate" : "merge";
 }
@@ -29577,7 +29588,7 @@ function promptTemplateFileText(template) {
   return [
     "---",
     ...(template.action ? [`action: ${normalizePromptTemplateAction(template.action)}`] : []),
-    ...(meeting ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`, `subprojects: ${parseMeetingSubprojects(template.subprojects)}`, `taskList: ${parseMeetingTaskList(template.taskList)}`, `maxTasks: ${parseMeetingMaxTasks(template.maxTasks)}`, `overview: ${parseTemplateBoolean(template.overview, true) ? "yes" : "no"}`] : []),
+    ...(meeting ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`, `ignoreProjects: ${(template.ignoreProjects || []).join(", ")}`, `ignoreLabels: ${(template.ignoreLabels || []).join(", ")}`, `subprojects: ${parseMeetingSubprojects(template.subprojects)}`, `taskList: ${parseMeetingTaskList(template.taskList)}`, `maxTasks: ${parseMeetingMaxTasks(template.maxTasks)}`, `overview: ${parseTemplateBoolean(template.overview, true) ? "yes" : "no"}`] : []),
     `createTasks: ${Boolean(template.createTasks)}`,
     `insertResponse: ${template.insertResponse !== false}`,
     `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
@@ -29594,7 +29605,10 @@ function promptTemplateFileText(template) {
 const oldMeetingFileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${prompt}`;
 const OLD_SUPERVISOR_FILE_TEXT = oldMeetingFileText(OLD_SUPERVISOR_PROMPT);
 const MEETING_PREP_0_9_38_FILE_TEXT = oldMeetingFileText(SUPERVISOR_PROMPT_0_9_38);
-const SUPERVISOR_TEMPLATE_VERSION = "0.9.40";
+// Exact bytes the 0.9.39/0.9.40 serializer wrote (template-driven keys + settings comment, no ignore keys); comparison-only, never built from the current serializer.
+const meeting0940FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nsubprojects: merge\ntaskList: cited\nmaxTasks: 5\noverview: yes\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_40}\n\n${prompt}`;
+const MEETING_PREP_0_9_40_FILE_TEXT = meeting0940FileText(SUPERVISOR_PROMPT);
+const SUPERVISOR_TEMPLATE_VERSION = "0.9.41";
 
 function yesNo(value) {
   return value ? "Yes" : "No";

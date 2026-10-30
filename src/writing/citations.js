@@ -90,13 +90,72 @@ function labelFor(source) {
     if (url && /^https?:\/\//i.test(url)) return `[${title}](${url})`;
     return title || url;
   }
-  if (source.kind === "todoist") {
-    const title = String(source.title || "").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
-    const url = String(source.url || "").trim();
-    const head = url && /^(https?|todoist):\/\//i.test(url) ? `[${title}](${url})` : title || url;
-    return [head, "Todoist task", source.project, source.state].filter(Boolean).join(", ");
+  return ""; // todoist sources never reach the footnotes: they render as inline links
+}
+
+const RANGE_CAP = 32;
+const DASH = "[-–—]";
+const MARKER_INNER = `E\\d+(?:\\s*${DASH}\\s*(?:E)?\\d+)?\\s*(?:,\\s*E\\d+(?:\\s*${DASH}\\s*(?:E)?\\d+)?\\s*)*`;
+// One bare id or E16-E19 range; not E2E, E1.5 or E3-5.
+const BARE_ITEM = `\\bE\\d+(?:[ \\t]*${DASH}[ \\t]*E\\d+)?(?!\\w|\\.\\d|${DASH}\\d)`;
+const BARE_SEP = "(?:[ \\t]*,[ \\t]*(?:and[ \\t]+)?|[ \\t]+(?:and|&)[ \\t]+)";
+// Spans that are matched first and returned untouched: code, wikilinks, links, urls, real markers.
+const SPAN_RE = new RegExp(`(\`\`\`[\\s\\S]*?(?:\`\`\`|$)|~~~[\\s\\S]*?(?:~~~|$)|\`[^\`\\n]*\`|\\[\\[[^\\]\\n]*\\]\\]|\\[[^\\[\\]\\n]*\\]\\((?:<[^>\\n]*>|[^)\\n]*)\\)|\\[[^\\[\\]\\n]*\\]|\\b(?:https?|todoist|obsidian):\\/\\/\\S+)|(${BARE_ITEM}(?:${BARE_SEP}${BARE_ITEM})*)`, "g");
+const GONE = "\u0000";
+
+// Bare ids the model left outside brackets: allowed ids become [E1, E2] markers, ids that are
+// evidence but not allowed here are removed, any other token is not ours and stays as written.
+// By design a real word like "Grant E10" is cited when E10 is an allowed id.
+function normalizeBareCitations(text, { allowed, known } = {}) {
+  const src = typeof text === "string" ? text : "";
+  const ok = allowed instanceof Set ? allowed : new Set();
+  const all = known instanceof Set ? known : ok;
+  function rewriteRun(run) {
+    const parts = []; // { text } kept as written, or { ids } to cite
+    let end = 0;
+    for (const m of run.matchAll(new RegExp(BARE_ITEM, "g"))) {
+      const sep = parts.length ? run.slice(end, m.index) : "";
+      end = m.index + m[0].length;
+      const r = new RegExp(`^E(\\d+)[ \\t]*${DASH}[ \\t]*E(\\d+)$`).exec(m[0]);
+      let ids = [m[0]];
+      if (r) {
+        const lo = parseInt(r[1], 10);
+        const hi = parseInt(r[2], 10);
+        ids = lo <= hi && hi - lo < RANGE_CAP ? Array.from({ length: hi - lo + 1 }, (_, i) => "E" + (lo + i)) : [];
+      }
+      const cite = ids.filter((id) => ok.has(id));
+      if (cite.length) {
+        const prev = parts[parts.length - 1];
+        if (prev && prev.ids) prev.ids.push(...cite);
+        else parts.push({ sep, ids: cite });
+      } else if (ids.length && ids.every((id) => all.has(id))) {
+        // evidence the caller may not cite here: removed
+      } else {
+        parts.push({ sep, text: m[0] });
+      }
+    }
+    if (!parts.length) return GONE;
+    return parts.map((p, i) => (i ? p.sep : "") + (p.ids ? "[" + p.ids.join(", ") + "]" : p.text)).join("");
   }
-  return "";
+  const out = src.replace(SPAN_RE, (m, span, run) => (span !== undefined ? span : rewriteRun(run)));
+  if (!out.includes(GONE)) return out;
+  return out
+    .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]*\u0000[ \t]*(?:\r?\n|$)/gm, "") // list item that became empty
+    .replace(/,[ \t]*\u0000[ \t]*,/g, ",") // "a, E4, b"
+    .replace(/,[ \t]*\u0000(?=[ \t]*[)\].;:!?])/g, "") // "(a, E4)", "a, E4."
+    .replace(/\(\s*\u0000\s*\)/g, GONE)
+    .replace(/([ \t]*)\u0000([ \t]*)/g, (m, before, after, at, whole) => {
+      const prev = whole.charAt(at - 1);
+      const next = whole.charAt(at + m.length);
+      if (at === 0 || prev === "\n" || next === "" || next === "\n" || /[.,;:!?)\]]/.test(next)) return "";
+      return before || after ? " " : "";
+    });
+}
+
+// A usable link for a todoist source, or "" (then the citation is dropped).
+function todoistUrl(source) {
+  const url = String((source && source.url) || "").trim();
+  return /^(?:https?|todoist):\/\/[^\s<>]+$/i.test(url) ? url : "";
 }
 
 function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
@@ -112,19 +171,23 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   const used = [];
   let dropped = 0;
 
+  const isTask = (eid) => !!(byEid.get(eid).source && byEid.get(eid).source.kind === "todoist");
+
+  // Todoist citations are inline links: they are reported as used but take no footnote number.
   function numFor(eid) {
+    if (!used.includes(eid)) used.push(eid);
+    if (isTask(eid)) return 0;
     if (!numByEid.has(eid)) {
       numByEid.set(eid, next);
       next += 1;
-      used.push(eid);
     }
     return numByEid.get(eid);
   }
 
-  const RANGE_CAP = 32;
   const RANGE_RE = /^E(\d+)\s*[-–—]\s*(E)?(\d+)$/;
   const MARKER_RE = /( ?)\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*))\]( ?)/g;
-  const src = typeof markdown === "string" ? markdown : "";
+  const eids = new Set(byEid.keys());
+  const src = normalizeBareCitations(typeof markdown === "string" ? markdown : "", { allowed: eids, known: eids });
 
   // Collect marker groups first so apa/nature can plan reference numbers
   // for every cited source before any marker is replaced.
@@ -162,28 +225,32 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   }
 
   const ordered = Array.from(numByEid.entries()).sort((a, b) => a[1] - b[1]);
-  const cited = ordered.map(([eid]) => byEid.get(eid).source).filter(Boolean);
+  const cited = used.map((eid) => byEid.get(eid).source).filter(Boolean);
 
   let numbers = {};
   if (nonFootnotes) {
-    numbers = planReferences(noteText, style, cited).numbers;
+    numbers = planReferences(noteText, style, cited).numbers; // planReferences skips todoist sources
   }
 
   let gi = 0;
   const out = src.replace(MARKER_RE, (match, pre, inner, post) => {
     const g = groups[gi];
     gi += 1;
-    if (g.known.length === 0) return pre && post ? " " : "";
-    if (!nonFootnotes) {
-      return pre + g.known.map((eid) => "[^" + numByEid.get(eid) + "]").join("") + post;
+    const notes = g.known.filter((eid) => !isTask(eid));
+    const links = g.known.filter(isTask).map((eid) => todoistUrl(byEid.get(eid).source)).filter(Boolean).map((u) => "[↗](<" + u + ">)");
+    let cite = "";
+    if (notes.length && !nonFootnotes) cite = notes.map((eid) => "[^" + numByEid.get(eid) + "]").join("");
+    else if (notes.length) {
+      cite = formatInText(style, notes.map((eid) => {
+        const source = byEid.get(eid).source;
+        const item = { source };
+        if (style === "nature") item.number = numbers[sourceKey(source)];
+        return item;
+      }));
     }
-    const items = g.known.map((eid) => {
-      const source = byEid.get(eid).source;
-      const item = { source };
-      if (style === "nature") item.number = numbers[sourceKey(source)];
-      return item;
-    });
-    return pre + formatInText(style, items) + post;
+    const body = [cite, ...links].filter(Boolean).join(" ");
+    if (!body) return pre && post ? " " : "";
+    return pre + body + post;
   });
 
   const lines = ordered.map(([eid, n]) => {
@@ -194,4 +261,4 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   return { markdown: out, footnotes: nonFootnotes ? "" : lines.join("\n"), used, cited, numbers, dropped };
 }
 
-module.exports = { rewriteCitations };
+module.exports = { rewriteCitations, normalizeBareCitations };

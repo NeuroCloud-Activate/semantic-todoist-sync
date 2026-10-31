@@ -216,7 +216,7 @@ assert.notStrictEqual(formatReference(style, { kind: "web", meta }), "", "web st
 {
   const task = { kind: "todoist", title: "Draft ethics amendment", project: "Grant", url: "https://app.todoist.com/app/task/9", state: "open", meta: { title: "Draft ethics amendment", site: "Todoist", url: "https://app.todoist.com/app/task/9", year: 2026 } };
   const note = { kind: "vault", path: "papers/schott.md", meta: journalMeta };
-  const link = "[↗](<https://app.todoist.com/app/task/9>)";
+  const link = "[\\[T1\\]](<https://app.todoist.com/app/task/9>)";
   assert.strictEqual(formatInText("apa", [{ source: task }]), "", "apa in-text skips a task");
   assert.strictEqual(formatInText("nature", [{ source: task, number: 1 }]), "", "nature in-text skips a task");
   assert.strictEqual(formatInText("apa", [{ source: task }, { source: note }]), "(Schott et al., 2002)", "apa group keeps only the note");
@@ -241,6 +241,11 @@ assert.notStrictEqual(formatReference(style, { kind: "web", meta }), "", "web st
 
   const bad = rewriteCitations("Claim [E1, E2].", [{ eid: "E1", source: note }, { eid: "E2", source: { ...task, url: "javascript:x" } }], "", "apa");
   assert.strictEqual(bad.markdown, "Claim (Schott et al., 2002).", "invalid task url is dropped: " + bad.markdown);
+
+  const task2 = { ...task, url: "https://app.todoist.com/app/task/10", meta: { ...task.meta, url: "https://app.todoist.com/app/task/10" } };
+  const two = rewriteCitations("A [E2] then B [E3] then A [E2].", [{ eid: "E2", source: task }, { eid: "E3", source: task2 }], "", "apa");
+  assert.strictEqual(two.markdown, "A " + link + " then B [\\[T2\\]](<https://app.todoist.com/app/task/10>) then A " + link + ".", "apa: task numbers run T1, T2 and repeat: " + two.markdown);
+  assert.deepStrictEqual(two.numbers, {}, "apa numbers stay note-only");
   console.log("PASS todoist inline links in apa/nature");
 }
 process.stdout.write(JSON.stringify({ passed: 17, failed: 0 }, null, 2) + "\n");

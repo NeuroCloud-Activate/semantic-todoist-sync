@@ -357,6 +357,29 @@ function charOffset(text, pos) {
   return off + (pos.ch || 0);
 }
 
+// Applies CodeMirror-style changes the way Obsidian does: offsets against the
+// pre-edit text, applied back-to-front so earlier offsets stay valid.
+function applyChangesToText(text, changes) {
+  let next = String(text || '');
+  const withOffsets = (changes || []).map((change) => ({
+    from: charOffset(next, change.from),
+    to: charOffset(next, change.to),
+    text: String(change.text == null ? '' : change.text),
+  }));
+  withOffsets.sort((a, b) => b.from - a.from);
+  for (const change of withOffsets) {
+    const lo = Math.min(change.from, change.to);
+    const hi = Math.max(change.from, change.to);
+    next = next.slice(0, lo) + change.text + next.slice(hi);
+  }
+  return next;
+}
+
+// Lets fire-and-forget async work (the preview-mode persistence) settle.
+function flushAsync() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function makeMarkdownLeaf(filePath, text) {
   const obsidian = require('obsidian');
   const view = new obsidian.MarkdownView();
@@ -384,8 +407,14 @@ function makeMarkdownLeaf(filePath, text) {
       return { line: lines.length - 1, ch: lines[lines.length - 1].length };
     },
     getRange: (from, to) => current.slice(charOffset(current, from), charOffset(current, to)),
-    replaceRange: (draft, from, to) => { calls.replaceRange.push({ draft, from, to }); },
-    transaction: ({ changes }) => { calls.transaction.push(changes || []); },
+    replaceRange: (draft, from, to) => {
+      calls.replaceRange.push({ draft, from, to });
+      current = applyChangesToText(current, [{ from, to, text: draft }]);
+    },
+    transaction: ({ changes }) => {
+      calls.transaction.push(changes || []);
+      current = applyChangesToText(current, changes || []);
+    },
   };
   return { leaf: { view }, calls, setText: (t) => { current = String(t || ''); } };
 }
@@ -429,8 +458,14 @@ function makePinEditor(text, path, from, to) {
       return { line: lines.length - 1, ch: lines[lines.length - 1].length };
     },
     getRange(f, t) { return this._state.current.slice(charOffset(this._state.current, f), charOffset(this._state.current, t)); },
-    replaceRange(draft, f, t) { calls.replaceRange.push({ draft, from: f, to: t }); },
-    transaction({ changes }) { calls.transaction.push(changes || []); },
+    replaceRange(draft, f, t) {
+      calls.replaceRange.push({ draft, from: f, to: t });
+      this._state.current = applyChangesToText(this._state.current, [{ from: f, to: t, text: draft }]);
+    },
+    transaction({ changes }) {
+      calls.transaction.push(changes || []);
+      this._state.current = applyChangesToText(this._state.current, changes || []);
+    },
   };
   view.file = { path, basename: path.split('/').pop() };
   view.editor = editor;
@@ -1082,6 +1117,555 @@ async function testApplyUsesEditedAfterText() {
   assert.deepStrictEqual(calls.replaceRange[0], { draft: 'B edited', from: { line: 0, ch: 0 }, to: { line: 0, ch: 10 } }, 'replaceRange replaces pinned range');
   assert.strictEqual(view.pinned, null, 'pin cleared after apply');
   console.log('PASS apply-uses-edited-after-text');
+}
+
+// ---- D1: Reading view (preview) applies edits to the current disk text ----
+// Obsidian's MarkdownView in preview mode saves its preview data, not the hidden
+// editor buffer (reval14), and that buffer goes stale when the file changes on
+// disk (reval16), so Reading-view edits go through vault.process against the
+// current file text and never touch the hidden editor.
+
+// Vault spy with both write APIs: `modify` records a hidden-buffer write,
+// `process` applies the callback to a DISK string held apart from the editor.
+function installVaultProcessSpy(plugin, initialDisk, processImpl) {
+  const calls = [];
+  let disk = String(initialDisk == null ? '' : initialDisk);
+  plugin.app.vault = {
+    modify: async (file, data) => {
+      calls.push({ api: 'modify', path: file.path, text: String(data) });
+    },
+    process: async (file, fn) => {
+      calls.push({ api: 'process', path: file.path });
+      if (processImpl) return processImpl(file, fn, disk);
+      const next = fn(disk);
+      disk = String(next == null ? '' : next);
+      return disk;
+    },
+  };
+  return { calls, get disk() { return disk; } };
+}
+
+function setCursorAt(editor, line, ch) {
+  editor.getCursor = () => ({ line, ch });
+}
+
+async function testReadingViewInsertUsesDiskText() {
+  // Reading view has no visible cursor, so Apply appends the draft at the END
+  // of the DISK text after a blank line; the hidden editor buffer is never edited.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'Reading view never edits the hidden editor buffer');
+  assert.strictEqual(calls.transaction.length, 0, 'Reading view never transacts the hidden editor buffer');
+  assert.strictEqual(leaf.view.editor.getValue(), 'hello world', 'the hidden buffer is left untouched');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'exactly one atomic vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'hello world\n\nEDITED draft', 'draft appended at the end of the disk text after a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-uses-disk-text');
+}
+
+async function testReadingViewApaInsertUsesDiskText() {
+  // Non-footnote style: the draft and the reference list are composed on disk.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(calls.transaction.length, 0, 'Reading view never transacts the hidden editor buffer');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Draft with citation (Schott, 2002).'), 'the disk text contains the draft: ' + vault.disk);
+  assert.ok(vault.disk.includes('## References'), 'the disk text contains the reference list: ' + vault.disk);
+  console.log('PASS reading-view-apa-insert-uses-disk-text');
+}
+
+async function testSourceModeApplyDoesNotWriteVault() {
+  // Source / Live Preview keeps Obsidian's own save path: the editor is edited,
+  // and neither vault.process nor vault.modify is called.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'source';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 1, 'source mode still inserts into the editor buffer');
+  assert.deepStrictEqual(vault.calls, [], 'no vault.process/modify in source/Live Preview: ' + JSON.stringify(vault.calls));
+  console.log('PASS source-mode-apply-does-not-write-vault');
+}
+
+async function testReadingViewRewriteUsesDiskText() {
+  // Pinned footnotes rewrite: the replacement is applied to the disk text.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true so the modal closes');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.strictEqual(calls.transaction.length, 0, 'the hidden editor buffer is never transacted');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('B edited'), 'the disk text contains the replacement: ' + vault.disk);
+  assert.ok(!vault.disk.includes('The origin'), 'the disk text no longer holds the replaced passage: ' + vault.disk);
+  console.log('PASS reading-view-rewrite-uses-disk-text');
+}
+
+async function testReadingViewRewriteApaUsesDiskText() {
+  // APA pinned rewrite: replacement + References section composed on disk.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised passage (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('Revised passage (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.transaction.length, 0, 'the hidden editor buffer is never transacted');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Revised passage (Schott, 2002).'), 'the disk text contains the replacement: ' + vault.disk);
+  assert.ok(!vault.disk.includes('original passage'), 'the replaced passage is gone: ' + vault.disk);
+  assert.ok(vault.disk.includes('## References'), 'the disk text contains the references section: ' + vault.disk);
+  console.log('PASS reading-view-rewrite-apa-uses-disk-text');
+}
+
+async function testReadingViewStaleBufferKeepsExtraLineAndAppendsDraft() {
+  // The hidden buffer is stale: the note changed on disk before the recorded
+  // cursor, so the prefix guard falls back to the END of the current disk text.
+  // The newer disk line must survive (reval16: v1 deleted it).
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  setCursorAt(leaf.view.editor, 0, 11);
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'Line B added later.\nhello world');
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.strictEqual(vault.disk.endsWith('hello world\n\nEDITED draft'), true, 'the draft is appended at the end of the current disk text after a blank line: ' + JSON.stringify(vault.disk));
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(!notices.some((n) => n.includes('Note changed while writing')), 'no cursor-fallback notice in Reading view: ' + JSON.stringify(notices));
+  console.log('PASS reading-view-stale-buffer-keeps-extra-line-and-appends-draft');
+}
+
+async function testReadingViewStaleBufferApaKeepsExtraLineAndAppendsDraft() {
+  // Same stale-buffer fallback with APA: disk line kept, draft + References on disk.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  setCursorAt(leaf.view.editor, 0, 11);
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'Line B added later.\nhello world');
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(calls.transaction.length, 0, 'the stale hidden buffer is never transacted');
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('Draft with citation (Schott, 2002).'), 'the draft is on disk: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('## References'), 'the reference list is on disk: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.startsWith('Line B added later.\nhello world\n\nDraft with citation (Schott, 2002).'), 'draft appended at the end after a blank line, references after the draft: ' + JSON.stringify(vault.disk));
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(!notices.some((n) => n.includes('Note changed while writing')), 'no cursor-fallback notice in Reading view: ' + JSON.stringify(notices));
+  console.log('PASS reading-view-stale-buffer-apa-keeps-extra-line-and-appends-draft');
+}
+
+async function testReadingViewRewriteKeepsStaleDiskLine() {
+  // Rewrite: disk has a line the buffer lacks, the pinned passage is unchanged,
+  // so the passage is replaced on disk and the newer line survives.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.\nExtra line added later.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.ok(vault.disk.includes('Extra line added later.'), 'the disk-only line is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('B edited'), 'the passage is replaced on disk: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-rewrite-keeps-stale-disk-line');
+}
+
+async function testReadingViewRewriteStalePassageWritesNothingAndKeepsDraft() {
+  // The pinned passage changed on disk: write nothing, show the notice, and keep
+  // the edited text recoverable in the sidebar.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const diskBefore = 'Changed line.\nThe original passage here.';
+  const vault = installVaultProcessSpy(plugin, diskBefore);
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'the Reading-view apply returns true (the save result arrives later)');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing is written to the hidden buffer');
+  assert.strictEqual(vault.disk, diskBefore, 'the changed passage is not overwritten');
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(notices.some((n) => n.includes('Selected text changed; not applied.')), 'the refusal is announced: ' + JSON.stringify(notices));
+  assert.ok(view.messageLog.some((m) => String(m.text || '').includes('B edited')), 'the edited text stays recoverable in the sidebar: ' + JSON.stringify(view.messageLog));
+  console.log('PASS reading-view-rewrite-stale-passage-writes-nothing-and-keeps-draft');
+}
+
+async function testReadingViewProcessFailureShowsNotice() {
+  // A failed vault.process is announced and the draft stays in the sidebar.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  installVaultProcessSpy(plugin, 'hello world', async () => { throw new Error('disk full'); });
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(notices.some((n) => n.includes('Could not save the draft: disk full')), 'a failed save is announced, never silent: ' + JSON.stringify(notices));
+  assert.ok(view.messageLog.some((m) => String(m.text || '').includes('EDITED draft')), 'the draft is kept in the sidebar after the failed save: ' + JSON.stringify(view.messageLog));
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden buffer was never used');
+  console.log('PASS reading-view-process-failure-shows-notice');
+}
+
+async function testReadingViewInsertButtonKeepsStaleDiskLine() {
+  // The Insert button in Reading view appends to the current disk text.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, 'hello world\nLine B added later.');
+  view.renderDraftForInsert({ markdown: 'DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.strictEqual(vault.disk, 'hello world\nLine B added later.\n\nDRAFT', 'the draft is appended at the end after a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-button-keeps-stale-disk-line');
+}
+
+async function testReadingViewInsertAppendsAfterFrontmatter() {
+  // F1: a fresh Reading view reports the hidden cursor at {0,0}; the draft must
+  // land at the end of the body, never glued above the YAML frontmatter.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '---\ntitle: Note\n---\nBody text.\n');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, '---\ntitle: Note\n---\nBody text.\n');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.strictEqual(vault.disk, '---\ntitle: Note\n---\nBody text.\n\nDRAFT', 'frontmatter intact and the draft appended after the body with a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-appends-after-frontmatter');
+}
+
+async function testReadingViewInsertEmptyNoteDraftOnly() {
+  // F1: an empty note holds the draft alone.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, '');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT');
+  await flushAsync();
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'DRAFT', 'an empty note holds the draft alone: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-empty-note-draft-only');
+}
+
+async function testReadingViewInsertButtonEmptyNoteDraftOnly() {
+  // F1: the Insert button placement rule also gives an empty note the draft alone.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, '');
+  view.renderDraftForInsert({ markdown: 'DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  assert.strictEqual(vault.disk, 'DRAFT', 'an empty note holds the draft alone: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-button-empty-note-draft-only');
+}
+
+async function testReadingViewCrlfRewriteKeepsCrlf() {
+  // F2: pins are recorded from the LF-normalized editor; a multi-line pinned
+  // rewrite on a CRLF note must apply and keep CRLF line endings throughout.
+  const { view: leafView, leaf, calls } = makePinEditor('line1\nline2', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 1, ch: 5 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'B edited\r\n', 'the multi-line CRLF passage is replaced and CRLF is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-rewrite-keeps-crlf');
+}
+
+async function testReadingViewCrlfInsertKeepsCrlf() {
+  // F2: an appended draft on a CRLF note keeps CRLF line endings throughout.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT line1\nDRAFT line2');
+  await flushAsync();
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'line1\r\nline2\r\n\r\nDRAFT line1\r\nDRAFT line2', 'the appended draft keeps CRLF line endings: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-insert-keeps-crlf');
+}
+
+// R1: a Reading-view draft must never land inside an existing reference-list
+// section — a later APA/Nature apply rewrites that section from its entry lines
+// and would silently delete the draft.
+async function testReadingViewTwoApaAppliesKeepBothDraftsAboveExistingReferences() {
+  // Reviewer repro: note ends with "## References"; Apply FIRST (Zed), then
+  // Apply SECOND (Able) citing a new source. Both drafts and all three entries
+  // must survive, both drafts above the single heading.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const first = { meta: { authors: ['Zed, Z.'], year: 2020, title: 'Zed new work', journal: 'J. Z.', volume: 3, pages: '10-19' }, path: 'Notes/Zed.md' };
+  const second = { meta: { authors: ['Able, A.'], year: 2019, title: 'Able new work', journal: 'J. Y.', volume: 1, pages: '1-9' }, path: 'Notes/Able.md' };
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'FIRST DRAFT paragraph (Zed, 2020).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa', cited: [first], numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('FIRST DRAFT paragraph (Zed, 2020).');
+  await flushAsync();
+  plugin.writeWithEvidence = async () => ({
+    markdown: 'SECOND DRAFT paragraph (Able, 2019).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa', cited: [second], numbers: {},
+  });
+  view.promptEl.value = 'second draft';
+  await view.write();
+  await view.rewriteModal.onApply('SECOND DRAFT paragraph (Able, 2019).');
+  await flushAsync();
+  const disk = vault.disk;
+  const heading = disk.indexOf('## References');
+  const firstAt = disk.indexOf('FIRST DRAFT paragraph');
+  const secondAt = disk.indexOf('SECOND DRAFT paragraph');
+  assert.ok(firstAt >= 0, 'the first draft survives the second apply: ' + JSON.stringify(disk));
+  assert.ok(secondAt >= 0, 'the second draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(firstAt < heading && secondAt < heading, 'both drafts sit above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading, not duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^- /gm) || []).length, 3, 'three reference entries: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the original entry is neither lost nor duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Zed new work/g) || []).length, 1, 'the first source is listed once: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Able new work/g) || []).length, 1, 'the second source is listed once: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-two-apa-applies-keep-drafts-above-existing-references');
+}
+
+async function testReadingViewFootnotesInsertDraftAboveExistingReferences() {
+  // Footnotes style: a draft must not land inside an existing References section either.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT with a footnote[^1].');
+  await flushAsync();
+  const disk = vault.disk;
+  assert.ok(disk.indexOf('DRAFT with a footnote[^1].') >= 0, 'the draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(disk.indexOf('DRAFT with a footnote[^1].') < disk.indexOf('## References'), 'the footnotes draft sits above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-footnotes-insert-draft-above-existing-references');
+}
+
+async function testReadingViewInsertButtonDraftAboveExistingReferences() {
+  // The Insert button follows the same placement rule.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, note);
+  view.renderDraftForInsert({ markdown: 'INSERTED DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  const disk = vault.disk;
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden buffer is never edited');
+  assert.ok(disk.indexOf('INSERTED DRAFT') >= 0, 'the draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(disk.indexOf('INSERTED DRAFT') < disk.indexOf('## References'), 'the Insert-button draft sits above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-insert-button-draft-above-existing-references');
+}
+
+async function testReadingViewInsertDraftGoesBeforePlanReferencesHeadingEvenWhenBodyFollows() {
+  // Choice: the draft goes immediately before the References/Bibliography heading that
+  // planReferences locates (its section start), even when body follows the section —
+  // never inside the section, and no original text is lost.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n\n## Appendix\n\nTrailing body after the references.\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'MIDDLE DRAFT paragraph (Noe, 2018).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Noe, N.'], year: 2018, title: 'Noe new work', journal: 'J. N.', volume: 2, pages: '2-3' }, path: 'Notes/Noe.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('MIDDLE DRAFT paragraph (Noe, 2018).');
+  await flushAsync();
+  const disk = vault.disk;
+  const draftAt = disk.indexOf('MIDDLE DRAFT paragraph');
+  const referencesAt = disk.indexOf('## References');
+  assert.ok(draftAt >= 0 && referencesAt > draftAt, 'the draft sits above the References heading it precedes: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## Appendix$/gm) || []).length, 1, 'the section after the references survives: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Body text\./g) || []).length, 1, 'the body text is neither lost nor duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Trailing body after the references\./g) || []).length, 1, 'the body after the references section is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-insert-draft-before-plan-references-heading-when-body-follows');
+}
+
+async function testReadingViewCrlfDraftWithCrlfKeepsCrlfOnly() {
+  // R2: a CRLF draft on a CRLF note must not produce "\r\r\n" (CRCRLF).
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  await view.rewriteModal.onApply('one\r\ntwo');
+  await flushAsync();
+  assert.strictEqual(vault.disk, 'line1\r\nline2\r\n\r\none\r\ntwo', 'the CRLF draft keeps CRLF line endings: ' + JSON.stringify(vault.disk));
+  assert.ok(!/\r\r\n/.test(vault.disk), 'no CRCRLF is produced: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-draft-with-crlf-keeps-crlf-only');
+}
+
+async function testReadingViewPinnedFootnotesStalePassageKeepsFootnoteDefinitionInSidebar() {
+  // F5 regression (gap from review): a refused pinned footnotes rewrite keeps the
+  // draft AND its "[^1]:" definition recoverable in the sidebar; the disk is untouched.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Rewritten draft[^1].', footnotes: '[^1]: Doe, J. (2001). *Old work*. [[Old-Work]]',
+    sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const diskBefore = 'Changed line.\nThe original passage here.';
+  const vault = installVaultProcessSpy(plugin, diskBefore);
+  await view.write();
+  const ok = view.rewriteModal.onApply('Rewritten draft[^1].');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'the Reading-view apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing is written to the hidden buffer');
+  assert.strictEqual(vault.disk, diskBefore, 'the changed passage is not overwritten');
+  const sidebar = view.messageLog.map((m) => String(m.text || '')).join('\n');
+  assert.ok(sidebar.includes('Rewritten draft[^1].'), 'the draft stays recoverable in the sidebar: ' + JSON.stringify(sidebar));
+  assert.ok(sidebar.includes('[^1]: Doe, J. (2001). *Old work*. [[Old-Work]]'), 'the footnote definition stays recoverable in the sidebar: ' + JSON.stringify(sidebar));
+  console.log('PASS reading-view-pinned-footnotes-stale-passage-keeps-footnote-definition-in-sidebar');
+}
+
+async function testReadingViewApaInsertDraftThenReferencesAtEnd() {
+  // F1: the APA draft lands after the body, then the References edit — both at the end.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.ok(vault.disk.startsWith('hello world\n\nDraft with citation (Schott, 2002).'), 'the draft follows the body after a blank line: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.indexOf('## References') > vault.disk.indexOf('Draft with citation (Schott, 2002).'), 'the References section follows the draft: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-apa-insert-draft-then-references-at-end');
+}
+
+async function testReadingViewInsertStatusAfterSuccessAndFailure() {
+  // F3: the completion status is only claimed after the atomic save resolves.
+  const good = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  good.leaf.view.getMode = () => 'preview';
+  const goodPlugin = makeWritePlugin();
+  const goodView = makeWriteView(goodPlugin, [good.leaf], good.leaf);
+  installVaultProcessSpy(goodPlugin, 'hello world');
+  await goodView.write();
+  await goodView.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.ok(goodView.statusLog.includes('Collaboration complete.'), 'success reports completion: ' + JSON.stringify(goodView.statusLog));
+
+  const bad = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  bad.leaf.view.getMode = () => 'preview';
+  const badPlugin = makeWritePlugin();
+  const badView = makeWriteView(badPlugin, [bad.leaf], bad.leaf);
+  installVaultProcessSpy(badPlugin, 'hello world', async () => { throw new Error('disk full'); });
+  await badView.write();
+  await badView.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.ok(badView.statusLog.includes('Draft not saved; it is in the sidebar.'), 'a failed save reports the recovery status: ' + JSON.stringify(badView.statusLog));
+  assert.ok(!badView.statusLog.includes('Collaboration complete.'), 'a failed save never claims completion: ' + JSON.stringify(badView.statusLog));
+  console.log('PASS reading-view-insert-status-after-success-and-failure');
 }
 
 async function testContinueInsertsAfterSelection() {
@@ -1937,6 +2521,30 @@ async function runTests() {
   await testEditorMenuTypedPathPinsSelection();
   await testEditorMenuTypedPathUsesCapturedPin();
   await testApplyUsesEditedAfterText();
+  await testReadingViewInsertUsesDiskText();
+  await testReadingViewApaInsertUsesDiskText();
+  await testSourceModeApplyDoesNotWriteVault();
+  await testReadingViewRewriteUsesDiskText();
+  await testReadingViewRewriteApaUsesDiskText();
+  await testReadingViewStaleBufferKeepsExtraLineAndAppendsDraft();
+  await testReadingViewStaleBufferApaKeepsExtraLineAndAppendsDraft();
+  await testReadingViewRewriteKeepsStaleDiskLine();
+  await testReadingViewRewriteStalePassageWritesNothingAndKeepsDraft();
+  await testReadingViewProcessFailureShowsNotice();
+  await testReadingViewInsertButtonKeepsStaleDiskLine();
+  await testReadingViewInsertAppendsAfterFrontmatter();
+  await testReadingViewInsertEmptyNoteDraftOnly();
+  await testReadingViewInsertButtonEmptyNoteDraftOnly();
+  await testReadingViewCrlfRewriteKeepsCrlf();
+  await testReadingViewCrlfInsertKeepsCrlf();
+  await testReadingViewApaInsertDraftThenReferencesAtEnd();
+  await testReadingViewTwoApaAppliesKeepBothDraftsAboveExistingReferences();
+  await testReadingViewFootnotesInsertDraftAboveExistingReferences();
+  await testReadingViewInsertButtonDraftAboveExistingReferences();
+  await testReadingViewInsertDraftGoesBeforePlanReferencesHeadingEvenWhenBodyFollows();
+  await testReadingViewCrlfDraftWithCrlfKeepsCrlfOnly();
+  await testReadingViewPinnedFootnotesStalePassageKeepsFootnoteDefinitionInSidebar();
+  await testReadingViewInsertStatusAfterSuccessAndFailure();
   await testContinueInsertsAfterSelection();
   await testApaApplyAddsReferencesInTransaction();
   await testNatureNumberingChangedRefuses();

@@ -170,6 +170,17 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   const numByEid = new Map();
   const used = [];
   let dropped = 0;
+  // writing-mode: tasks take their own [T1] sequence, by first appearance in the document
+  const taskNumByEid = new Map();
+  // Continue the [T<n>] numbers already in the note, so Apply does not renumber them.
+  const TASK_LINK_RE = /\[\\\[T(\d+)\\\]\]\(<([^>\n]*)>\)/g;
+  const taskNumByUrl = new Map();
+  let taskSeq = 0;
+  for (const m of String(noteText || "").matchAll(TASK_LINK_RE)) {
+    const n = parseInt(m[1], 10);
+    if (n > taskSeq) taskSeq = n;
+    if (!taskNumByUrl.has(m[2])) taskNumByUrl.set(m[2], n);
+  }
 
   const isTask = (eid) => !!(byEid.get(eid).source && byEid.get(eid).source.kind === "todoist");
 
@@ -182,6 +193,19 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
       next += 1;
     }
     return numByEid.get(eid);
+  }
+
+  function taskNumFor(eid) {
+    if (!taskNumByEid.has(eid)) {
+      const url = todoistUrl(byEid.get(eid).source);
+      if (url && taskNumByUrl.has(url)) {
+        taskNumByEid.set(eid, taskNumByUrl.get(url));
+      } else {
+        taskSeq += 1;
+        taskNumByEid.set(eid, taskSeq);
+      }
+    }
+    return taskNumByEid.get(eid);
   }
 
   const RANGE_RE = /^E(\d+)\s*[-–—]\s*(E)?(\d+)$/;
@@ -237,7 +261,11 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
     const g = groups[gi];
     gi += 1;
     const notes = g.known.filter((eid) => !isTask(eid));
-    const links = g.known.filter(isTask).map((eid) => todoistUrl(byEid.get(eid).source)).filter(Boolean).map((u) => "[↗](<" + u + ">)");
+    const links = g.known.filter(isTask).map((eid) => {
+      const url = todoistUrl(byEid.get(eid).source);
+      // visible text is [T1]: escaped brackets keep it out of Obsidian's wikilink syntax
+      return url ? "[\\[T" + taskNumFor(eid) + "\\]](<" + url + ">)" : "";
+    }).filter(Boolean);
     let cite = "";
     if (notes.length && !nonFootnotes) cite = notes.map((eid) => "[^" + numByEid.get(eid) + "]").join("");
     else if (notes.length) {
@@ -248,7 +276,7 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
         return item;
       }));
     }
-    const body = [cite, ...links].filter(Boolean).join(" ");
+    const body = [cite, links.join("")].filter(Boolean).join(" ");
     if (!body) return pre && post ? " " : "";
     return pre + body + post;
   });

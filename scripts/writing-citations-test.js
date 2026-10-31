@@ -389,40 +389,91 @@ function ev(eid, source) {
 {
   const task = (n, extra) => ({ kind: "todoist", title: "Task " + n, project: "Thesis", url: "https://app.todoist.com/app/task/" + n, state: "open", meta: { title: "Task " + n, site: "Todoist", url: "https://app.todoist.com/app/task/" + n, year: 2026 }, ...extra });
   const evs = [ev("E1", { kind: "vault", path: "A.md" }), ev("E2", task(2)), ev("E3", task(3)), ev("E4", { kind: "vault", path: "B.md" })];
-  const link = (n) => "[↗](<https://app.todoist.com/app/task/" + n + ">)";
+  // each task link shows its own sequence number in brackets: [\[T1\]](<url>)
+  const t = (seq, n) => "[\\[T" + seq + "\\]](<https://app.todoist.com/app/task/" + n + ">)";
 
   const only = rewriteCitations("a [E2] b", evs, "");
-  assert.strictEqual(only.markdown, "a " + link(2) + " b", "todoist marker becomes an inline link: " + only.markdown);
+  assert.strictEqual(only.markdown, "a " + t(1, 2) + " b", "todoist marker becomes a numbered inline link: " + only.markdown);
   assert.strictEqual(only.footnotes, "", "todoist adds no footnote: " + only.footnotes);
   assert.deepStrictEqual(only.used, ["E2"], "todoist id still reported as used");
   assert.strictEqual(only.cited.length, 1, "todoist source still reported as cited");
 
   const first = rewriteCitations("x [E2] y [E1] z [E4]", evs, "");
-  assert.strictEqual(first.markdown, "x " + link(2) + " y [^1] z [^2]", "todoist consumes no footnote number: " + first.markdown);
+  assert.strictEqual(first.markdown, "x " + t(1, 2) + " y [^1] z [^2]", "todoist consumes no footnote number: " + first.markdown);
   assert.deepStrictEqual(first.footnotes.split("\n"), ["[^1]: [[A]]", "[^2]: [[B]]"], "footnotes numbered from 1: " + first.footnotes);
   assert.deepStrictEqual(first.used, ["E2", "E1", "E4"], "used keeps first-seen order");
 
   const continued = rewriteCitations("x [E2] y [E1]", evs, "[^3] old");
-  assert.strictEqual(continued.markdown, "x " + link(2) + " y [^4]", "numbering still continues the note: " + continued.markdown);
+  assert.strictEqual(continued.markdown, "x " + t(1, 2) + " y [^4]", "numbering still continues the note: " + continued.markdown);
 
   const mixed = rewriteCitations("a [E2, E1] b", evs, "");
-  assert.strictEqual(mixed.markdown, "a [^1] " + link(2) + " b", "mixed group: footnote then inline link: " + mixed.markdown);
+  assert.strictEqual(mixed.markdown, "a [^1] " + t(1, 2) + " b", "mixed group: footnote then inline link: " + mixed.markdown);
   assert.strictEqual(mixed.footnotes, "[^1]: [[A]]", "mixed group footnotes only the note");
 
   const many = rewriteCitations("a [E2, E3] b", evs, "");
-  assert.strictEqual(many.markdown, "a " + link(2) + " " + link(3) + " b", "several tasks: space-separated links: " + many.markdown);
+  assert.strictEqual(many.markdown, "a " + t(1, 2) + t(2, 3) + " b", "several tasks: adjacent numbered links: " + many.markdown);
 
   const bare = rewriteCitations("E2 and E3 agree.", evs, "");
-  assert.strictEqual(bare.markdown, link(2) + " " + link(3) + " agree.", "bare task ids become links too: " + bare.markdown);
+  assert.strictEqual(bare.markdown, t(1, 2) + t(2, 3) + " agree.", "bare task ids become links too: " + bare.markdown);
+  const mix2 = rewriteCitations("a [E1, E2, E3] b", evs, "");
+  assert.strictEqual(mix2.markdown, "a [^1] " + t(1, 2) + t(2, 3) + " b", "mixed group: note then adjacent task links: " + mix2.markdown);
+
+  // task numbers run in order of first appearance and repeat for later citations
+  const own = rewriteCitations("x [E2] y [E3] z [E2]", evs, "");
+  assert.strictEqual(own.markdown, "x " + t(1, 2) + " y " + t(2, 3) + " z " + t(1, 2), "own sequence by first appearance: " + own.markdown);
+  assert.deepStrictEqual(own.used, ["E2", "E3"], "used reports both tasks");
+
+  // task numbers are independent of note footnote numbers
+  const indep = rewriteCitations("n [E1] t [E2]", evs, "");
+  assert.strictEqual(indep.markdown, "n [^1] t " + t(1, 2), "task numbering ignores note footnotes: " + indep.markdown);
+
+  for (const style of ["apa", "nature"]) {
+    const styled = rewriteCitations("a [E2] b [E3] c [E2]", [ev("E2", task(2)), ev("E3", task(3))], "", style);
+    assert.strictEqual(styled.markdown, "a " + t(1, 2) + " b " + t(2, 3) + " c " + t(1, 2), style + " keeps task numbers: " + styled.markdown);
+    assert.strictEqual(styled.footnotes, "", style + ": tasks add no footnote");
+  }
 
   for (const url of ["", "javascript:x", "not a url", "https://x.test/a b"]) {
     const bad = rewriteCitations("a [E2] b", [ev("E2", task(2, { url }))], "");
     assert.strictEqual(bad.markdown, "a b", "invalid url '" + url + "' renders nothing: " + bad.markdown);
     assert.strictEqual(bad.footnotes, "", "invalid url adds no footnote");
+    const next = rewriteCitations("a [E2] b [E3]", [ev("E2", task(2, { url })), ev("E3", task(3))], "");
+    assert.strictEqual(next.markdown, "a b " + t(1, 3), "invalid url consumes no T number: " + next.markdown);
   }
   const todoistScheme = rewriteCitations("a [E2] b", [ev("E2", task(2, { url: "todoist://task?id=6gjvC96xxWrjG2PH" }))], "");
-  assert.strictEqual(todoistScheme.markdown, "a [↗](<todoist://task?id=6gjvC96xxWrjG2PH>) b", "todoist:// urls are links: " + todoistScheme.markdown);
+  assert.strictEqual(todoistScheme.markdown, "a [\\[T1\\]](<todoist://task?id=6gjvC96xxWrjG2PH>) b", "todoist:// urls are links: " + todoistScheme.markdown);
   console.log("PASS todoist inline links");
 }
-process.stdout.write(JSON.stringify({ passed: 22, failed: 0 }, null, 2) + "\n");
+
+// 19: task numbers continue those already cited in the note (Apply keeps numbering)
+{
+  const task = (n, extra) => ({ kind: "todoist", title: "Task " + n, project: "Thesis", url: "https://app.todoist.com/app/task/" + n, state: "open", meta: { title: "Task " + n, site: "Todoist", url: "https://app.todoist.com/app/task/" + n, year: 2026 }, ...extra });
+  const t = (seq, n) => "[\\[T" + seq + "\\]](<https://app.todoist.com/app/task/" + n + ">)";
+
+  // re-citing task/2 must stay T1, not become T2
+  const repro = rewriteCitations("[E9] [E2]", [ev("E2", task(2)), ev("E9", task(99))], "ACCEPTED FINDING only " + t(1, 2) + ".\n");
+  assert.strictEqual(repro.markdown, t(2, 99) + " " + t(1, 2), "seeded task keeps T1, new task gets T2: " + repro.markdown);
+
+  // a task already numbered T3 keeps T3
+  const t3 = rewriteCitations("[E2]", [ev("E2", task(2))], "x " + t(3, 2) + " y");
+  assert.strictEqual(t3.markdown, t(3, 2), "seeded task keeps T3: " + t3.markdown);
+
+  // new tasks number after the seeded maximum, in first-appearance order; seeded tasks reuse
+  const mixed = rewriteCitations("[E9] [E3] [E9]", [ev("E9", task(9)), ev("E3", task(3))], t(1, 2) + " and " + t(2, 3));
+  assert.strictEqual(mixed.markdown, t(3, 9) + " " + t(2, 3) + " " + t(3, 9), "mixed seeded and new: " + mixed.markdown);
+
+  // no task links in the note: numbering starts at T1 as before
+  const fresh = rewriteCitations("[E2] [E3]", [ev("E2", task(2)), ev("E3", task(3))], "[^1] old footnote\n");
+  assert.strictEqual(fresh.markdown, t(1, 2) + " " + t(2, 3), "no seeded links: " + fresh.markdown);
+
+  // plain text that merely looks like a number does not seed
+  const literal = rewriteCitations("[E2]", [ev("E2", task(2))], "plain [T3] and [\\[T4\\]] text\n");
+  assert.strictEqual(literal.markdown, t(1, 2), "non-link literals do not seed: " + literal.markdown);
+
+  // an invalid url still drops its marker and consumes no number
+  const badUrl = rewriteCitations("[E2] [E3]", [ev("E2", task(2, { url: "javascript:x" })), ev("E3", task(3))], t(4, 9));
+  assert.strictEqual(badUrl.markdown, t(5, 3), "invalid url consumes no number after seeded max: " + badUrl.markdown);
+  console.log("PASS task numbers seed from note");
+}
+process.stdout.write(JSON.stringify({ passed: 23, failed: 0 }, null, 2) + "\n");
 

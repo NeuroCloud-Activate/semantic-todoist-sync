@@ -24388,6 +24388,52 @@ class SemanticTodoistView extends ItemView {
             to: recordedFrom,
             prefix: recordedPrefix,
           };
+          // writing-mode: Reading view has no visible cursor and its hidden buffer
+          // can be stale; append inside vault.process against the current disk
+          // text, and report failure by Notice + sidebar because this
+          // synchronous callback cannot await the save.
+          const previewView = findPreviewModeViewForEditor(this.plugin && this.plugin.app ? this.plugin.app : null, currentPath, currentEditor);
+          if (previewView) {
+            const previewApp = this.plugin && this.plugin.app ? this.plugin.app : null;
+            // writing-mode: Reading view has no visible cursor, so the draft is
+            // placed against the current disk text (never planned against the
+            // recorded hidden cursor) — above an existing reference-list
+            // section, else at the end; the status is claimed only after the
+            // atomic save resolves, never before.
+            (async () => {
+              try {
+                await previewApp.vault.process(previewView.file, (current) => withLfText(current, (body) => {
+                  const shim = makeTextEditorShim(body);
+                  const draftPlan = draftInsertPlan(body, draftText);
+                  const draftAt = shim.offsetToPos(draftPlan.offset);
+                  // the draft sits at its own offset (end of the body, or above an
+                  // existing reference-list section); the references edit keeps
+                  // its planned offsets against the same pre-edit text
+                  const changes = [{ from: draftAt, to: draftAt, text: draftPlan.text }];
+                  if (citationStyle !== "footnotes") {
+                    const { planReferences } = require("./writing/styles.js");
+                    const planned = planReferences(body, citationStyle, result.cited || []);
+                    if (planned && planned.edit) {
+                      changes.push({
+                        from: shim.offsetToPos(planned.edit.from),
+                        to: shim.offsetToPos(planned.edit.to),
+                        text: planned.edit.text,
+                      });
+                    }
+                  }
+                  shim.transaction({ changes });
+                  return shim.getValue();
+                }));
+              } catch (error) {
+                new Notice(`Could not save the draft: ${error && error.message ? error.message : String(error)}`);
+                this.renderDraftForInsert({ markdown: draftText }, filePath, null);
+                this.setStatus("Draft not saved; it is in the sidebar.");
+                return;
+              }
+              this.setStatus("Collaboration complete.");
+            })();
+            return;
+          }
           const plan = planInsertion(currentEditor, recorded, currentPath);
           if (plan.mode === "recorded" || plan.mode === "cursor") {
             // writing-mode: task 4 a non-footnote style adds its reference list in the same transaction as the insert
@@ -24540,6 +24586,75 @@ class SemanticTodoistView extends ItemView {
     }
     const { planReplacement } = require("./writing/rewrite.js");
     const recorded = { path: currentPath, from: pinned.from, to: pinned.to, original: pinned.original };
+    // writing-mode: Reading view has no visible cursor and its hidden buffer can
+    // be stale; plan and apply inside vault.process against the current disk text.
+    // Return true synchronously so the modal closes; a failed apply is reported by
+    // Notice with the edited text kept in the sidebar, never silently lost.
+    const previewView = findPreviewModeViewForEditor(app, currentPath, editor);
+    if (previewView) {
+      const previewFootnoteText = citationStyle === "footnotes" ? String(result.footnotes || "").trim() : "";
+      (async () => {
+        let failure = "";
+        try {
+          await app.vault.process(previewView.file, (current) => withLfText(current, (body) => {
+            const shim = makeTextEditorShim(body);
+            const previewPlan = planReplacement(shim, recorded, currentPath);
+            if (!previewPlan.ok) {
+              failure = previewPlan.notice;
+              return body;
+            }
+            const changes = [];
+            if (apply === "after") {
+              changes.push({ from: previewPlan.to, to: previewPlan.to, text: "\n\n" + text + (previewFootnoteText ? "\n\n" + previewFootnoteText : "") });
+            } else if (citationStyle === "footnotes") {
+              shim.replaceRange(previewFootnoteText ? text + "\n\n" + previewFootnoteText : text, previewPlan.from, previewPlan.to);
+              return shim.getValue();
+            } else {
+              changes.push({ from: previewPlan.from, to: previewPlan.to, text: text });
+            }
+            if (citationStyle !== "footnotes") {
+              const { planReferences } = require("./writing/styles.js");
+              const planned = planReferences(body, citationStyle, result.cited || []);
+              if (citationStyle === "nature") {
+                const resultNumbers = result.numbers || {};
+                for (const key of Object.keys(resultNumbers)) {
+                  if (planned.numbers[key] !== resultNumbers[key]) {
+                    failure = "References changed while writing; run again.";
+                    return body;
+                  }
+                }
+              }
+              if (planned.edit) {
+                const pinnedStart = shim.posToOffset(pinned.from);
+                const pinnedEnd = shim.posToOffset(pinned.to);
+                if (pinnedStart < planned.edit.to && pinnedEnd > planned.edit.from) {
+                  failure = "The selection overlaps the reference list; not applied.";
+                  return body;
+                }
+                changes.push({
+                  from: shim.offsetToPos(planned.edit.from),
+                  to: shim.offsetToPos(planned.edit.to),
+                  text: planned.edit.text,
+                });
+              }
+            }
+            shim.transaction({ changes });
+            return shim.getValue();
+          }));
+        } catch (error) {
+          new Notice(`Could not save the draft: ${error && error.message ? error.message : String(error)}`);
+          this.renderDraftForInsert({ markdown: text, footnotes: previewFootnoteText }, currentPath, null);
+          return;
+        }
+        if (failure) {
+          new Notice(failure);
+          this.renderDraftForInsert({ markdown: text, footnotes: previewFootnoteText }, currentPath, null);
+          return;
+        }
+        this.clearPin();
+      })();
+      return true;
+    }
     const plan = planReplacement(editor, recorded, currentPath);
     if (!plan.ok) {
       new Notice(plan.notice);
@@ -24608,12 +24723,26 @@ class SemanticTodoistView extends ItemView {
         // writing-mode: Insert button looks up any open markdown leaf with originalPath (works when sidebar has focus); preferred view passed as null
         const ed = findMarkdownEditorForPath(app, originalPath, null);
         if (ed) {
-          const cursor = ed.getCursor ? ed.getCursor() : { line: 0, ch: 0 };
           const draftText = draftMarkdown || "";
-          try {
-            ed.replaceRange ? ed.replaceRange(draftText, cursor, cursor) : null;
-          } catch (e) {
-            new Notice("Insert failed: " + (e.message || e));
+          const previewView = findPreviewModeViewForEditor(app, originalPath, ed);
+          if (previewView) {
+            // writing-mode: Reading view has no visible cursor, so the draft is
+            // appended at the end of the current disk text; the draft is already
+            // in the sidebar, so a failed save is never silent or lost.
+            try {
+              await app.vault.process(previewView.file, (current) => withLfText(current, (body) => appendDraftAtEnd(body, draftText)));
+            } catch (e) {
+              new Notice("Could not save the draft: " + (e.message || e));
+              this.setStatus("Draft not saved; it is in the sidebar.");
+              return;
+            }
+          } else {
+            const cursor = ed.getCursor ? ed.getCursor() : { line: 0, ch: 0 };
+            try {
+              ed.replaceRange ? ed.replaceRange(draftText, cursor, cursor) : null;
+            } catch (e) {
+              new Notice("Insert failed: " + (e.message || e));
+            }
           }
           this.setStatus("Draft inserted.");
         } else {
@@ -33571,6 +33700,120 @@ function findMarkdownEditorForPath(app, filePath, preferredView) {
     }
   }
   return preferredEditor || firstEditor || null;
+}
+
+// writing-mode: Reading view (preview) has no live editor and never saves editor
+// edits (reval14 D1); its hidden buffer also goes stale when the note changes on
+// disk (reval16), so find the preview view that owns this editor and apply the
+// edit to the current file text instead of that buffer.
+function findPreviewModeViewForEditor(app, filePath, editor) {
+  const MarkdownViewLocal = (typeof MarkdownView !== "undefined" ? MarkdownView : null);
+  if (!app || !filePath || !editor || !MarkdownViewLocal) return null;
+  const leaves = (typeof app.workspace?.getLeavesOfType === "function") ? app.workspace.getLeavesOfType("markdown") : [];
+  for (const leaf of (leaves || [])) {
+    const view = leaf && leaf.view instanceof MarkdownViewLocal ? leaf.view : null;
+    if (!view || !view.file || view.file.path !== filePath || view.editor !== editor) continue;
+    if (typeof view.getMode === "function" && view.getMode() === "preview") return view;
+  }
+  return null;
+}
+
+// writing-mode: Reading view has no visible cursor, so a draft goes at the end
+// of the current text; a blank note takes the draft directly. It must never land
+// inside an existing reference-list section (a later APA/Nature apply rewrites
+// that section from its entry lines), so it goes just before the heading
+// planReferences locates in ./writing/styles.js, using the same heading regex.
+function draftInsertPlan(current, draftText) {
+  const text = String(current == null ? "" : current);
+  const draft = String(draftText == null ? "" : draftText);
+  if (!text.trim()) return { offset: 0, text: draft };
+  let heading = -1;
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    if (/^(#{1,6})\s+(References|Bibliography)\s*$/i.test(line)) {
+      heading = offset;
+      break;
+    }
+    offset += line.length + 1;
+  }
+  if (heading < 0) return { offset: text.length, text: (text.endsWith("\n") ? "\n" : "\n\n") + draft };
+  const before = text.slice(0, heading);
+  let pad = "\n\n";
+  if (!before || before.endsWith("\n\n")) pad = "";
+  else if (before.endsWith("\n")) pad = "\n";
+  return { offset: heading, text: pad + draft + "\n\n" };
+}
+
+function appendDraftAtEnd(current, draftText) {
+  const text = String(current == null ? "" : current);
+  const plan = draftInsertPlan(text, draftText);
+  return text.slice(0, plan.offset) + plan.text + text.slice(plan.offset);
+}
+
+// writing-mode: pins and planners use the LF text of the editor, so preview
+// callbacks read CRLF disk text as LF and restore CRLF on the result, only
+// when the note uses it.
+function withLfText(current, fn) {
+  const source = String(current == null ? "" : current);
+  if (!source.includes("\r\n")) return fn(source);
+  const result = fn(source.replace(/\r\n/g, "\n"));
+  // writing-mode: a CRLF draft in the LF text would otherwise restore as "\r\r\n"
+  return String(result == null ? "" : result).replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+}
+
+// writing-mode: string-backed editor shim so the existing planners run unchanged
+// against the current file text; Reading view has no visible cursor, so
+// getCursor returns the end of the text. Preview drafts no longer plan at the
+// cursor: they append at the end via appendDraftAtEnd.
+function makeTextEditorShim(text) {
+  let current = String(text == null ? "" : text);
+  const posToOffset = (pos) => {
+    const lines = current.split("\n");
+    const line = Math.max(0, Math.min(pos && Number.isFinite(pos.line) ? pos.line : 0, lines.length - 1));
+    let offset = 0;
+    for (let i = 0; i < line; i++) offset += lines[i].length + 1;
+    const ch = Math.max(0, Math.min(pos && Number.isFinite(pos.ch) ? pos.ch : 0, lines[line].length));
+    return offset + ch;
+  };
+  const offsetToPos = (offset) => {
+    const lines = current.split("\n");
+    const at = Number.isFinite(offset) ? offset : 0;
+    let off = 0;
+    for (let line = 0; line < lines.length; line++) {
+      const length = lines[line].length;
+      if (at <= off + length) return { line, ch: Math.max(0, at - off) };
+      off += length + 1;
+    }
+    return { line: lines.length - 1, ch: lines[lines.length - 1].length };
+  };
+  const applyChange = (from, to, replacement) => {
+    const a = posToOffset(from);
+    const b = posToOffset(to);
+    current = current.slice(0, Math.min(a, b)) + String(replacement == null ? "" : replacement) + current.slice(Math.max(a, b));
+  };
+  return {
+    getValue: () => current,
+    getCursor: () => offsetToPos(current.length),
+    posToOffset,
+    offsetToPos,
+    getRange: (from, to) => current.slice(posToOffset(from), posToOffset(to)),
+    replaceRange: (replacement, from, to) => applyChange(from, to, replacement),
+    transaction: ({ changes }) => {
+      // simultaneous changes address the pre-edit text, so compose them in order
+      const list = (changes || []).map((change) => ({
+        from: posToOffset(change.from),
+        to: posToOffset(change.to == null ? change.from : change.to),
+        text: String(change.text == null ? "" : change.text),
+      })).sort((a, b) => (a.from - b.from) || (a.to - b.to));
+      let next = "";
+      let at = 0;
+      for (const change of list) {
+        next += current.slice(at, change.from) + change.text;
+        at = Math.max(at, change.to);
+      }
+      current = next + current.slice(at);
+    },
+  };
 }
 
 // Chat-completions message shaping for the OpenAI-compatible adapters.

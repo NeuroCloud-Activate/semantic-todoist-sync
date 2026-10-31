@@ -19,6 +19,11 @@ function rec(projectId, projectName, title, extra = {}) {
   }, extra);
 }
 
+// Matches one rendered task citation: [\[T3\]](<url>) — a markdown link whose text is [T3].
+function taskLink(url) {
+  return new RegExp("\\[\\\\\\[T\\d+\\\\\\]\\]\\(<" + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ">\\)");
+}
+
 function threeProjects() {
   return [
     rec("pa", "A", "A one", { notePaths: ["Notes/A.md"], description: "see note" }),
@@ -120,7 +125,8 @@ test("citations global: one numbering, one footnote block, disjoint global ids",
   assert.strictEqual((r.footnotes.match(/^\[\^1\]:/gm) || []).length, 1);
   assert.ok(/\[\^1\]/.test(r.markdown) && !/\[\^2\]/.test(r.markdown));
   assert.ok(!/\[E\d+\]/.test(r.markdown));
-  assert.ok(/\[↗\]\(<https:\/\/todoist\.com\/app\/task\/t\d+>\)/.test(r.markdown), "task citations are links");
+  assert.ok(/\[\\\[T\d+\\\]\]\(<https:\/\/todoist\.com\/app\/task\/t\d+>\)/.test(r.markdown), "task citations are numbered links");
+  assert.ok(/\[\\\[T1\\\]\]/.test(r.markdown), "first task in the document is T1");
   assert.ok(!r.footnotes.includes("Todoist task"), "tasks stay out of the reference list");
 });
 
@@ -255,8 +261,8 @@ test("fix5: citations outside shared + own ids are removed, valid kept", async (
     return "### T\nplain B.\n";
   };
   const r = await prepareMeeting(p, base());
-  assert.ok(r.markdown.includes(`[↗](<${recs[0].url}>)`), r.markdown);
-  assert.ok(!r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B")).includes(`[↗](<${recs[1].url}>)`), "B's task never cited in A");
+  assert.ok(taskLink(recs[0].url).test(r.markdown), r.markdown);
+  assert.ok(!taskLink(recs[1].url).test(r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B"))), "B's task never cited in A");
   void orig;
 });
 
@@ -537,8 +543,8 @@ test("bare ids: own-project ids in prose become citations, other project's id re
   assert.ok(!/\[\d+(?:, ?\d+)*\](?!\()/.test(r.markdown.replace(/\[\^\d+\]/g, "")), r.markdown);
   assert.ok(!r.markdown.includes("[74]") && !r.markdown.includes("[12, 13]"), r.markdown);
   const a = r.markdown.slice(r.markdown.indexOf("## A"), r.markdown.indexOf("## B"));
-  for (const t of recs.slice(0, 3)) assert.ok(a.includes(`[↗](<${t.url}>)`), `${t.title} cited: ${a}`);
-  assert.ok(!r.markdown.includes(`[↗](<${recs[3].url}>)`), "other project's id removed, not cited");
+  for (const t of recs.slice(0, 3)) assert.ok(taskLink(t.url).test(a), `${t.title} cited: ${a}`);
+  assert.ok(!taskLink(recs[3].url).test(r.markdown), "other project's id removed, not cited");
 });
 
 test("note dates: vault evidence starts with Note modified (local date); missing stat is silent", async () => {

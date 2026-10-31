@@ -1000,7 +1000,7 @@ assert.ok(user.includes("- Todoist: 2 open, 1 completed in last 14 days"), "sour
 assert.ok(!/\(\d+ of \d+ tasks included\)/.test(user), "no budget suffix when nothing dropped");
 assert.strictEqual(result.sources[2].label, "Todoist: Due one (Grant)");
 assert.ok(!result.footnotes.includes("Todoist task"), "a task is cited inline, not in the footnotes, got " + result.footnotes);
-assert.ok(result.markdown.includes("[↗](<https://app.todoist.com/app/task/3>)"), "task cited as an inline link, got " + result.markdown);
+assert.ok(result.markdown.includes("[\\[T1\\]](<https://app.todoist.com/app/task/2>)") && result.markdown.includes("[\\[T2\\]](<https://app.todoist.com/app/task/3>)"), "tasks cited as numbered inline links, got " + result.markdown);
 const cited = result.cited.find((s) => s.kind === "todoist");
 assert.strictEqual(cited.meta.year, "2026");
 assert.strictEqual(evidenceLabel({ source: { kind: "todoist", title: "T", project: "" } }), "Todoist: T");

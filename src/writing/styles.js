@@ -92,6 +92,7 @@ function natureAuthorList(authors) {
 }
 
 function formatReference(style, source) {
+  if (style === "none") return ""; // no citation style: nothing is listed as a reference
   const meta = (source && source.meta) || {};
   const authors = Array.isArray(meta.authors) ? meta.authors.filter((a) => typeof a === "string" && a.trim()) : [];
   const year = meta.year !== undefined && meta.year !== null && String(meta.year) !== "" ? String(meta.year) : null;
@@ -160,6 +161,7 @@ function formatReference(style, source) {
 const isTodoist = (source) => !!source && source.kind === "todoist";
 
 function formatInText(style, items) {
+  if (style === "none") return ""; // no citation style: no in-text markers
   const list = (Array.isArray(items) ? items : []).filter((it) => !isTodoist(it && it.source));
   if (style === "apa") {
     // writing-mode: task 4 fix — several sources share ONE bracket: (A, 2020; B, n.d.)
@@ -184,6 +186,7 @@ function formatInText(style, items) {
 }
 
 function planReferences(noteText, style, sources) {
+  if (style === "none") return { numbers: {}, added: [], edit: null }; // no citation style: nothing planned
   const text = typeof noteText === "string" ? noteText : "";
   const srcs = (Array.isArray(sources) ? sources : []).filter((s) => !isTodoist(s));
   const isNature = style === "nature";

@@ -1,3 +1,18 @@
+## 0.9.43 - 2026-11-04
+
+### Changed
+- **Collaborate writes in the style you ask for.** Drafts and rewrites follow your instruction instead of an evidence-report layout, and no longer says "based on the supplied evidence". Typed rewrite requests are passed through as-is instead of being reworded.
+- **Knowledge, suggestions and corrections are marked as such.** The assistant connects related notes, offers next steps, and flags conflicting or doubtful information, each clearly marked as suggestion or general knowledge. Claims about your own work still come only from your notes.
+- **Citation style None.** No citation markers, references or "Sources searched" footer are written.
+- **Todoist pull.** With Todoist ticked, Collaborate pulls a project, section or task into the open note from a pasted link or exact name — all its tasks, subtasks included — as plain linked bullets appended through Review draft. Completed tasks are pulled only when you ask and when Todoist reports where they belong.
+- **Todoist change.** With Todoist ticked, Collaborate can create, update, move, complete or reschedule tasks from what you write, with the same preview, Apply and Undo as Ask. Nothing reaches Todoist until you approve.
+- **Todoist tick covers rewrites and Check.** The Todoist tick now also applies to rewrites of a selection and to Check against my notes. Presets that turn evidence off still skip it.
+### Fixed
+- **Ask keeps the names, titles and dates from a note it cites.** When a note is retrieved, its attendee section and opening lines now travel with it, so "who were the Mitacs reps we met recently?" names both people and their roles instead of saying they are not established.
+- **Undo reopens a completed task again.** Undo sent a Todoist command the API rejects, so undoing a completion failed; it now reopens the task and unchecks its task line.
+- Live check (Nov 4, 2026, test vault, real Todoist): the same Mitacs question answered by the older build named nobody, and by this build named Joanne Tejeda (Strategic Partnership Advisor) and Chris Lannon (Director of Strategic Partnerships); a section pulled by link and by exact name gave 13 bullets with its 8 subtasks, plain and not linked to sync; ambiguous and unknown names stopped with a clear message; a create applied to a scratch project and Undo removed it and its task line, a completion applied and Undo reopened it; citation style None wrote no markers, footnotes, references or "Sources searched" footer; a wrong due date was corrected against the note's date.
+- Tests: `npm test` passes 87/87.
+
 ## 0.9.42 - 2026-10-30
 ### Changed
 - **Todoist task citations are numbered.** A cited task now shows as its own number, **[T1]**, [T2]…, linked to the task, instead of a bare ↗. Tasks are numbered in the order they first appear; the same task keeps the same number everywhere in the note, including across later drafts applied to it, and new tasks continue from the highest number already there. Tasks still never appear in footnotes or References and never use up a note's footnote number.

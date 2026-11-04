@@ -8,7 +8,7 @@ const LOOKUP_SCHEMA = {
   required: ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence"],
   properties: {
     needsTodoist: { type: "boolean" },
-    kind: { type: "string", enum: ["none", "question", "change", "duplicates"] },
+    kind: { type: "string", enum: ["none", "question", "change", "duplicates", "pull"] },
     filters: {
       type: "object",
       additionalProperties: false,
@@ -36,7 +36,8 @@ function lookupPrompt(prompt, historyText, today = "") {
     ...(today ? [`Today's date is ${today} (${weekday}). Turn relative dates into dueFrom/dueTo: "today" means dueFrom and dueTo are both today's date; "tomorrow", "this week" and similar map to their date range; "overdue" means dueTo is yesterday.`] : []),
     "needsTodoist=false (kind \"none\") when the message is only about vault notes, writing or general chat.",
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
-    "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
+    "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks; \"pull\" = asks to bring, list, copy or insert the tasks of a named or linked Todoist project, section or task into the note as they are (no analysis, summary or rewrite of them).",
+    "A request to summarize, analyze, group by theme or write prose about those tasks stays \"question\". A request that contains a Todoist link (todoist.com/app/...) and says bring/pull/import/copy/list/add the tasks is \"pull\". needsTodoist must be true for \"pull\".",
     "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = Todoist API number, inverted from what users say: user P1 (urgent) = 4, P2 = 3, P3 = 2, P4 (normal) = 1, so \"my P1 tasks\" means priority 4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
     "Follow-up: when the message follows up on a previous answer that was about Todoist tasks (the conversation shows it), set needsTodoist=true and kind \"question\" (\"change\" if it asks to change them), and carry over that question's filters (dueFrom/dueTo, projects, labels and words such as a person's name) unless the user changes them; add the new words (e.g. \"Jim\") to the carried-over ones.",
 "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\").",

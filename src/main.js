@@ -2899,9 +2899,9 @@ function normalizeStableSettings(input = {}) {
   const rawLength = typeof source.writingDraftLength === "string" ? source.writingDraftLength.trim().toLowerCase() : "";
   result.writingDraftLength = rawLength === "brief" || rawLength === "detailed" ? rawLength : "standard";
   result.writingCollaborateMode = source.writingCollaborateMode === true;
-  // writing-mode: task 4 citation style — keep only footnotes|apa|nature, else footnotes
+  // writing-mode: task 4 citation style — keep only footnotes|apa|nature|none, else footnotes
   result.writingCitationStyle =
-    source.writingCitationStyle === "apa" || source.writingCitationStyle === "nature"
+    source.writingCitationStyle === "apa" || source.writingCitationStyle === "nature" || source.writingCitationStyle === "none"
       ? source.writingCitationStyle
       : "footnotes";
   result.writingUseVault = source.writingUseVault !== false;
@@ -11097,6 +11097,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     // Semantic index records already carry bounded temporal metadata; never scan vault files to hydrate relevance.
     const scopedCandidates = filterContextCandidatesForPlan(semanticRawCandidates, profile);
     let uniqueCandidates;
+    let companionCount = 0;
     if (retrievalMode === "chat") {
       // D5 chat-only union: the semantic window plus a lexical window over the
       // SAME guarded `usableIndex` snapshot. Other modes keep the existing
@@ -11133,11 +11134,60 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         if (existing) unionItems.push(existing);
       }
       uniqueCandidates = deduplicateSemanticRetrievalCandidates(unionItems);
+      // Chat note companions: pull each selected note's attendee/people section
+      // and its first evidence chunk along with the selected siblings, so a
+      // cited note's people are present in the model's context. Companions are
+      // ranked right after their note's highest-scored chunk so the per-note
+      // diversify passes keep them once the trim limit makes room.
+      const companionBuilder = (chunk) => Object.assign({
+        chunk,
+        useNoteCreatedTime,
+        recency: recencyBoost(contextCandidateFreshnessAt({ chunk, useNoteCreatedTime }))
+      }, contextCandidateScopeMetadata(chunk, profile, {}));
+      const companions = buildChatNoteCompanionCandidates(uniqueCandidates, usableIndex, companionBuilder);
+      companionCount = companions.length;
+      if (companionCount) {
+        const companionsByPath = new Map();
+        for (const item of companions) {
+          const path = String(item.chunk.path || "");
+          let list = companionsByPath.get(path);
+          if (!list) { list = []; companionsByPath.set(path, list); }
+          list.push(item);
+        }
+        const anchorIndexByPath = new Map();
+        for (let i = 0; i < uniqueCandidates.length; i += 1) {
+          const item = uniqueCandidates[i];
+          const chunk = item.chunk || item;
+          const path = String(chunk.path || "");
+          if (!path) continue;
+          const score = Number(item.semantic || 0);
+          const current = anchorIndexByPath.get(path);
+          if (current === undefined || score > Number((uniqueCandidates[current].chunk || uniqueCandidates[current]).semantic || 0)) {
+            anchorIndexByPath.set(path, i);
+          }
+        }
+        const placed = [];
+        const companionsEmitted = new Set();
+        for (let i = 0; i < uniqueCandidates.length; i += 1) {
+          const item = uniqueCandidates[i];
+          placed.push(item);
+          const chunk = item.chunk || item;
+          const path = String(chunk.path || "");
+          if (path && anchorIndexByPath.get(path) === i && !companionsEmitted.has(path)) {
+            const noteCompanions = companionsByPath.get(path);
+            if (noteCompanions) {
+              for (const comp of noteCompanions) placed.push(comp);
+              companionsEmitted.add(path);
+            }
+          }
+        }
+        uniqueCandidates = placed;
+      }
     } else {
       const candidates = rankContextCandidates(scopedCandidates.filter(semanticCandidateIsAdmissible)).slice(0, poolSize);
       uniqueCandidates = deduplicateSemanticRetrievalCandidates(candidates);
     }
-    const selected = selectContextCandidatesForPlan(uniqueCandidates, requestedLimit, plan)
+    const selected = selectContextCandidatesForPlan(uniqueCandidates, requestedLimit + companionCount, plan)
       .filter((item) => item && typeof item === "object")
       .map((item) => annotateContextChunk(item, profile));
     const integrityRejected = index.filter((chunk) => !usableIndex.includes(chunk)).map((chunk) => ({ chunk, semantic: 0, reasonCode: "integrity-quarantine" }));
@@ -24149,6 +24199,9 @@ class SemanticTodoistView extends ItemView {
       const { typedRewriteInstruction } = require("./writing/rewrite.js");
 
       const isChat = apply === "chat";
+      // writing-mode: sections C & D — Todoist pull/change branches run only for a typed sidebar write
+      // with Todoist ticked: not a preset override, not a meeting, not a pinned range, not chat apply.
+      const todoistGate = this.plugin.settings.writingUseTodoist === true && !overrideInstruction && !meetingTemplate && !pinned && !isChat;
       // writing-mode: task 4 only a pinned range rewrites or checks; a plain sidebar Write stays a draft
       const mode = isChat ? "check" : (pinned ? "rewrite" : "draft");
 
@@ -24266,10 +24319,11 @@ class SemanticTodoistView extends ItemView {
       try {
         // Same per-message look-up as Ask: a standalone search query, whether the last evidence can be reused, and the notes the matched tasks came from (never the tasks).
         let lookup = null;
+        let turn = null;
         let taskSourcePaths = [];
         try {
           // Meeting runs skip the look-up entirely.
-          const turn = !meetingTemplate && typeof this.plugin.todoistChatTurn === "function" ? await this.plugin.todoistChatTurn(instruction, previousMessages) : null;
+          turn = !meetingTemplate && typeof this.plugin.todoistChatTurn === "function" ? await this.plugin.todoistChatTurn(instruction, previousMessages) : null;
           lookup = turn?.lookup || null;
           const seenPaths = new Set();
           const addSource = (notePath) => {
@@ -24290,36 +24344,124 @@ class SemanticTodoistView extends ItemView {
           lookup = null;
           taskSourcePaths = [];
         }
+        // writing-mode: sections C & D — Todoist pull / change routing on the typed sidebar write gate.
+        let pullResult = null;
+        if (todoistGate && lookup?.kind === "pull") {
+          if (turn?.unavailable || !turn?.snapshot) {
+            this.replaceLastAssistantMessage("Todoist isn't connected or couldn't be reached, so I couldn't pull those tasks.");
+            this.setStatus("Ready");
+            return;
+          }
+          const { resolveTodoistTarget, targetRecords, renderPullList } = require("./writing/todoist-evidence.js");
+          const target = resolveTodoistTarget(instruction, turn.snapshot);
+          if (!target) {
+            this.replaceLastAssistantMessage("I couldn't find that Todoist project, section or task in your Todoist data. Paste its link or use its exact name.");
+            this.setStatus("Ready");
+            return;
+          }
+          if (target.ambiguous) {
+            const list = target.ambiguous.map((c) => `- ${c.kind}: ${c.name}`).join("\n");
+            this.replaceLastAssistantMessage(`Several Todoist items match your instruction. Which one did you mean?\n${list}`);
+            this.setStatus("Ready");
+            return;
+          }
+          let completed = [];
+          const includeCompleted = lookup.filters?.includeCompleted === true;
+          if (includeCompleted) {
+            try {
+              completed = (await this.plugin.getMeetingTodoistRaw({ completedDays: 90 })).completed || [];
+            } catch (error) {
+              // continue open-only when completed data can't be fetched
+            }
+          }
+          const { records, skippedCompleted } = targetRecords({
+            snapshot: turn.snapshot,
+            completed,
+            target,
+            taskUrl: (id) => todoistTaskUrl(id, this.plugin.settings),
+            includeCompleted,
+          });
+          if (!records || !records.length) {
+            this.replaceLastAssistantMessage(`${target.name} has no open tasks.`);
+            this.setStatus("Ready");
+            return;
+          }
+          pullResult = {
+            markdown: renderPullList(records),
+            footnotes: "",
+            sourcesBlock: "",
+            sources: [],
+            cited: [],
+            numbers: {},
+            dropped: 0,
+            citationStyle: "footnotes",
+            notice: `Pulled ${records.length} task(s) from "${target.name}".` + (skippedCompleted > 0 && includeCompleted ? ` ${skippedCompleted} completed task(s) were left out because Todoist did not say which ${target.kind} they belong to.` : ""),
+          };
+        }
+        if (todoistGate && lookup?.kind === "change") {
+          if (turn?.unavailable || !turn?.snapshot) {
+            this.replaceLastAssistantMessage("Todoist isn't connected, so I can't change tasks.");
+            this.setStatus("Ready");
+            return;
+          }
+          // writing-mode: section D — hand off to the same Ask path (chat with todoist + web off), then the
+          // TodoistChangesModal Apply/Undo flow. Nothing reaches Todoist before Apply.
+          const chatOptions = { webSearchMode: "off", previousContext: this.lastContext };
+          chatOptions.todoist = true;
+          const chatResult = await this.plugin.chat(instruction, active, previousMessages, "chat-query", chatOptions);
+          if (chatResult.todoistChanges) {
+            const modal = new TodoistChangesModal(this.plugin.app, this.plugin, chatResult.todoistChanges, (summary, applied) => {
+              this.addMessage("assistant", summary);
+              if (!applied?.undoable) return;
+              const record = this.plugin.settings?.todoistChatLastUndo;
+              this.addMessageAction("Undo last Todoist change", async () => { if (this.plugin.settings?.todoistChatLastUndo !== record) return; await this.plugin.undoLastTodoistChanges(true); this.renderMessages(); }, () => !record || this.plugin.settings?.todoistChatLastUndo !== record);
+            });
+            modal.open();
+            this.replaceLastAssistantMessage(`Review ${chatResult.todoistChanges.rows.length} change${chatResult.todoistChanges.rows.length === 1 ? "" : "s"} before anything is applied to Todoist.`);
+          } else {
+            this.replaceLastAssistantMessage(chatResult.answer);
+          }
+          this.setStatus("Collaboration complete.");
+          return;
+        }
         const searchQuery = typeof lookup?.searchQuery === "string" ? lookup.searchQuery.trim().slice(0, 300) : "";
         const reuse = lookup?.reuseEvidence === true && Array.isArray(this.lastWriteEvidence) && this.lastWriteEvidence.length > 0;
         // writing-mode: task 4 the request carries the resolved instruction and the citation style
-        const result = meetingTemplate ? await this.plugin.prepareMeeting({
-          instruction,
-          template: meetingTemplate,
-          active,
-          citationStyle,
-          webSearchMode,
-          useVault,
-          useContext,
-          useResearch,
-          onProgress: (k, n) => this.setStatus(`Preparing meeting doc\u2026 ${k} of ${n} projects`),
-        }) : await this.plugin.writeWithEvidence(instruction, {
-          history,
-          ...(searchQuery ? { searchQuery } : {}),
-          ...(reuse ? { reuseEvidence: true, previousEvidence: this.lastWriteEvidence } : {}),
-          ...(lookup ? { taskSourcePaths } : {}),
-          mode,
-          citationStyle,
-          active,
-          webSearchMode,
-          useVault,
-          useContext,
-          useResearch,
-          useTodoist: evidence === "off" || pinned || isChat ? false : this.plugin.settings.writingUseTodoist === true,
-          // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
-          ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
-        });
-        if (Array.isArray(result?.evidence)) this.lastWriteEvidence = result.evidence;
+        let result;
+        if (pullResult) {
+          result = pullResult;
+        } else if (meetingTemplate) {
+          result = await this.plugin.prepareMeeting({
+            instruction,
+            template: meetingTemplate,
+            active,
+            citationStyle,
+            webSearchMode,
+            useVault,
+            useContext,
+            useResearch,
+            onProgress: (k, n) => this.setStatus(`Preparing meeting doc\u2026 ${k} of ${n} projects`),
+          });
+        } else {
+          result = await this.plugin.writeWithEvidence(instruction, {
+            history,
+            ...(searchQuery ? { searchQuery } : {}),
+            ...(reuse ? { reuseEvidence: true, previousEvidence: this.lastWriteEvidence } : {}),
+            ...(lookup ? { taskSourcePaths } : {}),
+            mode,
+            citationStyle,
+            active,
+            webSearchMode,
+            useVault,
+            useContext,
+            useResearch,
+            useTodoist: evidence === "off" ? false : this.plugin.settings.writingUseTodoist === true,
+            // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
+            ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
+          });
+        }
+        // A pull has no evidence list to persist; a model result's evidence is stored for reuse.
+        if (!pullResult && Array.isArray(result?.evidence)) this.lastWriteEvidence = result.evidence;
 
         // writing-mode: task 4 a pinned range drives the rewrite/check path: preview modal, chat answer, or continuation
         // Project notices first so the note-closed early returns below still show them.
@@ -24337,9 +24479,10 @@ class SemanticTodoistView extends ItemView {
           if (isChat) {
             // chat (Check against my notes): assistant message, no modal, no edit
             const { formatReference } = require("./writing/styles.js");
-            const refs = citationStyle === "footnotes"
-              ? (result.footnotes || "")
-              : ((result.cited || []).map((s) => formatReference(citationStyle, s)).filter(Boolean).join("\n"));
+            const refs = citationStyle === "none" ? ""
+              : (citationStyle === "footnotes"
+                ? (result.footnotes || "")
+                : ((result.cited || []).map((s) => formatReference(citationStyle, s)).filter(Boolean).join("\n")));
             const parts = [result.markdown || "", refs, result.sourcesBlock || ""].filter(Boolean);
             this.replaceLastAssistantMessage(parts.join("\n\n"));
             this.renderRelevantNotes(result.sources || []);
@@ -24351,7 +24494,7 @@ class SemanticTodoistView extends ItemView {
           let references = [];
           if (citationStyle === "footnotes") {
             references = (result.footnotes || "").split("\n").filter(Boolean);
-          } else {
+          } else if (citationStyle !== "none") {
             const planned = planReferences(active.text, citationStyle, result.cited || []);
             references = (planned && planned.added) || [];
           }
@@ -24410,7 +24553,7 @@ class SemanticTodoistView extends ItemView {
                   // existing reference-list section); the references edit keeps
                   // its planned offsets against the same pre-edit text
                   const changes = [{ from: draftAt, to: draftAt, text: draftPlan.text }];
-                  if (citationStyle !== "footnotes") {
+                  if (citationStyle !== "footnotes" && citationStyle !== "none") {
                     const { planReferences } = require("./writing/styles.js");
                     const planned = planReferences(body, citationStyle, result.cited || []);
                     if (planned && planned.edit) {
@@ -24437,7 +24580,7 @@ class SemanticTodoistView extends ItemView {
           const plan = planInsertion(currentEditor, recorded, currentPath);
           if (plan.mode === "recorded" || plan.mode === "cursor") {
             // writing-mode: task 4 a non-footnote style adds its reference list in the same transaction as the insert
-            if (citationStyle !== "footnotes") {
+            if (citationStyle !== "footnotes" && citationStyle !== "none") {
               const { planReferences } = require("./writing/styles.js");
               const currentText = currentEditor.getValue ? currentEditor.getValue() : "";
               const planned = planReferences(currentText, citationStyle, result.cited || []);
@@ -24472,7 +24615,7 @@ class SemanticTodoistView extends ItemView {
         // writing-mode: sources searched block shown in the sidebar message exactly as proposed for the note
         this.replaceLastAssistantMessage(initialDraft);
         let draftRefs = [];
-        if (citationStyle !== "footnotes") {
+        if (citationStyle !== "footnotes" && citationStyle !== "none") {
           const { planReferences: planDraftRefs } = require("./writing/styles.js");
           const refEditor = findMarkdownEditorForPath(this.plugin.app, currentPath, null);
           draftRefs = (planDraftRefs(refEditor && refEditor.getValue ? refEditor.getValue() : "", citationStyle, result.cited || []) || {}).added || [];
@@ -24612,7 +24755,7 @@ class SemanticTodoistView extends ItemView {
             } else {
               changes.push({ from: previewPlan.from, to: previewPlan.to, text: text });
             }
-            if (citationStyle !== "footnotes") {
+            if (citationStyle !== "footnotes" && citationStyle !== "none") {
               const { planReferences } = require("./writing/styles.js");
               const planned = planReferences(body, citationStyle, result.cited || []);
               if (citationStyle === "nature") {
@@ -24675,7 +24818,7 @@ class SemanticTodoistView extends ItemView {
       changes.push({ from: plan.from, to: plan.to, text: text });
     }
     // non-footnote: combine the passage edit with the reference edit in one transaction
-    if (citationStyle !== "footnotes") {
+    if (citationStyle !== "footnotes" && citationStyle !== "none") {
       const { planReferences } = require("./writing/styles.js");
       const planned = planReferences(currentText, citationStyle, result.cited || []);
       if (citationStyle === "nature") {
@@ -25659,6 +25802,7 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
         dropdown.addOption("footnotes", "Footnotes");
         dropdown.addOption("apa", "APA 7");
         dropdown.addOption("nature", "Nature");
+        dropdown.addOption("none", "None");
         dropdown.setValue(this.plugin.settings.writingCitationStyle || "footnotes").onChange(async (value) => {
           this.plugin.settings.writingCitationStyle = value;
           await this.plugin.saveSettings();
@@ -53228,6 +53372,81 @@ function buildLexicalUnionRows(usableIndex, profile, useNoteCreatedTime) {
     lexicalSelectorRows.push({ evidenceId, text: String(chunk.text || "") });
   }
   return { lexicalCandidateById, lexicalSelectorRows };
+}
+
+// Chat note companions: when a note's chunks are selected for chat context,
+// pull the note's attendee/people section and its first evidence chunk along
+// with the selected siblings, so a cited note's people are present in context.
+// Pure: takes the selected union items, the usable index snapshot, and a
+// candidate builder shaped like buildLexicalUnionRows' lexicalCandidateById
+// entries; returns the extra items so annotate/finalize/diversify stay
+// unchanged. scope/stale rules come from semanticRetrievalChunkEligible plus
+// contextCandidateScopeMetadata applied by the builder.
+// shortcut: companions capped at 2 per note and 6 total; the caller raises the
+// trim limit by the count actually added (never more than +6).
+function buildChatNoteCompanionCandidates(selectedItems = [], usableIndex = [], buildCandidate) {
+  const ATTENDEE_SECTION = /attend|participant|present|people|who/i;
+  const MAX_COMPANIONS_PER_NOTE = 2;
+  const MAX_COMPANIONS_TOTAL = 6;
+  const isIndexablePath = (path) => Boolean(path && String(path).length > 0);
+  const selectedById = new Map();
+  const noteBestScore = new Map();
+  for (const item of selectedItems || []) {
+    const chunk = item.chunk || item;
+    const evidenceId = String(chunk.evidenceId || chunk.id || "");
+    if (evidenceId && !selectedById.has(evidenceId)) selectedById.set(evidenceId, item);
+    const path = String(chunk.path || "");
+    if (!path) continue;
+    const score = Number(item.semantic || 0);
+    const current = noteBestScore.get(path);
+    if (current === undefined || score > current) noteBestScore.set(path, score);
+  }
+  const notePaths = [...noteBestScore.keys()].sort((a, b) => noteBestScore.get(b) - noteBestScore.get(a));
+  const companions = [];
+  const companionById = new Set(selectedById.keys());
+  for (const path of notePaths) {
+    if (companions.length >= MAX_COMPANIONS_TOTAL) break;
+    let count = 0;
+    const noteChunks = usableIndex.filter((chunk) => chunk && String(chunk.path || "") === path);
+    const picks = [];
+    // (a) attendee / participant / present / people / who section chunks, in index order.
+    for (const chunk of noteChunks) {
+      if (count >= MAX_COMPANIONS_PER_NOTE) break;
+      const evidenceId = String(chunk.evidenceId || chunk.id || "");
+      if (!evidenceId || companionById.has(evidenceId)) continue;
+      if (!semanticRetrievalChunkEligible(chunk, { isIndexablePath })) continue;
+      if (!ATTENDEE_SECTION.test(String(chunk.section || ""))) continue;
+      picks.push(chunk);
+      companionById.add(evidenceId);
+      count += 1;
+    }
+    // (b) first non-metadata evidence chunk of the note (lowest lineStart).
+    if (count < MAX_COMPANIONS_PER_NOTE) {
+      const firstEvidence = noteChunks
+        .slice()
+        .sort((left, right) => Number(left.lineStart || 0) - Number(right.lineStart || 0))
+        .find((chunk) => {
+          const evidenceId = String(chunk.evidenceId || chunk.id || "");
+          if (!evidenceId || companionById.has(evidenceId)) return false;
+          if (!semanticRetrievalChunkEligible(chunk, { isIndexablePath })) return false;
+          if (chunk.metadataOnly === true) return false;
+          if (String(chunk.evidenceEligibility || "").toLowerCase() === "metadata-only") return false;
+          return true;
+        });
+      if (firstEvidence) {
+        picks.push(firstEvidence);
+        companionById.add(String(firstEvidence.evidenceId || firstEvidence.id || ""));
+        count += 1;
+      }
+    }
+    for (const chunk of picks) {
+      if (companions.length >= MAX_COMPANIONS_TOTAL) break;
+      const item = typeof buildCandidate === "function" ? buildCandidate(chunk) : { chunk };
+      item.companionForPath = path;
+      companions.push(item);
+    }
+  }
+  return companions;
 }
 
 function taskWorkflowSelectScoreEvidence(ranked, actionText, options = {}) {

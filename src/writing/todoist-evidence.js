@@ -93,29 +93,7 @@ function buildTaskRecords({ snapshot, completed = [], completedDays = 14, projec
   const titles = new Map(all.map((t) => [String(t.id), singleLine(t.content)]));
   const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - completedDays);
   const seen = new Set();
-  const mk = (t) => {
-    const d = String(t.description || "");
-    const r = {
-      id: String(t.id),
-      title: singleLine(t.content),
-      projectId: String(t.projectId || ""),
-      projectName: projectNames.get(String(t.projectId)) || "Unknown project",
-      sectionName: sectionNames.get(String(t.sectionId)) || "",
-      parentId: String(t.parentId || ""),
-      parentTitle: titles.get(String(t.parentId)) || "",
-      status: "open",
-      due: t.dueDate || "",
-      deadline: t.deadlineDate || "",
-      priority: t.priority,
-      labels: t.labels || [],
-      completedAt: t.completedAt || "",
-      description: stripSources(d).slice(0, DESC_LIMIT),
-      notePaths: notePathsFromDescription(d),
-      url: typeof taskUrl === "function" ? taskUrl(String(t.id)) : ""
-    };
-    r.status = taskStatus(r, now);
-    return r;
-  };
+  const mk = (t) => mkRecord(t, projectNames, sectionNames, titles, taskUrl, now);
   let records = [];
   for (const t of snap.tasks || []) {
     if (t.completedAt || seen.has(String(t.id))) continue;
@@ -216,6 +194,31 @@ function taskEvidenceText(r) {
   return r.description ? `${head}\n${singleLine(r.description)}` : head;
 }
 
+// Shared record builder used by buildTaskRecords and targetRecords (identical shape).
+function mkRecord(t, projectNames, sectionNames, titles, taskUrl, now) {
+  const d = String(t.description || "");
+  const r = {
+    id: String(t.id),
+    title: singleLine(t.content),
+    projectId: String(t.projectId || ""),
+    projectName: projectNames.get(String(t.projectId)) || "Unknown project",
+    sectionName: sectionNames.get(String(t.sectionId)) || "",
+    parentId: String(t.parentId || ""),
+    parentTitle: titles.get(String(t.parentId)) || "",
+    status: "open",
+    due: t.dueDate || "",
+    deadline: t.deadlineDate || "",
+    priority: t.priority,
+    labels: t.labels || [],
+    completedAt: t.completedAt || "",
+    description: stripSources(d).slice(0, DESC_LIMIT),
+    notePaths: notePathsFromDescription(d),
+    url: typeof taskUrl === "function" ? taskUrl(String(t.id)) : ""
+  };
+  r.status = taskStatus(r, now);
+  return r;
+}
+
 function budgetRecords(records, instruction, maxChars = 6000) {
   const words = String(instruction || "").toLowerCase().split(/\W+/).filter((w) => w.length > 2);
   const rank = (r) => {
@@ -260,4 +263,221 @@ function renderTaskList(records, followUps = new Map()) {
   return out.join("\n");
 }
 
-module.exports = { buildTaskRecords, taskStatus, notePathsFromDescription, followUpMap, groupByProject, taskEvidenceText, budgetRecords, renderTaskList };
+const escapeRegExp = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Matches a Todoist task / project / section link on app.todoist.com or todoist.com,
+// plus todoist://task?id=. Captures kind, the raw id segment (slug allowed), an optional
+// query string, or the todoist:// id. Trailing punctuation is stripped by linkId.
+const TODOIST_LINK = /(?:https?:\/\/(?:app\.)?todoist\.com\/app\/(task|project|section)\/([^\s#?]+)(?:\?([^\s#]*))?)|(?:todoist:\/\/task\?id=([^\s#&]+))/gi;
+const stripTrailing = (s) => String(s).replace(/[^A-Za-z0-9]+$/, "");
+const stripSlug = (s) => { const i = String(s).lastIndexOf("-"); return i < 0 ? String(s) : String(s).slice(i + 1); };
+const linkId = (raw) => stripSlug(stripTrailing(raw));
+
+// Resolves a Todoist target from an instruction: a link (first match wins) or a name.
+// Returns { kind, id, name, projectId }, { ambiguous: [...] } or null.
+function resolveTodoistTarget(text, snapshot) {
+  const snap = snapshot || {};
+  const tasks = snap.tasks || [];
+  const projects = snap.projects || [];
+  const sections = snap.sections || [];
+  const taskById = new Map(tasks.map((t) => [String(t.id), t]));
+  const projectById = new Map(projects.map((p) => [String(p.id), p]));
+  const sectionById = new Map(sections.map((s) => [String(s.id), s]));
+
+  TODOIST_LINK.lastIndex = 0;
+  const m = TODOIST_LINK.exec(String(text || ""));
+  if (m) {
+    let kind = null; let rawId = null; let projectId = null;
+    if (m[4] !== undefined) { kind = "task"; rawId = m[4]; }
+    else {
+      kind = m[1]; rawId = m[2]; const query = m[3] || "";
+      if (kind === "project") {
+        const sec = /(?:^|&)section=([^&]*)/.exec(query);
+        if (sec) {
+          kind = "section";
+          const s = sectionById.get(String(stripTrailing(sec[1])));
+          if (s) return { kind: "section", id: String(s.id), name: s.name, projectId: String(s.projectId || "") };
+          kind = null; // section id not in snapshot: link does not resolve
+        } else {
+          projectId = String(rawId);
+        }
+      }
+    }
+    if (kind) {
+      const id = linkId(rawId);
+      if (id) {
+        if (kind === "task") {
+          const t = taskById.get(String(id));
+          if (t) return { kind: "task", id: String(t.id), name: t.content, projectId: String(t.projectId || "") };
+        } else if (kind === "section") {
+          const s = sectionById.get(String(id));
+          if (s) return { kind: "section", id: String(s.id), name: s.name, projectId: String(s.projectId || "") };
+        } else {
+          const p = projectById.get(String(id));
+          if (p) return { kind: "project", id: String(p.id), name: p.name, projectId: String(p.id) };
+        }
+      }
+    }
+    // link found but did not resolve: fall through to name matching below
+  }
+
+  const phrase = (name) => new RegExp(`\\b${escapeRegExp(name)}\\b`, "i");
+  const candidates = []; const seen = new Set();
+  const add = (kind, id, name, projectId) => {
+    const key = `${kind}:${String(id)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ kind, id: String(id), name, projectId: String(projectId || "") });
+  };
+  for (const s of sections) {
+    const name = String(s.name || "");
+    if (name.length < 3) continue;
+    if (phrase(name).test(String(text))) add("section", s.id, name, s.projectId);
+  }
+  for (const p of projects) {
+    const name = String(p.name || "");
+    if (name.length < 3) continue;
+    if (phrase(name).test(String(text))) add("project", p.id, name, p.id);
+  }
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  return { ambiguous: candidates };
+}
+
+// Returns every open task of the target (no sampling, no window, no cap), plus matching
+// completed tasks when includeCompleted is true. Keeps snapshot order; no sub-project merge.
+function targetRecords({ snapshot, completed = [], target, taskUrl, includeCompleted = false }) {
+  const snap = snapshot || {};
+  const now = new Date();
+  const tasks = snap.tasks || [];
+  const projects = snap.projects || [];
+  const projectNames = new Map(projects.map((p) => [String(p.id), p.name]));
+  const projectParent = new Map(projects.map((p) => [String(p.id), String(p.parentId ?? p.parent_id ?? "")]));
+  const sectionNames = new Map((snap.sections || []).map((s) => [String(s.id), s.name]));
+  const byId = new Map(tasks.map((t) => [String(t.id), t]));
+  const titles = new Map(tasks.map((t) => [String(t.id), singleLine(t.content)]));
+  const children = new Map();
+  for (const t of tasks) {
+    const pid = String(t.parentId || "");
+    if (!children.has(pid)) children.set(pid, []);
+    children.get(pid).push(t);
+  }
+  const projectClosure = (rootId) => {
+    const out = new Set([String(rootId)]);
+    for (const [pid] of projectNames) {
+      let cur = pid; const seen = new Set();
+      while (cur && projectNames.has(cur) && !seen.has(cur)) {
+        if (cur === String(rootId)) { out.add(pid); break; }
+        seen.add(cur); cur = projectParent.get(cur) || "";
+      }
+    }
+    return out;
+  };
+  const collectDescendants = (rootIds) => {
+    const out = []; const seen = new Set(); const queue = rootIds.map(String);
+    while (queue.length) {
+      const id = queue.shift();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const t = byId.get(id);
+      if (t) out.push(t);
+      for (const c of (children.get(id) || [])) queue.push(String(c.id));
+    }
+    return out;
+  };
+  let rootIds = [];
+  if (target && target.kind === "task") rootIds = [String(target.id)];
+  else if (target && target.kind === "section") {
+    rootIds = tasks.filter((t) => String(t.sectionId) === String(target.id)).map((t) => String(t.id));
+  } else if (target && target.kind === "project") {
+    const closure = projectClosure(target.id);
+    rootIds = tasks.filter((t) => closure.has(String(t.projectId))).map((t) => String(t.id));
+  }
+  const selected = collectDescendants(rootIds);
+  const selectedSet = new Set(selected.map((t) => String(t.id)));
+  const records = [];
+  const seen = new Set();
+  for (const t of tasks) {
+    const id = String(t.id);
+    if (!selectedSet.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    records.push(mkRecord(t, projectNames, sectionNames, titles, taskUrl, now));
+  }
+  let skippedCompleted = 0;
+  if (includeCompleted) {
+    let matchCompleted;
+    if (target && target.kind === "section") {
+      const sid = String(target.id);
+      matchCompleted = (c) => String(c.sectionId || "") === sid;
+    } else if (target && target.kind === "project") {
+      const closure = projectClosure(target.id);
+      matchCompleted = (c) => closure.has(String(c.projectId || ""));
+    } else if (target && target.kind === "task") {
+      // A completed item attaches to a task target only as a child of the
+      // target task or of one of the target's open descendants (by parentId).
+      // Completed items without a usable parentId are skipped and counted.
+      const attachable = new Set(collectDescendants([String(target.id)]).map((t) => String(t.id)));
+      matchCompleted = (c) => {
+        const pid = String(c.parentId || "");
+        return Boolean(pid && attachable.has(pid));
+      };
+    } else {
+      matchCompleted = () => false;
+    }
+    for (const c of completed) {
+      const id = String(c.id || "");
+      if (!matchCompleted(c) || seen.has(id)) { skippedCompleted++; continue; }
+      seen.add(id);
+      records.push(mkRecord(c, projectNames, sectionNames, titles, taskUrl, now));
+    }
+  } else {
+    skippedCompleted = completed.length;
+  }
+  return { records, skippedCompleted };
+}
+
+// Plain bullets: - [title](url) · status [· due <label>], done shows `done <label>`.
+// Subtasks indented two spaces under a parent that is also in records. Section headers
+// (**<name>** / **No section**) only when records span more than one section.
+function renderPullList(records) {
+  if (!records || !records.length) return "";
+  const byId = new Map(records.map((r) => [r.id, r]));
+  const children = new Map(); const topLevel = [];
+  for (const r of records) {
+    const pid = String(r.parentId || "");
+    if (pid && byId.has(pid)) {
+      if (!children.has(pid)) children.set(pid, []);
+      children.get(pid).push(r);
+    } else {
+      topLevel.push(r);
+    }
+  }
+  const sectionKey = (r) => r.sectionName || "No section";
+  const distinct = []; const seenSec = new Set();
+  for (const r of records) {
+    const k = sectionKey(r);
+    if (!seenSec.has(k)) { seenSec.add(k); distinct.push(k); }
+  }
+  const multi = distinct.length > 1;
+  const out = []; let lastKey = null;
+  const line = (r, indent) => {
+    const due = r.status === "done" ? dueLabel(r.completedAt) : dueLabel(r.due);
+    const suffix = r.status === "done"
+      ? ` · done ${due}`
+      : ` · ${r.status}${due ? ` · due ${due}` : ""}`;
+    const title = singleLine(r.title);
+    const text = title ? markdownLinkText(title) : "(untitled task)";
+    return `${indent}- [${text}](${r.url})${suffix}`;
+  };
+  const emit = (r, indent) => {
+    if (indent === "" && multi) {
+      const k = sectionKey(r);
+      if (k !== lastKey) { out.push(`**${k}**`); lastKey = k; }
+    }
+    out.push(line(r, indent));
+    for (const c of (children.get(r.id) || [])) emit(c, indent + "  ");
+  };
+  for (const r of topLevel) emit(r, "");
+  return out.join("\n");
+}
+
+module.exports = { buildTaskRecords, taskStatus, notePathsFromDescription, followUpMap, groupByProject, taskEvidenceText, budgetRecords, renderTaskList, resolveTodoistTarget, targetRecords, renderPullList };

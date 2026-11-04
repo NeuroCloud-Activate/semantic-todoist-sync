@@ -211,6 +211,65 @@ function rewriteCitations(markdown, evidence, noteText, style = "footnotes") {
   const RANGE_RE = /^E(\d+)\s*[-–—]\s*(E)?(\d+)$/;
   const MARKER_RE = /( ?)\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*))\]( ?)/g;
   const eids = new Set(byEid.keys());
+  // citation style "none": strip every [En] marker (single, [E1, E2] group, dash
+  // range) and every todoist [T#] inline link; count an id as dropped only when
+  // it was unknown; collapse the whitespace left behind so nothing raw leaks.
+  // No footnotes, no reference list, no cited/numbers. Other styles are untouched.
+  if (style === "none") {
+    let dropped = 0;
+    // Protect inline code spans and fenced code blocks: [En] markers inside them are
+    // left untouched and table cell padding / code interiors are never collapsed.
+    // Only code spans are protected here (SPAN_RE also protects bare [En] brackets,
+    // which we intentionally strip in text).
+    const CODE_SPAN_RE = /(\`\`\`[\s\S]*?(?:\`\`\`|$)|~~~[\s\S]*?(?:~~~|$)|\`[^\`\n]*\`)/g;
+    // Marker without the surrounding-space groups: adjacent whitespace is left in
+    // place so the GONE collapse below joins words with a single space only next to
+    // a removed marker/link.
+    const MARKER_ONLY_RE = /\[((?:E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*(?:,\s*E\d+(?:\s*[-–—]\s*(?:E)?\d+)?\s*)*)*)\]/g;
+    const segments = String(markdown || "").split(CODE_SPAN_RE);
+    for (let i = 0; i < segments.length; i += 1) {
+      if (i % 2 === 0) {
+        // text segment: strip markers and todoist links, counting only unknown ids as dropped
+        segments[i] = segments[i]
+          .replace(MARKER_ONLY_RE, (match, inner) => {
+            if (!inner.trim()) return match; // leave empty bracket pairs [], [ ] untouched
+            const tokens = inner.split(",").map((s) => s.trim()).filter(Boolean);
+            for (const token of tokens) {
+              const rm = RANGE_RE.exec(token);
+              if (rm) {
+                const start = parseInt(rm[1], 10);
+                const end = parseInt(rm[3], 10);
+                if (start <= end && end - start + 1 <= RANGE_CAP) {
+                  for (let n = start; n <= end; n += 1) if (!byEid.has("E" + n)) dropped += 1;
+                } else {
+                  dropped += 1;
+                }
+                continue;
+              }
+              if (!byEid.has(token)) dropped += 1;
+            }
+            return GONE;
+          })
+          .replace(/\[\\\[T\d+\\\]]\(<[^>\n]*>\)/g, GONE);
+      }
+      // odd segments are code spans: untouched
+    }
+    let out = segments.join("");
+    // Collapse only the whitespace left next to a removed marker/link; code spans
+    // and table rows carry no GONE, so they are left alone.
+    out = out
+      .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]*\u0000[ \t]*(?:\r?\n|$)/gm, "")
+      .replace(/,[ \t]*\u0000[ \t]*,/g, ",")
+      .replace(/,[ \t]*\u0000(?=[ \t]*[)\].;:!?])/g, "")
+      .replace(/\(\s*\u0000\s*\)/g, GONE)
+      .replace(/([ \t]*)\u0000([ \t]*)/g, (m, before, after, at, whole) => {
+        const prev = whole.charAt(at - 1);
+        const next = whole.charAt(at + m.length);
+        if (at === 0 || prev === "\n" || next === "" || next === "\n" || /[.,;:!?)\]]/.test(next)) return "";
+        return before || after ? " " : "";
+      });
+    return { markdown: out, footnotes: "", used: [], cited: [], numbers: {}, dropped };
+  }
   const src = normalizeBareCitations(typeof markdown === "string" ? markdown : "", { allowed: eids, known: eids });
 
   // Collect marker groups first so apa/nature can plan reference numbers

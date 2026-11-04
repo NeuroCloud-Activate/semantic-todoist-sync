@@ -817,7 +817,7 @@ function testCollaborateSettingsTab() {
   assert(context > citation, 'Context folder comes after Citation style');
   assert(rescan > context, 'Rescan context folder comes after Context folder');
   assert(describe > rescan, 'Describe images comes after Rescan context folder');
-  for (const [value, label] of [['footnotes', 'Footnotes'], ['apa', 'APA 7'], ['nature', 'Nature']]) {
+  for (const [value, label] of [['footnotes', 'Footnotes'], ['apa', 'APA 7'], ['nature', 'Nature'], ['none', 'None']]) {
     assert(body.includes(`addOption("${value}", "${label}")`), `citation style offers ${value} as ${label}`);
   }
   assert(body.includes('this.plugin.settings.writingCitationStyle || "footnotes"'), 'citation style shows the saved value');
@@ -2451,10 +2451,10 @@ async function testMeetingTodoistPinnedAndMenuAndOverride() {
     view.pinned = { path: 'Notes/Meet.md', from: { line: 0, ch: 0 }, to: { line: 0, ch: 5 }, original: 'Hello' };
     view.promptEl.value = 'make it better';
     await view.write();
-    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, false, 'pinned rewrite');
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'pinned rewrite now follows the Todoist tick');
     view.pinned = null;
     await view.write({ instruction: 'q', apply: 'chat' });
-    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, false, 'chat check');
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'chat check now follows the Todoist tick');
     view.promptEl.value = 'plain';
     await view.write();
     assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'plain write follows setting');
@@ -2468,6 +2468,250 @@ async function testMeetingTodoistPinnedAndMenuAndOverride() {
     assert.strictEqual(plugin.writeCallCount(), 1);
   }
   console.log('PASS meeting-todoist-pinned-menu-override');
+}
+
+// ---- Todoist pull / change routing, design sections C & D ----
+
+// Snapshot builder: each entry is [sectionName, taskCount]; tasks get ids t{i}{j}.
+function buildTodoistSnapshot(sectionTasks) {
+  const tasks = []; const sections = []; let i = 1;
+  for (const [sectionName, count] of sectionTasks) {
+    const sid = 's' + i;
+    sections.push({ id: sid, name: sectionName, projectId: 'p1' });
+    for (let j = 0; j < count; j++) tasks.push({ id: 't' + String(i) + String(j), content: sectionName + ' task ' + String(j), sectionId: sid, projectId: 'p1' });
+    i += 1;
+  }
+  return { tasks, projects: [{ id: 'p1', name: 'Project One' }], sections };
+}
+
+async function testTodoistPullByLink() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 60]]);
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  // cursor at the end so Apply appends the draft at the end of the note
+  leaf.view.editor.getCursor = () => ({ line: 0, ch: leaf.view.editor.getValue().length });
+  const obs = require('obsidian');
+  obs.notices = [];
+  view.promptEl.value = 'pull the tasks in https://app.todoist.com/app/section/slug-s1';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for a pull');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'the review draft modal opens');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'review draft title');
+  const after = view.rewriteModal.after;
+  assert.ok(/^- \[/m.test(after), 'plain bullets present: ' + after.slice(0, 120));
+  assert(!after.includes('[ ]'), 'no checkboxes');
+  assert(!after.includes('#STsync'), 'no #STsync markers');
+  assert(!after.includes('oid::'), 'no oid markers');
+  const bullets = (after.match(/(^|\n)- \[/g) || []).length;
+  assert.strictEqual(bullets, 60, 'all 60 tasks present, got ' + bullets);
+  assert.ok(obs.notices.includes('Pulled 60 task(s) from "Section A".'), 'notice mentions count: ' + JSON.stringify(obs.notices));
+  leaf.view.editor.getCursor = () => ({ line: 0, ch: leaf.view.editor.getValue().length });
+  await view.rewriteModal.onApply(after);
+  assert.strictEqual(leaf.view.editor.getValue().slice(-after.length), after, 'apply appends the draft at the end of the note');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-pull-by-link');
+}
+
+async function testTodoistPullByName() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 3], ['Section B', 2]]);
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section B tasks';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for a pull');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'review draft modal opens');
+  const after = view.rewriteModal.after;
+  assert.ok(after.includes('Section B task 0'), 'resolved by exact name: ' + after.slice(0, 120));
+  assert(!after.includes('Section A task'), 'only the named section tasks are present');
+  const bullets = (after.match(/(^|\n)- \[/g) || []).length;
+  assert.strictEqual(bullets, 2, 'both section B tasks present, got ' + bullets);
+  console.log('PASS todoist-pull-by-name');
+}
+
+async function testTodoistPullUnknownLink() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  let writeCalls = 0; let chatCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.chat = async () => { chatCalls += 1; return { answer: 'x' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull https://app.todoist.com/app/section/does-not-exist';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call for an unknown link');
+  assert.strictEqual(chatCalls, 0, 'no chat call for an unknown link');
+  assert.ok(!view.rewriteModal, 'no review modal for an unknown link');
+  assert.ok(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === "I couldn't find that Todoist project, section or task in your Todoist data. Paste its link or use its exact name."), 'not-found message');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  console.log('PASS todoist-pull-unknown-link');
+}
+
+async function testTodoistPullAmbiguousName() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = { tasks: [], projects: [{ id: 'p1', name: 'Section A' }], sections: [{ id: 's1', name: 'Section A', projectId: 'p1' }] };
+  let writeCalls = 0; let chatCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.chat = async () => { chatCalls += 1; return { answer: 'x' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call for an ambiguous name');
+  assert.strictEqual(chatCalls, 0, 'no chat call for an ambiguous name');
+  assert.ok(!view.rewriteModal, 'no review modal for an ambiguous name');
+  const msg = view.messageLog.find((m) => m.role === 'assistant-replaced');
+  assert.ok(msg && msg.text.includes('- section: Section A') && msg.text.includes('- project: Section A'), 'ambiguous listing: ' + JSON.stringify(msg && msg.text));
+  assert.ok(msg && /Which one/.test(msg.text), 'asks which one: ' + JSON.stringify(msg && msg.text));
+  console.log('PASS todoist-pull-ambiguous-name');
+}
+
+async function testTodoistPullNotConnected() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ unavailable: true, lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } } });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call when Todoist is unavailable');
+  assert.ok(!view.rewriteModal, 'no review modal when Todoist is unavailable');
+  assert.ok(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === "Todoist isn't connected or couldn't be reached, so I couldn't pull those tasks."), 'not-connected message');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-pull-not-connected');
+}
+
+async function testTodoistPullNotTickedFallsThrough() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  // writingUseTodoist is not set: Todoist not ticked
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  let writeCalls = 0; let lastUseTodoist = null;
+  plugin.writeWithEvidence = async (inst, opts) => { writeCalls += 1; lastUseTodoist = opts.useTodoist; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 1, 'writeWithEvidence called when Todoist is not ticked');
+  assert.strictEqual(lastUseTodoist, false, 'useTodoist false when not ticked');
+  assert.ok(!view.messageLog.some((m) => m.role === 'assistant-replaced' && /^Pulled /.test(m.text)), 'no pull notice when not ticked');
+  console.log('PASS todoist-pull-not-ticked-falls-through');
+}
+
+async function testTodoistUseTodoistFollowsTickPinnedAndChat() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const draft = { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' };
+  // pinned run: writingUseTodoist ticked → writeWithEvidence receives useTodoist true
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    view.pinSelection(leaf.view.editor, 'Notes/Visible.md');
+    await view.write({ pinned: view.pinned });
+    assert.strictEqual(lastUseTodoist, true, 'pinned run useTodoist true when ticked');
+  }
+  // apply==='chat' run: writingUseTodoist ticked → useTodoist true
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    await view.write({ apply: 'chat' });
+    assert.strictEqual(lastUseTodoist, true, 'apply===chat run useTodoist true when ticked');
+  }
+  // evidence off run: useTodoist false even when ticked
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    await view.write({ evidence: 'off' });
+    assert.strictEqual(lastUseTodoist, false, 'evidence off run useTodoist false');
+  }
+  console.log('PASS todoist-use-todoist-follows-tick');
+}
+
+async function testTodoistChangeRoutesToAsk() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  const changes = { preview: { groups: [], summary: '1 change', deletes: [] }, rows: [{ id: 't10', sentence: 'Do x' }] };
+  let chatCalls = 0; let chatArgs = null; let applyCalls = 0;
+  plugin.chat = async (prompt, active, history, modelOperation, options) => {
+    if (!Array.isArray(history)) throw new TypeError('chat history must be a message array, got ' + typeof history);
+    chatCalls += 1;
+    chatArgs = { prompt, active, history, modelOperation, options };
+    return { answer: 'I will do it.', todoistChanges: changes };
+  };
+  plugin.applyTodoistChanges = async () => { applyCalls += 1; return { refused: false }; };
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'change', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  // a prior turn lives in the sidebar history; the change hand-off must forward the array, not the formatted string
+  view.messages = [{ role: 'user', text: 'previous turn' }];
+  view.promptEl.value = 'turn the checklist into tasks';
+  await view.write();
+  assert.strictEqual(chatCalls, 1, 'chat called once');
+  assert.strictEqual(chatArgs.prompt, 'turn the checklist into tasks', 'chat gets the instruction');
+  assert.strictEqual(chatArgs.active.text, 'hello world', 'chat gets the full open note text');
+  assert.strictEqual(chatArgs.modelOperation, 'chat-query', 'model operation is chat-query');
+  assert.strictEqual(chatArgs.options.todoist, true, 'chat options todoist true');
+  assert.strictEqual(chatArgs.options.webSearchMode, 'off', 'chat options web search off');
+  assert.ok(Array.isArray(chatArgs.history), 'chat history is a message array, not the formatted string: ' + chatArgs.history);
+  assert.strictEqual(chatArgs.history.length, 1, 'history carries the prior turns only');
+  assert.strictEqual(chatArgs.history[chatArgs.history.length - 1].text, 'previous turn', 'last history element is the previous turn');
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for change');
+  assert.strictEqual(applyCalls, 0, 'nothing applied to Todoist before the user clicks Apply');
+  const obs = require('obsidian');
+  const modal = obs.modalInstances.find((m) => m.changes === changes);
+  assert.ok(modal, 'TodoistChangesModal opened with the stub changes');
+  assert.strictEqual(modal.opened, true, 'modal opened');
+  const msg = view.messageLog.find((m) => m.role === 'assistant-replaced');
+  assert.ok(msg && /Review/.test(msg.text), 'sidebar tells the user to review changes: ' + JSON.stringify(msg && msg.text));
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-change-routes-to-ask');
+}
+
+async function testStyleNoneShowsNoReferences() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  plugin.settings.writingCitationStyle = 'none';
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'draft text', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'none', cited: [], numbers: {} }; };
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'draft a summary';
+  await view.write();
+  assert.strictEqual(writeCalls, 1, 'write still runs with style none');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'review draft modal opens');
+  assert.strictEqual(view.rewriteModal.references.length, 0, 'no References to add panel entries');
+  assert.strictEqual(view.rewriteModal.after, 'draft text', 'no reference list appended to the draft');
+  assert.ok(!/## References/.test(view.rewriteModal.after), 'no reference list appended');
+  console.log('PASS style-none-shows-no-references');
 }
 
 async function runTests() {
@@ -2576,6 +2820,15 @@ async function runTests() {
   await testRuntimeCheckDoesNotRecreateDefaults();
   testRunStaleErrorSetsStatus();
   await testMeetingTodoistPinnedAndMenuAndOverride();
+  await testTodoistPullByLink();
+  await testTodoistPullByName();
+  await testTodoistPullUnknownLink();
+  await testTodoistPullAmbiguousName();
+  await testTodoistPullNotConnected();
+  await testTodoistPullNotTickedFallsThrough();
+  await testTodoistUseTodoistFollowsTickPinnedAndChat();
+  await testTodoistChangeRoutesToAsk();
+  await testStyleNoneShowsNoReferences();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

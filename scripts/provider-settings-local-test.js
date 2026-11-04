@@ -309,8 +309,8 @@ assert.deepStrictEqual(
 const citationStyleSetting = collaborateSettings.find((setting) => setting.name === 'Citation style');
 assert.deepStrictEqual(
   citationStyleSetting?.control?.options,
-  [{ value: 'footnotes', label: 'Footnotes' }, { value: 'apa', label: 'APA 7' }, { value: 'nature', label: 'Nature' }],
-  'citation style dropdown stores footnotes/apa/nature behind the house labels'
+  [{ value: 'footnotes', label: 'Footnotes' }, { value: 'apa', label: 'APA 7' }, { value: 'nature', label: 'Nature' }, { value: 'none', label: 'None' }],
+  'citation style dropdown stores footnotes/apa/nature/none behind the house labels'
 );
 assert.strictEqual(citationStyleSetting?.control?.value, 'footnotes', 'citation style defaults to footnotes');
 assert.ok(collaborateSettings.some((setting) => setting.description === 'Web search provider and saving research notes: AI & Search tab.'), 'Collaborate tab points at the AI & Search tab');

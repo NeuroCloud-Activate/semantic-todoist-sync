@@ -314,3 +314,16 @@ The root `main.js` bundle is rebuilt by the coordinator once more after these fi
 - `styles.css`: changed by Task 4 (pin chip, preview grid, reference list, button bar) and listed in the Task 4 section, not in the table
 - Line numbers in the table's "current line" column: refreshed for this round by grepping `src/main.js` (every pointer was re-checked against the current file). 138 of the 141 rows now point at the `// writing-mode:` tag line of their own change; 3 point at the changed code because the tag itself is gone — row 50 (the Gemini schema-fallback retry, tagged on the main path), row 85 (the superseded row whose tag Task 5 deleted with the `Writing` section) and row 129 (the `renderAiSearch()` method, whose own tag went with that section). Four hunks are described by two rows each, because two rounds touched the same hunk: rows 65/113 (the pre-await capture of the insert position), 75/124 (the `vault` evidence branch), 77/132 (the request's instruction and citation style) and 79/133 (the pinned-range branch)
 - Concerns: the root `main.js` bundle is rebuilt by the coordinator once more after these final fixes (one `npm run build`), so it matches a fresh build of the current source
+
+## Collaborate assistant and Todoist — 2026-11-04
+
+| file | what changed |
+|---|---|
+| src/writing/write.js | three-way rule (evidence-only claims, marked knowledge/corrections, not-established), citation style none, stale comment removed |
+| src/writing/rewrite.js | typed instruction passes through as the instruction |
+| src/writing/citations.js and styles.js | citation style none |
+| src/main.js | normalizer + dropdown for none; write() routing for pull and change; useTodoist follows the tick |
+| src/writing/todoist-evidence.js | resolveTodoistTarget, targetRecords, renderPullList, shared mkRecord |
+| src/todoist/lookup.js | kind pull |
+| scripts/writing-todoist-pull-test.js | new test file for pull resolution and rendered lists; writing-write, writing-sidebar, writing-citations, writing-styles and provider-settings tests extended |
+| root main.js | stale built bundle — not edited here; must be rebuilt by the coordinator |

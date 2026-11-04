@@ -82,7 +82,7 @@ test("undo restores fields, moves back, reopens completed, deletes created secti
   assert.strictEqual(of("item_update", "t1").length, 1);
   assert.strictEqual(of("item_update", "t1")[0].args.priority, 1);
   assert.strictEqual(of("item_move", "t1")[0].args.section_id, "s1");
-  assert.strictEqual(of("item_reopen", "t2").length, 1);
+  assert.strictEqual(of("item_uncomplete", "t2").length, 1);
   assert.strictEqual(of("item_delete", "real1").length, 1);
   assert.strictEqual(of("section_delete", "sA").length, 1);
   assert.strictEqual(of("section_delete", "sB").length, 0);
@@ -143,15 +143,36 @@ test("undo of complete reopens although task is absent from active snapshot", ()
   const s = { tasks: [item()], projects: [], sections: [] };
   const r = buildApplyBatches([{ op: "complete", taskId: "t1", fields: {} }], s, s, uuid);
   const u = buildUndoBatches(r.undo, { tasks: [], projects: [], sections: [] }, uuid);
-  assert.deepStrictEqual(all(u).map((c) => [c.type, c.args.id]), [["item_reopen", "t1"]]);
+  assert.deepStrictEqual(all(u).map((c) => [c.type, c.args.id]), [["item_uncomplete", "t1"]]);
   assert.strictEqual(u.skipped.length, 0);
 });
 
 test("reopen row not skipped when task absent from active snapshot", () => {
   const pre = { tasks: [item({ isCompleted: true })], projects: [], sections: [] };
   const r = buildApplyBatches([{ op: "reopen", taskId: "t1", fields: {} }], pre, { tasks: [], projects: [], sections: [] }, uuid);
-  assert.deepStrictEqual(all(r).map((c) => [c.type, c.args.id]), [["item_reopen", "t1"]]);
+  assert.deepStrictEqual(all(r).map((c) => [c.type, c.args.id]), [["item_uncomplete", "t1"]]);
   assert.strictEqual(r.skipped.length, 0);
+});
+
+test("reopen command args are exactly {id}", () => {
+  const pre = { tasks: [item({ isCompleted: true })], projects: [], sections: [] };
+  const r = buildApplyBatches([{ op: "reopen", taskId: "t1", fields: {} }], pre, { tasks: [], projects: [], sections: [] }, uuid);
+  const cmds = all(r);
+  assert.strictEqual(cmds.length, 1);
+  assert.strictEqual(cmds[0].type, "item_uncomplete");
+  assert.deepStrictEqual(cmds[0].args, { id: "t1" });
+  assert.strictEqual(r.skipped.length, 0);
+});
+
+test("undo of chat completion emits item_uncomplete", () => {
+  const s = { tasks: [item()], projects: [], sections: [] };
+  const r = buildApplyBatches([{ op: "complete", taskId: "t1", fields: {} }], s, s, uuid);
+  const u = buildUndoBatches(r.undo, { tasks: [], projects: [], sections: [] }, uuid);
+  const cmds = all(u);
+  assert.strictEqual(cmds.length, 1);
+  assert.strictEqual(cmds[0].type, "item_uncomplete");
+  assert.deepStrictEqual(cmds[0].args, { id: "t1" });
+  assert.strictEqual(u.skipped.length, 0);
 });
 
 const merge = (taskId, keep) => ({ op: "merge", taskId, fields: { targetTaskId: keep } });
@@ -234,10 +255,10 @@ test("merge: undo reopens and restores", () => {
   assert.strictEqual(k.args.priority, 1);
   assert.deepStrictEqual(k.args.labels, ["home"]);
   assert.strictEqual(k.args.due, null);
-  assert.ok(idx("item_reopen", "a") >= 0);
+  assert.ok(idx("item_uncomplete", "a") >= 0);
   const a = cmds.find((c) => c.type === "item_update" && c.args.id === "a");
   assert.strictEqual(a.args.description, "a-desc");
-  assert.ok(idx("item_reopen", "a") < idx("item_move", "s1"));
+  assert.ok(idx("item_uncomplete", "a") < idx("item_move", "s1"));
   assert.strictEqual(cmds[idx("item_move", "s1")].args.parent_id, "a");
 });
 let failed = 0;

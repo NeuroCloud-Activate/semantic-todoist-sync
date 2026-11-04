@@ -248,4 +248,19 @@ assert.notStrictEqual(formatReference(style, { kind: "web", meta }), "", "web st
   assert.deepStrictEqual(two.numbers, {}, "apa numbers stay note-only");
   console.log("PASS todoist inline links in apa/nature");
 }
-process.stdout.write(JSON.stringify({ passed: 17, failed: 0 }, null, 2) + "\n");
+
+// 13: styles.js is safe for citation style "none"
+{
+  const note = { kind: "vault", path: "Notes/n.md", meta: { title: "Note", year: 2020, authors: ["One, A."] } };
+  assert.strictEqual(formatReference("none", note), "", "formatReference returns nothing for none");
+  assert.strictEqual(formatInText("none", [{ source: note }]), "", "formatInText returns nothing for none");
+  const planned = planReferences("Just a note.", "none", [{ meta: { title: "Alpha", url: "http://a" } }]);
+  assert.deepStrictEqual(planned, { numbers: {}, added: [], edit: null }, "planReferences returns empties for none");
+  const r = rewriteCitations("Claim [E1].", [{ eid: "E1", source: note }], "", "none");
+  assert.strictEqual(r.markdown, "Claim.", "none strips the marker");
+  assert.strictEqual(r.footnotes, "", "none no footnotes");
+  assert.deepStrictEqual(r.cited, [], "none cited empty");
+  assert.deepStrictEqual(r.numbers, {}, "none numbers empty");
+  console.log("PASS styles safe for none");
+}
+process.stdout.write(JSON.stringify({ passed: 18, failed: 0 }, null, 2) + "\n");

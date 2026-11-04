@@ -154,7 +154,37 @@ const cases = {
     assert.ok(p.system.includes("Today's date is 2026-10-28 (Wednesday)"), p.system);
     assert.ok(/"today" means dueFrom and dueTo are both today's date/.test(p.system), "today mapping");
     assert.ok(!/Today's date/.test(lookupPrompt("x", "").system), "no date line without a date");
-  }
+  },
+  "schema enum contains pull; schema stays strict; required list unchanged"() {
+    assert.deepStrictEqual(LOOKUP_SCHEMA.properties.kind.enum, ["none", "question", "change", "duplicates", "pull"]);
+    assert.strictEqual(LOOKUP_SCHEMA.additionalProperties, false);
+    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence"]);
+    const bad = (s, p = "root") => {
+      const o = [];
+      if ([].concat(s.type).includes("object")) {
+        const k = Object.keys(s.properties);
+        if (s.additionalProperties !== false) o.push(p + " additionalProperties");
+        if (JSON.stringify([...s.required].sort()) !== JSON.stringify(k.sort())) o.push(p + " required");
+        for (const x of k) o.push(...bad(s.properties[x], p + "." + x));
+      }
+      return o;
+    };
+    assert.deepStrictEqual(bad(LOOKUP_SCHEMA), []);
+  },
+  "lookupPrompt defines pull and its disambiguation rules"() {
+    const sys = lookupPrompt("x", "").system;
+    assert.ok(/"pull" = asks to bring, list, copy or insert/.test(sys), "pull kind definition");
+    assert.ok(/summarize, analyze, group by theme or write prose about those tasks stays "question"/i.test(sys), "summarize stays question");
+    assert.ok(/todoist\.com\/app\//.test(sys) && /bring\/pull\/import\/copy\/list\/add/.test(sys), "link rule");
+    assert.ok(/needsTodoist must be true for "pull"/i.test(sys), "needsTodoist for pull");
+    assert.ok(/"question" = asks about tasks/.test(sys) && /"change" = asks to create\/edit\/move\/complete\/delete tasks/.test(sys) && /"duplicates" = asks to find duplicate tasks/.test(sys), "existing kind sentence intact");
+  },
+  "pull shortlist matches question shortlist with the same filters"() {
+    const filters = { words: ["compost"], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters }), [], 10)), ids(shortlistTasks(snapshot, lk({ kind: "question", filters }), [], 10)));
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters: { words: [], projects: ["work & home"], labels: ["Home"] } }), [], 10)), ["t2"]);
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters: { words: [], projects: [], labels: [], priority: 4 } }), [], 10)), ["t2"]);
+  },
 };
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

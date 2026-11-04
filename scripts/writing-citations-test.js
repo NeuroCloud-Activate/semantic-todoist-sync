@@ -475,5 +475,115 @@ function ev(eid, source) {
   assert.strictEqual(badUrl.markdown, t(5, 3), "invalid url consumes no number after seeded max: " + badUrl.markdown);
   console.log("PASS task numbers seed from note");
 }
-process.stdout.write(JSON.stringify({ passed: 23, failed: 0 }, null, 2) + "\n");
+// 20: citation style "none" strips every [En] marker and todoist link, no footnotes or references
+{
+  const evs = [
+    ev("E1", { kind: "vault", path: "A.md" }),
+    ev("E2", { kind: "todoist", title: "Task 2", project: "P", url: "https://app.todoist.com/app/task/2", meta: { title: "Task 2", site: "Todoist", url: "https://app.todoist.com/app/task/2", year: 2026 } }),
+  ];
+  const link = "[\\[T1\\]](<https://app.todoist.com/app/task/2>)";
+  const r = rewriteCitations("a [E1] b [E1, E2] c [E99] d " + link + " e", evs, "", "none");
+  assert.strictEqual(r.markdown, "a b c d e", "none removes markers, groups, unknowns and todoist links: " + r.markdown);
+  assert.strictEqual(r.dropped, 1, "none counts only the unknown id: " + r.dropped);
+  assert.strictEqual(r.footnotes, "", "none footnotes empty");
+  assert.deepStrictEqual(r.cited, [], "none cited empty");
+  assert.deepStrictEqual(r.numbers, {}, "none numbers empty");
+  assert.deepStrictEqual(r.used, [], "none used empty");
+  const range = rewriteCitations("x [E1-E2] y", evs, "", "none");
+  assert.strictEqual(range.markdown, "x y", "none range of known ids removed");
+  assert.strictEqual(range.dropped, 0, "known range ids are not dropped");
+  const badRange = rewriteCitations("x [E5-E7] y", evs, "", "none");
+  assert.strictEqual(badRange.markdown, "x y", "none unknown range removed");
+  assert.strictEqual(badRange.dropped, 3, "each unknown id in a range drops once");
+  const space = rewriteCitations("a [E1]   b  [E2] c", evs, "", "none");
+  assert.strictEqual(space.markdown, "a b c", "none collapses whitespace: " + JSON.stringify(space.markdown));
+  const fn = rewriteCitations("a [E1] b " + link, evs, "");
+  assert.ok(fn.markdown.includes("[^1]") && fn.markdown.includes(link), "footnotes still mark and keep todoist link");
+  assert.ok(fn.footnotes.startsWith("[^1]:") && fn.dropped === 0, "footnotes unchanged for non-none styles");
+
+  const emptyLink = rewriteCitations("[](https://x)", [], "", "none");
+  assert.strictEqual(emptyLink.markdown, "[](https://x)", "empty link text stays untouched: " + emptyLink.markdown);
+  const spacedEmpty = rewriteCitations("[ ](https://x)", [], "", "none");
+  assert.strictEqual(spacedEmpty.markdown, "[ ](https://x)", "spaced empty brackets stay untouched: " + spacedEmpty.markdown);
+  const bareEmpty = rewriteCitations("[]", [], "", "none");
+  assert.strictEqual(bareEmpty.markdown, "[]", "bare empty brackets stay untouched: " + bareEmpty.markdown);
+  console.log("PASS citation style none");
+}
+
+// 21: citation style "none" keeps code spans, fenced blocks and table padding intact; collapses only marker-adjacent whitespace.
+{
+  const evs = [
+    ev("E1", { kind: "vault", path: "A.md" }),
+    ev("E2", { kind: "vault", path: "B.md" }),
+  ];
+  const link = "[\\[T1\\]](<https://app.todoist.com/app/task/1>)";
+
+  const code = rewriteCitations("see `x  [E1]  y` here", evs, "", "none");
+  assert.strictEqual(code.markdown, "see `x  [E1]  y` here", "inline code span left byte-identical");
+  assert.strictEqual(code.dropped, 0, "code-span marker counts no drop");
+
+  const fenced = rewriteCitations("before\n```\nx [E1] y\n```\nafter", evs, "", "none");
+  assert.strictEqual(fenced.markdown, "before\n```\nx [E1] y\n```\nafter", "fenced code block left byte-identical");
+
+  const table = rewriteCitations("| a   | b |\n|---|---|\n|  x  |  y  |", evs, "", "none");
+  assert.strictEqual(table.markdown, "| a   | b |\n|---|---|\n|  x  |  y  |", "table row padding unchanged");
+
+  const sentence = rewriteCitations("see [E2] more", evs, "", "none");
+  assert.strictEqual(sentence.markdown, "see more", "\"see [E2] more\" -> \"see more\"");
+  assert.strictEqual(sentence.dropped, 0, "known id dropped nothing");
+
+  const group = rewriteCitations("a [E1, E9] b", evs, "", "none");
+  assert.strictEqual(group.markdown, "a b", "[E1, E9] group stripped");
+  assert.strictEqual(group.dropped, 1, "only the unknown E9 is dropped");
+
+  const agg = rewriteCitations("a [E1] b [E1, E2] c [E99] d " + link + " e", evs, "", "none");
+  assert.strictEqual(agg.markdown, "a b c d e", "aggregate none output");
+  assert.strictEqual(agg.dropped, 1, "aggregate counts only the unknown id");
+  assert.deepStrictEqual(agg.footnotes, "", "agg footnotes empty");
+  assert.deepStrictEqual(agg.cited, [], "agg cited empty");
+  assert.deepStrictEqual(agg.numbers, {}, "agg numbers empty");
+  assert.deepStrictEqual(agg.used, [], "agg used empty");
+  console.log("PASS citation style none span protection and targeted whitespace collapse");
+}
+
+// 22: footnotes/apa/nature output of rewriteCitations stays byte-identical to HEAD (git show HEAD:src/writing/citations.js).
+{
+  const { execSync } = require("child_process");
+  const { writeFileSync, mkdirSync } = require("fs");
+  const path = require("path");
+  const repoRoot = path.join(__dirname, "..");
+  const baselineDir = "C:/Users/MattS/AppData/Local/Temp/opencode/head-baseline";
+  const baseWriting = path.join(baselineDir, "src", "writing");
+  const baseContext = path.join(baselineDir, "src", "context");
+  mkdirSync(baseWriting, { recursive: true });
+  mkdirSync(baseContext, { recursive: true });
+  writeFileSync(path.join(baseWriting, "citations.js"), execSync("git show HEAD:src/writing/citations.js", { cwd: repoRoot, encoding: "utf8" }));
+  writeFileSync(path.join(baseWriting, "styles.js"), execSync("git show HEAD:src/writing/styles.js", { cwd: repoRoot, encoding: "utf8" }));
+  writeFileSync(path.join(baseContext, "source.js"), execSync("git show HEAD:src/context/source.js", { cwd: repoRoot, encoding: "utf8" }));
+  const baseline = require(path.join(baseWriting, "citations.js"));
+  const current = require("../src/writing/citations.js");
+  const todoist = { kind: "todoist", title: "Task 2", project: "P", url: "https://app.todoist.com/app/task/2", meta: { title: "Task 2", site: "Todoist", url: "https://app.todoist.com/app/task/2", year: 2026 } };
+  const evs = [
+    ev("E1", { kind: "vault", path: "Folder/Note.md", heading: "Heading" }),
+    ev("E2", todoist),
+    ev("E3", { kind: "vault", path: "A3.md" }),
+    ev("E8", { kind: "vault", path: "A8.md" }),
+  ];
+  const samples = [
+    "x [E1, E3–E8] y",
+    "x [E2][E5] y",
+    "a [E99] b",
+    "x [E2] z [E3, E9] w",
+    "see [E2] more and [\\[T1\\]](<https://app.todoist.com/app/task/2>)",
+    "E232 shows the guidelines.",
+  ];
+  const pick = (r) => ({ markdown: r.markdown, footnotes: r.footnotes, used: r.used, cited: r.cited, numbers: r.numbers, dropped: r.dropped });
+  for (const style of ["footnotes", "apa", "nature"]) {
+    for (const sample of samples) {
+      assert.deepStrictEqual(pick(baseline.rewriteCitations(sample, evs, "", style)), pick(current.rewriteCitations(sample, evs, "", style)), style + " output identical to HEAD for " + JSON.stringify(sample));
+    }
+  }
+  console.log("PASS footnotes/apa/nature output byte-identical to HEAD");
+}
+process.stdout.write(JSON.stringify({ passed: 25, failed: 0 }, null, 2) + "\n");
 

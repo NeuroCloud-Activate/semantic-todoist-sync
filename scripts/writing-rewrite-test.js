@@ -108,4 +108,11 @@ test('typedRewriteInstruction("be bolder") contains "be bolder"', () => {
   assert.ok(typedRewriteInstruction("be bolder").includes("be bolder"));
 });
 
+test('typedRewriteInstruction passes the typed text through verbatim (no wrapper, no preserve clause)', () => {
+  assert.strictEqual(typedRewriteInstruction("Summarize this selection in 3 bullets"), "Summarize this selection in 3 bullets", "typed text reaches writeWithEvidence as the instruction, unchanged");
+  assert.strictEqual(typedRewriteInstruction("  Summarize this selection in 3 bullets  "), "Summarize this selection in 3 bullets", "leading/trailing whitespace trimmed");
+  assert.strictEqual(typedRewriteInstruction(""), "", "empty typed text stays empty");
+  assert.ok(!typedRewriteInstruction("Summarize this selection in 3 bullets").includes("Keep names"), "no preserve clause added");
+});
+
 process.stdout.write(JSON.stringify({ passed, failed: 0 }) + "\n");

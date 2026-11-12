@@ -1,3 +1,8 @@
+## 0.9.45 - 2026-11-12
+
+### Fixed
+- **Release packages attach the plugin files.** The GitHub release now carries `main.js`, `manifest.json` and `styles.css` as assets, so Obsidian can install the update.
+
 ## 0.9.44 - 2026-11-11
 
 ### Changed

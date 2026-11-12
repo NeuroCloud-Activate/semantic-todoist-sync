@@ -339,3 +339,10 @@ The root `main.js` bundle is rebuilt by the coordinator once more after these fi
 | scripts/web-research-local-test.js | web-mode schema and prompt agreement assertions |
 | root main.js | rebuilt by `npm.cmd run build`; version unchanged (0.9.43) |
 | Live gate | 0 hedge phrases (old build 4); 7 of 8 prompts pass. A1 does not name Chris Lannon: the attendee chunk is in the active index but the six-companion budget is consumed by higher-scored notes before the meeting note, which entered through the lexical window at score 0. Pre-existing retrieval ranking, outside this change. |
+
+## Release procedure — 2026-11-12
+
+1. Bump `package.json`, `manifest.json` and `versions.json`; date the CHANGELOG entry.
+2. Run `npm.cmd run build` and `npm.cmd test`.
+3. Commit, tag, push the branch and the tag.
+4. Create the GitHub release with `main.js`, `manifest.json` and `styles.css` attached as assets. Obsidian's validator reads the release assets, not the repository files; a release without them is rejected even when the files are committed.

@@ -166,7 +166,9 @@ function fakeVault() {
     assert.strictEqual(request.mode, 'concise');
     return { status: 'searched', provider: 'openrouter', model: 'fictional-search-model', queryCount: 1, resultCount: 1, evidence: normalized.rows, reasons: {} };
   };
+  let chatRequest = null;
   chatPlugin.openaiResponse = async (request) => {
+    chatRequest = request;
     synthesisRuns += 1;
     assert.strictEqual(request.operation, 'chat');
     return JSON.stringify({ research_subject: 'FICTIONAL subject', claims: [{ text: 'FICTIONAL externally supported claim.', established: true, evidence_ids: [normalized.rows[0].evidenceId], category: 'fact' }] });
@@ -175,6 +177,13 @@ function fakeVault() {
   assert.strictEqual(searchRuns, 1, 'chat concise mode performs one search');
   assert.strictEqual(synthesisRuns, 1, 'chat concise mode performs one synthesis');
   assert.ok(chatResult.answer.includes('(1)'), 'research answer uses numbered citations');
+
+  assert.ok(chatRequest.system.includes("Keep to the number of claims stated above: fold your own knowledge into those claims rather than adding extra ones."), "web mode keeps its claim cap sentence");
+  assert.ok(chatRequest.system.includes("category=unsupported and no evidence_ids"), "web mode names the unsupported category");
+  assert.ok(!chatRequest.system.includes("category=general"), "general category never reaches web mode");
+  assert.strictEqual(chatRequest.jsonSchema.properties.claims.maxItems, 2, "concise web schema caps at two claims");
+  assert.deepStrictEqual(chatRequest.jsonSchema.properties.claims.items.properties.category.enum.slice(-1), ["unsupported"], "web schema keeps unsupported");
+  console.log('web-research-local-test: PASS (web mode schema and prompt agree)');
 
   console.log('web-research-local-test: PASS');
 })().catch((error) => {

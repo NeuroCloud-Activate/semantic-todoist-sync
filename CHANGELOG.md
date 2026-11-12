@@ -1,3 +1,11 @@
+## 0.9.44 - 2026-11-11
+
+### Changed
+- **Collaborate and Ask lead with what is known.** Answers no longer open with what the notes lack; a gap is mentioned once in a short plain clause, and only when it matters.
+- **Ask answers general questions.** When a question is not about your own work, Ask answers it from its own knowledge and says so; facts about your notes still come from the vault and link back to the note.
+- **Suggestions and general knowledge stay marked, in ordinary words.** The assistant's own additions read naturally, and a claim that cites no evidence can no longer carry a note link.
+- **"Sources searched" shows only what ran.** The footer lists the sources that were actually searched, or says a source was unavailable; switched-off sources no longer appear.
+
 ## 0.9.43 - 2026-11-04
 
 ### Changed

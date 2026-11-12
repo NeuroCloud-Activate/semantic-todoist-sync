@@ -125,6 +125,14 @@ const inlineText = (renderResponse(JSON.stringify({ claims: [
 ] }), repeatLedger).answer || "").trim();
 assert.strictEqual(inlineText, "You have [buy printer paper](http://example.com/e1) and [email Alex](http://example.com/e2) open. [e3](http://example.com/e3) The paper task came from a team note. Ignore ghost and this.", inlineText);
 console.log("PASS (c-inline): directly named items link inline, context stays a source, unknown ids and URLs stay plain text");
+// (c-inline-general) a claim with no evidence_ids cannot carry a note link
+const generalRendered = renderResponse(JSON.stringify({ claims: [
+  { text: "As a general rule, see [Joanne note](e1) for context.", established: false, evidence_ids: [], category: "general", topic: "General" },
+] }), repeatLedger);
+assert.strictEqual((generalRendered.answer || "").trim(), "As a general rule, see Joanne note for context.");
+assert.strictEqual(generalRendered.telemetry.removedLinkCount, 1, "stripped link counted");
+assert.ok(generalRendered.telemetry.reasonCodes.includes("inline-link-without-evidence-removed"));
+console.log("PASS (c-inline-general): no note link on a claim without evidence ids");
 // (c-inline-later) A source linked inline later is not also shown as a source link on an earlier sentence
 const laterText = (renderResponse(JSON.stringify({ claims: [
   { text: "The project lists two tasks.", established: true, evidence_ids: ["e1", "e2", "e3"], category: "fact", topic: "Project" },
@@ -157,13 +165,54 @@ assert.ok(srcText.includes("You are a helpful Obsidian sidebar assistant."), "he
 assert.ok(srcText.includes("read together as one short, connected answer"), "claims read as connected prose");
 assert.ok(srcText.includes("vary how sentences begin"), "no repetitive sentence openings");
 assert.ok(!srcText.includes("\"You are a concise Obsidian sidebar assistant.\""), "old robotic role sentence removed");
-assert.ok(srcText.includes("Each claim must be one clear, factual sentence."), "claims stay factual");
+assert.ok(srcText.includes("Each claim is one or two natural sentences."), "claims are natural sentences");
 console.log("PASS (d-tone): prompt asks for helpful, natural, concise prose");
 assert.ok(srcText.includes("write its name once as a Markdown link to its exact evidence_id, like [name](evidence_id)"), "prompt asks for inline links to directly named tasks/notes");
 assert.ok(!srcText.includes("do not write Markdown links, numbered citations, or a source list yourself"), "old no-links rule replaced");
 console.log("PASS (d-inline): prompt asks for inline links to items named directly");
 assert.ok(srcText.includes("A short follow-up continues the previous question"), "prompt keeps follow-ups in the previous question's scope");
 console.log("PASS (d-followup): follow-ups keep the earlier scope");
+
+// (d-natural) Ask answers positively, may use its own knowledge, keeps its guards
+{
+  const start = srcText.indexOf('"You are a helpful Obsidian sidebar assistant."');
+  const end = srcText.indexOf('"Avoid long preambles."', start);
+  assert.ok(start > 0 && end > start, "chat system array located");
+  const sys = srcText.slice(start, end);
+  assert.ok(!/not established|not-established|unsupported/.test(sys), "no not-established or unsupported wording in the Ask rules");
+  assert.ok(sys.includes("You know the user's vault from the evidence below and you also bring your own knowledge."));
+  assert.ok(sys.includes("Each claim is one or two natural sentences."));
+  assert.ok(sys.includes("do not list what is missing"));
+  assert.ok(sys.includes("answer it from your own knowledge the way a knowledgeable colleague would"));
+  assert.ok(sys.includes("a general question that is not about the user's own work"));
+  assert.ok(sys.includes("Facts about the user's own work - their notes, people, dates, amounts or decisions - come only from the evidence; never present a guess about them as your own knowledge."), "own-work facts come only from evidence");
+  assert.ok(sys.includes("When the evidence does not contain one that the user asks for, say so once in a short plain clause, such as that it is not in the notes, inside a helpful sentence that also gives what is known or where to look."), "gap is one plain clause inside a helpful sentence");
+  assert.ok(sys.includes("Give each claim the one category that fits best, and never present your own knowledge as if it came from the evidence."));
+  assert.ok(sys.includes("has established=false, category=${ownCategory} and no evidence_ids; say in a few natural words that it is general knowledge or your suggestion, and never link it to a note."));
+  assert.ok(sys.includes("You may connect related notes, but never fuse unrelated details from different notes into one event, decision, task, or explanation."));
+  assert.ok(sys.includes("Do not invent missing task details."));
+  assert.ok(sys.includes("Keep the source's level of certainty: planned, possible, requested or suggested work stays planned, possible, requested or suggested, and is never presented as booked, confirmed, approved, invited, contacted, sent or completed, or as any other stronger proof, unless the evidence says exactly that."));
+  assert.ok(sys.includes("when sources genuinely conflict, say so briefly."));
+  assert.ok(srcText.includes('const ownCategory = webSearchMode === "off" ? "general" : "unsupported";'), "own-knowledge category follows the active schema");
+  assert.ok(srcText.includes("Keep to the number of claims stated above: fold your own knowledge into those claims rather than adding extra ones."), "web mode keeps its claim cap");
+  assert.ok(srcText.includes("mention once that the vault could not be searched."), "degraded line");
+  assert.ok(!srcText.includes("use only the supplied selected evidence"), "vault-only order removed");
+  assert.ok(!srcText.includes("state unsupported elements explicitly"), "old degraded order removed");
+  // guards kept
+  assert.ok(sys.includes("Cite only sources resolved from the supplied selected evidence ledger"));
+  assert.ok(sys.includes("Use the task context to identify whether a task already exists before suggesting task creation."));
+  assert.ok(sys.includes("For a named project, person, program, document, or topic, ignore supplied evidence that does not directly match that subject"));
+  // schema
+  const sStart = srcText.indexOf("function chatResponseSchema");
+  const schemaSrc = srcText.slice(sStart, srcText.indexOf("required: [...(changePlanSchema", sStart));
+  assert.ok(/"hierarchy", "general"\]/.test(schemaSrc), "general replaces unsupported in the enum");
+  assert.ok(!schemaSrc.includes("unsupported"), "no unsupported in the vault chat schema");
+  assert.ok(schemaSrc.includes('description: "One or two natural sentences."'));
+  assert.deepStrictEqual(getSchema().properties.claims.items.properties.category.enum.slice(-2), ["hierarchy", "general"]);
+  // web research is untouched
+  assert.ok(srcText.includes('enum: ["fact", "current-state", "history", "criteria", "next-step", "unsupported"]'), "web research schema unchanged");
+  console.log("PASS (d-natural): Ask prompt is positive, allows own knowledge, keeps guards");
+}
 
 // (e) Subset merge: related topic labels reunite under one heading
 const subsetResponse = JSON.stringify({

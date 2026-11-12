@@ -327,3 +327,15 @@ The root `main.js` bundle is rebuilt by the coordinator once more after these fi
 | src/todoist/lookup.js | kind pull |
 | scripts/writing-todoist-pull-test.js | new test file for pull resolution and rendered lists; writing-write, writing-sidebar, writing-citations, writing-styles and provider-settings tests extended |
 | root main.js | stale built bundle — not edited here; must be rebuilt by the coordinator |
+
+## Natural assistant tone — 2026-11-11
+
+| file | what changed |
+|---|---|
+| src/writing/write.js | `systemPromptFor(mode, cite)` composes the three prompts from shared sentences; natural-tone copy; footer lists only searched sources; generic empty-evidence text; Todoist counts as a searched source; `searchedSources` removed |
+| src/main.js | Ask prompt copy and schema descriptions; `ownCategory` (`general` for vault chat, `unsupported` for web research); renderer strips an inline note link from a claim that declares no `evidence_ids`, counted in telemetry `removedLinkCount` with reasonCode `inline-link-without-evidence-removed` |
+| scripts/writing-write-test.js | natural-tone prompt and footer tests; web-empty and web-throwing cases; Todoist-only zero-tasks case; strengthened FACTS, HEDGE and rewrite-none assertions |
+| scripts/structured-chat-evidence-test.js | (d-natural) Ask prompt/schema test; (c-inline-general) renderer link-guard test |
+| scripts/web-research-local-test.js | web-mode schema and prompt agreement assertions |
+| root main.js | rebuilt by `npm.cmd run build`; version unchanged (0.9.43) |
+| Live gate | 0 hedge phrases (old build 4); 7 of 8 prompts pass. A1 does not name Chris Lannon: the attendee chunk is in the active index but the six-companion budget is consumed by higher-scored notes before the meeting note, which entered through the lexical window at score 0. Pre-existing retrieval ranking, outside this change. |

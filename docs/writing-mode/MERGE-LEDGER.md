@@ -346,3 +346,11 @@ The root `main.js` bundle is rebuilt by the coordinator once more after these fi
 2. Run `npm.cmd run build` and `npm.cmd test`.
 3. Commit, tag, push the branch and the tag.
 4. Create the GitHub release with `main.js`, `manifest.json` and `styles.css` attached as assets. Obsidian's validator reads the release assets, not the repository files; a release without them is rejected even when the files are committed.
+
+## 0.9.46 — duplicate review box — 2026-11-12
+
+| File | Change |
+| --- | --- |
+| src/main.js | Resolved duplicate box (merged/kept/cleared/unanswered) keeps its outcome and renders one enabled Dismiss that removes the box; a resolving record not in `duplicateInFlight` also gets Dismiss, while a live one keeps two disabled buttons; `dismissDuplicateReviewBox` clears the box and its session-resolved entry so a sidebar restore does not bring it back; waiting and failure paths unchanged |
+| scripts/duplicate-review-box-test.js | Dismiss assertions for kept and merged flows, no-re-add after restore, stale-resolving box (disabled pair + enabled Dismiss), in-flight resolving box (no Dismiss) |
+| Live gate | Real sidebar at 0.9.46: waiting box Merge/Keep both clickable; merged box outcome + Dismiss, click removes and restore does not bring it back; stale resolving box disabled pair + working Dismiss; in-flight resolving box has no Dismiss and gains it when the flight ends. Synthetic records only; store restored, no notes changed. |

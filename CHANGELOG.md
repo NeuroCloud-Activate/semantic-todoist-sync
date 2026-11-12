@@ -1,3 +1,8 @@
+## 0.9.46 - 2026-11-12
+
+### Fixed
+- **A reviewed duplicate can always be cleared.** Once a duplicate is merged, kept, or otherwise answered, its box keeps the outcome word and offers an enabled **Dismiss** instead of two dead Merge/Keep both buttons; dismissing removes the box and it does not come back when the sidebar reopens. The box for a merge left behind by a crash also gets Dismiss, while a merge still running keeps its two buttons greyed only for those seconds; a failed merge still returns to waiting with both choices clickable.
+
 ## 0.9.45 - 2026-11-12
 
 ### Fixed

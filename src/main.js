@@ -22398,6 +22398,11 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     if (view && (record.status === "waiting" || view.hasDuplicateReviewBox(record.id))) view.upsertDuplicateReviewBox(record, this.duplicateReviewText(record));
   }
 
+  dismissDuplicateReviewBox(id) {
+    if (this.duplicateSessionResolved) this.duplicateSessionResolved.delete(id);
+    this.duplicateReviewView()?.removeDuplicateReviewBox(id);
+  }
+
   async restoreDuplicateReviewBoxes(view) {
     const store = await this.loadDuplicateStore();
     for (const record of store.held) {
@@ -25328,10 +25333,17 @@ class SemanticTodoistView extends ItemView {
     const plugin = this.plugin;
     const existing = this.messages.find((message) => message.kind === "duplicate-review" && message.heldId === record.id);
     const open = () => record.status === "waiting";
-    const actions = [
-      { label: "Merge", onClick: () => plugin.resolveHeldDuplicate(record.id, "merge", { by: "user" }), isDisabled: () => !open() },
-      { label: "Keep both", onClick: () => plugin.resolveHeldDuplicate(record.id, "keep", { by: "user" }), isDisabled: () => !open() }
-    ];
+    let actions;
+    if (record.status === "waiting" || record.status === "resolving") {
+      actions = [
+        { label: "Merge", onClick: () => plugin.resolveHeldDuplicate(record.id, "merge", { by: "user" }), isDisabled: () => !open() },
+        { label: "Keep both", onClick: () => plugin.resolveHeldDuplicate(record.id, "keep", { by: "user" }), isDisabled: () => !open() }
+      ];
+      // Escape hatch for a resolving record that never comes back down the in-flight path (e.g. crash, no resume); a live one lasts seconds and re-renders when done.
+      if (record.status === "resolving" && !(plugin.duplicateInFlight && plugin.duplicateInFlight.has(record.id))) actions.push({ label: "Dismiss", onClick: () => plugin.dismissDuplicateReviewBox(record.id) });
+    } else {
+      actions = [{ label: "Dismiss", onClick: () => plugin.dismissDuplicateReviewBox(record.id) }];
+    }
     if (existing) { existing.text = text; existing.actions = actions; }
     else this.messages.push({ role: "assistant", kind: "duplicate-review", heldId: record.id, text, actions });
     this.renderMessages();

@@ -92,12 +92,16 @@ test('prompt: triage is selective and keeps its guardrails', () => {
   assert.ok(/quiet, nothing is due/i.test(MEETING_TRIAGE_SYSTEM_PROMPT));
 });
 
-test('prompt: top questions are capped, prefixed and one-line', () => {
+test('prompt: top questions are grouped, numbered, capped and one-line', () => {
   assert.ok(/at most 8 questions, most important first/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
-  assert.ok(/start each question with the project name, then a colon/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
+  assert.ok(/### <exact project name>/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
+  assert.ok(/numbered list/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
+  assert.ok(/don't repeat the project name inside a question/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
+  assert.ok(/number straight through the groups from 1/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
   assert.ok(/keep each question to one line/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
   assert.ok(/merge duplicates/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
   assert.ok(/never invent/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
+  assert.ok(!/start each question with the project name/i.test(MEETING_QUESTIONS_SYSTEM_PROMPT));
 });
 
 test("parallel: 3 projects + overview < 160ms, in-flight <= 4", async () => {
@@ -925,7 +929,7 @@ test('questions: project keeps block, top hoists and calls once, both keeps and 
   }
 });
 
-test('questions: top fallback keeps every question; no questions means no empty top section', async () => {
+test('questions: top fallback keeps every question in grouped numbered format; no questions means no empty top section', async () => {
   const p = makePlugin();
   const orig = p.openaiResponse;
   p.openaiResponse = async (o) => {
@@ -933,14 +937,35 @@ test('questions: top fallback keeps every question; no questions means no empty 
     return orig(o);
   };
   const r = await prepareMeeting(p, base({ template: { questions: 'top' } }));
-  assert.ok(r.markdown.startsWith('## Questions'), r.markdown.slice(0, 160));
+  const top = slice(r, 'Questions', 'Overview');
+  assert.ok(top.startsWith('## Questions'), r.markdown.slice(0, 160));
   assert.strictEqual((r.markdown.match(/Is it ok\?/g) || []).length, 3, 'every question kept by fallback');
-  assert.ok(r.markdown.includes("couldn't prioritise"), r.markdown.slice(0, 160));
+  assert.ok(top.includes("couldn't prioritise"), top);
+  assert.ok(top.includes('### A') && top.includes('### B') && top.includes('### C'), top);
+  assert.deepStrictEqual(top.split('\n').filter((l) => /^\d+\. /.test(l)).map((l) => l.slice(0, 3)), ['1. ', '2. ', '3. '], top);
   const none = makePlugin({ records: [rec('solo', 'Solo', 'x')] });
   none.openaiResponse = async () => 'plain body, no questions';
   const rn = await prepareMeeting(none, base({ template: { questions: 'both' } }));
   assert.ok(!rn.markdown.includes('## Questions'), 'no empty top section');
   assert.ok(!rn.markdown.includes('### Questions'), 'no empty project question block');
+});
+
+test('questions: fallback caps 8 across projects with continuous numbering', async () => {
+  const recs = [rec('pa', 'A', 'a'), rec('pb', 'B', 'b')];
+  const p = makePlugin({ records: recs });
+  p.openaiResponse = async (o) => {
+    p.calls.push(o);
+    if (o.system === MEETING_QUESTIONS_SYSTEM_PROMPT) throw new Error('rate limited');
+    if (o.system === MEETING_OVERVIEW_SYSTEM_PROMPT) return 'ov';
+    const m = /Project: (.+)/.exec(o.user)[1];
+    const qs = Array.from({ length: 6 }, (_, i) => `- ${m} Q${i}? [E1]`).join('\n');
+    return `### Status\nok [E1].\n\n### Questions\n${qs}`;
+  };
+  const r = await prepareMeeting(p, base({ template: { questions: 'top', maxQuestions: 10 } }));
+  const top = slice(r, 'Questions', 'Overview');
+  const nums = top.split('\n').filter((l) => /^\d+\. /.test(l)).map((l) => Number(l.match(/^(\d+)/)[1]));
+  assert.deepStrictEqual(nums, [1, 2, 3, 4, 5, 6, 7, 8], top);
+  assert.ok(top.includes('A Q5?') && top.includes('B Q1?') && !top.includes('B Q2?'), top);
 });
 
 test('questions: citations survive hoisting and are numbered once', async () => {
@@ -954,7 +979,7 @@ test('questions: citations survive hoisting and are numbered once', async () => 
   };
   const r = await prepareMeeting(p, base({ template: { questions: 'top' } }));
   const top = slice(r, 'Questions', 'Overview');
-  assert.ok(top.includes('Decide this?'), top);
+  assert.ok(top.includes('1. Decide this?'), top);
   assert.ok(!/\[E\d+\]/.test(top), top);
   assert.ok(taskLink(task.url).test(top), top);
   assert.ok(!slice(r, 'A').includes('### Questions'));
@@ -999,25 +1024,91 @@ test('capQuestionBullets: keeps whole bullet blocks with wrapped lines, drops ex
   assert.strictEqual(capQuestionBullets(wrapped, 2), '- P0: First question\nwrapped detail [E1]\n- P1: Second');
 });
 
-test('questions: top call caps 12 questions to 8 with project prefixes and no empty section', async () => {
-  const twelve = Array.from({ length: 12 }, (_, i) => `- Project ${i}: Question ${i}? [E1]`).join('\n');
+test('questions: grouped model output is numbered continuously, mapped to known names, capped at 8', async () => {
   const p = makePlugin();
   p.openaiResponse = async (o) => {
     p.calls.push(o);
-    if (o.system === MEETING_QUESTIONS_SYSTEM_PROMPT) return `## Questions\n${twelve}`;
+    if (o.system === MEETING_QUESTIONS_SYSTEM_PROMPT) return [
+      '## Questions',
+      '### a',
+      '1. Q0? [E1]',
+      '2. Q1? [E1]',
+      '### B',
+      '- Q2? [E1]',
+      '### Zed',
+      '- Q3? [E1]', '- Q4? [E1]', '- Q5? [E1]', '- Q6? [E1]',
+      '- Q7? [E1]', '- Q8? [E1]', '- Q9? [E1]',
+      '### Late',
+      '- Q10? [E1]',
+    ].join('\n');
     if (o.system === MEETING_OVERVIEW_SYSTEM_PROMPT) return 'ov';
     return '### Status\nok [E1].\n\n### Questions\n- Is it ok? [E1]';
   };
   const r = await prepareMeeting(p, base({ template: { questions: 'top' } }));
   const top = slice(r, 'Questions', 'Overview');
-  const bullets = top.split('\n').filter((l) => /^\s*(?:[-*+]|\d+[.)])\s+/.test(l));
-  assert.strictEqual(bullets.length, 8, top);
-  assert.ok(bullets.every((l) => /^-\s*Project \d+:/.test(l)), top);
-  assert.ok(top.includes('Question 0?'), top);
-  assert.ok(!top.includes('Question 8?'), 'ninth and later questions dropped');
+  assert.ok(top.startsWith('## Questions\n'), top);
+  assert.ok(top.includes('### A\n'), top); // lower-case heading mapped to the real name
+  assert.ok(top.includes('### B\n'), top);
+  assert.ok(top.includes('### Zed\n'), top); // unknown heading kept as written
+  const nums = top.split('\n').filter((l) => /^\d+\. /.test(l)).map((l) => Number(l.match(/^(\d+)/)[1]));
+  assert.deepStrictEqual(nums, [1, 2, 3, 4, 5, 6, 7, 8], top);
+  assert.ok(top.includes('Q7?') && !top.includes('Q8?') && !top.includes('Q9?'), top);
+  assert.ok(!top.includes('### Late') && !top.includes('Q10?'), 'groups emptied by the cap are removed');
+  assert.ok(!/\d+\.\s*A:/.test(top), 'no project prefix inside a question');
   const topCall = p.calls.find((c) => c.system === MEETING_QUESTIONS_SYSTEM_PROMPT).user;
-  assert.ok(/at most 8/i.test(topCall) && /project name/i.test(topCall) && /one line/i.test(topCall), topCall);
+  assert.ok(/at most 8/i.test(topCall) && /one line/i.test(topCall) && /### <exact project name>/i.test(topCall), topCall);
   assert.ok(!/^\s*(?:none|no questions)\.?\s*$/im.test(top), 'no empty/None section');
+});
+
+test('questions: output without ### groups renders one continuous numbered list', async () => {
+  const p = makePlugin();
+  p.openaiResponse = async (o) => {
+    p.calls.push(o);
+    if (o.system === MEETING_QUESTIONS_SYSTEM_PROMPT) return '## Questions\n- First? [E1]\n2. Second? [E1]\n+ Third? [E1]';
+    if (o.system === MEETING_OVERVIEW_SYSTEM_PROMPT) return 'ov';
+    return '### Status\nok [E1].\n\n### Questions\n- Is it ok? [E1]';
+  };
+  const r = await prepareMeeting(p, base({ template: { questions: 'top' } }));
+  const top = slice(r, 'Questions', 'Overview');
+  assert.ok(!/^### /m.test(top), top);
+  assert.deepStrictEqual(top.split('\n').filter((l) => /^\d+\. /.test(l)).map((l) => l.slice(0, 3)), ['1. ', '2. ', '3. '], top);
+  assert.ok(top.includes('First?') && top.includes('Second?') && top.includes('Third?'), top);
+});
+
+test('questions: top-call input groups each project’s questions under its real name', async () => {
+  const p = makePlugin();
+  p.openaiResponse = async (o) => {
+    p.calls.push(o);
+    if (o.system === MEETING_QUESTIONS_SYSTEM_PROMPT) return '### A\n- Pick this? [E1]';
+    if (o.system === MEETING_OVERVIEW_SYSTEM_PROMPT) return 'ov';
+    const project = /Project: (.+)/.exec(o.user)[1];
+    return `### Status\nok [E1].\n\n### Questions\n- ${project} question? [E1]`;
+  };
+  await prepareMeeting(p, base({ template: { questions: 'both' } }));
+  const top = p.calls.find((c) => c.system === MEETING_QUESTIONS_SYSTEM_PROMPT).user;
+  assert.ok(top.includes('### A') && top.includes('### B') && top.includes('### C'), top);
+  assert.ok(top.includes('A question?') && top.includes('B question?'), top);
+  assert.ok(/at most 8/i.test(top) && /one line/i.test(top), top);
+});
+
+test('questions: project-body blocks are numbered per project from normalized bullets', async () => {
+  const p = makePlugin();
+  p.openaiResponse = async (o) => {
+    p.calls.push(o);
+    if (o.system === MEETING_OVERVIEW_SYSTEM_PROMPT) return 'ov';
+    const m = /Project: (.+)/.exec(o.user)[1];
+    const qs = m === 'A' ? '1) Keep? [E1]\n* Also? [E1]' : (m === 'B' ? '- Why now? [E1]' : '- None.');
+    return `### Status\nok [E1].\n\n### Questions\n${qs}`;
+  };
+  const r = await prepareMeeting(p, base({ template: { questions: 'project' } }));
+  const a = slice(r, 'A', 'B');
+  const b = slice(r, 'B', 'C');
+  assert.ok(/### Questions\n1\. Keep\?/.test(a), a);
+  assert.ok(/2\. Also\?/.test(a), a);
+  assert.ok(!/^1\) Keep\?|^[*] Also\?/m.test(a), a);
+  assert.ok(/### Questions\n1\. Why now\?/.test(b), b);
+  assert.ok(!slice(r, 'C').includes('### Questions'), 'placeholder block removed');
+  assert.ok(!/^## Questions\s*$/m.test(r.markdown), 'no top call in project mode');
 });
 
 test('questions: placeholder blocks make no top call and no heading', async () => {
@@ -1109,7 +1200,7 @@ test('questions: custom maxQuestions 4 caps body; a wrapped question counts once
   const r = await prepareMeeting(p, base({ template: { questions: 'project', maxQuestions: 4 } }));
   const proj = slice(r, 'A');
   const q = proj.slice(proj.indexOf('### Questions'));
-  assert.strictEqual(q.split('\n').filter((l) => /^-\s+Project A:/.test(l)).length, 4, q);
+  assert.strictEqual(q.split('\n').filter((l) => /^\d+\.\s/.test(l)).length, 4, q);
   assert.ok(q.includes('First question for wrapped detail'), q);
   assert.ok(!q.includes('Question 4?'), q);
 });

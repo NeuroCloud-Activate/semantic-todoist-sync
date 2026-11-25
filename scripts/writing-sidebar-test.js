@@ -2336,6 +2336,40 @@ async function testMeetingTriageModal() {
   await v2b.write();
   check('prepare selected');
 
+  // Toggling a checkbox must not re-render: rebuilding the scrollable list resets its scrollTop to 0.
+  const v2c = guarded(async (o) => {
+    const { promise, modal } = startTriage(o, { rows: rows.map((r) => Object.assign({}, r)), recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const listBefore = findByClass(modal.contentEl, 'semantic-todoist-triage-list');
+    assert(listBefore, 'triage list rendered');
+    let renders = 0;
+    let empties = 0;
+    const originalRender = modal.render.bind(modal);
+    const originalEmpty = modal.contentEl.empty.bind(modal.contentEl);
+    modal.render = () => { renders += 1; return originalRender(); };
+    modal.contentEl.empty = () => { empties += 1; return originalEmpty(); };
+    const boxes = triageChecks(modal);
+    const enabled = () => triageButton(modal, 'Prepare selected').disabled === false;
+    // Unticking every box disables Prepare, with no list replacement and no re-render.
+    for (const box of boxes) { if (box.checked) { box.checked = false; box.onchange(); } }
+    assert(!enabled(), 'Prepare disabled after unticking every box');
+    assert.strictEqual(findByClass(modal.contentEl, 'semantic-todoist-triage-list'), listBefore, 'toggling a box keeps the same scrollable list element');
+    assert.strictEqual(renders, 0, 'toggling a box does not re-run render');
+    assert.strictEqual(empties, 0, 'toggling a box does not empty contentEl');
+    // Re-ticking one enables Prepare, still with no list replacement and no re-render.
+    boxes[0].checked = true;
+    boxes[0].onchange();
+    assert(enabled(), 'Prepare enabled after re-ticking one');
+    assert.strictEqual(findByClass(modal.contentEl, 'semantic-todoist-triage-list'), listBefore, 're-ticking keeps the same scrollable list element');
+    assert.strictEqual(renders, 0, 're-ticking does not re-run render');
+    assert.strictEqual(empties, 0, 're-ticking does not empty contentEl');
+    modal.close();
+    await promise;
+    return { cancelled: true };
+  }).view;
+  v2c.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2c.write();
+  check('no re-render on toggle');
+
   // Escape / close resolves null exactly once.
   const v3 = guarded(async (o) => {
     const { promise, modal } = startTriage(o, { rows, recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });

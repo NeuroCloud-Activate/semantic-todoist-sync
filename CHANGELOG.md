@@ -1,3 +1,13 @@
+## 0.9.48 - 2026-11-25
+
+### Changed
+- **Questions are a numbered list under a subheading per project.** The top section groups questions under each project's name instead of tagging every line, and the numbers run 1 to 8 across the whole section so a question can be referred to by number. Questions under each project are numbered from 1.
+- **The settings note in the Supervisor template is readable.** The one-paragraph block is now a short hidden list, one line per setting with its options beside it (for example `triage: ai | off`).
+
+### Fixed
+- **Ticking a project no longer scrolls the list back to the top.** Ticking or unticking a project in "Projects for this meeting" leaves the list where you scrolled it.
+- **Template upgrade.** An unedited 0.9.48 Supervisor template is replaced quietly; an edited one is backed up and keeps your settings, as before.
+
 ## 0.9.47 - 2026-11-25
 
 ### Changed

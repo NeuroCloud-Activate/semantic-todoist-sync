@@ -61,12 +61,12 @@ const MEETING_OVERVIEW_SYSTEM_PROMPT = [
 // One small pass over the collected project questions; persona first, guardrails brief.
 const MEETING_QUESTIONS_SYSTEM_PROMPT = [
   "You're helping someone pick the questions that most need their meeting partner's input.",
-  "You're given the template's instruction and the question blocks the project notes already produced.",
+  "You're given the template's instruction and the questions each project already produced, grouped under that project's name.",
   "Keep only questions that need their decision, approval or input; leave out anything the evidence already answers.",
-  "At most 8 questions, most important first. Start each question with the project name, then a colon.",
-  "Keep each question to one line. Merge duplicates.",
+  "At most 8 questions, most important first. Merge duplicates.",
+  "Write a numbered list under `### <exact project name>` subheadings, one short question per item; don't repeat the project name inside a question.",
+  "Number straight through the groups from 1 and keep each question to one line.",
   "Keep every [En] citation marker exactly as written, and never invent a question, a fact or a source.",
-  "Write one short bullet per question and no heading of your own.",
 ].join(" ");
 
 // Triage preflight: a compact digest in, one row per project out. Reasons read like a colleague, not a label.
@@ -166,7 +166,8 @@ function splitProjectQuestions(text) {
   return { body: body.join("\n").replace(/(?:\r?\n[ \t]*)+$/, ""), questions: questions.filter((q) => !QUESTION_PLACEHOLDER.test(q)) };
 }
 
-const stripLeadingHeading = (text) => String(text == null ? "" : text).replace(/^\s*#{1,6}[ \t]+[^\r\n]*(?:\r?\n|$)/, "");
+// Only a leading template heading (h1/h2) is dropped; `### <project>` groups must survive.
+const stripLeadingHeading = (text) => String(text == null ? "" : text).replace(/^\s*#{1,2}[ \t]+[^\r\n]*(?:\r?\n|$)/, "");
 
 // A bullet plus its wrapped lines is one question; keep only the first `limit` whole blocks.
 function capQuestionBullets(text, limit = 8) {
@@ -181,6 +182,54 @@ function capQuestionBullets(text, limit = 8) {
     kept.push(line);
   }
   return kept.join("\n");
+}
+
+const questionText = (line) => String(line).replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
+const numberedItems = (items) => items.map((q, i) => `${i + 1}. ${q}`);
+
+// Parse the model's `### <project>` groups (and flat lists) into whole question items.
+function parseQuestionGroups(text, knownProjects) {
+  const known = new Map((knownProjects || []).map((n) => [String(n).trim().toLowerCase(), String(n).trim()]));
+  const groups = [];
+  let cur = null;
+  let prevBlank = true;
+  for (const line of String(text == null ? "" : text).split(/\r?\n/)) {
+    const h = /^###[ \t]+([^\r\n]*?)[ \t]*$/.exec(line);
+    if (h) {
+      const name = h[1].trim();
+      cur = { heading: known.get(name.toLowerCase()) || name, items: [] };
+      groups.push(cur);
+      prevBlank = true;
+      continue;
+    }
+    if (/^#{1,2}[ \t]/.test(line)) continue; // stray document heading, not a question
+    const bullet = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    const text2 = bullet ? bullet[1].trim() : line.trim();
+    if (!text2) { prevBlank = true; continue; }
+    if (!cur) { cur = { heading: "", items: [] }; groups.push(cur); }
+    if (bullet || prevBlank || !cur.items.length) cur.items.push(text2);
+    else cur.items[cur.items.length - 1] += ` ${text2}`;
+    prevBlank = false;
+  }
+  return groups.filter((g) => g.items.length);
+}
+
+// Continuous numbering across all groups, one overall cap; empty groups disappear.
+function formatQuestionGroups(groups, limit = 8) {
+  let remaining = Math.max(0, limit);
+  const kept = [];
+  for (const g of groups || []) {
+    if (remaining <= 0) break;
+    const items = (g.items || []).slice(0, remaining);
+    remaining -= items.length;
+    if (items.length) kept.push({ heading: g.heading || "", items });
+  }
+  let n = 0;
+  return kept.map((g) => {
+    const head = g.heading ? [`### ${escapeHeading(g.heading)}`] : [];
+    const list = g.items.map((q) => { n += 1; return `${n}. ${q}`; });
+    return [...head, ...list].join("\n");
+  }).join("\n\n");
 }
 
 const oneLine = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
@@ -684,15 +733,17 @@ const allEids = () => new Set(evidence.map((e) => e.eid));
   });
 
   // Hoist questions only where placement asks for it; keep the blocks in place for `project`/`both`.
-  const questionBlocks = [];
-  for (const res of results) {
+  const questionGroups = [];
+  for (let i = 0; i < results.length; i++) {
+    const res = results[i];
     if (!res.text) continue;
     const split = splitProjectQuestions(res.text);
     const capped = capQuestionBullets(split.questions.join("\n"), maxQuestions).split("\n").filter(Boolean);
-    if (capped.length && questionsMode !== "project") questionBlocks.push(capped.join("\n"));
+    const items = capped.map(questionText).filter(Boolean);
+    if (items.length && questionsMode !== "project") questionGroups.push({ heading: groups[i].projectName, items });
     // `top` always removes the block; `project`/`both` drop only an empty placeholder block.
-    if (questionsMode === "top" || (!capped.length && /^###[ \t]+Questions[ \t]*$/im.test(res.text))) res.text = split.body;
-    else if (capped.length && capped.length < split.questions.length) res.text = [split.body, `### Questions\n${capped.join("\n")}`].filter(Boolean).join("\n\n");
+    if (questionsMode === "top" || (!items.length && /^###[ \t]+Questions[ \t]*$/im.test(res.text))) res.text = split.body;
+    else if (items.length) res.text = [split.body, `### Questions\n${numberedItems(items).join("\n")}`].filter(Boolean).join("\n\n");
   }
 
   const kept = groups.filter((g, i) => !results[i].skipped);
@@ -712,25 +763,28 @@ const allEids = () => new Set(evidence.map((e) => e.eid));
   }
 
   let topQuestions = "";
-  if (questionsMode !== "project" && questionBlocks.length) {
+  if (questionsMode !== "project" && questionGroups.length) {
     const sec = findSection(instruction, "Questions");
     const heading = sec ? sec.heading : "## Questions";
+    const collected = questionGroups.map((g) => [`### ${g.heading}`, ...g.items.map((q) => `- ${q}`)].join("\n")).join("\n\n");
     const user = [
       `Instruction: ${sectionBody(instruction, "Questions")}`,
-      "At most 8 questions, most important first. Start each question with the project name and a colon. Keep each to one line. Merge duplicates. Preserve [En] markers. Never invent.",
+      "At most 8 questions, most important first. Merge duplicates. Preserve [En] markers. Never invent.",
+      "Group them under `### <exact project name>` subheadings and number them; keep each question to one line and don't repeat the project name inside it.",
       "",
-      "Questions collected from the projects:",
-      questionBlocks.join("\n\n"),
+      "Questions collected from the projects (grouped by project):",
+      collected,
       "",
       "Write the prioritized questions now.",
     ].join("\n");
     try {
       const cleaned = stripLeadingHeading(stripCheckboxes(normalizeBareCitations(dropNumericMarkers(scrub(String(await ask(MEETING_QUESTIONS_SYSTEM_PROMPT, user)))), { allowed: allEids(), known: allEids() })));
-      let out = capQuestionBullets(cleaned).trim();
+      const out = formatQuestionGroups(parseQuestionGroups(cleaned, groups.map((g) => g.projectName))).trim();
       if (!out) throw new Error("the model returned no questions");
       topQuestions = `${heading}\n\n${isolateCitations(out, allEids())}`;
     } catch (err) {
-      topQuestions = `${heading}\n\n_I couldn't prioritise these this time (${reasonOf(err)})._\n\n${capQuestionBullets(questionBlocks.join("\n\n"))}`;
+      const fallback = formatQuestionGroups(questionGroups);
+      topQuestions = `${heading}\n\n_I couldn't prioritise these this time (${reasonOf(err)})._\n\n${isolateCitations(fallback, allEids())}`;
     }
   }
 
@@ -797,4 +851,4 @@ const allEids = () => new Set(evidence.map((e) => e.eid));
   };
 }
 
-module.exports = { dropNumericMarkers, prepareMeeting, MEETING_PROJECT_SYSTEM_PROMPT, MEETING_OVERVIEW_SYSTEM_PROMPT, MEETING_TRIAGE_SYSTEM_PROMPT, MEETING_QUESTIONS_SYSTEM_PROMPT, TRIAGE_SCHEMA, headTail, enrichGroupActivity, pickRecentTitles, splitProjectQuestions, capQuestionBullets, sectionBody };
+module.exports = { dropNumericMarkers, prepareMeeting, MEETING_PROJECT_SYSTEM_PROMPT, MEETING_OVERVIEW_SYSTEM_PROMPT, MEETING_TRIAGE_SYSTEM_PROMPT, MEETING_QUESTIONS_SYSTEM_PROMPT, TRIAGE_SCHEMA, headTail, enrichGroupActivity, pickRecentTitles, splitProjectQuestions, capQuestionBullets, parseQuestionGroups, formatQuestionGroups, sectionBody };

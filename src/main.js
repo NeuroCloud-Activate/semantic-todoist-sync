@@ -266,7 +266,7 @@ const SUPERVISOR_PROMPT = [
   "",
   "## Questions",
   "",
-  "Choose at most 8 questions that most need my supervisor's decision, approval, or input. Start each line with the project name, then a colon. One short line each.",
+  "Choose at most 8 questions that most need my supervisor's decision, approval, or input. Most important first. One short line each.",
   "",
   "## For each project",
   "",
@@ -292,15 +292,36 @@ const SUPERVISOR_PROMPT = [
   "",
   "Use only facts from the evidence and cite them. Prefer the most recent evidence when sources disagree. Name tasks only when it helps. Leave out tasks that need no discussion. Include important items from sub-projects in their main project."
 ].join("\n");
+// The 0.9.48 built-in body, kept byte-exact so the released 0.9.48/0.9.47 file texts stay recognisable; comparison-only.
+const SUPERVISOR_PROMPT_0_9_48 = SUPERVISOR_PROMPT.replace("Most important first.", "Start each line with the project name, then a colon.");
 // The 0.9.47 built-in body, kept only so an unedited 0.9.47 file can be upgraded to the maxQuestions body.
-const SUPERVISOR_PROMPT_0_9_47 = SUPERVISOR_PROMPT.replace("{maxQuestions}", "2");
+const SUPERVISOR_PROMPT_0_9_47 = SUPERVISOR_PROMPT_0_9_48.replace("{maxQuestions}", "2");
 // Settings comment as released in 0.9.39/0.9.40 (before ignore keys); comparison-only for recognising an unedited old Supervisor.
 const MEETING_PREP_SETTINGS_COMMENT_0_9_40 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
 // Settings comment as released in 0.9.46; comparison-only for recognising an unedited old Supervisor.
 const MEETING_PREP_SETTINGS_COMMENT_0_9_46 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
-const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 maxQuestions = most questions per project (1-10) \u00b7 overview = yes or no \u00b7 triage = ai (let the assistant suggest which projects to include before writing) or off \u00b7 questions = top, project, or both (where questions for the meeting go). Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+// Settings comment as released in 0.9.48; comparison-only so the released file text stays byte-exact after the comment was rewritten.
+const MEETING_PREP_SETTINGS_COMMENT_0_9_48 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 maxQuestions = most questions per project (1-10) \u00b7 overview = yes or no \u00b7 triage = ai (let the assistant suggest which projects to include before writing) or off \u00b7 questions = top, project, or both (where questions for the meeting go). Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
 // Settings comment as released in 0.9.47 (before maxQuestions); comparison-only for recognising an unedited old Supervisor.
-const MEETING_PREP_SETTINGS_COMMENT_0_9_47 = MEETING_PREP_SETTINGS_COMMENT.replace(" \u00b7 maxQuestions = most questions per project (1-10)", "");
+const MEETING_PREP_SETTINGS_COMMENT_0_9_47 = MEETING_PREP_SETTINGS_COMMENT_0_9_48.replace(" \u00b7 maxQuestions = most questions per project (1-10)", "");
+// Short per-key settings block for the template author; hidden in Reading view and stripped before the prompt is sent.
+const MEETING_PREP_SETTINGS_COMMENT = [
+  "%%",
+  "Settings (this note is not sent to the assistant):",
+  "completedDays: 1-90 \u00b7 days of finished tasks to include",
+  "projects: names, comma-separated \u00b7 blank = all",
+  "ignoreProjects: names, comma-separated \u00b7 left out with their sub-projects",
+  "ignoreLabels: labels, comma-separated \u00b7 e.g. Notes",
+  "subprojects: merge | separate \u00b7 merge folds sub-projects into their main project",
+  "taskList: cited | all | none \u00b7 tasks listed after each project",
+  "maxTasks: 1-50 \u00b7 most \"Left to do\" items per project",
+  "maxQuestions: 1-10 \u00b7 most questions per project",
+  "overview: yes | no",
+  "triage: ai | off \u00b7 ai suggests which projects to include before writing",
+  "questions: top | project | both \u00b7 where the questions go",
+  "Notes, context, research and web sources follow the sidebar's Evidence menu.",
+  "%%"
+].join("\n");
 const MEETING_PREP_FOLDER_REFRESH_MS = 400;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
@@ -20935,7 +20956,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const seen = normalize(current);
       if (seen !== normalize(newText)) {
         let replacement = newText;
-        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT, MEETING_PREP_0_9_40_FILE_TEXT, MEETING_PREP_0_9_46_FILE_TEXT, MEETING_PREP_0_9_47_FILE_TEXT].some((text) => seen === normalize(text))) {
+        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT, MEETING_PREP_0_9_40_FILE_TEXT, MEETING_PREP_0_9_46_FILE_TEXT, MEETING_PREP_0_9_47_FILE_TEXT, MEETING_PREP_0_9_48_FILE_TEXT].some((text) => seen === normalize(text))) {
           let backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}).md`);
           for (let n = 2; this.app.vault.getAbstractFileByPath(backupPath); n += 1) backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}) ${n}.md`);
           await this.app.vault.create(backupPath, current);
@@ -26000,7 +26021,7 @@ class MeetingTriageModal extends Modal {
       box.onchange = () => {
         if (box.checked) this.selected.add(String(row.projectId));
         else this.selected.delete(String(row.projectId));
-        this.render();
+        this.prepareEl.disabled = this.selected.size === 0;
       };
       label.createSpan({ text: String(row.name || "") });
       if (row.reason) wrap.createDiv({ cls: "semantic-todoist-triage-reason", text: String(row.reason) });
@@ -26011,6 +26032,7 @@ class MeetingTriageModal extends Modal {
     const buttons = contentEl.createDiv({ cls: "semantic-todoist-triage-buttons" });
     buttons.createEl("button", { text: "Cancel" }).onclick = () => this.close();
     const prepare = buttons.createEl("button", { text: "Prepare selected", cls: "mod-cta" });
+    this.prepareEl = prepare;
     prepare.disabled = this.selected.size === 0;
     prepare.onclick = () => {
       if (!this.selected.size) return;
@@ -30090,7 +30112,10 @@ const MEETING_PREP_0_9_46_FILE_TEXT = meeting0946FileText(SUPERVISOR_PROMPT_0_9_
 // Exact bytes the 0.9.47 serializer wrote (no maxQuestions key/comment/placeholder); comparison-only, never built from the current serializer.
 const meeting0947FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nignoreProjects: \nignoreLabels: \nsubprojects: merge\ntaskList: none\nmaxTasks: 5\noverview: no\ntriage: ai\nquestions: both\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_47}\n\n${prompt}`;
 const MEETING_PREP_0_9_47_FILE_TEXT = meeting0947FileText(SUPERVISOR_PROMPT_0_9_47);
-const SUPERVISOR_TEMPLATE_VERSION = "0.9.48";
+// Exact bytes the 0.9.48 serializer wrote (maxQuestions key/comment/placeholder, project-name question prefix); comparison-only, never built from the current serializer.
+const meeting0948FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nignoreProjects: \nignoreLabels: \nsubprojects: merge\ntaskList: none\nmaxTasks: 5\nmaxQuestions: 2\noverview: no\ntriage: ai\nquestions: both\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_48}\n\n${prompt}`;
+const MEETING_PREP_0_9_48_FILE_TEXT = meeting0948FileText(SUPERVISOR_PROMPT_0_9_48);
+const SUPERVISOR_TEMPLATE_VERSION = "0.9.49";
 
 function yesNo(value) {
   return value ? "Yes" : "No";
@@ -60383,6 +60408,7 @@ if (typeof module !== "undefined" && module.exports) {
   MEETING_PREP_SETTINGS_COMMENT,
   MEETING_PREP_0_9_46_FILE_TEXT,
   MEETING_PREP_0_9_47_FILE_TEXT,
+  MEETING_PREP_0_9_48_FILE_TEXT,
   meetingPrepTemplateSkeleton,
     isTaskGenerationTemplate,
     isScheduleTodayTemplate,

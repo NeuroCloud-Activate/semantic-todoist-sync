@@ -29,7 +29,8 @@ global.fetch = async () => { throw new Error('network disabled'); };
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
 const {
   parsePromptTemplateFile, promptTemplateFileText, DEFAULT_PROMPT_TEMPLATE_FILES,
-  isMeetingPrepTemplate, isTaskGenerationTemplate, isScheduleTodayTemplate
+  isMeetingPrepTemplate, isTaskGenerationTemplate, isScheduleTodayTemplate,
+  MEETING_PREP_SETTINGS_COMMENT, MEETING_PREP_0_9_46_FILE_TEXT, MEETING_PREP_0_9_47_FILE_TEXT
 } = Plugin;
 
 function makePlugin(settings = {}) {
@@ -73,6 +74,14 @@ async function main() {
   assert.strictEqual(tpl('maxTasks: 0').maxTasks, 1);
   assert.strictEqual(tpl('maxTasks: 500').maxTasks, 50);
   assert.strictEqual(tpl('maxTasks: 4.7').maxTasks, 4);
+  // maxQuestions: per-project question cap, default 2, clamped 1-10, snake_case accepted
+  assert.strictEqual(d.maxQuestions, 2, 'maxQuestions defaults to 2');
+  assert.strictEqual(tpl('maxQuestions: 5').maxQuestions, 5);
+  assert.strictEqual(tpl('max_questions: 7').maxQuestions, 7, 'snake_case key accepted');
+  assert.strictEqual(tpl('maxQuestions: 0').maxQuestions, 1, 'clamped low');
+  assert.strictEqual(tpl('maxQuestions: 500').maxQuestions, 10, 'clamped high');
+  assert.strictEqual(tpl('maxQuestions: bogus').maxQuestions, 2, 'invalid -> default');
+  assert.strictEqual(tpl('maxQuestions: 4.7').maxQuestions, 4, 'truncated');
   // ignoreLabels / ignoreProjects: Todoist tags and projects to leave out
   assert.deepStrictEqual({ l: d.ignoreLabels, p: d.ignoreProjects }, { l: [], p: [] }, 'ignore lists default to empty');
   assert.deepStrictEqual(tpl('ignoreLabels:\nignoreProjects:').ignoreLabels, [], 'blank ignoreLabels');
@@ -85,6 +94,14 @@ async function main() {
   assert.deepStrictEqual(tpl('ignoreLabels: ##Notes, @#Odd').ignoreLabels, ['#Notes', '#Odd'], 'only one leading marker stripped per label');
   assert.deepStrictEqual(tpl('ignoreLabels: #, @').ignoreLabels, [], 'marker-only items are blank');
   assert.deepStrictEqual(tpl('ignoreProjects: #Hash').ignoreProjects, ['#Hash'], 'project names are not marker-stripped');
+  // triage / questions: new frontmatter keys, defaults and invalid fallbacks
+  const q = tpl('triage: ai\nquestions: both');
+  assert.deepStrictEqual({ triage: q.triage, questions: q.questions }, { triage: 'ai', questions: 'both' });
+  assert.deepStrictEqual({ triage: d.triage, questions: d.questions }, { triage: 'off', questions: 'project' });
+  assert.strictEqual(tpl('triage: bogus').triage, 'off');
+  assert.strictEqual(tpl('questions: bogus').questions, 'project');
+  assert.strictEqual(tpl('triage: AI').triage, 'ai', 'case-insensitive triage');
+  assert.strictEqual(tpl('questions: Top').questions, 'top', 'case-insensitive questions');
   console.log('PASS parse');
 
   // built-in
@@ -96,6 +113,22 @@ async function main() {
   assert.strictEqual(round.completedDays, 14);
   assert.deepStrictEqual(round.projects, []);
   assert.strictEqual(round.createTasks, false);
+  const text = promptTemplateFileText(entry);
+  assert.ok(/^triage: ai$/m.test(text) && /^questions: both$/m.test(text) && /^overview: no$/m.test(text) && /^taskList: none$/m.test(text));
+  assert.ok(text.indexOf('overview:') < text.indexOf('triage:') && text.indexOf('triage:') < text.indexOf('questions:'));
+  assert.ok(text.includes('{maxTasks}'), 'built-in body uses the maxTasks placeholder');
+  assert.strictEqual(round.maxQuestions, 2, 'built-in frontmatter carries maxQuestions');
+  assert.ok(/^maxQuestions: 2$/m.test(text), 'serializer writes maxQuestions: 2');
+  assert.ok(text.indexOf('maxTasks:') < text.indexOf('maxQuestions:') && text.indexOf('maxQuestions:') < text.indexOf('overview:'), 'maxQuestions serialized between maxTasks and overview');
+  assert.ok(text.includes('{maxQuestions}'), 'built-in body uses the maxQuestions placeholder');
+  assert.ok(entry.prompt.includes('At most {maxQuestions} questions for the supervisor, only where a decision, approval, or clarity is genuinely needed.'), 'per-project questions line is templated');
+  assert.ok(/maxQuestions = most questions per project \(1-10\)/.test(MEETING_PREP_SETTINGS_COMMENT), 'settings comment documents maxQuestions');
+  const skelText = Plugin.meetingPrepTemplateSkeleton();
+  assert.ok(/^maxQuestions: 2$/m.test(skelText), 'skeleton carries maxQuestions: 2');
+  assert.strictEqual(parsePromptTemplateFile(file, skelText).maxQuestions, 2, 'skeleton round-trips maxQuestions');
+  assert.ok(/triage/.test(MEETING_PREP_SETTINGS_COMMENT) && /questions/.test(MEETING_PREP_SETTINGS_COMMENT));
+  assert.ok(/triage/.test(skelText) && /questions/.test(skelText));
+  assert.strictEqual(Plugin.SUPERVISOR_TEMPLATE_VERSION, '0.9.48');
   assert.strictEqual(Plugin.DEFAULT_SETTINGS.writingUseTodoist, false);
   assert.strictEqual(Plugin.normalizeStableSettings({}).writingUseTodoist, false);
   assert.strictEqual(Plugin.normalizeStableSettings({ writingUseTodoist: true }).writingUseTodoist, true);
@@ -178,20 +211,57 @@ async function main() {
 }
 
 function specFileText() {
-  const L = require('fs').readFileSync(path.join(__dirname, '..', 'docs/superpowers/specs/2026-10-29-meeting-prep-design.md'), 'utf8').split(/\r?\n/);
-  const h = L.findIndex((l) => l.startsWith('## The built-in template'));
+  const L = require('fs').readFileSync(path.join(__dirname, '..', 'docs/superpowers/specs/2026-11-25-supervisor-meeting-prep-rework-design.md'), 'utf8').split(/\r?\n/);
+  const h = L.findIndex((l) => l.startsWith('### 6. Built-in Supervisor body'));
   let start = -1, end = -1;
   for (let i = h + 1; i < L.length; i++) {
-    if (start < 0 && L[i].startsWith('```')) { start = i + 1; continue; }
+    if (start < 0 && L[i].startsWith('```markdown')) { start = i + 1; continue; }
     if (start >= 0 && L[i].startsWith('```')) { end = i; break; }
   }
   return L.slice(start, end).join('\n').trim();
 }
+// Expected built-in Supervisor body after the live-validation length caps. The design-doc draft still holds the older wording, so the verbatim check is pinned here.
+const SUPERVISOR_BODY = [
+  "## Meeting",
+  "",
+  "Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
+  "",
+  "## Questions",
+  "",
+  "Choose at most 8 questions that most need my supervisor's decision, approval, or input. Start each line with the project name, then a colon. One short line each.",
+  "",
+  "## For each project",
+  "",
+  "Use point form only. Write 2 to 4 bullets for each part:",
+  "",
+  "### Updates",
+  "- What changed since the last meeting: finished work, progress, decisions.",
+  "",
+  "### Status",
+  "- Where the project stands now: blockers, risks, dependencies, anything that needs the supervisor's attention.",
+  "",
+  "### Left to do",
+  "- Up to {maxTasks} of the most important next actions, each tied to its task, with timing when the evidence supports it.",
+  "",
+  "Then write:",
+  "",
+  "### Questions",
+  "- At most {maxQuestions} questions for the supervisor, only where a decision, approval, or clarity is genuinely needed.",
+  "",
+  "Keep every bullet to one line. Surface a nuance or risk when the evidence shows one; do not pad. Skip the project entirely when nothing in it needs discussion.",
+  "",
+  "## Rules",
+  "",
+  "Use only facts from the evidence and cite them. Prefer the most recent evidence when sources disagree. Name tasks only when it helps. Leave out tasks that need no discussion. Include important items from sub-projects in their main project."
+].join("\n");
 {
   const e = DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep');
   assert.strictEqual(e.filename, 'Collaborate/Prepare for meeting \u2013 Supervisor.md');
-  assert.strictEqual(e.prompt, specFileText());
-  console.log('PASS built-in verbatim');
+  assert.strictEqual(e.prompt, SUPERVISOR_BODY);
+  for (const phrase of ['at most 8', 'Start each line with the project name', '2 to 4 bullets', 'At most {maxQuestions} questions']) {
+    assert(e.prompt.includes(phrase), `built-in body contains "${phrase}"`);
+  }
+  console.log('PASS built-in verbatim and length caps');
 }
 main().catch((e) => { console.error(e); process.exit(1); });
 
@@ -200,11 +270,12 @@ const TFile = SharedTFile;
 const OLD_SUPERVISOR_PROMPT = "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting.";
 const OLD_HEADINGS = ['Meeting', 'For each project', 'Task list', 'Rules'];
 const HEADINGS = ['Meeting', 'Overview', 'For each project', 'Rules'];
+const SUPERVISOR_HEADINGS = ['Meeting', 'Questions', 'For each project', 'Rules'];
 const SUB = 'Collaborate';
 const FOLDER = 'Semantic Todoist Sync/Prompts';
 const OLD_PATH = `${FOLDER}/Prepare for meeting \u2013 Supervisor.md`;
 const NEW_PATH = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor.md`;
-const BACKUP = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor (before 0.9.41).md`;
+const BACKUP = `${FOLDER}/${SUB}/Prepare for meeting \u2013 Supervisor (before 0.9.48).md`;
 const norm = (s) => String(s).replace(/\r\n/g, '\n').trim();
 const oldFileText = () => `---
 action: meeting-prep
@@ -282,6 +353,52 @@ const V0940 = [
 ].join("\n");
 const oldSupervisor09040Text = () => V0940;
 
+// Released 0.9.46 built-in Supervisor, byte-exact (1690 bytes, sha256 549BCEB8BE71...) captured from promptTemplateFileText() before the rework.
+const V0946 = [
+  "---",
+  "action: meeting-prep",
+  "completedDays: 14",
+  "projects: ",
+  "ignoreProjects: ",
+  "ignoreLabels: ",
+  "subprojects: merge",
+  "taskList: cited",
+  "maxTasks: 5",
+  "overview: yes",
+  "createTasks: false",
+  "insertResponse: true",
+  "syncTasks: false",
+  "---",
+  "",
+  "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%",
+  "",
+  "## Meeting",
+  "",
+  "Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
+  "",
+  "## Overview",
+  "",
+  "Start with an overview of at most 3 sentences on the most time-sensitive items across projects.",
+  "",
+  "## For each project",
+  "",
+  "Write one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.",
+  "",
+  "## Rules",
+  "",
+  "Use only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project."
+].join("\n");
+
+// Released 0.9.47 built-in Supervisor: the new text with the maxQuestions key, comment sentence and placeholder reverted.
+// Independent size/hash assertions below prove these are the real released bytes (2242, AC4723263E26).
+const V0947 = (() => {
+  const fresh = promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep'));
+  return fresh
+    .replace('maxQuestions: 2\n', '')
+    .replace(' · maxQuestions = most questions per project (1-10)', '')
+    .replace('At most {maxQuestions} questions for the supervisor,', 'At most 2 questions for the supervisor,');
+})();
+
 function fakeApp(initial = {}) {
   const files = new Map(Object.entries(initial));
   const folders = new Set();
@@ -332,6 +449,21 @@ async function folderTests() {
     assert(!t.filter(isTaskGenerationTemplate).some(isMeetingPrepTemplate));
     console.log('PASS folder-implied meeting templates');
   }
+  // upgrade backups are kept for the user but must not appear as selectable templates
+  {
+    const backup2 = BACKUP.replace(/\.md$/, ' 2.md');
+    const p = appPlugin({
+      [NEW_PATH]: '---\naction: meeting-prep\n---\nBody',
+      [BACKUP]: 'Edited old copy',
+      [backup2]: 'Second edited old copy',
+      [`${FOLDER}/Normal.md`]: 'Summarize things',
+    });
+    const t = await p.getPromptTemplates({ ensure: false });
+    assert(t.some((x) => x.source.endsWith('/Normal.md')), 'normal template returned');
+    assert(t.some((x) => x.source === NEW_PATH), 'normal Supervisor returned');
+    assert(!t.some((x) => x.source === BACKUP || x.source === backup2), 'upgrade backups skipped');
+    console.log('PASS upgrade backups excluded from templates');
+  }
   // 4/5: built-in entry, headings, verbatim sections
   {
     const e = DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep');
@@ -339,13 +471,13 @@ async function folderTests() {
     const skeleton = Plugin.meetingPrepTemplateSkeleton();
     const heads = (s) => s.split('\n').filter((l) => l.startsWith('## '));
     assert.deepStrictEqual(heads(skeleton), HEADINGS.map((h) => '## ' + h));
-    assert.deepStrictEqual(heads(e.prompt), HEADINGS.map((h) => '## ' + h));
-    const paras = [ 'Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.', 'Start with an overview of at most 3 sentences on the most time-sensitive items across projects.', 'Write one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.', 'Use only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project.' ];
+    assert.deepStrictEqual(heads(e.prompt), SUPERVISOR_HEADINGS.map((h) => '## ' + h));
+    const paras = [ 'Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.', "Choose at most 8 questions that most need my supervisor's decision, approval, or input. Start each line with the project name, then a colon. One short line each.", 'Use point form only. Write 2 to 4 bullets for each part:\n\n### Updates\n- What changed since the last meeting: finished work, progress, decisions.\n\n### Status\n- Where the project stands now: blockers, risks, dependencies, anything that needs the supervisor\'s attention.\n\n### Left to do\n- Up to {maxTasks} of the most important next actions, each tied to its task, with timing when the evidence supports it.\n\nThen write:\n\n### Questions\n- At most {maxQuestions} questions for the supervisor, only where a decision, approval, or clarity is genuinely needed.\n\nKeep every bullet to one line. Surface a nuance or risk when the evidence shows one; do not pad. Skip the project entirely when nothing in it needs discussion.', 'Use only facts from the evidence and cite them. Prefer the most recent evidence when sources disagree. Name tasks only when it helps. Leave out tasks that need no discussion. Include important items from sub-projects in their main project.' ];
     const secs = e.prompt.split(/^## .*$/m).slice(1).map((s) => s.trim());
     assert.deepStrictEqual(secs, paras);
     assert(!e.prompt.includes('%%'), 'no instruction comments in Supervisor');
     const fm = (s) => s.split('\n---')[0].split('\n').map((l) => l.split(':')[0].trim()).filter((k) => k && k !== '---');
-    const expectedKeys = ['action', 'completedDays', 'projects', 'ignoreProjects', 'ignoreLabels', 'subprojects', 'taskList', 'maxTasks', 'overview', 'createTasks', 'insertResponse', 'syncTasks'];
+    const expectedKeys = ['action', 'completedDays', 'projects', 'ignoreProjects', 'ignoreLabels', 'subprojects', 'taskList', 'maxTasks', 'maxQuestions', 'overview', 'triage', 'questions', 'createTasks', 'insertResponse', 'syncTasks'];
     assert.deepStrictEqual(fm(promptTemplateFileText(e)), expectedKeys);
     assert.deepStrictEqual(fm(skeleton), expectedKeys);
     // blank values, and the settings comment explains both new keys
@@ -363,7 +495,8 @@ async function folderTests() {
     assert.deepStrictEqual(sk.projects, []); assert.strictEqual(sk.createTasks, false);
     assert.strictEqual(sk.insertResponse, true); assert.strictEqual(sk.syncAfterInsert, false);
     assert.strictEqual(sk.subprojects, 'merge'); assert.strictEqual(sk.taskList, 'cited');
-    assert.strictEqual(sk.maxTasks, 5); assert.strictEqual(sk.overview, true);
+    assert.strictEqual(sk.maxTasks, 5); assert.strictEqual(sk.maxQuestions, 2); assert.strictEqual(sk.overview, true);
+    assert.deepStrictEqual({ triage: sk.triage, questions: sk.questions }, { triage: 'ai', questions: 'project' });
     console.log('PASS built-in subfolder, shared headings, verbatim sections');
   }
   // 4: migration
@@ -419,9 +552,11 @@ assert.strictEqual(modifies, 0, 'second run does not rewrite');
 assert.strictEqual(p.app.files.get(NEW_PATH), once);
     console.log('PASS migration (unedited, edited, both, neither)');
   }
-  // 0.9.41 one-time Supervisor upgrade: marker, backup of edited copies, never overwrite
+  // 0.9.48 one-time Supervisor upgrade: marker, backup of edited copies, never overwrite
   {
-    const V = '0.9.41';
+    const V = '0.9.48';
+    const notice0946 = 'Updated your Supervisor meeting template to the new point-form layout and kept your settings. Your previous version is saved as “Prepare for meeting – Supervisor (before 0.9.48)”.';
+    const notice0946Failed = "Updated your Supervisor meeting template to the new point-form layout. I couldn't read your old settings, so please check them. Your previous version is saved as “Prepare for meeting – Supervisor (before 0.9.48)”.";
     const newText = promptTemplateFileText(DEFAULT_PROMPT_TEMPLATE_FILES.find((x) => x.action === 'meeting-prep'));
     const old09038 = oldSupervisor09038Text();
     assert.strictEqual(Plugin.DEFAULT_SETTINGS.supervisorTemplateVersion, '');
@@ -456,11 +591,91 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
         assert.deepStrictEqual(notices, [], 'no backup notice for unedited default');
       }
     }
-    // edited 0.9.40 with the old marker -> backup '(before 0.9.41)' then replace
+    // released unedited 0.9.46 -> replaced with no backup, marker 0.9.48, even with the 0.9.41 marker set
+    assert.strictEqual(V0946, Plugin.MEETING_PREP_0_9_46_FILE_TEXT, 'comparison constant is the byte-exact 0.9.46 file text');
+    assert.strictEqual(Buffer.byteLength(V0946, 'utf8'), 1690, 'real 0.9.46 file size');
+    assert.strictEqual(require('crypto').createHash('sha256').update(V0946).digest('hex').slice(0, 12).toUpperCase(), '549BCEB8BE71', 'real 0.9.46 file hash');
+    for (const marker of ['', '0.9.41']) {
+      for (const eol of ['\n', '\r\n']) {
+        notices.length = 0;
+        p = appPlugin({ [NEW_PATH]: V0946.replace(/\n/g, eol) }, { supervisorTemplateVersion: marker });
+        await p.ensurePromptTemplateFolder(false);
+        assert(!p.app.files.has(BACKUP), 'unedited 0.9.46 is not backed up');
+        assert.strictEqual(p.app.files.get(NEW_PATH), newText, 'unedited file becomes exactly the new built-in text');
+        assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+        assert.deepStrictEqual(notices, [], 'no backup notice for unedited default');
+      }
+    }
+    // released unedited 0.9.47 -> replaced with no backup, marker 0.9.48, even with the 0.9.47 marker set
+    assert.strictEqual(MEETING_PREP_0_9_47_FILE_TEXT, V0947, 'comparison constant is the byte-exact 0.9.47 file text');
+    assert.strictEqual(Buffer.byteLength(V0947, 'utf8'), 2242, 'real 0.9.47 file size');
+    assert.strictEqual(require('crypto').createHash('sha256').update(V0947).digest('hex').slice(0, 12).toUpperCase(), 'AC4723263E26', 'real 0.9.47 file hash');
+    for (const marker of ['', '0.9.47']) {
+      for (const eol of ['\n', '\r\n']) {
+        notices.length = 0;
+        p = appPlugin({ [NEW_PATH]: V0947.replace(/\n/g, eol) }, { supervisorTemplateVersion: marker });
+        await p.ensurePromptTemplateFolder(false);
+        assert(!p.app.files.has(BACKUP), 'unedited 0.9.47 is not backed up');
+        assert.strictEqual(p.app.files.get(NEW_PATH), newText, 'unedited 0.9.47 becomes exactly the new built-in text');
+        assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+        assert.deepStrictEqual(notices, [], 'no backup notice for unedited 0.9.47');
+      }
+    }
+    // edited 0.9.47 with maxTasks/maxQuestions edits -> backup of exact bytes, settings carried, body replaced
+    const edited0947 = V0947.replace('maxTasks: 5\n', 'maxTasks: 8\nmaxQuestions: 7\n');
+    const expected0947 = newText.replace('maxTasks: 5\n', 'maxTasks: 8\n').replace('maxQuestions: 2\n', 'maxQuestions: 7\n');
+    notices.length = 0;
+    const original0947 = edited0947.replace(/\n/g, '\r\n');
+    p = appPlugin({ [NEW_PATH]: original0947 }, { supervisorTemplateVersion: '0.9.47' });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), original0947, 'edited 0.9.47 backed up byte-for-byte');
+    assert.strictEqual(p.app.files.get(NEW_PATH), expected0947, 'maxTasks and maxQuestions carried over into the new body');
+    assert.deepStrictEqual(notices, [notice0946], 'edited 0.9.47 gets the kept-settings notice');
+    // edited 0.9.46 with only ignoreLabels: Notes (LF and CRLF) -> byte-exact backup, new body + new defaults except ignoreLabels
+    const edited0946 = V0946.replace('ignoreLabels: \n', 'ignoreLabels: Notes\n');
+    const expected0946 = newText.replace('ignoreLabels: \n', 'ignoreLabels: Notes\n');
+    for (const eol of ['\n', '\r\n']) {
+      notices.length = 0;
+      const original = edited0946.replace(/\n/g, eol);
+      p = appPlugin({ [NEW_PATH]: original }, { supervisorTemplateVersion: '0.9.41' });
+      await p.ensurePromptTemplateFolder(false);
+      assert.strictEqual(p.app.files.get(BACKUP), original, 'edited 0.9.46 backed up byte-for-byte');
+      assert.strictEqual(p.app.files.get(NEW_PATH), expected0946, 'active file = new text with ignoreLabels kept and new defaults');
+      assert.strictEqual(p.settings.supervisorTemplateVersion, V);
+      assert.deepStrictEqual(notices, [notice0946]);
+    }
+    // edited with maxTasks: 8, a custom body and an extra front-matter key -> settings carried, body replaced
+    const editedCustom = V0946.replace('maxTasks: 5\n', 'maxTasks: 8\n').replace('syncTasks: false\n---', 'syncTasks: false\nname: My Supervisor\n---') + '\nMy custom body';
+    const expectedCustom = newText.replace('maxTasks: 5\n', 'maxTasks: 8\n').replace('syncTasks: false\n---', 'syncTasks: false\nname: My Supervisor\n---');
+    notices.length = 0;
+    p = appPlugin({ [NEW_PATH]: editedCustom });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), editedCustom, 'custom edit backed up byte-for-byte');
+    assert.strictEqual(p.app.files.get(NEW_PATH), expectedCustom, 'maxTasks and extra key carried over, new body and defaults elsewhere');
+    assert(!p.app.files.get(NEW_PATH).includes('My custom body'), 'old body lives only in the backup');
+    // edited 0.9.46 with syncTasks: true (differs from the released default) -> carried over, not reset to false
+    const editedSync = V0946.replace('syncTasks: false\n', 'syncTasks: true\n');
+    const expectedSync = newText.replace('syncTasks: false\n', 'syncTasks: true\n');
+    notices.length = 0;
+    p = appPlugin({ [NEW_PATH]: editedSync });
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(NEW_PATH), expectedSync, 'differing syncTasks value carried over');
+    assert.deepStrictEqual(notices, [notice0946], 'success notice when carry-over reads the settings');
+    // malformed front matter -> log locally, then fall back to byte-exact backup + plain new default
+    const malformed = '---\nignoreLabels: Notes\nMy custom body';
+    notices.length = 0;
+    p = appPlugin({ [NEW_PATH]: malformed });
+    const logged = []; p.logLocal = (...a) => logged.push(a);
+    await p.ensurePromptTemplateFolder(false);
+    assert.strictEqual(p.app.files.get(BACKUP), malformed, 'malformed file still backed up byte-for-byte');
+    assert.strictEqual(p.app.files.get(NEW_PATH), newText, 'fall back to plain new default');
+    assert.deepStrictEqual(notices, [notice0946Failed], 'malformed front matter gets the couldn\'t-read notice, not the kept-settings one');
+    assert(logged.some((entry) => /carry-over/i.test(String(entry && entry[0]))), 'parse failure logged locally');
+    // edited 0.9.40 with the old marker -> backup '(before 0.9.47)' then replace
     p = appPlugin({ [NEW_PATH]: old09040 + '\nMy edit' }, { supervisorTemplateVersion: '0.9.40' });
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(BACKUP), old09040 + '\nMy edit'); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText)); assert.strictEqual(p.settings.supervisorTemplateVersion, V);
-    assert(BACKUP.endsWith('(before 0.9.41).md'));
+    assert(BACKUP.endsWith('(before 0.9.48).md'));
     // released unedited 0.9.38 -> replaced, no backup
     p = appPlugin({ [NEW_PATH]: old09038 });
     await p.ensurePromptTemplateFolder(false);
@@ -470,7 +685,7 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     p = appPlugin({ [NEW_PATH]: 'MY\r\nEDIT ' });
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(norm(p.app.files.get(NEW_PATH)), norm(newText));
-    assert.deepStrictEqual(notices, ['Updated Supervisor meeting template. Previous version saved \u201cPrepare for meeting \u2013 Supervisor (before 0.9.41)\u201d.']);
+    assert.deepStrictEqual(notices, [notice0946]);
     assert.strictEqual(p.settings.supervisorTemplateVersion, V); assert.strictEqual(p.saveCount, 1);
     // second run is a no-op
     await p.ensurePromptTemplateFolder(false); assert.strictEqual(p.app.files.get(BACKUP), 'MY\r\nEDIT '); assert.strictEqual(p.saveCount, 1);
@@ -487,10 +702,10 @@ assert.strictEqual(p.app.files.get(NEW_PATH), once);
     p.app.vault.create = cr;
     await p.ensurePromptTemplateFolder(false);
     assert.strictEqual(p.app.files.get(BACKUP), 'EDIT4'); assert.strictEqual(p.settings.supervisorTemplateVersion, V);
-    // backups are ordinary meeting templates with distinct identities
+    // backups stay in the vault for the user but are not selectable meeting templates
     const names = (await p.getPromptTemplates()).filter(isMeetingPrepTemplate).map((t) => t.source);
-    assert(names.includes(BACKUP) && names.includes(NEW_PATH) && new Set(names).size === names.length);
-    console.log('PASS 0.9.41 supervisor one-time upgrade');
+    assert(!names.includes(BACKUP) && names.includes(NEW_PATH) && new Set(names).size === names.length);
+    console.log('PASS 0.9.48 supervisor one-time upgrade');
   }
   // getMeetingTodoistData forwards ignoreLabels / ignoreProjects to buildTaskRecords
   {

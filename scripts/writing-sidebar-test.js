@@ -2054,7 +2054,7 @@ function makeSelectStub() {
 
 const MEETING_TEMPLATES = [
   { name: 'Chat prompt', prompt: 'chat', action: '' },
-  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, overview: false, ignoreLabels: ['Notes'], ignoreProjects: ['Inbox', 'Personal'] },
+  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, maxQuestions: 3, overview: false, ignoreLabels: ['Notes'], ignoreProjects: ['Inbox', 'Personal'] },
 ];
 
 function makeMeetingView(prepareImpl, notePath = 'Notes/Meet.md') {
@@ -2122,6 +2122,7 @@ async function testMeetingRouting() {
   assert.strictEqual(prepCalls[0].template.subprojects, 'separate');
   assert.strictEqual(prepCalls[0].template.taskList, 'all');
   assert.strictEqual(prepCalls[0].template.maxTasks, 9);
+  assert.strictEqual(prepCalls[0].template.maxQuestions, 3, 'maxQuestions reaches prepareMeeting with the template');
   assert.strictEqual(prepCalls[0].template.overview, false);
   assert.deepStrictEqual(prepCalls[0].template.ignoreLabels, ['Notes'], 'ignoreLabels reach prepareMeeting');
   assert.deepStrictEqual(prepCalls[0].template.ignoreProjects, ['Inbox', 'Personal'], 'ignoreProjects reach prepareMeeting');
@@ -2211,6 +2212,183 @@ async function testMeetingNoticesWhenNoteClosed() {
   assert(obs.notices.some((n) => n.includes('Beta')), 'failed notice survives closed note');
   assert(obs.notices.some((n) => n.includes('Ghost')), 'unknown notice survives closed note');
   console.log('PASS meeting-notices-note-closed');
+}
+
+// Task 6: triage modal + Collaborate view wiring. The modal class is not exported; drive the
+// real instance the view opens through the obsidian mock's modalInstances seam.
+function triageElements(root) {
+  const out = [];
+  const visit = (el) => { out.push(el); for (const child of el.children || []) visit(child); };
+  visit(root);
+  return out;
+}
+function lastTriageModal() {
+  const obs = require('obsidian');
+  const list = obs.modalInstances || [];
+  return list[list.length - 1];
+}
+function startTriage(o, args) {
+  const promise = o.onTriage(args);
+  const modal = lastTriageModal();
+  assert(modal, 'triage modal opened');
+  return { promise, modal };
+}
+function triageChecks(modal) {
+  const list = findByClass(modal.contentEl, 'semantic-todoist-triage-list');
+  assert(list, 'scrollable triage list rendered');
+  return triageElements(list).filter((el) => el.tagName === 'input');
+}
+function triageButton(modal, text) {
+  return triageElements(modal.contentEl).find((el) => el.tagName === 'button' && el.textContent === text);
+}
+function triageText(modal) {
+  return triageElements(modal.contentEl).map((el) => el.textContent).join(' | ');
+}
+
+async function testMeetingTriageModal() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('class MeetingTriageModal extends Modal'), 'modal class exists');
+  assert(src.includes('semantic-todoist-triage-list'), 'list class in source');
+  assert(css.includes('.semantic-todoist-triage-list'), 'scrollable list in styles');
+  assert(/onTriage:\s*(?:async\s*)?\(/.test(src), 'view passes onTriage');
+  assert(src.includes('onPhase:'), 'view passes onPhase');
+  assert(src.includes('result.cancelled'), 'view handles cancelled result');
+
+  const obs = require('obsidian');
+  const rows = [
+    { projectId: 'Alpha', name: 'Alpha', include: true, reason: 'Worth a look', activityLabel: 'active 3 days ago', open: 12, overdue: 2, dueSoon: 1, completedInWindow: 3, titles: ['One', 'Two', 'Three'] },
+    { projectId: 'Beta', name: 'Beta', include: false, reason: 'Nothing has moved here', activityLabel: 'no recent activity', open: 0, overdue: 0, dueSoon: 0, completedInWindow: 0, titles: [] },
+    { projectId: 'Gamma', name: 'Gamma', include: false, reason: 'Quiet for now', activityLabel: 'active last month', open: 4, overdue: 0, dueSoon: 0, completedInWindow: 1, titles: ['Only sample'] },
+  ];
+  // meeting.js swallows errors thrown by onTriage, so surface assertion failures here instead.
+  const failures = [];
+  const guarded = (impl) => makeMeetingView(async (o) => {
+    try { return await impl(o); } catch (e) { failures.push(e); return { cancelled: true }; }
+  });
+  const check = (label) => assert.strictEqual(failures.length, 0, `${label}: ${failures.map((e) => e.message).join('; ')}`);
+
+  // Pre-check comes from rows[].include, never from recommended; samples cap at two.
+  const v1 = guarded(async (o) => {
+    assert.strictEqual(typeof o.onTriage, 'function', 'onTriage callback');
+    assert.strictEqual(typeof o.onPhase, 'function', 'onPhase callback');
+    o.onPhase('triaging');
+    assert(v1.statusLog.includes('Looking over your projects\u2026'), 'triaging status');
+    const { promise, modal } = startTriage(o, { rows, recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const boxes = triageChecks(modal);
+    assert.strictEqual(boxes.length, rows.length, 'one checkbox per project');
+    assert.deepStrictEqual(boxes.map((b) => b.checked), [true, false, false], 'pre-checked from include, not recommended');
+    const text = triageText(modal);
+    assert(text.includes('Projects for this meeting'), 'title');
+    assert(text.includes('Worth a look'), 'reason shown');
+    assert(text.includes('active 3 days ago'), 'activity shown');
+    assert(text.includes('12 open \u00b7 2 overdue \u00b7 1 due soon \u00b7 3 completed in 14 days'), 'counts in plain words');
+    assert(text.includes('One') && text.includes('Two') && !text.includes('Three'), 'at most two samples');
+    assert(text.includes("I've picked the projects that look worth discussing"), 'normal subline');
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, false, 'Prepare enabled when one checked');
+    modal.close();
+    assert.strictEqual(await promise, null, 'cancel resolves null');
+    return { cancelled: true };
+  }).view;
+  v1.meetingTemplate = MEETING_TEMPLATES[1];
+  await v1.write();
+  check('pre-check');
+
+  // Zero checked disables Prepare; unavailable subline; ticking one re-enables it.
+  const v2 = guarded(async (o) => {
+    const allOff = rows.map((r) => Object.assign({}, r, { include: false }));
+    const { promise, modal } = startTriage(o, { rows: allOff, recommended: [], windowDays: 14, triageSource: 'unavailable' });
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, true, 'Prepare disabled at zero checked');
+    assert(triageText(modal).includes("I couldn't sort these this time"), 'unavailable subline');
+    const box = triageChecks(modal)[0];
+    box.checked = true;
+    box.onchange();
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, false, 'Prepare enabled after tick');
+    modal.close();
+    await promise;
+    return { cancelled: true };
+  }).view;
+  v2.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2.write();
+  check('zero checked');
+
+  // "Prepare selected" resolves only the ticked ids, exactly once; later closes do not resolve again.
+  const v2b = guarded(async (o) => {
+    let doneCalls = 0;
+    const { promise, modal } = startTriage(o, { rows: rows.map((r) => Object.assign({}, r)), recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const original = modal.onDone;
+    modal.onDone = (value) => { doneCalls += 1; original(value); };
+    triageChecks(modal)[0].checked = false; // untick Alpha
+    triageChecks(modal)[0].onchange();
+    triageChecks(modal)[2].checked = true; // tick Gamma
+    triageChecks(modal)[2].onchange();
+    const prepare = triageButton(modal, 'Prepare selected');
+    assert.strictEqual(prepare.disabled, false, 'Prepare enabled with one ticked');
+    prepare.onclick();
+    assert.deepStrictEqual(await promise, { selected: ['Gamma'] }, 'resolves only the ticked ids');
+    modal.close();
+    modal.close();
+    assert.strictEqual(doneCalls, 1, 'onDone called once; later closes do not resolve again');
+    return { cancelled: true };
+  }).view;
+  v2b.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2b.write();
+  check('prepare selected');
+
+  // Escape / close resolves null exactly once.
+  const v3 = guarded(async (o) => {
+    const { promise, modal } = startTriage(o, { rows, recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    let doneCalls = 0;
+    const original = modal.onDone;
+    modal.onDone = (value) => { doneCalls += 1; original(value); };
+    modal.close();
+    modal.close();
+    assert.strictEqual(doneCalls, 1, 'onDone called once');
+    assert.strictEqual(await promise, null, 'escape resolves null');
+    return { cancelled: true };
+  }).view;
+  v3.meetingTemplate = MEETING_TEMPLATES[1];
+  await v3.write();
+  check('escape');
+
+  // off / single never open the modal and resolve to the recommendation.
+  for (const source of ['off', 'single']) {
+    const before = (obs.modalInstances || []).length;
+    const v4 = guarded(async (o) => {
+      const decision = await o.onTriage({ rows, recommended: ['Alpha'], windowDays: 14, triageSource: source });
+      assert.deepStrictEqual(decision, { selected: ['Alpha'] }, `${source} resolves recommendation`);
+      return { cancelled: true };
+    }).view;
+    v4.meetingTemplate = MEETING_TEMPLATES[1];
+    await v4.write();
+    check(`${source} no modal`);
+    assert.strictEqual((obs.modalInstances || []).length, before, `no modal for ${source}`);
+  }
+
+  // Review Focus #5: cancellation writes nothing, shows a friendly status and resets busy state.
+  obs.notices = [];
+  const { view: v5, calls } = guarded(async (o) => {
+    o.onPhase('triaging');
+    o.onPhase('gathering');
+    o.onPhase('writing');
+    const { promise } = startTriage(o, { rows: [], recommended: [], windowDays: 14, triageSource: 'ai' });
+    lastTriageModal().close();
+    assert.strictEqual(await promise, null, 'empty-row cancel resolves null');
+    return { cancelled: true };
+  });
+  v5.collaborateButton = { disabled: false, textContent: 'Collaborate' };
+  v5.meetingTemplate = MEETING_TEMPLATES[1];
+  await v5.write();
+  assert.strictEqual(calls.replaceRange.length + calls.transaction.length, 0, 'nothing written to note');
+  assert(v5.statusLog.some((s) => /nothing was written/i.test(s)), 'friendly cancel status: ' + JSON.stringify(v5.statusLog));
+  assert(v5.statusLog.includes('Reading your notes\u2026'), 'gathering status');
+  assert(v5.statusLog.includes('Writing your meeting prep\u2026'), 'writing status');
+  assert.strictEqual(v5.collaborateButton.disabled, false, 'busy reset');
+  assert.strictEqual(v5.writing, false, 'writing flag cleared');
+  assert.strictEqual(v5.rewriteModal, undefined, 'no draft rendered');
+  check('cancel writes nothing');
+  console.log('PASS meeting-triage-modal');
 }
 
 async function testSidebarActionRefresh() {
@@ -2814,6 +2992,7 @@ async function runTests() {
   await testMeetingMessagesAndReset();
   await testMeetingClearsStaleEvidence();
   await testMeetingNoticesWhenNoteClosed();
+  await testMeetingTriageModal();
   await testMeetingPresetRefresh();
   await testRunRefreshesRenamedPrompt();
   await testBuiltInTemplatesKeepIdentity();

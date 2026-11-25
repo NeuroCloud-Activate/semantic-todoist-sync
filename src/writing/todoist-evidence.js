@@ -23,6 +23,8 @@ const dayOf = (v) => {
   return d && !Number.isNaN(d.getTime()) ? localDay(d) : datePart(s);
 };
 const cleanLabel = (l) => String(l || "").replace(/^[#@]/, "").trim().toLowerCase();
+// Date.parse of a missing/invalid value must not poison an activity max.
+const safeTime = (v) => { const n = Date.parse(String(v || "")); return Number.isFinite(n) ? n : 0; };
 
 function taskStatus(task, now = new Date()) {
   if (task.completedAt) return "done";
@@ -176,7 +178,8 @@ function groupByProject(records) {
     groups.get(r.projectId).records.push(r);
   }
   const active = (g) => g.records.filter((r) => r.status !== "done").length;
-  return [...groups.values()].sort((a, b) => active(b) - active(a) || a.projectName.localeCompare(b.projectName));
+  for (const g of groups.values()) g.activityAt = g.records.reduce((m, r) => Math.max(m, r.activityAt || 0), 0);
+  return [...groups.values()].sort((a, b) => b.activityAt - a.activityAt || active(b) - active(a) || a.projectName.localeCompare(b.projectName));
 }
 
 function taskEvidenceText(r) {
@@ -189,7 +192,8 @@ function taskEvidenceText(r) {
     r.deadline ? `deadline ${datePart(r.deadline)}` : "",
     r.priority > 1 ? `priority p${5 - r.priority}` : "",
     r.labels.length ? `labels: ${r.labels.join(", ")}` : "",
-    r.completedAt ? `completed ${dayOf(r.completedAt)}` : ""
+    r.completedAt ? `completed ${dayOf(r.completedAt)}` : "",
+    r.updatedAt ? `updated ${dayOf(r.updatedAt)}` : ""
   ].filter(Boolean).join(" | ");
   return r.description ? `${head}\n${singleLine(r.description)}` : head;
 }
@@ -211,11 +215,14 @@ function mkRecord(t, projectNames, sectionNames, titles, taskUrl, now) {
     priority: t.priority,
     labels: t.labels || [],
     completedAt: t.completedAt || "",
+    addedAt: t.added_at || t.addedAt || "",
+    updatedAt: t.updated_at || t.updatedAt || "",
     description: stripSources(d).slice(0, DESC_LIMIT),
     notePaths: notePathsFromDescription(d),
     url: typeof taskUrl === "function" ? taskUrl(String(t.id)) : ""
   };
   r.status = taskStatus(r, now);
+  r.activityAt = Math.max(safeTime(r.completedAt), safeTime(r.updatedAt), safeTime(r.addedAt));
   return r;
 }
 
@@ -228,7 +235,7 @@ function budgetRecords(records, instruction, maxChars = 6000) {
     const hay = `${r.title} ${r.projectName}`.toLowerCase();
     return words.some((w) => hay.includes(w)) ? 3 : 4;
   };
-  const sorted = records.map((r, i) => [r, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map((x) => x[0]);
+  const sorted = records.map((r, i) => [r, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || (b[0].activityAt || 0) - (a[0].activityAt || 0) || a[1] - b[1]).map((x) => x[0]);
   const kept = [];
   let used = 0;
   for (const r of sorted) {

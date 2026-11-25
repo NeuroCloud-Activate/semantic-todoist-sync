@@ -252,15 +252,55 @@ const MEETING_PREP_HEADINGS = ["Meeting", "Overview", "For each project", "Rules
 const OLD_SUPERVISOR_PROMPT = "Prepare me for a meeting with my supervisor.\n\nFor each project, group related tasks into themes. For each theme write one short paragraph in plain prose: where things stand, what I finished recently, what is in progress or coming up, and any decisions, blockers or questions I should raise. Name the tasks you discuss. Give follow-ups of recently completed work particular attention.\n\nBelow the paragraphs for each project, list only the tasks worth discussing.\n\nUse only facts from the evidence and cite them. If something is unclear or missing, put it under \"Questions to raise\" rather than guessing. Keep it easy to follow in a meeting.";
 // The 0.9.38 built-in supervisor body (four sections), kept only so an unedited 0.9.38 file can be upgraded to the template-driven body.
 const SUPERVISOR_PROMPT_0_9_38 = OLD_SUPERVISOR_PROMPT.split("\n\n").map((paragraph, index) => `## ${["Meeting", "For each project", "Task list", "Rules"][index]}\n\n${paragraph}`).join("\n\n");
-const SUPERVISOR_PROMPT = [
+// The 0.9.46 built-in body, kept only so an unedited 0.9.46 file can be upgraded to the point-form body.
+const SUPERVISOR_PROMPT_0_9_46 = [
   "## Meeting\n\nPrepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
   "## Overview\n\nStart with an overview of at most 3 sentences on the most time-sensitive items across projects.",
   "## For each project\n\nWrite one short paragraph of at most 5 sentences: where things stand, what I finished recently, what is in progress or coming up, and any decisions or blockers. Group related tasks together instead of going through them one by one, and give follow-ups of recently completed work particular attention. Do not use sub-headings. After the paragraph, list at most 3 questions to raise, only for things that are unclear or missing.",
   "## Rules\n\nUse only facts from the evidence and cite them. Leave out tasks that need no discussion, and skip a project entirely when nothing in it needs discussion. Include important items from sub-projects in their main project."
 ].join("\n\n");
+const SUPERVISOR_PROMPT = [
+  "## Meeting",
+  "",
+  "Prepare me for a meeting with my supervisor. Keep the whole document short enough to read in a few minutes.",
+  "",
+  "## Questions",
+  "",
+  "Choose at most 8 questions that most need my supervisor's decision, approval, or input. Start each line with the project name, then a colon. One short line each.",
+  "",
+  "## For each project",
+  "",
+  "Use point form only. Write 2 to 4 bullets for each part:",
+  "",
+  "### Updates",
+  "- What changed since the last meeting: finished work, progress, decisions.",
+  "",
+  "### Status",
+  "- Where the project stands now: blockers, risks, dependencies, anything that needs the supervisor's attention.",
+  "",
+  "### Left to do",
+  "- Up to {maxTasks} of the most important next actions, each tied to its task, with timing when the evidence supports it.",
+  "",
+  "Then write:",
+  "",
+  "### Questions",
+  "- At most {maxQuestions} questions for the supervisor, only where a decision, approval, or clarity is genuinely needed.",
+  "",
+  "Keep every bullet to one line. Surface a nuance or risk when the evidence shows one; do not pad. Skip the project entirely when nothing in it needs discussion.",
+  "",
+  "## Rules",
+  "",
+  "Use only facts from the evidence and cite them. Prefer the most recent evidence when sources disagree. Name tasks only when it helps. Leave out tasks that need no discussion. Include important items from sub-projects in their main project."
+].join("\n");
+// The 0.9.47 built-in body, kept only so an unedited 0.9.47 file can be upgraded to the maxQuestions body.
+const SUPERVISOR_PROMPT_0_9_47 = SUPERVISOR_PROMPT.replace("{maxQuestions}", "2");
 // Settings comment as released in 0.9.39/0.9.40 (before ignore keys); comparison-only for recognising an unedited old Supervisor.
 const MEETING_PREP_SETTINGS_COMMENT_0_9_40 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
-const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+// Settings comment as released in 0.9.46; comparison-only for recognising an unedited old Supervisor.
+const MEETING_PREP_SETTINGS_COMMENT_0_9_46 = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 overview = yes or no. Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+const MEETING_PREP_SETTINGS_COMMENT = "%% Settings: completedDays = days of finished tasks to include (1\u201390) \u00b7 projects = Todoist project names, comma-separated (blank = all) \u00b7 ignoreProjects = Todoist projects to leave out, with their sub-projects \u00b7 ignoreLabels = Todoist labels to leave out, e.g. Notes \u00b7 subprojects = merge (fold sub-projects into their main project) or separate \u00b7 taskList = cited (only tasks the text mentions), all, or none \u00b7 maxTasks = most tasks listed per project \u00b7 maxQuestions = most questions per project (1-10) \u00b7 overview = yes or no \u00b7 triage = ai (let the assistant suggest which projects to include before writing) or off \u00b7 questions = top, project, or both (where questions for the meeting go). Vault, context folder, research and web sources follow the sidebar's Evidence menu. %%";
+// Settings comment as released in 0.9.47 (before maxQuestions); comparison-only for recognising an unedited old Supervisor.
+const MEETING_PREP_SETTINGS_COMMENT_0_9_47 = MEETING_PREP_SETTINGS_COMMENT.replace(" \u00b7 maxQuestions = most questions per project (1-10)", "");
 const MEETING_PREP_FOLDER_REFRESH_MS = 400;
 const DEFAULT_PROMPT_TEMPLATE_FILES = [
   {
@@ -300,9 +340,12 @@ const DEFAULT_PROMPT_TEMPLATE_FILES = [
     ignoreProjects: [],
     ignoreLabels: [],
     subprojects: "merge",
-    taskList: "cited",
+    taskList: "none",
     maxTasks: 5,
-    overview: true,
+    maxQuestions: 2,
+    overview: false,
+    triage: "ai",
+    questions: "both",
     prompt: SUPERVISOR_PROMPT
   },
   {
@@ -20807,7 +20850,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     const templates = [];
     const folder = trimSlashes(this.settings.promptTemplatesFolder || "");
     if (!folder) return [...(this.settings.builtInPromptTemplates || [])].map((template) => Object.assign({ source: "Built in", createTasks: true }, template));
-    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${folder}/`));
+    const files = this.app.vault.getMarkdownFiles().filter((file) => file.path.startsWith(`${folder}/`) && !/ \(before \d+\.\d+\.\d+\)(?: \d+)?$/.test(file.basename));
     for (const file of files) {
       const text = await this.app.vault.cachedRead(file);
       templates.push(parsePromptTemplateFile(file, text, file.path.startsWith(`${folder}/${COLLABORATE_SUBFOLDER}/`)));
@@ -20846,7 +20889,31 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
     return file;
   }
 
-  // One-time upgrade (SUPERVISOR_TEMPLATE_VERSION): 0.9.37 kept the Supervisor at the folder top; move it into the subfolder, then swap any older default for the current text. An edited copy is saved byte-for-byte as a "(before x)" note first and never overwritten.
+  // Values the released Supervisor serializer wrote. Anything else in an edited file belongs to the user and is carried over.
+  supervisorTextKeepingSettings(current, entry) {
+    if (current.startsWith("---") && current.indexOf("\n---", 3) < 0) throw new Error("Unclosed front matter");
+    const parsed = parsePromptTemplateFile({ basename: "Supervisor", path: "" }, current, true);
+    const meta = parseSimpleFrontmatter(current).meta;
+    const old = { completedDays: 14, projects: [], ignoreProjects: [], ignoreLabels: [], subprojects: "merge", taskList: "cited", maxTasks: 5, maxQuestions: 2, overview: true, createTasks: false, insertResponse: true, syncTasks: false };
+    const carried = Object.assign({}, entry);
+    for (const key of Object.keys(old)) {
+      // parsePromptTemplateFile exposes `syncTasks` as `syncAfterInsert`.
+      const value = key === "syncTasks" ? parsed.syncAfterInsert : parsed[key];
+      const previous = old[key];
+      if (Array.isArray(previous) ? value.join(",") !== previous.join(",") : value !== previous) carried[key] = value;
+    }
+    for (const key of ["triage", "questions"]) if (Object.prototype.hasOwnProperty.call(meta, key)) carried[key] = parsed[key];
+    let text = promptTemplateFileText(carried);
+    const known = ["action", ...Object.keys(old), "triage", "questions", "taskHeading", "taskGenerationTemplate"];
+    const extras = Object.keys(meta).filter((key) => !known.includes(key));
+    if (extras.length) {
+      const end = text.indexOf("\n---", 3);
+      text = `${text.slice(0, end)}\n${extras.map((key) => `${key}: ${meta[key]}`).join("\n")}${text.slice(end)}`;
+    }
+    return text;
+  }
+
+  // One-time upgrade (SUPERVISOR_TEMPLATE_VERSION): 0.9.37 kept the Supervisor at the folder top; move it into the subfolder, then swap any older default for the current text. An edited copy is saved byte-for-byte as a "(before x)" note first, and its settings carried into the new built-in text.
   async migrateSupervisorTemplate(folder) {
     if (this.settings.supervisorTemplateVersion === SUPERVISOR_TEMPLATE_VERSION) return;
     const oldPath = `${folder}/Prepare for meeting \u2013 Supervisor.md`;
@@ -20867,13 +20934,21 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       const current = await this.app.vault.read(file);
       const seen = normalize(current);
       if (seen !== normalize(newText)) {
-        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT, MEETING_PREP_0_9_40_FILE_TEXT].some((text) => seen === normalize(text))) {
+        let replacement = newText;
+        if (![OLD_SUPERVISOR_FILE_TEXT, MEETING_PREP_0_9_38_FILE_TEXT, MEETING_PREP_0_9_40_FILE_TEXT, MEETING_PREP_0_9_46_FILE_TEXT, MEETING_PREP_0_9_47_FILE_TEXT].some((text) => seen === normalize(text))) {
           let backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}).md`);
           for (let n = 2; this.app.vault.getAbstractFileByPath(backupPath); n += 1) backupPath = newPath.replace(/\.md$/, ` (before ${SUPERVISOR_TEMPLATE_VERSION}) ${n}.md`);
           await this.app.vault.create(backupPath, current);
-          new Notice(`Updated Supervisor meeting template. Previous version saved \u201c${backupPath.split("/").pop().replace(/\.md$/, "")}\u201d.`);
+          const backupName = backupPath.split("/").pop().replace(/\.md$/, "");
+          try {
+            replacement = this.supervisorTextKeepingSettings(current, entry);
+            new Notice(`Updated your Supervisor meeting template to the new point-form layout and kept your settings. Your previous version is saved as \u201c${backupName}\u201d.`);
+          } catch (error) {
+            this.logLocal("Supervisor template settings carry-over failed", { error: error.message || String(error) });
+            new Notice(`Updated your Supervisor meeting template to the new point-form layout. I couldn't read your old settings, so please check them. Your previous version is saved as \u201c${backupName}\u201d.`);
+          }
         }
-        await this.app.vault.modify(file, newText);
+        await this.app.vault.modify(file, replacement);
       }
     }
     this.settings.supervisorTemplateVersion = SUPERVISOR_TEMPLATE_VERSION;
@@ -24447,6 +24522,18 @@ class SemanticTodoistView extends ItemView {
             useVault,
             useContext,
             useResearch,
+            onTriage: (args) => {
+              const triage = args || {};
+              const source = triage.triageSource;
+              if (source !== "ai" && source !== "unavailable") return Promise.resolve({ selected: (triage.recommended || []).map(String) });
+              return new Promise((resolve) => {
+                const modal = new MeetingTriageModal(this.app, triage.rows || [], (decision) => {
+                  resolve(decision == null ? null : { selected: (decision.selected || []).map(String) });
+                }, triage);
+                modal.open();
+              });
+            },
+            onPhase: (phase) => this.setStatus(phase === "triaging" ? "Looking over your projects\u2026" : phase === "gathering" ? "Reading your notes\u2026" : phase === "writing" ? "Writing your meeting prep\u2026" : "Preparing meeting doc\u2026"),
             onProgress: (k, n) => this.setStatus(`Preparing meeting doc\u2026 ${k} of ${n} projects`),
           });
         } else {
@@ -24466,6 +24553,12 @@ class SemanticTodoistView extends ItemView {
             // writing-mode: task 10 draft length comes from persisted settings (length row removed from toolbar)
             ...(pinned ? {} : { length: this.plugin.settings.writingDraftLength === "brief" || this.plugin.settings.writingDraftLength === "detailed" ? this.plugin.settings.writingDraftLength : "standard" }),
           });
+        }
+        if (result.cancelled) {
+          const message = "No projects picked, so nothing was written.";
+          this.replaceLastAssistantMessage(message);
+          this.setStatus(message);
+          return;
         }
         // A pull has no evidence list to persist; a model result's evidence is stored for reuse.
         if (!pullResult && Array.isArray(result?.evidence)) this.lastWriteEvidence = result.evidence;
@@ -25847,6 +25940,85 @@ class SemanticTodoistSettingTab extends PluginSettingTab {
   }
 }
 
+class MeetingTriageModal extends Modal {
+  constructor(app, rows, onDone, meta) {
+    super(app);
+    this.rows = rows || [];
+    this.onDone = onDone;
+    const info = meta || {};
+    this.unavailable = info.triageSource === "unavailable";
+    this.windowDays = Number(info.windowDays) || 14;
+    // Pre-check from the row's own include flag: projects the model omitted stay ticked.
+    this.selected = new Set(this.rows.filter((row) => row.include).map((row) => String(row.projectId)));
+    this.settled = false;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("semantic-todoist-modal");
+    this.modalEl.addClass("semantic-todoist-triage-modal");
+    this.contentEl.addClass("semantic-todoist-modal-content");
+    this.render();
+  }
+
+  onClose() {
+    this.finish(null);
+    this.contentEl.empty();
+  }
+
+  finish(value) {
+    if (this.settled) return;
+    this.settled = true;
+    if (typeof this.onDone === "function") this.onDone(value);
+  }
+
+  countParts(row) {
+    const parts = [];
+    const open = Number(row.open) || 0;
+    const overdue = Number(row.overdue) || 0;
+    const dueSoon = Number(row.dueSoon) || 0;
+    const done = Number(row.completedInWindow) || 0;
+    if (open) parts.push(`${open} open`);
+    if (overdue) parts.push(`${overdue} overdue`);
+    if (dueSoon) parts.push(`${dueSoon} due soon`);
+    if (done) parts.push(`${done} completed in ${this.windowDays} days`);
+    return parts;
+  }
+
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Projects for this meeting" });
+    contentEl.createDiv({ text: this.unavailable
+      ? "I couldn't sort these this time, so everything's included. Untick what you don't need."
+      : "I've picked the projects that look worth discussing. Untick anything you'd rather skip." });
+    const list = contentEl.createDiv({ cls: "semantic-todoist-triage-list" });
+    for (const row of this.rows) {
+      const wrap = list.createDiv({ cls: "semantic-todoist-triage-row" });
+      const label = wrap.createEl("label");
+      const box = label.createEl("input", { type: "checkbox" });
+      box.checked = this.selected.has(String(row.projectId));
+      box.onchange = () => {
+        if (box.checked) this.selected.add(String(row.projectId));
+        else this.selected.delete(String(row.projectId));
+        this.render();
+      };
+      label.createSpan({ text: String(row.name || "") });
+      if (row.reason) wrap.createDiv({ cls: "semantic-todoist-triage-reason", text: String(row.reason) });
+      const bits = [row.activityLabel].concat(this.countParts(row)).filter(Boolean);
+      if (bits.length) wrap.createDiv({ cls: "semantic-todoist-triage-meta", text: bits.join(" \u00b7 ") });
+      for (const title of (row.titles || []).slice(0, 2)) wrap.createDiv({ cls: "semantic-todoist-triage-sample", text: String(title) });
+    }
+    const buttons = contentEl.createDiv({ cls: "semantic-todoist-triage-buttons" });
+    buttons.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const prepare = buttons.createEl("button", { text: "Prepare selected", cls: "mod-cta" });
+    prepare.disabled = this.selected.size === 0;
+    prepare.onclick = () => {
+      if (!this.selected.size) return;
+      this.finish({ selected: [...this.selected] });
+      this.close();
+    };
+  }
+}
 class TodoistChangesModal extends Modal {
   constructor(app, plugin, changes, onDone) {
     super(app);
@@ -29757,7 +29929,10 @@ function parsePromptTemplateFile(file, text, inMeetingFolder = false) {
     subprojects: parseMeetingSubprojects(parsed.meta.subprojects),
     taskList: parseMeetingTaskList(parsed.meta.taskList ?? parsed.meta.task_list),
     maxTasks: parseMeetingMaxTasks(parsed.meta.maxTasks ?? parsed.meta.max_tasks),
-    overview: parseTemplateBoolean(parsed.meta.overview, true)
+    maxQuestions: parseMeetingMaxQuestions(parsed.meta.maxQuestions ?? parsed.meta.max_questions),
+    overview: parseTemplateBoolean(parsed.meta.overview, true),
+    triage: parseMeetingTriage(parsed.meta.triage),
+    questions: parseMeetingQuestions(parsed.meta.questions)
   };
 }
 
@@ -29821,11 +29996,11 @@ function meetingPrepTemplateSkeleton() {
   const sections = [
     ["Meeting", "Say who the meeting is with and what it is for."],
     ["Overview", "Say how long the overview should be, or delete this section and set overview: no."],
-    ["For each project", "Say the paragraph length, what to cover, and how many questions to raise."],
-    ["Rules", "Say the tone and what to leave out."],
+    ["For each project", "Say what to cover in point form, and put questions under a ### Questions heading."],
+    ["Rules", "Ask for point form only, and say what to leave out."],
   ];
   return promptTemplateFileText({
-    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], ignoreProjects: [], ignoreLabels: [], subprojects: "merge", taskList: "cited", maxTasks: 5, overview: true,
+    action: "meeting-prep", createTasks: false, insertResponse: true, syncTasks: false, completedDays: 14, projects: [], ignoreProjects: [], ignoreLabels: [], subprojects: "merge", taskList: "cited", maxTasks: 5, maxQuestions: 2, overview: true, triage: "ai", questions: "project",
     prompt: sections.map(([heading, hint]) => `## ${heading}\n\n%% ${hint} %%\n`).join("\n\n") + "\n",
   });
 }
@@ -29870,12 +30045,26 @@ function parseMeetingMaxTasks(value) {
   return Number.isFinite(count) ? Math.min(50, Math.max(1, count)) : 5;
 }
 
+function parseMeetingMaxQuestions(value) {
+  const count = value == null || String(value).trim() === "" ? NaN : Math.trunc(Number(value));
+  return Number.isFinite(count) ? Math.min(10, Math.max(1, count)) : 2;
+}
+
+function parseMeetingTriage(value) {
+  return String(value || "").trim().toLowerCase() === "ai" ? "ai" : "off";
+}
+
+function parseMeetingQuestions(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return text === "top" || text === "both" ? text : "project";
+}
+
 function promptTemplateFileText(template) {
   const meeting = isMeetingPrepTemplate(template);
   return [
     "---",
     ...(template.action ? [`action: ${normalizePromptTemplateAction(template.action)}`] : []),
-    ...(meeting ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`, `ignoreProjects: ${(template.ignoreProjects || []).join(", ")}`, `ignoreLabels: ${(template.ignoreLabels || []).join(", ")}`, `subprojects: ${parseMeetingSubprojects(template.subprojects)}`, `taskList: ${parseMeetingTaskList(template.taskList)}`, `maxTasks: ${parseMeetingMaxTasks(template.maxTasks)}`, `overview: ${parseTemplateBoolean(template.overview, true) ? "yes" : "no"}`] : []),
+    ...(meeting ? [`completedDays: ${parseMeetingCompletedDays(template.completedDays ?? 14)}`, `projects: ${(template.projects || []).join(", ")}`, `ignoreProjects: ${(template.ignoreProjects || []).join(", ")}`, `ignoreLabels: ${(template.ignoreLabels || []).join(", ")}`, `subprojects: ${parseMeetingSubprojects(template.subprojects)}`, `taskList: ${parseMeetingTaskList(template.taskList)}`, `maxTasks: ${parseMeetingMaxTasks(template.maxTasks)}`, `maxQuestions: ${parseMeetingMaxQuestions(template.maxQuestions)}`, `overview: ${parseTemplateBoolean(template.overview, true) ? "yes" : "no"}`, `triage: ${parseMeetingTriage(template.triage)}`, `questions: ${parseMeetingQuestions(template.questions)}`] : []),
     `createTasks: ${Boolean(template.createTasks)}`,
     `insertResponse: ${template.insertResponse !== false}`,
     `syncTasks: ${Boolean(template.syncTasks ?? template.syncAfterInsert)}`,
@@ -29894,8 +30083,14 @@ const OLD_SUPERVISOR_FILE_TEXT = oldMeetingFileText(OLD_SUPERVISOR_PROMPT);
 const MEETING_PREP_0_9_38_FILE_TEXT = oldMeetingFileText(SUPERVISOR_PROMPT_0_9_38);
 // Exact bytes the 0.9.39/0.9.40 serializer wrote (template-driven keys + settings comment, no ignore keys); comparison-only, never built from the current serializer.
 const meeting0940FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nsubprojects: merge\ntaskList: cited\nmaxTasks: 5\noverview: yes\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_40}\n\n${prompt}`;
-const MEETING_PREP_0_9_40_FILE_TEXT = meeting0940FileText(SUPERVISOR_PROMPT);
-const SUPERVISOR_TEMPLATE_VERSION = "0.9.41";
+const MEETING_PREP_0_9_40_FILE_TEXT = meeting0940FileText(SUPERVISOR_PROMPT_0_9_46);
+// Exact bytes the 0.9.46 serializer wrote (ignore keys + current comment/body); comparison-only, never built from the current serializer.
+const meeting0946FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nignoreProjects: \nignoreLabels: \nsubprojects: merge\ntaskList: cited\nmaxTasks: 5\noverview: yes\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_46}\n\n${prompt}`;
+const MEETING_PREP_0_9_46_FILE_TEXT = meeting0946FileText(SUPERVISOR_PROMPT_0_9_46);
+// Exact bytes the 0.9.47 serializer wrote (no maxQuestions key/comment/placeholder); comparison-only, never built from the current serializer.
+const meeting0947FileText = (prompt) => `---\naction: meeting-prep\ncompletedDays: 14\nprojects: \nignoreProjects: \nignoreLabels: \nsubprojects: merge\ntaskList: none\nmaxTasks: 5\noverview: no\ntriage: ai\nquestions: both\ncreateTasks: false\ninsertResponse: true\nsyncTasks: false\n---\n\n${MEETING_PREP_SETTINGS_COMMENT_0_9_47}\n\n${prompt}`;
+const MEETING_PREP_0_9_47_FILE_TEXT = meeting0947FileText(SUPERVISOR_PROMPT_0_9_47);
+const SUPERVISOR_TEMPLATE_VERSION = "0.9.48";
 
 function yesNo(value) {
   return value ? "Yes" : "No";
@@ -58953,6 +59148,8 @@ function normalizeTodoistTask(task) {
     dueDate: task.due?.date || task.due_date || "",
     deadlineDate: task.deadline?.date || task.deadline_date || "",
     duration: normalizeTodoistDuration(task.duration),
+    addedAt: task.added_at || task.addedAt || "",
+    updatedAt: task.updated_at || task.updatedAt || "",
     isRecurring: Boolean(task.isRecurring || task.due?.is_recurring),
     isCompleted: Boolean(task.is_completed || task.checked || task.completed)
   };
@@ -60183,6 +60380,9 @@ if (typeof module !== "undefined" && module.exports) {
     promptTemplateFileText,
     DEFAULT_PROMPT_TEMPLATE_FILES,
   SUPERVISOR_TEMPLATE_VERSION,
+  MEETING_PREP_SETTINGS_COMMENT,
+  MEETING_PREP_0_9_46_FILE_TEXT,
+  MEETING_PREP_0_9_47_FILE_TEXT,
   meetingPrepTemplateSkeleton,
     isTaskGenerationTemplate,
     isScheduleTodayTemplate,

@@ -1,3 +1,17 @@
+## 0.9.47 - 2026-11-25
+
+### Changed
+- **Supervisor meeting prep is triaged and written in point form.** One AI pass suggests which projects are worth discussing, and a checkbox list lets you change the list before anything is written. Each project now shows short **Updates**, **Status**, **Left to do** and **Questions** bullets instead of paragraphs.
+- **Questions lead the document.** The top lists at most 8 questions for the supervisor, each starting with its project or topic, and questions also stay under each project. Placement is a template setting: `questions: top`, `project`, or `both`.
+- **Active projects come first.** Projects are ordered by the latest task or linked-note activity instead of open-task count, and tasks carry their last-updated date, so a quiet project no longer outranks one with recent work.
+- **Recent context is used.** Long linked notes are read from the start and the end, recently edited notes are read first, and project searches use the newest tasks.
+- **Caps are configurable.** `maxTasks` sets Left to do items; `maxQuestions` (new, default 2) sets questions per project. The template body uses `{maxTasks}` and `{maxQuestions}` placeholders.
+
+### Fixed
+- **Supervisor template upgrades keep your settings.** An edited Supervisor template is backed up byte-for-byte, then moved to the new layout with your own front-matter settings carried over. Upgrade backups no longer appear in the meeting template list.
+- **Triage cannot silently drop a project.** A malformed or partial triage reply leaves every project ticked; cancelling the list writes nothing.
+- **Newer note context survives long notes.** Updates appended below the first 4,000 characters of a linked note now reach the assistant.
+
 ## 0.9.46 - 2026-11-12
 
 ### Fixed

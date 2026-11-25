@@ -277,3 +277,36 @@ console.log("PASS status");
   assert.ok(!E.renderTaskList(fu.records, E.followUpMap(fu.records)).includes("/o)"));
   console.log("PASS ignoreLabels and ignoreProjects");
 }
+
+// timestamps and activity
+{
+  const { records } = build([T("a", { added_at: "2026-10-20T10:00:00Z", updated_at: "2026-10-27T10:00:00Z" })]);
+  const r = records[0];
+  assert.strictEqual(r.addedAt, "2026-10-20T10:00:00Z");
+  assert.strictEqual(r.updatedAt, "2026-10-27T10:00:00Z");
+  assert.ok(r.activityAt >= Date.parse("2026-10-27T10:00:00Z"));
+  assert.ok(E.taskEvidenceText(r).includes("updated 2026-10-27"));
+  // Task 2's normalizer emits camelCase; mkRecord must accept both shapes.
+  const camel = build([T("b", { addedAt: "2026-10-21T10:00:00Z", updatedAt: "2026-10-29T10:00:00Z" })]).records[0];
+  assert.strictEqual(camel.addedAt, "2026-10-21T10:00:00Z");
+  assert.strictEqual(camel.updatedAt, "2026-10-29T10:00:00Z");
+  // safeTime guards malformed/missing dates: no activity and no "updated" segment.
+  const bad = build([T("e", { added_at: "garbage" })]).records[0];
+  assert.strictEqual(bad.addedAt, "garbage");
+  assert.strictEqual(bad.updatedAt, "");
+  assert.strictEqual(bad.activityAt, 0);
+  assert.ok(!E.taskEvidenceText(bad).includes("updated"), E.taskEvidenceText(bad));
+}
+{
+  const old = build([T("a"), T("b"), T("c")]).records;
+  const recent = build([T("d", { projectId: "p2", updated_at: "2026-10-28T10:00:00Z" })]).records;
+  assert.deepStrictEqual(E.groupByProject([...old, ...recent]).map((g) => g.projectName), ["Grants", "Thesis"]);
+  assert.deepStrictEqual(E.groupByProject(old).map((g) => g.projectName), ["Thesis"]); // neutral fallback: today's order
+}
+{
+  const recent = rec("r", { status: "done", completedAt: "2026-10-28T10:00:00", title: "recent", activityAt: Date.parse("2026-10-28T10:00:00") });
+  const stale = rec("s", { status: "done", completedAt: "2026-10-01T10:00:00", title: "stale", activityAt: Date.parse("2026-10-01T10:00:00") });
+  const max = E.taskEvidenceText(recent).length + 1;
+  assert.deepStrictEqual(E.budgetRecords([stale, recent], "", max).kept.map((x) => x.id), ["r"]);
+}
+console.log("PASS timestamps and activity");

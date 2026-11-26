@@ -50,6 +50,7 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
     let before = "";
     let after = "";
     let writesTo;
+    let detail;
     if (row.op === "move") {
       before = where(task.projectId, task.sectionId);
       const pt = t.parentId ? byId.get(String(t.parentId)) : null; // item_move with parent_id lands in the parent's project
@@ -68,7 +69,18 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
       if (f.description) bits.push(`description "${f.description}"`);
       sentence = `Add "${title}" to ${after}${bits.length ? ` (${bits.join("; ")})` : ""}`;
       // p.phrase is the caller's ready plain-language place ("at the end of <note>"); the heading form stays for callers without one.
-      if (p) { writesTo = p.path; sentence += p.phrase ? `; a note line will be added ${p.phrase}` : `; a note line will be written to ${p.path} under "${p.heading}"`; }
+      const notePhrase = p ? (p.phrase ? `a note line will be added ${p.phrase}` : `a note line will be written to ${p.path} under "${p.heading}"`) : "";
+      if (p) { writesTo = p.path; sentence += `; ${notePhrase}`; }
+      // Structured copy for the review modal; the sentence above stays byte-identical for chat fallback.
+      detail = { title, where: after };
+      if (t.parentId) detail.parent = (byId.get(String(t.parentId)) || {}).content || "task";
+      if (f.priority) detail.priority = PRIO[f.priority] || String(f.priority);
+      if (f.dueDate) detail.due = day(f.dueDate);
+      if (f.deadlineDate) detail.deadline = day(f.deadlineDate);
+      if (f.labels && f.labels.length) detail.labels = f.labels.slice();
+      if (f.description) detail.description = String(f.description);
+      // Structured copy drops the sentence's "a note line will be added/written to" lead-in.
+      if (p) detail.notePhrase = p.phrase || `to ${p.path} under "${p.heading}"`;
     } else if (row.op === "create-section") {
       after = f.content || "";
       sentence = `Create section "${after}" in ${projName(t.projectId)}`;
@@ -123,6 +135,7 @@ function buildPreview(rows, snapshot, { placementFor } = {}) {
     const pids = [task.projectId, t.projectId].filter(Boolean);
     if (pids.some((id) => (projects.get(String(id)) || {}).isShared)) warnings.push("Shared project");
     const out = { id: `row-${i}`, sentence, before, after, warnings, ticked: row.op !== "delete" };
+    if (detail) out.detail = detail;
     if (writesTo) out.writesTo = writesTo;
     return out;
   };

@@ -98,6 +98,28 @@ test("create row uses the caller's plain phrase for where the note line goes", (
   assert.ok(!/written|"/.test(r.sentence.split("; a note line")[1]), r.sentence);
   assert.strictEqual(r.writesTo, placementFor().path);
 });
+test("create row carries structured detail fields and keeps its sentence byte-identical", () => {
+  const description = "Line one\nSee [notes](obsidian://vault/Notes.md)";
+  const row = { op: "create", fields: { content: "Plan", priority: 4, dueDate: "2026-12-01T09:00:00", deadlineDate: "2026-12-15", labels: ["a", "b"], description }, target: { projectId: "p1" }, newLabels: [] };
+  const r = buildPreview([row], snapshot, { placementFor }).groups[0].rows[0];
+  assert.deepStrictEqual(r.detail, {
+    title: "Plan",
+    where: "Home",
+    priority: "P1",
+    due: "2026-12-01",
+    deadline: "2026-12-15",
+    labels: ["a", "b"],
+    description,
+    notePhrase: 'to Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md under "Home"'
+  });
+  assert.strictEqual(r.sentence, `Add "Plan" to Home (priority P1; due 2026-12-01; deadline 2026-12-15; labels a, b; description "${description}"); a note line will be written to Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md under "Home"`);
+  assert.ok(!/a note line will be added/.test(r.detail.notePhrase) && r.detail.notePhrase.includes("Home"), r.detail.notePhrase);
+  const phrase = "in the monthly note under Home";
+  const r2 = buildPreview([create], snapshot, { placementFor: () => ({ path: placementFor().path, phrase }) }).groups[0].rows[0];
+  assert.strictEqual(r2.detail.notePhrase, phrase);
+  assert.ok(!/a note line will be added/.test(r2.detail.notePhrase) && r2.detail.notePhrase.includes("Home"), r2.detail.notePhrase);
+  assert.strictEqual(first([move]).detail, undefined, "non-create rows keep sentence and diff");
+});
 test("groups ordered moves, labels, dates, completions, creates, merges, edits last", () => {
   const p = buildPreview([edit, merge, create, done, date, label, move], snapshot, { placementFor });
   assert.deepStrictEqual(p.groups.map((g) => g.kind), ["moves", "labels", "dates", "completions", "creates", "merges", "edits"]);

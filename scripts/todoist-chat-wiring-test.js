@@ -39,12 +39,17 @@ const baseSnapshot = (tasks) => ({ tasks, projects: [{ id: "p1", name: "Home", i
 function makePlugin({ lookup, answer, token = "tok", snapshot = baseSnapshot([task({ id: "t1" })]), context = [], taskCache = {} } = {}) {
   const plugin = Object.create(Plugin.prototype);
   plugin.settings = Object.assign({}, Plugin.DEFAULT_SETTINGS, { todoistToken: token, autoAddActiveContentToContext: false, taskCache, scheduleTodayLastUndo: { sentinel: true } });
-  plugin.calls = { snapshot: [], sync: [], ops: [], saves: 0, lineUpdates: [], checks: [] };
+  plugin.calls = { snapshot: [], sync: [], ops: [], saves: 0, lineUpdates: [], checks: [], retrievals: [] };
   plugin.saveSettings = async () => { plugin.calls.saves += 1; };
   for (const name of ["logLocal", "recordDebugDiagnostic", "setSidebarStatus", "markTaskReferenceStateDirty"]) plugin[name] = () => {};
   for (const name of ["ensureCompatibleEmbeddingForChatModel", "tryUpdateSchedulerMemoryFromChat", "tryUpdateTaskDeduplicationPolicyFromChat", "buildTaskContext"]) plugin[name] = async () => "";
   plugin.requireAiAccess = () => {};
-  plugin.retrieveAdaptiveSemanticContext = async () => context.slice();
+  plugin.retrievalByQuery = null;
+  plugin.retrieveAdaptiveSemanticContext = async (query, mode, baseLimit, prompt, options) => {
+    plugin.calls.retrievals.push(String(query));
+    const rows = options?.background && plugin.retrievalByQuery ? plugin.retrievalByQuery(String(query)) : context;
+    return (rows || []).slice();
+  };
   plugin.aiModelForRequest = () => ({ model: "fictional-model" });
   plugin.withAiActivity = async (label, work) => work();
   plugin.getTodoistSnapshot = async (types, force) => { plugin.calls.snapshot.push({ force: Boolean(force) }); return plugin.snapshotNow || snapshot; };
@@ -159,6 +164,17 @@ test("create row description cites vault notes used in answer", async () => {
   assert.equal(row.op, "create");
   assert.ok(row.fields.description.startsWith("Per the garden plan."));
   assert.ok(row.fields.description.includes("[Garden](obsidian://open?file=Notes%2FGarden.md)"));
+});
+
+test("create row note links encode parentheses in note names", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change" }),
+    context: [{ evidenceId: "E1", path: "Notes/Garden (BEAP).md", title: "Garden (BEAP)", text: "Build a compost bin." }],
+    answer: { ...claims(["E1"]), changePlan: { changes: [{ op: "create", content: "Build compost bin", description: "Per the garden plan." }] } }
+  });
+  const r = await p.chat("Add a task to build the compost bin", null, [], "chat-query", { todoist: true });
+  const d = r.todoistChanges.rows[0].fields.description;
+  assert.ok(d.includes("obsidian://open?file=Notes%2FGarden%20%28BEAP%29.md)"), d);
 });
 
 test("duplicates request in phase 1 keeps the vault answer and proposes nothing", async () => {
@@ -561,6 +577,101 @@ test("change turn with model text keeps it unchanged", async () => {
   const r = await p.chat("Make compost urgent", null, [], "chat-query", { todoist: true });
   assert.ok(!r.answer.includes("I've prepared"), r.answer);
 });
+
+// ---- fixes 2 and 3: readable prose replies, background vault context ----
+test("prose chat answer renders one bullet per sentence", async () => {
+  const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }) });
+  const original = p.openaiResponse;
+  p.openaiResponse = async (request) => request.operation === "chat"
+    ? "First sentence about compost. Second sentence about the garden."
+    : original(request);
+  const r = await p.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
+  assert.equal(r.answer.trim(), "- First sentence about compost.\n- Second sentence about the garden.", r.answer);
+});
+
+test("todoist lookup schema and prompt allow up to three broad background queries", () => {
+  const { LOOKUP_SCHEMA, lookupPrompt } = require("../src/todoist/lookup.js");
+  const field = LOOKUP_SCHEMA.properties.backgroundQueries;
+  assert.ok(field, "lookup schema has backgroundQueries");
+  assert.equal(field.maxItems, 3);
+  assert.deepEqual(strictProblems(LOOKUP_SCHEMA), [], "lookup schema stays strict-compatible");
+  const { system } = lookupPrompt("Add a task for IRGP", "none");
+  assert.ok(/backgroundQueries/i.test(system), system);
+  assert.ok(/not paraphrase/i.test(system), system);
+  assert.ok(/IRGP|BEAP review committee/.test(system), system);
+});
+
+test("todoist answer prompt asks for short claims and evidence-grounded descriptions", () => {
+  const src = fs.readFileSync(mainPath, "utf8");
+  assert.ok(src.includes("Write one short claim per proposed change."), src);
+  assert.ok(src.includes("When drafting create or update descriptions, use the supplied background evidence"), src);
+  assert.ok(src.includes("never invent facts that are not in the supplied evidence"), src);
+});
+
+test("background queries retrieve extra chunks that reach the answer prompt", async () => {
+  let userText = "";
+  const normal = Array.from({ length: 21 }, (_, i) => ({ evidenceId: `E-normal-${i}`, path: `Notes/N${i}.md`, title: `N${i}`, text: `Normal chunk ${i}` }));
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change", backgroundQueries: ["IRGP", "BEAP review committee"] }),
+    context: normal,
+    answer: (request) => { userText = request.user; return claims(); }
+  });
+  p.retrievalByQuery = (query) => query === "IRGP" ? [
+    { evidenceId: "E-normal-0", path: "Notes/N0.md", title: "N0", text: "Normal chunk 0" },
+    { evidenceId: "E-irgp", path: "Notes/IRGP.md", title: "IRGP", text: "IRGP was approved." }
+  ] : [{ evidenceId: "E-beap", path: "Notes/BEAP.md", title: "BEAP", text: "BEAP review committee met." }];
+  const r = await p.chat("Add a task for IRGP", null, [], "chat-query", { todoist: true });
+  assert.deepEqual(p.calls.retrievals, ["Add a task for IRGP", "IRGP", "BEAP review committee"]);
+  assert.ok(userText.includes("IRGP was approved."), userText);
+  assert.ok(userText.includes("BEAP review committee met."), userText);
+  assert.equal((userText.match(/Normal chunk 0/g) || []).length, 1, "duplicate chunk kept once");
+  assert.ok(r.context.length <= 24 && r.context.length === 23, `evidence budget: ${r.context.length}`);
+});
+
+test("background hits never push evidence past the chat retrieval budget", async () => {
+  const normal = Array.from({ length: 24 }, (_, i) => ({ evidenceId: `E-${i}`, path: `Notes/${i}.md`, title: `N${i}`, text: `chunk ${i}` }));
+  let userText = "";
+  const p = makePlugin({ lookup: lookupOf({ kind: "change", backgroundQueries: ["IRGP"] }), context: normal, answer: (request) => { userText = request.user; return claims(); } });
+  p.retrievalByQuery = () => [{ evidenceId: "E-extra", path: "Notes/Extra.md", title: "Extra", text: "extra background" }];
+  const r = await p.chat("Add a task for IRGP", null, [], "chat-query", { todoist: true });
+  assert.equal(r.context.length, 24);
+  assert.ok(!userText.includes("extra background"), userText);
+});
+
+test("no background queries leaves retrieval unchanged", async () => {
+  const p = makePlugin({ lookup: lookupOf({ kind: "change" }), answer: claims() });
+  await p.chat("Add a task", null, [], "chat-query", { todoist: true });
+  assert.equal(p.calls.retrievals.length, 1);
+});
+
+test("background retrieval failure leaves the answer unchanged", async () => {
+  const p = makePlugin({ lookup: lookupOf({ kind: "change", backgroundQueries: ["IRGP"] }), answer: claims() });
+  p.retrievalByQuery = () => { throw new Error("retrieval offline"); };
+  const r = await p.chat("Add a task for IRGP", null, [], "chat-query", { todoist: true });
+  assert.ok(r.answer.includes("Compost is on your list"), r.answer);
+  assert.equal(p.calls.retrievals.length, 2);
+});
+
+test("background hits drop stale Todoist index rows", async () => {
+  let userText = "";
+  const p = makePlugin({ lookup: lookupOf({ kind: "change", backgroundQueries: ["IRGP"] }), answer: (request) => { userText = request.user; return claims(); } });
+  p.retrievalByQuery = () => [indexRow("gone1"), indexRow("t1")];
+  await p.chat("Add a task for IRGP", null, [], "chat-query", { todoist: true });
+  assert.ok(!userText.includes("marker-gone1"), userText);
+  assert.ok(userText.includes("marker-t1"), userText);
+});
+
+test("background chunks are citable in create descriptions", async () => {
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "change", backgroundQueries: ["IRGP"] }),
+    answer: { ...claims(["E-bg"]), changePlan: { changes: [{ op: "create", content: "Draft IRGP update", description: "Per IRGP notes." }] } }
+  });
+  p.retrievalByQuery = () => [{ evidenceId: "E-bg", path: "Notes/IRGP.md", title: "IRGP", text: "IRGP was approved." }];
+  const r = await p.chat("Add a task for IRGP", null, [], "chat-query", { todoist: true });
+  const d = r.todoistChanges.rows[0].fields.description;
+  assert.ok(d.includes("obsidian://open?file=Notes%2FIRGP.md"), d);
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of cases) {

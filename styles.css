@@ -2355,8 +2355,19 @@
   font-size: var(--font-ui-small);
 }
 
-.semantic-todoist-changes-modal .semantic-todoist-change-row { padding: 6px 0; }
-.semantic-todoist-changes-modal .semantic-todoist-change-row label { display: flex; gap: 8px; align-items: flex-start; }
+.semantic-todoist-changes-modal .modal-content { overflow-x: hidden; }
+.semantic-todoist-changes-modal .semantic-todoist-change-row { display: flex; flex-direction: column; gap: 4px; min-width: 0; overflow-wrap: anywhere; padding: 6px 0; white-space: normal; }
+.semantic-todoist-changes-modal .semantic-todoist-change-row label { display: flex; gap: 8px; align-items: flex-start; min-width: 0; line-height: 1.4; }
+.semantic-todoist-changes-modal .semantic-todoist-change-row label input[type="checkbox"] { flex: 0 0 auto; margin: 2px 0 0; }
+.semantic-todoist-changes-modal .semantic-todoist-change-title { min-width: 0; overflow-wrap: anywhere; }
+.semantic-todoist-changes-modal .semantic-todoist-change-detail { display: flex; flex-direction: column; gap: 2px; margin-left: 24px; min-width: 0; overflow-wrap: anywhere; }
+.semantic-todoist-changes-modal .semantic-todoist-change-field { min-width: 0; overflow-wrap: anywhere; }
+.semantic-todoist-changes-modal .semantic-todoist-change-field-label { color: var(--text-muted); }
+.semantic-todoist-changes-modal .semantic-todoist-change-field-value { font-weight: normal; }
+.semantic-todoist-changes-modal .semantic-todoist-change-summary { cursor: pointer; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.semantic-todoist-changes-modal .semantic-todoist-change-summary:hover { color: var(--text-normal); }
+.semantic-todoist-changes-modal .semantic-todoist-change-description { padding-left: 12px; min-width: 0; overflow-wrap: anywhere; }
+.semantic-todoist-changes-modal .semantic-todoist-change-description-line { margin: 0 0 2px; white-space: normal; }
 .semantic-todoist-changes-modal .semantic-todoist-change-diff,
 .semantic-todoist-changes-modal .semantic-todoist-change-note { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-left: 24px; }
 .semantic-todoist-changes-modal .semantic-todoist-change-warning { color: var(--text-warning); font-size: var(--font-ui-smaller); margin-left: 24px; }

@@ -5,9 +5,10 @@
 const LOOKUP_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["needsTodoist", "kind", "filters", "refersToLastAnswer"],
+  required: ["needsTodoist", "kind", "filters", "refersToLastAnswer", "backgroundQueries"],
   properties: {
     needsTodoist: { type: "boolean" },
+    backgroundQueries: { type: ["array", "null"], items: { type: "string" }, maxItems: 3 },
     kind: { type: "string", enum: ["none", "question", "change", "duplicates"] },
     filters: {
       type: "object",
@@ -34,7 +35,8 @@ function lookupPrompt(prompt, historyText) {
     "needsTodoist=true when it asks about, changes, or looks for duplicates among the user's Todoist tasks, projects, sections or labels.",
     "kind: \"question\" = asks about tasks; \"change\" = asks to create/edit/move/complete/delete tasks; \"duplicates\" = asks to find duplicate tasks.",
     "filters: words = key words likely in task titles; projects/labels = names the user mentioned; dueFrom/dueTo = YYYY-MM-DD; priority = Todoist API number, inverted from what users say: user P1 (urgent) = 4, P2 = 3, P3 = 2, P4 (normal) = 1, so \"my P1 tasks\" means priority 4; filters describe the EXISTING tasks to find, not the new value to set (for a change request, leave dueFrom/dueTo/priority null unless the user describes the task by its current date or priority); includeCompleted only if the user asks about completed tasks.",
-    "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\")."
+    "refersToLastAnswer=true when the message points at tasks from the previous answer (\"those\", \"them\", \"the first one\").",
+    "backgroundQueries: up to 3 broad vault searches for the PROJECTS, initiatives, people or topics behind the request (e.g. \"IRGP\", \"BEAP review committee\"): what they are, recent status and decisions. Do NOT paraphrase the literal ask or search for the task itself; use null when the request needs no wider context."
   ].join("\n");
   return { system, user: `Conversation so far:\n${historyText || "(none)"}\n\nLatest message:\n${prompt}` };
 }

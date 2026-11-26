@@ -14283,6 +14283,40 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       context = await this.withAiActivity("Finding vault context", () => this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, prompt, { sourceContract }));
       context = dropStaleTodoistIndexRows(context, todoistTurn?.snapshot);
     }
+    // Todoist turns may ask the look-up for broad background searches. Keep the
+    // normal query's hits first, dedupe by chunk, and stay inside the chat budget.
+    const backgroundQueries = Array.isArray(todoistTurn?.lookup?.backgroundQueries)
+      ? todoistTurn.lookup.backgroundQueries.filter((item) => typeof item === "string" && item.trim()).slice(0, 3)
+      : [];
+    if (backgroundQueries.length && !reservedTaskEvidence) {
+      const merged = (context || []).slice();
+      if (context?.semanticRetrieval) merged.semanticRetrieval = context.semanticRetrieval;
+      const chunkKey = (row) => String(row?.evidenceId || row?.evidence_id || row?.id || `${row?.path || ""}|${String(row?.text || row?.excerpt || "").slice(0, 120)}`);
+      const seen = new Set(merged.map(chunkKey));
+      const budget = adaptiveContextBudget("chat").maxRetrieval;
+      const hitCounts = [];
+      for (const query of backgroundQueries) {
+        if (merged.length >= budget) break;
+        try {
+          const hits = dropStaleTodoistIndexRows(await this.withAiActivity("Finding background context", () => this.retrieveAdaptiveSemanticContext(query, "chat", this.settings.maxChatContextChunks, query, { sourceContract, background: true })), todoistTurn?.snapshot) || [];
+          let accepted = 0;
+          for (const hit of hits) {
+            if (merged.length >= budget) break;
+            const key = chunkKey(hit);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            merged.push(hit);
+            accepted += 1;
+          }
+          hitCounts.push(`${query}:${accepted}`);
+        } catch (error) {
+          hitCounts.push(`${query}:failed`);
+          this.logLocal("Todoist background retrieval failed", { query, error: error.message || String(error) });
+        }
+      }
+      context = merged;
+      this.logLocal("Todoist background context", { queries: backgroundQueries, hitCounts, total: merged.length });
+    }
     if (!reservedTaskEvidence) {
       const rawContext = context || [];
       const retrievalTelemetry = rawContext.semanticRetrieval?.telemetry || {};
@@ -14401,7 +14435,9 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         ...(todoistTurn?.shortlist ? [
           "Todoist tasks, projects and sections are listed in the user message; answer questions about them from those lists only.",
           ...(todoistTurn.snapshot && todoistTurn.lookup.kind === "change" ? [
-            "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. In changePlan, priority is Todoist's API number: user P1, P2, P3, P4 = API 4, 3, 2, 1 (so priority 1 or P1 means API 4; P4 or normal means API 1). In your answer to the user, name priorities only as P1-P4 and never mention API numbers. Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite."
+            "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. In changePlan, priority is Todoist's API number: user P1, P2, P3, P4 = API 4, 3, 2, 1 (so priority 1 or P1 means API 4; P4 or normal means API 1). In your answer to the user, name priorities only as P1-P4 and never mention API numbers. Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite.",
+            "Write one short claim per proposed change.",
+            "When drafting create or update descriptions, use the supplied background evidence to write an informed description: relevant project context, recent decisions and related prior work; cite the evidence_ids you used and never invent facts that are not in the supplied evidence."
           ] : [])
         ] : [])
       ].join(" "),
@@ -25014,14 +25050,52 @@ class TodoistChangesModal extends Modal {
     this.contentEl.empty();
   }
 
+  renderDescription(parent, text) {
+    const details = parent.createEl("details", { cls: "semantic-todoist-change-details" });
+    details.createEl("summary", { cls: "semantic-todoist-change-summary", text: "Description" });
+    const body = details.createDiv({ cls: "semantic-todoist-change-description" });
+    const link = /\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+    for (const line of String(text).split(/\r?\n/)) {
+      const row = body.createDiv({ cls: "semantic-todoist-change-description-line" });
+      let last = 0, m;
+      while ((m = link.exec(line))) {
+        if (!/^(obsidian|https?):\/\//i.test(m[2])) continue;
+        row.createSpan({ text: line.slice(last, m.index) });
+        row.createEl("a", { text: m[1] }).setAttr("href", m[2]);
+        last = m.index + m[0].length;
+      }
+      if (last < line.length) row.createSpan({ text: line.slice(last) });
+    }
+  }
+
   renderRow(parent, row, isDelete) {
     const wrap = parent.createDiv({ cls: `semantic-todoist-change-row${isDelete ? " is-delete" : ""}` });
     const label = wrap.createEl("label");
     const box = label.createEl("input", { type: "checkbox" });
     box.checked = this.ticked.has(row.id);
     box.onchange = () => { if (box.checked) this.ticked.add(row.id); else this.ticked.delete(row.id); this.render(); };
-    label.createSpan({ text: row.sentence });
-    if (row.before || row.after) wrap.createDiv({ cls: "semantic-todoist-change-diff", text: `${row.before || "-"} -> ${row.after || "-"}` });
+    if (row.detail) {
+      label.createEl("strong", { cls: "semantic-todoist-change-title", text: row.detail.title || "Task" });
+      const detail = wrap.createDiv({ cls: "semantic-todoist-change-detail" });
+      const fields = [
+        ["Where", row.detail.where && row.detail.where + (row.detail.parent ? ` / subtask of "${row.detail.parent}"` : "")],
+        ["Due", row.detail.due],
+        ["Deadline", row.detail.deadline],
+        ["Priority", row.detail.priority],
+        ["Labels", row.detail.labels && row.detail.labels.join(", ")],
+        ["Note line", row.detail.notePhrase]
+      ];
+      for (const [name, value] of fields) {
+        if (!value) continue;
+        const field = detail.createDiv({ cls: "semantic-todoist-change-field" });
+        field.createSpan({ cls: "semantic-todoist-change-field-label", text: `${name}:` });
+        field.createSpan({ cls: "semantic-todoist-change-field-value", text: ` ${value}` });
+      }
+      if (row.detail.description) this.renderDescription(detail, row.detail.description);
+    } else {
+      label.createSpan({ text: row.sentence });
+      if (row.before || row.after) wrap.createDiv({ cls: "semantic-todoist-change-diff", text: `${row.before || "-"} -> ${row.after || "-"}` });
+    }
     for (const warning of row.warnings || []) wrap.createDiv({ cls: "semantic-todoist-change-warning", text: warning });
   }
 
@@ -35709,7 +35783,7 @@ function chatSourceLedger(active = null, chunks = [], settings = DEFAULT_SETTING
     const title = singleLine(entry.title || task.content || task.title || path || taskId);
     const url = kind === "todoist-task"
       ? todoistTaskUrl(taskId, settings)
-      : `obsidian://open?file=${encodeURIComponent(path)}`;
+      : `obsidian://open?file=${encodeURIComponent(path).replace(/[()]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)}`;
     if (!url) return;
     entries.push({
       key,
@@ -36038,7 +36112,7 @@ function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
     missingSentenceCitationCount += 1;
     renderedParts.push(sentence.replace(/\[([^\]\n]+)\]\(([^)\s]+(?:\s+[^)]*)?)\)/g, "$1").replace(/\s{2,}/g, " ").trim());
   }
-  text = renderedParts.join(" ").trim();
+  text = renderedParts.map((part) => `- ${part.replace(/^\s*(?:[-*]\s+|\d+[.)]\s+)/, "")}`).join("\n").trim();
   usedSourceCount = sourceUrlsUsed.size;
   if (missingSentenceCitationCount) reasonCodes.push("missing-sentence-end-citation");
   const retrievalTelemetry = options.retrievalTelemetry || {};

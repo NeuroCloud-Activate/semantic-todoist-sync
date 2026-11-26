@@ -124,12 +124,9 @@ const REWRITE_PRESETS = [
   },
 ];
 
-// The typed row is not a preset; its instruction is built on demand.
-const TYPED_REWRITE_INSTRUCTION =
-  "Rewrite the selected passage according to this request: <typed text>. Keep names, terms and facts unchanged unless the request explicitly asks.";
-
+// The typed row is not a preset; its instruction is the typed text itself, unchanged.
 function typedRewriteInstruction(text) {
-  return TYPED_REWRITE_INSTRUCTION.replace("<typed text>", String(text == null ? "" : text));
+  return String(text == null ? "" : text).trim();
 }
 
 function fileBaseName(path) {

@@ -314,3 +314,43 @@ The root `main.js` bundle is rebuilt by the coordinator once more after these fi
 - `styles.css`: changed by Task 4 (pin chip, preview grid, reference list, button bar) and listed in the Task 4 section, not in the table
 - Line numbers in the table's "current line" column: refreshed for this round by grepping `src/main.js` (every pointer was re-checked against the current file). 138 of the 141 rows now point at the `// writing-mode:` tag line of their own change; 3 point at the changed code because the tag itself is gone — row 50 (the Gemini schema-fallback retry, tagged on the main path), row 85 (the superseded row whose tag Task 5 deleted with the `Writing` section) and row 129 (the `renderAiSearch()` method, whose own tag went with that section). Four hunks are described by two rows each, because two rounds touched the same hunk: rows 65/113 (the pre-await capture of the insert position), 75/124 (the `vault` evidence branch), 77/132 (the request's instruction and citation style) and 79/133 (the pinned-range branch)
 - Concerns: the root `main.js` bundle is rebuilt by the coordinator once more after these final fixes (one `npm run build`), so it matches a fresh build of the current source
+
+## Collaborate assistant and Todoist — 2026-11-04
+
+| file | what changed |
+|---|---|
+| src/writing/write.js | three-way rule (evidence-only claims, marked knowledge/corrections, not-established), citation style none, stale comment removed |
+| src/writing/rewrite.js | typed instruction passes through as the instruction |
+| src/writing/citations.js and styles.js | citation style none |
+| src/main.js | normalizer + dropdown for none; write() routing for pull and change; useTodoist follows the tick |
+| src/writing/todoist-evidence.js | resolveTodoistTarget, targetRecords, renderPullList, shared mkRecord |
+| src/todoist/lookup.js | kind pull |
+| scripts/writing-todoist-pull-test.js | new test file for pull resolution and rendered lists; writing-write, writing-sidebar, writing-citations, writing-styles and provider-settings tests extended |
+| root main.js | stale built bundle — not edited here; must be rebuilt by the coordinator |
+
+## Natural assistant tone — 2026-11-11
+
+| file | what changed |
+|---|---|
+| src/writing/write.js | `systemPromptFor(mode, cite)` composes the three prompts from shared sentences; natural-tone copy; footer lists only searched sources; generic empty-evidence text; Todoist counts as a searched source; `searchedSources` removed |
+| src/main.js | Ask prompt copy and schema descriptions; `ownCategory` (`general` for vault chat, `unsupported` for web research); renderer strips an inline note link from a claim that declares no `evidence_ids`, counted in telemetry `removedLinkCount` with reasonCode `inline-link-without-evidence-removed` |
+| scripts/writing-write-test.js | natural-tone prompt and footer tests; web-empty and web-throwing cases; Todoist-only zero-tasks case; strengthened FACTS, HEDGE and rewrite-none assertions |
+| scripts/structured-chat-evidence-test.js | (d-natural) Ask prompt/schema test; (c-inline-general) renderer link-guard test |
+| scripts/web-research-local-test.js | web-mode schema and prompt agreement assertions |
+| root main.js | rebuilt by `npm.cmd run build`; version unchanged (0.9.43) |
+| Live gate | 0 hedge phrases (old build 4); 7 of 8 prompts pass. A1 does not name Chris Lannon: the attendee chunk is in the active index but the six-companion budget is consumed by higher-scored notes before the meeting note, which entered through the lexical window at score 0. Pre-existing retrieval ranking, outside this change. |
+
+## Release procedure — 2026-11-12
+
+1. Bump `package.json`, `manifest.json` and `versions.json`; date the CHANGELOG entry.
+2. Run `npm.cmd run build` and `npm.cmd test`.
+3. Commit, tag, push the branch and the tag.
+4. Create the GitHub release with `main.js`, `manifest.json` and `styles.css` attached as assets. Obsidian's validator reads the release assets, not the repository files; a release without them is rejected even when the files are committed.
+
+## 0.9.46 — duplicate review box — 2026-11-12
+
+| File | Change |
+| --- | --- |
+| src/main.js | Resolved duplicate box (merged/kept/cleared/unanswered) keeps its outcome and renders one enabled Dismiss that removes the box; a resolving record not in `duplicateInFlight` also gets Dismiss, while a live one keeps two disabled buttons; `dismissDuplicateReviewBox` clears the box and its session-resolved entry so a sidebar restore does not bring it back; waiting and failure paths unchanged |
+| scripts/duplicate-review-box-test.js | Dismiss assertions for kept and merged flows, no-re-add after restore, stale-resolving box (disabled pair + enabled Dismiss), in-flight resolving box (no Dismiss) |
+| Live gate | Real sidebar at 0.9.46: waiting box Merge/Keep both clickable; merged box outcome + Dismiss, click removes and restore does not bring it back; stale resolving box disabled pair + working Dismiss; in-flight resolving box has no Dismiss and gains it when the flight ends. Synthetic records only; store restored, no notes changed. |

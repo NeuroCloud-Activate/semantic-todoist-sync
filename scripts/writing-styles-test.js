@@ -204,4 +204,63 @@ const webMeta = { title: "Sloth squeak", url: WEB_URL, site: "blogs.scientificam
   console.log("PASS rewriteCitations apa/nature");
 }
 
-process.stdout.write(JSON.stringify({ passed: 15, failed: 0 }, null, 2) + "\n");
+{
+  const meta = { title: "Draft ethics amendment", url: "https://todoist.com/app/task/1", site: "Todoist", year: 2026 };
+  for (const style of ["apa", "nature"]) {
+    assert.strictEqual(formatReference(style, { kind: "todoist", meta }), "", "todoist gets no reference entry (" + style + ")");
+assert.notStrictEqual(formatReference(style, { kind: "web", meta }), "", "web still formats (" + style + ")");
+  }
+  console.log("PASS todoist as web");
+}
+// 12: todoist tasks are cited by an inline link, never by in-text markers or reference entries
+{
+  const task = { kind: "todoist", title: "Draft ethics amendment", project: "Grant", url: "https://app.todoist.com/app/task/9", state: "open", meta: { title: "Draft ethics amendment", site: "Todoist", url: "https://app.todoist.com/app/task/9", year: 2026 } };
+  const note = { kind: "vault", path: "papers/schott.md", meta: journalMeta };
+  const link = "[\\[T1\\]](<https://app.todoist.com/app/task/9>)";
+  assert.strictEqual(formatInText("apa", [{ source: task }]), "", "apa in-text skips a task");
+  assert.strictEqual(formatInText("nature", [{ source: task, number: 1 }]), "", "nature in-text skips a task");
+  assert.strictEqual(formatInText("apa", [{ source: task }, { source: note }]), "(Schott et al., 2002)", "apa group keeps only the note");
+  assert.strictEqual(formatInText("nature", [{ source: task, number: 1 }, { source: note, number: 2 }]), "[2]", "nature group keeps only the note");
+  const plan = planReferences("", "apa", [task]);
+  assert.strictEqual(plan.edit, null, "a task alone adds no reference section");
+  assert.deepStrictEqual(plan.added, [], "a task adds no entry");
+
+  const evidence = [{ eid: "E1", source: note }, { eid: "E2", source: task }];
+  const apa = rewriteCitations("Claim [E1, E2]. Task only [E2]. Bare E2.", evidence, "", "apa");
+  assert.strictEqual(apa.markdown, "Claim (Schott et al., 2002) " + link + ". Task only " + link + ". Bare " + link + ".", "apa text: " + apa.markdown);
+  assert.deepStrictEqual(apa.used, ["E1", "E2"], "apa used still lists the task");
+  assert.strictEqual(apa.cited.length, 2, "apa cited still lists the task");
+  assert.strictEqual(planReferences("", "apa", apa.cited).added.length, 1, "apa References hold only the note: " + JSON.stringify(planReferences("", "apa", apa.cited).added));
+
+  const nature = rewriteCitations("Claim [E2, E1]. Task only [E2].", [{ eid: "E1", source: note }, { eid: "E2", source: task }], "", "nature");
+  assert.strictEqual(nature.markdown, "Claim [1] " + link + ". Task only " + link + ".", "nature text: " + nature.markdown);
+  assert.deepStrictEqual(Object.values(nature.numbers), [1], "nature numbers the note as 1, the task takes none: " + JSON.stringify(nature.numbers));
+  const natureRefs = planReferences("", "nature", nature.cited);
+  assert.strictEqual(natureRefs.added.length, 1, "nature References hold only the note");
+  assert.ok(natureRefs.added[0].startsWith("1. "), "nature entry numbered 1: " + natureRefs.added[0]);
+
+  const bad = rewriteCitations("Claim [E1, E2].", [{ eid: "E1", source: note }, { eid: "E2", source: { ...task, url: "javascript:x" } }], "", "apa");
+  assert.strictEqual(bad.markdown, "Claim (Schott et al., 2002).", "invalid task url is dropped: " + bad.markdown);
+
+  const task2 = { ...task, url: "https://app.todoist.com/app/task/10", meta: { ...task.meta, url: "https://app.todoist.com/app/task/10" } };
+  const two = rewriteCitations("A [E2] then B [E3] then A [E2].", [{ eid: "E2", source: task }, { eid: "E3", source: task2 }], "", "apa");
+  assert.strictEqual(two.markdown, "A " + link + " then B [\\[T2\\]](<https://app.todoist.com/app/task/10>) then A " + link + ".", "apa: task numbers run T1, T2 and repeat: " + two.markdown);
+  assert.deepStrictEqual(two.numbers, {}, "apa numbers stay note-only");
+  console.log("PASS todoist inline links in apa/nature");
+}
+
+// 13: styles.js is safe for citation style "none"
+{
+  const note = { kind: "vault", path: "Notes/n.md", meta: { title: "Note", year: 2020, authors: ["One, A."] } };
+  assert.strictEqual(formatReference("none", note), "", "formatReference returns nothing for none");
+  assert.strictEqual(formatInText("none", [{ source: note }]), "", "formatInText returns nothing for none");
+  const planned = planReferences("Just a note.", "none", [{ meta: { title: "Alpha", url: "http://a" } }]);
+  assert.deepStrictEqual(planned, { numbers: {}, added: [], edit: null }, "planReferences returns empties for none");
+  const r = rewriteCitations("Claim [E1].", [{ eid: "E1", source: note }], "", "none");
+  assert.strictEqual(r.markdown, "Claim.", "none strips the marker");
+  assert.strictEqual(r.footnotes, "", "none no footnotes");
+  assert.deepStrictEqual(r.cited, [], "none cited empty");
+  assert.deepStrictEqual(r.numbers, {}, "none numbers empty");
+  console.log("PASS styles safe for none");
+}
+process.stdout.write(JSON.stringify({ passed: 18, failed: 0 }, null, 2) + "\n");

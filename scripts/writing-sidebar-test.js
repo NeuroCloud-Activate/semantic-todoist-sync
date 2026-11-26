@@ -95,7 +95,7 @@ function mockObsidian() {
       },
       TFile: Empty,
       Menu: class {
-        constructor() { this.items = []; }
+        constructor() { this.items = []; obsidianMock.lastMenu = this; }
         addItem(fn) {
           const item = {
             title: "",
@@ -328,7 +328,7 @@ function testClosedNoteShowsDraftAndInsertButton() {
   // and replaceRange is never called by the main insertion path.
   const fs = require('fs');
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
-  assert(src.includes('renderDraftForInsert(result, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
+  assert(src.includes('renderDraftForInsert({ markdown: draftText }, filePath, null)'), 'closed-note fallback calls renderDraftForInsert');
   assert(src.includes('Insert at current cursor'), 'Insert button present in draft UI');
   console.log('PASS closed-note-shows-draft-and-button (fallback path verified)');
 }
@@ -355,6 +355,29 @@ function charOffset(text, pos) {
   let off = 0;
   for (let i = 0; i < pos.line && i < lines.length; i++) off += lines[i].length + 1;
   return off + (pos.ch || 0);
+}
+
+// Applies CodeMirror-style changes the way Obsidian does: offsets against the
+// pre-edit text, applied back-to-front so earlier offsets stay valid.
+function applyChangesToText(text, changes) {
+  let next = String(text || '');
+  const withOffsets = (changes || []).map((change) => ({
+    from: charOffset(next, change.from),
+    to: charOffset(next, change.to),
+    text: String(change.text == null ? '' : change.text),
+  }));
+  withOffsets.sort((a, b) => b.from - a.from);
+  for (const change of withOffsets) {
+    const lo = Math.min(change.from, change.to);
+    const hi = Math.max(change.from, change.to);
+    next = next.slice(0, lo) + change.text + next.slice(hi);
+  }
+  return next;
+}
+
+// Lets fire-and-forget async work (the preview-mode persistence) settle.
+function flushAsync() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function makeMarkdownLeaf(filePath, text) {
@@ -384,8 +407,14 @@ function makeMarkdownLeaf(filePath, text) {
       return { line: lines.length - 1, ch: lines[lines.length - 1].length };
     },
     getRange: (from, to) => current.slice(charOffset(current, from), charOffset(current, to)),
-    replaceRange: (draft, from, to) => { calls.replaceRange.push({ draft, from, to }); },
-    transaction: ({ changes }) => { calls.transaction.push(changes || []); },
+    replaceRange: (draft, from, to) => {
+      calls.replaceRange.push({ draft, from, to });
+      current = applyChangesToText(current, [{ from, to, text: draft }]);
+    },
+    transaction: ({ changes }) => {
+      calls.transaction.push(changes || []);
+      current = applyChangesToText(current, changes || []);
+    },
   };
   return { leaf: { view }, calls, setText: (t) => { current = String(t || ''); } };
 }
@@ -429,8 +458,14 @@ function makePinEditor(text, path, from, to) {
       return { line: lines.length - 1, ch: lines[lines.length - 1].length };
     },
     getRange(f, t) { return this._state.current.slice(charOffset(this._state.current, f), charOffset(this._state.current, t)); },
-    replaceRange(draft, f, t) { calls.replaceRange.push({ draft, from: f, to: t }); },
-    transaction({ changes }) { calls.transaction.push(changes || []); },
+    replaceRange(draft, f, t) {
+      calls.replaceRange.push({ draft, from: f, to: t });
+      this._state.current = applyChangesToText(this._state.current, [{ from: f, to: t, text: draft }]);
+    },
+    transaction({ changes }) {
+      calls.transaction.push(changes || []);
+      this._state.current = applyChangesToText(this._state.current, changes || []);
+    },
   };
   view.file = { path, basename: path.split('/').pop() };
   view.editor = editor;
@@ -483,6 +518,113 @@ function makeWritePlugin(leafEntries, writeWithEvidenceImpl) {
   return plugin;
 }
 
+async function testCollaborateSendsConversation() {
+  // Collaborate continues the sidebar conversation: earlier turns go with the request; a new chat sends none.
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messages = [{ role: 'user', text: 'what is due today' }, { role: 'assistant', text: 'You have 62 tasks due today.' }];
+  view.promptEl.value = 'draft a short note about those';
+  await view.write();
+  assert.ok(String(plugin.lastWriteArgs().opts.history || '').includes('User: what is due today\nAssistant: You have 62 tasks due today.'), 'history sent: ' + plugin.lastWriteArgs().opts.history);
+  assert.ok(!String(plugin.lastWriteArgs().opts.history).includes('draft a short note about those'), 'current request is not repeated as history');
+  view.messages = [{ role: 'user', text: 'first ask' }, { role: 'assistant', text: 'Collaborating\u2026' }, { role: 'assistant', text: 'Thinking...' }];
+  view.promptEl.value = 'next';
+  await view.write();
+  assert.strictEqual(plugin.lastWriteArgs().opts.history, 'User: first ask', 'in-flight placeholders never enter history: ' + plugin.lastWriteArgs().opts.history);
+  view.messages = [];
+  view.promptEl.value = 'draft again';
+  await view.write();
+  assert.ok(!plugin.lastWriteArgs().opts.history, 'new chat sends no history');
+  console.log('PASS collaborate-sends-conversation');
+}
+
+async function testCollaborateUsesTodoistLookup() {
+  // The look-up step supplies the search query / reuse flag / task source notes; tasks themselves never become evidence.
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const files = { 'Projects/Jim.md': 1, 'Notes/B.md': 1, 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md': 1 };
+  const plugin = makeWritePlugin();
+  plugin.settings.taskCache = {
+    t1: { path: 'Projects/Jim.md' },
+    t2: { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' },
+    t3: { path: 'Gone/Missing.md' },
+    t4: {},
+    t6: { path: 'Projects/Jim.md' },
+    t7: { path: 'Notes/B.md' },
+  };
+  let lookupArgs = null;
+  const turn = { lookup: { searchQuery: 'Jim tasks due today', reuseEvidence: false }, shortlist: [{ id: 't1' }, { id: 't2' }, { id: 't3' }, { id: 't4' }, { id: 't5' }, { id: 't6' }, { id: 't7' }] };
+  plugin.todoistChatTurn = async (...args) => { lookupArgs = args; return turn; };
+  const view = makeWriteView(plugin, [leaf], leaf);
+  plugin.app.vault = { getAbstractFileByPath: (p) => (files[p] ? { path: p, extension: 'md' } : null) };
+  view.messages = [{ role: 'user', text: 'what tasks do I have today' }, { role: 'assistant', text: 'You have 62 tasks.' }];
+  view.promptEl.value = "what's specific to Jim?";
+  await view.write();
+  assert.ok(lookupArgs, 'look-up ran');
+  assert.strictEqual(lookupArgs[0], "what's specific to Jim?", 'look-up gets the request');
+  assert.ok(Array.isArray(lookupArgs[1]) && lookupArgs[1].length === 2 && !lookupArgs[1].some((m) => m.text === "what's specific to Jim?"), 'history excludes the current message: ' + JSON.stringify(lookupArgs[1]));
+  const opts = plugin.lastWriteArgs().opts;
+  assert.strictEqual(opts.searchQuery, 'Jim tasks due today', 'searchQuery forwarded');
+  assert.ok(!opts.reuseEvidence, 'no reuse without earlier evidence');
+  assert.deepStrictEqual(opts.taskSourcePaths, ['Projects/Jim.md', 'Notes/B.md'], 'uncached, missing, monthly and duplicate sources skipped, order kept');
+  assert.ok(!('todoistTasks' in opts), 'tasks themselves are never forwarded');
+  // evidence is stored, then a reuse-only follow-up forwards it
+  const stored = [{ eid: 'E1', text: 't', source: { kind: 'vault', path: 'Notes/B.md' } }];
+  const plugin2 = makeWritePlugin(null, async () => ({ markdown: 'D', footnotes: '', sources: [], dropped: 0, evidence: stored }));
+  plugin2.settings.taskCache = {};
+  plugin2.todoistChatTurn = async () => ({ lookup: { searchQuery: '', reuseEvidence: true }, shortlist: [] });
+  const view2 = makeWriteView(plugin2, [leaf], leaf);
+  plugin2.app.vault = { getAbstractFileByPath: () => null };
+  view2.promptEl.value = 'first';
+  await view2.write();
+  assert.deepStrictEqual(view2.lastWriteEvidence, stored, 'lastWriteEvidence stored');
+  assert.ok(!plugin2.lastWriteArgs().opts.reuseEvidence, 'first write has nothing to reuse');
+  view2.promptEl.value = 'shorter';
+  await view2.write();
+  const o2 = plugin2.lastWriteArgs().opts;
+  assert.strictEqual(o2.reuseEvidence, true, 'reuse forwarded');
+  assert.deepStrictEqual(o2.previousEvidence, stored, 'previous evidence forwarded');
+  assert.strictEqual(o2.searchQuery, undefined, 'blank searchQuery not forwarded');
+  assert.deepStrictEqual(o2.taskSourcePaths, [], 'no task notes');
+  // follow-up on a previous Ask answer: its task notes and evidence notes join the sources (never tasks); neither flag = not added
+  const askFiles = { 'Projects/Jim.md': 1, 'Notes/Ev1.md': 1, 'Notes/Ev2.md': 1, 'Notes/N3.md': 1, 'Notes/N4.md': 1, 'Notes/N5.md': 1, 'Notes/N6.md': 1, 'Notes/N7.md': 1, 'Notes/N8.md': 1, 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md': 1 };
+  const makeAskView = (lookup) => {
+    const p = makeWritePlugin();
+    p.settings.taskCache = { a1: { path: 'Projects/Jim.md' }, a2: { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' }, a3: { path: 'Notes/Ev1.md' } };
+    p.lastTodoistAnswerTaskIds = ['a1', 'a2', 'a3'];
+    p.todoistChatTurn = async () => ({ lookup, shortlist: [] });
+    const v = makeWriteView(p, [leaf], leaf);
+    p.app.vault = { getAbstractFileByPath: (x) => (askFiles[x] ? { path: x, extension: 'md' } : null) };
+    v.lastContext = [{ path: '@todoist/task/x' }, { path: '' }, { path: 'Notes/Ev1.md' }, { path: 'Notes/Ev2.md' }, { path: 'Semantic Todoist Sync/Miscellaneous Tasks/2026-10 Tasks.md' },
+      ...['N3', 'N4', 'N5', 'N6', 'N7', 'N8'].map((n) => ({ path: `Notes/${n}.md` }))];
+    v.promptEl.value = 'Draft a short status note on the Jim items above';
+    return { p, v };
+  };
+  const ask1 = makeAskView({ needsTodoist: false, refersToLastAnswer: true, reuseEvidence: true, searchQuery: 'Jim tasks due today' });
+  await ask1.v.write();
+  const o4 = ask1.p.lastWriteArgs().opts;
+  assert.deepStrictEqual(o4.taskSourcePaths, ['Projects/Jim.md', 'Notes/Ev1.md', 'Notes/Ev2.md', 'Notes/N3.md', 'Notes/N4.md', 'Notes/N5.md', 'Notes/N6.md', 'Notes/N7.md'], 'previous answer notes: task sources first, then evidence notes, no @todoist, no monthly, deduped, cap 8: ' + JSON.stringify(o4.taskSourcePaths));
+  assert.strictEqual(o4.searchQuery, 'Jim tasks due today', 'searchQuery forwarded');
+  const ask2 = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: false, searchQuery: 'vendor policy' });
+  await ask2.v.write();
+  assert.deepStrictEqual(ask2.p.lastWriteArgs().opts.taskSourcePaths, [], 'previous answer notes not added without refersToLastAnswer/reuseEvidence');
+  const ask3 = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: true, searchQuery: 'x' });
+  await ask3.v.write();
+  assert.ok(ask3.p.lastWriteArgs().opts.taskSourcePaths.includes('Notes/Ev2.md'), 'reuseEvidence alone also adds previous answer notes');
+  const longQ = makeAskView({ needsTodoist: false, refersToLastAnswer: false, reuseEvidence: false, searchQuery: 'q'.repeat(500) });
+  await longQ.v.write();
+  assert.strictEqual(longQ.p.lastWriteArgs().opts.searchQuery.length, 300, 'searchQuery capped at 300');
+  // a look-up that throws still writes
+  const plugin3 = makeWritePlugin();
+  plugin3.todoistChatTurn = async () => { throw new Error('boom'); };
+  const view3 = makeWriteView(plugin3, [leaf], leaf);
+  view3.promptEl.value = 'draft';
+  await view3.write();
+  assert.strictEqual(plugin3.writeCallCount(), 1, 'look-up failure still writes');
+  assert.ok(!plugin3.lastWriteArgs().opts.reuseEvidence && !plugin3.lastWriteArgs().opts.searchQuery, 'no look-up data forwarded');
+  console.log('PASS collaborate-uses-todoist-lookup');
+}
+
 async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   // (1) Active view null AND lastActiveMarkdownLeaf null, one markdown leaf open
   // → write proceeds against THAT note: position captured pre-await,
@@ -492,9 +634,16 @@ async function testWriteProceedsWithVisibleLeafAndNoLastActive() {
   const view = makeWriteView(plugin, [leaf], leaf);
   await view.write();
   assert.strictEqual(plugin.writeCallCount(), 1, 'model called once for the visible note');
-  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor');
-  assert.strictEqual(calls.replaceRange[0].draft, 'DRAFT\n\nSources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched', 'draft plus Sources searched block inserted');
-  assert(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === calls.replaceRange[0].draft), 'sidebar shows exactly what was inserted');
+  const draft = 'DRAFT\n\nSources searched:\n- deep research: not searched (turned off)\n- vault: searched\n- context folder: searched';
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'the review modal opened');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'review draft title');
+  assert.strictEqual(view.rewriteModal.after, draft, 'modal holds draft plus Sources searched block');
+  assert(!view.rewriteModal.before, 'no Before text for a fresh draft');
+  assert(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === draft), 'sidebar shows the draft');
+  await view.rewriteModal.onApply('EDITED draft');
+  assert.strictEqual(calls.replaceRange.length, 1, 'one replaceRange into the visible leaf editor on Apply');
+  assert.strictEqual(calls.replaceRange[0].draft, 'EDITED draft', 'the edited text is inserted');
   assert.strictEqual(view.writing, false, 'writing flag restored');
   assert.strictEqual(view.collaborateButton.disabled, false, 'button re-enabled');
   assert(!view.messageLog.some((m) => m.text === 'Open a note to write into.'), 'no open-a-note message');
@@ -509,6 +658,7 @@ async function testWritePrefersMostRecentLeaf() {
   const view = makeWriteView(plugin, [first.leaf, recent.leaf], recent.leaf);
   await view.write();
   assert.strictEqual(plugin.writeCallCount(), 1, 'model called once');
+  await view.rewriteModal.onApply('D');
   assert.strictEqual(first.calls.replaceRange.length, 0, 'older leaf untouched');
   assert.strictEqual(recent.calls.replaceRange.length, 1, 'most-recent leaf receives the draft');
   console.log('PASS write-prefers-most-recent-leaf');
@@ -667,7 +817,7 @@ function testCollaborateSettingsTab() {
   assert(context > citation, 'Context folder comes after Citation style');
   assert(rescan > context, 'Rescan context folder comes after Context folder');
   assert(describe > rescan, 'Describe images comes after Rescan context folder');
-  for (const [value, label] of [['footnotes', 'Footnotes'], ['apa', 'APA 7'], ['nature', 'Nature']]) {
+  for (const [value, label] of [['footnotes', 'Footnotes'], ['apa', 'APA 7'], ['nature', 'Nature'], ['none', 'None']]) {
     assert(body.includes(`addOption("${value}", "${label}")`), `citation style offers ${value} as ${label}`);
   }
   assert(body.includes('this.plugin.settings.writingCitationStyle || "footnotes"'), 'citation style shows the saved value');
@@ -841,6 +991,8 @@ async function testChipClearsPin() {
   const args = plugin.lastWriteArgs();
   assert.strictEqual(args.opts.mode, 'draft', 'a sidebar write without a pin stays a draft');
   assert.strictEqual(args.opts.length, 'standard', 'the insert path sends the draft length');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  await view.rewriteModal.onApply(view.rewriteModal.after);
   assert.strictEqual(calls.replaceRange.length, 1, 'the draft is inserted into the note');
   assert.ok(calls.replaceRange[0].draft.includes('DRAFT'), 'the draft text is what got inserted');
   console.log('PASS chip-clears-pin');
@@ -965,6 +1117,555 @@ async function testApplyUsesEditedAfterText() {
   assert.deepStrictEqual(calls.replaceRange[0], { draft: 'B edited', from: { line: 0, ch: 0 }, to: { line: 0, ch: 10 } }, 'replaceRange replaces pinned range');
   assert.strictEqual(view.pinned, null, 'pin cleared after apply');
   console.log('PASS apply-uses-edited-after-text');
+}
+
+// ---- D1: Reading view (preview) applies edits to the current disk text ----
+// Obsidian's MarkdownView in preview mode saves its preview data, not the hidden
+// editor buffer (reval14), and that buffer goes stale when the file changes on
+// disk (reval16), so Reading-view edits go through vault.process against the
+// current file text and never touch the hidden editor.
+
+// Vault spy with both write APIs: `modify` records a hidden-buffer write,
+// `process` applies the callback to a DISK string held apart from the editor.
+function installVaultProcessSpy(plugin, initialDisk, processImpl) {
+  const calls = [];
+  let disk = String(initialDisk == null ? '' : initialDisk);
+  plugin.app.vault = {
+    modify: async (file, data) => {
+      calls.push({ api: 'modify', path: file.path, text: String(data) });
+    },
+    process: async (file, fn) => {
+      calls.push({ api: 'process', path: file.path });
+      if (processImpl) return processImpl(file, fn, disk);
+      const next = fn(disk);
+      disk = String(next == null ? '' : next);
+      return disk;
+    },
+  };
+  return { calls, get disk() { return disk; } };
+}
+
+function setCursorAt(editor, line, ch) {
+  editor.getCursor = () => ({ line, ch });
+}
+
+async function testReadingViewInsertUsesDiskText() {
+  // Reading view has no visible cursor, so Apply appends the draft at the END
+  // of the DISK text after a blank line; the hidden editor buffer is never edited.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'Reading view never edits the hidden editor buffer');
+  assert.strictEqual(calls.transaction.length, 0, 'Reading view never transacts the hidden editor buffer');
+  assert.strictEqual(leaf.view.editor.getValue(), 'hello world', 'the hidden buffer is left untouched');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'exactly one atomic vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'hello world\n\nEDITED draft', 'draft appended at the end of the disk text after a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-uses-disk-text');
+}
+
+async function testReadingViewApaInsertUsesDiskText() {
+  // Non-footnote style: the draft and the reference list are composed on disk.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(calls.transaction.length, 0, 'Reading view never transacts the hidden editor buffer');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Draft with citation (Schott, 2002).'), 'the disk text contains the draft: ' + vault.disk);
+  assert.ok(vault.disk.includes('## References'), 'the disk text contains the reference list: ' + vault.disk);
+  console.log('PASS reading-view-apa-insert-uses-disk-text');
+}
+
+async function testSourceModeApplyDoesNotWriteVault() {
+  // Source / Live Preview keeps Obsidian's own save path: the editor is edited,
+  // and neither vault.process nor vault.modify is called.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'source';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 1, 'source mode still inserts into the editor buffer');
+  assert.deepStrictEqual(vault.calls, [], 'no vault.process/modify in source/Live Preview: ' + JSON.stringify(vault.calls));
+  console.log('PASS source-mode-apply-does-not-write-vault');
+}
+
+async function testReadingViewRewriteUsesDiskText() {
+  // Pinned footnotes rewrite: the replacement is applied to the disk text.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true so the modal closes');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.strictEqual(calls.transaction.length, 0, 'the hidden editor buffer is never transacted');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('B edited'), 'the disk text contains the replacement: ' + vault.disk);
+  assert.ok(!vault.disk.includes('The origin'), 'the disk text no longer holds the replaced passage: ' + vault.disk);
+  console.log('PASS reading-view-rewrite-uses-disk-text');
+}
+
+async function testReadingViewRewriteApaUsesDiskText() {
+  // APA pinned rewrite: replacement + References section composed on disk.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 26 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Revised passage (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Passage.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('Revised passage (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.transaction.length, 0, 'the hidden editor buffer is never transacted');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Revised passage (Schott, 2002).'), 'the disk text contains the replacement: ' + vault.disk);
+  assert.ok(!vault.disk.includes('original passage'), 'the replaced passage is gone: ' + vault.disk);
+  assert.ok(vault.disk.includes('## References'), 'the disk text contains the references section: ' + vault.disk);
+  console.log('PASS reading-view-rewrite-apa-uses-disk-text');
+}
+
+async function testReadingViewStaleBufferKeepsExtraLineAndAppendsDraft() {
+  // The hidden buffer is stale: the note changed on disk before the recorded
+  // cursor, so the prefix guard falls back to the END of the current disk text.
+  // The newer disk line must survive (reval16: v1 deleted it).
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  setCursorAt(leaf.view.editor, 0, 11);
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'Line B added later.\nhello world');
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.strictEqual(vault.disk.endsWith('hello world\n\nEDITED draft'), true, 'the draft is appended at the end of the current disk text after a blank line: ' + JSON.stringify(vault.disk));
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(!notices.some((n) => n.includes('Note changed while writing')), 'no cursor-fallback notice in Reading view: ' + JSON.stringify(notices));
+  console.log('PASS reading-view-stale-buffer-keeps-extra-line-and-appends-draft');
+}
+
+async function testReadingViewStaleBufferApaKeepsExtraLineAndAppendsDraft() {
+  // Same stale-buffer fallback with APA: disk line kept, draft + References on disk.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  setCursorAt(leaf.view.editor, 0, 11);
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'Line B added later.\nhello world');
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.strictEqual(calls.transaction.length, 0, 'the stale hidden buffer is never transacted');
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('Draft with citation (Schott, 2002).'), 'the draft is on disk: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('## References'), 'the reference list is on disk: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.startsWith('Line B added later.\nhello world\n\nDraft with citation (Schott, 2002).'), 'draft appended at the end after a blank line, references after the draft: ' + JSON.stringify(vault.disk));
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(!notices.some((n) => n.includes('Note changed while writing')), 'no cursor-fallback notice in Reading view: ' + JSON.stringify(notices));
+  console.log('PASS reading-view-stale-buffer-apa-keeps-extra-line-and-appends-draft');
+}
+
+async function testReadingViewRewriteKeepsStaleDiskLine() {
+  // Rewrite: disk has a line the buffer lacks, the pinned passage is unchanged,
+  // so the passage is replaced on disk and the newer line survives.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'The original passage here.\nExtra line added later.');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.ok(vault.disk.includes('Extra line added later.'), 'the disk-only line is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.includes('B edited'), 'the passage is replaced on disk: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-rewrite-keeps-stale-disk-line');
+}
+
+async function testReadingViewRewriteStalePassageWritesNothingAndKeepsDraft() {
+  // The pinned passage changed on disk: write nothing, show the notice, and keep
+  // the edited text recoverable in the sidebar.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const diskBefore = 'Changed line.\nThe original passage here.';
+  const vault = installVaultProcessSpy(plugin, diskBefore);
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'the Reading-view apply returns true (the save result arrives later)');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing is written to the hidden buffer');
+  assert.strictEqual(vault.disk, diskBefore, 'the changed passage is not overwritten');
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(notices.some((n) => n.includes('Selected text changed; not applied.')), 'the refusal is announced: ' + JSON.stringify(notices));
+  assert.ok(view.messageLog.some((m) => String(m.text || '').includes('B edited')), 'the edited text stays recoverable in the sidebar: ' + JSON.stringify(view.messageLog));
+  console.log('PASS reading-view-rewrite-stale-passage-writes-nothing-and-keeps-draft');
+}
+
+async function testReadingViewProcessFailureShowsNotice() {
+  // A failed vault.process is announced and the draft stays in the sidebar.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  installVaultProcessSpy(plugin, 'hello world', async () => { throw new Error('disk full'); });
+  const noticesBefore = (require('obsidian').notices || []).length;
+  await view.write();
+  await view.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  const notices = (require('obsidian').notices || []).slice(noticesBefore);
+  assert.ok(notices.some((n) => n.includes('Could not save the draft: disk full')), 'a failed save is announced, never silent: ' + JSON.stringify(notices));
+  assert.ok(view.messageLog.some((m) => String(m.text || '').includes('EDITED draft')), 'the draft is kept in the sidebar after the failed save: ' + JSON.stringify(view.messageLog));
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden buffer was never used');
+  console.log('PASS reading-view-process-failure-shows-notice');
+}
+
+async function testReadingViewInsertButtonKeepsStaleDiskLine() {
+  // The Insert button in Reading view appends to the current disk text.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, 'hello world\nLine B added later.');
+  view.renderDraftForInsert({ markdown: 'DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the stale hidden buffer is never edited');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.ok(vault.disk.includes('Line B added later.'), 'the extra disk line is kept: ' + JSON.stringify(vault.disk));
+  assert.strictEqual(vault.disk, 'hello world\nLine B added later.\n\nDRAFT', 'the draft is appended at the end after a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-button-keeps-stale-disk-line');
+}
+
+async function testReadingViewInsertAppendsAfterFrontmatter() {
+  // F1: a fresh Reading view reports the hidden cursor at {0,0}; the draft must
+  // land at the end of the body, never glued above the YAML frontmatter.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '---\ntitle: Note\n---\nBody text.\n');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, '---\ntitle: Note\n---\nBody text.\n');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT');
+  await flushAsync();
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.strictEqual(vault.disk, '---\ntitle: Note\n---\nBody text.\n\nDRAFT', 'frontmatter intact and the draft appended after the body with a blank line: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-appends-after-frontmatter');
+}
+
+async function testReadingViewInsertEmptyNoteDraftOnly() {
+  // F1: an empty note holds the draft alone.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, '');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT');
+  await flushAsync();
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'DRAFT', 'an empty note holds the draft alone: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-empty-note-draft-only');
+}
+
+async function testReadingViewInsertButtonEmptyNoteDraftOnly() {
+  // F1: the Insert button placement rule also gives an empty note the draft alone.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', '');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, '');
+  view.renderDraftForInsert({ markdown: 'DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  assert.strictEqual(vault.disk, 'DRAFT', 'an empty note holds the draft alone: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-insert-button-empty-note-draft-only');
+}
+
+async function testReadingViewCrlfRewriteKeepsCrlf() {
+  // F2: pins are recorded from the LF-normalized editor; a multi-line pinned
+  // rewrite on a CRLF note must apply and keep CRLF line endings throughout.
+  const { view: leafView, leaf, calls } = makePinEditor('line1\nline2', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 1, ch: 5 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'B', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {} }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  const ok = view.rewriteModal.onApply('B edited');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden editor buffer is never edited');
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'B edited\r\n', 'the multi-line CRLF passage is replaced and CRLF is kept: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-rewrite-keeps-crlf');
+}
+
+async function testReadingViewCrlfInsertKeepsCrlf() {
+  // F2: an appended draft on a CRLF note keeps CRLF line endings throughout.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT line1\nDRAFT line2');
+  await flushAsync();
+  assert.deepStrictEqual(vault.calls.map((c) => c.api), ['process'], 'one vault.process write: ' + JSON.stringify(vault.calls));
+  assert.strictEqual(vault.disk, 'line1\r\nline2\r\n\r\nDRAFT line1\r\nDRAFT line2', 'the appended draft keeps CRLF line endings: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-insert-keeps-crlf');
+}
+
+// R1: a Reading-view draft must never land inside an existing reference-list
+// section — a later APA/Nature apply rewrites that section from its entry lines
+// and would silently delete the draft.
+async function testReadingViewTwoApaAppliesKeepBothDraftsAboveExistingReferences() {
+  // Reviewer repro: note ends with "## References"; Apply FIRST (Zed), then
+  // Apply SECOND (Able) citing a new source. Both drafts and all three entries
+  // must survive, both drafts above the single heading.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const first = { meta: { authors: ['Zed, Z.'], year: 2020, title: 'Zed new work', journal: 'J. Z.', volume: 3, pages: '10-19' }, path: 'Notes/Zed.md' };
+  const second = { meta: { authors: ['Able, A.'], year: 2019, title: 'Able new work', journal: 'J. Y.', volume: 1, pages: '1-9' }, path: 'Notes/Able.md' };
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'FIRST DRAFT paragraph (Zed, 2020).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa', cited: [first], numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('FIRST DRAFT paragraph (Zed, 2020).');
+  await flushAsync();
+  plugin.writeWithEvidence = async () => ({
+    markdown: 'SECOND DRAFT paragraph (Able, 2019).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa', cited: [second], numbers: {},
+  });
+  view.promptEl.value = 'second draft';
+  await view.write();
+  await view.rewriteModal.onApply('SECOND DRAFT paragraph (Able, 2019).');
+  await flushAsync();
+  const disk = vault.disk;
+  const heading = disk.indexOf('## References');
+  const firstAt = disk.indexOf('FIRST DRAFT paragraph');
+  const secondAt = disk.indexOf('SECOND DRAFT paragraph');
+  assert.ok(firstAt >= 0, 'the first draft survives the second apply: ' + JSON.stringify(disk));
+  assert.ok(secondAt >= 0, 'the second draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(firstAt < heading && secondAt < heading, 'both drafts sit above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading, not duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^- /gm) || []).length, 3, 'three reference entries: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the original entry is neither lost nor duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Zed new work/g) || []).length, 1, 'the first source is listed once: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Able new work/g) || []).length, 1, 'the second source is listed once: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-two-apa-applies-keep-drafts-above-existing-references');
+}
+
+async function testReadingViewFootnotesInsertDraftAboveExistingReferences() {
+  // Footnotes style: a draft must not land inside an existing References section either.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('DRAFT with a footnote[^1].');
+  await flushAsync();
+  const disk = vault.disk;
+  assert.ok(disk.indexOf('DRAFT with a footnote[^1].') >= 0, 'the draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(disk.indexOf('DRAFT with a footnote[^1].') < disk.indexOf('## References'), 'the footnotes draft sits above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-footnotes-insert-draft-above-existing-references');
+}
+
+async function testReadingViewInsertButtonDraftAboveExistingReferences() {
+  // The Insert button follows the same placement rule.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n';
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.messagesEl = new FakeElement('div');
+  const vault = installVaultProcessSpy(plugin, note);
+  view.renderDraftForInsert({ markdown: 'INSERTED DRAFT' }, 'Notes/Visible.md', null);
+  const button = view.messagesEl.children.find((el) => el.tagName === 'button');
+  assert.ok(button, 'the Insert button is rendered');
+  await button.onclick();
+  const disk = vault.disk;
+  assert.strictEqual(calls.replaceRange.length, 0, 'the hidden buffer is never edited');
+  assert.ok(disk.indexOf('INSERTED DRAFT') >= 0, 'the draft is on disk: ' + JSON.stringify(disk));
+  assert.ok(disk.indexOf('INSERTED DRAFT') < disk.indexOf('## References'), 'the Insert-button draft sits above the References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-insert-button-draft-above-existing-references');
+}
+
+async function testReadingViewInsertDraftGoesBeforePlanReferencesHeadingEvenWhenBodyFollows() {
+  // Choice: the draft goes immediately before the References/Bibliography heading that
+  // planReferences locates (its section start), even when body follows the section —
+  // never inside the section, and no original text is lost.
+  const note = 'Body text.\n\n## References\n\n- Doe, J. (2001). *Old work*. [[Old-Work]]\n\n## Appendix\n\nTrailing body after the references.\n';
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'MIDDLE DRAFT paragraph (Noe, 2018).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Noe, N.'], year: 2018, title: 'Noe new work', journal: 'J. N.', volume: 2, pages: '2-3' }, path: 'Notes/Noe.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, note);
+  await view.write();
+  await view.rewriteModal.onApply('MIDDLE DRAFT paragraph (Noe, 2018).');
+  await flushAsync();
+  const disk = vault.disk;
+  const draftAt = disk.indexOf('MIDDLE DRAFT paragraph');
+  const referencesAt = disk.indexOf('## References');
+  assert.ok(draftAt >= 0 && referencesAt > draftAt, 'the draft sits above the References heading it precedes: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## References$/gm) || []).length, 1, 'one References heading: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/^## Appendix$/gm) || []).length, 1, 'the section after the references survives: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Body text\./g) || []).length, 1, 'the body text is neither lost nor duplicated: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Old work/g) || []).length, 1, 'the existing entry is kept: ' + JSON.stringify(disk));
+  assert.strictEqual((disk.match(/Trailing body after the references\./g) || []).length, 1, 'the body after the references section is kept: ' + JSON.stringify(disk));
+  console.log('PASS reading-view-insert-draft-before-plan-references-heading-when-body-follows');
+}
+
+async function testReadingViewCrlfDraftWithCrlfKeepsCrlfOnly() {
+  // R2: a CRLF draft on a CRLF note must not produce "\r\r\n" (CRCRLF).
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin();
+  const view = makeWriteView(plugin, [leaf], leaf);
+  const vault = installVaultProcessSpy(plugin, 'line1\r\nline2\r\n');
+  await view.write();
+  await view.rewriteModal.onApply('one\r\ntwo');
+  await flushAsync();
+  assert.strictEqual(vault.disk, 'line1\r\nline2\r\n\r\none\r\ntwo', 'the CRLF draft keeps CRLF line endings: ' + JSON.stringify(vault.disk));
+  assert.ok(!/\r\r\n/.test(vault.disk), 'no CRCRLF is produced: ' + JSON.stringify(vault.disk));
+  assert.ok(!/(^|[^\r])\n/.test(vault.disk), 'no bare LF remains: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-crlf-draft-with-crlf-keeps-crlf-only');
+}
+
+async function testReadingViewPinnedFootnotesStalePassageKeepsFootnoteDefinitionInSidebar() {
+  // F5 regression (gap from review): a refused pinned footnotes rewrite keeps the
+  // draft AND its "[^1]:" definition recoverable in the sidebar; the disk is untouched.
+  const { view: leafView, leaf, calls } = makePinEditor('The original passage here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 10 });
+  leafView.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Rewritten draft[^1].', footnotes: '[^1]: Doe, J. (2001). *Old work*. [[Old-Work]]',
+    sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'footnotes', cited: [], numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.pinSelection(leafView.editor, 'Notes/Passage.md');
+  const diskBefore = 'Changed line.\nThe original passage here.';
+  const vault = installVaultProcessSpy(plugin, diskBefore);
+  await view.write();
+  const ok = view.rewriteModal.onApply('Rewritten draft[^1].');
+  await flushAsync();
+  assert.strictEqual(ok, true, 'the Reading-view apply returns true');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing is written to the hidden buffer');
+  assert.strictEqual(vault.disk, diskBefore, 'the changed passage is not overwritten');
+  const sidebar = view.messageLog.map((m) => String(m.text || '')).join('\n');
+  assert.ok(sidebar.includes('Rewritten draft[^1].'), 'the draft stays recoverable in the sidebar: ' + JSON.stringify(sidebar));
+  assert.ok(sidebar.includes('[^1]: Doe, J. (2001). *Old work*. [[Old-Work]]'), 'the footnote definition stays recoverable in the sidebar: ' + JSON.stringify(sidebar));
+  console.log('PASS reading-view-pinned-footnotes-stale-passage-keeps-footnote-definition-in-sidebar');
+}
+
+async function testReadingViewApaInsertDraftThenReferencesAtEnd() {
+  // F1: the APA draft lands after the body, then the References edit — both at the end.
+  const { leaf, calls } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  leaf.view.getMode = () => 'preview';
+  const plugin = makeWritePlugin(null, async () => ({
+    markdown: 'Draft with citation (Schott, 2002).', footnotes: '', sources: [], dropped: 0, sourcesBlock: '',
+    citationStyle: 'apa',
+    cited: [{ meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X', journal: 'J. Cell Biol.', volume: 156, pages: '35-39' }, path: 'Notes/Visible.md' }],
+    numbers: {},
+  }));
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.plugin.settings.writingCitationStyle = 'apa';
+  const vault = installVaultProcessSpy(plugin, 'hello world');
+  await view.write();
+  await view.rewriteModal.onApply('Draft with citation (Schott, 2002).');
+  await flushAsync();
+  assert.ok(vault.disk.startsWith('hello world\n\nDraft with citation (Schott, 2002).'), 'the draft follows the body after a blank line: ' + JSON.stringify(vault.disk));
+  assert.ok(vault.disk.indexOf('## References') > vault.disk.indexOf('Draft with citation (Schott, 2002).'), 'the References section follows the draft: ' + JSON.stringify(vault.disk));
+  console.log('PASS reading-view-apa-insert-draft-then-references-at-end');
+}
+
+async function testReadingViewInsertStatusAfterSuccessAndFailure() {
+  // F3: the completion status is only claimed after the atomic save resolves.
+  const good = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  good.leaf.view.getMode = () => 'preview';
+  const goodPlugin = makeWritePlugin();
+  const goodView = makeWriteView(goodPlugin, [good.leaf], good.leaf);
+  installVaultProcessSpy(goodPlugin, 'hello world');
+  await goodView.write();
+  await goodView.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.ok(goodView.statusLog.includes('Collaboration complete.'), 'success reports completion: ' + JSON.stringify(goodView.statusLog));
+
+  const bad = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  bad.leaf.view.getMode = () => 'preview';
+  const badPlugin = makeWritePlugin();
+  const badView = makeWriteView(badPlugin, [bad.leaf], bad.leaf);
+  installVaultProcessSpy(badPlugin, 'hello world', async () => { throw new Error('disk full'); });
+  await badView.write();
+  await badView.rewriteModal.onApply('EDITED draft');
+  await flushAsync();
+  assert.ok(badView.statusLog.includes('Draft not saved; it is in the sidebar.'), 'a failed save reports the recovery status: ' + JSON.stringify(badView.statusLog));
+  assert.ok(!badView.statusLog.includes('Collaboration complete.'), 'a failed save never claims completion: ' + JSON.stringify(badView.statusLog));
+  console.log('PASS reading-view-insert-status-after-success-and-failure');
 }
 
 async function testContinueInsertsAfterSelection() {
@@ -1206,6 +1907,24 @@ async function testCheckGoesToSidebar() {
   console.log('PASS check-goes-to-sidebar');
 }
 
+async function testCheckChatOmitsTodoistReferences() {
+  for (const style of ['apa', 'nature']) {
+    const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
+    const task = { kind: 'todoist', title: 'Secret task', url: 'https://app.todoist.com/app/task/9', meta: { title: 'Secret task', url: 'https://app.todoist.com/app/task/9', site: 'Todoist', year: 2026 } };
+    const note = { meta: { authors: ['Schott, D. H.'], year: 2002, title: 'X' }, path: 'Notes/Passage.md' };
+    const plugin = makeWritePlugin(null, async () => ({ markdown: 'Checked.', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: style, cited: [task, note], numbers: {} }));
+    const view = makeWriteView(plugin, [leaf], leaf);
+    view.plugin.settings.writingCitationStyle = style;
+    view.pinSelection(leafView.editor, 'Notes/Passage.md');
+    await view.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: view.pinned });
+    const text = view.messageLog[view.messageLog.length - 1].text;
+    assert.ok(text.includes('Schott'), style + ' keeps the note reference');
+    assert.ok(!text.includes('Secret task') && !text.includes('todoist.com'), style + ' leaks no task reference: ' + text);
+    assert.ok(!/\n\n\n/.test(text) && !/\n\s*\n\s*\n/.test(text), style + ' no blank reference lines');
+  }
+  console.log('PASS check-chat-omits-todoist-references');
+}
+
 async function testVaultEvidenceForcesVault() {
   // "vault" evidence forces the vault on even when the vault toggle is off; the other toggles keep their state.
   const { view: leafView, leaf } = makePinEditor('Claim here.', 'Notes/Passage.md', { line: 0, ch: 0 }, { line: 0, ch: 7 });
@@ -1275,6 +1994,9 @@ async function testInsertAtCursorApa() {
   const view = makeWriteView(plugin, [leaf], leaf);
   view.plugin.settings.writingCitationStyle = 'apa';
   await view.write();
+  assert.strictEqual(calls.transaction.length, 0, 'nothing inserted before Apply');
+  assert.ok(view.rewriteModal.references.some((r) => r.includes('Schott')), 'modal lists the references to be added');
+  await view.rewriteModal.onApply('Draft with a citation (Schott, 2002).');
   assert.strictEqual(calls.replaceRange.length, 0, 'no replaceRange for the apa insert');
   assert.strictEqual(calls.transaction.length, 1, 'one transaction');
   assert.strictEqual(calls.transaction[0].length, 2, 'two changes: draft + references');
@@ -1285,7 +2007,927 @@ async function testInsertAtCursorApa() {
   console.log('PASS insert-at-cursor-apa');
 }
 
+async function testDraftReviewCancelClosedAndCheck() {
+  // Cancel writes nothing; Apply with the note closed falls back to the sidebar draft; check mode opens no modal.
+  const a = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const viewA = makeWriteView(makeWritePlugin(), [a.leaf], a.leaf);
+  await viewA.write();
+  assert.ok(viewA.rewriteModal.opened, 'modal open');
+  assert.ok(!findByClass(viewA.rewriteModal.contentEl, 'semantic-todoist-rewrite-before'), 'no Before pane for a fresh draft');
+  assert.ok(findByClass(viewA.rewriteModal.contentEl, 'semantic-todoist-rewrite-after'), 'After pane present');
+  viewA.rewriteModal.close();
+  assert.strictEqual(a.calls.replaceRange.length + a.calls.transaction.length, 0, 'Cancel inserts nothing');
+
+  const b = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const leaves = [b.leaf];
+  const viewB = makeWriteView(makeWritePlugin(), leaves, b.leaf);
+  viewB.messagesEl = null;
+  await viewB.write();
+  leaves.length = 0; // note closed while the modal is open
+  viewB.statusLog.length = 0;
+  await viewB.rewriteModal.onApply('EDITED');
+  assert.strictEqual(b.calls.replaceRange.length, 0, 'closed note: nothing inserted');
+  assert(viewB.messageLog.some((m) => m.role === 'assistant' && m.text === 'EDITED'), 'closed note: edited draft shown in sidebar');
+  assert(viewB.statusLog.includes('Collaboration complete (draft shown).'), 'closed note status');
+
+  const c = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const viewC = makeWriteView(makeWritePlugin(), [c.leaf], c.leaf);
+  const before = (require('obsidian').modalInstances || []).length;
+  viewC.pinSelection(makePinEditor('Claim here.', 'Notes/Visible.md', { line: 0, ch: 0 }, { line: 0, ch: 5 }).view.editor, 'Notes/Visible.md');
+  await viewC.write({ instruction: 'check', evidence: 'vault', apply: 'chat', pinned: viewC.pinned });
+  assert.strictEqual((require('obsidian').modalInstances || []).length, before, 'check mode opens no modal');
+  console.log('PASS draft-review-cancel-closed-check');
+}
+
+// ---- meeting prep wiring ----
+function makeSelectStub() {
+  const el = {
+    children: [], style: {}, _value: '', onchange: null,
+    get firstChild() { return this.children[0] || null; },
+    removeChild(c) { this.children.splice(this.children.indexOf(c), 1); },
+    createEl(tag, o = {}) { const c = { text: o.text, value: o.value }; this.children.push(c); return c; },
+    get value() { return this._value; },
+    set value(v) { this._value = String(v); },
+  };
+  return el;
+}
+
+const MEETING_TEMPLATES = [
+  { name: 'Chat prompt', prompt: 'chat', action: '' },
+  { name: 'Weekly sync', prompt: 'Prep the weekly sync', action: 'meeting-prep', completedDays: 7, projects: ['Alpha'], subprojects: 'separate', taskList: 'all', maxTasks: 9, maxQuestions: 3, overview: false, ignoreLabels: ['Notes'], ignoreProjects: ['Inbox', 'Personal'] },
+];
+
+function makeMeetingView(prepareImpl, notePath = 'Notes/Meet.md') {
+  const { view: leafView, leaf, calls } = makePinEditor('Hello world.', notePath, { line: 0, ch: 0 }, { line: 0, ch: 5 });
+  const prepCalls = [];
+  const plugin = makeWritePlugin(null, async () => ({ markdown: 'DRAFT', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }));
+  plugin.getPromptTemplates = async () => MEETING_TEMPLATES;
+  plugin.prepareMeeting = async (o) => { prepCalls.push(o); return prepareImpl(o); };
+  const view = makeWriteView(plugin, [leaf], leaf, SourcePlugin);
+  view.meetingPresetEl = makeSelectStub();
+  return { view, plugin, calls, prepCalls, leafView };
+}
+
+async function testMeetingEvidenceMenuAndLabel() {
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  view.collaborateFeaturesButton = { textContent: '' };
+  view.openCollaborateFeaturesMenu({});
+  // last constructed Menu is not exposed; read via the source instead of the mock
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const body = srcClassMethodBody(src, 'openCollaborateFeaturesMenu');
+  assert(body.includes('choice.setTitle("Todoist tasks")'), 'Todoist tasks menu item');
+  assert(body.includes('writingUseTodoist === true'), 'unchecked unless on');
+  plugin.settings.writingUseTodoist = false;
+  view.updateCollaborateFeaturesLabel();
+  assert(!view.collaborateFeaturesButton.textContent.includes('Todoist'), 'label omits Todoist when off');
+  plugin.settings.writingUseTodoist = true;
+  view.updateCollaborateFeaturesLabel();
+  assert(view.collaborateFeaturesButton.textContent.endsWith('Todoist'), 'label shows Todoist when on');
+  console.log('PASS meeting-evidence-menu');
+}
+
+async function testMeetingPresetDropdown() {
+  const { view } = makeMeetingView(async () => ({}));
+  await view.populateMeetingPresetOptions();
+  assert.deepStrictEqual(view.meetingPresetEl.children.map((c) => c.text), ['None', 'Weekly sync'], 'None + meeting templates only');
+  view.promptEl = { value: 'x' };
+  view.meetingPresetEl.value = '0';
+  view.selectMeetingPreset();
+  assert.strictEqual(view.promptEl.value, 'Prep the weekly sync');
+  assert.strictEqual(view.meetingTemplate, MEETING_TEMPLATES[1]);
+  view.meetingPresetEl.value = '';
+  view.selectMeetingPreset();
+  assert.strictEqual(view.meetingTemplate, null, 'None clears the preset');
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('semantic-todoist-meeting-preset'), 'select class present');
+  assert(src.indexOf('semantic-todoist-collaborate-features') < src.indexOf('semantic-todoist-meeting-preset'), 'preset sits after Features button');
+  assert(srcClassMethodBody(src, 'applyCollaborateMode').includes('meetingPresetEl'), 'shown only in Collaborate mode');
+  const popStart = src.indexOf('async populateSidebarActionOptions()');
+  assert(src.slice(popStart, src.indexOf('async populateMeetingPresetOptions()')).includes('populateMeetingPresetOptions'), 'refreshed with action options');
+  console.log('PASS meeting-preset-dropdown');
+}
+
+async function testMeetingRouting() {
+  const { view, plugin, calls, prepCalls } = makeMeetingView(async () => ({ markdown: 'MEET', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: 'Sources searched:\n- Todoist: 1 open, 0 completed in last 7 days', failedProjects: [], unknownProjects: [] }));
+  view.pinned = { path: 'Notes/Meet.md', from: { line: 0, ch: 0 }, to: { line: 0, ch: 5 }, original: 'Hello' };
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  view.meetingPresetEl.value = '0';
+  view.promptEl.value = 'edited meeting prompt';
+  view.webSearchMode = 'concise';
+  await view.write();
+  assert.strictEqual(plugin.writeCallCount(), 0, 'writeWithEvidence not called');
+  assert.strictEqual(prepCalls.length, 1);
+  assert.strictEqual(prepCalls[0].instruction, 'edited meeting prompt');
+  assert.strictEqual(prepCalls[0].template, MEETING_TEMPLATES[1]);
+  assert.strictEqual(prepCalls[0].template.subprojects, 'separate');
+  assert.strictEqual(prepCalls[0].template.taskList, 'all');
+  assert.strictEqual(prepCalls[0].template.maxTasks, 9);
+  assert.strictEqual(prepCalls[0].template.maxQuestions, 3, 'maxQuestions reaches prepareMeeting with the template');
+  assert.strictEqual(prepCalls[0].template.overview, false);
+  assert.deepStrictEqual(prepCalls[0].template.ignoreLabels, ['Notes'], 'ignoreLabels reach prepareMeeting');
+  assert.deepStrictEqual(prepCalls[0].template.ignoreProjects, ['Inbox', 'Personal'], 'ignoreProjects reach prepareMeeting');
+  assert.strictEqual(prepCalls[0].webSearchMode, 'concise');
+  assert.strictEqual(prepCalls[0].citationStyle, 'footnotes');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'Review draft window opened');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'draft review, not pinned rewrite preview');
+  assert.strictEqual(view.rewriteModal.before, undefined, 'pinned rewrite ignored (no before pane)');
+  assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted before Apply');
+  await view.rewriteModal.onApply(view.rewriteModal.after);
+  assert.strictEqual(calls.replaceRange.length, 1, 'inserted like a draft on Apply');
+  assert.strictEqual(calls.replaceRange[0].draft, 'MEET\n\nSources searched:\n- Todoist: 1 open, 0 completed in last 7 days');
+  assert.strictEqual(view.meetingTemplate, null, 'preset reset after run');
+  assert.strictEqual(view.meetingPresetEl.value, '', 'dropdown back to None');
+
+  // no preset: useTodoist follows the setting
+  for (const on of [true, false]) {
+    plugin.settings.writingUseTodoist = on;
+    view.pinned = null;
+    view.promptEl.value = 'plain draft';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, on, `useTodoist ${on}`);
+  }
+  console.log('PASS meeting-routing');
+}
+
+async function testMeetingMessagesAndReset() {
+  const cases = [
+    [Object.assign(new Error('x'), { code: 'meeting-empty', unknownProjects: [] }), 'No Todoist tasks in scope for this template.'],
+    [Object.assign(new Error('x'), { code: 'meeting-empty', unknownProjects: ['Foo', 'Bar'] }), 'Unknown project(s) in template: Foo, Bar'],
+    [Object.assign(new Error('Todoist unavailable: no token'), { code: 'todoist-unavailable' }), 'Todoist unavailable: no token'],
+    [Object.assign(new Error('Todoist is unavailable: HTTP 401'), { code: 'todoist-unavailable' }), 'Todoist unavailable: HTTP 401'],
+    [Object.assign(new Error('Todoist is unavailable'), { code: 'todoist-unavailable' }), 'Todoist unavailable: no token or request failed'],
+    [Object.assign(new Error('Every project failed: boom'), { code: 'meeting-failed' }), "Couldn't write any project: boom"],
+  ];
+  for (const [err, expected] of cases) {
+    const { view, calls } = makeMeetingView(async () => { throw err; });
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    view.meetingPresetEl.value = '0';
+    await view.write();
+    assert(view.statusLog.includes(expected), `status: ${expected}`);
+    assert.strictEqual(calls.replaceRange.length, 0, 'nothing inserted');
+    assert.strictEqual(view.meetingTemplate, null, 'reset after failure');
+    assert.strictEqual(view.meetingPresetEl.value, '');
+  }
+  const obs = require('obsidian');
+  obs.notices = [];
+  const { view } = makeMeetingView(async (o) => {
+    o.onProgress(1, 2);
+    return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: ['Beta'], unknownProjects: ['Ghost'] };
+  });
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  await view.write();
+  assert(view.statusLog.includes('Preparing meeting doc\u2026 1 of 2 projects'), 'progress status');
+  assert(obs.notices.some((n) => n.includes('Beta')), 'failed project notice');
+  assert(obs.notices.includes('Unknown project(s) in template: Ghost'), 'unknown project notice');
+  console.log('PASS meeting-messages-and-reset');
+}
+
+async function testMeetingClearsStaleEvidence() {
+  for (const fail of [false, true]) {
+    const { view, plugin } = makeMeetingView(async () => { if (fail) throw new Error('boom'); return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '' }; });
+    view.lastWriteEvidence = [{ id: 'E1', path: 'Old/Unrelated.md' }];
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    await view.write();
+    assert.strictEqual(view.lastWriteEvidence, null, `meeting run clears stale evidence (fail=${fail})`);
+    plugin.todoistChatTurn = async () => ({ lookup: { searchQuery: '', reuseEvidence: true }, shortlist: [] });
+    view.promptEl.value = 'shorten that';
+    await view.write();
+    const o = plugin.lastWriteArgs().opts;
+    assert.ok(!o.reuseEvidence && !o.previousEvidence, 'follow-up after meeting searches fresh');
+  }
+  console.log('PASS meeting-clears-stale-evidence');
+}
+
+async function testMeetingNoticesWhenNoteClosed() {
+  const obs = require('obsidian');
+  obs.notices = [];
+  let view;
+  ({ view } = makeMeetingView(async () => {
+    view.plugin.app.workspace.getLeavesOfType = () => [];
+    view.plugin.app.workspace.getMostRecentLeaf = undefined;
+    return { markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: ['Beta'], unknownProjects: ['Ghost'] };
+  }));
+  view.meetingTemplate = MEETING_TEMPLATES[1];
+  await view.write();
+  assert(obs.notices.some((n) => n.includes('Beta')), 'failed notice survives closed note');
+  assert(obs.notices.some((n) => n.includes('Ghost')), 'unknown notice survives closed note');
+  console.log('PASS meeting-notices-note-closed');
+}
+
+// Task 6: triage modal + Collaborate view wiring. The modal class is not exported; drive the
+// real instance the view opens through the obsidian mock's modalInstances seam.
+function triageElements(root) {
+  const out = [];
+  const visit = (el) => { out.push(el); for (const child of el.children || []) visit(child); };
+  visit(root);
+  return out;
+}
+function lastTriageModal() {
+  const obs = require('obsidian');
+  const list = obs.modalInstances || [];
+  return list[list.length - 1];
+}
+function startTriage(o, args) {
+  const promise = o.onTriage(args);
+  const modal = lastTriageModal();
+  assert(modal, 'triage modal opened');
+  return { promise, modal };
+}
+function triageChecks(modal) {
+  const list = findByClass(modal.contentEl, 'semantic-todoist-triage-list');
+  assert(list, 'scrollable triage list rendered');
+  return triageElements(list).filter((el) => el.tagName === 'input');
+}
+function triageButton(modal, text) {
+  return triageElements(modal.contentEl).find((el) => el.tagName === 'button' && el.textContent === text);
+}
+function triageText(modal) {
+  return triageElements(modal.contentEl).map((el) => el.textContent).join(' | ');
+}
+
+async function testMeetingTriageModal() {
+  const fs = require('fs');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8').replace(/\r\n/g, '\n');
+  assert(src.includes('class MeetingTriageModal extends Modal'), 'modal class exists');
+  assert(src.includes('semantic-todoist-triage-list'), 'list class in source');
+  assert(css.includes('.semantic-todoist-triage-list'), 'scrollable list in styles');
+  assert(/onTriage:\s*(?:async\s*)?\(/.test(src), 'view passes onTriage');
+  assert(src.includes('onPhase:'), 'view passes onPhase');
+  assert(src.includes('result.cancelled'), 'view handles cancelled result');
+
+  const obs = require('obsidian');
+  const rows = [
+    { projectId: 'Alpha', name: 'Alpha', include: true, reason: 'Worth a look', activityLabel: 'active 3 days ago', open: 12, overdue: 2, dueSoon: 1, completedInWindow: 3, titles: ['One', 'Two', 'Three'] },
+    { projectId: 'Beta', name: 'Beta', include: false, reason: 'Nothing has moved here', activityLabel: 'no recent activity', open: 0, overdue: 0, dueSoon: 0, completedInWindow: 0, titles: [] },
+    { projectId: 'Gamma', name: 'Gamma', include: false, reason: 'Quiet for now', activityLabel: 'active last month', open: 4, overdue: 0, dueSoon: 0, completedInWindow: 1, titles: ['Only sample'] },
+  ];
+  // meeting.js swallows errors thrown by onTriage, so surface assertion failures here instead.
+  const failures = [];
+  const guarded = (impl) => makeMeetingView(async (o) => {
+    try { return await impl(o); } catch (e) { failures.push(e); return { cancelled: true }; }
+  });
+  const check = (label) => assert.strictEqual(failures.length, 0, `${label}: ${failures.map((e) => e.message).join('; ')}`);
+
+  // Pre-check comes from rows[].include, never from recommended; samples cap at two.
+  const v1 = guarded(async (o) => {
+    assert.strictEqual(typeof o.onTriage, 'function', 'onTriage callback');
+    assert.strictEqual(typeof o.onPhase, 'function', 'onPhase callback');
+    o.onPhase('triaging');
+    assert(v1.statusLog.includes('Looking over your projects\u2026'), 'triaging status');
+    const { promise, modal } = startTriage(o, { rows, recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const boxes = triageChecks(modal);
+    assert.strictEqual(boxes.length, rows.length, 'one checkbox per project');
+    assert.deepStrictEqual(boxes.map((b) => b.checked), [true, false, false], 'pre-checked from include, not recommended');
+    const text = triageText(modal);
+    assert(text.includes('Projects for this meeting'), 'title');
+    assert(text.includes('Worth a look'), 'reason shown');
+    assert(text.includes('active 3 days ago'), 'activity shown');
+    assert(text.includes('12 open \u00b7 2 overdue \u00b7 1 due soon \u00b7 3 completed in 14 days'), 'counts in plain words');
+    assert(text.includes('One') && text.includes('Two') && !text.includes('Three'), 'at most two samples');
+    assert(text.includes("I've picked the projects that look worth discussing"), 'normal subline');
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, false, 'Prepare enabled when one checked');
+    modal.close();
+    assert.strictEqual(await promise, null, 'cancel resolves null');
+    return { cancelled: true };
+  }).view;
+  v1.meetingTemplate = MEETING_TEMPLATES[1];
+  await v1.write();
+  check('pre-check');
+
+  // Zero checked disables Prepare; unavailable subline; ticking one re-enables it.
+  const v2 = guarded(async (o) => {
+    const allOff = rows.map((r) => Object.assign({}, r, { include: false }));
+    const { promise, modal } = startTriage(o, { rows: allOff, recommended: [], windowDays: 14, triageSource: 'unavailable' });
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, true, 'Prepare disabled at zero checked');
+    assert(triageText(modal).includes("I couldn't sort these this time"), 'unavailable subline');
+    const box = triageChecks(modal)[0];
+    box.checked = true;
+    box.onchange();
+    assert.strictEqual(triageButton(modal, 'Prepare selected').disabled, false, 'Prepare enabled after tick');
+    modal.close();
+    await promise;
+    return { cancelled: true };
+  }).view;
+  v2.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2.write();
+  check('zero checked');
+
+  // "Prepare selected" resolves only the ticked ids, exactly once; later closes do not resolve again.
+  const v2b = guarded(async (o) => {
+    let doneCalls = 0;
+    const { promise, modal } = startTriage(o, { rows: rows.map((r) => Object.assign({}, r)), recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const original = modal.onDone;
+    modal.onDone = (value) => { doneCalls += 1; original(value); };
+    triageChecks(modal)[0].checked = false; // untick Alpha
+    triageChecks(modal)[0].onchange();
+    triageChecks(modal)[2].checked = true; // tick Gamma
+    triageChecks(modal)[2].onchange();
+    const prepare = triageButton(modal, 'Prepare selected');
+    assert.strictEqual(prepare.disabled, false, 'Prepare enabled with one ticked');
+    prepare.onclick();
+    assert.deepStrictEqual(await promise, { selected: ['Gamma'] }, 'resolves only the ticked ids');
+    modal.close();
+    modal.close();
+    assert.strictEqual(doneCalls, 1, 'onDone called once; later closes do not resolve again');
+    return { cancelled: true };
+  }).view;
+  v2b.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2b.write();
+  check('prepare selected');
+
+  // Toggling a checkbox must not re-render: rebuilding the scrollable list resets its scrollTop to 0.
+  const v2c = guarded(async (o) => {
+    const { promise, modal } = startTriage(o, { rows: rows.map((r) => Object.assign({}, r)), recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    const listBefore = findByClass(modal.contentEl, 'semantic-todoist-triage-list');
+    assert(listBefore, 'triage list rendered');
+    let renders = 0;
+    let empties = 0;
+    const originalRender = modal.render.bind(modal);
+    const originalEmpty = modal.contentEl.empty.bind(modal.contentEl);
+    modal.render = () => { renders += 1; return originalRender(); };
+    modal.contentEl.empty = () => { empties += 1; return originalEmpty(); };
+    const boxes = triageChecks(modal);
+    const enabled = () => triageButton(modal, 'Prepare selected').disabled === false;
+    // Unticking every box disables Prepare, with no list replacement and no re-render.
+    for (const box of boxes) { if (box.checked) { box.checked = false; box.onchange(); } }
+    assert(!enabled(), 'Prepare disabled after unticking every box');
+    assert.strictEqual(findByClass(modal.contentEl, 'semantic-todoist-triage-list'), listBefore, 'toggling a box keeps the same scrollable list element');
+    assert.strictEqual(renders, 0, 'toggling a box does not re-run render');
+    assert.strictEqual(empties, 0, 'toggling a box does not empty contentEl');
+    // Re-ticking one enables Prepare, still with no list replacement and no re-render.
+    boxes[0].checked = true;
+    boxes[0].onchange();
+    assert(enabled(), 'Prepare enabled after re-ticking one');
+    assert.strictEqual(findByClass(modal.contentEl, 'semantic-todoist-triage-list'), listBefore, 're-ticking keeps the same scrollable list element');
+    assert.strictEqual(renders, 0, 're-ticking does not re-run render');
+    assert.strictEqual(empties, 0, 're-ticking does not empty contentEl');
+    modal.close();
+    await promise;
+    return { cancelled: true };
+  }).view;
+  v2c.meetingTemplate = MEETING_TEMPLATES[1];
+  await v2c.write();
+  check('no re-render on toggle');
+
+  // Escape / close resolves null exactly once.
+  const v3 = guarded(async (o) => {
+    const { promise, modal } = startTriage(o, { rows, recommended: ['Beta'], windowDays: 14, triageSource: 'ai' });
+    let doneCalls = 0;
+    const original = modal.onDone;
+    modal.onDone = (value) => { doneCalls += 1; original(value); };
+    modal.close();
+    modal.close();
+    assert.strictEqual(doneCalls, 1, 'onDone called once');
+    assert.strictEqual(await promise, null, 'escape resolves null');
+    return { cancelled: true };
+  }).view;
+  v3.meetingTemplate = MEETING_TEMPLATES[1];
+  await v3.write();
+  check('escape');
+
+  // off / single never open the modal and resolve to the recommendation.
+  for (const source of ['off', 'single']) {
+    const before = (obs.modalInstances || []).length;
+    const v4 = guarded(async (o) => {
+      const decision = await o.onTriage({ rows, recommended: ['Alpha'], windowDays: 14, triageSource: source });
+      assert.deepStrictEqual(decision, { selected: ['Alpha'] }, `${source} resolves recommendation`);
+      return { cancelled: true };
+    }).view;
+    v4.meetingTemplate = MEETING_TEMPLATES[1];
+    await v4.write();
+    check(`${source} no modal`);
+    assert.strictEqual((obs.modalInstances || []).length, before, `no modal for ${source}`);
+  }
+
+  // Review Focus #5: cancellation writes nothing, shows a friendly status and resets busy state.
+  obs.notices = [];
+  const { view: v5, calls } = guarded(async (o) => {
+    o.onPhase('triaging');
+    o.onPhase('gathering');
+    o.onPhase('writing');
+    const { promise } = startTriage(o, { rows: [], recommended: [], windowDays: 14, triageSource: 'ai' });
+    lastTriageModal().close();
+    assert.strictEqual(await promise, null, 'empty-row cancel resolves null');
+    return { cancelled: true };
+  });
+  v5.collaborateButton = { disabled: false, textContent: 'Collaborate' };
+  v5.meetingTemplate = MEETING_TEMPLATES[1];
+  await v5.write();
+  assert.strictEqual(calls.replaceRange.length + calls.transaction.length, 0, 'nothing written to note');
+  assert(v5.statusLog.some((s) => /nothing was written/i.test(s)), 'friendly cancel status: ' + JSON.stringify(v5.statusLog));
+  assert(v5.statusLog.includes('Reading your notes\u2026'), 'gathering status');
+  assert(v5.statusLog.includes('Writing your meeting prep\u2026'), 'writing status');
+  assert.strictEqual(v5.collaborateButton.disabled, false, 'busy reset');
+  assert.strictEqual(v5.writing, false, 'writing flag cleared');
+  assert.strictEqual(v5.rewriteModal, undefined, 'no draft rendered');
+  check('cancel writes nothing');
+  console.log('PASS meeting-triage-modal');
+}
+
+async function testSidebarActionRefresh() {
+  const mk = (n) => ({ name: n, source: `P/${n}.md`, prompt: n, action: '' });
+  const selectedName = (view) => view.sidebarActionTemplates[Number(view.actionSelectEl.value.split(':')[1])].name;
+  const labels = (view) => view.actionSelectEl.children.map((c) => c.text);
+  const setup = (templates) => {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.scheduleTodayEnabled = false;
+    view.actionSelectEl = makeSelectStub();
+    plugin.getPromptTemplates = async () => templates;
+    return { view, plugin };
+  };
+  // selected prompt B stays B when a new prompt sorts before it
+  {
+    const { view, plugin } = setup([mk('A'), mk('B')]);
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    assert.strictEqual(selectedName(view), 'B');
+    plugin.getPromptTemplates = async () => [mk('N'), mk('A'), mk('B')];
+    await view.populateSidebarActionOptions();
+    assert.strictEqual(selectedName(view), 'B', 'selection follows the template, not its index');
+    plugin.getPromptTemplates = async () => [mk('N'), mk('A')];
+    await view.populateSidebarActionOptions();
+    assert.strictEqual(labels(view)[0], 'N', 'deleted selection falls back to first option');
+    assert.strictEqual(selectedName(view), 'N');
+  }
+  // overlapping calls: no duplicate options, selection survives
+  {
+    const { view, plugin } = setup([]);
+    plugin.getPromptTemplates = async () => [mk('A'), mk('B')];
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    const gates = [];
+    let n = 0;
+    plugin.getPromptTemplates = () => (n++ < 2 ? new Promise((resolve) => gates.push(resolve)) : Promise.resolve([mk('A'), mk('B')]));
+    const p1 = view.populateSidebarActionOptions();
+    const p2 = view.populateSidebarActionOptions();
+    gates[1]([mk('A'), mk('B')]);
+    await p2;
+    gates[0]([mk('A'), mk('B')]);
+    await p1;
+    assert.deepStrictEqual(labels(view), ['A', 'B'], 'no duplicate options');
+    assert.strictEqual(selectedName(view), 'B', 'overlap keeps selection');
+  }
+  console.log('PASS sidebar-action-refresh');
+}
+
+async function testMeetingPresetRefresh() {
+  const names = (v) => v.meetingPresetEl.children.map((c) => c.text);
+  const mk = (n) => ({ name: n, source: `T/${n}.md`, prompt: n, action: 'meeting-prep' });
+  // overlapping populate calls: older (slow) result must not append
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  const gates = [];
+  plugin.getPromptTemplates = () => new Promise((resolve) => gates.push(resolve));
+  const p1 = view.populateMeetingPresetOptions();
+  const p2 = view.populateMeetingPresetOptions();
+  gates[1]([mk('A'), mk('B')]);
+  await p2;
+  gates[0]([mk('A'), mk('B')]);
+  await p1;
+  assert.deepStrictEqual(names(view), ['None', 'A', 'B'], 'no duplicate options');
+  // stale index: selected B, a new template inserted first
+  plugin.getPromptTemplates = async () => [mk('A'), mk('B')];
+  await view.populateMeetingPresetOptions();
+  view.meetingPresetEl.value = '1';
+  view.promptEl = { value: '' };
+  view.selectMeetingPreset();
+  const freshB = mk('B');
+  plugin.getPromptTemplates = async () => [mk('N'), mk('A'), freshB];
+  await view.populateMeetingPresetOptions();
+  assert.deepStrictEqual(names(view), ['None', 'N', 'A', 'B']);
+  assert.strictEqual(view.meetingPresetEl.value, '2', 'dropdown still shows B');
+  assert.strictEqual(view.meetingTemplate, freshB, 'meetingTemplate refreshed to fresh B');
+  // selected template disappears
+  plugin.getPromptTemplates = async () => [mk('N')];
+  await view.populateMeetingPresetOptions();
+  assert.strictEqual(view.meetingTemplate, null);
+  assert.strictEqual(view.meetingPresetEl.value, '');
+  console.log('PASS meeting-preset-refresh');
+}
+
+async function testRunRefreshesRenamedPrompt() {
+  const mk = (n, extra = {}) => ({ name: n, source: `P/${n}.md`, prompt: n, action: '', ...extra });
+  const setup = async (templates) => {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.scheduleTodayEnabled = false;
+    view.actionSelectEl = makeSelectStub();
+    view.getSelectedActiveContext = async () => ({});
+    const ran = [];
+    plugin.runPromptTemplate = async (t) => { ran.push(t); return { markdown: 'ok' }; };
+    plugin.getPromptTemplates = async () => templates;
+    await view.populateSidebarActionOptions();
+    view.actionSelectEl.value = 'prompt:1';
+    return { view, plugin, ran };
+  };
+  // renamed (same file, new name)
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    plugin.getPromptTemplates = async () => [mk('A'), { ...mk('B2'), source: 'P/B.md' }];
+    await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && e.message.includes('"B2"') && /changed/.test(e.message));
+    assert.strictEqual(ran.length, 0, 'renamed prompt not run');
+    assert.strictEqual(view.sidebarActionTemplates[1].name, 'B2', 'list refreshed');
+  }
+  // removed
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    plugin.getPromptTemplates = async () => [mk('A')];
+    await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && /removed/.test(e.message));
+    assert.strictEqual(ran.length, 0);
+    assert.strictEqual(view.sidebarActionTemplates.length, 1, 'list refreshed');
+  }
+  // edited content, same name: runs the fresh object
+  {
+    const { view, plugin, ran } = await setup([mk('A'), mk('B')]);
+    const fresh = mk('B', { prompt: 'edited' });
+    plugin.getPromptTemplates = async () => [mk('A'), fresh];
+    await view.runSelectedSidebarAction();
+    assert.strictEqual(ran.length, 1);
+    assert.strictEqual(ran[0], fresh, 'fresh template used');
+  }
+  // meeting preset
+  const mt = (n, extra = {}) => ({ name: n, source: `T/${n}.md`, prompt: n, action: 'meeting-prep', ...extra });
+  const meetingSetup = async (templates) => {
+    const { view, plugin, prepCalls } = makeMeetingView(async () => ({ markdown: 'M', footnotes: '', sources: [], cited: [], dropped: 0, sourcesBlock: '', failedProjects: [], unknownProjects: [] }));
+    plugin.getPromptTemplates = async () => templates;
+    await view.populateMeetingPresetOptions();
+    view.meetingPresetEl.value = '0';
+    view.meetingTemplate = view.meetingTemplates[0];
+    view.promptEl.value = 'typed instruction';
+    return { view, plugin, prepCalls };
+  };
+  const obs = require('obsidian');
+  for (const [label, after, expect] of [
+    ['renamed', (o) => [{ ...mt('S2'), source: o.source }], '"S2"'],
+    ['removed', () => [], 'removed'],
+  ]) {
+    const { view, plugin, prepCalls } = await meetingSetup([mt('S')]);
+    plugin.getPromptTemplates = async () => after(mt('S'));
+    obs.notices = [];
+    const notices = obs.notices;
+    await view.write();
+    assert.strictEqual(prepCalls.length, 0, `meeting ${label}: prepareMeeting not called`);
+    assert(notices.some((m) => String(m).includes('"S"') && String(m).includes(expect)), `meeting ${label}: notice shown: ${notices}`);
+  }
+  {
+    const fresh = mt('S', { completedDays: 30 });
+    const { view, plugin, prepCalls } = await meetingSetup([mt('S')]);
+    plugin.getPromptTemplates = async () => [fresh];
+    await view.write();
+    assert.strictEqual(prepCalls.length, 1);
+    assert.strictEqual(prepCalls[0].template, fresh, 'fresh meeting template');
+    assert.strictEqual(prepCalls[0].instruction, 'typed instruction');
+  }
+  console.log('PASS run-refreshes-renamed-prompt');
+}
+
+// Built-in fallback templates all carry source "Built in" (same shape getPromptTemplates returns when the folder is empty).
+async function testBuiltInTemplatesKeepIdentity() {
+  const builtIn = (n) => ({ source: 'Built in', createTasks: true, name: n, prompt: n, action: '' });
+  const { view, plugin } = makeMeetingView(async () => ({}));
+  plugin.settings.scheduleTodayEnabled = false;
+  view.actionSelectEl = makeSelectStub();
+  view.getSelectedActiveContext = async () => ({});
+  const ran = [];
+  plugin.runPromptTemplate = async (t) => { ran.push(t); return { markdown: 'ok' }; };
+  plugin.getPromptTemplates = async () => [builtIn('A'), builtIn('B'), builtIn('C')];
+  await view.populateSidebarActionOptions();
+  view.actionSelectEl.value = 'prompt:1';
+  await view.populateSidebarActionOptions();
+  assert.strictEqual(view.actionSelectEl.value, 'prompt:1', 'selection survives refresh');
+  await view.runSelectedSidebarAction();
+  assert.deepStrictEqual(ran.map((t) => t.name), ['B'], 'second built-in runs, no false changed error');
+  // a built-in that disappears is still reported, not swapped for another built-in
+  plugin.getPromptTemplates = async () => [builtIn('A'), builtIn('C')];
+  await assert.rejects(() => view.runSelectedSidebarAction(), (e) => e.message.includes('"B"') && /removed/.test(e.message));
+  assert.strictEqual(ran.length, 1);
+  console.log('PASS builtin-templates-keep-identity');
+}
+
+// The run-time check must not use the folder-setup path of getPromptTemplates: that would re-create a renamed default.
+async function testRuntimeCheckDoesNotRecreateDefaults() {
+  const obs = require('obsidian');
+  const { view, plugin, prepCalls } = makeMeetingView(async () => ({}));
+  const sup = { name: 'Prepare for meeting \u2013 Supervisor', source: 'P/Collaborate/Prepare for meeting \u2013 Supervisor.md', prompt: 'x', action: 'meeting-prep' };
+  let recreated = 0;
+  const firstCall = [];
+  let current = [sup];
+  plugin.getPromptTemplates = async (opts = {}) => {
+    firstCall.push(opts.ensure);
+    if (opts.ensure !== false) { recreated += 1; return [sup]; } // folder setup brings the default back
+    return current;
+  };
+  await view.populateMeetingPresetOptions();
+  view.meetingPresetEl.value = '0';
+  view.meetingTemplate = view.meetingTemplates[0];
+  view.promptEl.value = 'typed';
+  firstCall.length = 0;
+  current = [{ ...sup, name: 'Weekly sync', source: 'P/Collaborate/Weekly sync.md' }];
+  obs.notices = [];
+  await view.write();
+  assert.strictEqual(prepCalls.length, 0, 'renamed Supervisor is not prepared');
+  assert(obs.notices.some((m) => String(m).includes('Supervisor') && /renamed or removed|changed/.test(m)), 'notice shown');
+  assert.strictEqual(firstCall[0], false, 'check itself never runs folder setup (first read is ensure:false)');
+  assert(view.statusLog.some((s) => /Supervisor/.test(s)), 'status line set too');
+  console.log('PASS runtime-check-no-recreate');
+}
+
+function testRunStaleErrorSetsStatus() {
+  const src = require('fs').readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
+  const i = src.indexOf('runButton.onclick = async () => {');
+  const body = src.slice(i, src.indexOf('};', i));
+  assert(/await this\.runSelectedSidebarAction\(\);\s*\} catch \(error\) \{\s*new Notice\(error\.message \|\| String\(error\)\);\s*this\.setStatus\(error\.message \|\| String\(error\)\);/.test(body), 'Run click: Notice + setStatus on stale error');
+  console.log('PASS run-stale-error-status');
+}
+
+async function testMeetingTodoistPinnedAndMenuAndOverride() {
+  const obs = require('obsidian');
+  // Evidence submenu "Todoist tasks" item flips setting and saves
+  {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.writingUseTodoist = false;
+    let saved = 0;
+    plugin.saveSettings = async () => { saved += 1; };
+    view.collaborateFeaturesButton = null;
+    view.openCollaborateFeaturesMenu({});
+    const evidence = obs.lastMenu.items.find((i) => i.title === 'Evidence');
+    const todoist = evidence.submenu.items.find((i) => i.title === 'Todoist tasks');
+    assert(todoist, 'Todoist tasks item present');
+    await todoist.handler();
+    assert.strictEqual(plugin.settings.writingUseTodoist, true);
+    assert.strictEqual(saved, 1);
+  }
+  // pinned rewrite / chat check never pull Todoist; plain write does
+  {
+    const { view, plugin } = makeMeetingView(async () => ({}));
+    plugin.settings.writingUseTodoist = true;
+    view.pinned = { path: 'Notes/Meet.md', from: { line: 0, ch: 0 }, to: { line: 0, ch: 5 }, original: 'Hello' };
+    view.promptEl.value = 'make it better';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'pinned rewrite now follows the Todoist tick');
+    view.pinned = null;
+    await view.write({ instruction: 'q', apply: 'chat' });
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'chat check now follows the Todoist tick');
+    view.promptEl.value = 'plain';
+    await view.write();
+    assert.strictEqual(plugin.lastWriteArgs().opts.useTodoist, true, 'plain write follows setting');
+  }
+  // editor preset override ignores a selected meeting preset
+  {
+    const { view, plugin, prepCalls } = makeMeetingView(async () => ({}));
+    view.meetingTemplate = MEETING_TEMPLATES[1];
+    await view.write({ instruction: 'Fix grammar', evidence: 'off' });
+    assert.strictEqual(prepCalls.length, 0, 'prepareMeeting not called');
+    assert.strictEqual(plugin.writeCallCount(), 1);
+  }
+  console.log('PASS meeting-todoist-pinned-menu-override');
+}
+
+// ---- Todoist pull / change routing, design sections C & D ----
+
+// Snapshot builder: each entry is [sectionName, taskCount]; tasks get ids t{i}{j}.
+function buildTodoistSnapshot(sectionTasks) {
+  const tasks = []; const sections = []; let i = 1;
+  for (const [sectionName, count] of sectionTasks) {
+    const sid = 's' + i;
+    sections.push({ id: sid, name: sectionName, projectId: 'p1' });
+    for (let j = 0; j < count; j++) tasks.push({ id: 't' + String(i) + String(j), content: sectionName + ' task ' + String(j), sectionId: sid, projectId: 'p1' });
+    i += 1;
+  }
+  return { tasks, projects: [{ id: 'p1', name: 'Project One' }], sections };
+}
+
+async function testTodoistPullByLink() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 60]]);
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  // cursor at the end so Apply appends the draft at the end of the note
+  leaf.view.editor.getCursor = () => ({ line: 0, ch: leaf.view.editor.getValue().length });
+  const obs = require('obsidian');
+  obs.notices = [];
+  view.promptEl.value = 'pull the tasks in https://app.todoist.com/app/section/slug-s1';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for a pull');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'the review draft modal opens');
+  assert.strictEqual(view.rewriteModal.title, 'Review draft', 'review draft title');
+  const after = view.rewriteModal.after;
+  assert.ok(/^- \[/m.test(after), 'plain bullets present: ' + after.slice(0, 120));
+  assert(!after.includes('[ ]'), 'no checkboxes');
+  assert(!after.includes('#STsync'), 'no #STsync markers');
+  assert(!after.includes('oid::'), 'no oid markers');
+  const bullets = (after.match(/(^|\n)- \[/g) || []).length;
+  assert.strictEqual(bullets, 60, 'all 60 tasks present, got ' + bullets);
+  assert.ok(obs.notices.includes('Pulled 60 task(s) from "Section A".'), 'notice mentions count: ' + JSON.stringify(obs.notices));
+  leaf.view.editor.getCursor = () => ({ line: 0, ch: leaf.view.editor.getValue().length });
+  await view.rewriteModal.onApply(after);
+  assert.strictEqual(leaf.view.editor.getValue().slice(-after.length), after, 'apply appends the draft at the end of the note');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-pull-by-link');
+}
+
+async function testTodoistPullByName() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 3], ['Section B', 2]]);
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section B tasks';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for a pull');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'review draft modal opens');
+  const after = view.rewriteModal.after;
+  assert.ok(after.includes('Section B task 0'), 'resolved by exact name: ' + after.slice(0, 120));
+  assert(!after.includes('Section A task'), 'only the named section tasks are present');
+  const bullets = (after.match(/(^|\n)- \[/g) || []).length;
+  assert.strictEqual(bullets, 2, 'both section B tasks present, got ' + bullets);
+  console.log('PASS todoist-pull-by-name');
+}
+
+async function testTodoistPullUnknownLink() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  let writeCalls = 0; let chatCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.chat = async () => { chatCalls += 1; return { answer: 'x' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull https://app.todoist.com/app/section/does-not-exist';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call for an unknown link');
+  assert.strictEqual(chatCalls, 0, 'no chat call for an unknown link');
+  assert.ok(!view.rewriteModal, 'no review modal for an unknown link');
+  assert.ok(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === "I couldn't find that Todoist project, section or task in your Todoist data. Paste its link or use its exact name."), 'not-found message');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  console.log('PASS todoist-pull-unknown-link');
+}
+
+async function testTodoistPullAmbiguousName() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = { tasks: [], projects: [{ id: 'p1', name: 'Section A' }], sections: [{ id: 's1', name: 'Section A', projectId: 'p1' }] };
+  let writeCalls = 0; let chatCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.chat = async () => { chatCalls += 1; return { answer: 'x' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call for an ambiguous name');
+  assert.strictEqual(chatCalls, 0, 'no chat call for an ambiguous name');
+  assert.ok(!view.rewriteModal, 'no review modal for an ambiguous name');
+  const msg = view.messageLog.find((m) => m.role === 'assistant-replaced');
+  assert.ok(msg && msg.text.includes('- section: Section A') && msg.text.includes('- project: Section A'), 'ambiguous listing: ' + JSON.stringify(msg && msg.text));
+  assert.ok(msg && /Which one/.test(msg.text), 'asks which one: ' + JSON.stringify(msg && msg.text));
+  console.log('PASS todoist-pull-ambiguous-name');
+}
+
+async function testTodoistPullNotConnected() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ unavailable: true, lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } } });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 0, 'no model call when Todoist is unavailable');
+  assert.ok(!view.rewriteModal, 'no review modal when Todoist is unavailable');
+  assert.ok(view.messageLog.some((m) => m.role === 'assistant-replaced' && m.text === "Todoist isn't connected or couldn't be reached, so I couldn't pull those tasks."), 'not-connected message');
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-pull-not-connected');
+}
+
+async function testTodoistPullNotTickedFallsThrough() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  // writingUseTodoist is not set: Todoist not ticked
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  let writeCalls = 0; let lastUseTodoist = null;
+  plugin.writeWithEvidence = async (inst, opts) => { writeCalls += 1; lastUseTodoist = opts.useTodoist; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'pull', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'pull Section A';
+  await view.write();
+  assert.strictEqual(writeCalls, 1, 'writeWithEvidence called when Todoist is not ticked');
+  assert.strictEqual(lastUseTodoist, false, 'useTodoist false when not ticked');
+  assert.ok(!view.messageLog.some((m) => m.role === 'assistant-replaced' && /^Pulled /.test(m.text)), 'no pull notice when not ticked');
+  console.log('PASS todoist-pull-not-ticked-falls-through');
+}
+
+async function testTodoistUseTodoistFollowsTickPinnedAndChat() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const draft = { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' };
+  // pinned run: writingUseTodoist ticked → writeWithEvidence receives useTodoist true
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    view.pinSelection(leaf.view.editor, 'Notes/Visible.md');
+    await view.write({ pinned: view.pinned });
+    assert.strictEqual(lastUseTodoist, true, 'pinned run useTodoist true when ticked');
+  }
+  // apply==='chat' run: writingUseTodoist ticked → useTodoist true
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    await view.write({ apply: 'chat' });
+    assert.strictEqual(lastUseTodoist, true, 'apply===chat run useTodoist true when ticked');
+  }
+  // evidence off run: useTodoist false even when ticked
+  {
+    const plugin = makeWritePlugin();
+    plugin.settings.writingUseTodoist = true;
+    let lastUseTodoist = null;
+    plugin.writeWithEvidence = async (inst, opts) => { lastUseTodoist = opts.useTodoist; return draft; };
+    const view = makeWriteView(plugin, [leaf], leaf);
+    await view.write({ evidence: 'off' });
+    assert.strictEqual(lastUseTodoist, false, 'evidence off run useTodoist false');
+  }
+  console.log('PASS todoist-use-todoist-follows-tick');
+}
+
+async function testTodoistChangeRoutesToAsk() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  const snapshot = buildTodoistSnapshot([['Section A', 2]]);
+  const changes = { preview: { groups: [], summary: '1 change', deletes: [] }, rows: [{ id: 't10', sentence: 'Do x' }] };
+  let chatCalls = 0; let chatArgs = null; let applyCalls = 0;
+  plugin.chat = async (prompt, active, history, modelOperation, options) => {
+    if (!Array.isArray(history)) throw new TypeError('chat history must be a message array, got ' + typeof history);
+    chatCalls += 1;
+    chatArgs = { prompt, active, history, modelOperation, options };
+    return { answer: 'I will do it.', todoistChanges: changes };
+  };
+  plugin.applyTodoistChanges = async () => { applyCalls += 1; return { refused: false }; };
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'X', footnotes: '', sources: [], dropped: 0, sourcesBlock: '' }; };
+  plugin.todoistChatTurn = async () => ({ lookup: { kind: 'change', needsTodoist: true, filters: { includeCompleted: false } }, snapshot });
+  const view = makeWriteView(plugin, [leaf], leaf);
+  // a prior turn lives in the sidebar history; the change hand-off must forward the array, not the formatted string
+  view.messages = [{ role: 'user', text: 'previous turn' }];
+  view.promptEl.value = 'turn the checklist into tasks';
+  await view.write();
+  assert.strictEqual(chatCalls, 1, 'chat called once');
+  assert.strictEqual(chatArgs.prompt, 'turn the checklist into tasks', 'chat gets the instruction');
+  assert.strictEqual(chatArgs.active.text, 'hello world', 'chat gets the full open note text');
+  assert.strictEqual(chatArgs.modelOperation, 'chat-query', 'model operation is chat-query');
+  assert.strictEqual(chatArgs.options.todoist, true, 'chat options todoist true');
+  assert.strictEqual(chatArgs.options.webSearchMode, 'off', 'chat options web search off');
+  assert.ok(Array.isArray(chatArgs.history), 'chat history is a message array, not the formatted string: ' + chatArgs.history);
+  assert.strictEqual(chatArgs.history.length, 1, 'history carries the prior turns only');
+  assert.strictEqual(chatArgs.history[chatArgs.history.length - 1].text, 'previous turn', 'last history element is the previous turn');
+  assert.strictEqual(writeCalls, 0, 'writeWithEvidence not called for change');
+  assert.strictEqual(applyCalls, 0, 'nothing applied to Todoist before the user clicks Apply');
+  const obs = require('obsidian');
+  const modal = obs.modalInstances.find((m) => m.changes === changes);
+  assert.ok(modal, 'TodoistChangesModal opened with the stub changes');
+  assert.strictEqual(modal.opened, true, 'modal opened');
+  const msg = view.messageLog.find((m) => m.role === 'assistant-replaced');
+  assert.ok(msg && /Review/.test(msg.text), 'sidebar tells the user to review changes: ' + JSON.stringify(msg && msg.text));
+  assert.strictEqual(view.writing, false, 'writing flag restored');
+  assert.strictEqual(view.collaborateButton.disabled, false, 'button restored');
+  console.log('PASS todoist-change-routes-to-ask');
+}
+
+async function testStyleNoneShowsNoReferences() {
+  const { leaf } = makeMarkdownLeaf('Notes/Visible.md', 'hello world');
+  const plugin = makeWritePlugin();
+  plugin.settings.writingUseTodoist = true;
+  plugin.settings.writingCitationStyle = 'none';
+  let writeCalls = 0;
+  plugin.writeWithEvidence = async () => { writeCalls += 1; return { markdown: 'draft text', footnotes: '', sources: [], dropped: 0, sourcesBlock: '', citationStyle: 'none', cited: [], numbers: {} }; };
+  const view = makeWriteView(plugin, [leaf], leaf);
+  view.promptEl.value = 'draft a summary';
+  await view.write();
+  assert.strictEqual(writeCalls, 1, 'write still runs with style none');
+  assert.ok(view.rewriteModal && view.rewriteModal.opened, 'review draft modal opens');
+  assert.strictEqual(view.rewriteModal.references.length, 0, 'no References to add panel entries');
+  assert.strictEqual(view.rewriteModal.after, 'draft text', 'no reference list appended to the draft');
+  assert.ok(!/## References/.test(view.rewriteModal.after), 'no reference list appended');
+  console.log('PASS style-none-shows-no-references');
+}
+
 async function runTests() {
+  await testDraftReviewCancelClosedAndCheck();
   testDefaultChat();
   testNormalizeInvalidSettings();
   testSettingsMigrationStillPasses();
@@ -1307,6 +2949,8 @@ async function runTests() {
   testClosedNoteShowsDraftAndInsertButton();
   testInsertButtonUsesLeafLookup();
   testInsertButtonClosedNoteNotice();
+  await testCollaborateSendsConversation();
+  await testCollaborateUsesTodoistLookup();
   await testWriteProceedsWithVisibleLeafAndNoLastActive();
   await testWritePrefersMostRecentLeaf();
   await testWriteWithNoMarkdownLeafKeepsMessage();
@@ -1333,6 +2977,30 @@ async function runTests() {
   await testEditorMenuTypedPathPinsSelection();
   await testEditorMenuTypedPathUsesCapturedPin();
   await testApplyUsesEditedAfterText();
+  await testReadingViewInsertUsesDiskText();
+  await testReadingViewApaInsertUsesDiskText();
+  await testSourceModeApplyDoesNotWriteVault();
+  await testReadingViewRewriteUsesDiskText();
+  await testReadingViewRewriteApaUsesDiskText();
+  await testReadingViewStaleBufferKeepsExtraLineAndAppendsDraft();
+  await testReadingViewStaleBufferApaKeepsExtraLineAndAppendsDraft();
+  await testReadingViewRewriteKeepsStaleDiskLine();
+  await testReadingViewRewriteStalePassageWritesNothingAndKeepsDraft();
+  await testReadingViewProcessFailureShowsNotice();
+  await testReadingViewInsertButtonKeepsStaleDiskLine();
+  await testReadingViewInsertAppendsAfterFrontmatter();
+  await testReadingViewInsertEmptyNoteDraftOnly();
+  await testReadingViewInsertButtonEmptyNoteDraftOnly();
+  await testReadingViewCrlfRewriteKeepsCrlf();
+  await testReadingViewCrlfInsertKeepsCrlf();
+  await testReadingViewApaInsertDraftThenReferencesAtEnd();
+  await testReadingViewTwoApaAppliesKeepBothDraftsAboveExistingReferences();
+  await testReadingViewFootnotesInsertDraftAboveExistingReferences();
+  await testReadingViewInsertButtonDraftAboveExistingReferences();
+  await testReadingViewInsertDraftGoesBeforePlanReferencesHeadingEvenWhenBodyFollows();
+  await testReadingViewCrlfDraftWithCrlfKeepsCrlfOnly();
+  await testReadingViewPinnedFootnotesStalePassageKeepsFootnoteDefinitionInSidebar();
+  await testReadingViewInsertStatusAfterSuccessAndFailure();
   await testContinueInsertsAfterSelection();
   await testApaApplyAddsReferencesInTransaction();
   await testNatureNumberingChangedRefuses();
@@ -1346,10 +3014,34 @@ async function runTests() {
   await testApplyButtonUsesTextareaValue();
   await testEmptyAfterPaneRefusesApply();
   await testCheckGoesToSidebar();
+  await testCheckChatOmitsTodoistReferences();
   await testVaultEvidenceForcesVault();
   await testEvidenceOff();
   await testEmptyModelOutput();
   await testInsertAtCursorApa();
+  await testMeetingEvidenceMenuAndLabel();
+  await testSidebarActionRefresh();
+  await testMeetingPresetDropdown();
+  await testMeetingRouting();
+  await testMeetingMessagesAndReset();
+  await testMeetingClearsStaleEvidence();
+  await testMeetingNoticesWhenNoteClosed();
+  await testMeetingTriageModal();
+  await testMeetingPresetRefresh();
+  await testRunRefreshesRenamedPrompt();
+  await testBuiltInTemplatesKeepIdentity();
+  await testRuntimeCheckDoesNotRecreateDefaults();
+  testRunStaleErrorSetsStatus();
+  await testMeetingTodoistPinnedAndMenuAndOverride();
+  await testTodoistPullByLink();
+  await testTodoistPullByName();
+  await testTodoistPullUnknownLink();
+  await testTodoistPullAmbiguousName();
+  await testTodoistPullNotConnected();
+  await testTodoistPullNotTickedFallsThrough();
+  await testTodoistUseTodoistFollowsTickPinnedAndChat();
+  await testTodoistChangeRoutesToAsk();
+  await testStyleNoneShowsNoReferences();
   console.log('writing-sidebar-test: PASS (expanded)');
 }
 

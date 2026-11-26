@@ -184,9 +184,10 @@ function buildApplyBatches(rows, previewSnapshot, freshSnapshot, uuid) {
     const p = pre.get(id);
     const cur = fresh.get(id);
     // Snapshots hold active tasks only, so a task to reopen is legitimately absent: send it.
+    // Todoist Sync API command for reopening a completed task is item_uncomplete; item_reopen is rejected (INVALID_COMMAND).
     if (!cur && row.op === "reopen") {
       undo.entries.push({ taskId: id, previous: { fields: {}, projectId: p ? p.projectId : "", sectionId: p ? p.sectionId : "", parentId: p ? p.parentId : "", checked: true } });
-      cmds.push({ type: "item_reopen", uuid: uuid(), args: { id } });
+      cmds.push({ type: "item_uncomplete", uuid: uuid(), args: { id } });
       continue;
     }
     if (!cur) { skipped.push({ row, reason: "task no longer exists in Todoist" }); continue; }
@@ -213,7 +214,7 @@ function buildApplyBatches(rows, previewSnapshot, freshSnapshot, uuid) {
       const sectionId = ref(t.sectionId !== undefined ? t.sectionId : "");
       cmds.push({ type: "item_move", uuid: uuid(), args: moveArgs(id, projectId, sectionId, t.parentId || "") });
     } else if (row.op === "complete") cmds.push({ type: "item_close", uuid: uuid(), args: { id } });
-    else if (row.op === "reopen") cmds.push({ type: "item_reopen", uuid: uuid(), args: { id } });
+    else if (row.op === "reopen") cmds.push({ type: "item_uncomplete", uuid: uuid(), args: { id } });
     else if (row.op === "delete") cmds.push({ type: "item_delete", uuid: uuid(), args: { id } });
   }
   return { batches: chunk([...sectionCmds, ...cmds]), skipped, undo, mergedAwayIds };
@@ -230,7 +231,7 @@ function buildUndoBatches(undo, freshSnapshot, uuid) {
   for (const e of asArr(undo.entries)) {
     const cur = fresh.get(String(e.taskId));
     // A chat-completed task leaves the active snapshot; reopen it by id.
-    if (!cur && e.previous && e.previous.completedByChat) { cmds.push({ type: "item_reopen", uuid: uuid(), args: { id: String(e.taskId) } }); if (e.previous.fields && "description" in e.previous.fields) cmds.push({ type: "item_update", uuid: uuid(), args: { id: String(e.taskId), description: e.previous.fields.description } }); continue; }
+    if (!cur && e.previous && e.previous.completedByChat) { cmds.push({ type: "item_uncomplete", uuid: uuid(), args: { id: String(e.taskId) } }); if (e.previous.fields && "description" in e.previous.fields) cmds.push({ type: "item_update", uuid: uuid(), args: { id: String(e.taskId), description: e.previous.fields.description } }); continue; }
     if (!cur) { skipped.push({ entry: e, reason: "task no longer exists in Todoist" }); continue; }
     const prev = e.previous || {};
     const args = {};
@@ -244,7 +245,7 @@ function buildUndoBatches(undo, freshSnapshot, uuid) {
       cmds.push({ type: "item_move", uuid: uuid(), args: moveArgs(cur.id, prev.projectId, prev.sectionId, prev.parentId) });
       finalSection.set(cur.id, prev.sectionId || "");
     }
-    if (prev.checked === false && cur.isCompleted) cmds.push({ type: "item_reopen", uuid: uuid(), args: { id: cur.id } });
+    if (prev.checked === false && cur.isCompleted) cmds.push({ type: "item_uncomplete", uuid: uuid(), args: { id: cur.id } });
     else if (prev.checked === true && !cur.isCompleted) cmds.push({ type: "item_close", uuid: uuid(), args: { id: cur.id } });
   }
   for (const id of created) if (fresh.has(id)) cmds.push({ type: "item_delete", uuid: uuid(), args: { id } });

@@ -146,7 +146,7 @@ test("onOpen: every waiting record and this session's resolved records get their
   const view = makeView(p);
   await p.restoreDuplicateReviewBoxes(view);
   assert.deepEqual(view.messages.map((m) => m.heldId).sort(), ["k1", "w1"]);
-  assert.ok(view.messages.find((m) => m.heldId === "k1").actions.every((a) => a.isDisabled()), "resolved box has disabled buttons");
+  assert.deepEqual(view.messages.find((m) => m.heldId === "k1").actions.map((a) => a.label), ["Dismiss"], "resolved box has Dismiss action");
   assert.ok(view.messages.find((m) => m.heldId === "k1").text.includes("Created separate task."));
   const source = fs.readFileSync(mainPath, "utf8");
   assert.ok(/async onOpen\(\)\s*\{[\s\S]{0,400}restoreDuplicateReviewBoxes/.test(source), "onOpen calls it");
@@ -169,7 +169,15 @@ test("Keep both (note): batch created once with source section, note line for ma
   assert.equal(rec.status, "kept");
   const m = p.view.messages[0];
   assert.ok(m.text.includes("Created separate task."));
-  assert.ok(m.actions.every((a) => a.isDisabled()));
+  assert.deepEqual(m.actions.map((a) => a.label), ["Dismiss"]);
+  const dismiss = m.actions.find((a) => a.label === "Dismiss");
+  const beforeDismiss = p.view.messages.filter((msg) => msg.kind === "duplicate-review").length;
+  await dismiss.onClick();
+  assert.ok(!p.view.messages.some((msg) => msg.heldId === "h1"), "Dismiss removes the box");
+  assert.equal(p.view.messages.filter((msg) => msg.kind === "duplicate-review").length, 0, "no duplicate-review boxes remain");
+  assert.equal(beforeDismiss, 1);
+  await p.restoreDuplicateReviewBoxes(p.view);
+  assert.ok(!p.view.messages.some((msg) => msg.heldId === "h1"), "restore does not re-add a dismissed box");
   assert.equal(storeOf(p).answers.length, 1);
   assert.equal(storeOf(p).answers[0].answer, "keep"); assert.equal(storeOf(p).answers[0].by, "user");
   assert.equal(storeOf(p).answers[0].newTitle, "Submit the annual IRGP report"); assert.equal(storeOf(p).answers[0].existingId, "e1");
@@ -208,6 +216,54 @@ test("Merge: no item_add, existing title, labels only added, every old descripti
   assert.deepEqual(entry.row.notePlacement, { path: "note", notePath: NEW_NOTE });
   assert.equal(rec.status, "merged");
   assert.equal(storeOf(p).answers[0].answer, "merge");
+});
+
+test("Merge box ends with Dismiss that removes the box", async () => {
+  const p = makePlugin({ stubLines: true }); p.view = makeView(p);
+  p.updateTodoistFromParsedTask = async (task, remote) => { p.calls.update.push({ task, remote }); return true; };
+  const rec = record(); (await p.loadDuplicateStore()).held.push(rec);
+  await p.postDuplicateReviewBox(rec);
+  assert.equal(await p.resolveHeldDuplicate("h1", "merge", { by: "user" }), true);
+  const m = p.view.messages[0];
+  assert.ok(m.text.includes("Merged into existing task."));
+  assert.deepEqual(m.actions.map((a) => a.label), ["Dismiss"]);
+  const dismiss = m.actions.find((a) => a.label === "Dismiss");
+  await dismiss.onClick();
+  assert.ok(!p.view.messages.some((msg) => msg.heldId === "h1"), "Dismiss removes the box");
+  await p.restoreDuplicateReviewBoxes(p.view);
+  assert.ok(!p.view.messages.some((msg) => msg.heldId === "h1"), "restore does not re-add a dismissed box");
+});
+
+test("resolving record not in flight: restored box has disabled pair plus enabled Dismiss; Dismiss removes the box", async () => {
+  const p = makePlugin();
+  (await p.loadDuplicateStore()).held.push(record({ id: "r1", status: "resolving", answer: "merge" }));
+  const view = makeView(p); p.view = view;
+  await p.restoreDuplicateReviewBoxes(view);
+  const box = view.messages.find((m) => m.heldId === "r1");
+  assert.ok(box, "resolving box is restored");
+  assert.deepEqual(box.actions.map((a) => a.label), ["Merge", "Keep both", "Dismiss"]);
+  assert.ok(box.actions[0].isDisabled() && box.actions[1].isDisabled(), "Merge/Keep both disabled");
+  const dismiss = box.actions.find((a) => a.label === "Dismiss");
+  assert.ok(!dismiss.isDisabled || !dismiss.isDisabled(), "Dismiss enabled");
+  await dismiss.onClick();
+  assert.ok(!view.messages.some((m) => m.heldId === "r1"), "Dismiss removes the box");
+});
+
+test("resolving record in flight: no Dismiss; once it leaves the in-flight set, re-upsert adds Dismiss", async () => {
+  const p = makePlugin();
+  const store = await p.loadDuplicateStore();
+  const rec = record({ id: "r2", status: "resolving", answer: "merge" });
+  store.held.push(rec);
+  p.duplicateInFlight = new Set(["r2"]);
+  const view = makeView(p);
+  await p.restoreDuplicateReviewBoxes(view);
+  const box = view.messages.find((m) => m.heldId === "r2");
+  assert.deepEqual(box.actions.map((a) => a.label), ["Merge", "Keep both"]);
+  assert.ok(box.actions.every((a) => a.isDisabled()), "both disabled while in flight");
+  p.duplicateInFlight.delete("r2");
+  view.upsertDuplicateReviewBox(rec, "text");
+  const updated = view.messages.find((m) => m.heldId === "r2");
+  assert.deepEqual(updated.actions.map((a) => a.label), ["Merge", "Keep both", "Dismiss"]);
 });
 
 test("Merge through the real update path sends only changed fields and never drops labels or description lines", async () => {

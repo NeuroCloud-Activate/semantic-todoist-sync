@@ -30,8 +30,8 @@ const cases = {
     assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: { words: [], projects: [], labels: [], priority: 4 } }), [], 10)), ["t2"]);
     assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: { words: [], projects: [], labels: [], dueFrom: "2026-10-30", dueTo: "2026-11-02" } }), [], 10)), ["t1"]);
   },
-  "refersToLastAnswer returns those ids first"() {
-    const out = shortlistTasks(snapshot, lk({ refersToLastAnswer: true, filters: { words: ["compost"], projects: [], labels: [] } }), ["t2", "gone"], 10);
+  "change request on those tasks keeps every last-answer task first"() {
+    const out = shortlistTasks(snapshot, lk({ kind: "change", refersToLastAnswer: true, filters: { words: ["compost"], projects: [], labels: [] } }), ["t2", "gone"], 10);
     assert.deepStrictEqual(ids(out), ["t2", "t1", "t3"]);
   },
   "cap is respected"() {
@@ -71,7 +71,7 @@ const cases = {
     assert.deepStrictEqual(bad(LOOKUP_SCHEMA), []);
     for (const k of ["dueFrom", "dueTo", "priority", "includeCompleted"]) assert.ok(LOOKUP_SCHEMA.properties.filters.properties[k].type.includes("null"), k);
     const nul = { words: [], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
-    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)), ["t1", "t2", "t3"]);
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ filters: nul }), [], 10)).sort(), ["t1", "t2", "t3"]);
   },
   "change request: new due date in filters does not drop the named task"() {
     const sts = { tasks: [
@@ -107,14 +107,87 @@ const cases = {
   },
   "prompt and schema"() {
     assert.ok(/existing tasks/i.test(lookupPrompt("x", "").system) && /not.*new value/i.test(lookupPrompt("x", "").system));
-    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer", "backgroundQueries"]);
+    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence", "backgroundQueries"]);
+    assert.strictEqual(LOOKUP_SCHEMA.properties.searchQuery.type, "string");
+    assert.strictEqual(LOOKUP_SCHEMA.properties.reuseEvidence.type, "boolean");
     assert.deepStrictEqual(LOOKUP_SCHEMA.properties.backgroundQueries.maxItems, 3);
     assert.ok([].concat(LOOKUP_SCHEMA.properties.backgroundQueries.type).includes("null"), "background queries stay optional via null");
+    const sys = lookupPrompt("x", "").system;
+    assert.ok(/searchQuery/.test(sys) && /standalone/i.test(sys) && /Jim tasks due today/.test(sys), "searchQuery explained with example");
+    assert.ok(/always (a )?(useful|filled)|never empty/i.test(sys) && !/Empty string when reuseEvidence/i.test(sys), "searchQuery is always filled, also when reusing");
+    assert.ok(/reuseEvidence=true/.test(sys) && /previous answer/i.test(sys), "reuseEvidence explained");
+    assert.ok(/backgroundQueries/i.test(sys) && /Do NOT paraphrase/i.test(sys), "background queries explained");
     assert.ok(/P1.*=.*4/s.test(lookupPrompt("x", "").system) && /P4.*=.*1/s.test(lookupPrompt("x", "").system), "priority mapping");
     const p = lookupPrompt("move it", "User: hi");
     assert.ok(p.user.includes("move it") && p.user.includes("User: hi"));
     assert.ok(/needsTodoist.*false/s.test(p.system) && /vault notes/.test(p.system) && /short/i.test(p.system));
-  }
+  },
+  "ties rank by priority, then earliest due date (overdue first), undated last"() {
+    const s = { tasks: [
+      task("p4near", "a", { priority: 1, dueDate: "2026-10-28" }),
+      task("p1none", "b", { priority: 4 }),
+      task("p1far", "c", { priority: 4, dueDate: "2026-12-30" }),
+      task("p1near", "d", { priority: 4, dueDate: "2026-10-29" }),
+      task("p1over", "e", { priority: 4, dueDate: "2026-10-27T09:00:00" }),
+      task("p2today", "f", { priority: 3, dueDate: "2026-10-28" })
+    ], projects: [], sections: [] };
+    assert.deepStrictEqual(ids(shortlistTasks(s, lk(), [], 10)), ["p1over", "p1near", "p1far", "p1none", "p2today", "p4near"]);
+    // word relevance still comes first; priority/date only break its ties
+    const w = { tasks: [task("lowHit", "budget report", { priority: 1 }), task("hiTie", "budget", { priority: 4 }), task("loTie", "budget", { priority: 2 })], projects: [], sections: [] };
+    assert.deepStrictEqual(ids(shortlistTasks(w, lk({ filters: { words: ["budget", "report"], projects: [], labels: [] } }), [], 10)), ["lowHit", "hiTie", "loTie"]);
+    // a capped list keeps the most important
+    assert.deepStrictEqual(ids(shortlistTasks(s, lk(), [], 2)), ["p1over", "p1near"]);
+  },
+  "follow-up narrowing the last answer keeps only its tasks that match the new words, first"() {
+    const s = { tasks: [
+      task("a", "Email Sophie", { priority: 4 }),
+      task("b", "Book meeting with Jim", { priority: 2 }),
+      task("c", "Call Jim about IRGP", { priority: 3 }),
+      task("d", "Jim budget review (not in last answer)", { priority: 4 })
+    ], projects: [], sections: [] };
+    const out = ids(shortlistTasks(s, lk({ refersToLastAnswer: true, filters: { words: ["Jim"], projects: [], labels: [] } }), ["a", "b", "c"], 10));
+    assert.deepStrictEqual(out, ["c", "b", "d"], "last-answer tasks naming Jim lead (ranked), other matches next; unmatched last-answer tasks dropped");
+  },
+  "look-up prompt tells the model to carry over a Todoist follow-up's filters"() {
+    const s = lookupPrompt("what's specific to Jim?", "User: tasks today").system;
+    assert.ok(/follow[- ]?up/i.test(s) && /carr(y|ied) over/i.test(s) && /needsTodoist=true/.test(s), s);
+  },
+  "look-up is told today's date so 'today' becomes a due filter"() {
+    const p = lookupPrompt("what tasks do I have to do today", "", "2026-10-28");
+    assert.ok(p.system.includes("Today's date is 2026-10-28 (Wednesday)"), p.system);
+    assert.ok(/"today" means dueFrom and dueTo are both today's date/.test(p.system), "today mapping");
+    assert.ok(!/Today's date/.test(lookupPrompt("x", "").system), "no date line without a date");
+  },
+  "schema enum contains pull; schema stays strict; required list unchanged"() {
+    assert.deepStrictEqual(LOOKUP_SCHEMA.properties.kind.enum, ["none", "question", "change", "duplicates", "pull"]);
+    assert.strictEqual(LOOKUP_SCHEMA.additionalProperties, false);
+    assert.deepStrictEqual(LOOKUP_SCHEMA.required, ["needsTodoist", "kind", "filters", "refersToLastAnswer", "searchQuery", "reuseEvidence", "backgroundQueries"]);
+    const bad = (s, p = "root") => {
+      const o = [];
+      if ([].concat(s.type).includes("object")) {
+        const k = Object.keys(s.properties);
+        if (s.additionalProperties !== false) o.push(p + " additionalProperties");
+        if (JSON.stringify([...s.required].sort()) !== JSON.stringify(k.sort())) o.push(p + " required");
+        for (const x of k) o.push(...bad(s.properties[x], p + "." + x));
+      }
+      return o;
+    };
+    assert.deepStrictEqual(bad(LOOKUP_SCHEMA), []);
+  },
+  "lookupPrompt defines pull and its disambiguation rules"() {
+    const sys = lookupPrompt("x", "").system;
+    assert.ok(/"pull" = asks to bring, list, copy or insert/.test(sys), "pull kind definition");
+    assert.ok(/summarize, analyze, group by theme or write prose about those tasks stays "question"/i.test(sys), "summarize stays question");
+    assert.ok(/todoist\.com\/app\//.test(sys) && /bring\/pull\/import\/copy\/list\/add/.test(sys), "link rule");
+    assert.ok(/needsTodoist must be true for "pull"/i.test(sys), "needsTodoist for pull");
+    assert.ok(/"question" = asks about tasks/.test(sys) && /"change" = asks to create\/edit\/move\/complete\/delete tasks/.test(sys) && /"duplicates" = asks to find duplicate tasks/.test(sys), "existing kind sentence intact");
+  },
+  "pull shortlist matches question shortlist with the same filters"() {
+    const filters = { words: ["compost"], projects: [], labels: [], dueFrom: null, dueTo: null, priority: null, includeCompleted: null };
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters }), [], 10)), ids(shortlistTasks(snapshot, lk({ kind: "question", filters }), [], 10)));
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters: { words: [], projects: ["work & home"], labels: ["Home"] } }), [], 10)), ["t2"]);
+    assert.deepStrictEqual(ids(shortlistTasks(snapshot, lk({ kind: "pull", filters: { words: [], projects: [], labels: [], priority: 4 } }), [], 10)), ["t2"]);
+  },
 };
 let failed = 0;
 for (const [name, fn] of Object.entries(cases)) {

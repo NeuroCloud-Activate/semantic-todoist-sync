@@ -161,6 +161,30 @@ test("next normal sync of the written note creates no duplicate and leaves the l
   assert.deepEqual(p.deleted, []);
 });
 
+// A line written into an ordinary note (held-duplicate Merge / Keep both) must already be what that note's next sync writes.
+test("line written into a note with a section is left alone by the next sync", async () => {
+  const p = makePlugin({ [NOTE]: "# Garden\n" });
+  const sections = [{ id: "s1", name: "Errands Week", projectId: "p1" }];
+  const r = remote({ sectionId: "s1", dueDate: "2026-11-23" });
+  const row = createRow({ fields: { content: "Buy mulch", dueDate: "2026-11-23" } }, { sectionId: "s1" }); row.notePlacement = { path: "note", notePath: NOTE };
+  await p.writeCreatedTaskLines([{ id: "n1", row }], { snapshot: { ...snapshotOf([r]), sections }, now: OCT_DATE });
+  const before = p.store.get(NOTE);
+  p.snapshot = { ...snapshotOf([r]), sections };
+  await p.syncFileNotes(NOTE, false);
+  assert.equal(p.store.get(NOTE), before);
+});
+
+test("line written into a note for a task with no section is left alone by the next sync", async () => {
+  const p = makePlugin({ [NOTE]: "# Garden\n" });
+  const row = createRow(); row.notePlacement = { path: "note", notePath: NOTE };
+  await p.writeCreatedTaskLines([{ id: "n1", row }], { snapshot: snapshotOf([remote()]), now: OCT_DATE });
+  const before = p.store.get(NOTE);
+  p.snapshot = snapshotOf([remote()]);
+  await p.syncFileNotes(NOTE, false);
+  assert.equal(p.store.get(NOTE), before);
+  assert.deepEqual(p.created, []);
+});
+
 test("write failure is reported, never thrown, and Apply keeps its result", async () => {
   const p = makePlugin();
   p.failProcess = true;

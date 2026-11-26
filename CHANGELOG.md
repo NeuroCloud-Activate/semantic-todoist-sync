@@ -1,10 +1,167 @@
-## Unreleased
+## 0.9.48 - 2026-11-25
+
+### Changed
+- **Questions are a numbered list under a subheading per project.** The top section groups questions under each project's name instead of tagging every line, and the numbers run 1 to 8 across the whole section so a question can be referred to by number. Questions under each project are numbered from 1.
+- **The settings note in the Supervisor template is readable.** The one-paragraph block is now a short hidden list, one line per setting with its options beside it (for example `triage: ai | off`).
+
+### Fixed
+- **Ticking a project no longer scrolls the list back to the top.** Ticking or unticking a project in "Projects for this meeting" leaves the list where you scrolled it.
+- **Template upgrade.** An unedited 0.9.48 Supervisor template is replaced quietly; an edited one is backed up and keeps your settings, as before.
+
+## 0.9.47 - 2026-11-25
+
+### Changed
+- **Supervisor meeting prep is triaged and written in point form.** One AI pass suggests which projects are worth discussing, and a checkbox list lets you change the list before anything is written. Each project now shows short **Updates**, **Status**, **Left to do** and **Questions** bullets instead of paragraphs.
+- **Questions lead the document.** The top lists at most 8 questions for the supervisor, each starting with its project or topic, and questions also stay under each project. Placement is a template setting: `questions: top`, `project`, or `both`.
+- **Active projects come first.** Projects are ordered by the latest task or linked-note activity instead of open-task count, and tasks carry their last-updated date, so a quiet project no longer outranks one with recent work.
+- **Recent context is used.** Long linked notes are read from the start and the end, recently edited notes are read first, and project searches use the newest tasks.
+- **Caps are configurable.** `maxTasks` sets Left to do items; `maxQuestions` (new, default 2) sets questions per project. The template body uses `{maxTasks}` and `{maxQuestions}` placeholders.
+
+### Fixed
+- **Supervisor template upgrades keep your settings.** An edited Supervisor template is backed up byte-for-byte, then moved to the new layout with your own front-matter settings carried over. Upgrade backups no longer appear in the meeting template list.
+- **Triage cannot silently drop a project.** A malformed or partial triage reply leaves every project ticked; cancelling the list writes nothing.
+- **Newer note context survives long notes.** Updates appended below the first 4,000 characters of a linked note now reach the assistant.
+
+## 0.9.46 - 2026-11-12
+
+### Fixed
+- **A reviewed duplicate can always be cleared.** Once a duplicate is merged, kept, or otherwise answered, its box keeps the outcome word and offers an enabled **Dismiss** instead of two dead Merge/Keep both buttons; dismissing removes the box and it does not come back when the sidebar reopens. The box for a merge left behind by a crash also gets Dismiss, while a merge still running keeps its two buttons greyed only for those seconds; a failed merge still returns to waiting with both choices clickable.
+
+## 0.9.45 - 2026-11-12
+
+### Fixed
+- **Release packages attach the plugin files.** The GitHub release now carries `main.js`, `manifest.json` and `styles.css` as assets, so Obsidian can install the update.
+
+## 0.9.44 - 2026-11-11
+
+### Changed
+- **Collaborate and Ask lead with what is known.** Answers no longer open with what the notes lack; a gap is mentioned once in a short plain clause, and only when it matters.
+- **Ask answers general questions.** When a question is not about your own work, Ask answers it from its own knowledge and says so; facts about your notes still come from the vault and link back to the note.
+- **Suggestions and general knowledge stay marked, in ordinary words.** The assistant's own additions read naturally, and a claim that cites no evidence can no longer carry a note link.
+- **"Sources searched" shows only what ran.** The footer lists the sources that were actually searched, or says a source was unavailable; switched-off sources no longer appear.
+
+## 0.9.43 - 2026-11-04
+
+### Changed
+- **Collaborate writes in the style you ask for.** Drafts and rewrites follow your instruction instead of an evidence-report layout, and no longer says "based on the supplied evidence". Typed rewrite requests are passed through as-is instead of being reworded.
+- **Knowledge, suggestions and corrections are marked as such.** The assistant connects related notes, offers next steps, and flags conflicting or doubtful information, each clearly marked as suggestion or general knowledge. Claims about your own work still come only from your notes.
+- **Citation style None.** No citation markers, references or "Sources searched" footer are written.
+- **Todoist pull.** With Todoist ticked, Collaborate pulls a project, section or task into the open note from a pasted link or exact name — all its tasks, subtasks included — as plain linked bullets appended through Review draft. Completed tasks are pulled only when you ask and when Todoist reports where they belong.
+- **Todoist change.** With Todoist ticked, Collaborate can create, update, move, complete or reschedule tasks from what you write, with the same preview, Apply and Undo as Ask. Nothing reaches Todoist until you approve.
+- **Todoist tick covers rewrites and Check.** The Todoist tick now also applies to rewrites of a selection and to Check against my notes. Presets that turn evidence off still skip it.
+### Fixed
+- **Ask keeps the names, titles and dates from a note it cites.** When a note is retrieved, its attendee section and opening lines now travel with it, so "who were the Mitacs reps we met recently?" names both people and their roles instead of saying they are not established.
+- **Undo reopens a completed task again.** Undo sent a Todoist command the API rejects, so undoing a completion failed; it now reopens the task and unchecks its task line.
+- Live check (Nov 4, 2026, test vault, real Todoist): the same Mitacs question answered by the older build named nobody, and by this build named Joanne Tejeda (Strategic Partnership Advisor) and Chris Lannon (Director of Strategic Partnerships); a section pulled by link and by exact name gave 13 bullets with its 8 subtasks, plain and not linked to sync; ambiguous and unknown names stopped with a clear message; a create applied to a scratch project and Undo removed it and its task line, a completion applied and Undo reopened it; citation style None wrote no markers, footnotes, references or "Sources searched" footer; a wrong due date was corrected against the note's date.
+- Tests: `npm test` passes 87/87.
+
+## 0.9.42 - 2026-10-30
+### Changed
+- **Todoist task citations are numbered.** A cited task now shows as its own number, **[T1]**, [T2]…, linked to the task, instead of a bare ↗. Tasks are numbered in the order they first appear; the same task keeps the same number everywhere in the note, including across later drafts applied to it, and new tasks continue from the highest number already there. Tasks still never appear in footnotes or References and never use up a note's footnote number.
+
+### Fixed
+- **Apply in Reading view no longer loses the draft.** With the note open in Reading view, Apply in "Review draft", Apply on a rewrite and "Insert at current cursor" used to report success while nothing reached the file. They now write to the note as it is on disk at that moment, so text added meanwhile (by sync, another app, or this plugin) is never overwritten. Because Reading view has no visible cursor, the draft goes at the end of the note after a blank line, or just above an existing "## References"/"## Bibliography" section. A rewrite whose passage changed is not applied: a notice explains why and the rewritten text stays in the sidebar, with its footnotes. Notes with Windows line endings keep them. The status says "complete" only after the save; a failed save says so and keeps the draft in the sidebar. Editing and Live Preview behave exactly as before.
+- Live checks (Oct 30, 2026, test vault, real Todoist read-only): Supervisor on all projects gave 232 task citations numbered [T1]–[T153] by first appearance with no number reused for a different task, rendered as clickable links (not note links) in Reading view and Live Preview; Reading-view Apply saved the draft in footnote and APA styles, kept lines changed on disk before or during the write, kept note properties intact, placed two successive APA drafts above one reference list without losing either; Live Preview still inserted at the cursor. Todoist, notes and settings were unchanged.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.41 - 2026-10-30
+### Added
+- **Leave out Todoist tasks by label or project.** Collaborate templates can set `ignoreLabels` (for example `ignoreLabels: Notes`) and `ignoreProjects` (a project also leaves out its sub-projects). Matching tasks, open or completed, are dropped before anything is written, so they never appear in the text, the task list or the citations. Both settings are explained in the template's settings comment; the Supervisor template gets them blank. An unedited 0.9.40 Supervisor is upgraded automatically; an edited one is first saved as "Prepare for meeting – Supervisor (before 0.9.41)".
+- **A Tasks heading** above each project's task list in meeting prep.
+
+### Changed
+- **Todoist task citations are links in the text.** A cited task shows as a small ↗ link that opens it in Todoist, in every citation style and in normal Collaborate drafts. Tasks no longer fill the footnotes or the References list; notes and other sources stay there.
+- **Conflicting evidence is settled, not asked about.** When notes or tasks disagree, meeting prep goes with the most recent one and says so; it only raises a question when the evidence can't settle it. Notes now carry their last-modified date so the newest can be told apart.
+
+### Fixed
+- **No raw evidence numbers in the text.** Phrases like "E232 shows…" or a stray "[74]" no longer reach the page: a bare evidence number becomes a proper citation, or is removed when it doesn't belong to that section.
+- Live check (Oct 30, 2026, test vault, real Todoist read-only): the Supervisor document went from 57 KB with 180 footnotes (121 of them tasks) to 40 KB with 23 note footnotes and tasks linked inline; no raw evidence numbers; every task list headed; tasks labelled Notes left out; "Check against my notes" with APA listed no tasks. Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.40 - 2026-10-30
+### Fixed
+- **An edited "Prepare for meeting – Supervisor" template now gets the new shorter layout too.** 0.9.39 only upgraded unedited copies, so an edited one kept the old long layout. On first load, an edited copy is saved exactly as it was as "Prepare for meeting – Supervisor (before 0.9.40)" in the Collaborate folder (numbered " 2", " 3" if that name exists), then replaced with the new template, and a notice names the backup. The backup stays in the meeting preset list, so the old version can still be run. If the backup can't be saved, the template is left untouched and the upgrade is tried again on the next load. This happens once; later edits are never changed.
+- Live check (Oct 30, 2026, test vault): an already-current template was left alone; an edited copy was backed up byte-for-byte and replaced with one notice, and further reloads changed nothing; a second upgrade with an existing backup saved " 2". Notes, Todoist and settings were otherwise unchanged.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.39 - 2026-10-30
+### Changed
+- **Meeting prep documents are much shorter, and the template note decides the layout.** The plugin no longer forces a heading and paragraph per theme or a questions list for every project, so the wording in your Collaborate template (paragraph length, number of questions, overview length) now takes effect. The plugin keeps only its safety rules: use only the evidence and cite it, never invent anything, and never write checkboxes.
+- **New template settings for the Todoist task list.** A Collaborate template's front matter can set `subprojects` (`merge` folds sub-projects into their main project, `separate` keeps them as their own sections), `taskList` (`cited` lists only the tasks the text mentions, or `all`, or `none`), `maxTasks` (most tasks listed per project) and `overview` (`yes` or `no`), alongside `completedDays` and `projects`. A short comment under the settings explains each one. Vault, context folder, research and web sources still follow the sidebar's Evidence menu.
+- **Shorter Supervisor template.** "Prepare for meeting – Supervisor" now asks for an overview of at most 3 sentences and one paragraph of at most 5 sentences per project with at most 3 questions, and to skip a project when nothing in it needs discussion. An unedited 0.9.37 or 0.9.38 copy is upgraded automatically; an edited copy is never changed. The Generate button's template uses the same settings and sections (Meeting, Overview, For each project, Rules).
+- **Projects with nothing to discuss can be skipped.** When the template asks for it, a project the AI judges quiet is left out entirely: no heading, task list or footnotes.
+
+### Fixed
+- Naming a project in `projects:` includes its sub-projects, and naming a sub-project directly works too.
+- Each project's paragraph no longer repeats its own overview and heading.
+- Live check (Oct 30, 2026, test vault, real Todoist read-only): the Supervisor run went from 117 KB with 23+ sections and 269 references to 57 KB with 18 sections and 180 references, with at most 3 questions and 5 listed tasks per project and no checkboxes; the unedited Supervisor upgraded on load; merge, separate and single sub-project templates all ran; Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.38 - 2026-10-29
+### Added
+- **A Collaborate folder for Collaborate prompts.** Every note in `Semantic Todoist Sync/Prompts/Collaborate` is a Collaborate prompt: it appears in Collaborate's preset list and never in the Run menu, with no settings needed in the note. The list updates within about half a second when you add, rename, edit or delete a note there.
+- **Generate meeting prep template.** Settings → Collaborate has a new Generate button. It creates "New meeting template" (then "New meeting template 2", and so on) in the Collaborate folder and opens it. The note has the scope settings at the top (days of completed tasks, which Todoist projects) and four sections (Meeting, For each project, Task list, Rules), each with a short instruction saying what to write. Instructions written as Obsidian comments (`%% … %%`) are removed before the prompt is used.
+
+### Changed
+- **The Supervisor meeting template moved into the Collaborate folder.** "Prepare for meeting – Supervisor" now lives in `Prompts/Collaborate` and is laid out in the same four sections as a generated template, with the same wording. On first load it is moved there from the top of the Prompts folder; if you had edited it, your edits are kept.
+
+### Fixed
+- **A prompt renamed or removed just before you run it is not run.** Run and Write first check the selected prompt. If it was renamed or removed, a message names it and asks you to pick it again; if it was only edited, the latest version runs.
+- **The Run menu keeps your selection when the prompt list changes.** Adding or renaming a prompt no longer switches the selected prompt or shows it twice.
+- Error messages from the Run button now show as a notice.
+- Live check (Oct 29, 2026, test vault, real Todoist read-only): the Supervisor moved into the Collaborate folder on 8 of 8 fresh starts with exactly one copy; Generate, auto-refresh, the renamed-prompt check and a one-project meeting run all passed; Todoist and notes were unchanged.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.37 - 2026-10-29
+### Added
+- **Prepare for a meeting from your Todoist tasks.** In Collaborate, a new preset list next to Features offers meeting templates. The built-in "Prepare for meeting – Supervisor" fills the prompt box; edit it if you like, then press Write. The draft covers every open task and tasks completed in the last 14 days, grouped by project and then by theme, each theme with short prose and a short task list. Follow-ups of recently completed tasks are highlighted. Each task title links to the task in Todoist. Task lines are plain list lines, never checkboxes, so they never create or duplicate synced tasks. The draft reuses what is already written on the tasks: their descriptions and the notes they link to. It opens in the Review draft window like other drafts.
+- **Your own meeting templates.** Templates are notes in the Prompts folder (`Semantic Todoist Sync/Prompts`). Duplicate the Supervisor template, edit it, and your copy appears in the preset list automatically.
+- **Todoist tasks evidence switch.** Collaborate's Evidence menu has a new "Todoist tasks" switch, off by default. With it off, Collaborate works exactly as before. Privacy: with it on, the titles and descriptions of your Todoist tasks (open, and completed in the last 14 days, across all projects) are sent to your AI provider with each Collaborate request.
+
+### Fixed
+- **Duplicate detection uses your AI provider's models.** With LiteLLM, duplicate detection asked for a model LiteLLM doesn't offer; it now uses your LiteLLM model. The model menu lists your provider's models and remembers your choice with the provider. A saved model that no longer matches your provider (for example, settings synced from another device) is ignored, shown as "Automatic", and cleared on reload. Open WebUI password sign-in is no longer treated as "no key". The model setting's help text is corrected.
+- **Unchecking a task that changed in Todoist.** A task deleted in Todoist and then unchecked in the note is re-created once, in its original project, keeping its details and its link to the note. A task completed in Todoist and then unchecked is reopened. Neither is re-checked any more.
+- **No duplicate task when Todoist's reply is lost.** If Todoist creates a task but the reply never arrives, the retry no longer creates a second one, and no leftover record can relink a retyped line to an old task.
+- **Sync no longer redoes finished work.** A second sync with nothing new does nothing.
+- Live check (Oct 29, 2026, test vault, real Todoist): meeting prep for 21 projects took 51–77 s on the first run and 7 s within 5 minutes; Cancel wrote nothing; the draft had no checkboxes or sync markers; a follow-up after a meeting run searched fresh; Todoist and notes were unchanged afterwards. The sync fixes passed against a scratch Todoist project, which was cleaned up.
+- Tests: `npm test` passes 85/85.
+
+## 0.9.36 - 2026-10-28
+### Fixed
+- **Collaborate drafts are reviewed before they go into your note.** A draft written without a selected passage used to be inserted at the cursor straight away. It now opens in a Review draft window where you can read and edit it, see the references it will add, and then Apply, Copy or Cancel. Apply inserts your edited version where your cursor was; Cancel writes nothing and leaves the draft in the sidebar. Rewrites of a selected passage and Check against my notes are unchanged.
+- Live check (Oct 28, 2026): the window opened with the draft, the note stayed unchanged while it was open, Cancel wrote nothing, and Apply inserted the edited text.
+- Tests: `npm test` passes 79/79, including draft review Apply, Cancel, closed-note fallback and check mode.
+
+## 0.9.35 - 2026-10-28
+### Fixed
+- **Follow-up questions keep the conversation's scope.** After "what tasks do I have to do today?", asking "what's specific to Jim?" now answers with Jim's tasks due today instead of starting a fresh search of your notes. The Todoist look-up narrows the previous answer to the tasks that match the new words, and the chat is told to read a short follow-up in the light of the previous question.
+- **Collaborate now continues the sidebar conversation.** Earlier questions and answers in the same sidebar chat (from Ask or Collaborate) go with each Collaborate request and help its search, so "which of those involve Jim?" works. The conversation resets on New chat or when Obsidian reloads.
+- **Every message is checked on its own, with the conversation in view.** For each Ask or Collaborate message the look-up writes a notes search that carries the conversation's subject (for example "Jim tasks due today"), reuses the previous answer's evidence when the message only reworks that answer, and keeps the previous Todoist scope (dates, words such as a name) on a follow-up even when the model forgets it.
+- **Collaborate builds on notes, never on tasks.** When a message needs your tasks, Collaborate uses the note each task was written from (skipping the monthly task list and missing notes) and, on a follow-up, the notes behind the previous answer. Stored task copies are filtered out of its evidence.
+- **Todoist stays current in the background with small downloads.** After the first full download, the plugin fetches only what changed every 5 minutes, whether or not the sidebar is open. A failed refresh (such as a rate limit) waits 5 minutes before retrying, and changing the Todoist token starts fresh. Live check: a changes-only refresh was about 0.2 KB against about 257 KB for a full download of 230 tasks, with the same task list.
+- Live check (Oct 28, 2026): the Jim follow-up linked 6 of Jim's tasks due today (before: no tasks, only older note excerpts); a Collaborate follow-up listed the Jim tasks from the earlier answer; after New chat no earlier turns were sent.
+- Tests: `npm test` passes 79/79, including tests for changes-only Todoist updates and backoff, per-message search and reuse, task source notes as Collaborate evidence, and the follow-up scope guard.
+
+## 0.9.34 - 2026-10-28
+### Fixed
+- **Asking what is due today (or tomorrow, this week, overdue) now finds those Todoist tasks.** The chat's Todoist look-up was never told today's date, so it ignored the date and showed 40 tasks picked regardless of their due date. It now gets the date, and when more tasks match than fit in the answer it is told the real total.
+- Live check (Oct 28, 2026): "what tasks do I have to do today" went from 1 of 40 tasks due today (answer said nothing was due) to 40 of 40, and the answer gave the real total of 62.
+- **When many tasks match equally, the most important come first.** If the words in a question don't separate the tasks (as with "what's due today"), they are ranked by priority, then by earliest due date (overdue first), before the answer's 40-task limit. Before, the order was whatever Todoist returned. In the live check, all 15 P1 tasks due today made the list (4 were left out before) and no P3 task displaced a P1 or P2.
+- Tests: `npm test` passes 77/77, including tests that the look-up gets today's date, the real total is passed on, and ties rank by priority then due date.
+
+## 0.9.33 - 2026-10-28
+### Changed
+- **Tasks and notes named in a chat answer are linked right where they are named.** The answer no longer lists a task as a link and then names it again in the next sentence. Sources used only for background still appear once, as a link after the sentence that used them.
+- Live check (Oct 28, 2026): a Todoist question named each STS Test task once, as a link inside its sentence; a notes question linked the notes it named inline; a change request still opened its preview, which was cancelled.
+- Tests: `npm test` passes 77/77, including tests that a link the model invents, or a fake internal link marker, stays plain text.
+
+## 0.9.32 - 2026-10-27
 ### Added
 - **Ask about your Todoist tasks in the sidebar chat.** Questions such as "what is due this week?" are answered from your Todoist tasks, with a link to each task named.
 - **Change Todoist tasks by asking.** In the sidebar chat you can create, edit, move, label, prioritise, complete and delete tasks, and make a task a subtask of another.
 - **Every change is previewed first, and nothing is written until you press Apply.** The preview lists each change as a row you can tick or untick, in plain words, and only ticked rows are applied. Priorities are shown as P1 to P4, the way Todoist shows them, and the chat is told to use the same names in its answers.
 - **Deletes are kept apart and need two steps.** They appear in a separate red section, unticked, and need a second confirmation before they run. A delete cannot be undone, and the chat says so.
-- **One-step Undo of your last Apply.** An "Undo last Todoist change" button appears after an Apply that can be undone, and puts back what that Apply changed. It only appears when there is something to undo, so a delete-only Apply never offers it.
+- **One-step Undo of your last Apply.** An "Undo last Todoist change" button appears after an Apply that can be undone, and puts back what that Apply changed. It only appears when there is something to undo, so a delete-only Apply never offers it. An older Undo button turns off once its change is undone or a later Apply replaces it.
 - **Tasks made in chat that are not tied to a note go into a monthly "Miscellaneous Tasks" note.** Each task is a line under its project's heading. A project heading appears only when it is used, and disappears again when Undo or a task deleted in Todoist leaves it empty. Headings and text you typed yourself are left alone.
 - **Possible duplicates are held for you to decide.** When a new task (from a note, an email or the sidebar chat) looks like a task you already have open in Todoist, it is held and a box in the sidebar asks Merge or Keep both. Nothing is merged without your click. Other tasks in the same run are created straight away; the check is quick and never holds them up.
 - **Merge updates the existing task instead of making a new one.** The new task is not created. The existing task gains the new labels (labels are only added), any new due date, deadline or priority, the new note or email in its source list, and one short dated sentence saying what changed and why. Nothing already in the task is removed. The note gets a line pointing at the existing task.
@@ -17,13 +174,23 @@
 - **Asking the chat to find duplicates now answers "I can't search existing tasks for duplicates; new tasks are checked when they're created."** This replaces the earlier "switched off" answer.
 - **Fixed: a task generated from a note was never matched against your existing top-level tasks.** It has no id yet, so the check wrongly skipped them.
 - **New installs default to the embeddinggemma-2 embedding model** for an OpenAI-compatible (LiteLLM) host; you still enter your host's address. A model you have already saved is kept.
+- **The sidebar status box is a fixed three lines tall.** It no longer jumps in height as status messages change; longer messages scroll inside it.
+- **A task line written into a note by Merge or Keep both is already in its final form.** The note's next sync no longer rewrites it (adding the section or reordering its markers).
+- **Chat answers read as short, helpful prose.** Answers are written in a warmer, natural tone and shown as paragraphs instead of one bullet per sentence, and each source link appears once instead of after every sentence that uses it.
 ### Notes
-- Tests: `npm test` passes 76/76, including the new Todoist test files for planning, preview, apply, look-up, the monthly note, and the chat and monthly-note wiring, and the new duplicate review test files.
+- Tests: `npm test` passes 77/77, including the fixed status-box height test, the new Todoist test files for planning, preview, apply, look-up, the monthly note, and the chat and monthly-note wiring, and the new duplicate review test files.
 - Live check in the dev vault: only the "STS Test" project was changed, and tasks in other projects were left unchanged. A create with a priority and due date, a due-date edit, a move to subtask and a delete each showed a preview first and wrote nothing until Apply. Undo restored the earlier state each time, and in the sidebar the red delete section, the second confirmation and the Undo button were seen working. The chat asked for "priority 1" and the preview showed P1. The repeatable check script (search, create, organize, undo) passed every step.
 - Live check of the duplicate review box in the dev vault: only STS Test changed. Held duplicates from a note showed the box; Keep both created exactly one task and one note line; Merge updated the existing task in place with no new task; syncs afterwards changed nothing.
+- Live check of 0.9.32 in the dev vault (Oct 27, 2026), with the 0.9.31 fixes merged in: the check script, sidebar create / edit / delete / Undo clicks, the monthly note, Merge and Keep both all passed, and a note line written by Merge or Keep both stayed the same through two later syncs. Clicking an older Undo button changed nothing; after Undo or a delete-only Apply every Undo button was off. The status box stayed one height through a real task run. Answers to a Todoist question, a notes question and a change request (Oct 28) showed as prose with no bullets and each link once; the change preview still opened and was cancelled.
 - Known limits of the duplicate box: if Obsidian crashes between Keep both creating the task and saving the answer, the task can be created twice. A box can point at a task deleted in Todoist since the last refresh; Merge then refuses and the box stays.
 - Known limits: Undo covers only the last Apply. A task deleted in Todoist has its monthly-note line removed at the next Todoist check, not at once. Removing a task line while syncing leaves its project heading in place; only Undo and a Todoist delete remove an emptied heading.
 
+## 0.9.31 - 2026-10-26
+### Fixed
+- **Notes without a #todo marker get tasks again.** Creating tasks from a note that has no marked line stopped with "Task creation blocked before the AI step: protected-workflow-evidence-closure-unresolved (action-source-mismatch ... why=markers=0)". A safety check expected exactly one marked line, which can never be found in an unmarked note. Markers now only confirm tasks; the whole note is read for actions and questions whether or not it has a marker. The other safety checks are unchanged: the evidence must still come from the note itself.
+- **A new or just-edited unmarked note is no longer blocked while it is being indexed.** A marked note already fell back to its own text when the search index did not have it yet; an unmarked note now does the same instead of stopping with "action-or-self-missing" or "ranked corpus is empty".
+### Notes
+- New tests cover an unmarked note, an unmarked note not yet in the index, and that evidence from a different note is still refused. Marked-note results are unchanged. `npm test` passes 55/55. Checked live in Obsidian on real meeting notes before and after the fix.
 ## 0.9.30 - 2026-10-20
 ### Fixed
 - **Emails are no longer blocked when processed back to back.** When one email finished, the plugin added its log note to the vault search index, which briefly reset the search lookup. An email already in progress could search during that reset, find no supporting notes, and be blocked with "protected provider evidence was unresolved". The email now waits for vault search to be ready again before its second search.

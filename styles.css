@@ -769,7 +769,9 @@
 
 .semantic-todoist-status {
   flex: 0 0 auto;
-  max-height: 30vh;
+  /* Fixed three-line height so the box never jumps as messages change; longer text scrolls. */
+  box-sizing: content-box;
+  height: calc(3em * 1.25);
   overflow: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--background-modifier-border);
@@ -2292,6 +2294,9 @@
     grid-template-columns: 1fr;
   }
 }
+.semantic-todoist-rewrite-modal .semantic-todoist-rewrite-pane:only-child {
+  grid-column: 1 / -1;
+}
 .semantic-todoist-rewrite-modal .semantic-todoist-rewrite-pane > div:first-child {
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
@@ -2378,3 +2383,8 @@
 .semantic-todoist-duplicate-review { border: 1px solid var(--background-modifier-border); background: var(--background-secondary); border-radius: var(--radius-m, 6px); }
 .semantic-todoist-duplicate-review .semantic-todoist-message-text { color: var(--text-normal); }
 .semantic-todoist-duplicate-review .semantic-todoist-message-action { margin-right: 6px; }
+.semantic-todoist-triage-list { max-height: 50vh; overflow-y: auto; margin: 10px 0; }
+.semantic-todoist-triage-row { padding: 6px 0; border-bottom: 1px solid var(--background-modifier-border); }
+.semantic-todoist-triage-row label { display: flex; gap: 8px; align-items: flex-start; font-weight: 600; }
+.semantic-todoist-triage-reason, .semantic-todoist-triage-meta, .semantic-todoist-triage-sample { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-left: 24px; }
+.semantic-todoist-triage-buttons { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 12px; }

@@ -868,6 +868,67 @@ async function main() {
     });
   }
 
+  // ---- A note with no action marker still gets tasks -----------------------
+  // Markers only confirm tasks in a note; they never screen out actions or
+  // questions. A note with no marker falls back to the single "source" scope,
+  // and its plan must reach the model instead of failing closed with
+  // action-source-mismatch ...:why=markers=0.
+  const UNMARKED_PATH = "Notes/Unmarked Note.md";
+  const UNMARKED_TEXT = "Alex asked me to send the Acme atlas budget report to Dana by Friday.\nShould we ask Dana about the Acme atlas budget review?";
+  const unmarkedChunk = Object.assign({}, buildIndexChunks()[0], {
+    path: UNMARKED_PATH,
+    title: "Unmarked Note",
+    text: UNMARKED_TEXT,
+    embedding: fakeEmbed(UNMARKED_TEXT),
+    provenance: { path: UNMARKED_PATH, sourceId: `src-${UNMARKED_PATH}`, authority: "authoritative" },
+    lineStart: 1,
+    lineEnd: 2
+  });
+  unmarkedChunk.indexMetadata = Object.assign({}, unmarkedChunk.indexMetadata);
+  unmarkedChunk.evidenceId = unmarkedChunk.id = unmarkedChunk.chunkId = semanticChunkEvidenceId(UNMARKED_PATH, semanticChunkContentFingerprint(UNMARKED_TEXT), 0);
+  const unmarkedSource = { type: "note", title: "Unmarked Note", path: UNMARKED_PATH, text: UNMARKED_TEXT };
+  const unmarkedPlugin = (await makePlugin({ chunks: buildIndexChunks().concat([unmarkedChunk]) })).plugin;
+  const unmarkedContract = buildTaskSourceContract(unmarkedSource, UNMARKED_TEXT, unmarkedPlugin.settings);
+  const unmarkedCalls = [];
+  installAiStub(unmarkedPlugin, unmarkedCalls, { scopeId: unmarkedContract.sourceScopeId, content: "Send the Acme atlas budget report to Dana" });
+  const unmarkedPlan = await unmarkedPlugin.createTaskPlanWithLocalActivity(unmarkedSource, {});
+  const unmarkedBundle = bundleOf(unmarkedPlan);
+
+  check("an unmarked note has no marker scope (the source-scope fallback)", () => {
+    assert.equal((unmarkedContract.explicitMarkers || []).length, 0);
+    assert.equal(unmarkedContract.scopes.length, 1);
+  });
+  check("an unmarked note is not blocked before the model call", () => {
+    const failure = unmarkedPlan?.workflowContextFailure || null;
+    assert.equal(failure?.code || "", "", `blocked: ${failure?.code} ${JSON.stringify(failure?.reason || "")}`);
+    assert.equal(unmarkedBundle?.contextBundleValidation?.dispatchAllowed, true);
+    assert.ok(unmarkedCalls.length > 0, "the model must be called");
+    assert.ok(Array.isArray(unmarkedPlan?.tasks) && unmarkedPlan.tasks.length > 0, "the unmarked note must produce tasks");
+  });
+  // A brand-new or just-edited unmarked note is not in the index yet: it must fall back to
+  // its own text exactly like a marked note does, not fail closed.
+  const unindexedPlugin = (await makePlugin()).plugin;
+  const unindexedCalls = [];
+  installAiStub(unindexedPlugin, unindexedCalls, { scopeId: unmarkedContract.sourceScopeId, content: "Send the Acme atlas budget report to Dana" });
+  const unindexedPlan = await unindexedPlugin.createTaskPlanWithLocalActivity(unmarkedSource, {});
+  check("an unmarked note not yet in the index is not blocked before the model call", () => {
+    const failure = unindexedPlan?.workflowContextFailure || null;
+    assert.equal(failure?.code || "", "", `blocked: ${failure?.code} ${JSON.stringify(failure?.reason || "")}`);
+    assert.ok(unindexedCalls.length > 0, "the model must be called");
+    assert.ok(Array.isArray(unindexedPlan?.tasks) && unindexedPlan.tasks.length > 0, "the unindexed unmarked note must produce tasks");
+  });
+  // Negative: the other source checks still fail closed for an unmarked note.
+  check("an unmarked note whose query handle is another note still fails closed", () => {
+    const scopeId = unmarkedContract.sourceScopeId;
+    const key = `scope:${scopeId}`;
+    const selection = taskWorkflowSelectTaskRelevantEvidence({ [key]: {
+      taskKey: key, scopeId, queryHandleEvidenceId: "ev:foreign:0", actionText: "source",
+      rows: [{ evidenceId: "ev:foreign:0", path: "Notes/Other.md", text: UNMARKED_TEXT, lineStart: 1, lineEnd: 2, rawSemanticScore: 0.9 }]
+    } }, { sourceContract: unmarkedContract, settings: unmarkedPlugin.settings });
+    assert.ok(selection.protectedReferenceErrors.some((code) => /^action-source-mismatch:.*why=path-differs$/.test(code)),
+      JSON.stringify(selection.protectedReferenceErrors));
+  });
+
   // ---- Email log notes are never task evidence ----------------------------
   // A processed email's log note holds an AI summary of THAT email. If a
   // later email's plan retrieved the summary as task evidence, the request in

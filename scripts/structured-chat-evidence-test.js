@@ -150,6 +150,22 @@ assert.strictEqual((injectText.match(/\]\(/g) || []).length, 1, injectText);
 assert.ok(!injectText.includes("\u0001"), injectText);
 console.log("PASS (c-inline-inject): fake link markers are ignored");
 
+// (c-evid) Raw internal evidence ids never reach a visible answer; non-Todoist output stays prose.
+const stripOne = (text) => (renderResponse(JSON.stringify({ claims: [
+  { text, established: false, evidence_ids: [], category: "general", topic: "T" }
+] }), []).answer || "").trim();
+assert.strictEqual(stripOne("The minutes follow the IRGP format (ev:1ceuuay:10qojjt:0)."), "The minutes follow the IRGP format.");
+assert.strictEqual(stripOne("A bare ev:abc123:def456:0 token remains."), "A bare token remains.");
+assert.strictEqual(stripOne("See [E1] for context."), "See for context.");
+assert.strictEqual(stripOne("evidence_id=E9 was printed."), "was printed.");
+console.log("PASS (c-evid): raw evidence ids stripped without empty parens or double spaces");
+
+// Non-Todoist chat (no bulletClaims) must remain byte-identical prose.
+const guardText = (renderResponse(repeatResponse, repeatLedger, { bulletClaims: false }).answer || "").trim();
+assert.strictEqual(guardText, "The project has three tasks. [e1](http://example.com/e1) [e2](http://example.com/e2) One is to buy paper. Another is due Nov 2. [e3](http://example.com/e3)");
+assert.ok(!/^- /m.test(guardText), "non-Todoist answer has no bullets");
+console.log("PASS (c-guard): non-Todoist answer stays prose without bulletClaims");
+
 // (d) Prompt sentences check (source-text check)
 const srcPath = path.join(__dirname, "..", "src", "main.js");
 const srcText = fs.readFileSync(srcPath, "utf8");

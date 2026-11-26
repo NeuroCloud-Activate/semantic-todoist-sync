@@ -92,6 +92,16 @@ test("vault-only question never fetches snapshot", async () => {
   assert.equal(r.todoistChanges, undefined);
 });
 
+test("non-Todoist question in the sidebar keeps prose paragraphs, not bullets", async () => {
+  const two = { claims: [
+    { text: "Compost is on your list.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" },
+    { text: "Mulch is on your list too.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" }
+  ] };
+  const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: two });
+  const r = await p.chat("What did the vendor notes say about invoices?", null, [], "chat-query", { todoist: true });
+  assert.ok(!/(^|\n)- /.test(r.answer), r.answer);
+});
+
 test("chat turn never calls todoistSync even when model returns a changePlan", async () => {
   const p = makePlugin({
     lookup: lookupOf({ kind: "change", filters: { words: ["compost"], projects: [], labels: [] } }),
@@ -632,6 +642,24 @@ test("change turn with model text keeps it unchanged", async () => {
 });
 
 // ---- fixes 2 and 3: readable prose replies, background vault context ----
+test("structured Todoist answer renders one bullet per sentence under topic headings", async () => {
+  const context = [
+    { evidenceId: "E-one", path: "Notes/One.md", title: "One note", text: "Topic one evidence" },
+    { evidenceId: "E-two", path: "Notes/Two.md", title: "Two note", text: "Topic two evidence" }
+  ];
+  const p = makePlugin({
+    lookup: lookupOf({ kind: "question" }),
+    context,
+    answer: { claims: [
+      { text: "First topic fact.", established: true, evidence_ids: ["E-one"], category: "fact", topic: "Topic One" },
+      { text: "Second topic fact.", established: true, evidence_ids: ["E-two"], category: "fact", topic: "Topic Two" }
+    ] }
+  });
+  const r = await p.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
+  assert.equal(r.answer.trim(),
+    "**Topic: Topic One**\n- First topic fact. [One note](obsidian://open?file=Notes%2FOne.md)\n\n**Topic: Topic Two**\n- Second topic fact. [Two note](obsidian://open?file=Notes%2FTwo.md)", r.answer);
+});
+
 test("prose chat answer renders one bullet per sentence", async () => {
   const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }) });
   const original = p.openaiResponse;

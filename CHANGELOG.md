@@ -1,3 +1,16 @@
+## 0.9.49 - 2026-11-26
+
+### Changed
+- **The Todoist review window is organised.** Each new task shows a bold title, labelled Where / Due / Priority / Labels / Note line lines, and a collapsed Description whose note links show the note's name instead of a raw obsidian:// address. Rows wrap, so the window no longer scrolls sideways. Other kinds of change keep their one-line summary.
+- **Todoist chat answers are bullet points.** When the assistant answers in plain prose, each sentence becomes its own bullet instead of one long paragraph, and it is asked to give one point per proposed change.
+- **New tasks drafted from chat use wider vault context.** The Todoist look-up now also suggests up to three broad searches about the projects, initiatives and people in your request, and the notes they find are given to the assistant alongside the normal search (same overall limit, no extra AI call), so descriptions reflect what your notes say about the work. The activity log records the searches and how many notes each found.
+
+### Fixed
+- **No raw evidence ids in answers.** An internal reference such as (ev:1ceuuay:10qojjt:0) can no longer appear in a chat answer.
+- **Note names with brackets link correctly.** A note such as "October 22, 2025 (BEAP)" no longer produces a truncated link in task descriptions and answers.
+
+### Notes
+- Verified in a test vault in Obsidian: bulleted answer, review window layout (no raw links, no horizontal scroll), and background searches returning real hits.
 ## 0.9.48 - 2026-11-25
 
 ### Changed

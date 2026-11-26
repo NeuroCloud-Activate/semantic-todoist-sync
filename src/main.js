@@ -14696,7 +14696,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
     }
     const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
-      retrievalTelemetry: context.semanticRetrieval?.telemetry
+      retrievalTelemetry: context.semanticRetrieval?.telemetry,
+      ...(todoistTurn?.snapshot ? { bulletClaims: true } : {})
     });
     const parsedAnswer = todoistTurn?.snapshot && todoistTurn.lookup.kind === "change" ? parseChatEvidenceResponse(response) : null;
     const todoistChanges = parsedAnswer ? this.buildTodoistChanges(parsedAnswer.changePlan, todoistTurn, sourceLedger, parsedAnswer.claims, active) : null;
@@ -37216,13 +37217,24 @@ function parseChatEvidenceResponse(value = "") {
   }
 }
 
-function chatClaimBody(value = "") {
+// Raw internal ids are handles for evidence, not prose; never let them reach a visible answer.
+function stripChatEvidenceIdTokens(value = "") {
   return String(value || "")
+    .replace(/\bevidence_id=[^\s,;)\]]+/g, "")
+    .replace(/\bev:[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){2}\b/g, "")
+    .replace(/\[E\d+\]/g, "")
+    .replace(/\(\s*\)/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+([.,!?;:])/g, "$1")
+    .trim();
+}
+
+function chatClaimBody(value = "") {
+  return stripChatEvidenceIdTokens(String(value || "")
     .replace(/\[([^\]\n]+)\]\([^)]*\)/g, "$1")
     .replace(/\s*\(\s*\d+\s*\)/g, "")
     .replace(/^\s*(?:[-*]\s+|\d+[.)]\s+)/, "")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\s+/g, " "));
 }
 
 function chatClaimSentences(value = "") {
@@ -37379,14 +37391,15 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const groupEntries = Array.from(groupMap.entries());
   const nonEmptyTopicKeys = new Set(groupEntries.filter(([k, g]) => g.firstText && g.firstText.trim()).map(([k, g]) => k));
   const showHeadings = nonEmptyTopicKeys.size >= 2;
-  // Sentences read as prose paragraphs; each source link shows once, after the first sentence that cites it.
+  // Sentences read as prose paragraphs (or one bullet each for Todoist turns); each source link shows once, after the first sentence that cites it.
   // Items linked inline anywhere are never repeated as source links.
   const shownLinks = new Set(renderedClaims.flatMap((item) => item.inline));
   const paragraph = (items) => items.map((item) => {
     const fresh = item.links.filter((link) => !shownLinks.has(link));
     fresh.forEach((link) => shownLinks.add(link));
-    return fresh.length ? `${item.text} ${fresh.join(" ")}` : item.text;
-  }).join(" ");
+    const line = fresh.length ? `${item.text} ${fresh.join(" ")}` : item.text;
+    return options.bulletClaims ? `- ${line}` : line;
+  }).join(options.bulletClaims ? "\n" : " ");
   let answer;
   if (!showHeadings) {
     answer = paragraph(renderedClaims);
@@ -37409,7 +37422,7 @@ function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
   let removedInventedLinkCount = 0;
   let usedSourceCount = 0;
   const sourceUrlsUsed = new Set();
-  let text = String(answer || "").trim();
+  let text = stripChatEvidenceIdTokens(String(answer || "").trim());
   text = text.replace(/\n\s*(?:Source List|Sources|Available evidence)\s*:\s*[\s\S]*$/i, "").trim();
   text = text.replace(/\s*\(\s*\d+\s*\)/g, "");
   if (/\b(?:Source List|Available evidence)\s*:/i.test(String(answer || ""))) reasonCodes.push("chat-source-list-removed");

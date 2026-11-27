@@ -160,11 +160,37 @@ assert.strictEqual(stripOne("See [E1] for context."), "See for context.");
 assert.strictEqual(stripOne("evidence_id=E9 was printed."), "was printed.");
 console.log("PASS (c-evid): raw evidence ids stripped without empty parens or double spaces");
 
-// Non-Todoist chat (no bulletClaims) must remain byte-identical prose.
-const guardText = (renderResponse(repeatResponse, repeatLedger, { bulletClaims: false }).answer || "").trim();
+// Unmarked claims stay byte-identical prose, whatever the turn type.
+const guardText = (renderResponse(repeatResponse, repeatLedger).answer || "").trim();
 assert.strictEqual(guardText, "The project has three tasks. [e1](http://example.com/e1) [e2](http://example.com/e2) One is to buy paper. Another is due Nov 2. [e3](http://example.com/e3)");
-assert.ok(!/^- /m.test(guardText), "non-Todoist answer has no bullets");
-console.log("PASS (c-guard): non-Todoist answer stays prose without bulletClaims");
+assert.ok(!/^- /m.test(guardText), "unmarked answer has no bullets");
+console.log("PASS (c-guard): unmarked claims stay prose");
+
+// (c-points) Model-marked points render as real bullets after a prose lead-in; each link shows once.
+const pointsResponse = JSON.stringify({ claims: [
+  { text: "Here is what I found.", established: false, evidence_ids: [], category: "general", topic: "Plan" },
+  { text: "- Draft **Task A** by Friday.", established: true, evidence_ids: ["e1"], category: "next-step", topic: "Plan" },
+  { text: "- Email **Alex** about the budget.", established: true, evidence_ids: ["e2"], category: "next-step", topic: "Plan" }
+] });
+const pointsText = (renderResponse(pointsResponse, repeatLedger).answer || "").trim();
+assert.strictEqual(pointsText, "Here is what I found.\n\n- Draft **Task A** by Friday. [e1](http://example.com/e1)\n- Email **Alex** about the budget. [e2](http://example.com/e2)", pointsText);
+console.log("PASS (c-points): prose lead-in, blank line, then one bullet per marked point");
+
+// (c-points-bold) Bold survives and an inline link inside a bullet is shown once.
+const boldPointText = (renderResponse(JSON.stringify({ claims: [
+  { text: "- [Buy paper](e1) is **urgent** for the review.", established: true, evidence_ids: ["e1"], category: "fact", topic: "T" }
+] }), repeatLedger).answer || "").trim();
+assert.strictEqual(boldPointText, "- [Buy paper](http://example.com/e1) is **urgent** for the review.", boldPointText);
+assert.strictEqual((boldPointText.match(/\]\(/g) || []).length, 1, "inline link inside a bullet shows once");
+console.log("PASS (c-points-bold): bold survives and an inline link works inside a bullet");
+
+// (c-points-only) A topic containing only marked points renders a plain list, no heading.
+const onlyPointsText = (renderResponse(JSON.stringify({ claims: [
+  { text: "- First option.", established: false, evidence_ids: [], category: "general", topic: "Options" },
+  { text: "* Second option.", established: false, evidence_ids: [], category: "general", topic: "Options" }
+] }), []).answer || "").trim();
+assert.strictEqual(onlyPointsText, "- First option.\n- Second option.", onlyPointsText);
+console.log("PASS (c-points-only): a topic with only marked points renders a plain list");
 
 // (d) Prompt sentences check (source-text check)
 const srcPath = path.join(__dirname, "..", "src", "main.js");

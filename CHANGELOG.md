@@ -1,3 +1,7 @@
+## 0.9.50 - 2026-11-27
+
+### Changed
+- **Chat answers keep their short, helpful prose and add bullets only for distinct points.** 0.9.49 briefly made every sentence of a Todoist answer its own bullet; that is reverted. A summary or lead-in reads as normal connected prose, and when the answer lists separate items (each proposed task or change, options, decisions, people or steps) each item is its own bullet. Key names such as task titles, projects, people, dates and priorities are picked out in **bold**.
 ## 0.9.49 - 2026-11-26
 
 ### Changed

@@ -14590,6 +14590,8 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
         "Return only JSON matching the supplied chat evidence schema. Each claim is one or two natural sentences.",
         "Answer in plain language, usually in 3-6 claims, in your own words rather than quoting notes. The claims are shown in order as prose, so write them to read together as one short, connected answer: lead with the direct answer, then add the most useful supporting details.",
         "Write in a warm, natural tone, the way a capable colleague would reply: vary how sentences begin, do not restate the question, and do not repeat a name or phrase in every sentence when \"it\", \"they\" or \"this\" is clear.",
+        "Keep the answer short and warm, and let it read as connected prose: write a lead-in or summary as plain prose, but when you list distinct items - several tasks or changes, options, decisions, people or steps - write each one as its own claim starting with `- ` so it shows as a bullet.",
+        "Use **bold** to pick out the key items so the answer is scannable: you may open a bullet with the **task title, person or option** it is about, and bold projects, due dates and priorities P1-P4 where they are named; bullets are claims like any other, so keep citing the evidence_ids that support them, and for new tasks still fill in each description from the cited evidence; do not bold whole sentences, do not use headings and never put one bullet on every sentence.",
         "Answer from what the evidence and your own knowledge support, and do not list what is missing. When the vault is silent on a general question that is not about the user's own work, answer it from your own knowledge the way a knowledgeable colleague would, and offer a useful next step when it helps.",
         "Facts about the user's own work - their notes, people, dates, amounts or decisions - come only from the evidence; never present a guess about them as your own knowledge. When the evidence does not contain one that the user asks for, say so once in a short plain clause, such as that it is not in the notes, inside a helpful sentence that also gives what is known or where to look.",
         "Give each claim the one category that fits best, and never present your own knowledge as if it came from the evidence.",
@@ -14620,7 +14622,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
           "Todoist tasks, projects and sections are listed in the user message; answer questions about them from those lists only.",
           ...(todoistTurn.snapshot && todoistTurn.lookup.kind === "change" ? [
             "The user wants Todoist changed: put each change in changePlan.changes; the plugin shows a preview and nothing is changed until the user applies it. Use only task, project and section ids from the Todoist lists; never invent ids or names. In changePlan, priority is Todoist's API number: user P1, P2, P3, P4 = API 4, 3, 2, 1 (so priority 1 or P1 means API 4; P4 or normal means API 1). In your answer to the user, name priorities only as P1-P4 and never mention API numbers. Propose a delete only when the user explicitly asks to delete. For new tasks, take title and description from the supplied vault evidence you cite.",
-            "Write one short claim per proposed change.",
+            "List each proposed change as its own bullet claim.",
             "When drafting create or update descriptions, use the supplied background evidence to write an informed description: relevant project context, recent decisions and related prior work; cite the evidence_ids you used and never invent facts that are not in the supplied evidence."
           ] : [])
         ] : [])
@@ -14696,8 +14698,7 @@ async purgeInactiveSemanticIndexDataset(datasetKey, options = {}) {
       };
     }
     const citationResult = validateChatEvidenceCitations(response, sourceLedger, {
-      retrievalTelemetry: context.semanticRetrieval?.telemetry,
-      ...(todoistTurn?.snapshot ? { bulletClaims: true } : {})
+      retrievalTelemetry: context.semanticRetrieval?.telemetry
     });
     const parsedAnswer = todoistTurn?.snapshot && todoistTurn.lookup.kind === "change" ? parseChatEvidenceResponse(response) : null;
     const todoistChanges = parsedAnswer ? this.buildTodoistChanges(parsedAnswer.changePlan, todoistTurn, sourceLedger, parsedAnswer.claims, active) : null;
@@ -37280,7 +37281,10 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
       inlineLinks.push({ markdown: `[${markdownLinkText(label)}](${entry.url})`, source: entry.markdown, url: entry.url });
       return `[\u0001${inlineLinks.length - 1}]`;
     });
-    const sentences = chatClaimSentences(claimText);
+    // A claim starting with "- " or "* " is a distinct point; keep it as one bullet instead of splitting into sentences.
+    const isPoint = /^[ \t]*[-*][ \t]+/.test(claimText);
+    const pointBody = isPoint ? chatClaimBody(claimText) : "";
+    const sentences = isPoint ? (pointBody ? [pointBody] : []) : chatClaimSentences(claimText);
     if (!sentences.length) continue;
     const validEntries = evidenceIds.map((id) => byEvidenceId.get(id)).filter(Boolean);
     const unresolvedIds = evidenceIds.filter((id) => !byEvidenceId.has(id));
@@ -37305,7 +37309,7 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
       if (!clean) continue;
       const inline = [];
       const text = clean.replace(/\[\u0001(\d+)\]/g, (whole, i) => { const link = inlineLinks[Number(i)]; inline.push(link.source); sourceUrlsUsed.add(link.url); return link.markdown; });
-      const sentenceItem = { text, links, inline, claimIndex: parsed.claims.indexOf(claim) };
+      const sentenceItem = { text, links, inline, claimIndex: parsed.claims.indexOf(claim), point: isPoint };
       renderedClaims.push(sentenceItem);
       currentGroup.bullets.push(sentenceItem);
     }
@@ -37391,15 +37395,25 @@ function renderStructuredChatEvidenceResponse(value = "", ledger = [], options =
   const groupEntries = Array.from(groupMap.entries());
   const nonEmptyTopicKeys = new Set(groupEntries.filter(([k, g]) => g.firstText && g.firstText.trim()).map(([k, g]) => k));
   const showHeadings = nonEmptyTopicKeys.size >= 2;
-  // Sentences read as prose paragraphs (or one bullet each for Todoist turns); each source link shows once, after the first sentence that cites it.
-  // Items linked inline anywhere are never repeated as source links.
+  // Plain claims read as one prose paragraph; claims marked "- " or "* " each become a list point.
+  // Each source link shows once, after the first sentence that cites it; inline-linked items are never repeated.
   const shownLinks = new Set(renderedClaims.flatMap((item) => item.inline));
-  const paragraph = (items) => items.map((item) => {
-    const fresh = item.links.filter((link) => !shownLinks.has(link));
-    fresh.forEach((link) => shownLinks.add(link));
-    const line = fresh.length ? `${item.text} ${fresh.join(" ")}` : item.text;
-    return options.bulletClaims ? `- ${line}` : line;
-  }).join(options.bulletClaims ? "\n" : " ");
+  const paragraph = (items) => {
+    const parts = [];
+    let prose = [];
+    const flush = () => { if (prose.length) { parts.push({ type: "prose", text: prose.join(" ") }); prose = []; } };
+    for (const item of items) {
+      const fresh = item.links.filter((link) => !shownLinks.has(link));
+      fresh.forEach((link) => shownLinks.add(link));
+      const line = fresh.length ? `${item.text} ${fresh.join(" ")}` : item.text;
+      if (item.point) { flush(); parts.push({ type: "point", text: `- ${line}` }); } else prose.push(line);
+    }
+    flush();
+    return parts.map((part, idx) => {
+      if (!idx) return part.text;
+      return (parts[idx - 1].type === "point" && part.type === "point" ? "\n" : "\n\n") + part.text;
+    }).join("");
+  };
   let answer;
   if (!showHeadings) {
     answer = paragraph(renderedClaims);
@@ -37450,7 +37464,7 @@ function validateChatEvidenceCitations(answer = "", ledger = [], options = {}) {
     missingSentenceCitationCount += 1;
     renderedParts.push(sentence.replace(/\[([^\]\n]+)\]\(([^)\s]+(?:\s+[^)]*)?)\)/g, "$1").replace(/\s{2,}/g, " ").trim());
   }
-  text = renderedParts.map((part) => `- ${part.replace(/^\s*(?:[-*]\s+|\d+[.)]\s+)/, "")}`).join("\n").trim();
+  text = renderedParts.join(" ").trim();
   usedSourceCount = sourceUrlsUsed.size;
   if (missingSentenceCitationCount) reasonCodes.push("missing-sentence-end-citation");
   const retrievalTelemetry = options.retrievalTelemetry || {};

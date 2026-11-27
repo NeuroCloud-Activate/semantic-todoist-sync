@@ -92,14 +92,23 @@ test("vault-only question never fetches snapshot", async () => {
   assert.equal(r.todoistChanges, undefined);
 });
 
-test("non-Todoist question in the sidebar keeps prose paragraphs, not bullets", async () => {
+test("non-Todoist question keeps unmarked claims as prose and marked claims as bullets", async () => {
   const two = { claims: [
     { text: "Compost is on your list.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" },
     { text: "Mulch is on your list too.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" }
   ] };
   const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: two });
   const r = await p.chat("What did the vendor notes say about invoices?", null, [], "chat-query", { todoist: true });
-  assert.ok(!/(^|\n)- /.test(r.answer), r.answer);
+  assert.equal(r.answer.trim(), "Compost is on your list. Mulch is on your list too.", r.answer);
+
+  const marked = { claims: [
+    { text: "Here are the options.", established: false, evidence_ids: [], category: "unsupported", topic: "Options" },
+    { text: "- **Compost** this week.", established: false, evidence_ids: [], category: "unsupported", topic: "Options" },
+    { text: "- **Mulch** next week.", established: false, evidence_ids: [], category: "unsupported", topic: "Options" }
+  ] };
+  const p2 = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }), answer: marked });
+  const r2 = await p2.chat("What should I do?", null, [], "chat-query", { todoist: true });
+  assert.equal(r2.answer.trim(), "Here are the options.\n\n- **Compost** this week.\n- **Mulch** next week.", r2.answer);
 });
 
 test("chat turn never calls todoistSync even when model returns a changePlan", async () => {
@@ -642,32 +651,36 @@ test("change turn with model text keeps it unchanged", async () => {
 });
 
 // ---- fixes 2 and 3: readable prose replies, background vault context ----
-test("structured Todoist answer renders one bullet per sentence under topic headings", async () => {
-  const context = [
-    { evidenceId: "E-one", path: "Notes/One.md", title: "One note", text: "Topic one evidence" },
-    { evidenceId: "E-two", path: "Notes/Two.md", title: "Two note", text: "Topic two evidence" }
-  ];
+test("Todoist change turn with a lead-in and two marked claims renders prose then bullets", async () => {
   const p = makePlugin({
-    lookup: lookupOf({ kind: "question" }),
-    context,
+    lookup: lookupOf({ kind: "change" }),
     answer: { claims: [
-      { text: "First topic fact.", established: true, evidence_ids: ["E-one"], category: "fact", topic: "Topic One" },
-      { text: "Second topic fact.", established: true, evidence_ids: ["E-two"], category: "fact", topic: "Topic Two" }
+      { text: "Here are the changes I would make.", established: false, evidence_ids: [], category: "general", topic: "Changes" },
+      { text: "- Move **Buy compost** to P1.", established: false, evidence_ids: [], category: "general", topic: "Changes" },
+      { text: "- Add **Call Alex** on Friday.", established: false, evidence_ids: [], category: "general", topic: "Changes" }
     ] }
   });
-  const r = await p.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
-  assert.equal(r.answer.trim(),
-    "**Topic: Topic One**\n- First topic fact. [One note](obsidian://open?file=Notes%2FOne.md)\n\n**Topic: Topic Two**\n- Second topic fact. [Two note](obsidian://open?file=Notes%2FTwo.md)", r.answer);
+  const r = await p.chat("Make compost urgent and add a call", null, [], "chat-query", { todoist: true });
+  assert.equal(r.answer.trim(), "Here are the changes I would make.\n\n- Move **Buy compost** to P1.\n- Add **Call Alex** on Friday.", r.answer);
 });
 
-test("prose chat answer renders one bullet per sentence", async () => {
-  const p = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }) });
-  const original = p.openaiResponse;
-  p.openaiResponse = async (request) => request.operation === "chat"
+test("unmarked claims stay prose for Todoist and non-Todoist turns", async () => {
+  const answer = { claims: [
+    { text: "First sentence about compost.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" },
+    { text: "Second sentence about the garden.", established: false, evidence_ids: [], category: "unsupported", topic: "Compost" }
+  ] };
+  for (const lookup of [lookupOf({ kind: "question" }), lookupOf({ needsTodoist: false, kind: "none" })]) {
+    const p = makePlugin({ lookup, answer });
+    const r = await p.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
+    assert.equal(r.answer.trim(), "First sentence about compost. Second sentence about the garden.", r.answer);
+  }
+  const plain = makePlugin({ lookup: lookupOf({ needsTodoist: false, kind: "none" }) });
+  const original = plain.openaiResponse;
+  plain.openaiResponse = async (request) => request.operation === "chat"
     ? "First sentence about compost. Second sentence about the garden."
     : original(request);
-  const r = await p.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
-  assert.equal(r.answer.trim(), "- First sentence about compost.\n- Second sentence about the garden.", r.answer);
+  const pr = await plain.chat("What do my notes say?", null, [], "chat-query", { todoist: true });
+  assert.equal(pr.answer.trim(), "First sentence about compost. Second sentence about the garden.", pr.answer);
 });
 
 test("todoist lookup schema and prompt allow up to three broad background queries", () => {
@@ -682,11 +695,23 @@ test("todoist lookup schema and prompt allow up to three broad background querie
   assert.ok(/IRGP|BEAP review committee/.test(system), system);
 });
 
-test("todoist answer prompt asks for short claims and evidence-grounded descriptions", () => {
+test("todoist answer prompt asks for bullet claims and evidence-grounded descriptions", () => {
   const src = fs.readFileSync(mainPath, "utf8");
-  assert.ok(src.includes("Write one short claim per proposed change."), src);
+  assert.ok(src.includes("List each proposed change as its own bullet claim."), src);
   assert.ok(src.includes("When drafting create or update descriptions, use the supplied background evidence"), src);
   assert.ok(src.includes("never invent facts that are not in the supplied evidence"), src);
+});
+
+test("chat prompt asks for bullet points and sparing bold for all answers", () => {
+  const src = fs.readFileSync(mainPath, "utf8");
+  const start = src.indexOf('"You are a helpful Obsidian sidebar assistant."');
+  const end = src.indexOf("...(todoistTurn?.shortlist", start);
+  assert.ok(start > 0 && end > start, "chat system array located");
+  const general = src.slice(start, end);
+  assert.ok(general.includes("write each one as its own claim starting with `- `"), general);
+  assert.ok(general.includes("Use **bold** to pick out the key items")
+    && general.includes("keep citing the evidence_ids that support them"), general);
+  assert.ok(general.includes("do not use headings"), general);
 });
 
 test("background queries retrieve extra chunks that reach the answer prompt", async () => {
